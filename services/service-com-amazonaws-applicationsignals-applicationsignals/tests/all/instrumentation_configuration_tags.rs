@@ -32,7 +32,7 @@ use crate::slo_lifecycle::{arn_uri_segment, call, ACCOUNT, REGION};
 
 /// The only `DynamicInstrumentationSignalType` the model declares
 /// (`smithy_query(query="shape",shape="DynamicInstrumentationSignalType")` -> `["SNAPSHOT"]`).
-const SNAPSHOT: &str = "SNAPSHOT";
+pub(crate) const SNAPSHOT: &str = "SNAPSHOT";
 
 /// The two `InstrumentationType` values
 /// (`smithy_query(query="shape",shape="InstrumentationType")` -> `["BREAKPOINT", "PROBE"]`).
@@ -42,7 +42,7 @@ const PROBE: &str = "PROBE";
 /// The capitalised type name a failure about an instrumentation configuration reports in
 /// `ResourceType` (the resource's TYPE name, not the `instrumentationConfig` segment its ARN
 /// spells).
-const CONFIGURATION_RESOURCE_TYPE: &str = "InstrumentationConfiguration";
+pub(crate) const CONFIGURATION_RESOURCE_TYPE: &str = "InstrumentationConfiguration";
 
 /// The resource-type segment of a configuration's ARN, from the modelled
 /// `InstrumentationConfigurationArn` doc:
@@ -52,7 +52,7 @@ const CONFIGURATION_ARN_RESOURCE: &str = "instrumentationConfig";
 /// A router with just this service mounted on a fresh engine, together with the engine the
 /// handlers share, so a test can stage what the clock would have done to a configuration
 /// whose documented lifetime floor (5 minutes) outlasts any test.
-fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -76,7 +76,7 @@ async fn create_configuration(router: &MultiServiceRouter, body: Value) -> (u16,
 }
 
 /// `POST /get-instrumentation-configuration`.
-async fn get_configuration(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+pub(crate) async fn get_configuration(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(
         router,
         "POST",
@@ -87,7 +87,7 @@ async fn get_configuration(router: &MultiServiceRouter, body: Value) -> (u16, Va
 }
 
 /// `POST /delete-instrumentation-configuration`.
-async fn delete_configuration(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+pub(crate) async fn delete_configuration(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(
         router,
         "POST",
@@ -100,15 +100,15 @@ async fn delete_configuration(router: &MultiServiceRouter, body: Value) -> (u16,
 /// One row of the configuration table: the identity of a configuration to create and the tags
 /// the create carries.
 #[derive(Clone, Debug)]
-struct Case {
-    label: &'static str,
-    instrumentation_type: &'static str,
-    service: &'static str,
-    environment: &'static str,
+pub(crate) struct Case {
+    pub(crate) label: &'static str,
+    pub(crate) instrumentation_type: &'static str,
+    pub(crate) service: &'static str,
+    pub(crate) environment: &'static str,
     /// The `CodeLocation` body of the `Location` union.
-    location: Value,
+    pub(crate) location: Value,
     /// The `Tags` the create carries, or `None` when it names the member not at all.
-    tags: Option<Vec<(String, String)>>,
+    pub(crate) tags: Option<Vec<(String, String)>>,
 }
 
 impl Case {
@@ -132,13 +132,13 @@ impl Case {
 
     /// The tags this row's configuration must report: the ones the create named, and none at
     /// all when it named the member not at all or named it empty.
-    fn expected(&self) -> BTreeMap<String, String> {
+    pub(crate) fn expected(&self) -> BTreeMap<String, String> {
         expected_map(self.tags.as_deref().unwrap_or_default())
     }
 
     /// A `GetInstrumentationConfiguration` request for this row's configuration, by the
     /// `LocationHash` the create answered.
-    fn get_body(&self, location_hash: &str) -> Value {
+    pub(crate) fn get_body(&self, location_hash: &str) -> Value {
         json!({
             "InstrumentationType": self.instrumentation_type,
             "Service": self.service,
@@ -169,7 +169,7 @@ fn generated_tags(n: usize) -> Vec<(String, String)> {
 /// `Tags` at all, and the sizes the modelled key and value admit
 /// (`smithy_query(query="shape",shape="Tag,TagKey,TagValue")`: `TagKey` has `length 1..128`,
 /// `TagValue` `length 0..256`).
-fn cases() -> Vec<Case> {
+pub(crate) fn cases() -> Vec<Case> {
     vec![
         Case {
             label: "BREAKPOINT, Java, several tags",
@@ -261,7 +261,7 @@ fn cases() -> Vec<Case> {
 
 /// Create this row's configuration and hand back the `ARN` and `LocationHash` the service
 /// answered — the stored record's own, never a value the test derived.
-async fn created(router: &MultiServiceRouter, case: &Case) -> (String, String) {
+pub(crate) async fn created(router: &MultiServiceRouter, case: &Case) -> (String, String) {
     let (status, created) = create_configuration(router, case.create_body()).await;
     assert_eq!(
         status, 200,

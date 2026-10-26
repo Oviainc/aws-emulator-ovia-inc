@@ -89,3 +89,5 @@ mod state_roundtrip;
 mod tag_attachment;
 #[path = "all/time_ranged_reads.rs"]
 mod time_ranged_reads;
+#[path = "all/untag_resource_kinds.rs"]
+mod untag_resource_kinds;

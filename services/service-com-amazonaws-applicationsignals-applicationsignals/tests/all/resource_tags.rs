@@ -22,7 +22,7 @@ use crate::slo_lifecycle::{arn_uri_segment, call, create, router, sli_config, AC
 /// The `ResourceType` every failure about an SLO reports: the resource's type NAME,
 /// capitalised (`smithy_query(query="shape",shape="ResourceNotFoundException")` makes both
 /// `ResourceType` and `ResourceId` `@required`).
-const SLO_RESOURCE_TYPE: &str = "Slo";
+pub(crate) const SLO_RESOURCE_TYPE: &str = "Slo";
 
 /// The ARN of the SLO called `name` in this account and region, as the modelled
 /// `ServiceLevelObjectiveArn` pattern spells it
