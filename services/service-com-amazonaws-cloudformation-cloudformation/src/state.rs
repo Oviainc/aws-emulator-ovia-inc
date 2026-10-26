@@ -222,6 +222,11 @@ pub mod include;
 /// change set submits, and the resource-level change list that comparison answers.
 pub mod change_plan;
 
+/// The `{{resolve:...}}` dynamic references a resource's properties carry: the store each
+/// one is resolved against as the resource is deployed, and the resource failure a
+/// reference that store cannot satisfy is.
+pub mod dynamic_references;
+
 /// One entry per resource type this emulator really creates: which service owns it, and
 /// the create and delete calls that make its resources exist.
 mod provisioner;
