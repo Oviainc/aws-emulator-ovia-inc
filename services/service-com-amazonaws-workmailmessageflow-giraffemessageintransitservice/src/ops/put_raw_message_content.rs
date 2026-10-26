@@ -561,7 +561,7 @@ fn validate_mime(content: &[u8]) -> Result<(), String> {
     let missing: Vec<&str> = REQUIRED_HEADERS
         .iter()
         .copied()
-        .filter(|name| counts.get(*name).copied().unwrap_or_default() == 0)
+        .filter(|name| counts.get(name.as_bytes()).copied().unwrap_or_default() == 0)
         .collect();
     if !missing.is_empty() {
         return Err(format!(
@@ -571,7 +571,7 @@ fn validate_mime(content: &[u8]) -> Result<(), String> {
     }
 
     for name in SINGLETON_HEADERS {
-        if counts.get(*name).copied().unwrap_or_default() > 1 {
+        if counts.get(name.as_bytes()).copied().unwrap_or_default() > 1 {
             return Err(format!(
                 "The message carries more than one {name} header, which may only appear once."
             ));
@@ -590,12 +590,17 @@ fn validate_mime(content: &[u8]) -> Result<(), String> {
 /// unchanged only when the update carries the same values in the same order, so
 /// rewriting one of them, dropping one, reordering them or adding one are all
 /// changes, as is removing or inventing a header that appears once.
+///
+/// A value is the OCTETS the message carries for the field, never text decoded
+/// out of them: a message's content is arbitrary bytes, and any decoding that
+/// maps distinct byte sequences onto one string would read two different values
+/// as the same one and let a change through.
 fn immutable_header_conflict(current: &[u8], updated: &[u8]) -> Option<String> {
     let before = header_fields(current);
     let after = header_fields(updated);
     for name in IMMUTABLE_HEADERS {
-        let before: Vec<&str> = values_of(&before, name);
-        let after: Vec<&str> = values_of(&after, name);
+        let before: Vec<&[u8]> = values_of(&before, name);
+        let after: Vec<&[u8]> = values_of(&after, name);
         if before == after {
             continue;
         }
@@ -617,19 +622,25 @@ fn immutable_header_conflict(current: &[u8], updated: &[u8]) -> Option<String> {
 }
 
 /// The values of the header field `name` in `fields`, in the order the message
-/// carries them.
-fn values_of<'a>(fields: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+/// carries them. `name` is an ASCII-lowercased field name, which is the form
+/// [`header_fields`] keys a field by.
+fn values_of<'a>(fields: &'a [(Vec<u8>, Vec<u8>)], name: &str) -> Vec<&'a [u8]> {
     fields
         .iter()
-        .filter(|(field, _)| field == name)
-        .map(|(_, value)| value.as_str())
+        .filter(|(field, _)| field.as_slice() == name.as_bytes())
+        .map(|(_, value)| value.as_slice())
         .collect()
 }
 
 /// How many times each header field name appears in the message's header block,
 /// lowercased (RFC 5322 field names are case-insensitive).
-fn header_field_counts(content: &[u8]) -> ::std::collections::BTreeMap<String, usize> {
-    let mut counts: ::std::collections::BTreeMap<String, usize> =
+///
+/// A name is counted by its octets, so two fields are the same field only when
+/// their names are the same bytes up to ASCII case: a name that merely resembles
+/// another once its bytes are decoded is a different field and is counted on its
+/// own.
+fn header_field_counts(content: &[u8]) -> ::std::collections::BTreeMap<Vec<u8>, usize> {
+    let mut counts: ::std::collections::BTreeMap<Vec<u8>, usize> =
         ::std::collections::BTreeMap::new();
     for (name, _) in header_fields(content) {
         *counts.entry(name).or_default() += 1;
@@ -637,15 +648,23 @@ fn header_field_counts(content: &[u8]) -> ::std::collections::BTreeMap<String, u
     counts
 }
 
-/// The message's header block as (lowercased name, value) pairs, in order.
+/// The message's header block as (ASCII-lowercased name, value) pairs of OCTETS,
+/// in order.
 ///
 /// The block is the content up to the first empty line, and a line that opens with
 /// a space or a tab continues the field before it (RFC 5322 §2.2.3 folding) rather
 /// than starting a new one, so a folded value is compared as the one value it is.
-/// Field names are lowercased because RFC 5322 makes them case-insensitive;
+/// Field names are ASCII-lowercased because RFC 5322 makes them case-insensitive;
 /// values are not, since a value is what it says.
-fn header_fields(content: &[u8]) -> Vec<(String, String)> {
-    let mut fields: Vec<(String, String)> = Vec::new();
+///
+/// Both halves stay bytes. A message's content is an arbitrary octet stream — the
+/// model recommends encoding anything outside 7-bit ASCII but requires nothing —
+/// so a field is split and compared on its bytes: decoding to text first would
+/// map byte sequences that differ onto one string and read two different fields,
+/// or two different values, as one. Only [`trim_wsp`] comes off either half, so
+/// every octet that is not RFC 5322 whitespace belongs to the name or the value.
+fn header_fields(content: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut fields: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for line in content.split(|byte| *byte == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
@@ -657,22 +676,37 @@ fn header_fields(content: &[u8]) -> Vec<(String, String)> {
             // break and keeps the rest of the line, including its leading
             // whitespace.
             if let Some((_, value)) = fields.last_mut() {
-                value.push_str(&String::from_utf8_lossy(line));
+                value.extend_from_slice(line);
             }
             continue;
         }
         let Some(colon) = line.iter().position(|byte| *byte == b':') else {
             continue;
         };
-        let name = String::from_utf8_lossy(&line[..colon])
-            .trim()
-            .to_ascii_lowercase();
-        let value = String::from_utf8_lossy(&line[colon + 1..])
-            .trim()
-            .to_string();
+        let name = trim_wsp(&line[..colon]).to_ascii_lowercase();
+        let value = trim_wsp(&line[colon + 1..]).to_vec();
         fields.push((name, value));
     }
     fields
+}
+
+/// `octets` without the whitespace RFC 5322 pads a header field with.
+///
+/// That whitespace is the space and the horizontal tab (§3.2.2 `WSP`), and
+/// nothing else: every other octet, printable or not, is part of the field name
+/// or of its value, so trimming any of them would read two fields that differ as
+/// the same one.
+fn trim_wsp(octets: &[u8]) -> &[u8] {
+    let is_wsp = |byte: u8| byte == b' ' || byte == b'\t';
+    let start = octets
+        .iter()
+        .position(|byte| !is_wsp(*byte))
+        .unwrap_or(octets.len());
+    let end = octets
+        .iter()
+        .rposition(|byte| !is_wsp(*byte))
+        .map_or(start, |index| index + 1);
+    &octets[start..end]
 }
 
 /// The 1-based number and octet length of the first line of `content` longer than

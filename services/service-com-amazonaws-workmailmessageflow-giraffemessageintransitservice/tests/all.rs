@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/mime_header_criteria.rs"]
 mod mime_header_criteria;
+#[path = "all/mime_header_octets.rs"]
+mod mime_header_octets;
 #[path = "all/raw_message_content.rs"]
 mod raw_message_content;
 #[path = "all/regional_message_namespace.rs"]

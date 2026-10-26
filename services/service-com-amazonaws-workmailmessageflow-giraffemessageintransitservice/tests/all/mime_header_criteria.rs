@@ -46,7 +46,7 @@ fn message(headers: &[(&str, &str)], body: &str) -> Vec<u8> {
 
 /// Assert `reply` is the rejection the model declares for unusable MIME content,
 /// carrying a message that says what caused it.
-fn assert_rejected(case: &str, reply: &Reply) {
+pub(crate) fn assert_rejected(case: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 400,
         "case {case:?}: expected HTTP 400, got {} ({})",
@@ -81,7 +81,7 @@ fn required_field(name: &str) -> (&'static str, &'static str) {
 /// Put `content` in transit under a fresh id, offer `replacement` at a reference,
 /// call `PutRawMessageContent` and report the reply together with what
 /// `GetRawMessageContent` serves afterwards.
-async fn update(content: &[u8], replacement: &[u8]) -> (Reply, Vec<u8>) {
+pub(crate) async fn update(content: &[u8], replacement: &[u8]) -> (Reply, Vec<u8>) {
     let emulator = Emulator::new();
     let message_id = "in-transit-0";
     emulator.seed_message(message_id, content);
