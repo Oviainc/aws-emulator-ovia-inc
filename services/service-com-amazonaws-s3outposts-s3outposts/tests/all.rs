@@ -17,6 +17,8 @@ mod access_type_coip_pool_pairing;
 mod arn_partitions;
 #[path = "all/arn_patterns.rs"]
 mod arn_patterns;
+#[path = "all/control_plane_inventory.rs"]
+mod control_plane_inventory;
 #[path = "all/endpoint_commitment_conflict.rs"]
 mod endpoint_commitment_conflict;
 #[path = "all/endpoint_lifecycle.rs"]

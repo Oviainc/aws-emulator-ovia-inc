@@ -1610,6 +1610,13 @@ pub const SUPPORTED_STORAGE_EBS: &str = "EBS";
 /// The Amazon S3 storage option. See [`SUPPORTED_STORAGE_EBS`].
 pub const SUPPORTED_STORAGE_S3: &str = "S3";
 
+/// The bytes one terabyte of published S3 on Outposts capacity holds.
+///
+/// AWS publishes the S3 on Outposts capacity options of a rack in decimal
+/// terabytes, so that is the unit [`CatalogConfiguration::s3_capacity_bytes`]
+/// converts from.
+const PUBLISHED_TERABYTE: i64 = 1_000_000_000_000;
+
 /// The `RackScalingType` of a configuration that scales as one rack, from the
 /// modelled value set [`crate::ops::types::RACK_SCALING_TYPE_VALUES`]
 /// (`SINGLE_RACK` | `MULTI_RACK`), which `CatalogItem$RackScalingType` documents as
@@ -1669,6 +1676,18 @@ struct CatalogConfiguration {
     supported_uplink_gbps: &'static [i32],
     /// `SupportedStorage`: the storage options it supports.
     supported_storage: &'static [&'static str],
+    /// How much Amazon S3 storage capacity, in bytes, this configuration carries —
+    /// zero for one that supports no S3 storage, which therefore has no S3 capacity
+    /// to provision on an Outpost ordered from it.
+    ///
+    /// Held beside `supported_storage` because that member says WHICH storage
+    /// options the hardware supports and never how much of each: the figure is the
+    /// one an S3 on Outposts bucket's capacity is drawn from, which no member of this
+    /// API reports. The values are AWS's published S3 on Outposts capacity options
+    /// (26, 48, 96, 240 and 380 TB), one per S3-capable configuration in order of the
+    /// EC2 capacity it carries — this emulator's own catalog assignment, exactly as
+    /// which configurations are offered at all is.
+    s3_capacity_bytes: i64,
     /// `RackScalingType`, or `None` for a configuration rack scaling does not apply
     /// to — a single server is not a rack, so it scales as neither one rack nor
     /// several, and the member is omitted rather than given a value the hardware has
@@ -1725,6 +1744,7 @@ const CATALOG_ITEMS: &[CatalogConfiguration] = &[
         weight_lbs: 1400,
         supported_uplink_gbps: &[1, 10, 40, 100],
         supported_storage: &[SUPPORTED_STORAGE_EBS, SUPPORTED_STORAGE_S3],
+        s3_capacity_bytes: 26 * PUBLISHED_TERABYTE,
         rack_scaling_type: Some(RACK_SCALING_TYPE_SINGLE_RACK),
         capacity_vcpus: 480,
     },
@@ -1736,6 +1756,7 @@ const CATALOG_ITEMS: &[CatalogConfiguration] = &[
         weight_lbs: 1600,
         supported_uplink_gbps: &[10, 40, 100],
         supported_storage: &[SUPPORTED_STORAGE_EBS, SUPPORTED_STORAGE_S3],
+        s3_capacity_bytes: 48 * PUBLISHED_TERABYTE,
         rack_scaling_type: Some(RACK_SCALING_TYPE_SINGLE_RACK),
         capacity_vcpus: 960,
     },
@@ -1747,6 +1768,7 @@ const CATALOG_ITEMS: &[CatalogConfiguration] = &[
         weight_lbs: 1800,
         supported_uplink_gbps: &[10, 40, 100],
         supported_storage: &[SUPPORTED_STORAGE_EBS, SUPPORTED_STORAGE_S3],
+        s3_capacity_bytes: 240 * PUBLISHED_TERABYTE,
         rack_scaling_type: Some(RACK_SCALING_TYPE_MULTI_RACK),
         capacity_vcpus: 1440,
     },
@@ -1758,6 +1780,7 @@ const CATALOG_ITEMS: &[CatalogConfiguration] = &[
         weight_lbs: 1400,
         supported_uplink_gbps: &[1, 10],
         supported_storage: &[SUPPORTED_STORAGE_EBS],
+        s3_capacity_bytes: 0,
         rack_scaling_type: Some(RACK_SCALING_TYPE_SINGLE_RACK),
         capacity_vcpus: 240,
     },
@@ -1769,6 +1792,7 @@ const CATALOG_ITEMS: &[CatalogConfiguration] = &[
         weight_lbs: 1800,
         supported_uplink_gbps: &[10, 40, 100],
         supported_storage: &[SUPPORTED_STORAGE_EBS, SUPPORTED_STORAGE_S3],
+        s3_capacity_bytes: 96 * PUBLISHED_TERABYTE,
         rack_scaling_type: Some(RACK_SCALING_TYPE_SINGLE_RACK),
         capacity_vcpus: 1280,
     },
@@ -1780,6 +1804,7 @@ const CATALOG_ITEMS: &[CatalogConfiguration] = &[
         weight_lbs: 2000,
         supported_uplink_gbps: &[40, 100],
         supported_storage: &[SUPPORTED_STORAGE_EBS, SUPPORTED_STORAGE_S3],
+        s3_capacity_bytes: 380 * PUBLISHED_TERABYTE,
         rack_scaling_type: Some(RACK_SCALING_TYPE_MULTI_RACK),
         capacity_vcpus: 2560,
     },
@@ -1791,6 +1816,7 @@ const CATALOG_ITEMS: &[CatalogConfiguration] = &[
         weight_lbs: 50,
         supported_uplink_gbps: &[1, 10],
         supported_storage: &[SUPPORTED_STORAGE_EBS],
+        s3_capacity_bytes: 0,
         rack_scaling_type: None,
         capacity_vcpus: 64,
     },
@@ -1802,6 +1828,7 @@ const CATALOG_ITEMS: &[CatalogConfiguration] = &[
         weight_lbs: 70,
         supported_uplink_gbps: &[1, 10],
         supported_storage: &[SUPPORTED_STORAGE_EBS],
+        s3_capacity_bytes: 0,
         rack_scaling_type: None,
         capacity_vcpus: 128,
     },
@@ -1833,6 +1860,14 @@ pub struct CatalogItemRecord {
     /// which is what a subscription on it is priced by (see
     /// [`ComAmazonawsOutpostsOutpostsolafserviceState::renewal_pricing`]).
     pub capacity_vcpus: i32,
+    /// How much Amazon S3 storage capacity, in bytes, this item's hardware carries.
+    ///
+    /// Held BESIDE the projection for the reason [`Self::capacity_vcpus`] is: the
+    /// modelled `CatalogItem` reports WHICH storage options an item supports and
+    /// never how much of each. It is the published S3 capacity of the hardware,
+    /// which is what an Outpost ordered from this item has provisioned on it (see
+    /// [`CatalogConfiguration::s3_capacity_bytes`]).
+    pub s3_capacity_bytes: i64,
     /// The entry as a read of the catalog reports it.
     pub item: CatalogItem,
 }
@@ -1947,13 +1982,25 @@ pub fn catalog_item_catalog() -> Vec<CatalogItemRecord> {
         "every catalog configuration names a modelled class, status, storage option and \
          scaling type"
     );
+    // A configuration carries S3 capacity exactly when it supports S3 storage: a
+    // figure on hardware that supports none would be capacity nothing can provision,
+    // and an S3-capable configuration with none would be hardware whose S3 storage
+    // holds nothing.
+    debug_assert!(
+        CATALOG_ITEMS.iter().all(|config| {
+            config.supported_storage.contains(&SUPPORTED_STORAGE_S3)
+                == (config.s3_capacity_bytes > 0)
+        }),
+        "a configuration carries S3 capacity exactly when it supports S3 storage"
+    );
     let instance_types = orderable_instance_type_catalog();
-    let mut items: Vec<(String, i32, CatalogItem)> = CATALOG_ITEMS
+    let mut items: Vec<(String, i32, i64, CatalogItem)> = CATALOG_ITEMS
         .iter()
         .map(|config| {
             (
                 config.item_class.to_string(),
                 config.capacity_vcpus,
+                config.s3_capacity_bytes,
                 CatalogItem {
                     catalog_item_id: Some(sku_code(&config.sku_seed())),
                     item_status: Some(config.item_status.to_string()),
@@ -1975,21 +2022,22 @@ pub fn catalog_item_catalog() -> Vec<CatalogItemRecord> {
             )
         })
         .collect();
-    items.sort_by(|(_, _, left), (_, _, right)| left.catalog_item_id.cmp(&right.catalog_item_id));
+    items.sort_by(|(.., left), (.., right)| left.catalog_item_id.cmp(&right.catalog_item_id));
     debug_assert!(
         items
             .windows(2)
-            .all(|pair| pair[0].2.catalog_item_id != pair[1].2.catalog_item_id),
+            .all(|pair| pair[0].3.catalog_item_id != pair[1].3.catalog_item_id),
         "no two catalog configurations are published under one SkuCode"
     );
     items
         .into_iter()
         .enumerate()
         .map(
-            |(index, (item_class, capacity_vcpus, item))| CatalogItemRecord {
+            |(index, (item_class, capacity_vcpus, s3_capacity_bytes, item))| CatalogItemRecord {
                 sequence: u64::try_from(index).unwrap_or_default() + 1,
                 item_class,
                 capacity_vcpus,
+                s3_capacity_bytes,
                 item,
             },
         )
@@ -2718,6 +2766,14 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             .map(|record| record.capacity_vcpus)
     }
 
+    /// How much Amazon S3 storage capacity, in bytes, this service publishes for the
+    /// catalog item `catalog_item_id` names, or `None` for a SKU it publishes no
+    /// configuration under. See [`Self::catalog_item_capacity_vcpus`].
+    pub fn catalog_item_s3_capacity_bytes(&self, catalog_item_id: &str) -> Option<i64> {
+        self.catalog_item(catalog_item_id)
+            .map(|record| record.s3_capacity_bytes)
+    }
+
     /// The number of DEFAULT vCPUs this service publishes for one instance type, or
     /// `None` for a type its catalog does not publish — a figure the emulator does
     /// not have, and never one it invents.
@@ -2873,6 +2929,60 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
                 Some(i64::from(capacity) * quantity)
             })
             .sum()
+    }
+
+    /// The Amazon S3 storage capacity, in bytes, PROVISIONED on each Outpost that has
+    /// any: for every order placed and not cancelled, the published S3 capacity of
+    /// each line item's catalog item times the quantity of it the order carries,
+    /// totalled per Outpost and keyed by region and then `OutpostId` — the pair that
+    /// names one Outpost, since an order is placed in the region its Outpost belongs
+    /// to.
+    ///
+    /// Storage capacity is installed on an Outpost by ordering hardware that carries
+    /// it, so what is provisioned is what the orders on it bought, and an Outpost
+    /// nobody ordered S3-capable hardware for is absent rather than present with
+    /// zero: it has no S3 storage on it at all. A line item naming a catalog item
+    /// this service publishes no configuration for contributes nothing, for the
+    /// reason it contributes no vCPUs to [`Self::subscribed_capacity_vcpus`]: the
+    /// capacity of hardware the catalog does not describe is not a figure the
+    /// emulator has, and never one it invents.
+    ///
+    /// Totalled in ONE pass over the orders, so a caller that needs the figure for
+    /// every Outpost at once — the S3 on Outposts inventory does — pays for the
+    /// orders the store holds and not for their product with the Outposts.
+    pub fn provisioned_s3_capacity(&self) -> BTreeMap<String, BTreeMap<String, i64>> {
+        let mut provisioned: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+        for record in self.orders.values() {
+            if record.order.status.as_deref() == Some(ORDER_STATUS_CANCELLED) {
+                continue;
+            }
+            let Some(outpost_id) = record.order.outpost_id.as_deref() else {
+                continue;
+            };
+            for item in record.order.line_items.iter().flatten() {
+                let capacity = item
+                    .catalog_item_id
+                    .as_deref()
+                    .and_then(|sku| self.catalog_item_s3_capacity_bytes(sku))
+                    .unwrap_or_default();
+                if capacity <= 0 {
+                    continue;
+                }
+                // `LineItem$Quantity` is modelled `range(min: 1)`, so a quantity the
+                // boundary accepted is at least one unit of that configuration — which
+                // is also what an absent member means. The floor is belt and braces
+                // against a value the boundary cannot deliver: a negative quantity
+                // would otherwise subtract capacity the order never cancelled.
+                let quantity = i64::from(item.quantity.unwrap_or(1).max(0));
+                let total = provisioned
+                    .entry(record.region.clone())
+                    .or_default()
+                    .entry(outpost_id.to_string())
+                    .or_default();
+                *total = total.saturating_add(capacity.saturating_mul(quantity));
+            }
+        }
+        provisioned
     }
 
     /// The verdict on the capacity configuration `pools` asks of the Outpost
