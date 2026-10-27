@@ -76,7 +76,7 @@ use crate::ops::types::{
     DistributionTenant, DistributionTenantSummary, DomainResult, EntityAlreadyExists,
     EntityNotFound, FieldLevelEncryption, FieldLevelEncryptionConfig,
     FieldLevelEncryptionProfile, FieldLevelEncryptionProfileConfig,
-    FieldLevelEncryptionProfileSummary,
+    FieldLevelEncryptionProfileSummary, FieldLevelEncryptionSummary,
     ForwardedValues,
     FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
     InvalidTagging, IpamCidrConfig, IpamConfig, KGKeyPairIds, KeyGroup, KeyGroupConfig,
@@ -3835,6 +3835,23 @@ impl StoredFieldLevelEncryptionConfig {
             field_level_encryption_config: self.config.clone(),
         }
     }
+
+    /// The `FieldLevelEncryptionSummary` a listing reports for this configuration.
+    ///
+    /// Every member is the stored record's: the summary repeats the stored configuration's
+    /// `Comment`, `QueryArgProfileConfig` and `ContentTypeProfileConfig` beside the identity
+    /// the create minted, and all three are optional on both, so a configuration stored
+    /// without one is summarised without one rather than with an element invented by the
+    /// read. `CallerReference` is not a summary member, so it is not reported here.
+    pub fn to_summary(&self) -> FieldLevelEncryptionSummary {
+        FieldLevelEncryptionSummary {
+            id: self.id.clone(),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            comment: self.config.comment.clone(),
+            query_arg_profile_config: self.config.query_arg_profile_config.clone(),
+            content_type_profile_config: self.config.content_type_profile_config.clone(),
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-cloudfront-cloudfront2020-05-31. A handler reaches it through [`service_state`].
@@ -6903,6 +6920,18 @@ pub fn is_public_key_id(value: &str) -> bool {
     is_prefixed_token(value, PUBLIC_KEY_ID_PREFIX)
 }
 
+/// Whether `value` has the shape of a field-level encryption CONFIGURATION id this service
+/// mints ([`FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX`] followed by [`ID_BODY_LEN`] characters
+/// of the id alphabet).
+///
+/// `ListFieldLevelEncryptionConfigs`'s `Marker` is a configuration id — "set the Marker to
+/// the value of the NextMarker from the current page's response (which is also the ID of the
+/// last configuration on that page)" — and the model constrains it no further than `string`,
+/// so this is what tells a resume point the service issued from a value a client made up.
+pub fn is_field_level_encryption_config_id(value: &str) -> bool {
+    is_prefixed_token(value, FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX)
+}
+
 /// Whether `value` has the shape of a field-level encryption profile id this service mints
 /// ([`FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX`] followed by [`ID_BODY_LEN`] characters of
 /// the id alphabet).
@@ -9516,6 +9545,25 @@ pub fn invalid_public_key_marker() -> crate::ops::types::InvalidArgument {
 
 /// The message `ListPublicKeys` refuses an unusable `Marker` with, on the wire.
 pub const INVALID_PUBLIC_KEY_MARKER_MESSAGE: &str = "Marker must be a valid CF public key Id";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a `ListFieldLevelEncryptionConfigs` `Marker`
+/// that is no resume point this service handed out.
+///
+/// ONE CONSTANT for the condition, for the same reason [`invalid_public_key_marker`] is one:
+/// what the refusal states is the CONSTRAINT on the parameter — a marker is a field-level
+/// encryption configuration id — which is a property of the parameter rather than of the
+/// value submitted, so nothing from the request belongs in the text.
+pub fn invalid_field_level_encryption_config_marker() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_FIELD_LEVEL_ENCRYPTION_CONFIG_MARKER_MESSAGE.to_string()),
+    }
+}
+
+/// The message `ListFieldLevelEncryptionConfigs` refuses an unusable `Marker` with: the
+/// constraint on the parameter, worded as [`INVALID_PUBLIC_KEY_MARKER_MESSAGE`] words the
+/// same constraint on the other listing's marker, naming this listing's own resource.
+pub const INVALID_FIELD_LEVEL_ENCRYPTION_CONFIG_MARKER_MESSAGE: &str =
+    "Marker must be a valid CF field-level encryption config Id";
 
 /// The modelled `InvalidArgument` (HTTP 400) for a `ListFieldLevelEncryptionProfiles`
 /// `Marker` that is no resume point this service handed out.
