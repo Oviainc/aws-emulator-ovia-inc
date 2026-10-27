@@ -10,9 +10,13 @@
 //! exercises the restJson1 wire protocol, the modelled constraints and the handler
 //! together.
 
+use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde_json::Value;
+use service_com_amazonaws_connect_amazonconnectservice::state as connect_state;
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::ONBOARDING_JOB_DURATION;
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -28,20 +32,98 @@ pub fn authorization(region: &str) -> String {
 
 /// The router with only this service mounted, over a fresh engine, so each case
 /// starts from an empty store.
-pub fn router() -> MultiServiceRouter {
-    router_with_engine().0
-}
-
-/// [`router`], plus the engine it was built over — for a case that reads the store
-/// the handlers wrote to.
-pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub fn router() -> Harness {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signature verification is the core's concern, not this service's: these cases
     // assert handler behaviour, and the header above is a routing signal only.
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
-    (router, engine)
+    Harness { router, engine }
+}
+
+/// [`router`], plus the engine it was built over — for a case that reads the store
+/// the handlers wrote to.
+pub fn router_with_engine() -> (Harness, Arc<engine::InMemoryEngine>) {
+    let harness = router();
+    let engine = Arc::clone(&harness.engine);
+    (harness, engine)
+}
+
+/// The router under test together with the engine it was built over.
+///
+/// It DEREFS to the router, so a case drives its requests through it exactly as it
+/// drives them through a bare router; keeping the engine beside it is what lets a case
+/// reach a store in that engine which this service does not own — the Amazon Connect
+/// instance registry every onboarding call is resolved against (see
+/// [`Harness::register_connect_instance`]).
+pub struct Harness {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl Deref for Harness {
+    type Target = MultiServiceRouter;
+
+    fn deref(&self) -> &Self::Target {
+        &self.router
+    }
+}
+
+impl Harness {
+    /// [`register_connect_instance`] against the engine this harness was built over.
+    pub fn register_connect_instance(&self, region: &str, instance: &str) {
+        register_connect_instance(&self.engine, region, instance);
+    }
+}
+
+/// Give the account a Connect instance with id `instance` in `region`, in Amazon
+/// Connect's own instance registry inside `engine` — the registry
+/// `StartInstanceOnboardingJob` resolves a `connectInstanceId` against, so this is the
+/// fixture step that makes `instance` an instance there is something to onboard.
+///
+/// The record is written into Connect's store rather than created over
+/// `CreateInstance`, because that call mints the id it stores and these cases name
+/// their own instances; it is the record that call writes, already past the
+/// clock-owed activation instant so the instance is ACTIVE. Registering an id the
+/// registry already holds leaves the stored record alone, so the step is cheap to
+/// repeat.
+pub fn register_connect_instance(
+    engine: &engine::InMemoryEngine,
+    region: &str,
+    instance: &str,
+) {
+    let state = connect_state::service_state(engine)
+        .expect("the shared in-memory engine carries Amazon Connect's store");
+    let mut store = state.lock();
+    if store.instances.contains_key(instance) {
+        return;
+    }
+    let now = SystemTime::now();
+    store.instances.insert(
+        instance.to_string(),
+        connect_state::InstanceRecord {
+            id: instance.to_string(),
+            arn: connect_state::instance_arn(region, instance),
+            region: region.to_string(),
+            // `DirectoryType`'s catalog (DIRECTORY_TYPE_VALUES in the Connect crate's
+            // `ops::types`) opens with the type an instance Connect manages itself
+            // carries.
+            identity_management_type: "CONNECT_MANAGED".to_string(),
+            instance_alias: Some(instance.to_string()),
+            directory_id: None,
+            inbound_calls_enabled: true,
+            outbound_calls_enabled: true,
+            service_role: connect_state::instance_service_role(instance),
+            instance_access_url: connect_state::instance_access_url(Some(instance), instance),
+            created_time: now,
+            active_at: now,
+            tags: BTreeMap::new(),
+            queues: BTreeMap::new(),
+            contact_flows: BTreeMap::new(),
+            hours_of_operations: BTreeMap::new(),
+        },
+    );
 }
 
 /// Drive one request and return its status and parsed JSON body (`Value::Null` for
@@ -87,11 +169,12 @@ pub fn error_code(response: &Value) -> &str {
 /// Onboard `instance` so it is a campaign target by the time this returns:
 /// `CreateCampaign` mints a campaign only for an instance whose onboarding job has
 /// SUCCEEDED, which it does one `ONBOARDING_JOB_DURATION` after
-/// `StartInstanceOnboardingJob`.
+/// `StartInstanceOnboardingJob` — which in turn onboards only an instance the
+/// account's Connect registry holds, so the instance is registered there first.
 ///
 /// Idempotent and cheap to repeat: an instance whose job has already succeeded is
 /// left alone, so the wait is paid once per instance rather than once per campaign.
-pub async fn onboard_instance(router: &MultiServiceRouter, region: &str, instance: &str) {
+pub async fn onboard_instance(router: &Harness, region: &str, instance: &str) {
     let (status, body) = call(
         router,
         region,
@@ -108,6 +191,7 @@ pub async fn onboard_instance(router: &MultiServiceRouter, region: &str, instanc
     {
         return;
     }
+    router.register_connect_instance(region, instance);
     let (status, started) = call(
         router,
         region,
@@ -127,7 +211,7 @@ pub async fn onboard_instance(router: &MultiServiceRouter, region: &str, instanc
 /// `schedule` attached when given — the run window is how a case reaches a state the
 /// CLOCK owns. Returns the minted campaign id.
 pub async fn create_campaign(
-    router: &MultiServiceRouter,
+    router: &Harness,
     region: &str,
     instance: &str,
     name: &str,

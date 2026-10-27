@@ -30,15 +30,18 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // One harness per crate: the routing header, the router under test and the
 // request/response plumbing live in `tests/all/common.rs`.
-use super::common::{call, error_code, router};
+use super::common::{call, error_code, router, Harness};
 
-/// `StartInstanceOnboardingJob` for `instance`, returning its status and body.
+/// `StartInstanceOnboardingJob` for `instance`, returning its status and body — on an
+/// instance registered in the account's Connect registry first, since onboarding
+/// resolves the `connectInstanceId` against it.
 async fn start_onboarding(
-    router: &MultiServiceRouter,
+    router: &Harness,
     region: &str,
     instance: &str,
     encryption_config: &Value,
 ) -> (u16, Value) {
+    router.register_connect_instance(region, instance);
     call(
         router,
         region,
@@ -52,7 +55,7 @@ async fn start_onboarding(
 /// Onboard `instance` and wait out the span the clock owes the job, so the instance is
 /// a campaign target by the time this returns. Nothing in the emulator sleeps for that
 /// span — only a caller that wants the settled state does.
-async fn onboard(router: &MultiServiceRouter, region: &str, instance: &str) {
+async fn onboard(router: &Harness, region: &str, instance: &str) {
     let (status, body) = start_onboarding(router, region, instance, &json!({"enabled": false})).await;
     assert_eq!(
         status, 200,

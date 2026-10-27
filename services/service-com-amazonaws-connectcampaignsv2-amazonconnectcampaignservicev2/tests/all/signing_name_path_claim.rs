@@ -26,6 +26,8 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::{
 };
 use smithy_server_runtime::{MultiServiceRouter, Service};
 
+use super::common::register_connect_instance;
+
 /// A SigV4 `Authorization` header whose credential scope names `service`. The scope's
 /// 4th field is the primary signal the router resolves a routing key from.
 fn authorization(service: &str) -> String {
@@ -324,7 +326,7 @@ async fn a_peer_route_never_reaches_this_service_while_its_own_route_is_served()
     let mut router = MultiServiceRouter::new();
     // Signature verification is the core's concern; the header is a routing signal here.
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
 
     let create_body = serde_json::json!({
         "name": "campaign-1",
@@ -340,6 +342,9 @@ async fn a_peer_route_never_reaches_this_service_while_its_own_route_is_served()
     // A campaign belongs to a Connect instance onboarded to Campaigns, so the
     // instance is onboarded first and the span the clock owes its job waited out;
     // onboarding stores no campaign, which the ListCampaigns assertions below rely on.
+    // Onboarding resolves the instance id against the account's Connect registry, so
+    // the instance is registered there first.
+    register_connect_instance(&engine, "us-east-1", "instance-1");
     let (status, payload) = call(
         &router,
         "PUT",
