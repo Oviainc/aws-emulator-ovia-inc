@@ -235,10 +235,19 @@ impl ActionTarget {
             self.extension_name, failure.detail
         );
         if let Some(request_id) = &failure.request_id {
-            message.push_str(&format!(", Lambda Request ID: {request_id}"));
+            message.push_str(&lambda_request_id_clause(request_id));
         }
         message
     }
+}
+
+/// The clause a relayed Lambda failure carries the invocation's request id in.
+///
+/// `pub(crate)` because every refusal this service relays from a function carries it the
+/// same way: a failed extension action above, and a configuration profile's `LAMBDA`
+/// validator in [`super::validators`].
+pub(crate) fn lambda_request_id_clause(request_id: &str) -> String {
+    format!(", Lambda Request ID: {request_id}")
 }
 
 /// The actions bound at `action_point` by the extensions associated to `scope`, in
@@ -526,7 +535,7 @@ pub async fn invoke(
         .unwrap_or(request_region);
     let body = event.to_string();
     match kind {
-        TargetKind::Function => invoke_function(ctx, target, region, body).await,
+        TargetKind::Function => invoke_function(ctx, &target.uri, region, body).await,
         TargetKind::Queue => {
             let Some(queue_url) = queue_url(&target.uri) else {
                 return Err(Failure {
@@ -574,15 +583,19 @@ pub async fn invoke(
 
 /// A Lambda function target: the one kind that can ANSWER, so it is invoked
 /// synchronously ("RequestResponse") and its payload is read back.
-async fn invoke_function(
+///
+/// `pub(crate)` because an action point is not the only place this service hands a
+/// document to a function and reads the verdict back: a configuration profile's `LAMBDA`
+/// validator does too ([`super::validators`]), and both go through this one invocation.
+pub(crate) async fn invoke_function(
     ctx: &smithy_server_runtime::OperationContext<'_>,
-    target: &ActionTarget,
+    function_name: &str,
     region: &str,
     body: String,
 ) -> Answer {
     let answer = lambda_client(ctx, region)
         .invoke()
-        .function_name(&target.uri)
+        .function_name(function_name)
         .invocation_type(::aws_sdk_lambda::types::InvocationType::RequestResponse)
         .payload(::aws_sdk_lambda::primitives::Blob::new(body.into_bytes()))
         .send()
@@ -653,8 +666,10 @@ enum TargetKind {
     EventBus,
 }
 
-/// The ARN namespace of AWS Lambda, whose functions an action invokes.
-const LAMBDA_ARN_NAMESPACE: &str = "lambda";
+/// The ARN namespace of AWS Lambda, whose functions an action invokes — and whose
+/// functions a configuration profile's `LAMBDA` validator names, which is why this is
+/// `pub(crate)`.
+pub(crate) const LAMBDA_ARN_NAMESPACE: &str = "lambda";
 /// The ARN namespace of Amazon SQS, whose queues an action sends to.
 const SQS_ARN_NAMESPACE: &str = "sqs";
 /// The ARN namespace of Amazon SNS, whose topics an action publishes to.

@@ -518,6 +518,7 @@ async fn issuing_tokens_sweeps_the_records_the_clock_expired() {
             username: "alice".to_string(),
             sub: alice_sub.clone(),
             kind: state::TokenKind::Access,
+            scopes: vec![state::USER_ADMIN_SCOPE.to_string()],
             issued_at: now - Duration::from_secs(7200),
             expires_at,
             revoked: false,

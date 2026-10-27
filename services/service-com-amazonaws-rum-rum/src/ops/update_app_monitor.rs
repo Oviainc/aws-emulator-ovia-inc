@@ -181,6 +181,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The modelled `@pattern` of `AppMonitorDomain`, which `Domain` targets directly
+        // and `DomainList`'s member targets too: written with look-around, so the boundary
+        // validator admits any value for it and this call is where it is applied — before
+        // the stored record is touched, so a refused update changes nothing
+        // (`crate::state::validation`). `Name` is not judged here: it is bound to the URI
+        // to resolve an EXISTING monitor, so a name outside the pattern names none and is
+        // answered with the modelled not-found.
+        if let Some(message) = crate::state::validation::app_monitor_refusal(
+            None,
+            input.domain.as_deref(),
+            input.domain_list.as_deref(),
+        ) {
+            return Err(
+                UpdateAppMonitorErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
         // The same prose-only rules `CreateAppMonitor` enforces: a monitor's domain
         // authority is held in exactly one of Domain/DomainList (this call may name
         // neither and leave the stored choice alone), and a configuration cannot carry
