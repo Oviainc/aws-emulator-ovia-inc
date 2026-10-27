@@ -201,6 +201,11 @@ async fn list_configurations(router: &MultiServiceRouter, body: &Value) -> (u16,
 /// against.
 const BASELINE_TYPE: &str = "AWSQuickSetupType-SSMHostMgmt";
 
+/// The organizational unit every definition below deploys to. A parameter set that
+/// names neither the accounts nor the organizational units to deploy to is refused, and
+/// no case here is about that rule, so every accepted parameter set names this one.
+const TARGET_OU: &str = "ou-1";
+
 /// The newest configuration version the catalog publishes for `type_` — what the
 /// modelled `LATEST` alias resolves to.
 fn latest_version_of(type_: &str) -> &'static str {
@@ -212,16 +217,21 @@ fn latest_version_of(type_: &str) -> &'static str {
 }
 
 /// The two definitions every case below starts from: both carry a `TypeVersion` the
-/// catalog publishes for their type and a parameter set, the first also both
-/// local-deployment role members, so an update that omits a member is observably
-/// leaving a STORED value alone rather than leaving an absent one absent.
+/// catalog publishes for their type and a parameter set naming somewhere to deploy to
+/// (which every accepted definition must), the first also both local-deployment role
+/// members, so an update that omits a member is observably leaving a STORED value alone
+/// rather than leaving an absent one absent.
 fn baseline() -> Value {
     json!({
         "Name": "definition-updates",
         "ConfigurationDefinitions": [
             {
                 "Type": BASELINE_TYPE,
-                "Parameters": { "TargetType": "*", "UpdateSSMAgent": "true" },
+                "Parameters": {
+                    "TargetOrganizationalUnits": TARGET_OU,
+                    "TargetType": "*",
+                    "UpdateSSMAgent": "true",
+                },
                 "TypeVersion": "1.0",
                 "LocalDeploymentExecutionRoleName": "QuickSetupExecution",
                 "LocalDeploymentAdministrationRoleArn":
@@ -229,7 +239,10 @@ fn baseline() -> Value {
             },
             {
                 "Type": "AWSQuickSetupType-Scheduler",
-                "Parameters": { "TargetTagKey": "Env" },
+                "Parameters": {
+                    "TargetOrganizationalUnits": TARGET_OU,
+                    "TargetTagKey": "Env",
+                },
                 "TypeVersion": "2.0",
             },
         ],
@@ -315,14 +328,19 @@ fn epoch_seconds(case: &str, value: &Value, member: &str) -> f64 {
     }
 }
 
-/// A parameter map of `count` entries, each key inside the modelled
+/// A parameter map of `count` entries, ONE of them the deployment target every accepted
+/// definition must name and the rest keys inside the modelled
 /// `ConfigurationParametersMap` key pattern `^[A-Za-z0-9+=@_\/\s-]+$`.
 fn parameters(count: usize) -> Value {
-    Value::Object(
-        (0..count)
-            .map(|index| (format!("Key{index}"), json!(index.to_string())))
-            .collect(),
-    )
+    assert!(
+        count >= 1,
+        "a parameter set names somewhere to deploy to, so it holds at least one entry"
+    );
+    let mut map: Map<String, Value> = (0..count - 1)
+        .map(|index| (format!("Key{index}"), json!(index.to_string())))
+        .collect();
+    map.insert("TargetOrganizationalUnits".to_string(), json!(TARGET_OU));
+    Value::Object(map)
 }
 
 /// An update replaces exactly the members it carries, in exactly the definition it
@@ -362,13 +380,19 @@ async fn an_update_replaces_only_the_members_it_carries_in_the_definition_it_nam
         ),
         (
             "parameters are replaced, not merged into",
-            json!({ "Parameters": { "TargetType": "instance" } }),
-            json!({ "Parameters": { "TargetType": "instance" } }),
+            json!({ "Parameters": {
+                "TargetOrganizationalUnits": TARGET_OU,
+                "TargetType": "instance",
+            } }),
+            json!({ "Parameters": {
+                "TargetOrganizationalUnits": TARGET_OU,
+                "TargetType": "instance",
+            } }),
         ),
         (
-            "an empty parameter set clears the stored one",
-            json!({ "Parameters": parameters(0) }),
-            json!({ "Parameters": parameters(0) }),
+            "a parameter set holding nothing but the deployment target",
+            json!({ "Parameters": parameters(1) }),
+            json!({ "Parameters": parameters(1) }),
         ),
         (
             "a parameter set larger than the stored one",
@@ -407,14 +431,22 @@ async fn an_update_replaces_only_the_members_it_carries_in_the_definition_it_nam
             "every member at once",
             json!({
                 "TypeVersion": "LATEST",
-                "Parameters": { "TargetType": "tag-key", "TargetTagKey": "Env" },
+                "Parameters": {
+                    "TargetOrganizationalUnits": TARGET_OU,
+                    "TargetType": "tag-key",
+                    "TargetTagKey": "Env",
+                },
                 "LocalDeploymentExecutionRoleName": "AllAtOnceExecution",
                 "LocalDeploymentAdministrationRoleArn":
                     "arn:aws:iam::000000000000:role/AllAtOnceAdministration",
             }),
             json!({
                 "TypeVersion": latest,
-                "Parameters": { "TargetType": "tag-key", "TargetTagKey": "Env" },
+                "Parameters": {
+                    "TargetOrganizationalUnits": TARGET_OU,
+                    "TargetType": "tag-key",
+                    "TargetTagKey": "Env",
+                },
                 "LocalDeploymentExecutionRoleName": "AllAtOnceExecution",
                 "LocalDeploymentAdministrationRoleArn":
                     "arn:aws:iam::000000000000:role/AllAtOnceAdministration",
@@ -509,7 +541,10 @@ async fn the_deployed_configuration_reports_what_the_update_wrote() {
         &target,
         &json!({
             "TypeVersion": "1.1",
-            "Parameters": { "TargetType": "instance" },
+            "Parameters": {
+                "TargetOrganizationalUnits": TARGET_OU,
+                "TargetType": "instance",
+            },
         }),
     )
     .await;
@@ -531,7 +566,10 @@ async fn the_deployed_configuration_reports_what_the_update_wrote() {
     );
     assert_eq!(
         target_after.get("FirstClassParameters"),
-        Some(&json!({ "TargetType": "instance" })),
+        Some(&json!({
+            "TargetOrganizationalUnits": TARGET_OU,
+            "TargetType": "instance",
+        })),
         "case {case}: the deployed configuration must carry the updated parameters, got {target_after:?}"
     );
     assert_eq!(
@@ -601,7 +639,13 @@ async fn a_pair_that_names_no_stored_definition_is_a_404() {
         &json!({
             "Name": "other",
             "ConfigurationDefinitions": [
-                { "Type": "AWSQuickSetupType-DHMC", "Parameters": { "TargetType": "*" } },
+                {
+                    "Type": "AWSQuickSetupType-DHMC",
+                    "Parameters": {
+                        "TargetOrganizationalUnits": TARGET_OU,
+                        "TargetType": "*",
+                    },
+                },
             ],
         }),
     )
@@ -665,6 +709,24 @@ async fn an_update_the_service_cannot_accept_is_refused_and_writes_nothing() {
             "one parameter past the bound a definition may hold",
             target.clone(),
             json!({ "Parameters": parameters(MAX_PARAMETERS + 1) }),
+        ),
+        (
+            // A definition is deployed where its parameters say, so a parameter set
+            // naming neither the accounts nor the organizational units to deploy to
+            // names nowhere — including when the update would be STRIPPING the target
+            // the stored definition has.
+            "a parameter set naming no deployment target",
+            target.clone(),
+            json!({ "Parameters": { "UpdateSSMAgent": "true" } }),
+        ),
+        (
+            "a parameter set whose only target keys are written empty",
+            target.clone(),
+            json!({ "Parameters": {
+                "TargetAccounts": "",
+                "TargetOrganizationalUnits": " ",
+                "TargetRegions": "us-east-1",
+            } }),
         ),
         (
             // `IAMRoleArn` carries `@arnReference(AWS::IAM::Role)` and no pattern, so
@@ -789,7 +851,10 @@ async fn an_update_redeploys_the_definition_and_the_deployment_settles() {
         case,
         &manager_arn,
         &target,
-        &json!({ "Parameters": { "TargetType": "instance" } }),
+        &json!({ "Parameters": {
+            "TargetOrganizationalUnits": TARGET_OU,
+            "TargetType": "instance",
+        } }),
     )
     .await;
 

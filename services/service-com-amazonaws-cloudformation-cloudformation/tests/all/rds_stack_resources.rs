@@ -23,12 +23,12 @@
 //! the Amazon RDS calls as a client's SDK makes them — so what is asserted is what a client
 //! that deploys a database by template and then calls `DescribeDBInstances` observes.
 
-use service_com_amazonaws_cloudformation_cloudformation::state::status;
+use service_com_amazonaws_cloudformation_cloudformation::state::{resource_status, status};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    call, create_stack, describe_stack, member, rds, router, wait_for_the_transition, xml_text,
-    xml_texts,
+    call, create_stack, describe_stack, member, rds, resource_event_reason, router,
+    wait_for_the_transition, xml_text, xml_texts,
 };
 
 /// The `PhysicalResourceId` the stack reports for the resource `logical_id`.
@@ -891,7 +891,15 @@ async fn a_property_this_emulator_does_not_provision_is_refused_rather_than_drop
         "a property no create of this emulator sends must roll the stack back to \
          ROLLBACK_COMPLETE, got {described}"
     );
-    let reason = xml_text(&described, "StackStatusReason").unwrap_or_default();
+    // WHICH property could not be provisioned is the resource's own diagnosis, reported
+    // on that resource's event.
+    let reason = resource_event_reason(
+        &router,
+        "rds-unsupported",
+        "Replica",
+        resource_status::CREATE_FAILED,
+    )
+    .await;
     assert!(
         reason.contains("SourceDBInstanceIdentifier"),
         "the reason must name the property that could not be provisioned, got {reason:?}"

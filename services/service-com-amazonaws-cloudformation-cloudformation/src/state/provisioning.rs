@@ -413,6 +413,10 @@ pub struct Materialised {
     /// The reason the stack cannot reach its completed status: an owning service refused
     /// to create one of the resources, or to delete one the deployment replaced. `None`
     /// when every resource this emulator provisions was created.
+    ///
+    /// This is the STACK-level reason ([`super::resource_failure_summary`]): the summary
+    /// of which logical resources failed, and nothing about why. Why each one failed is
+    /// carried on that resource's own transition ([`ResourceTransition::reason`]).
     pub failure: Option<String>,
     /// Every resource transition this deployment made, oldest first — the stack's
     /// per-resource event records.
@@ -500,12 +504,14 @@ pub async fn reconcile(
                     .iter()
                     .any(|existing| existing.materialised && is_same_resource(existing, &resource));
                 // CloudFormation itself failed the resource here — no owning service was
-                // asked anything — so the reason is this service's own words rather than
-                // a provider refusal ([`handler_failure_reason`]).
+                // asked anything — so the reason the RESOURCE's event carries is this
+                // service's own words rather than a provider refusal
+                // ([`handler_failure_reason`]), while the stack's own reason stays the
+                // summary of what failed ([`super::resource_failure_summary`]).
                 if updating {
-                    outcome.failure = Some(format!(
-                        "The following resource(s) failed to update: [{}]. {reason}",
-                        resource.logical_id
+                    outcome.failure = Some(super::resource_failure_summary(
+                        super::failed_action::UPDATE,
+                        [resource.logical_id.as_str()],
                     ));
                     outcome.transitions.push(ResourceTransition::starting(
                         &resource,
@@ -517,9 +523,9 @@ pub async fn reconcile(
                         Some(reason),
                     ));
                 } else {
-                    outcome.failure = Some(format!(
-                        "The following resource(s) failed to create: [{}]. {reason}",
-                        resource.logical_id
+                    outcome.failure = Some(super::resource_failure_summary(
+                        super::failed_action::CREATE,
+                        [resource.logical_id.as_str()],
                     ));
                     outcome
                         .transitions
@@ -587,9 +593,9 @@ pub async fn reconcile(
                              an existing {} in place; the resource was left as it is.",
                             resource.resource_type
                         );
-                        outcome.failure = Some(format!(
-                            "The following resource(s) failed to update: [{}]. {unsupported}",
-                            resource.logical_id
+                        outcome.failure = Some(super::resource_failure_summary(
+                            super::failed_action::UPDATE,
+                            [resource.logical_id.as_str()],
                         ));
                         outcome.transitions.push(ResourceTransition::finished(
                             &resource,
@@ -603,9 +609,9 @@ pub async fn reconcile(
                         // The owning service refused the change: nothing changed there, so
                         // the deployment reports that refusal rather than a configuration
                         // nothing applied.
-                        outcome.failure = Some(format!(
-                            "The following resource(s) failed to update: [{}]. {refusal}",
-                            resource.logical_id
+                        outcome.failure = Some(super::resource_failure_summary(
+                            super::failed_action::UPDATE,
+                            [resource.logical_id.as_str()],
                         ));
                         outcome.transitions.push(ResourceTransition::finished(
                             &resource,
@@ -656,9 +662,9 @@ pub async fn reconcile(
                             super::resource_status::UPDATE_IN_PROGRESS,
                         ));
                     }
-                    outcome.failure = Some(format!(
-                        "The following resource(s) failed to update: [{}]. {refusal}",
-                        resource.logical_id
+                    outcome.failure = Some(super::resource_failure_summary(
+                        super::failed_action::UPDATE,
+                        [resource.logical_id.as_str()],
                     ));
                     outcome.transitions.push(ResourceTransition::finished(
                         &resource,
@@ -747,9 +753,9 @@ pub async fn reconcile(
                 ));
             }
             Err(refusal) => {
-                outcome.failure = Some(format!(
-                    "The following resource(s) failed to create: [{}]. {refusal}",
-                    resource.logical_id
+                outcome.failure = Some(super::resource_failure_summary(
+                    super::failed_action::CREATE,
+                    [resource.logical_id.as_str()],
                 ));
                 outcome.transitions.push(ResourceTransition::failed(
                     &resource,
@@ -961,7 +967,9 @@ pub struct Deleted {
     /// ask for it again.
     pub resources: Vec<StoredResource>,
     /// The reason the stack's deletion cannot be reported as complete: an owning service
-    /// refused to delete one of the resources.
+    /// refused to delete one of the resources — the stack-level summary of which ones
+    /// ([`super::resource_failure_summary`]), with that service's own refusal carried on
+    /// the resource's transition.
     pub failure: Option<String>,
     /// Every resource transition this deletion made, oldest first — the stack's
     /// per-resource event records, exactly as [`Materialised::transitions`] carries a
@@ -1041,9 +1049,9 @@ async fn delete_pass(
                 ));
             }
             Err(refusal) => {
-                outcome.failure = Some(format!(
-                    "The following resource(s) failed to delete: [{}]. {refusal}",
-                    outcome.resources[index].logical_id
+                outcome.failure = Some(super::resource_failure_summary(
+                    super::failed_action::DELETE,
+                    [outcome.resources[index].logical_id.as_str()],
                 ));
                 let reason = handler_failure_reason(&refusal);
                 let resource = &outcome.resources[index];
