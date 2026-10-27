@@ -1039,3 +1039,170 @@ async fn a_profile_takes_five_linked_identities() {
         "case \"the sixth link after one was freed\": expected success, got {status} with {payload}"
     );
 }
+
+/// One row of the destination-identifier table: the `DestinationUser` members
+/// to send — every row naming the SAME stored profile — and the source identity
+/// linked through them.
+struct DestinationCase {
+    case: &'static str,
+    /// The destination's `ProviderAttributeName`, which the request must be
+    /// read without. Its modelled range is length 0..131072
+    /// (`smithy_query(query="shape",shape="ProviderUserIdentifierType")`), and
+    /// the rows walk both of its bounds.
+    attribute_name: String,
+    /// Whether the destination names the profile by its generated `sub` rather
+    /// than by its username, the two values a stored profile resolves by.
+    by_sub: bool,
+    /// This row's external identity value, so every row links an identity of
+    /// its own and starts from a profile that holds no link.
+    source_value: &'static str,
+}
+
+/// The table. Rows differ along the destination's attribute NAME (the subject,
+/// the model's own example claim, a custom claim, and each bound of the
+/// modelled length range) and along the FORM of the value that names the
+/// profile (its username, its `sub`).
+fn destination_cases() -> Vec<DestinationCase> {
+    vec![
+        DestinationCase {
+            case: "the subject attribute, the profile named by its username",
+            attribute_name: SUBJECT_ATTRIBUTE.to_string(),
+            by_sub: false,
+            source_value: "jade+subject@example.com",
+        },
+        DestinationCase {
+            // "The name of the provider attribute to link to, such as
+            // `NameID`"
+            // (`smithy_query(query="shape",shape="ProviderUserIdentifierType")`).
+            case: "the claim the model names as an example",
+            attribute_name: "NameID".to_string(),
+            by_sub: false,
+            source_value: "jade+nameid@example.com",
+        },
+        DestinationCase {
+            case: "a custom claim, the profile named by its sub",
+            attribute_name: "custom:employee_number".to_string(),
+            by_sub: true,
+            source_value: "jade+custom@example.com",
+        },
+        DestinationCase {
+            case: "an empty attribute name, the modelled length minimum 0",
+            attribute_name: String::new(),
+            by_sub: false,
+            source_value: "jade+empty@example.com",
+        },
+        DestinationCase {
+            case: "an attribute name at the modelled length maximum 131072",
+            attribute_name: "n".repeat(131_072),
+            by_sub: true,
+            source_value: "jade+max@example.com",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_destination_is_read_as_the_value_that_names_the_profile() {
+    let router = router();
+    let user_pool_id = pool(&router, "destination-member-pool").await;
+    let sub = user(&router, &user_pool_id, "jade").await;
+    provider(&router, &user_pool_id, "CorpSAML", "SAML").await;
+
+    // "The `ProviderAttributeName` of the `DestinationUser` is ignored"
+    // (`smithy_query(query="doc",shape="AdminLinkProviderForUserRequest",member="DestinationUser")`),
+    // so whatever attribute name a destination carries, the profile it resolves
+    // to is the one its VALUE names, and the identity STORED on that profile is
+    // the source triple alone.
+    for case in destination_cases() {
+        let label = case.case;
+        let destination_value = if case.by_sub {
+            sub.clone()
+        } else {
+            "jade".to_string()
+        };
+        let destination_user = json!({
+            "ProviderName": NATIVE_PROVIDER,
+            "ProviderAttributeName": case.attribute_name,
+            "ProviderAttributeValue": destination_value,
+        });
+        let source = identity("CorpSAML", "email", case.source_value);
+
+        let (status, payload) = link(&router, &user_pool_id, &source, &destination_user).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: the link must succeed, got {status} with {payload}"
+        );
+
+        // The one profile holds the one link, keyed by the SOURCE identity: the
+        // destination's own members are no part of what was stored.
+        let pairs = linked_pairs(&router, &user_pool_id, "jade").await;
+        assert_eq!(
+            pairs,
+            vec![format!("CorpSAML/{}", case.source_value)],
+            "case {label:?}: the profile must render the source identity alone, got {pairs:?}"
+        );
+
+        // Presenting the source triple again removes exactly that link, so the
+        // next row starts from a profile holding none.
+        let (status, payload) = disable(&router, &user_pool_id, &source).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: the stored link must be removed, got {status} with {payload}"
+        );
+        let pairs = linked_pairs(&router, &user_pool_id, "jade").await;
+        assert!(
+            pairs.is_empty(),
+            "case {label:?}: the de-linked profile renders no identity, got {pairs:?}"
+        );
+    }
+
+    // A destination that names no provider identifies nothing, and the refusal
+    // names the member that is missing — the same rule the source identifier is
+    // read under.
+    let source = identity("CorpSAML", "email", "jade+noprovider@example.com");
+    let (status, payload) = link(
+        &router,
+        &user_pool_id,
+        &source,
+        &json!({ "ProviderAttributeName": SUBJECT_ATTRIBUTE, "ProviderAttributeValue": "jade" }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&payload)),
+        (400, "InvalidParameterException"),
+        "case \"a destination naming no provider\": expected a 400 InvalidParameterException, \
+         got {status} with {payload}"
+    );
+    assert_eq!(
+        error_message(&payload),
+        "Missing required parameter ProviderName",
+        "case \"a destination naming no provider\": the refusal must name ProviderName, \
+         got {payload}"
+    );
+
+    // One character past the modelled length maximum is outside the constraint,
+    // so the request is a 400 rather than a link.
+    let (status, payload) = link(
+        &router,
+        &user_pool_id,
+        &source,
+        &json!({
+            "ProviderName": NATIVE_PROVIDER,
+            "ProviderAttributeName": "n".repeat(131_073),
+            "ProviderAttributeValue": "jade",
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&payload)),
+        (400, "InvalidParameterException"),
+        "case \"an attribute name one past the modelled maximum\": expected a 400 \
+         InvalidParameterException, got {status} with {payload}"
+    );
+
+    // Neither refusal stored anything: the profile still holds no link.
+    let pairs = linked_pairs(&router, &user_pool_id, "jade").await;
+    assert!(
+        pairs.is_empty(),
+        "case \"a profile no refused link reached\": expected no identity, got {pairs:?}"
+    );
+}
