@@ -658,6 +658,8 @@ async fn an_update_applies_the_declared_change_to_the_stream_cloudwatch_holds() 
                 "IncludeFilters": [{"Namespace": "AWS/EC2"}],
                 "StatisticsConfigurations": [{
                     "IncludeMetrics": [{"Namespace": "AWS/EC2", "MetricName": "CPUUtilization"}],
+                    // A trimmed mean, which only the json format carries — a statistic the
+                    // stream does not already send, so it is one it can be asked to ADD.
                     "AdditionalStatistics": ["TM(10%:90%)"],
                 }],
             }),
