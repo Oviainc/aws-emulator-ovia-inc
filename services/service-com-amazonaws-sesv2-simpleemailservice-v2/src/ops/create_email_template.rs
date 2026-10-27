@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEmailTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEmailTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEmailTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records an email template under the name the request names, with the subject line,
+//! HTML part and text part it carried and the tags it declared. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +139,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEmailTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEmailTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEmailTemplate"))
+        // Request metadata is not needed: a template is keyed by its name within the
+        // one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the scaffold's
+            // 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateEmailTemplate without the shared emulator state",
+            ));
+        };
+
+        let name = input.template_name;
+        let content = input.template_content;
+
+        // A template is "composed of a subject line, an HTML part, and a text-only
+        // part" (`EmailTemplateContent`), and the subject is the one part a send
+        // cannot supply for itself: content carrying none is refused on the input
+        // rather than stored as a template no send could ever use. `Subject` carries
+        // no length bound in the model, so a subject sent as an empty string reaches
+        // here, and it is the same absence.
+        if content.subject.as_deref().unwrap_or_default().is_empty() {
+            return Err(bad_request("The subject must be specified."));
+        }
+
+        // SES documents a maximum size of 500 KB for an email template, and none of
+        // the content's parts carries a length bound in the model, so the size of what
+        // the request carries is checked here.
+        let size = crate::state::email_template_size(&content);
+        if size > crate::state::MAX_EMAIL_TEMPLATE_BYTES {
+            return Err(bad_request(format!(
+                "The template is {size} bytes, which is larger than the maximum \
+                 template size of {} bytes.",
+                crate::state::MAX_EMAIL_TEMPLATE_BYTES
+            )));
+        }
+
+        let tags: Vec<(String, String)> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        // "A resource can have as many as 50 tags" (the model's `Tag` documentation).
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(bad_request(format!(
+                "A resource may have no more than {} tags, but {} were provided.",
+                crate::state::MAX_TAGS_PER_RESOURCE,
+                tags.len()
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Creating is not replacing: a name the store already holds is the naming
+        // conflict this operation models, and replacing that template's content is
+        // what `UpdateEmailTemplate` is for. The stored template is left exactly as it
+        // was, so the refused create changes nothing a later read or render sees.
+        if store.email_templates.contains_key(&name) {
+            return Err(CreateEmailTemplateErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(crate::state::email_template_already_exists(&name)),
+                },
+            )
+            .into());
+        }
+
+        if store.email_templates.len() >= crate::state::MAX_EMAIL_TEMPLATES {
+            return Err(CreateEmailTemplateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} email templates.",
+                        crate::state::MAX_EMAIL_TEMPLATES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The content is stored exactly as it was sent — a template is rendered when a
+        // send or a render names it, never rewritten here.
+        let mut record = crate::state::EmailTemplateRecord::new(&name, content, now);
+        record.tags = tags;
+        store.email_templates.insert(name, record);
+
+        // `CreateEmailTemplateResponse` carries no members: the stored template is read
+        // back with `GetEmailTemplate`.
+        Ok(CreateEmailTemplateOutput {})
     }
+}
+
+/// Refuse the request with this operation's input error: "The input you provided is
+/// invalid."
+fn bad_request(message: impl Into<String>) -> CreateEmailTemplateError {
+    CreateEmailTemplateErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
