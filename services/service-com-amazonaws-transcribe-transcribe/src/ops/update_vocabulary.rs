@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateVocabulary
-//! Replaces a stored custom vocabulary's terms, which puts it back into `PENDING`
-//! (see [`UpdateVocabulary::handle`]).
+//! Replaces a stored custom vocabulary's terms once its build has finished, which puts
+//! it back into `PENDING` (see [`UpdateVocabulary::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -252,10 +252,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        let Some(record) = store
-            .vocabularies
-            .get_mut(&region, &input.vocabulary_name)
-        else {
+        // Reached through the family's single lookup, so the transition the clock
+        // already owed this record is materialised FIRST: a vocabulary whose build was
+        // due is updated rather than refused for a state it had already left.
+        let Some(record) = store.vocabulary_mut(&region, &input.vocabulary_name, now) else {
             // A resource this Region does not hold is a `BadRequestException` on this
             // service's wire, not the modelled `NotFoundException`: the shape's own
             // documentation covers "the entity you're trying to delete doesn't exist",
@@ -264,6 +264,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::KIND_VOCABULARY,
             )));
         };
+
+        // "Your custom vocabulary must be in a terminal state (READY or FAILED) before
+        // you can update it" (the operation's own doc): a build the service is still
+        // running is not overwritten, so the in-flight terms survive the call. The same
+        // refusal `DeleteVocabulary` answers for the same record in the same state —
+        // "Your request didn't pass one or more validation tests. This can occur when
+        // the entity you're trying to delete doesn't exist or if it's in a non-terminal
+        // state" (`BadRequestException`'s own documentation).
+        if !crate::state::is_terminal_vocabulary_state(&record.state) {
+            let refusal = crate::state::resource_not_updatable_message(
+                crate::state::KIND_VOCABULARY,
+                &record.name,
+                &record.state,
+            );
+            return Err(bad_request(&refusal));
+        }
 
         // "This operation overwrites all existing information with your new values; you
         // cannot append new terms onto an existing custom vocabulary." The rebuilt

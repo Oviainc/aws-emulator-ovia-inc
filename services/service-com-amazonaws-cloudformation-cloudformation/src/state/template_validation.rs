@@ -1,0 +1,1174 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! What a SUBMITTED template is held to BEFORE the operation it was submitted to acts on
+//! it: the template-validation rules CloudFormation applies synchronously, and the
+//! `ValidationError` each one answers.
+//!
+//! CloudFormation "validates the template" as part of accepting a stack operation, and a
+//! template whose own declarations cannot be resolved is one it never deploys: the call is
+//! refused with HTTP 400 and NOTHING is written, rather than accepted with a stack id and
+//! then deployed into a stack whose resources carry nulls. [`refusal`] is that whole pass,
+//! in ONE place, so every operation that SUBMITS a body — `CreateStack`, `UpdateStack`,
+//! `CreateChangeSet` — holds it to the same rules and words the refusal the same way.
+//!
+//! Every rule here is decided from the template DOCUMENT alone, which is what makes it a
+//! rule about the request rather than about the deployment:
+//!
+//! * a body the reader will not read at all is a template-FORM error
+//!   ([`super::template::not_well_formed`]);
+//! * the `AWS::LanguageExtensions` directives are functions only that transform defines, so
+//!   a template using one without declaring it is refused — and `Fn::ForEach` is refused in
+//!   a section the transform does not define it for;
+//! * an intrinsic function whose arguments are not the ones it takes is refused for its own
+//!   arity, as is a condition's boolean operator;
+//! * a `Ref` or an `Fn::GetAtt` naming something the template does not declare, and a
+//!   `Condition` naming a condition it does not declare, are unresolved DEPENDENCIES: the
+//!   section they appear in is named, because that is where the author has to look;
+//! * an `Fn::FindInMap` whose keys the `Mappings` section does not carry resolves to
+//!   nothing — unless the lookup names a `DefaultValue` to fall back to;
+//! * and a dependency CYCLE among the declared resources is refused, since no creation
+//!   order satisfies it.
+//!
+//! The semantic rules are applied to the template's PROCESSED stage — the document
+//! CloudFormation really deploys — so a resource a transform's expansion contributes is
+//! held to them, and a loop's own identifier is not read as an undeclared name. A template
+//! whose processed stage this service cannot compute is left to the stack's own failure
+//! ([`super::template::process`]), which is the one thing this pass has nothing to say
+//! about.
+//!
+//! The `Rules` section is NOT part of this pass: a rule's assertion is checked against the
+//! parameter values a deployment runs with, and a failing one fails that deployment rather
+//! than the request that submitted it — [`rules_failure`].
+
+use ::std::collections::{BTreeMap, BTreeSet};
+
+use ::serde_json::Value;
+
+use super::template::{self, Template};
+
+/// The pseudo parameters a template may read without declaring them: "CloudFormation
+/// provides pseudo parameters ... you don't declare them in your template".
+const PSEUDO_PARAMETERS: [&str; 8] = [
+    "AWS::AccountId",
+    "AWS::NoValue",
+    "AWS::NotificationARNs",
+    "AWS::Partition",
+    "AWS::Region",
+    "AWS::StackId",
+    "AWS::StackName",
+    "AWS::URLSuffix",
+];
+
+/// The template sections the `Fn::ForEach` directive may appear in, as the
+/// language-extensions transform defines it ("you can use the Fn::ForEach intrinsic
+/// function in the Conditions, Resources and Outputs sections").
+const FOR_EACH_SECTIONS: [&str; 3] = ["Conditions", "Outputs", "Resources"];
+
+/// The `Resources` section, named in the refusal of an unresolved dependency inside it.
+const RESOURCES: &str = "Resources";
+
+/// The `Outputs` section, likewise.
+const OUTPUTS: &str = "Outputs";
+
+/// The `Conditions` section, likewise.
+const CONDITIONS: &str = "Conditions";
+
+/// `Some(message)` for a submitted template body CloudFormation refuses outright, worded
+/// as the service words it; `None` for one it accepts.
+///
+/// `processed` is the stage the submitting operation computed for `body`
+/// ([`super::template::process_with_parameters`]), so the semantic rules are applied to the
+/// document that really deploys without expanding the template twice. `supplied` carries the
+/// parameter values the request passed and `region` the Region it was signed for: a lookup
+/// or a key an expression decides is resolved against them, exactly as the deployment would
+/// resolve it.
+pub fn refusal(
+    body: &str,
+    processed: &template::Processed,
+    supplied: &BTreeMap<String, String>,
+    region: &str,
+) -> Option<String> {
+    let Some(document) = template::document(body) else {
+        // "If both these checks fail, CloudFormation returns a template validation error."
+        return Some(template::not_well_formed(body));
+    };
+    // A parameter is named by its own section key, and the names a parameter may be given
+    // are the alphanumeric ones — which is also what a template using a DIRECTIVE as a
+    // parameter name runs into.
+    if let Some(message) = parameter_name_refusal(&document) {
+        return Some(message);
+    }
+    // The directives are read from the SUBMITTED document: whether a template uses one is a
+    // question about what the author wrote, not about what the expansion left behind.
+    let declares_extensions = template::body_declared_transforms(body)
+        .iter()
+        .any(|name| name == template::LANGUAGE_EXTENSIONS);
+    if let Some(message) = directive_refusal(&document, declares_extensions) {
+        return Some(message);
+    }
+    // The rules below are about the document CloudFormation DEPLOYS. A template with no
+    // processed stage has nothing for them to read, and the operation that submitted it
+    // fails the stack with the transform's own reason instead.
+    let deployed = processed.body(body)?;
+    // A body past a documented per-template quota is refused by that rule, which the
+    // submitting operation applies on its own; nothing here reports part of such a template.
+    let template = template::parse(deployed)?;
+    if let Some(message) = arity_refusal(&template) {
+        return Some(message);
+    }
+    if let Some(message) = unresolved_refusal(&template) {
+        return Some(message);
+    }
+    // What an expression inside a lookup resolves to: the parameters in force — the values
+    // the request passed, over the template's own declared defaults — and the pseudo
+    // parameters whose value this request fixes.
+    let mut values = template.parameter_defaults();
+    for (key, value) in supplied {
+        values.insert(key.clone(), value.clone());
+    }
+    let resolved = Resolution {
+        parameters: &values,
+        region,
+    };
+    if let Some(message) = mapping_refusal(&template, &resolved) {
+        return Some(message);
+    }
+    cycle_refusal(&template)
+}
+
+/// `Some(message)` for a `Parameters` section whose key is not a name a parameter may be
+/// given: "the parameter's logical name" is alphanumeric, so anything else — a
+/// language-extensions directive among them — is no parameter declaration at all.
+fn parameter_name_refusal(document: &Value) -> Option<String> {
+    let parameters = document.get("Parameters")?.as_object()?;
+    let name = parameters
+        .keys()
+        .find(|name| !name.chars().all(|character| character.is_ascii_alphanumeric()))?;
+    Some(format!(
+        "Template format error: Parameter name {name} is non alphanumeric."
+    ))
+}
+
+/// What an expression inside a template resolves against where the REQUEST decides it.
+struct Resolution<'a> {
+    /// The parameter values in force: what the request passed, over the declared defaults.
+    parameters: &'a BTreeMap<String, String>,
+    /// The Region the request was signed for, which is what `AWS::Region` stands for.
+    region: &'a str,
+}
+
+impl Resolution<'_> {
+    /// What `{"Ref": "<name>"}` stands for, or `None` for a name whose value this request
+    /// does not fix — which leaves the expression one this pass has nothing to say about.
+    fn value_of(&self, name: &str) -> Option<String> {
+        match name {
+            "AWS::Region" => Some(self.region.to_string()),
+            "AWS::Partition" => Some(template::PARTITION.to_string()),
+            "AWS::AccountId" => Some(::emulator_server::emulator_account_id().to_string()),
+            name => self.parameters.get(name).cloned(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The language-extensions directives: which template may use them, and where
+// ---------------------------------------------------------------------------
+
+/// `Some(message)` when the submitted document uses a function the
+/// `AWS::LanguageExtensions` transform defines without declaring that transform, or uses
+/// `Fn::ForEach` in a section the transform does not define it for.
+fn directive_refusal(document: &Value, declares_extensions: bool) -> Option<String> {
+    let sections = document.as_object()?;
+    // The DYNAMIC `Fn::GetAtt` first, wherever it is: a template that names a resource with
+    // an expression is refused for the arguments that function takes, which is the verdict
+    // whatever else the template also uses.
+    if !declares_extensions
+        && sections
+            .values()
+            .any(|node| holds_dynamic_get_att(node, 0))
+    {
+        return Some(GET_ATT_PARAMETERS.to_string());
+    }
+    sections
+        .values()
+        .find_map(|node| directives_in(node, declares_extensions, 0))
+}
+
+/// Whether a subtree names a resource's attribute with an expression rather than with the
+/// resource's own logical name.
+fn holds_dynamic_get_att(node: &Value, depth: usize) -> bool {
+    if depth > template::MAX_TEMPLATE_DEPTH {
+        return false;
+    }
+    match node {
+        Value::Array(items) => items
+            .iter()
+            .any(|item| holds_dynamic_get_att(item, depth + 1)),
+        Value::Object(members) => members.iter().any(|(key, member)| {
+            (key == template::FN_GET_ATT && is_dynamic_get_att(member))
+                || holds_dynamic_get_att(member, depth + 1)
+        }),
+        _ => false,
+    }
+}
+
+/// [`directive_refusal`] over one section's subtree.
+fn directives_in(node: &Value, declares_extensions: bool, depth: usize) -> Option<String> {
+    if depth > template::MAX_TEMPLATE_DEPTH {
+        return None;
+    }
+    match node {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| directives_in(item, declares_extensions, depth + 1)),
+        Value::Object(members) => {
+            for (key, member) in members {
+                if !declares_extensions
+                    && (key.starts_with(template::FOR_EACH_PREFIX)
+                        || key == template::FN_LENGTH
+                        || key == template::FN_TO_JSON_STRING)
+                {
+                    return Some(unsupported_function(key));
+                }
+                if let Some(message) = directives_in(member, declares_extensions, depth + 1) {
+                    return Some(message);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Whether an `Fn::GetAtt` argument names its resource with an expression rather than with
+/// the logical name itself.
+fn is_dynamic_get_att(argument: &Value) -> bool {
+    match argument {
+        Value::Array(parts) => parts.first().is_some_and(|first| !first.is_string()),
+        Value::String(_) => false,
+        // Neither documented form, which the arity rule reports.
+        _ => false,
+    }
+}
+
+/// How `Fn::ForEach` in a section the declared transform does not define it for FAILS the
+/// deployment: the request is accepted — the template is well-formed and the loop IS one of
+/// that transform's functions — and the transform then cannot apply it where it stands,
+/// which is the one thing a transform's failure says.
+fn for_each_not_supported() -> String {
+    format!(
+        "Transform {} failed with: Error parsing the template.",
+        template::LANGUAGE_EXTENSIONS
+    )
+}
+
+/// How an `Fn::GetAtt` that does not name a resource and an attribute is refused.
+const GET_ATT_PARAMETERS: &str = "Template error: every Fn::GetAtt object requires two \
+                                  non-empty parameters, the resource name and the resource \
+                                  attribute";
+
+// ---------------------------------------------------------------------------
+// Arity: the arguments each intrinsic function takes
+// ---------------------------------------------------------------------------
+
+/// `Some(message)` for an intrinsic function the deployed document spells with arguments
+/// that are not the ones it takes.
+fn arity_refusal(template: &Template) -> Option<String> {
+    sections(template).find_map(|(_, node)| arity_in(&node, 0))
+}
+
+/// [`arity_refusal`] over one node.
+fn arity_in(node: &Value, depth: usize) -> Option<String> {
+    if depth > template::MAX_TEMPLATE_DEPTH {
+        return None;
+    }
+    match node {
+        Value::Array(items) => items.iter().find_map(|item| arity_in(item, depth + 1)),
+        Value::Object(members) => {
+            // An intrinsic function is a single-member object whose name is the function's,
+            // and the functions a template may use are the documented ones: anything else
+            // under an `Fn::` name is no function CloudFormation resolves.
+            if members.len() == 1 {
+                if let Some(name) = members.keys().next() {
+                    if name.starts_with(FUNCTION_PREFIX) && !is_documented_function(name) {
+                        return Some(unsupported_function(name));
+                    }
+                }
+            }
+            for (key, member) in members {
+                let arity = match key.as_str() {
+                    // "[MapName, TopLevelKey, SecondLevelKey]", plus the optional fourth
+                    // argument that carries the lookup's `DefaultValue`.
+                    template::FN_FIND_IN_MAP => {
+                        let length = member.as_array().map_or(0, Vec::len);
+                        (!(3..=4).contains(&length)).then(|| FIND_IN_MAP_PARAMETERS.to_string())
+                    }
+                    // "[logicalNameOfResource, attributeName]", or the short form's one
+                    // dotted string.
+                    template::FN_GET_ATT => {
+                        let documented = match member {
+                            Value::Array(parts) => parts.len() >= 2,
+                            Value::String(dotted) => dotted.contains('.'),
+                            _ => false,
+                        };
+                        (!documented).then(|| GET_ATT_PARAMETERS.to_string())
+                    }
+                    // "[condition_name, value_if_true, value_if_false]".
+                    template::FN_IF => {
+                        let length = member.as_array().map_or(0, Vec::len);
+                        (length != 3).then(|| IF_PARAMETERS.to_string())
+                    }
+                    // "Fn::Length returns the number of elements within an array or an
+                    // intrinsic function that returns an array": an argument that is
+                    // neither can be no list at all.
+                    template::FN_LENGTH => (!countable(member)).then(|| LENGTH_PARAMETERS.to_string()),
+                    _ => boolean_arity(key, member),
+                };
+                if let Some(message) = arity {
+                    return Some(message);
+                }
+                if let Some(message) = arity_in(member, depth + 1) {
+                    return Some(message);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `Some(message)` when a boolean operator is spelled with a number of conditions it does
+/// not take, and `None` for anything that is not one.
+fn boolean_arity(name: &str, argument: &Value) -> Option<String> {
+    let length = argument.as_array().map_or(0, Vec::len);
+    match name {
+        // "Fn::Equals: [value_1, value_2]".
+        "Fn::Equals" => (length != 2).then(|| condition_parameters(name, "two values")),
+        // "Fn::Not: [condition]".
+        "Fn::Not" => (length != 1).then(|| condition_parameters(name, "one condition")),
+        // "You can use ... a minimum of 2 conditions and a maximum of 10 conditions."
+        "Fn::And" | "Fn::Or" => (!(2..=usize::from(MAX_BOOLEAN_CONDITIONS)).contains(&length))
+            .then(|| {
+                condition_parameters(name, &format!("2 to {MAX_BOOLEAN_CONDITIONS} conditions"))
+            }),
+        _ => None,
+    }
+}
+
+/// The most conditions one `Fn::And` or `Fn::Or` takes: "a maximum of 10 conditions".
+const MAX_BOOLEAN_CONDITIONS: u8 = 10;
+
+/// How a condition function spelled with the wrong number of arguments is refused.
+fn condition_parameters(name: &str, takes: &str) -> String {
+    format!("Template error: every {name} object requires a list of {takes}")
+}
+
+/// The prefix every intrinsic function but `Ref` is named with.
+const FUNCTION_PREFIX: &str = "Fn::";
+
+/// The intrinsic functions a template may use, as the "Intrinsic function reference"
+/// publishes them: the value functions, the condition functions, the ones the
+/// `AWS::LanguageExtensions` transform defines (held to that declaration by
+/// [`directive_refusal`]) and the rule functions the `Rules` section asserts with.
+const DOCUMENTED_FUNCTIONS: [&str; 25] = [
+    "Fn::Base64",
+    "Fn::GetAtt",
+    "Fn::GetAZs",
+    "Fn::ImportValue",
+    "Fn::Join",
+    "Fn::Select",
+    "Fn::Split",
+    "Fn::Sub",
+    "Ref",
+    "Fn::Cidr",
+    "Fn::FindInMap",
+    "Fn::Transform",
+    "Fn::If",
+    "Fn::And",
+    "Fn::Equals",
+    "Fn::Not",
+    "Fn::Or",
+    "Fn::Contains",
+    "Fn::EachMemberEquals",
+    "Fn::EachMemberIn",
+    "Fn::RefAll",
+    "Fn::ValueOf",
+    "Fn::ValueOfAll",
+    "Fn::Length",
+    "Fn::ToJsonString",
+];
+
+/// Whether `name` is one of the functions a template may use — the loop directive included,
+/// which carries its own loop name after the function's
+/// ([`super::template::FOR_EACH_PREFIX`]).
+fn is_documented_function(name: &str) -> bool {
+    DOCUMENTED_FUNCTIONS.contains(&name) || name.starts_with(template::FOR_EACH_PREFIX)
+}
+
+/// The functions the service names FIRST in the list its refusal reports, which no TEMPLATE
+/// may use: they are the service's own, and appear there only because the refusal reports
+/// the whole set it resolves.
+const INTERNAL_FUNCTIONS: [&str; 3] = [
+    "Fn::GetStackOutput",
+    "Fn::AccountIdFromAlias",
+    "Fn::GetConstantAZs",
+];
+
+/// How a function no template may use is refused, naming it and the functions that are
+/// supported — which is what a caller who misspelled one needs.
+///
+/// The list is reported in the order the service reports it, as far as that order is known:
+/// its own three first, then the value functions. The functions past those are this
+/// service's own set, since the order the service lists the rest in is not something this
+/// emulator can observe.
+fn unsupported_function(name: &str) -> String {
+    let listed: Vec<&str> = INTERNAL_FUNCTIONS
+        .iter()
+        .chain(DOCUMENTED_FUNCTIONS.iter())
+        .copied()
+        .collect();
+    format!(
+        "Template Error: Encountered unsupported function: {name} Supported functions are: \
+         [{}]",
+        listed.join(", ")
+    )
+}
+
+/// Whether an `Fn::Length` argument is something that can be a list: a list itself, or an
+/// intrinsic function — one member named `Ref` or `Fn::<Name>` — which may return one.
+fn countable(argument: &Value) -> bool {
+    match argument {
+        Value::Array(_) => true,
+        Value::Object(members) => {
+            members.len() == 1
+                && members
+                    .keys()
+                    .next()
+                    .is_some_and(|name| name == "Ref" || name.starts_with("Fn::"))
+        }
+        _ => false,
+    }
+}
+
+/// How an `Fn::Length` whose argument can be no list is refused.
+const LENGTH_PARAMETERS: &str = "Template error: every Fn::Length object requires a list, \
+                                 or a function that returns one";
+
+/// How an `Fn::FindInMap` that does not name a map and two keys is refused.
+const FIND_IN_MAP_PARAMETERS: &str = "Template error: every Fn::FindInMap object requires \
+                                      three parameters, the map name, the top-level key, \
+                                      and the second-level key";
+
+/// How an `Fn::If` that does not name a condition and both values is refused.
+const IF_PARAMETERS: &str = "Template error: every Fn::If object requires three \
+                             parameters, the condition name and the values to return when \
+                             it holds and when it does not";
+
+// ---------------------------------------------------------------------------
+// Unresolved dependencies: names the template does not declare
+// ---------------------------------------------------------------------------
+
+/// `Some(message)` when a section of the deployed document names something the template
+/// does not declare: a `Ref` or an `Fn::GetAtt` naming no parameter and no resource, or a
+/// `Condition` naming no declared condition.
+///
+/// The section is named in the refusal, because that is where the author has to look.
+///
+/// A walk of its own rather than [`super::template::references`]: that one collects the
+/// names a value REFERS to for the dependency relation, where a false positive is harmless
+/// (it is filtered to the declared resources), while this one has to decide a REFUSAL — so
+/// it honours what `Fn::Sub`'s own variable map supplies, reads condition names, and carries
+/// the section each reference sits in, none of which that relation needs.
+fn unresolved_refusal(template: &Template) -> Option<String> {
+    let parameters: BTreeSet<&str> = template
+        .parameters
+        .iter()
+        .map(|parameter| parameter.key.as_str())
+        .collect();
+    let resources: BTreeSet<&str> = template
+        .resources
+        .iter()
+        .map(|resource| resource.logical_id.as_str())
+        .collect();
+    let conditions: BTreeSet<&str> = declared_conditions(template);
+    let declared = Declared {
+        parameters: &parameters,
+        resources: &resources,
+        conditions: &conditions,
+    };
+    // A resource's or an output's own `Condition` names a condition the same way `Fn::If`
+    // does, so it is held to the same rule.
+    for resource in &template.resources {
+        if let Some(condition) = &resource.condition {
+            if !conditions.contains(condition.as_str()) {
+                return Some(condition_not_defined(condition));
+            }
+        }
+    }
+    for output in &template.outputs {
+        if let Some(condition) = &output.condition {
+            if !conditions.contains(condition.as_str()) {
+                return Some(condition_not_defined(condition));
+            }
+        }
+    }
+    sections(template).find_map(|(section, node)| {
+        unresolved_in(&node, section, &declared, 0)
+    })
+}
+
+/// The names a template declares, which is what every reference in it has to name.
+struct Declared<'a> {
+    parameters: &'a BTreeSet<&'a str>,
+    resources: &'a BTreeSet<&'a str>,
+    conditions: &'a BTreeSet<&'a str>,
+}
+
+/// The conditions a template's `Conditions` section declares.
+fn declared_conditions(template: &Template) -> BTreeSet<&str> {
+    template
+        .conditions
+        .as_object()
+        .map(|conditions| conditions.keys().map(String::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// [`unresolved_refusal`] over one node of `section`.
+fn unresolved_in(
+    node: &Value,
+    section: &str,
+    declared: &Declared<'_>,
+    depth: usize,
+) -> Option<String> {
+    if depth > template::MAX_TEMPLATE_DEPTH {
+        return None;
+    }
+    match node {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| unresolved_in(item, section, declared, depth + 1)),
+        Value::Object(members) => {
+            for (key, member) in members {
+                match (key.as_str(), member) {
+                    // "Ref returns the value of the specified parameter or resource", so a
+                    // name that is neither — nor a pseudo parameter — resolves to nothing.
+                    ("Ref", Value::String(name)) => {
+                        if !declared.parameters.contains(name.as_str())
+                            && !declared.resources.contains(name.as_str())
+                            && !PSEUDO_PARAMETERS.contains(&name.as_str())
+                        {
+                            return Some(unresolved_dependency_in(name, section));
+                        }
+                    }
+                    // "Fn::GetAtt returns the value of an attribute from a resource in the
+                    // template": the first argument names a RESOURCE, never a parameter.
+                    (template::FN_GET_ATT, argument) => {
+                        if let Some(name) = get_att_resource(argument) {
+                            if !declared.resources.contains(name) {
+                                return Some(unresolved_dependency_in(name, section));
+                            }
+                        }
+                    }
+                    // "Fn::If: [condition_name, ...]" and `{"Condition": "<name>"}` both
+                    // name a condition the `Conditions` section has to declare.
+                    (template::FN_IF, Value::Array(branches)) => {
+                        if let Some(name) = branches.first().and_then(Value::as_str) {
+                            if !declared.conditions.contains(name) {
+                                return Some(condition_not_defined(name));
+                            }
+                        }
+                    }
+                    ("Condition", Value::String(name)) => {
+                        if !declared.conditions.contains(name.as_str()) {
+                            return Some(condition_not_defined(name));
+                        }
+                    }
+                    // "Fn::Sub substitutes variables in an input string": a `${Name}` the
+                    // substitution's own variable map does not supply names what a `Ref`
+                    // names, and a `${Name.Attribute}` what an `Fn::GetAtt` does.
+                    ("Fn::Sub", argument) => {
+                        if let Some(message) = substitution_refusal(argument, section, declared)
+                        {
+                            return Some(message);
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(message) = unresolved_in(member, section, declared, depth + 1) {
+                    return Some(message);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `Some(message)` for an `Fn::Sub` whose source string names something neither its own
+/// variable map nor the template declares.
+fn substitution_refusal(
+    argument: &Value,
+    section: &str,
+    declared: &Declared<'_>,
+) -> Option<String> {
+    // "Fn::Sub: [ String, { Var1Name: Var1Value, ... } ]", or the string on its own.
+    let (source, variables) = match argument {
+        Value::String(source) => (source.as_str(), None),
+        Value::Array(parts) => (
+            parts.first()?.as_str()?,
+            parts.get(1).and_then(Value::as_object),
+        ),
+        _ => return None,
+    };
+    for (name, path) in template::substitution_names(source) {
+        if variables.is_some_and(|supplied| supplied.contains_key(&name)) {
+            continue;
+        }
+        let known = match path {
+            // `${Name.Attribute}` reads an attribute off a RESOURCE.
+            Some(_) => declared.resources.contains(name.as_str()),
+            None => {
+                declared.parameters.contains(name.as_str())
+                    || declared.resources.contains(name.as_str())
+                    || PSEUDO_PARAMETERS.contains(&name.as_str())
+            }
+        };
+        if !known {
+            return Some(unresolved_dependency_in(&name, section));
+        }
+    }
+    None
+}
+
+/// The logical name an `Fn::GetAtt` reads its attribute off, or `None` when the argument
+/// names it with an expression rather than with the name itself (the language-extensions
+/// form, resolved from the parameters in force rather than from the document).
+fn get_att_resource(argument: &Value) -> Option<&str> {
+    match argument {
+        Value::Array(parts) => parts.first()?.as_str(),
+        Value::String(dotted) => Some(template::resource_of(dotted)),
+        _ => None,
+    }
+}
+
+/// How a reference to a name the template does not declare is refused, naming the section
+/// the reference is in.
+fn unresolved_dependency_in(name: &str, section: &str) -> String {
+    format!(
+        "Template format error: Unresolved resource dependencies [{name}] in the {section} \
+         block of the template"
+    )
+}
+
+/// How a reference to a condition the template does not declare is refused.
+fn condition_not_defined(name: &str) -> String {
+    format!("Template format error: Condition {name} is not defined.")
+}
+
+// ---------------------------------------------------------------------------
+// Mappings: the lookups a template's `Fn::FindInMap`s really make
+// ---------------------------------------------------------------------------
+
+/// `Some(message)` for an `Fn::FindInMap` whose keys the `Mappings` section does not carry
+/// and that names no `DefaultValue` to fall back to.
+///
+/// Only a lookup whose three keys the DOCUMENT decides is checked: a key an expression
+/// supplies (a `Ref` to a parameter) is one the request decides, and a lookup nested inside
+/// another is resolved here so the outer one can be checked too.
+fn mapping_refusal(template: &Template, resolved: &Resolution<'_>) -> Option<String> {
+    sections(template)
+        .find_map(|(_, node)| mapping_in(&node, &template.mappings, resolved, 0))
+}
+
+/// [`mapping_refusal`] over one node.
+fn mapping_in(
+    node: &Value,
+    mappings: &Value,
+    resolved: &Resolution<'_>,
+    depth: usize,
+) -> Option<String> {
+    if depth > template::MAX_TEMPLATE_DEPTH {
+        return None;
+    }
+    match node {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| mapping_in(item, mappings, resolved, depth + 1)),
+        Value::Object(members) => {
+            for (key, member) in members {
+                if key == template::FN_FIND_IN_MAP {
+                    if let Some(message) = lookup_refusal(member, mappings, resolved, depth) {
+                        return Some(message);
+                    }
+                }
+                if let Some(message) = mapping_in(member, mappings, resolved, depth + 1) {
+                    return Some(message);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `Some(message)` when ONE `Fn::FindInMap`'s lookup misses and it carries no default.
+fn lookup_refusal(
+    argument: &Value,
+    mappings: &Value,
+    resolved: &Resolution<'_>,
+    depth: usize,
+) -> Option<String> {
+    let keys = argument.as_array()?;
+    if keys.len() < 3 {
+        // Its arity is reported by the rule that owns arity.
+        return None;
+    }
+    let map = static_text(&keys[0], mappings, resolved, depth)?;
+    let top = static_text(&keys[1], mappings, resolved, depth)?;
+    let second = static_text(&keys[2], mappings, resolved, depth)?;
+    if found_in(mappings, &map, &top, &second).is_some() || carries_default(keys) {
+        return None;
+    }
+    Some(format!(
+        "Template error: Unable to get mapping for {map}::{top}::{second}"
+    ))
+}
+
+/// Whether an `Fn::FindInMap`'s arguments name a `DefaultValue` for the lookup to fall back
+/// to: "the value to be returned if the key is not found".
+fn carries_default(keys: &[Value]) -> bool {
+    keys.get(3)
+        .and_then(|options| options.get(template::FIND_IN_MAP_DEFAULT_VALUE))
+        .is_some()
+}
+
+/// The value a `Mappings` lookup finds, or `None` when the section carries no such entry.
+fn found_in<'a>(mappings: &'a Value, map: &str, top: &str, second: &str) -> Option<&'a Value> {
+    let found = mappings.get(map)?.get(top)?.get(second)?;
+    (!found.is_null()).then_some(found)
+}
+
+/// The text a scalar template value spells, and nothing for a value that is not one.
+fn scalar_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+/// The text an `Fn::FindInMap` key spells, where the TEMPLATE and the REQUEST decide it: a
+/// literal, a `Ref` whose value this request fixes, or another `Fn::FindInMap` whose own
+/// lookup resolves. `None` for a key something else decides, which this check has nothing
+/// to say about.
+fn static_text(
+    value: &Value,
+    mappings: &Value,
+    resolved: &Resolution<'_>,
+    depth: usize,
+) -> Option<String> {
+    if depth > template::MAX_TEMPLATE_DEPTH {
+        return None;
+    }
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Object(members) if members.len() == 1 => {
+            let (name, argument) = members.iter().next()?;
+            match name.as_str() {
+                "Ref" => resolved.value_of(argument.as_str()?),
+                template::FN_FIND_IN_MAP => {
+                    let keys = argument.as_array()?;
+                    if keys.len() < 3 {
+                        return None;
+                    }
+                    let map = static_text(&keys[0], mappings, resolved, depth + 1)?;
+                    let top = static_text(&keys[1], mappings, resolved, depth + 1)?;
+                    let second = static_text(&keys[2], mappings, resolved, depth + 1)?;
+                    match found_in(mappings, &map, &top, &second).and_then(scalar_text) {
+                        Some(found) => Some(found),
+                        None => keys
+                            .get(3)
+                            .and_then(|options| {
+                                options.get(template::FIND_IN_MAP_DEFAULT_VALUE)
+                            })
+                            .and_then(|default| {
+                                static_text(default, mappings, resolved, depth + 1)
+                            }),
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dependency cycles
+// ---------------------------------------------------------------------------
+
+/// `Some(message)` when the declared resources depend on each other in a cycle, naming the
+/// resources that form it: no creation order satisfies such a template, so CloudFormation
+/// refuses it instead of creating a resource whose references cannot be resolved.
+fn cycle_refusal(template: &Template) -> Option<String> {
+    let dependencies = template::direct_dependencies(template);
+    let cycle = cycle_through(&dependencies)?;
+    Some(format!(
+        "Circular dependency between resources: [{}]",
+        cycle.join(", ")
+    ))
+}
+
+/// The resources of one cycle in the dependency relation, each named BEFORE the resource
+/// that depends on it, or `None` for a relation that has none.
+///
+/// Walked from each resource in logical-id order, so one template yields one answer.
+fn cycle_through(dependencies: &BTreeMap<String, BTreeSet<String>>) -> Option<Vec<String>> {
+    let mut settled: BTreeSet<&str> = BTreeSet::new();
+    for start in dependencies.keys() {
+        let mut path: Vec<&str> = Vec::new();
+        if let Some(mut cycle) = walk(start, dependencies, &mut settled, &mut path) {
+            // The walk collected the chain in the direction of the DEPENDENCY (each entry
+            // depends on the next), and the refusal names them the other way round: a
+            // resource before the one that needs it.
+            cycle.reverse();
+            return Some(cycle);
+        }
+    }
+    None
+}
+
+/// Depth-first walk from `logical_id`, reporting the cycle it closes.
+///
+/// `settled` holds the resources already walked with no cycle under them, so the whole
+/// relation is walked once however many resources point at the same one; `path` is the
+/// chain being walked, which is what a cycle is read off. The recursion is bounded by the
+/// resources one template may declare ([`super::template::MAX_RESOURCES_PER_TEMPLATE`]),
+/// which the quota rule refuses a body past before anything reads it.
+fn walk<'a>(
+    logical_id: &'a str,
+    dependencies: &'a BTreeMap<String, BTreeSet<String>>,
+    settled: &mut BTreeSet<&'a str>,
+    path: &mut Vec<&'a str>,
+) -> Option<Vec<String>> {
+    if let Some(position) = path.iter().position(|walked| *walked == logical_id) {
+        return Some(path[position..].iter().map(|id| (*id).to_string()).collect());
+    }
+    if settled.contains(logical_id) {
+        return None;
+    }
+    path.push(logical_id);
+    if let Some(needs) = dependencies.get(logical_id) {
+        for dependency in needs {
+            if let Some(cycle) = walk(dependency, dependencies, settled, path) {
+                return Some(cycle);
+            }
+        }
+    }
+    path.pop();
+    settled.insert(logical_id);
+    None
+}
+
+// ---------------------------------------------------------------------------
+// The sections every rule above walks
+// ---------------------------------------------------------------------------
+
+/// The sections of a read template that carry expressions, each with the name the refusals
+/// report it by: every resource's declaration WITHOUT its `Metadata` ("the Metadata
+/// attribute ... CloudFormation does not evaluate intrinsic functions in it"), every
+/// output's value and export name, and the `Conditions` section.
+fn sections(template: &Template) -> impl Iterator<Item = (&'static str, Value)> + '_ {
+    let resources = template
+        .resources
+        .iter()
+        .map(|resource| (RESOURCES, evaluated_declaration(&resource.declaration)));
+    let outputs = template.outputs.iter().flat_map(|output| {
+        [
+            Some((OUTPUTS, output.value.clone())),
+            output.export_name.clone().map(|name| (OUTPUTS, name)),
+        ]
+    });
+    resources
+        .chain(outputs.flatten())
+        .chain([(CONDITIONS, template.conditions.clone())])
+}
+
+/// One resource's declaration as the rules above read it: everything but `Metadata`, which
+/// is the one resource attribute whose contents CloudFormation does not evaluate, so a key
+/// or an object inside it that merely LOOKS like an intrinsic is no declaration about this
+/// template.
+fn evaluated_declaration(declaration: &Value) -> Value {
+    let Some(members) = declaration.as_object() else {
+        return declaration.clone();
+    };
+    Value::Object(
+        members
+            .iter()
+            .filter(|(key, _)| key.as_str() != METADATA)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+/// The resource attribute CloudFormation evaluates nothing in.
+const METADATA: &str = "Metadata";
+
+// ---------------------------------------------------------------------------
+// The `Rules` section
+// ---------------------------------------------------------------------------
+
+/// The template member that declares the rules a deployment's parameter values are
+/// asserted against.
+const RULES: &str = "Rules";
+
+/// `Some(reason)` for a template a request may SUBMIT but whose deployment cannot be
+/// carried out, worded as the failure that deployment records.
+///
+/// Two rules answer here rather than refusing the request, because neither is a question
+/// about the request's own shape:
+///
+/// * a `Rules` assertion the parameter values in force do not satisfy ([`rules_failure`]);
+/// * an `Fn::ForEach` in a section the declared transform does not define it for — the
+///   template is well-formed and the loop IS one of that transform's functions, so what
+///   fails is the transform's own application.
+///
+/// The operation that reads a failure here answers its caller normally and then ends the
+/// operation it opened in the service's failure state, which for a create is followed by the
+/// rollback that create's `OnFailure` asks for.
+pub fn deployment_failure(body: &str, parameters: &BTreeMap<String, String>) -> Option<String> {
+    for_each_placement_failure(body).or_else(|| rules_failure(body, parameters))
+}
+
+/// `Some(reason)` for an `Fn::ForEach` the declared transform cannot apply where it stands.
+fn for_each_placement_failure(body: &str) -> Option<String> {
+    let document = template::document(body)?;
+    let sections = document.as_object()?;
+    sections.iter().find_map(|(section, node)| {
+        (!FOR_EACH_SECTIONS.contains(&section.as_str()) && holds_for_each(node, 0))
+            .then(for_each_not_supported)
+    })
+}
+
+/// Whether a subtree carries an `Fn::ForEach` loop.
+fn holds_for_each(node: &Value, depth: usize) -> bool {
+    if depth > template::MAX_TEMPLATE_DEPTH {
+        return false;
+    }
+    match node {
+        Value::Array(items) => items.iter().any(|item| holds_for_each(item, depth + 1)),
+        Value::Object(members) => members.iter().any(|(key, member)| {
+            key.starts_with(template::FOR_EACH_PREFIX) || holds_for_each(member, depth + 1)
+        }),
+        _ => false,
+    }
+}
+
+/// `Some(reason)` when a `Rules` assertion does not hold for the parameter values a
+/// deployment runs with, worded as the failure that deployment records.
+///
+/// "Rules ... validates a parameter or a combination of parameters passed to a template
+/// during a stack creation or stack update": the assertions are checked against the VALUES
+/// in force, so this is a property of the deployment rather than of the request — the stack
+/// operation that reads a failure here fails and rolls back, with the rule's own
+/// `AssertDescription` as the reason the caller is told.
+///
+/// An assertion this service cannot evaluate from the parameters alone holds: a rule is a
+/// guard on the values, and nothing here fails a deployment over an expression it did not
+/// understand.
+pub fn rules_failure(body: &str, parameters: &BTreeMap<String, String>) -> Option<String> {
+    let document = template::document(body)?;
+    let rules = document.get(RULES)?.as_object()?;
+    for (_name, rule) in rules {
+        // "RuleCondition (optional): Determines when a rule takes effect."
+        let applies = match rule.get("RuleCondition") {
+            Some(condition) => assertion_holds(condition, parameters, 0).unwrap_or(false),
+            None => true,
+        };
+        if !applies {
+            continue;
+        }
+        let Some(assertions) = rule.get("Assertions").and_then(Value::as_array) else {
+            continue;
+        };
+        for assertion in assertions {
+            let Some(assert) = assertion.get("Assert") else {
+                continue;
+            };
+            if assertion_holds(assert, parameters, 0) == Some(false) {
+                let description = assertion
+                    .get("AssertDescription")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                return Some(format!(
+                    "Parameter validation failed: assertion error: {description}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Whether one rule expression holds for the parameter values in force, or `None` for one
+/// this service cannot evaluate from those values alone.
+///
+/// The rule functions are the documented ones that read nothing but the parameters:
+/// `Fn::Equals`, `Fn::Not`, `Fn::And`, `Fn::Or`, `Fn::Contains`, `Fn::EachMemberEquals` and
+/// `Fn::EachMemberIn`. The ones that read the account's own resources (`Fn::RefAll`,
+/// `Fn::ValueOf`, `Fn::ValueOfAll`) are not evaluated here, so an assertion using one is
+/// not one this service judges.
+fn assertion_holds(
+    expression: &Value,
+    parameters: &BTreeMap<String, String>,
+    depth: usize,
+) -> Option<bool> {
+    if depth > template::MAX_INTRINSIC_DEPTH {
+        return None;
+    }
+    if let Some(flag) = expression.as_bool() {
+        return Some(flag);
+    }
+    let members = expression.as_object()?;
+    if members.len() != 1 {
+        return None;
+    }
+    let (name, argument) = members.iter().next()?;
+    let arguments = argument.as_array();
+    match name.as_str() {
+        "Fn::Equals" => {
+            let arguments = arguments?;
+            if arguments.len() != 2 {
+                return None;
+            }
+            let left = rule_value(&arguments[0], parameters, depth)?;
+            let right = rule_value(&arguments[1], parameters, depth)?;
+            Some(left == right)
+        }
+        "Fn::Not" => {
+            let arguments = arguments?;
+            if arguments.len() != 1 {
+                return None;
+            }
+            Some(!assertion_holds(&arguments[0], parameters, depth + 1)?)
+        }
+        "Fn::And" | "Fn::Or" => {
+            let arguments = arguments?;
+            let all = name == "Fn::And";
+            let mut holds = all;
+            for argument in arguments {
+                let evaluated = assertion_holds(argument, parameters, depth + 1)?;
+                holds = if all {
+                    holds && evaluated
+                } else {
+                    holds || evaluated
+                };
+            }
+            Some(holds)
+        }
+        // "Fn::Contains: Returns true if a specified string matches at least one value in
+        // a list": [list_of_strings, value]. The candidates are indexed once, so the
+        // comparison is logarithmic in the list rather than a scan per member.
+        "Fn::Contains" => {
+            let arguments = arguments?;
+            if arguments.len() != 2 {
+                return None;
+            }
+            let candidates: BTreeSet<String> =
+                rule_values(&arguments[0], parameters, depth)?.into_iter().collect();
+            let value = rule_value(&arguments[1], parameters, depth)?;
+            Some(candidates.contains(&value))
+        }
+        // "Fn::EachMemberEquals: Returns true if a specified string matches all values in
+        // a list": [list_of_strings, value].
+        "Fn::EachMemberEquals" => {
+            let arguments = arguments?;
+            if arguments.len() != 2 {
+                return None;
+            }
+            let members = rule_values(&arguments[0], parameters, depth)?;
+            let value = rule_value(&arguments[1], parameters, depth)?;
+            Some(members.iter().all(|member| *member == value))
+        }
+        // "Fn::EachMemberIn: Returns true if each member in a list of strings matches at
+        // least one value in a second list of strings":
+        // [strings_to_check, strings_to_match]. The second list is indexed once, so the
+        // work is the sum of the two lengths rather than their product.
+        "Fn::EachMemberIn" => {
+            let arguments = arguments?;
+            if arguments.len() != 2 {
+                return None;
+            }
+            let checked = rule_values(&arguments[0], parameters, depth)?;
+            let against: BTreeSet<String> =
+                rule_values(&arguments[1], parameters, depth)?.into_iter().collect();
+            Some(checked.iter().all(|member| against.contains(member)))
+        }
+        _ => None,
+    }
+}
+
+/// One value a rule expression compares: a literal, or a `Ref` to a parameter the
+/// deployment carries a value for.
+fn rule_value(
+    value: &Value,
+    parameters: &BTreeMap<String, String>,
+    depth: usize,
+) -> Option<String> {
+    if depth > template::MAX_INTRINSIC_DEPTH {
+        return None;
+    }
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        Value::Object(members) if members.len() == 1 => {
+            let (name, argument) = members.iter().next()?;
+            (name == "Ref")
+                .then(|| parameters.get(argument.as_str()?).cloned())
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// The list of values a rule expression reads: a literal list, or a `Ref` to a parameter
+/// whose value is "an array of literal strings that are separated by commas".
+///
+/// `None` for a list past [`super::template::MAX_RESOLVED_LIST_LEN`], the bound every list
+/// this service resolves is held to: both the list's LENGTH and the request-supplied text it
+/// is split from are the caller's to choose, so the split is stopped at the bound rather
+/// than materialising as many strings as a body holds commas — and an assertion over a list
+/// past it is one this service does not judge.
+fn rule_values(
+    value: &Value,
+    parameters: &BTreeMap<String, String>,
+    depth: usize,
+) -> Option<Vec<String>> {
+    if depth > template::MAX_INTRINSIC_DEPTH {
+        return None;
+    }
+    match value {
+        Value::Array(items) => {
+            if items.len() > template::MAX_RESOLVED_LIST_LEN {
+                return None;
+            }
+            items
+                .iter()
+                .map(|item| rule_value(item, parameters, depth + 1))
+                .collect()
+        }
+        other => {
+            let text = rule_value(other, parameters, depth + 1)?;
+            // One past the bound is enough to know it is past it, so nothing larger is
+            // ever built.
+            let items: Vec<String> = text
+                .split(',')
+                .take(template::MAX_RESOLVED_LIST_LEN + 1)
+                .map(|item| item.trim().to_string())
+                .collect();
+            (items.len() <= template::MAX_RESOLVED_LIST_LEN).then_some(items)
+        }
+    }
+}

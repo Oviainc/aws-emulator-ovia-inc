@@ -196,21 +196,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(record) => record.domains.clone(),
                 None => {
                     // The domains of a list DNS Firewall publishes itself are
-                    // the service's, not this account's, and nothing here holds
-                    // them: the id resolves (it is a list every account sees),
-                    // and no `Domains` member is reported for it rather than an
-                    // empty one, which would claim the published list holds no
-                    // domain. The same reasoning leaves its `DomainCount`
-                    // unset.
+                    // the service's own threat intelligence, not this account's
+                    // data: the list is readable as a resource
+                    // (`GetFirewallDomainList` reports it), while the domains
+                    // inside it are not the caller's to read at all, which is
+                    // the `AccessDeniedException` this operation models.
                     if crate::state::managed_firewall_domain_list(
                         &input.firewall_domain_list_id,
                     )
                     .is_some()
                     {
-                        return Ok(ListFirewallDomainsOutput {
-                            domains: None,
-                            next_token: None,
-                        });
+                        return Err(ListFirewallDomainsErrorModeled::AccessDeniedException(
+                            crate::state::managed_firewall_domain_list_access_denied(),
+                        )
+                        .into());
                     }
                     return Err(ListFirewallDomainsErrorModeled::ResourceNotFoundException(
                         crate::state::firewall_domain_list_not_found(

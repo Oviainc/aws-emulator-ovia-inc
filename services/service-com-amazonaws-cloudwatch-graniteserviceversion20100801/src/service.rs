@@ -95,6 +95,111 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 }
 
+/// The refusal classes CloudWatch answers as one of its own parameter faults, and the whole
+/// rewording this service does.
+///
+/// A constraint the boundary validator catches is refused before any handler runs, so the
+/// framework answers it under the protocol's generic `ValidationException`. CloudWatch's
+/// metric operations model the parameter faults instead — `InvalidParameterValueException` is
+/// the only client error `ListMetrics` declares, and `GetMetricStatistics` declares it beside
+/// the combination and missing-parameter faults — so these two classes are stated under that
+/// code, in this service's own parameter wording ([`crate::state`]'s shared sentences, the
+/// same ones its handlers refuse with), and a client branching on the code reaches its
+/// handler:
+///
+/// * a `Dimensions` collection longer than its cap, named with the cap it broke
+///   ([`dimension_cap_refusal`]);
+/// * a value inside a LIST that is outside the enumerated type the list's member names — a
+///   percentile passed in `Statistics`, whose place is `ExtendedStatistics` — named as the
+///   value and the request member path it arrived on.
+///
+/// Every other violation keeps the framework's code and wording: a scalar outside its own
+/// bound or enum is what this service is recorded answering `ValidationException` for, and a
+/// code a client branches on is not changed without a recording that shows it.
+fn parameter_fault(refusal: &Refusal) -> Option<Refused> {
+    let Refusal::Invalid(violations) = refusal else {
+        return None;
+    };
+    violations
+        .iter()
+        .find_map(dimension_cap_refusal)
+        .or_else(|| violations.iter().find_map(list_element_enum_refusal))
+}
+
+/// The refusal of a `Dimensions` collection longer than the dimensions it may carry, or
+/// `None` when `violation` is not one.
+///
+/// The cap CloudWatch enforces on a dimension collection is the per-metric dimension maximum
+/// ([`crate::state::MAX_METRIC_DIMENSIONS`]), whatever the operation; `ListMetricsInput`'s own
+/// filter list is modelled BELOW it (`length 0..10`), and a collection inside the per-metric
+/// maximum but outside that member's own bound is refused naming THAT bound — the refusal
+/// names the cap the collection actually broke, and this seam chooses the words of a refusal
+/// rather than whether there is one.
+fn dimension_cap_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<Refused> {
+    let aws_smithy_schema_server::ViolationKind::MaxLength(declared) = violation.kind else {
+        return None;
+    };
+    if !is_dimension_collection(&violation.path) {
+        return None;
+    }
+    let submitted =
+        service_common::validation_message::list_item_count(violation.value.as_deref()?)?;
+    let cap = if submitted > crate::state::MAX_METRIC_DIMENSIONS {
+        crate::state::MAX_METRIC_DIMENSIONS
+    } else {
+        usize::try_from(declared).ok()?
+    };
+    Some(Refused {
+        code: INVALID_PARAMETER_VALUE.to_string(),
+        message: crate::state::collection_too_large_message(
+            &crate::state::query_parameter_path(&violation.path),
+            cap,
+        ),
+    })
+}
+
+/// The refusal of an element of a LIST holding a value outside the enumerated type the list's
+/// member names, or `None` when `violation` is not one.
+///
+/// Stated in the wording this service refuses an unusable input value in
+/// ([`crate::state::value_is_invalid_message`], the sentence its handlers already answer an
+/// unusable value with): the value, and the request member path it arrived on as a
+/// query-protocol refusal names it (`Statistics.member.1`), which is what locates the element
+/// a client has to change.
+fn list_element_enum_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<Refused> {
+    if !matches!(
+        violation.kind,
+        aws_smithy_schema_server::ViolationKind::EnumValue(_)
+    ) || !is_list_element(&violation.path)
+    {
+        return None;
+    }
+    Some(Refused {
+        code: INVALID_PARAMETER_VALUE.to_string(),
+        message: crate::state::value_is_invalid_message(
+            violation.value.as_deref()?,
+            &crate::state::query_parameter_path(&violation.path),
+        ),
+    })
+}
+
+/// The wire error code of the modelled `InvalidParameterValueException` ("The value of an
+/// input parameter is bad or out-of-range"): its `awsQueryError` code, which is what a client
+/// of this service branches on.
+const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
+/// Whether `path` points at a request's `Dimensions` collection — of any operation, and at
+/// any depth, since a metric's dimension set is one shape wherever it is submitted.
+fn is_dimension_collection(path: &str) -> bool {
+    path.split('.').next_back() == Some("dimensions")
+}
+
+/// Whether `path` points at an ELEMENT of a list rather than at a member of its own: the
+/// validating walk ends such a path with the step from the collection into the element.
+fn is_list_element(path: &str) -> bool {
+    path.split('.').next_back() == Some("member")
+}
+
 /// The response header an ACCEPTED `PutMetricData` reports a dropped entity in.
 ///
 /// `PutMetricDataInput$StrictEntityValidation` documents that such an answer carries "an
@@ -212,17 +317,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // The centralized walk calls this on a framework-level refusal (an absent required
+        // member, or a value outside a declared bound) to let this service reword it. Only
+        // the classes CloudWatch answers as one of its own PARAMETER faults are restated
+        // ([`parameter_fault`]); everything else keeps the framework's code and wording.
+        parameter_fault(refusal)
     }
 
     fn override_routing_error(

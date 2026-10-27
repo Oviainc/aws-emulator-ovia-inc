@@ -3,13 +3,17 @@
 //! @op RollbackAutomationEvent
 //!
 //! IMPLEMENTED. Resolves `eventId` against the automation events this service
-//! holds: an id no event has is `ResourceNotFoundException` (404), and an event
-//! whose automation was not carried out — one that is still running, or one
-//! already rolled back — is `InvalidParameterValueException` (400), because a
-//! rollback is initiated for a COMPLETED event. A completed event goes back to
-//! running in the non-terminal `RollbackInProgress` status, and the clock
-//! settles it to the modelled `RollbackComplete` once its rollback window has
-//! passed — see `crate::state::StoredEvent::begin_rollback`.
+//! holds: an id no event has is `ResourceNotFoundException` (404); an event of
+//! an account the caller may no longer initiate work in — a member account
+//! whose association has been removed — is `AccessDeniedException` (403),
+//! because a rollback is initiated only for events belonging to ASSOCIATED
+//! member accounts; and an event whose automation was not carried out — one
+//! that is still running, or one already rolled back — is
+//! `InvalidParameterValueException` (400), because a rollback is initiated for
+//! a COMPLETED event. A completed event goes back to running in the
+//! non-terminal `RollbackInProgress` status, and the clock settles it to the
+//! modelled `RollbackComplete` once its rollback window has passed — see
+//! `crate::state::StoredEvent::begin_rollback`.
 //!
 //! ## Shape of an operation
 //!
@@ -242,7 +246,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The rollback is initiated for an AUTOMATION EVENT, so the event is
         // what the request has to name; an id no stored event carries names no
-        // resource of this service.
+        // resource of this service. The event records the account its
+        // automation ran in, which is what the caller's standing is judged on.
+        let Some(account_id) = guard
+            .events
+            .get(&input.event_id)
+            .map(|event| event.account_id.clone())
+        else {
+            return Err(not_found());
+        };
+
+        // The caller's STANDING, before the event's eligibility: a rollback is
+        // initiated only for an event belonging to an associated member
+        // account. The association is read NOW rather than taken from the
+        // stored event, because it can have been removed since the automation
+        // ran — see `crate::state::…::may_initiate_in`. So an account the
+        // caller may no longer reach into is answered the same way whatever
+        // status its event is in.
+        if !guard.may_initiate_in(&account_id) {
+            return Err(access_denied());
+        }
+
         let Some(event) = guard.events.get_mut(&input.event_id) else {
             return Err(not_found());
         };
@@ -295,6 +319,17 @@ fn output_for(event: &crate::state::StoredEvent) -> RollbackAutomationEventOutpu
 fn not_found() -> RollbackAutomationEventError {
     RollbackAutomationEventErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.into()),
+    })
+    .into()
+}
+
+/// The modelled 403 (`AccessDeniedException`, HTTP 403), for an event the
+/// caller may not initiate a rollback for. The message is this service's fixed
+/// access-denied sentence: it names neither the event nor the account it
+/// belongs to, so the refusal discloses nothing about what the store holds.
+fn access_denied() -> RollbackAutomationEventError {
+    RollbackAutomationEventErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(crate::state::ACCESS_DENIED_MESSAGE.into()),
     })
     .into()
 }

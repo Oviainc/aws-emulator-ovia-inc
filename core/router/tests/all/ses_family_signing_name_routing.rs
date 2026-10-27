@@ -42,52 +42,81 @@ use std::sync::Arc;
 use aws_emulator_router::{build_router, InMemoryEngine};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
-const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+///
+/// Shared with the sibling suite that drives this same family's pre-dispatch refusals
+/// (`ses_family_pre_dispatch_refusals`), so the two cannot assemble the router against
+/// two different stacks.
+pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// The region every row signs for and addresses.
 const REGION: &str = "us-east-1";
+
+/// The two refusals the ROUTER itself produces, which name no AWS shape: a request that
+/// addresses one service must provoke neither — `AmbiguousService` when several services
+/// claim it, `UnknownService` when none does.
+pub(crate) const ROUTER_REFUSALS: [&str; 2] = ["AmbiguousService", "UnknownService"];
 
 /// The contact list the SESv2 rows write and then read back.
 const CONTACT_LIST: &str = "router-contact-list";
 
 /// One request a row sends.
-struct Call {
+///
+/// Shared with the sibling suite named on [`BOOT_STACK_SIZE`]: one description of a
+/// request to this family, so the two suites cannot describe one differently.
+pub(crate) struct Call {
     /// What this row is, for the assertion messages.
-    case: &'static str,
-    method: &'static str,
+    pub(crate) case: &'static str,
+    pub(crate) method: &'static str,
     /// Path (and query) only; the host is supplied separately.
-    uri: String,
+    pub(crate) uri: String,
     /// The `Host` header — the host-style routing signal, read when a request carries no
     /// SigV4 credential scope.
-    host: String,
+    pub(crate) host: String,
     /// The signing name a SigV4 credential scope names, or `None` for an unsigned
     /// (anonymous) request that must route by host alone.
-    signing_name: Option<&'static str>,
-    content_type: Option<&'static str>,
+    pub(crate) signing_name: Option<&'static str>,
+    pub(crate) content_type: Option<&'static str>,
     /// The `X-Amz-Target` an `awsJson` client names its operation in.
-    target: Option<&'static str>,
-    body: String,
+    pub(crate) target: Option<&'static str>,
+    pub(crate) body: String,
 }
 
 /// What the one service that owns a [`Call`] must answer.
-struct Expect {
+///
+/// Shared with the sibling suite named on [`BOOT_STACK_SIZE`], so the two cannot drift in
+/// what they consider a correct answer.
+pub(crate) struct Expect {
     /// The HTTP status, when pinning it does not pin an unimplemented operation's
     /// scaffold 501 (which would fail the day that operation is implemented).
-    status: Option<u16>,
+    pub(crate) status: Option<u16>,
     /// The wire error code (`<Code>` on XML, `__type` on JSON), same caveat.
-    code: Option<&'static str>,
+    pub(crate) code: Option<&'static str>,
     /// Whether the answer must be an XML document. A query/XML-protocol client cannot
     /// parse a JSON `__type` envelope at all — it raises a malformed-response error
     /// instead of surfacing any error code — so an `awsQuery` service's answer must be
     /// XML whether it succeeds or fails.
-    xml: bool,
+    pub(crate) xml: bool,
     /// Substrings the body must contain (a read-back's own values, say).
-    contains: &'static [&'static str],
+    pub(crate) contains: &'static [&'static str],
+}
+
+/// The SES endpoint host, which three of the four services answer on.
+pub(crate) fn email_host() -> String {
+    format!("email.{REGION}.amazonaws.com")
+}
+
+/// MailManager's own endpoint host.
+pub(crate) fn mail_manager_host() -> String {
+    format!("mail-manager.{REGION}.amazonaws.com")
 }
 
 /// A SigV4 `Authorization` header whose credential scope names `signing_name`. The
-/// signature is never checked: this router runs with request authentication off.
-fn authorization(signing_name: &str) -> String {
+/// signature it carries is not a real one and verifies against nothing: what the header is
+/// here for is the credential scope, which is the routing signal. This suite drives it
+/// with request authentication off, so nothing checks it; the sibling suite named on
+/// [`BOOT_STACK_SIZE`] drives the same header with authentication ON, where being
+/// unverifiable is the point.
+pub(crate) fn authorization(signing_name: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{signing_name}/aws4_request, \
          SignedHeaders=host;x-amz-date, Signature=deadbeef"
@@ -111,7 +140,7 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 
 /// The wire error code of an answer: `<Code>` for an XML body, `__type` for a JSON one,
 /// and the empty string for a success.
-fn error_code(body: &str) -> String {
+pub(crate) fn error_code(body: &str) -> String {
     if body.trim_start().starts_with('<') {
         return xml_element(body, "Code").unwrap_or_default();
     }
@@ -133,7 +162,7 @@ fn ses_v1_call(case: &'static str, action: &str) -> Call {
         case,
         method: "POST",
         uri: "/".to_string(),
-        host: format!("email.{REGION}.amazonaws.com"),
+        host: email_host(),
         signing_name: Some("ses"),
         content_type: Some("application/x-www-form-urlencoded"),
         target: None,
@@ -147,7 +176,7 @@ fn mail_manager_call(case: &'static str, target: &'static str) -> Call {
         case,
         method: "POST",
         uri: "/".to_string(),
-        host: format!("mail-manager.{REGION}.amazonaws.com"),
+        host: mail_manager_host(),
         signing_name: Some("ses"),
         content_type: Some("application/x-amz-json-1.0"),
         target: Some(target),
@@ -190,7 +219,7 @@ fn rows() -> Vec<(Call, Expect)> {
                 case: "ses v1 GetSendQuota, unsigned and host-addressed",
                 method: "POST",
                 uri: "/".to_string(),
-                host: format!("email.{REGION}.amazonaws.com"),
+                host: email_host(),
                 signing_name: None,
                 content_type: Some("application/x-www-form-urlencoded"),
                 target: None,
@@ -212,7 +241,7 @@ fn rows() -> Vec<(Call, Expect)> {
                 case: "sesv2 CreateContactList",
                 method: "POST",
                 uri: "/v2/email/contact-lists".to_string(),
-                host: format!("email.{REGION}.amazonaws.com"),
+                host: email_host(),
                 signing_name: Some("ses"),
                 content_type: Some("application/json"),
                 target: None,
@@ -230,7 +259,7 @@ fn rows() -> Vec<(Call, Expect)> {
                 case: "sesv2 ListContactLists reads the list back",
                 method: "GET",
                 uri: "/v2/email/contact-lists?PageSize=1".to_string(),
-                host: format!("email.{REGION}.amazonaws.com"),
+                host: email_host(),
                 signing_name: Some("ses"),
                 content_type: None,
                 target: None,
@@ -248,7 +277,7 @@ fn rows() -> Vec<(Call, Expect)> {
                 case: "sesv2 GetContactList",
                 method: "GET",
                 uri: format!("/v2/email/contact-lists/{CONTACT_LIST}"),
-                host: format!("email.{REGION}.amazonaws.com"),
+                host: email_host(),
                 signing_name: Some("ses"),
                 content_type: None,
                 target: None,
@@ -269,7 +298,7 @@ fn rows() -> Vec<(Call, Expect)> {
                 case: "sesv2 ListContactLists, unsigned and host-addressed",
                 method: "GET",
                 uri: "/v2/email/contact-lists".to_string(),
-                host: format!("email.{REGION}.amazonaws.com"),
+                host: email_host(),
                 signing_name: None,
                 content_type: None,
                 target: None,
@@ -290,7 +319,7 @@ fn rows() -> Vec<(Call, Expect)> {
                 case: "sesv2 GetContactList for a list nothing stored",
                 method: "GET",
                 uri: "/v2/email/contact-lists/router-absent-list".to_string(),
-                host: format!("email.{REGION}.amazonaws.com"),
+                host: email_host(),
                 signing_name: Some("ses"),
                 content_type: None,
                 target: None,
@@ -313,7 +342,7 @@ fn rows() -> Vec<(Call, Expect)> {
                 case: "pinpoint-email GetAccount, signed as ses",
                 method: "GET",
                 uri: "/v1/email/account".to_string(),
-                host: format!("email.{REGION}.amazonaws.com"),
+                host: email_host(),
                 signing_name: Some("ses"),
                 content_type: None,
                 target: None,
@@ -331,7 +360,7 @@ fn rows() -> Vec<(Call, Expect)> {
                 case: "pinpoint-email ListConfigurationSets, host-addressed",
                 method: "GET",
                 uri: "/v1/email/configuration-sets".to_string(),
-                host: format!("email.{REGION}.amazonaws.com"),
+                host: email_host(),
                 signing_name: None,
                 content_type: None,
                 target: None,
@@ -378,7 +407,7 @@ fn rows() -> Vec<(Call, Expect)> {
                 case: "mailmanager ListAddressLists, rpcv2Cbor URI",
                 method: "POST",
                 uri: "/service/MailManagerSvc/operation/ListAddressLists".to_string(),
-                host: format!("mail-manager.{REGION}.amazonaws.com"),
+                host: mail_manager_host(),
                 signing_name: Some("ses"),
                 content_type: Some("application/cbor"),
                 target: None,
@@ -403,7 +432,7 @@ fn unclaimed_rows() -> Vec<Call> {
             case: "a REST path no model in the family binds",
             method: "GET",
             uri: "/v3/email/contact-lists".to_string(),
-            host: format!("email.{REGION}.amazonaws.com"),
+            host: email_host(),
             signing_name: Some("ses"),
             content_type: None,
             target: None,
@@ -416,7 +445,7 @@ fn unclaimed_rows() -> Vec<Call> {
             case: "an awsJson target at the email endpoint",
             method: "POST",
             uri: "/".to_string(),
-            host: format!("email.{REGION}.amazonaws.com"),
+            host: email_host(),
             signing_name: None,
             content_type: Some("application/x-amz-json-1.0"),
             target: Some("MailManagerSvc.ListArchives"),
@@ -428,7 +457,7 @@ fn unclaimed_rows() -> Vec<Call> {
             case: "the awsQuery root path at the mail-manager endpoint",
             method: "POST",
             uri: "/".to_string(),
-            host: format!("mail-manager.{REGION}.amazonaws.com"),
+            host: mail_manager_host(),
             signing_name: None,
             content_type: Some("application/x-www-form-urlencoded"),
             target: None,
@@ -439,7 +468,7 @@ fn unclaimed_rows() -> Vec<Call> {
             case: "a /v2 path at the mail-manager endpoint",
             method: "GET",
             uri: "/v2/email/contact-lists".to_string(),
-            host: format!("mail-manager.{REGION}.amazonaws.com"),
+            host: mail_manager_host(),
             signing_name: None,
             content_type: None,
             target: None,
@@ -449,7 +478,7 @@ fn unclaimed_rows() -> Vec<Call> {
 }
 
 /// Send one [`Call`] through the router, returning the status and the body as text.
-fn send(
+pub(crate) fn send(
     router: &smithy_server_runtime::MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     call: &Call,
@@ -497,7 +526,7 @@ fn every_ses_signed_request_reaches_exactly_one_service() {
                 // The two routing failures, which no row may provoke: `AmbiguousService`
                 // (more than one service claimed it) and `UnknownService` (none did).
                 assert!(
-                    code != "AmbiguousService" && code != "UnknownService",
+                    !ROUTER_REFUSALS.contains(&code.as_str()),
                     "case {case:?}: expected exactly one claiming service, got HTTP \
                      {status} {code}: {body}"
                 );

@@ -288,6 +288,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status: CONNECTION_STATUS_VALIDATING.to_string(),
                 status_message: None,
                 owed: Some(owed),
+                // Nothing has asked for this connection to be removed.
+                removal_due: None,
             },
         );
 

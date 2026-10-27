@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendCustomVerificationEmail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendCustomVerificationEmail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendCustomVerificationEmail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sends the custom verification email a template describes to an address, and
+//! adds that address to the account's identity list — after the account-wide
+//! restriction this operation carries: an account that has not been granted
+//! production access is refused before anything the request names is looked up.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +82,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -121,6 +118,26 @@ impl From<SendCustomVerificationEmailErrorModeled> for SendCustomVerificationEma
     fn from(modeled: SendCustomVerificationEmailErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// How this operation words the refusal of a call by an account that has not
+/// been granted production access.
+///
+/// The sentence states the condition the modelled error is documented to report,
+/// in the model's own words for this error class — `smithy_query(query="doc",
+/// shape="ProductionAccessNotGrantedException")` is "Indicates that the account
+/// has not been granted production access" — so it is about the ACCOUNT, not
+/// about the address, the template or the configuration set the request named,
+/// and carries no part of the request.
+const NO_PRODUCTION_ACCESS: &str = "The account has not been granted production access.";
+
+/// Refuse the message, as `MessageRejected` (HTTP 400): "Indicates that the
+/// action failed, and the message could not be sent."
+fn rejected(message: String) -> SendCustomVerificationEmailError {
+    SendCustomVerificationEmailErrorModeled::MessageRejected(MessageRejected {
+        message: Some(message),
+    })
+    .into()
 }
 
 /// The `SendCustomVerificationEmail` operation.
@@ -159,18 +176,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendCustomVerificationEmail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendCustomVerificationEmailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendCustomVerificationEmail"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let address = crate::state::addr_spec(&input.email_address).to_string();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all. Every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SendCustomVerificationEmail",
+            ));
+        };
+        let mut state = state.lock();
+
+        // The account-wide restriction, read before anything the request names:
+        // this operation is served only to an account that has been granted
+        // production access, whichever template, configuration set or address the
+        // request carries, so the call is refused with the error the model binds
+        // for exactly that and nothing is read or written.
+        if !state.account.production_access_granted {
+            return Err(
+                SendCustomVerificationEmailErrorModeled::ProductionAccessNotGrantedException(
+                    ProductionAccessNotGrantedException {
+                        message: Some(NO_PRODUCTION_ACCESS.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `EmailAddress` is modelled as a plain string, so a value that is not an
+        // address at all reaches here: the message could not be sent to it, and no
+        // identity it names could ever be verified.
+        if !crate::state::is_email_address(&address) {
+            return Err(rejected(crate::state::illegal_address_message(
+                &input.email_address,
+            )));
+        }
+
+        // A configuration set the send names must exist, as for every other send.
+        if let Some(configuration_set_name) = input.configuration_set_name.as_deref() {
+            if !state.configuration_sets.contains_key(configuration_set_name) {
+                return Err(
+                    SendCustomVerificationEmailErrorModeled::ConfigurationSetDoesNotExistException(
+                        ConfigurationSetDoesNotExistException {
+                            configuration_set_name: Some(configuration_set_name.to_string()),
+                            message: Some(format!(
+                                "Configuration set <{configuration_set_name}> does not exist."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "To use this operation, you must first create a custom verification
+        // email template": the message this call sends is that template, so a
+        // name the store does not hold is the modelled absence.
+        let Some(template) = state
+            .custom_verification_email_templates
+            .get(&input.template_name)
+        else {
+            return Err(
+                SendCustomVerificationEmailErrorModeled::CustomVerificationEmailTemplateDoesNotExistException(
+                    CustomVerificationEmailTemplateDoesNotExistException {
+                        custom_verification_email_template_name: Some(
+                            input.template_name.clone(),
+                        ),
+                        message: Some(format!(
+                            "Custom verification email template <{}> does not exist.",
+                            input.template_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The parts of the stored template this send needs, taken before the
+        // store is written to: the address it is sent FROM, and its subject.
+        let from_email_address = template.from_email_address.clone().unwrap_or_default();
+        let template_subject = template.template_subject.clone();
+
+        // The template's own sender must be a verified identity, which is what
+        // `FromEmailAddressNotVerifiedException` reports: "the sender address
+        // specified for a custom verification email is not verified, and is
+        // therefore not eligible to send the custom verification email". The same
+        // reading of a verified sender as every other send
+        // (`state::is_verified_sender`), so a verified domain covers its
+        // mailboxes here too.
+        if !state.is_verified_sender(&from_email_address) {
+            return Err(
+                SendCustomVerificationEmailErrorModeled::FromEmailAddressNotVerifiedException(
+                    FromEmailAddressNotVerifiedException {
+                        from_email_address: Some(from_email_address.clone()),
+                        message: Some(format!(
+                            "From email address <{from_email_address}> is not verified."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The verification message has one recipient, and it counts against the
+        // account's 24-hour quota like any other message SES sends for this
+        // account (`GetSendQuota$Max24HourSend`, "the maximum number of emails the
+        // user is allowed to send in a 24-hour interval"). A negative quota
+        // "signifies an unlimited quota" (the member's own documentation).
+        let now = SystemTime::now();
+        let quota = state.account.max_24_hour_send;
+        let already_sent = state.sent_last_24_hours(now);
+        if quota >= 0.0 && already_sent + 1.0 > quota {
+            return Err(rejected(crate::state::daily_quota_exceeded_message(
+                quota,
+                already_sent,
+            )));
+        }
+
+        // "Adds an email address to the list of identities for your Amazon SES
+        // account in the current Amazon Web Services Region and attempts to verify
+        // it": the same list, and the same recording of a verification, as
+        // `VerifyEmailIdentity`. The record is stored VERIFIED rather than
+        // pending, which is this store's one choice for every writer that adds an
+        // identity (`state::verify_identity` carries the reasoning): nothing here
+        // delivers the message, so nobody can follow the link in it, and a record
+        // left pending could never advance. A caller reading the address back
+        // therefore sees `Success` where AWS would still show `Pending` until the
+        // recipient confirms. `None` means the account is already at its identity
+        // limit, so the message is refused instead and nothing is logged.
+        if state
+            .verify_identity(&address, crate::state::IdentityType::EmailAddress)
+            .is_none()
+        {
+            return Err(rejected(format!(
+                "this account already holds the maximum of {} verified identities; delete one \
+                 before verifying {address}",
+                crate::state::MAX_IDENTITIES
+            )));
+        }
+
+        // The message is accepted: mint its id, log it, and answer with the id
+        // that was stored — never one computed from the request.
+        let message_id = state.new_message_id();
+        state.log_sent_message(crate::state::SentMessage {
+            message_id: message_id.clone(),
+            source: from_email_address,
+            destinations: vec![address],
+            // The subject is the template's, and its content is the template's
+            // own, which this log keeps no second copy of.
+            subject: crate::state::logged_text(template_subject.as_deref()),
+            body: None,
+            configuration_set: input.configuration_set_name.clone(),
+            tags: Vec::new(),
+            sent_at: now,
+        });
+
+        Ok(SendCustomVerificationEmailOutput {
+            message_id: Some(message_id),
+        })
     }
 }

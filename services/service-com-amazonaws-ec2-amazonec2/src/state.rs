@@ -915,6 +915,13 @@
 //! `TransitGatewayOptions$AssociationDefaultRouteTableId` and
 //! `$PropagationDefaultRouteTableId` report name that record.
 //!
+//! The ADDITIONAL route tables of a gateway ("You can use CreateTransitGatewayRouteTable to
+//! create additional transit gateway route tables", `CreateTransitGateway`) live in that
+//! same map, so one reader reports every route table of a gateway whichever call made it.
+//! An additional table holds neither default role, and it comes up on a due instant of its
+//! own ([`ComAmazonawsEc2Amazonec2State::transit_gateway_route_table_available_at`]) rather
+//! than with its gateway, which may have been `available` before the table was asked for.
+//!
 //! ## Virtual private gateways
 //!
 //! [`ComAmazonawsEc2Amazonec2State::vpn_gateways`] holds the account's virtual private
@@ -2969,6 +2976,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `CreateTransitGateway` makes (see the module docs). Ordered by id, the stable order
     /// every reader of it reports in.
     pub transit_gateway_route_tables: BTreeMap<String, TransitGatewayRouteTable>,
+    /// When each transit gateway route table's `pending` -> `available` transition falls
+    /// due, for the tables that have one of their own.
+    ///
+    /// A table `CreateTransitGatewayRouteTable` made has its own due instant, because it is
+    /// created on a gateway that may already be `available`: it comes up on the same
+    /// [`TRANSITION_DELAY`] as every other resource a create answers in a non-terminal
+    /// state. The DEFAULT table a `CreateTransitGateway` makes is not here — it comes up
+    /// with its gateway, off [`Self::transit_gateway_available_at`], which is the one
+    /// instant both move on.
+    pub transit_gateway_route_table_available_at: BTreeMap<String, Instant>,
     /// Which attachment propagates its routes into which transit gateway route table, by
     /// (`TransitGatewayRouteTableId`, `TransitGatewayAttachmentId`) — see
     /// [`TransitGatewayPropagationRecord`] and the module docs. One entry per pair, because
@@ -3558,6 +3575,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateways: BTreeMap::new(),
             transit_gateway_available_at: BTreeMap::new(),
             transit_gateway_route_tables: BTreeMap::new(),
+            transit_gateway_route_table_available_at: BTreeMap::new(),
             transit_gateway_propagations: BTreeMap::new(),
             vpn_gateways: BTreeMap::new(),
             transit_gateway_prefix_list_references: BTreeMap::new(),
@@ -6117,7 +6135,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// handed over `pending` becoming `available` and a subnet's own IPv6 association
     /// making that same `associating` -> `associated` move, a `pending` transit
     /// gateway with the route tables that come up
-    /// with it, a `pending` route server endpoint or route server peer becoming
+    /// with it (a route table a create ADDED to a gateway comes up on its own due instant),
+    /// a `pending` route server endpoint or route server peer becoming
     /// `available` (a route server's own two states are derived on read by
     /// [`RouteServerRecord::view_at`] instead), a VPC BPA exclusion reaching
     /// `create-complete`, a Windows fast
@@ -6500,6 +6519,26 @@ impl ComAmazonawsEc2Amazonec2State {
                     }
                 }
                 // The transition is applied once; nothing is owed on this gateway any more.
+                false
+            });
+        // A route table `CreateTransitGatewayRouteTable` added to a gateway comes up on its
+        // own due instant rather than with the gateway, which may have been `available`
+        // long before the table was asked for.
+        let route_tables = &mut self.transit_gateway_route_tables;
+        self.transit_gateway_route_table_available_at
+            .retain(|route_table_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(route_table) = route_tables.get_mut(route_table_id) {
+                    if route_table.state.as_deref()
+                        == Some(TRANSIT_GATEWAY_ROUTE_TABLE_STATE_PENDING)
+                    {
+                        route_table.state =
+                            Some(TRANSIT_GATEWAY_ROUTE_TABLE_STATE_AVAILABLE.to_string());
+                    }
+                }
+                // The transition is applied once; nothing is owed on this table any more.
                 false
             });
         // A route server, its endpoints and its peers come up the same way: each is
@@ -21247,6 +21286,73 @@ impl ComAmazonawsEc2Amazonec2State {
             .insert(transit_gateway_id.clone(), Instant::now() + TRANSITION_DELAY);
         transit_gateway_id
     }
+
+    /// Whether another transit gateway route table fits inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]).
+    ///
+    /// The same contract as [`Self::has_transit_gateway_capacity`]: a create asks first and
+    /// refuses when it answers `false`. The ceiling is this PROCESS's record ceiling, over
+    /// every route table the store holds, and not AWS's per-transit-gateway route table
+    /// quota — nothing here models that quota.
+    pub fn has_transit_gateway_route_table_capacity(&self) -> bool {
+        self.transit_gateway_route_tables.len() < MAX_STORED_RECORDS_PER_STORE
+    }
+
+    /// Insert an ADDITIONAL route table of `transit_gateway_id` in `pending`, and answer it
+    /// as stored — or `None` when the store is full.
+    ///
+    /// "You can use CreateTransitGatewayRouteTable to create additional transit gateway
+    /// route tables" (`CreateTransitGateway`): an additional table is neither of the
+    /// gateway's default tables, so both `DefaultAssociationRouteTable` and
+    /// `DefaultPropagationRouteTable` are reported `false` — only the table
+    /// [`Self::insert_transit_gateway`] creates is a default one, and only
+    /// `CreateTransitGateway`'s options decide which roles it holds.
+    ///
+    /// Everything the service owns is derived here rather than taken from the caller — the
+    /// id, the state and the clock-owed `available` move — so no two writers can report one
+    /// table differently. Like every other insert, the caller-chosen bytes of the record are
+    /// charged against the store's byte budget here, so a writer cannot store them
+    /// uncharged.
+    pub fn insert_transit_gateway_route_table(
+        &mut self,
+        transit_gateway_id: &str,
+        created_at: SystemTime,
+        tags: Vec<Tag>,
+    ) -> Option<TransitGatewayRouteTable> {
+        if !self.has_transit_gateway_route_table_capacity() {
+            return None;
+        }
+        let route_table_id = self.next_id(TRANSIT_GATEWAY_ROUTE_TABLE_ID_PREFIX);
+        let route_table = TransitGatewayRouteTable {
+            transit_gateway_route_table_id: Some(route_table_id.clone()),
+            transit_gateway_id: Some(transit_gateway_id.to_string()),
+            // The TRANSIENT state of a create, with the clock owing it `available`: the
+            // span is never zero, so a caller acting straight after this call still sees
+            // the table pending.
+            state: Some(TRANSIT_GATEWAY_ROUTE_TABLE_STATE_PENDING.to_string()),
+            default_association_route_table: Some(false),
+            default_propagation_route_table: Some(false),
+            creation_time: Some(system_time_to_date_time(created_at)),
+            tags: Some(tags),
+        };
+        self.add_stored_bytes(transit_gateway_route_table_payload_bytes(&route_table));
+        self.transit_gateway_route_table_available_at
+            .insert(route_table_id.clone(), Instant::now() + TRANSITION_DELAY);
+        self.transit_gateway_route_tables
+            .insert(route_table_id, route_table.clone());
+        Some(route_table)
+    }
+}
+
+/// The caller-chosen bytes one stored transit gateway route table holds: its tags.
+/// Everything else on the record — the two ids, the state, the default-role flags and the
+/// creation time — is derived by this module, so it is fixed-size.
+///
+/// The ONE definition of that charge: `CreateTransitGatewayRouteTable` asks it before the
+/// write and [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway_route_table`] charges
+/// exactly it, so a removal path must give back the same number.
+pub fn transit_gateway_route_table_payload_bytes(route_table: &TransitGatewayRouteTable) -> usize {
+    tag_list_bytes(route_table.tags.as_deref().unwrap_or_default())
 }
 
 /// The caller-chosen bytes one stored Elastic IP address holds: its tags. Everything else
@@ -22190,6 +22296,12 @@ pub const OPTION_DISABLE: &str = "disable";
 /// The `ResourceType` a `CreateTransitGateway` tag specification may name: the transit
 /// gateway it creates.
 pub const RESOURCE_TYPE_TRANSIT_GATEWAY: &str = "transit-gateway";
+
+/// The `ResourceType` a `CreateTransitGatewayRouteTable` tag specification may name: the
+/// transit gateway route table it creates ("The tags to apply to the transit gateway route
+/// table", `CreateTransitGatewayRouteTableRequest$TagSpecifications`), which is the
+/// `ResourceType` enum's `transit-gateway-route-table` member.
+pub const RESOURCE_TYPE_TRANSIT_GATEWAY_ROUTE_TABLE: &str = "transit-gateway-route-table";
 
 /// The ASN a transit gateway gets when the request names none: "The default is `64512`"
 /// (`TransitGatewayRequestOptions$AmazonSideAsn`).

@@ -15,8 +15,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+// The account's own AWS Outposts inventory, which `account_holds_outpost`
+// resolves an `OutpostArn` against: the Outposts live in that service's store,
+// so they are read through its own accessors.
+use ::service_com_amazonaws_outposts_outpostsolafservice::state as outposts;
+
 use crate::ops::types::{
-    FirewallConfig, FirewallDomainList, FirewallDomainListMetadata, InvalidParameterException,
+    AccessDeniedException, FirewallConfig, FirewallDomainList, FirewallDomainListMetadata,
+    InvalidParameterException,
     InvalidPolicyDocument, InvalidRequestException, IpAddressResponse, IpAddressUpdate,
     LimitExceededException, OutpostResolver, ResolverConfig, ResolverDnssecConfig, ResolverEndpoint,
     ResolverQueryLogConfig, ResolverQueryLogConfigAssociation, ResolverRule, ResolverRuleAssociation,
@@ -238,6 +244,16 @@ pub const RSLVR_CODE_FORWARD_RULE_FORWARDING_TARGET_REQUIRED: &str = "RSLVR-0070
 /// Resolver-on-Outpost write operations.
 pub const RSLVR_CODE_INSTANCE_COUNT_BELOW_MINIMUM: &str = "RSLVR-03002";
 
+/// The Route 53 Resolver service error code reported when a request asks for a
+/// Resolver on an Outpost that the account has not got.
+///
+/// Carried for the same reason as [`RSLVR_CODE_INSTANCE_COUNT_BELOW_MINIMUM`]:
+/// the create operation raises `ValidationException` for several distinct
+/// faults, so the code is the only discriminator between them. The model states
+/// no message text, so this code comes from the recorded responses of the
+/// Resolver-on-Outpost create operation.
+pub const RSLVR_CODE_OUTPOST_NOT_FOUND: &str = "RSLVR-03007";
+
 /// The Route 53 Resolver service error code reported when a request names a
 /// Resolver rule the service holds no rule under.
 ///
@@ -268,14 +284,17 @@ pub const RSLVR_CODE_RULE_IN_USE: &str = "RSLVR-00702";
 /// its rule/VPC pair and raises `ResourceNotFoundException`.
 pub const RSLVR_CODE_RULE_VPC_ASSOCIATION_NOT_FOUND: &str = "RSLVR-00800";
 
-/// The Route 53 Resolver service error code reported when a tag operation names
-/// a resource the service holds nothing under.
+/// The Route 53 Resolver service error code reported when a request names a
+/// resource the caller cannot address: one the service holds nothing under, and
+/// one it keeps to itself.
 ///
 /// Carried for the same reason as [`RSLVR_CODE_ENDPOINT_NOT_FOUND`]: the HTTP
 /// status (400) and the exception shape name together do not say which Resolver
 /// fault occurred, and the model states no message text, so this code comes
-/// from the recorded responses of the tag operations.
-pub const RSLVR_CODE_TAGGED_RESOURCE_NOT_FOUND: &str = "RSLVR-02025";
+/// from the recorded responses of the tag operations and of the DNS Firewall
+/// domain-list operations, which report this one code for every resource a
+/// caller names but cannot address. See [`resource_not_found_message`].
+pub const RSLVR_CODE_RESOURCE_NOT_FOUND: &str = "RSLVR-02025";
 
 /// `ResourceNotFoundException$ResourceType`, "the type of resource that doesn't
 /// exist": the modelled shape name of a Resolver endpoint.
@@ -426,6 +445,22 @@ pub fn rslvr_message(code: &str, sentence: &str) -> String {
     format!("[{code}] {sentence}.")
 }
 
+/// The message Route 53 Resolver answers for a resource the caller named but
+/// cannot address, with the id it named inside it.
+///
+/// ONE sentence for the whole class, because the service reports one
+/// ([`RSLVR_CODE_RESOURCE_NOT_FOUND`]) for it: a resource this account never
+/// created, and a resource the service publishes and keeps to itself. A caller
+/// that cannot address a resource learns nothing else about it — which is what
+/// makes a resource it may not write indistinguishable from one that does not
+/// exist.
+pub fn resource_not_found_message(resource_id: &str) -> String {
+    rslvr_message(
+        RSLVR_CODE_RESOURCE_NOT_FOUND,
+        &format!("Can’t find the resource with ID \"{resource_id}\""),
+    )
+}
+
 /// The `ResourceNotFoundException` every Resolver endpoint operation answers
 /// for an id it holds no endpoint under.
 ///
@@ -569,6 +604,61 @@ pub fn outpost_resolver_instance_count_below_minimum() -> ValidationException {
             ),
         )),
     }
+}
+
+/// The `ValidationException` the Resolver-on-Outpost create answers for an
+/// `OutpostArn` that names no Outpost of this account.
+///
+/// The sentence names the Outpost by the ARN the request supplied, verbatim, so
+/// the caller is told which value could not be resolved; the code
+/// ([`RSLVR_CODE_OUTPOST_NOT_FOUND`]) is what tells this fault apart from the
+/// operation's other `ValidationException` faults.
+pub fn outpost_not_found(outpost_arn: &str) -> ValidationException {
+    ValidationException {
+        message: Some(rslvr_message(
+            RSLVR_CODE_OUTPOST_NOT_FOUND,
+            &format!(r#"Cannot find the Outpost with Arn "{outpost_arn}""#),
+        )),
+    }
+}
+
+/// Whether the account holds, in `region`, the Outpost `outpost_arn` names.
+///
+/// A Resolver on an Outpost runs ON an Outpost: which Outposts exist is a fact
+/// of the account's own AWS Outposts inventory — the one `ListOutposts` answers
+/// from — and not a value this service's caller supplies, so this is the one
+/// place that resolution happens. The Outposts records live in that service's
+/// own store and are resolved through its own accessors, so one Outpost is
+/// never described by two services differently.
+///
+/// An Outpost is identified within the Region it is racked in, so only an ARN
+/// naming an Outpost OF `region` (and of this endpoint's partition and account)
+/// resolves: an ARN of another Region names nothing this endpoint holds, which
+/// is exactly how that service answers a call naming it.
+///
+/// LOCKING. The Outposts store lock is taken for the single lookup that answers
+/// this and is released before returning; handlers call this BEFORE taking this
+/// service's own lock, so the two stores are never held at once. AWS Outposts
+/// never reaches this service, so no cycle exists.
+pub fn account_holds_outpost<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    outpost_arn: &str,
+) -> bool {
+    let Some(outpost_id) = outposts::resolve_outpost_id(outpost_arn, region)
+        .as_ref()
+        .and_then(outposts::ResolvedIdentifier::here)
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    let Some(state) = outposts::service_state(engine) else {
+        // No Outposts store on this engine is no Outpost inventory to read, so
+        // the account holds no Outpost to put a Resolver on.
+        return false;
+    };
+    let store = state.lock();
+    store.outpost(region, &outpost_id).is_some()
 }
 
 /// The `InvalidRequestException` the rule write path answers for a rule that
@@ -979,17 +1069,20 @@ pub fn name_satisfies_pattern(name: &str) -> bool {
 }
 
 /// The `ResourceNotFoundException` the firewall domain-list operations answer
-/// for an id they hold no list under, built here so every operation that
-/// resolves a `FirewallDomainListId` reports the same body. See
-/// [`outpost_resolver_not_found`] on the absent `RSLVR-nnnnn` service error
-/// code.
+/// for a list the caller cannot address, built here so every operation that
+/// resolves a `FirewallDomainListId` reports the same body.
+///
+/// It is the answer both for an id this account created no list under and for
+/// one that names a list DNS Firewall publishes itself on a path that would
+/// WRITE it ([`managed_firewall_domain_list`]): a published list is the
+/// service's own, so nothing this account does changes it and it is not visible
+/// as a writable resource at all. Reporting one body for both is what makes
+/// those two indistinguishable, as [`resource_not_found_message`] describes.
 pub fn firewall_domain_list_not_found(
     firewall_domain_list_id: &str,
 ) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            r#"Firewall domain list with ID "{firewall_domain_list_id}" does not exist."#
-        )),
+        message: Some(resource_not_found_message(firewall_domain_list_id)),
         resource_type: Some(RESOURCE_TYPE_FIREWALL_DOMAIN_LIST.to_string()),
     }
 }
@@ -1141,11 +1234,18 @@ impl ManagedFirewallDomainList {
             id: Some(self.id()),
             arn: Some(self.arn(region)),
             name: Some(self.name.to_string()),
-            // The domains of a managed list are the service's, not this
-            // account's: nothing here holds them, so no count is claimed for
-            // them. `CreationTime`/`ModificationTime` are equally unknown — no
-            // call of this account created or last changed the list.
-            domain_count: None,
+            // `DomainCount` is "the number of domain names that are specified
+            // in the domain list": the domains of a published list are the
+            // service's own and are held nowhere here
+            // ([`managed_firewall_domain_list_access_denied`] is what a request
+            // for them is answered with), so the count this reports is the
+            // count this store holds for the list — none — exactly as a stored
+            // record's count is derived from its own domains
+            // ([`FirewallDomainListRecord::domain_count`]) rather than claimed.
+            // `CreationTime`/`ModificationTime` are unknown — no call of this
+            // account created or last changed the list — so neither is
+            // invented.
+            domain_count: Some(0),
             status: Some(FIREWALL_DOMAIN_LIST_STATUS_COMPLETE.to_string()),
             status_message: None,
             managed_owner_name: Some(MANAGED_FIREWALL_DOMAIN_LIST_OWNER.to_string()),
@@ -1168,6 +1268,27 @@ pub fn managed_firewall_domain_list(id: &str) -> Option<&'static ManagedFirewall
     MANAGED_FIREWALL_DOMAIN_LISTS
         .iter()
         .find(|managed| managed.id() == id)
+}
+
+/// The `AccessDeniedException` `ListFirewallDomains` answers for a list DNS
+/// Firewall publishes itself.
+///
+/// The domains of a published list are the service's own threat intelligence,
+/// not this account's data: the list is readable as a resource
+/// ([`ManagedFirewallDomainList::to_domain_list`]) while the domains inside it
+/// are not readable at all, which the model's `AccessDeniedException` ("the
+/// current account doesn't have the IAM permissions required to perform the
+/// specified Resolver operation") is the modelled answer for. The sentence
+/// states the fault and names the kind of list it is about — the owner every
+/// published list reports ([`MANAGED_FIREWALL_DOMAIN_LIST_OWNER`]) — and
+/// carries nothing from the request.
+pub fn managed_firewall_domain_list_access_denied() -> AccessDeniedException {
+    AccessDeniedException {
+        message: Some(format!(
+            "You don't have a permission to list the domains inside a \
+             {MANAGED_FIREWALL_DOMAIN_LIST_OWNER} managed list."
+        )),
+    }
 }
 
 /// A firewall domain list, as stored.
@@ -2649,13 +2770,7 @@ pub fn arn_resource_id(resource_arn: &str) -> &str {
 /// for.
 pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(rslvr_message(
-            RSLVR_CODE_TAGGED_RESOURCE_NOT_FOUND,
-            &format!(
-                "Can’t find the resource with ID \"{}\"",
-                arn_resource_id(resource_arn)
-            ),
-        )),
+        message: Some(resource_not_found_message(arn_resource_id(resource_arn))),
         resource_type: arn_resource_type(resource_arn).map(str::to_string),
     }
 }

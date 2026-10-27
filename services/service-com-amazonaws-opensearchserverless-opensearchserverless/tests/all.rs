@@ -29,6 +29,8 @@ mod collection_lifecycle;
 mod encryption_indexes_and_tagging;
 #[path = "all/lifecycle_policy.rs"]
 mod lifecycle_policy;
+#[path = "all/minted_identifiers.rs"]
+mod minted_identifiers;
 #[path = "all/policies_stats.rs"]
 mod policies_stats;
 #[path = "all/policy_and_group_writes.rs"]

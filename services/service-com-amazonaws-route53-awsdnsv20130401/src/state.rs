@@ -2276,26 +2276,22 @@ pub fn apply_tag_changes(
 /// traffic policy in this store.
 ///
 /// The ONE place this service words that refusal, so every operation addressed
-/// at a traffic policy answers a missing one identically. The message is
-/// REQUEST-DERIVED — it names what the request asked about. An operation
-/// addressed at ONE VERSION of a policy (`GetTrafficPolicy` takes `(Id,
-/// Version)`) passes that version, and the refusal names it too, which is what
-/// tells a caller whether the policy or the version was the missing half; an
-/// operation addressed at the POLICY passes `None`, because such a request
-/// names no version to report as missing.
-pub fn no_such_traffic_policy(
-    requested_id: &str,
-    requested_version: Option<i32>,
-) -> NoSuchTrafficPolicy {
+/// at a traffic policy answers a missing one identically — whichever half of
+/// `(Id, Version)` the store does not hold, and whether the request named a
+/// version at all. Route 53 words this refusal as one fixed sentence about the
+/// resource class, with no part of it taken from the request, so the message
+/// takes no argument: a caller learns WHAT it asked about from its own request.
+pub fn no_such_traffic_policy() -> NoSuchTrafficPolicy {
     NoSuchTrafficPolicy {
-        message: Some(match requested_version {
-            Some(version) => format!(
-                "No traffic policy exists with ID {requested_id} and version {version}"
-            ),
-            None => format!("No traffic policy exists with ID {requested_id}"),
-        }),
+        message: Some(NO_SUCH_TRAFFIC_POLICY_MESSAGE.to_string()),
     }
 }
+
+/// The sentence `NoSuchTrafficPolicy` carries.
+///
+/// `pub` so a test asserts the wording through the constant the handlers answer
+/// with rather than a second copy of the text.
+pub const NO_SUCH_TRAFFIC_POLICY_MESSAGE: &str = "The policy does not exist.";
 
 /// The modelled `NoSuchTrafficPolicyInstance` (HTTP 404) for a request that
 /// names no traffic policy instance in this store.

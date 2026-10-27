@@ -257,11 +257,12 @@ async fn reports_every_entity_a_policy_relates_with_its_stored_id() {
             "case {case:?}: expected the users {:?}, got {users:?}",
             expected_users(index, None, "/")
         );
-        // No group can be persisted yet (`CreateGroup` answers 501), so the account
-        // relates no group to any policy.
+        // This suite creates no group, so no group carries an attachment to any
+        // fixture policy and none can be related to one (a group's attachments are
+        // asserted by `tests/all/group_attached_policies.rs`).
         assert!(
             elements(&body, "GroupName").is_empty(),
-            "case {case:?}: the account holds no group, so none can be reported: {body}"
+            "case {case:?}: no group carries an attachment, so none can be reported: {body}"
         );
 
         // Each entity is reported under the id its create MINTED.
@@ -384,7 +385,7 @@ async fn entity_filter_selects_only_that_entity_type() {
             );
             assert!(
                 elements(&body, "GroupName").is_empty(),
-                "case {case:?}: the account holds no group, so none can be reported: {body}"
+                "case {case:?}: no group carries an attachment, so none can be reported: {body}"
             );
         }
     }

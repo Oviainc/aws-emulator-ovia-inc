@@ -336,23 +336,32 @@ pub const MAX_IDEMPOTENCY_TOKENS: usize = 1_024;
 
 /// The number of characters a minted `CollectionId` carries. `CollectionId` is
 /// `@length(min: 3, max: 40)` with `@pattern("^[a-z0-9]{3,40}$")`; 24 sits inside that and
-/// keeps `36^24` inside a `u128` so [`ID_MULTIPLIER`]'s bijection can be computed.
+/// keeps `36^24` inside a `u128`, so a single draw renders a whole id.
 const ID_LEN: u32 = 24;
 
 /// The characters a `CollectionId` is built from: exactly the pattern's class.
 const ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
+/// The radix [`render_id`] renders a draw in — the size of [`ID_ALPHABET`].
+const ID_BASE: u128 = ID_ALPHABET.len() as u128;
+
 /// The number of distinct ids [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::mint_collection_id`] can render: `36^24`.
-const ID_SPACE: u128 = 36u128.pow(ID_LEN);
+const ID_SPACE: u128 = ID_BASE.pow(ID_LEN);
 
-/// Scrambles consecutive seeds across [`ID_SPACE`]. Prime and neither 2 nor 3, so it is
-/// coprime with `36^24 = 2^48 * 3^48`, which makes
-/// `seed -> seed * MULTIPLIER + OFFSET (mod ID_SPACE)` a BIJECTION: distinct seeds can
-/// never mint the same collection id.
-const ID_MULTIPLIER: u128 = 1_000_000_007;
+/// How many draws one mint takes before it keeps the last one.
+///
+/// A fresh draw lands on an id already stored only by chance out of [`ID_SPACE`], so the
+/// first draw is almost always the answer; re-drawing on a collision is what keeps the ids
+/// of two live resources distinct, and the bound keeps a mint off an unbounded loop.
+const ID_MINT_ATTEMPTS: usize = 8;
 
-/// The bijection's constant term, so the first id minted is not a run of leading `a`s.
-const ID_OFFSET: u128 = 734_291;
+/// The number of random bytes behind one minted `PolicyVersion`.
+///
+/// `PolicyVersion` is `@length(min: 20, max: 36)` with
+/// `@pattern("^([0-9a-zA-Z+/]{4})*(([0-9a-zA-Z+/]{2}==)|([0-9a-zA-Z+/]{3}=))?$")`, a
+/// base64-shaped token: 18 bytes encode to exactly 24 base64 characters, which sits inside
+/// the length bound, is a whole number of four-character groups and so carries no padding.
+const POLICY_VERSION_BYTES: usize = 18;
 
 /// The `errorMessage` a `CollectionGroupErrorDetail` carries for an id or name that names
 /// no collection group, from `CollectionGroupErrorDetail$errorMessage`'s own
@@ -416,6 +425,78 @@ pub fn now_epoch_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or_default()
+}
+
+/// 32 fresh bytes behind ONE minted identifier or version token.
+///
+/// The seed is what the standard library offers without reaching for another crate:
+/// `RandomState`, which std seeds randomly once per process and varies per instance, plus
+/// the clock and a per-process mint counter, so two values minted in the same instant — or
+/// by two engines in the same process — still differ. SHA-256 spreads the seed so none of
+/// its structure shows in the value. A `CollectionId` and a `PolicyVersion` are
+/// identifiers, not secrets: this is a uniqueness and opacity source, and nothing drawn
+/// here is used as a credential.
+fn random_bytes() -> [u8; 32] {
+    use ::sha2::Digest as _;
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher as _, Hasher as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// How many values this process has minted, so the seed never repeats within it.
+    static MINTED: AtomicU64 = AtomicU64::new(0);
+
+    let mut digest = ::sha2::Sha256::new();
+    for _ in 0..2 {
+        digest.update(RandomState::new().build_hasher().finish().to_le_bytes());
+    }
+    digest.update(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    digest.update(MINTED.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    digest.finalize().into()
+}
+
+/// One draw out of [`ID_SPACE`], the value [`render_id`] renders an id from.
+fn draw_id_value() -> u128 {
+    let bytes = random_bytes();
+    let mut draw = [0_u8; 16];
+    draw.copy_from_slice(&bytes[..16]);
+    u128::from_be_bytes(draw) % ID_SPACE
+}
+
+/// Render `draw` as [`ID_LEN`] characters of [`ID_ALPHABET`] — the `^[a-z0-9]{3,40}$`
+/// shape a `CollectionId` and a `CollectionGroupId` both carry.
+///
+/// Every position comes out of the draw, so each one ranges over the whole alphabet
+/// instead of filling with whatever character the radix conversion ran out on.
+fn render_id(draw: u128) -> String {
+    let mut remaining = draw % ID_SPACE;
+    let mut id = Vec::with_capacity(ID_LEN as usize);
+    for _ in 0..ID_LEN {
+        let digit = usize::try_from(remaining % ID_BASE).unwrap_or(0);
+        id.push(ID_ALPHABET[digit]);
+        remaining /= ID_BASE;
+    }
+    String::from_utf8(id).unwrap_or_default()
+}
+
+/// Mint a fresh `PolicyVersion`: [`POLICY_VERSION_BYTES`] drawn bytes, base64-encoded.
+///
+/// The codec is `aws_smithy_types::base64`, the standard-alphabet encoder the wire
+/// serializer itself uses, so the token is drawn from exactly the characters
+/// `PolicyVersion`'s pattern admits.
+///
+/// The token is drawn rather than derived, so it is opaque — it carries neither the write
+/// instant nor a counter a caller could read a write order out of — and a write never
+/// mints the version an earlier write did, which is what makes it usable as the
+/// optimistic-concurrency precondition `Update*Policy` and `UpdateSecurityConfig` check.
+pub fn mint_policy_version() -> String {
+    let bytes = random_bytes();
+    ::aws_smithy_types::base64::encode(&bytes[..POLICY_VERSION_BYTES])
 }
 
 /// The region this request is signed for, which is the region its collections' ARNs and
@@ -933,7 +1014,7 @@ impl AccountSettingsRecord {
 /// stored value, so a member the request did not name keeps what is stored — the same
 /// partial-write rule [`AccountSettingsRecord::apply`] follows. The other two members are
 /// server-derived: every write mints a fresh `policyVersion`
-/// (see [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`])
+/// (see [`mint_policy_version`])
 /// and stamps `lastModifiedDate`.
 #[derive(Debug, Clone)]
 pub struct PolicyWrite {
@@ -975,7 +1056,7 @@ pub struct SecurityPolicyRecord {
     pub kind: String,
     pub name: String,
     /// The `PolicyVersion` token, re-minted on every write; see
-    /// [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`].
+    /// [`mint_policy_version`].
     pub policy_version: String,
     pub description: Option<String>,
     /// The policy document, held PARSED so a read answers "the JSON policy document
@@ -1303,7 +1384,7 @@ pub struct SecurityConfigRecord {
     /// The `SecurityConfigType` wire value; named `kind` because `type` is a Rust keyword.
     pub kind: String,
     /// The `PolicyVersion` token `configVersion` carries, re-minted on every write; see
-    /// [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`].
+    /// [`mint_policy_version`].
     pub config_version: String,
     pub description: Option<String>,
     /// Set exactly for a `saml` configuration, which is the type whose options are
@@ -1389,7 +1470,7 @@ impl SecurityConfigRecord {
 /// request did not name keeps its stored value — the same partial-write rule
 /// [`PolicyWrite`] follows. The other two members are server-derived: every write mints a
 /// fresh `configVersion`
-/// (see [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`])
+/// (see [`mint_policy_version`])
 /// and stamps `lastModifiedDate`.
 #[derive(Debug, Clone)]
 pub struct SecurityConfigWrite {
@@ -1421,7 +1502,7 @@ pub struct AccessPolicyRecord {
     pub kind: String,
     pub name: String,
     /// The `PolicyVersion` token, re-minted on every write; see
-    /// [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`].
+    /// [`mint_policy_version`].
     pub policy_version: String,
     pub description: Option<String>,
     /// The policy document, held PARSED so a read answers "the JSON policy document
@@ -1615,7 +1696,7 @@ pub struct LifecyclePolicyRecord {
     pub kind: String,
     pub name: String,
     /// The `PolicyVersion` token, re-minted on every write; see
-    /// [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`].
+    /// [`mint_policy_version`].
     pub policy_version: String,
     pub description: Option<String>,
     /// The policy document, held PARSED so a read answers "the JSON policy document
@@ -1899,14 +1980,6 @@ pub struct ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// The order [`Self::idempotency_tokens`] was written in, so the cap evicts the
     /// oldest token first.
     idempotency_token_order: VecDeque<String>,
-    /// Drives [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::mint_collection_id`] and
-    /// [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::mint_collection_group_id`]; see [`ID_MULTIPLIER`] for how an
-    /// id is derived from it. ONE seed serves both, so a collection and a collection group
-    /// can never be minted the same id.
-    pub id_seed: u64,
-    /// Drives [`ComAmazonawsOpensearchserverlessOpensearchserverlessState::next_policy_version`], so two writes in the same
-    /// millisecond still mint different versions.
-    pub policy_version_seed: u32,
     /// The account's own OCU capacity settings: `GetAccountSettings` reports them and
     /// `UpdateAccountSettings` writes them. Defaulted rather than optional, because an
     /// account always has limits — see [`AccountSettingsRecord`].
@@ -1978,47 +2051,43 @@ impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
     /// Mint a fresh `CollectionId`: [`ID_LEN`] lowercase alphanumeric characters, the
     /// shape `^[a-z0-9]{3,40}$` admits.
     ///
-    /// The id is derived from a counter through the bijection described on
-    /// [`ID_MULTIPLIER`], so it is unpredictable-looking yet never repeats.
-    pub fn mint_collection_id(&mut self) -> String {
+    /// Every character is DRAWN (see [`random_bytes`]), so the id carries no structure a
+    /// caller can read — no counter, no clock, no filler — and two collections, in this
+    /// store or in another process, never carry the same one.
+    pub fn mint_collection_id(&self) -> String {
         self.mint_id()
     }
 
     /// Mint a fresh `CollectionGroupId`. `CollectionGroupId` carries the same
-    /// `@length(min: 3, max: 40)` and `^[a-z0-9]{3,40}$` as `CollectionId`, so it is
-    /// minted the same way and from the same seed; see [`Self::mint_collection_id`].
-    pub fn mint_collection_group_id(&mut self) -> String {
+    /// `@length(min: 3, max: 40)` and `^[a-z0-9]{3,40}$` as `CollectionId`, so it is minted
+    /// the same way and against the same stored ids; see [`Self::mint_collection_id`].
+    pub fn mint_collection_group_id(&self) -> String {
         self.mint_id()
     }
 
-    /// The next id out of the bijection on [`ID_MULTIPLIER`], shared by every resource of
-    /// this service whose id shape is `^[a-z0-9]{3,40}$`.
-    fn mint_id(&mut self) -> String {
-        self.id_seed = self.id_seed.wrapping_add(1);
-        let mut scrambled = (u128::from(self.id_seed) * ID_MULTIPLIER + ID_OFFSET) % ID_SPACE;
-        let mut id = Vec::with_capacity(ID_LEN as usize);
-        for _ in 0..ID_LEN {
-            let digit = usize::try_from(scrambled % 36).unwrap_or(0);
-            id.push(ID_ALPHABET[digit]);
-            scrambled /= 36;
+    /// A drawn id no live resource of this service already carries, shared by every
+    /// resource whose id shape is `^[a-z0-9]{3,40}$`.
+    ///
+    /// A draw is answered as soon as [`Self::id_in_use`] says it is free; one already in
+    /// use is re-drawn, [`ID_MINT_ATTEMPTS`] draws in all. The last of them is answered
+    /// unchecked, which takes every one of those draws colliding — a run no store reaches
+    /// against [`ID_SPACE`].
+    fn mint_id(&self) -> String {
+        let mut drawn = render_id(draw_id_value());
+        for _ in 1..ID_MINT_ATTEMPTS {
+            if !self.id_in_use(&drawn) {
+                return drawn;
+            }
+            drawn = render_id(draw_id_value());
         }
-        String::from_utf8(id).unwrap_or_default()
+        drawn
     }
 
-    /// Mint the next `PolicyVersion` for a policy written at `written_at`.
-    ///
-    /// `PolicyVersion` is `@length(min: 20, max: 36)` with
-    /// `@pattern("^([0-9a-zA-Z+/]{4})*(([0-9a-zA-Z+/]{2}==)|([0-9a-zA-Z+/]{3}=))?$")`, so
-    /// the token is the hex of the write instant followed by a per-process counter: 24
-    /// characters out of `[0-9a-f]`, which is six groups of four from the pattern's class
-    /// and no padding. The counter is what makes two writes in the same millisecond mint
-    /// different versions, so the version changes on EVERY write.
-    pub fn next_policy_version(&mut self, written_at: i64) -> String {
-        self.policy_version_seed = self.policy_version_seed.wrapping_add(1);
-        let mut bytes = [0u8; 12];
-        bytes[..8].copy_from_slice(&written_at.to_be_bytes());
-        bytes[8..].copy_from_slice(&self.policy_version_seed.to_be_bytes());
-        hex::encode(bytes)
+    /// Whether a live collection or collection group is stored under `id`. Both resources
+    /// are checked, because both are addressed by an id of the one shape and a client maps
+    /// them by that id.
+    fn id_in_use(&self, id: &str) -> bool {
+        self.collections.contains_key(id) || self.collection_groups.contains_key(id)
     }
 
     /// The collection `name` resolves to, if one is stored under it.

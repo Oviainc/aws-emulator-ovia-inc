@@ -1370,6 +1370,10 @@ async fn refusals_carry_the_modelled_status_and_code() {
             "InvalidParameterCombinationException",
         ),
         (
+            // `Statistics` and `ExtendedStatistics` are an either/or combination ("you must
+            // specify either Statistics or ExtendedStatistics, but not both"), so a request
+            // naming neither breaks that combination rather than omitting one required
+            // member.
             "no statistic at all",
             "GetMetricStatistics",
             json!({
@@ -1380,7 +1384,7 @@ async fn refusals_carry_the_modelled_status_and_code() {
                 "Period": 60,
             }),
             400,
-            "MissingRequiredParameterException",
+            "InvalidParameterCombinationException",
         ),
         (
             "an extended statistic that is not a percentile, over an empty range",

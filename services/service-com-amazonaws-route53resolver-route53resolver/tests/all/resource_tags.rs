@@ -11,12 +11,13 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_route53resolver_route53resolver::state::{
-    MAX_TAGS_PER_RESOURCE, RSLVR_CODE_TAGGED_RESOURCE_NOT_FOUND,
+    MAX_TAGS_PER_RESOURCE, RSLVR_CODE_RESOURCE_NOT_FOUND,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    call, emulator, error_type, expect_error, ok, string_member, ACCOUNT, REGION,
+    call, emulator_with_outposts, error_type, expect_error, ok, rack_outpost, string_member,
+    ACCOUNT, REGION,
 };
 
 /// Every resource of this service a tag operation addresses, named by the
@@ -77,9 +78,10 @@ async fn create_resource(
                 "CreatorRequestId": creator,
                 "Name": creator,
                 "PreferredInstanceType": "m5.large",
-                // `OutpostArn`'s documented pattern
-                // `^arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:outpost/op-[a-f0-9]{17}$`.
-                "OutpostArn": "arn:aws:outposts:us-west-2:123456789012:outpost/op-0123456789abcdef0",
+                // A Resolver on an Outpost sits on an Outpost the account has,
+                // so one is racked for it through the Outposts API and its own
+                // minted `OutpostArn` is what this create names.
+                "OutpostArn": rack_outpost(router, REGION, creator).await,
             }),
         ),
         "firewall-domain-list" => (
@@ -327,7 +329,7 @@ fn lifecycle_rows() -> Vec<Row> {
 /// pinned to one resource kind.
 #[tokio::test]
 async fn a_tag_write_is_read_back_for_every_taggable_resource() {
-    let router = emulator();
+    let router = emulator_with_outposts();
 
     for kind in RESOURCE_KINDS {
         let creator = format!("tag-lifecycle-{kind}");
@@ -383,7 +385,7 @@ async fn a_tag_write_is_read_back_for_every_taggable_resource() {
 /// tags live in ONE place, whichever operation wrote them.
 #[tokio::test]
 async fn tags_given_at_create_are_the_tags_the_tag_operations_see() {
-    let router = emulator();
+    let router = emulator_with_outposts();
 
     for kind in RESOURCE_KINDS {
         let creator = format!("tag-at-create-{kind}");
@@ -432,7 +434,7 @@ async fn tags_given_at_create_are_the_tags_the_tag_operations_see() {
 /// two resources are of the same kind.
 #[tokio::test]
 async fn a_tag_write_reaches_only_the_resource_its_arn_names() {
-    let router = emulator();
+    let router = emulator_with_outposts();
     let first = create_resource(&router, "firewall-domain-list", "tag-isolation-one", None).await;
     let second = create_resource(&router, "firewall-domain-list", "tag-isolation-two", None).await;
     let other_kind = create_resource(&router, "resolver-rule", "tag-isolation-rule", None).await;
@@ -482,7 +484,7 @@ async fn a_tag_write_reaches_only_the_resource_its_arn_names() {
 /// persists nothing, and never a tag set it invented.
 #[tokio::test]
 async fn an_arn_no_resource_is_stored_under_is_reported_as_missing() {
-    let router = emulator();
+    let router = emulator_with_outposts();
     let present = create_resource(&router, "firewall-domain-list", "tag-present", None).await;
     ok(
         &router,
@@ -523,7 +525,7 @@ async fn an_arn_no_resource_is_stored_under_is_reported_as_missing() {
         // The refusal states the service error code and names the resource by
         // the id its ARN carries.
         let expected_message = format!(
-            "[{RSLVR_CODE_TAGGED_RESOURCE_NOT_FOUND}] Can’t find the resource with ID \"{}\".",
+            "[{RSLVR_CODE_RESOURCE_NOT_FOUND}] Can’t find the resource with ID \"{}\".",
             arn.rsplit_once('/').map_or(arn.as_str(), |(_, id)| id)
         );
         for (operation, body) in [
@@ -565,7 +567,7 @@ async fn an_arn_no_resource_is_stored_under_is_reported_as_missing() {
 /// `InvalidNextTokenException` the operation models.
 #[tokio::test]
 async fn the_tag_page_is_cut_at_max_results_and_resumed_by_its_cursor() {
-    let router = emulator();
+    let router = emulator_with_outposts();
     let arn = create_resource(&router, "resolver-endpoint", "tag-paging", None).await;
     let other = create_resource(&router, "resolver-endpoint", "tag-paging-other", None).await;
 
@@ -630,7 +632,7 @@ async fn the_tag_page_is_cut_at_max_results_and_resumed_by_its_cursor() {
 /// empty string.
 #[tokio::test]
 async fn a_tag_outside_the_modelled_constraints_is_refused() {
-    let router = emulator();
+    let router = emulator_with_outposts();
     let arn = create_resource(&router, "firewall-domain-list", "tag-constraints", None).await;
     let held = vec![pair("team", "net")];
     ok(&router, "TagResource", tag_request(&arn, &held)).await;
@@ -685,7 +687,7 @@ async fn a_tag_outside_the_modelled_constraints_is_refused() {
 /// and a write that only updates keys already held is still served at the cap.
 #[tokio::test]
 async fn a_write_past_the_tag_ceiling_is_refused_and_persists_nothing() {
-    let router = emulator();
+    let router = emulator_with_outposts();
     let arn = create_resource(&router, "firewall-domain-list", "tag-ceiling", None).await;
 
     let full: Vec<(String, String)> = (0..MAX_TAGS_PER_RESOURCE)

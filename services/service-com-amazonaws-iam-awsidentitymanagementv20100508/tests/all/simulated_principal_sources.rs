@@ -101,11 +101,13 @@ struct Case {
 }
 
 /// Rows spanning the three entity kinds a policy source may name and both places a
-/// document in force on one comes from. A group carries no MANAGED row because
-/// `AttachGroupPolicy` is still a scaffolded 501, so no group the account holds can
-/// carry a managed attachment to simulate from; the group's inline row covers the
-/// kind. The names span the `^[\w+=,.@-]+$` alphabet and both name cases, so the
-/// rule is not pinned to one spelling.
+/// document in force on one comes from. The group's row is the INLINE one, which
+/// covers the kind; a group's managed attachments are asserted end to end by
+/// `tests/all/group_attached_policies.rs` and
+/// `tests/all/group_attached_policy_listing.rs`, which drive the same collection
+/// through the simulation and the context-key reader. The names span the
+/// `^[\w+=,.@-]+$` alphabet and both name cases, so the rule is not pinned to one
+/// spelling.
 const CASES: &[Case] = &[
     Case {
         case: "a user's inline policy",

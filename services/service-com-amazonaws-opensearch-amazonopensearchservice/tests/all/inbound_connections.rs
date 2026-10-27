@@ -41,7 +41,7 @@ use super::cross_cluster_connections::{
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
 
 /// `DescribeInboundConnections`: `POST /opensearch/cc/inboundConnection/search`.
-async fn describe_inbound(emulator: &Emulator, body: Value) -> Answer {
+pub(crate) async fn describe_inbound(emulator: &Emulator, body: Value) -> Answer {
     emulator
         .call(
             "POST",

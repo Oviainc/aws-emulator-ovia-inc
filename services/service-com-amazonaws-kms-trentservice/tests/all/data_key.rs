@@ -36,6 +36,26 @@ const KEY_MATERIAL_ID_LEN: usize = 64;
 /// must not see it.
 const RESPONSE_MEMBERS: [&str; 4] = ["CiphertextBlob", "Plaintext", "KeyId", "KeyMaterialId"];
 
+/// The shortest data key for which two consecutive draws can be required to
+/// differ.
+///
+/// A drawn key of fewer bytes than this collides often enough to be seen: two
+/// one-byte keys are the same value once in 256 draws, so requiring one pair to
+/// differ would fail runs in which nothing is wrong. Those rows assert the same
+/// rule over [`SHORT_KEY_DRAWS`] draws instead. The threshold is the one the
+/// ciphertext-containment assertion in this file already uses for the same
+/// reason.
+const MIN_UNIQUE_BY_PAIR_BYTES: usize = 8;
+
+/// How many data keys a row shorter than [`MIN_UNIQUE_BY_PAIR_BYTES`] draws
+/// before asserting that they are not all the same value.
+///
+/// Enough that every draw coming back equal is not something a run will see by
+/// chance (for a one-byte key, 256 to the power of -23), while a key that is
+/// derived from the request rather than drawn — the defect the assertion is
+/// about — is the same value every time and still fails.
+const SHORT_KEY_DRAWS: usize = 24;
+
 /// How a row states the length of the data key it asks for.
 #[derive(Clone, Copy)]
 enum Length {
@@ -251,10 +271,26 @@ async fn both_copies_are_the_same_data_key_of_the_requested_length() {
                  got {} bytes",
                 other.len()
             );
-            assert_ne!(
-                plaintext, other,
-                "case {case}: two calls must draw two different data keys"
-            );
+            if row.bytes >= MIN_UNIQUE_BY_PAIR_BYTES {
+                assert_ne!(
+                    plaintext, other,
+                    "case {case}: two calls must draw two different data keys"
+                );
+            } else {
+                // A key this short can repeat by chance, so the rule is asserted over a
+                // sample of draws rather than over one pair.
+                let mut drawn = vec![plaintext.clone(), other.clone()];
+                while drawn.len() < SHORT_KEY_DRAWS {
+                    let again = ok(&router, OPERATION, &body).await;
+                    drawn.push(both_copies(&case, &again).0);
+                }
+                let distinct: std::collections::BTreeSet<&Vec<u8>> = drawn.iter().collect();
+                assert!(
+                    distinct.len() > 1,
+                    "case {case}: {SHORT_KEY_DRAWS} calls must not all draw the same data key, \
+                     got {drawn:?}"
+                );
+            }
             assert_ne!(
                 blob, other_blob,
                 "case {case}: two calls must answer two different ciphertexts"

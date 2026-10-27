@@ -58,9 +58,11 @@ use std::sync::Arc;
 /// (`smithy_query(query="shape",shape="AccessDeniedException")`). AWS's own text
 /// embeds the caller's ARN and the action, which is account-specific; the
 /// requirement is the 403 classification, so the modelled sentence is what this
-/// states.
+/// states — taken from [`crate::state::ACCESS_DENIED_MESSAGE`], where every
+/// client error of this service is worded, so this seam and the handlers that
+/// raise the same error cannot word it differently.
 const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
-const ACCESS_DENIED_MESSAGE: &str = "You do not have sufficient permissions to perform this action.";
+const ACCESS_DENIED_MESSAGE: &str = crate::state::ACCESS_DENIED_MESSAGE;
 
 /// The operations whose input names a resource by ARN, and the member each one
 /// names it in.

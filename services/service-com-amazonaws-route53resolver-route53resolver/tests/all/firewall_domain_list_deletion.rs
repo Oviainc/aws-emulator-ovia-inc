@@ -340,8 +340,9 @@ async fn an_unknown_domain_list_id_is_reported_as_missing() {
 }
 
 /// A domain list DNS Firewall publishes itself belongs to the service, not to
-/// the account reading it: a delete that names one is refused, and the published
-/// list is still there afterwards.
+/// the account reading it: a delete that names one is answered as a delete
+/// naming a list that does not exist, and the published list is still readable
+/// afterwards.
 #[tokio::test]
 async fn a_published_domain_list_is_not_this_accounts_to_delete() {
     let router = emulator();
@@ -364,7 +365,7 @@ async fn a_published_domain_list_is_not_this_accounts_to_delete() {
             "DeleteFirewallDomainList",
             json!({ "FirewallDomainListId": id.clone() }),
             name,
-            "ValidationException",
+            "ResourceNotFoundException",
         )
         .await;
 

@@ -83,6 +83,18 @@ pub fn map_entry_count(stored: &str) -> Option<usize> {
     collection_size(stored, " entries")
 }
 
+/// How many items the framework's rendering of a LIST member states, when `stored` is one.
+/// `None` for a map's rendering and for a caller's own string.
+///
+/// The mirror of [`map_entry_count`], and `pub` for the same reason: a service that words a
+/// list's own `@length` refusal itself — because the sentence its recordings show names the
+/// cap the SERVICE enforces rather than the clause the framework renders — reads the size out
+/// of the same rendering, so no two services disagree about how many items one list held.
+#[must_use]
+pub fn list_item_count(stored: &str) -> Option<usize> {
+    collection_size(stored, " items")
+}
+
 /// The clause a COLLECTION member's `@length` violation states — the framework's own,
 /// with the `Value '<…>'` half reduced to `Value` — or `None` when `violation` is not one.
 ///

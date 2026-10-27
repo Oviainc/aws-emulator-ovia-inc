@@ -216,6 +216,85 @@ impl BasicStatistics {
 /// `GetMetricStatisticsInput$Period`) — every other legal period is a multiple of 60.
 pub const SUB_MINUTE_PERIODS: [i32; 5] = [1, 5, 10, 20, 30];
 
+/// How many dimensions one metric may carry, and so how long any `Dimensions` collection of a
+/// request about a metric may be: "You can use up to 30 dimensions per metric to further
+/// clarify what data the metric collects" (`PutMetricData`), which the modelled dimension
+/// lists state as `length 0..30` (`GetMetricStatisticsInput$Dimensions`,
+/// `MetricDatum$Dimensions`).
+pub const MAX_METRIC_DIMENSIONS: usize = 30;
+
+/// How CloudWatch states a value it cannot accept, naming the request member path the value
+/// arrived on.
+///
+/// A client acts on the member path: it is what locates the member that has to change. This
+/// is the family this service answers an unusable input value in, as its recorded refusals
+/// carry it, and it is here rather than in one handler because the refusal of a value the
+/// boundary validator catches (`Service::override_refusal`) and the refusal of one a handler
+/// catches have to read alike.
+pub fn value_is_invalid_message(value: &str, parameter: &str) -> String {
+    format!("The value {value} for parameter {parameter} is invalid.")
+}
+
+/// How CloudWatch states a collection carrying more entries than its cap: the member and the
+/// cap, and nothing of the entries themselves.
+pub fn collection_too_large_message(collection: &str, cap: usize) -> String {
+    format!("The collection {collection} must not have a size greater than {cap}.")
+}
+
+/// How CloudWatch states a request carrying two members that cannot be served together.
+pub fn mutually_exclusive_message(first: &str, second: &str) -> String {
+    format!(
+        "The parameters {first} and {second} are mutually exclusive and you have specified both."
+    )
+}
+
+/// How CloudWatch states a request carrying NEITHER of two members one of which it needs.
+pub fn one_of_required_message(first: &str, second: &str) -> String {
+    format!("At least one of the parameters {first} and {second} must be specified.")
+}
+
+/// The request member path a refusal NAMES, built from the path the validating walk spells.
+///
+/// The walk spells a member in lowerCamel and an element of a list as `<position>.member`
+/// (`vendor/smithy-schema-server`'s `path` module); a query-protocol service names the same
+/// position `Member.member.<position>`, in the member names its model declares. One
+/// conversion, so a refusal from the boundary and one from a handler
+/// ([`value_is_invalid_message`]) name the same member the same way.
+pub fn query_parameter_path(path: &str) -> String {
+    let mut segments: Vec<String> = Vec::new();
+    let mut position: Option<&str> = None;
+    for segment in path.split('.') {
+        if !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()) {
+            position = Some(segment);
+        } else if segment == COLLECTION_STEP {
+            segments.push(COLLECTION_STEP.to_string());
+            if let Some(index) = position.take() {
+                segments.push(index.to_string());
+            }
+        } else {
+            segments.push(upper_camel(segment));
+        }
+    }
+    if let Some(index) = position {
+        segments.push(index.to_string());
+    }
+    segments.join(".")
+}
+
+/// The segment both path spellings use for the step from a collection into one of its
+/// elements.
+const COLLECTION_STEP: &str = "member";
+
+/// One path segment as a model names the member: the first character upper-cased, the rest as
+/// it stands (a model's member names are already camel-cased).
+fn upper_camel(segment: &str) -> String {
+    let mut characters = segment.chars();
+    match characters.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Why `period` is not a granularity a metric can be read at, or `None` when it is. Shared
 /// by every operation that takes a `Period`, so one rule answers them all; each maps the
 /// message onto the parameter error ITS model declares.
@@ -230,24 +309,81 @@ pub fn period_error(period: i32) -> Option<String> {
     })
 }
 
+/// How long a datapoint stays readable at a SUB-MINUTE period: "Data points with a period of
+/// less than 60 seconds are available for 3 hours." (`GetMetricStatistics`,
+/// `GetMetricData`)
+pub const SUB_MINUTE_RETENTION_SECS: f64 = 3.0 * 60.0 * 60.0;
+
+/// How long a datapoint stays readable at a ONE-HOUR period: "Data points with a period of
+/// 3600 seconds (1 hour) are available for 455 days (15 months)." — past it a datapoint is
+/// readable at no granularity at all.
+pub const ONE_HOUR_RETENTION_SECS: f64 = 455.0 * 24.0 * 60.0 * 60.0;
+
+/// Whether a datapoint stamped `timestamp_secs` is still readable at `period` seconds of
+/// granularity at the instant `now`.
+///
+/// CloudWatch keeps a series in coarser and coarser resolution as it ages, and a read sees an
+/// aged datapoint only at a granularity whose own tier still holds it: "Data points with a
+/// period of less than 60 seconds are available for 3 hours. […] Data points with a period of
+/// 60 seconds (1-minute) are available for 15 days. Data points with a period of 300 seconds
+/// (5-minute) are available for 63 days. Data points with a period of 3600 seconds (1 hour)
+/// are available for 455 days (15 months). Data points that are initially published with a
+/// shorter period are aggregated together for long-term storage." The same rule is stated
+/// from the request's side on the readers' `Period` member — "Start time between 3 hours and
+/// 15 days ago - Use a multiple of 60 seconds (1 minute). Start time between 15 and 63 days
+/// ago - Use a multiple of 300 seconds (5 minutes). Start time greater than 63 days ago - Use
+/// a multiple of 3600 seconds (1 hour)" — and judging each DATAPOINT by its own age is what
+/// makes a range that crosses a tier boundary answer with the part that survives.
+///
+/// Shared by every read that lays period windows over a range, so one rule decides what any
+/// of them can still see.
+pub fn retained_at_period(timestamp_secs: f64, period: i32, now: f64) -> bool {
+    let age = now - timestamp_secs;
+    // A multiple of the tier's own granularity is what the aggregated tier can be read at;
+    // the youngest tier is readable at every granularity a read may ask for.
+    let multiple_of = |granularity: i32| period % granularity == 0;
+    if age <= SUB_MINUTE_RETENTION_SECS {
+        true
+    } else if age <= FIFTEEN_DAYS_SECS {
+        multiple_of(60)
+    } else if age <= SIXTY_THREE_DAYS_SECS {
+        multiple_of(300)
+    } else if age <= ONE_HOUR_RETENTION_SECS {
+        multiple_of(3_600)
+    } else {
+        false
+    }
+}
+
 /// Fold one series' datapoints into the `period`-wide windows of `[start, end)`, keyed by the
-/// window's index from `start`.
+/// window's index from `start` and by the UNIT the datapoints in it were published with.
 ///
 /// `start` is INCLUSIVE and `end` EXCLUSIVE, as both readers' members document. A window
 /// holding no datapoint is never inserted, so what this allocates is bounded by the
 /// datapoints the series holds in the range rather than by the range the request spans.
+/// A datapoint the retention tier of `period` no longer holds is not in any window
+/// ([`retained_at_period`]).
+///
+/// The unit is part of the key because it is part of a datapoint's identity: "If you omit
+/// Unit, all data that was collected with any unit is returned, along with the corresponding
+/// units that were specified when the data was reported to CloudWatch."
+/// (`GetMetricStatisticsInput$Unit`) — observations published at one instant under different
+/// units are different series, so they fold into different windows and never into a
+/// cross-unit aggregate.
 ///
 /// `unit` is the caller's unit filter: "If you specify a unit, the operation returns only
 /// data that was collected with that unit specified. […] CloudWatch does not perform unit
 /// conversions." A request naming none takes every datapoint.
-pub fn windows_of<'a>(
+pub fn windows_by_unit<'a>(
     data: &'a [StoredDatum],
     start: f64,
     end: f64,
-    period: f64,
+    period: i32,
     unit: Option<&str>,
-) -> BTreeMap<i64, Vec<&'a StoredDatum>> {
-    let mut windows: BTreeMap<i64, Vec<&StoredDatum>> = BTreeMap::new();
+    now: f64,
+) -> BTreeMap<(i64, Option<&'a str>), Vec<&'a StoredDatum>> {
+    let span = f64::from(period);
+    let mut windows: BTreeMap<(i64, Option<&str>), Vec<&StoredDatum>> = BTreeMap::new();
     for datum in data {
         if datum.timestamp_secs < start || datum.timestamp_secs >= end {
             continue;
@@ -255,9 +391,37 @@ pub fn windows_of<'a>(
         if unit.is_some_and(|unit| datum.unit.as_deref() != Some(unit)) {
             continue;
         }
+        if !retained_at_period(datum.timestamp_secs, period, now) {
+            continue;
+        }
         #[allow(clippy::cast_possible_truncation)]
-        let index = ((datum.timestamp_secs - start) / period).floor() as i64;
-        windows.entry(index).or_default().push(datum);
+        let index = ((datum.timestamp_secs - start) / span).floor() as i64;
+        windows
+            .entry((index, datum.unit.as_deref()))
+            .or_default()
+            .push(datum);
+    }
+    windows
+}
+
+/// Fold one series' datapoints into the `period`-wide windows of `[start, end)`, keyed by the
+/// window's index from `start`, with the units of one window TOGETHER.
+///
+/// [`windows_by_unit`] for a reader that answers one series per query however many units the
+/// range holds, so the per-unit groups of one window are one span to it; every rule about
+/// what a window holds — the range's ends, the caller's unit filter and the retention tier of
+/// `period` — is that function's, so the two readers cannot disagree about what is in range.
+pub fn windows_of<'a>(
+    data: &'a [StoredDatum],
+    start: f64,
+    end: f64,
+    period: i32,
+    unit: Option<&str>,
+    now: f64,
+) -> BTreeMap<i64, Vec<&'a StoredDatum>> {
+    let mut windows: BTreeMap<i64, Vec<&StoredDatum>> = BTreeMap::new();
+    for ((index, _unit), data) in windows_by_unit(data, start, end, period, unit, now) {
+        windows.entry(index).or_default().extend(data);
     }
     windows
 }

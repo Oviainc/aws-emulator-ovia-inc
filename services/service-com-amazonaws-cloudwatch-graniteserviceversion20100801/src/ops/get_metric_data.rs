@@ -720,12 +720,20 @@ fn fold_series(
     now: f64,
 ) -> Vec<(f64, f64)> {
     let period = f64::from(period_secs);
+    // "If the StartTime parameter specifies a time stamp that is greater than 3 hours ago, you
+    // must specify the period as follows or no data points in that time range is returned"
+    // (`GetMetricDataInput$StartTime` / `MetricStat$Period`): the granularity a RANGE can be
+    // read at is the one the tier of its start time still holds, by the one shared rule
+    // ([`crate::state::retained_at_period`]), so a query at a finer one retrieves nothing.
+    if !crate::state::retained_at_period(requested_start, period_secs, now) {
+        return Vec::new();
+    }
     let start = crate::state::rounded_start(requested_start, period_secs, now);
     // `StartTime` inclusive, `EndTime` exclusive; windows are `Period` seconds wide and
     // anchored at the rounded start time, folded by the one shared helper every reader of a
     // series uses ([`crate::state::windows_of`]).
     let stored = store.metrics.get(key).map_or(&[][..], Vec::as_slice);
-    let windows = crate::state::windows_of(stored, start, end, period, unit);
+    let windows = crate::state::windows_of(stored, start, end, period_secs, unit, now);
 
     let mut points: Vec<(f64, f64)> = Vec::with_capacity(windows.len());
     for (index, data) in windows {
