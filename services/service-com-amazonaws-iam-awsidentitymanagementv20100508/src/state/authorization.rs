@@ -33,6 +33,17 @@
 //!    evaluation of IAM policy documents against `(action, resource)`, so IAM and every
 //!    other service handed the same documents decide alike.
 //!
+//! ## What the decision knows about the caller
+//!
+//! A statement may be written to depend on WHO is calling rather than only on what is
+//! asked: through a `Condition` clause over a key of the signing principal, or through a
+//! policy VARIABLE in its `Resource` element, which the shared evaluation substitutes from
+//! the request's condition context. Since the signing principal is resolved here before
+//! anything is decided, that context is built from it ([`principal_context`]) and passed
+//! with the request, so one document attached to many users scopes itself to each of them
+//! and a clause over a principal tag is decided from the tags the user holds at the instant
+//! of the call.
+//!
 //! ## The callers that are not IAM users
 //!
 //! * **A credential no IAM user owns.** The emulator's own published credential, and a
@@ -54,7 +65,7 @@ use ::std::sync::atomic::{AtomicU64, Ordering};
 
 use ::service_common::iam_authorization::{self as iam, Decision};
 
-use crate::ops::types::DelegationRequest;
+use crate::ops::types::{DelegationRequest, User};
 use crate::scaffolded::AccessDenied;
 
 use super::{ComAmazonawsIamAwsidentitymanagementv20100508State as IamState, PrincipalPolicies};
@@ -136,6 +147,9 @@ pub const LIST_GROUPS_FOR_USER: &str = "iam:ListGroupsForUser";
 
 /// `iam:ListUserTags`.
 pub const LIST_USER_TAGS: &str = "iam:ListUserTags";
+
+/// `iam:ListUserPolicies`.
+pub const LIST_USER_POLICIES: &str = "iam:ListUserPolicies";
 
 /// `iam:ListAccessKeys`.
 pub const LIST_ACCESS_KEYS: &str = "iam:ListAccessKeys";
@@ -226,6 +240,52 @@ pub fn decision_name(identity: Decision, resource: Decision) -> &'static str {
     }
 }
 
+/// The condition key whose value is the signing IAM user's friendly name: "`aws:username`
+/// — the friendly name of the current user", which for an IAM user is its name without
+/// the path it lives under.
+const USER_NAME_KEY: &str = "aws:username";
+
+/// The condition key whose value is the signing principal's unique id: "`aws:userid` — the
+/// unique identifier of the current user", which for an IAM user is the id the account
+/// minted it under.
+const USER_ID_KEY: &str = "aws:userid";
+
+/// The prefix the condition key of ONE tag of the signing principal is spelled with:
+/// "`aws:PrincipalTag/tag-key` — the tag attached to the principal making the request",
+/// read from the principal's CURRENT tags, since nothing in the request carries them.
+const PRINCIPAL_TAG_PREFIX: &str = "aws:PrincipalTag/";
+
+/// The condition keys a request to IAM MODELS, whatever values it then carries for them
+/// (`::service_common::iam_authorization::Request::published`).
+///
+/// The signing principal is resolved before any decision is made, so for each of these
+/// this gate can answer whether the request carries a value — including answering that it
+/// carries none. [`PRINCIPAL_TAG_PREFIX`] is published as the whole key FAMILY it is,
+/// because the principal's tags are known in full: a key of that family the context does
+/// not carry is a tag the principal does not hold, not a key this emulator cannot read.
+const PUBLISHED_CONTEXT_KEYS: &[&str] = &[USER_NAME_KEY, USER_ID_KEY, PRINCIPAL_TAG_PREFIX];
+
+/// The condition context a request signed by `user` carries: what IAM knows about the
+/// SIGNING principal at the instant of the call, which is where a policy variable's value
+/// and an `aws:PrincipalTag/` clause's value both come from.
+///
+/// The tags are the ones the principal holds NOW — nothing in the request carries them — so
+/// retagging the user changes what the same unchanged request decides, and untagging it
+/// takes the value away again.
+fn principal_context(user: &User) -> Vec<(String, String)> {
+    let mut context = vec![
+        (USER_NAME_KEY.to_string(), user.user_name.clone()),
+        (USER_ID_KEY.to_string(), user.user_id.clone()),
+    ];
+    for tag in user.tags.iter().flatten() {
+        context.push((
+            format!("{PRINCIPAL_TAG_PREFIX}{}", tag.key),
+            tag.value.clone(),
+        ));
+    }
+    context
+}
+
 /// Whether the principal that signed this request may perform `action` on `resource`.
 ///
 /// `Ok(())` when the call is permitted; `Err` is the refusal the operation answers
@@ -264,12 +324,22 @@ pub fn authorize_named(
     let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
     // A credential this account holds no IAM user for carries no identity-based
     // policies, so there is nothing to judge it on (see the module docs).
-    let Some((principal, policies)) = signing_principal(store, &access_key_id) else {
+    let Some(signer) = signing_principal(store, &access_key_id) else {
         return Ok(());
     };
+    let SigningPrincipal {
+        arn: principal,
+        policies,
+        context,
+    } = signer;
 
     let principals = [principal.clone()];
-    let request = iam::Request::new(action, resource, &principals);
+    // What the policies in force are decided against BESIDES the action and the resource:
+    // the keys that describe the signing principal, which a statement reads either through
+    // a `Condition` clause or through a policy variable in its `Resource` element.
+    let request = iam::Request::new(action, resource, &principals)
+        .with_context(&context)
+        .with_published_keys(PUBLISHED_CONTEXT_KEYS);
     let decided = iam::identity_decision(&policies.documents, &request);
     // Whether the documents in force grant the call at all. An attachment whose
     // document the account does not hold is a grant this emulator cannot read, so it
@@ -383,15 +453,24 @@ pub fn delegation_permission_check(
     // A credential this account holds no IAM user for carries no identity-based policies
     // at all — the position account root credentials are in (see the module docs) — so
     // there is nothing its permissions can fall short of.
-    let Some((principal, policies)) = signing_principal(store, &access_key_id) else {
+    let Some(signer) = signing_principal(store, &access_key_id) else {
         return PERMISSION_CHECK_ALLOWED;
     };
+    let SigningPrincipal {
+        arn: principal,
+        policies,
+        context,
+    } = signer;
 
     let principals = [principal];
     let documents = iam::prepare_documents(&policies.documents);
     let mut short_of_an_ask = false;
     for (action, resource) in &asks {
-        let request = iam::Request::new(action, resource, &principals);
+        // The same question [`authorize_named`] asks, so it is asked with the same
+        // knowledge of the caller (see [`principal_context`]).
+        let request = iam::Request::new(action, resource, &principals)
+            .with_context(&context)
+            .with_published_keys(PUBLISHED_CONTEXT_KEYS);
         let decided = iam::identity_decision_prepared(&documents, &request);
         if decided == Decision::Denied {
             return PERMISSION_CHECK_DENIED;
@@ -460,15 +539,31 @@ fn authorization_details_sentence(region: &str, authorization_id: &str) -> Strin
     )
 }
 
-/// The IAM user the access key id `access_key_id` belongs to — its ARN and the
-/// identity-based documents in force on it — or `None` when the account holds no user
-/// for that key.
-fn signing_principal(
-    store: &IamState,
-    access_key_id: &str,
-) -> Option<(String, PrincipalPolicies)> {
+/// What a signed request is judged on, resolved once from the access key it carries:
+/// the principal it speaks for, the identity-based documents in force on that principal,
+/// and the condition context the request carries about it.
+#[derive(Debug)]
+struct SigningPrincipal {
+    /// The ARN of the IAM user the signing access key belongs to — what a refusal names
+    /// as the caller, and the principal a resource-based statement would name.
+    arn: String,
+    /// The identity-based documents in force on it, and the attachments whose documents
+    /// the account does not hold.
+    policies: PrincipalPolicies,
+    /// The condition keys the request carries about that principal
+    /// ([`principal_context`]).
+    context: Vec<(String, String)>,
+}
+
+/// The IAM user the access key id `access_key_id` belongs to, or `None` when the account
+/// holds no user for that key.
+fn signing_principal(store: &IamState, access_key_id: &str) -> Option<SigningPrincipal> {
     let record = store.access_keys.get(access_key_id)?;
     let user = store.users.get(&record.user_key)?;
     let policies = store.principal_policies(&user.arn)?;
-    Some((user.arn.clone(), policies))
+    Some(SigningPrincipal {
+        arn: user.arn.clone(),
+        policies,
+        context: principal_context(user),
+    })
 }
