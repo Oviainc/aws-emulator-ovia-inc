@@ -35,6 +35,8 @@ mod dry_run_preflight;
 mod empty_collection_members;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/list_deployment_events_pagination.rs"]
+mod list_deployment_events_pagination;
 #[path = "all/list_deployment_pattern_versions.rs"]
 mod list_deployment_pattern_versions;
 #[path = "all/list_deployments_filter_pairs.rs"]

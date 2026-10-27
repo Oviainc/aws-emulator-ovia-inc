@@ -167,20 +167,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Events are reported oldest first, in the order the lifecycle appended them;
-        // an event has no id of its own, so a page resumes after its position in that
-        // append-only history. The deployment id is folded into the cursor, so a token
-        // one deployment's event list issued is not accepted on another's.
+        // Events are reported oldest first, in the order the lifecycle appended them,
+        // and a page resumes after the event the previous page ended on. An event has no
+        // id of its own, so the record names it by the ordinal it was appended under
+        // (`Deployment::events_with_cursors`) rather than by its position in the kept
+        // history: the log drops its oldest events once it is over its ceiling, and a
+        // position would then name a different, newer event than the one the token was
+        // issued for.
         let events: Vec<(String, DeploymentEventDataSummary)> = deployment
-            .events
-            .iter()
-            .enumerate()
-            .map(|(position, event)| {
-                (
-                    format!("{}:{position}", deployment.id),
-                    event.to_summary(),
-                )
-            })
+            .events_with_cursors()
+            .into_iter()
+            .map(|(cursor, event)| (cursor, event.to_summary()))
             .collect();
         let (page, next_token) = crate::state::paginate(
             events,
