@@ -185,6 +185,8 @@ mod load_balancer_instance_attachment;
 mod load_balancer_instance_detach;
 #[path = "all/load_balancer_listing.rs"]
 mod load_balancer_listing;
+#[path = "all/load_balancer_metric_data.rs"]
+mod load_balancer_metric_data;
 #[path = "all/load_balancer_provisioning.rs"]
 mod load_balancer_provisioning;
 #[path = "all/load_balancer_tls_certificate_create.rs"]

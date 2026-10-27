@@ -5,8 +5,10 @@
 //! persists everything the caller requested, and answers it from what was persisted;
 //! `GetCapacityTask` reads the same record back. The optional `OrderId` and `AssetId`
 //! name OTHER resources of this service, so both are resolved against the store
-//! before anything is created and a reference that resolves to nothing is refused
-//! with the modelled `NotFoundException` rather than stored on the task. The task
+//! before anything is created — the `OrderId` in the region the request is addressed
+//! to, the `AssetId` among the named Outpost's own hardware — and a reference that
+//! resolves to nothing is refused with the modelled `NotFoundException` rather than
+//! stored on the task. The task
 //! starts in the non-terminal
 //! `REQUESTED` status and runs to `COMPLETED` on the clock
 //! ([`crate::state::capacity_task_progression`]), and a second task is refused with the
@@ -268,17 +270,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the model gives it, coarsest member first:
         //
         // * an `OrderId` names an Amazon Web Services Outposts ORDER, which is a
-        //   top-level resource of the account (`/orders/{OrderId}`) and is the order
-        //   "of the host associated with the capacity task" — so what has to hold is
-        //   that the account placed it, which is also what makes the one-active-task
-        //   rule below a rule about the order rather than about the Outpost;
+        //   top-level resource of the inventory this endpoint serves
+        //   (`/orders/{OrderId}`) and is the order "of the host associated with the
+        //   capacity task" — so it is resolved in the region the request is addressed
+        //   to, exactly as `GetOrder` and `CancelOrder` resolve the same member: an
+        //   order of another region is as absent as one that was never placed, and a
+        //   task is never stored carrying an id this region's endpoint cannot show the
+        //   caller. That region scope is also what makes the one-active-task rule
+        //   below a rule about this region's order;
         // * an `AssetId` names one physical unit of hardware INSTALLED on an Outpost,
         //   a resource nested under the Outpost the task runs on
         //   (`/outposts/{OutpostIdentifier}/assets`), so it is resolved among THAT
         //   Outpost's assets.
         let order_id = crate::state::non_empty(input.order_id);
         if let Some(order_id) = order_id.as_deref() {
-            if !store.holds_order(order_id) {
+            if store.order(&region, order_id).is_none() {
                 return Err(StartCapacityTaskErrorModeled::NotFoundException(
                     NotFoundException {
                         message: Some(crate::state::identifier_not_found(
@@ -376,7 +382,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .or_else(|| {
                 let order_id = order_id.clone()?;
-                let active = store.active_capacity_task_on_order(&order_id)?;
+                let active = store.active_capacity_task_on_order(&region, &order_id)?;
                 Some((
                     crate::state::RESOURCE_TYPE_ORDER,
                     order_id,

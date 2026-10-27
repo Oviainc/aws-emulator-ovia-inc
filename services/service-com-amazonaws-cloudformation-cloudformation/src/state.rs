@@ -3562,6 +3562,11 @@ impl ComAmazonawsCloudformationCloudformationState {
                         physical_resource_id: deployed.resource.physical_resource_id.clone(),
                         logical_resource_id: deployed.resource.logical_id.clone(),
                         stack_id: stack.stack_id.clone(),
+                        // The primary identifier of the resource as it is when the scan
+                        // READS it, so what a read reports is the row the scan took.
+                        resource_identifier: resource_scans::primary_identifier(
+                            &deployed.resource,
+                        ),
                     })
             })
             .collect()
@@ -5046,6 +5051,8 @@ pub enum PageOf {
     Imports,
     /// `ListStackInstanceResourceDrifts`'s `Summaries`.
     StackInstanceResourceDrifts,
+    /// `ListResourceScanRelatedResources`'s `RelatedResources`.
+    RelatedResources,
 }
 
 impl PageOf {
@@ -5070,6 +5077,7 @@ impl PageOf {
             Self::TemplateSummaries => "template-summaries",
             Self::Imports => "imports",
             Self::StackInstanceResourceDrifts => "stack-instance-resource-drifts",
+            Self::RelatedResources => "related-resources",
         }
     }
 }

@@ -23,6 +23,8 @@ mod client_token_store;
 mod coverage_listing;
 #[path = "all/coverage_statistics.rs"]
 mod coverage_statistics;
+#[path = "all/custom_detection_rule_association_delete.rs"]
+mod custom_detection_rule_association_delete;
 #[path = "all/custom_detection_rule_association_listing.rs"]
 mod custom_detection_rule_association_listing;
 #[path = "all/custom_detection_rule_association_update.rs"]

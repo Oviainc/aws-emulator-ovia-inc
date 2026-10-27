@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeResourceScanErrorModeled::ResourceScanNotFoundException(
                     ResourceScanNotFoundException {
-                        message: Some(scans::does_not_exist(&input.resource_scan_id)),
+                        message: Some(scans::NOT_FOUND.to_string()),
                     },
                 )
             })?;
