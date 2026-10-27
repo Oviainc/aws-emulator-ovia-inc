@@ -658,7 +658,7 @@ async fn an_update_applies_the_declared_change_to_the_stream_cloudwatch_holds() 
                 "IncludeFilters": [{"Namespace": "AWS/EC2"}],
                 "StatisticsConfigurations": [{
                     "IncludeMetrics": [{"Namespace": "AWS/EC2", "MetricName": "CPUUtilization"}],
-                    "AdditionalStatistics": ["Average"],
+                    "AdditionalStatistics": ["TM(10%:90%)"],
                 }],
             }),
             "StatisticsConfigurations",

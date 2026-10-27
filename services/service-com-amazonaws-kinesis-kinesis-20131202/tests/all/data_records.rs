@@ -815,7 +815,12 @@ async fn a_read_or_write_the_rule_does_not_admit_is_refused() {
             "InvalidArgumentException",
         ),
         (
-            "a record past the stream's maximum record size",
+            // The blob alone is longer than the stream's maximum record size, which is a
+            // bound on that member's LENGTH: refused as a validation failure naming it,
+            // the way a modelled `@length` is. The total of the blob AND the partition key
+            // is a bound on two members together, which is the modelled
+            // `InvalidArgumentException` instead (asserted in `max_record_size`).
+            "a record whose data is longer than the stream's maximum record size",
             "PutRecord",
             json!({
                 "StreamName": stream,
@@ -824,7 +829,7 @@ async fn a_read_or_write_the_rule_does_not_admit_is_refused() {
                     vec![b'x'; (DEFAULT_MAX_RECORD_SIZE_KI_B as usize) * 1024 + 1],
                 ),
             }),
-            "InvalidArgumentException",
+            "ValidationException",
         ),
         (
             "a dry run of an otherwise valid write",
@@ -838,7 +843,7 @@ async fn a_read_or_write_the_rule_does_not_admit_is_refused() {
             "DryRunOperationException",
         ),
         (
-            "a batch with one entry past the maximum record size",
+            "a batch with one entry whose data is longer than the maximum record size",
             "PutRecords",
             json!({
                 "StreamName": stream,
@@ -849,7 +854,7 @@ async fn a_read_or_write_the_rule_does_not_admit_is_refused() {
                     )},
                 ],
             }),
-            "InvalidArgumentException",
+            "ValidationException",
         ),
         (
             // Each entry is inside the per-record maximum, but together they are past the

@@ -638,12 +638,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ::tokio::task::yield_now().await;
                 }
             }
-            // The evaluation result reports the decision on the FIRST resource it was
-            // asked about, and `ResourceSpecificResults` "the individual results of
-            // the simulation of the API operation specified in EvalActionName on each
-            // resource". The keys the request supplied no value for are the same for
-            // every result (see above), so the ONE list computed for this request is
-            // what each of them reports.
+            // `ResourceSpecificResults` carries "the individual results of the
+            // simulation of the API operation specified in EvalActionName on each
+            // resource", and the action's OWN result aggregates them (see below). The
+            // keys the request supplied no value for are the same for every result (see
+            // above), so the ONE list computed for this request is what each of them
+            // reports.
             let reported_missing = (!missing.is_empty()).then(|| missing.clone());
             if reports_each_resource {
                 for result in &mut per_resource {
@@ -663,11 +663,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             results.push(EvaluationResult {
                 eval_action_name: action.clone(),
                 eval_resource_name: Some(first.eval_resource_name.clone()),
-                eval_decision: first.eval_resource_decision.clone(),
+                eval_decision: most_restrictive(&per_resource),
                 missing_context_values: reported_missing,
-                permissions_boundary_decision_detail: first
-                    .permissions_boundary_decision_detail
-                    .clone(),
+                permissions_boundary_decision_detail: boundary_detail(&per_resource),
                 resource_specific_results: reports_each_resource.then_some(per_resource),
                 matched_statements: Some(matched),
                 // This emulator models no organization, so nothing about one is
@@ -977,6 +975,67 @@ fn source_policy_id(source: &crate::state::PolicySource) -> String {
                 .unwrap_or_else(|| policy_arn.clone())
         }
     }
+}
+
+/// The decision the ACTION's own result reports, from the decisions its resources were
+/// each decided.
+///
+/// "The top-level `EvalDecision` reflects the most restrictive decision across all
+/// resources (for example, if any resource produces `explicitDeny`, the top-level
+/// decision is `explicitDeny`)" (`EvaluationResult`), so the member agrees with the
+/// statements the same result reports as having determined it — the union across those
+/// resources — rather than describing whichever resource the request happened to name
+/// first. A request that named no resource is decided about one resource, `*`, so the
+/// aggregate is that one decision.
+///
+/// The order is IAM's own: an explicit deny is the most restrictive outcome, then the
+/// implicit deny, then the allow ([`restrictiveness`]).
+fn most_restrictive(per_resource: &[ResourceSpecificResult]) -> String {
+    per_resource
+        .iter()
+        .map(|result| result.eval_resource_decision.as_str())
+        .max_by_key(|decision| restrictiveness(decision))
+        // Nothing to aggregate is nothing stated about the request, which is the
+        // implicit deny; the handler always decides at least one resource, so this is
+        // the value of a decision no resource was asked for rather than a fallback the
+        // response is built from.
+        .unwrap_or(crate::state::authorization::DECISION_IMPLICIT_DENY)
+        .to_string()
+}
+
+/// How restrictive one `PolicyEvaluationDecisionType` value is, for [`most_restrictive`]
+/// to take the maximum of: the explicit deny withholds the most, the allow the least.
+fn restrictiveness(decision: &str) -> u8 {
+    if decision == crate::state::authorization::DECISION_EXPLICIT_DENY {
+        2
+    } else if decision == crate::state::authorization::DECISION_ALLOWED {
+        0
+    } else {
+        1
+    }
+}
+
+/// The permissions-boundary detail the ACTION's own result reports, from the details its
+/// resources were each decided with.
+///
+/// Aggregated the way the decision beside it is: the boundary allowed the action only
+/// where it allowed it on EVERY resource the request asked about, since one resource the
+/// boundary withheld is a resource the entity may not act on. Absent when the request
+/// simulated no permissions boundary at all, which is when no resource carries the detail
+/// either.
+fn boundary_detail(
+    per_resource: &[ResourceSpecificResult],
+) -> Option<PermissionsBoundaryDecisionDetail> {
+    per_resource
+        .iter()
+        .filter_map(|result| result.permissions_boundary_decision_detail.as_ref())
+        .map(|detail| detail.allowed_by_permissions_boundary)
+        .reduce(|allowed_everywhere, allowed| allowed_everywhere && allowed)
+        .map(
+            |allowed_by_permissions_boundary| PermissionsBoundaryDecisionDetail {
+                allowed_by_permissions_boundary,
+            },
+        )
 }
 
 /// One `MatchedStatements` entry: which policy a contributing statement is in, and of

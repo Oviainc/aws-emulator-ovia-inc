@@ -87,6 +87,14 @@ mod local_gateway_routes;
 // lines have already lost several serialized squash merges there.
 #[path = "all/transit_gateway_prefix_list_references.rs"]
 mod transit_gateway_prefix_list_references;
+// What `DescribeTransitGatewayRouteTableAnnouncements` reports out of the announcement store,
+// and how the id list, the filters and the page size narrow it. Declared beside the transit
+// gateway suite above rather than in sorted position or at the tail, for the reason this
+// file's header note gives: BOTH the sorted neighbourhood and the tail are where every new
+// ec2 suite inserts its two lines, and these two lines lost four serialized squash merges at
+// the tail.
+#[path = "all/transit_gateway_route_table_announcements.rs"]
+mod transit_gateway_route_table_announcements;
 #[path = "all/ec2_query_error_envelope.rs"]
 mod ec2_query_error_envelope;
 // The same envelope rule, driven over seven further operations and the four refusal kinds

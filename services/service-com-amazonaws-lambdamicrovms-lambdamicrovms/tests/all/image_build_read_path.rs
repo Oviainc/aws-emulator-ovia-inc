@@ -31,7 +31,7 @@ use crate::microvm_lifecycle::{
 
 /// `GET /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}/builds`,
 /// with whatever `query` adds to the query string.
-async fn list_builds(
+pub(crate) async fn list_builds(
     router: &MultiServiceRouter,
     identifier: &str,
     image_version: &str,
@@ -51,7 +51,7 @@ async fn list_builds(
 
 /// `GET
 /// /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}/builds/{buildId}`.
-async fn get_build(
+pub(crate) async fn get_build(
     router: &MultiServiceRouter,
     identifier: &str,
     image_version: &str,
@@ -67,7 +67,7 @@ async fn get_build(
 }
 
 /// The `items` of one page.
-fn page_items(body: &Value, case: &str) -> Vec<Value> {
+pub(crate) fn page_items(body: &Value, case: &str) -> Vec<Value> {
     body["items"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case}: items is a list, got {body}"))
@@ -75,7 +75,7 @@ fn page_items(body: &Value, case: &str) -> Vec<Value> {
 }
 
 /// The `buildId`s of one page, in the order the page carries them.
-fn page_build_ids(body: &Value, case: &str) -> Vec<String> {
+pub(crate) fn page_build_ids(body: &Value, case: &str) -> Vec<String> {
     page_items(body, case)
         .iter()
         .map(|item| item["buildId"].as_str().unwrap_or_default().to_string())
@@ -89,7 +89,11 @@ fn hex_token(value: &str) -> String {
 
 /// Create an image (named `name`, with whatever `extra` adds to the body) and return the
 /// ARN the create minted.
-async fn create_image(router: &MultiServiceRouter, name: &str, extra: Value) -> String {
+pub(crate) async fn create_image(
+    router: &MultiServiceRouter,
+    name: &str,
+    extra: Value,
+) -> String {
     let (status, body) = call(
         router,
         "POST",
@@ -103,7 +107,7 @@ async fn create_image(router: &MultiServiceRouter, name: &str, extra: Value) -> 
 
 /// The `(chipset, chipsetGeneration)` pairs the service builds the one modelled
 /// architecture for, as `state::BUILD_TARGETS` publishes them.
-fn arm64_targets() -> Vec<(&'static str, &'static str)> {
+pub(crate) fn arm64_targets() -> Vec<(&'static str, &'static str)> {
     BUILD_TARGETS
         .iter()
         .filter(|target| target.architecture == "ARM_64")

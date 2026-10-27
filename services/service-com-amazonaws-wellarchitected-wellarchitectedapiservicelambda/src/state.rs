@@ -1742,8 +1742,14 @@ pub struct CompletedUpgradeToken {
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The modelled member a tag-count refusal reports (`TagResourceInput$Tags`,
-/// `ImportLensInput$Tags` — every tag-writing operation names its tag map `Tags`).
+/// `ImportLensInput$Tags` — every tag-writing operation that takes a `TagMap` names it
+/// `Tags`).
 pub const TAGS_MEMBER: &str = "Tags";
+
+/// The same member on an operation that takes a `Tags` LIST instead, which this service's
+/// agent surface spells in lower camel case (`CreateAgentProfileRequest$tags`) — a field
+/// finding names the member the request actually carried, as [`PILLARS_MEMBER`] does.
+pub const AGENT_TAGS_MEMBER: &str = "tags";
 
 /// How many tags a resource would hold once `requested` is merged into `stored` — the
 /// count [`MAX_TAGS_PER_RESOURCE`] bounds.
