@@ -174,6 +174,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The write-only-commits-a-change rule lives on the state module's `VersionedRecord`,
+// which every `Update*` handler in this crate decides its commit through.
+use crate::state::VersionedRecord;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -537,9 +540,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already there changed nothing, so it commits nothing: neither the tag nor
         // `ModifiedAt` moves, and the tag the caller holds stays usable as the
         // precondition of the update it is entitled to make.
-        if endpoint.configuration_fingerprint() != before {
-            endpoint.commit(crate::state::now());
-        }
+        endpoint.commit_if_changed(&before, crate::state::now());
 
         Ok(endpoint_output(endpoint))
     }
