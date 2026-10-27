@@ -177,9 +177,10 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// (`mpa:GetApprovalTeam`).
 pub const SERVICE_ACTION_PREFIX: &str = "mpa";
 
-/// Longest `AccessDeniedException$Message` this service emits, from that member's
-/// modelled `@length(max: 1000)`.
-const MAX_ACCESS_DENIED_MESSAGE: usize = 1000;
+/// Longest `Message` this service emits on a modelled error, from the
+/// `@length(max: 1000)` both `AccessDeniedException$Message` and
+/// `ValidationException$Message` declare.
+const MAX_EXCEPTION_MESSAGE: usize = 1000;
 
 /// The `UpdateAction` token that asks for every approver's MFA devices to be
 /// synchronized with the identity source — the one value `UpdateAction` declares
@@ -2970,15 +2971,15 @@ pub fn is_malformed_arn_violation(violation: &::aws_smithy_schema_server::Violat
     )
 }
 
-/// `message` cut to the `AccessDeniedException$Message` bound
-/// ([`MAX_ACCESS_DENIED_MESSAGE`]) on a character boundary, so a long resource ARN
-/// (`ApprovalTeamArn` is `length(20..2048)`) cannot push the refusal past the length
-/// its own member declares.
+/// `message` cut to the modelled message bound ([`MAX_EXCEPTION_MESSAGE`]) on a
+/// character boundary, so a long value quoted back — a resource ARN
+/// (`ApprovalTeamArn` is `length(20..2048)`), a `Region` (`length(max: 1000)`) —
+/// cannot push the refusal past the length its own member declares.
 fn bounded_message(message: String) -> String {
-    if message.len() <= MAX_ACCESS_DENIED_MESSAGE {
+    if message.len() <= MAX_EXCEPTION_MESSAGE {
         return message;
     }
-    let mut end = MAX_ACCESS_DENIED_MESSAGE;
+    let mut end = MAX_EXCEPTION_MESSAGE;
     while end > 0 && !message.is_char_boundary(end) {
         end -= 1;
     }
@@ -3003,6 +3004,39 @@ fn is_arn_region(region: &str) -> bool {
         && region
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Whether `region` names an Amazon Web Services Region.
+///
+/// A member documented to carry a Region (`IamIdentityCenter$Region`, "Amazon Web
+/// Services Region where the IAM Identity Center instance is located") is modelled as a
+/// plain string with only a length bound — no `@pattern` and no value set — so which
+/// values it may carry is not expressible on the wire and the constraint boundary cannot
+/// decide it. The set is the shared catalog `emulator_telemetry::policy::KNOWN_REGIONS`
+/// ("every AWS region the wire may carry, sorted for binary search"), already a
+/// dependency of this crate, rather than a list copied in here, so the Regions this
+/// service accepts cannot drift from the ones the rest of the emulator knows. The lookup
+/// is the binary search that ordering is maintained for.
+#[must_use]
+pub fn is_aws_region(region: &str) -> bool {
+    ::emulator_telemetry::policy::KNOWN_REGIONS
+        .binary_search(&region)
+        .is_ok()
+}
+
+/// The `ValidationException` (400) a member that should name an Amazon Web Services
+/// Region is refused with when its value names none ([`is_aws_region`]).
+///
+/// The message names the member and the value it carried: neither `IamIdentityCenter`
+/// nor its `Region` is `@sensitive`, so the value is quoted back, and the whole message
+/// is held to the bound `ValidationException$Message` declares.
+#[must_use]
+pub fn invalid_region(member: &str, region: &str) -> ValidationException {
+    ValidationException {
+        message: bounded_message(format!(
+            "{member} {region:?} is not an Amazon Web Services Region."
+        )),
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

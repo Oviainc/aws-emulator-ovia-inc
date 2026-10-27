@@ -32,10 +32,10 @@
 //! material is not a symmetric encryption key is refused with the modelled
 //! `InvalidKeyUsageException` and nothing is generated.
 //!
-//! `GrantTokens` is treated exactly as `GenerateDataKeyWithoutPlaintext` treats it: a
-//! presented token is the only permission a handler here can judge, because there is
-//! no caller identity to evaluate a key policy or an IAM policy against. The effect is
-//! narrower than AWS, where a grant token is additive.
+//! Permission is judged exactly as `GenerateDataKeyWithoutPlaintext` judges it, through
+//! the service's one authorization decision ([`crate::state::authorization`]): the key
+//! policy, the calling principal's identity policies and the grants in force, with the
+//! presented-token divergence [`crate::state::authorization::authorize`] records.
 //!
 //! ## Shape of an operation
 //!
@@ -282,6 +282,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal("the KMS state store is unavailable"));
         };
 
+        // Who the request speaks for, resolved BEFORE this service's store is locked, so
+        // the IAM and STS stores the resolution reads are never reached while this
+        // service's guard is held.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let region = crate::state::request_region(ctx);
 
         // Permission a request draws from a grant is judged below, once the key is
@@ -295,38 +299,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let state = state.lock();
             let key = sealing_key(&state, &region, &input.key_id)?;
 
-            // The permission a request draws from a grant is exactly what that grant
-            // carries: the grant is on THIS key, it permits this operation, and the
-            // request's encryption context satisfies its constraints. A token that is
-            // not one this service minted names no grant at all, so the TOKEN "is not
-            // valid". A request presenting no grant token is not asking to be
-            // authorized by a grant and is not judged here — see this file's module
-            // doc.
-            if !tokens.is_empty() {
-                let named = match state.grants_for_tokens(&region, &tokens) {
-                    Ok(named) => named,
-                    Err(crate::state::GrantRefusal::MalformedToken) => {
-                        return Err(
-                            GenerateDataKeyPairWithoutPlaintextErrorModeled::InvalidGrantTokenException(
-                                InvalidGrantTokenException {
-                                    message: Some(
-                                        "The specified grant token is not valid.".to_string(),
-                                    ),
-                                },
-                            )
-                            .into(),
-                        );
-                    }
-                    Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
-                };
-                let permitted = named.iter().any(|grant| {
-                    grant.permits(&key.key_id, Self::NAME, input.encryption_context.as_ref())
-                });
-                if !permitted {
-                    return Err(crate::scaffolded::Scaffolded::access_denied(
-                        crate::state::grant_access_denied_message(Self::NAME, &key.arn),
-                    ));
+            // A token that is not one this service minted names no grant at all, so
+            // the TOKEN "is not valid". Everything else about permission is the
+            // service's one authorization decision (`crate::state::authorization`):
+            // the key's own key policy, the calling principal's identity policies, and
+            // the grants on this key the caller holds or presented a token for, judged
+            // together — see this file's module doc.
+            let named = match state.grants_for_tokens(&region, &tokens) {
+                Ok(named) => named,
+                Err(crate::state::GrantRefusal::MalformedToken) => {
+                    return Err(
+                        GenerateDataKeyPairWithoutPlaintextErrorModeled::InvalidGrantTokenException(
+                            InvalidGrantTokenException {
+                                message: Some(
+                                    "The specified grant token is not valid.".to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
                 }
+                // Every token is well formed but names a grant the store no longer
+                // holds, which carries no permission; what else the caller holds is
+                // judged below.
+                Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
+            };
+            let presented = (!tokens.is_empty()).then_some(named.as_slice());
+            if let Err(message) = crate::state::authorization::authorize(
+                &caller,
+                &state,
+                &region,
+                key,
+                Self::NAME,
+                input.encryption_context.as_ref(),
+                presented,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(message));
             }
 
             // `KeyPairSpec` "determines the type of data key pair that is generated",
@@ -415,7 +423,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // identifier of the key material used to encrypt the private key": the version
         // of the key's material that sealed it, which is the current one.
         let key_arn = key.arn.clone();
-        let key_material_id = key.current_key_material_id.clone();
+        let key_material_id = key.reported_key_material_id();
         let key_id = key.key_id.clone();
 
         // The key was just used in a successful cryptographic operation, which is what

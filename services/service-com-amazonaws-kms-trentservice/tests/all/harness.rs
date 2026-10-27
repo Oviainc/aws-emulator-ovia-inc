@@ -336,3 +336,73 @@ pub(crate) async fn create_alias_in(
     .await;
     assert_empty(case, "CreateAlias", &answer);
 }
+
+/// Rotate the key `identifier` names on demand and wait for the rotation to COMPLETE,
+/// which is what makes its material the one the key encrypts under.
+///
+/// "There might be a slight delay between initiating on-demand key rotation and the
+/// rotation's completion" — an on-demand rotation is in progress for
+/// `state::ON_DEMAND_ROTATION_SPAN` after the call that starts it, during which
+/// `GetKeyRotationStatus` reports its `OnDemandRotationStartDate` and the key goes on
+/// encrypting under the material it had. A case that is about what the rotation LEFT
+/// waits for it here; the in-progress report itself is asserted by
+/// `tests/all/refusal_and_rotation_contracts.rs`.
+pub(crate) async fn rotate_on_demand(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+) -> Value {
+    rotate_on_demand_in(router, REGION, case, identifier).await
+}
+
+/// [`rotate_on_demand`], through the endpoint of `region`.
+pub(crate) async fn rotate_on_demand_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    identifier: &str,
+) -> Value {
+    let answer = ok_in(
+        router,
+        region,
+        "RotateKeyOnDemand",
+        &json!({"KeyId": identifier}),
+    )
+    .await;
+    settle_rotation_in(router, region, case, identifier).await;
+    answer
+}
+
+/// Wait until no on-demand rotation of the key `identifier` names is in progress.
+pub(crate) async fn settle_rotation(router: &MultiServiceRouter, case: &str, identifier: &str) {
+    settle_rotation_in(router, REGION, case, identifier).await;
+}
+
+/// [`settle_rotation`], through the endpoint of `region`.
+pub(crate) async fn settle_rotation_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    identifier: &str,
+) {
+    let deadline = std::time::Instant::now()
+        + service_com_amazonaws_kms_trentservice::state::ON_DEMAND_ROTATION_SPAN * 20;
+    loop {
+        let status = ok_in(
+            router,
+            region,
+            "GetKeyRotationStatus",
+            &json!({"KeyId": identifier}),
+        )
+        .await;
+        if status["OnDemandRotationStartDate"].is_null() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case}: the on-demand rotation of {identifier} must complete, got {status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+

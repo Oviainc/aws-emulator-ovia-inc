@@ -33,9 +33,17 @@ use super::harness::{
 /// The refusal classes AWS words with NO message at all, so an empty `message` is the
 /// right answer for them and a sentence is not: a ciphertext, its encryption context and
 /// the key that sealed it are what `InvalidCiphertextException` reports on, and a caller
-/// presenting a ciphertext this key cannot open is told none of the three. Recorded
-/// behavior; the exception shape's own documentation is API-reference prose.
-const WORDLESS_REFUSALS: &[&str] = &["InvalidCiphertextException", "InvalidImportTokenException"];
+/// presenting a ciphertext this key cannot open is told none of the three; and a
+/// `ListRetirableGrants` call carrying a marker the service never issued is recorded
+/// answering `InvalidMarkerException` with an EMPTY `Error.Message`, which is a property
+/// of the refusal envelope rather than prose, so every paginated operation answers it
+/// that way. Recorded behavior; the exception shapes' own documentation is API-reference
+/// prose.
+const WORDLESS_REFUSALS: &[&str] = &[
+    "InvalidCiphertextException",
+    "InvalidImportTokenException",
+    "InvalidMarkerException",
+];
 
 /// Create a key with `description` and return its `KeyMetadata`.
 async fn described_key(
