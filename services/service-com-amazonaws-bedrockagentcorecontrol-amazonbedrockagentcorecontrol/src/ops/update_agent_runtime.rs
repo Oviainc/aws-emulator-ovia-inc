@@ -6,10 +6,12 @@
 //! becomes version N+1 in [`crate::state`], the previous versions stay readable,
 //! and the clock owes the new version its `UPDATING` -> `READY` transition.
 //!
-//! The new version RUNS AS the execution role the request names, so that role is
-//! resolved against IAM FIRST — a request naming a role that does not exist in this
-//! account, or whose trust policy does not let this service assume it, is refused with
-//! the operation's modelled validation error and no version is published.
+//! The new version RUNS the artifact the request names, so a `codeConfiguration`
+//! artifact's object-storage location is resolved FIRST — a request naming an object
+//! that is not there is refused with the operation's modelled validation error and no
+//! version is published — and it RUNS AS the execution role the request names, so that
+//! role is resolved against IAM next and a role this service cannot assume is refused
+//! the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -215,6 +217,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             replayed_output(&state.lock(), Self::NAME, input.client_token.as_deref(), now)
         {
             return Ok(replayed);
+        }
+
+        // The version this request would publish RUNS the code its artifact
+        // names, so a `codeConfiguration` artifact's object-storage location is
+        // resolved before anything is written — the same gate
+        // `CreateAgentRuntime` applies to the artifact it stores.
+        if crate::state::code_object_is_absent(ctx, &region, &input.agent_runtime_artifact).await {
+            return Err(UpdateAgentRuntimeErrorModeled::ValidationException(
+                crate::state::code_object_not_found(),
+            )
+            .into());
         }
 
         // The version this request would publish runs as the role it names, so
