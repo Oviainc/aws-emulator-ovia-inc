@@ -345,7 +345,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(material) = crate::state::mint_material(profile.material) else {
+        // The material of a symmetric encryption key is bytes from the OS CSPRNG, so
+        // this costs no key pair under the lock: on-demand rotation is reached only by
+        // such a key (the `is_symmetric_encryption` refusal above).
+        let Some(material) = crate::state::mint_material(profile) else {
             return Err(RotateKeyOnDemandErrorModeled::KMSInternalException(
                 KMSInternalException {
                     message: Some("the new key material could not be generated".to_string()),

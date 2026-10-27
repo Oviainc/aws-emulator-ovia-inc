@@ -711,7 +711,7 @@ impl ComAmazonawsKmsTrentserviceState {
         // An Amazon Web Services managed key is a symmetric encryption key whose
         // material KMS generated, so its material is the material that key spec
         // calls for rather than a kind named here.
-        let material = mint_material(key_spec_profile(KEY_SPEC_SYMMETRIC_DEFAULT)?.material)?;
+        let material = mint_material(key_spec_profile(KEY_SPEC_SYMMETRIC_DEFAULT)?)?;
         let key = Cmk::aws_managed(mint_key_id(false), region.to_string(), material);
         let key_id = key.key_id.clone();
         self.insert_key(key);
@@ -1982,6 +1982,22 @@ impl Cmk {
         !matches!(self.material, KeyMaterial::AwaitingImport)
     }
 
+    /// The PUBLIC half of this key's key pair, as a DER-encoded X.509
+    /// `SubjectPublicKeyInfo` — what a caller downloads for an asymmetric KMS key,
+    /// whose private half "never leaves KMS unencrypted"
+    /// (`smithy_query(query="doc",shape="GetPublicKey")`).
+    ///
+    /// It is COMPUTED from the private key this store holds ([`public_key_spki`]), so
+    /// it is the public half of the key that signs, decrypts or agrees under this KMS
+    /// key, and reading it changes nothing.
+    ///
+    /// `None` for a key whose material is not a key pair whose private half this store
+    /// holds: a symmetric or HMAC key, a key still waiting for imported material, or a
+    /// key pair of a spec no library reachable from here generates.
+    pub fn public_key(&self) -> Option<Vec<u8>> {
+        public_key_spki(&self.key_spec, self.material.private_key_pkcs8()?)
+    }
+
     /// The `KeyMaterialId` of the material waiting for an on-demand rotation of this
     /// key, or `None` while none is waiting — see [`PendingRotationMaterial`].
     pub fn pending_rotation_key_material_id(&self) -> Option<String> {
@@ -2332,8 +2348,9 @@ impl Cmk {
 
     /// The algorithms this key supports under `key_usage`, or `None` when that is
     /// not the usage the key was created with — which is what makes `KeyMetadata`
-    /// carry exactly one of the four per-usage algorithm lists.
-    fn algorithms_under(&self, key_usage: &str) -> Option<Vec<String>> {
+    /// carry exactly one of the four per-usage algorithm lists, and `GetPublicKey`
+    /// exactly one of its three.
+    pub fn algorithms_under(&self, key_usage: &str) -> Option<Vec<String>> {
         if self.key_usage != key_usage {
             return None;
         }
@@ -2733,8 +2750,8 @@ pub enum MaterialKind {
     /// An HMAC key of this many bytes: an `HMAC_<bits>` spec names the length of its
     /// key in bits, so `HMAC_256` is 32 bytes.
     Hmac(usize),
-    /// An asymmetric key pair. This slice does not generate asymmetric key material
-    /// (see [`KeyMaterial::KeyPairNotGenerated`]).
+    /// An asymmetric key pair, of the key pair the spec names (see
+    /// [`generate_key_pair`]).
     KeyPair,
 }
 
@@ -2768,7 +2785,8 @@ pub enum KeyMaterial {
     /// The key of an HMAC KMS key: as many bytes from the OS CSPRNG as the spec's
     /// name gives bits.
     Hmac(Vec<u8>),
-    /// A key pair this emulator has not generated.
+    /// A key pair of a spec no library reachable from here generates the key pair of
+    /// (see [`generate_key_pair`]).
     ///
     /// The KMS key itself is real: it is persisted, reported by `DescribeKey` and
     /// `ListKeys`, and moves through its key states like any other. What is absent
@@ -2777,12 +2795,17 @@ pub enum KeyMaterial {
     /// asymmetric spec — answers the scaffold's 501 rather than a fabricated
     /// signature, public key or ciphertext.
     KeyPairNotGenerated,
-    /// The PRIVATE key of an asymmetric KMS key whose key material a caller imported,
-    /// as a DER-encoded PKCS#8 `PrivateKeyInfo` — the form the wrapped material of an
-    /// asymmetric key takes, and the form every key pair in this service is encoded
-    /// in. Held as the caller supplied it, after it was parsed as a private key of the
-    /// key pair the key's `KeySpec` names (see [`imported_key_pair`]), so an operation
-    /// that uses it signs with the caller's key rather than with one minted here.
+    /// The PRIVATE key of an asymmetric KMS key, as a DER-encoded PKCS#8
+    /// `PrivateKeyInfo` — the form the wrapped material of an asymmetric key takes,
+    /// and the form every key pair in this service is encoded in. It is either the key
+    /// pair this service generated for the key ([`generate_key_pair`]) or the one a
+    /// caller imported into it, held as the caller supplied it after it was parsed as a
+    /// private key of the key pair the key's `KeySpec` names (see
+    /// [`imported_key_pair`]) — so an operation that uses it signs with the key's own
+    /// private half rather than with bytes invented for the occasion.
+    ///
+    /// The PUBLIC half is not stored beside it: it is derived from these bytes on
+    /// demand ([`public_key_spki`]), so the two halves cannot drift apart.
     ///
     /// The bytes never leave this process: the private half of a KMS key "never leaves
     /// KMS unencrypted" (`smithy_query(query="doc",shape="CreateKey")`).
@@ -2819,6 +2842,19 @@ impl KeyMaterial {
             Self::Hmac(_)
             | Self::KeyPairNotGenerated
             | Self::PrivateKeyPkcs8(_)
+            | Self::AwaitingImport => None,
+        }
+    }
+
+    /// The DER-encoded PKCS#8 private key behind an asymmetric KMS key, or `None` for
+    /// material of any other kind — including a key pair whose private half this
+    /// service does not hold.
+    pub fn private_key_pkcs8(&self) -> Option<&[u8]> {
+        match self {
+            Self::PrivateKeyPkcs8(material) => Some(material),
+            Self::Aes256(_)
+            | Self::Hmac(_)
+            | Self::KeyPairNotGenerated
             | Self::AwaitingImport => None,
         }
     }
@@ -2948,17 +2984,163 @@ fn key_pair_kind(key_spec: &str) -> Option<KeyPairKind> {
     }
 }
 
-/// The key material a key of `kind` is minted with.
+/// How many times a scalar is drawn before SM2 key generation gives up. A uniform
+/// 32-byte string is below the curve order with probability above 1 - 2^-32, so a
+/// handful of attempts is already beyond any practical failure.
+const SM2_SCALAR_ATTEMPTS: usize = 8;
+
+/// The length of an SM2 private scalar: the curve order is 256 bits
+/// (GM/T 0003-2012, the standard the `sm2` crate implements).
+const SM2_SCALAR_LEN: usize = 32;
+
+/// One freshly generated asymmetric key pair, in the two DER encodings every key pair
+/// in this service is held and reported in.
+pub struct GeneratedKeyPair {
+    /// The public half, as a DER-encoded X.509 `SubjectPublicKeyInfo` (SPKI), which is
+    /// the encoding `PublicKeyType` carries.
+    pub public_key_spki: Vec<u8>,
+    /// The private half, as a DER-encoded PKCS#8 `PrivateKeyInfo`, which is what a
+    /// `KeyMaterial::PrivateKeyPkcs8` holds. It never leaves this process in the clear.
+    pub private_key_pkcs8: Vec<u8>,
+}
+
+/// The private half never appears: the public half identifies the pair without
+/// disclosing it.
+impl std::fmt::Debug for GeneratedKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneratedKeyPair")
+            .field("public_key_spki", &self.public_key_spki)
+            .field("private_key_pkcs8", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The key pair `key_spec` names, drawn from the OS CSPRNG by the library that
+/// implements that algorithm.
 ///
-/// The kinds that HAVE material draw it from the OS CSPRNG; `MaterialKind::KeyPair`
-/// mints none, because this emulator does not generate asymmetric key pairs, and
-/// says so in the material it returns rather than inventing bytes that are not a key
-/// pair. Material a caller IMPORTS into such a key is [`imported_key_pair`].
+/// ONE generator for every key pair this service produces — the key material of an
+/// asymmetric KMS key and the data key pair a caller asks for — so the two cannot
+/// disagree about what a spec names or how a pair is encoded.
 ///
-/// `None` means the platform refused to produce entropy; the caller answers a
-/// modelled server error rather than minting a key with predictable material.
-pub fn mint_material(kind: MaterialKind) -> Option<KeyMaterial> {
-    match kind {
+/// `None` means `key_spec` names no key pair this service generates (see
+/// [`key_pair_kind`]) or the library refused to produce or encode one. Generating one
+/// is CPU work, hundreds of milliseconds for the largest modulus, so a caller runs it
+/// off the async worker and with no lock held.
+pub fn generate_key_pair(key_spec: &str) -> Option<GeneratedKeyPair> {
+    use ::aws_lc_rs::encoding::AsDer;
+    use ::aws_lc_rs::signature::KeyPair as _;
+    use ::sm2::pkcs8::{EncodePrivateKey, EncodePublicKey};
+
+    match key_pair_kind(key_spec)? {
+        KeyPairKind::Rsa(modulus_bits) => {
+            let private_key =
+                ::aws_lc_rs::rsa::PrivateDecryptingKey::generate(rsa_key_size(modulus_bits)?)
+                    .ok()?;
+            Some(GeneratedKeyPair {
+                public_key_spki: private_key.public_key().as_der().ok()?.as_ref().to_vec(),
+                private_key_pkcs8: private_key.as_der().ok()?.as_ref().to_vec(),
+            })
+        }
+        KeyPairKind::Ecdsa(signing_algorithm) => {
+            let pair = ::aws_lc_rs::signature::EcdsaKeyPair::generate(signing_algorithm).ok()?;
+            Some(GeneratedKeyPair {
+                public_key_spki: pair.public_key().as_der().ok()?.as_ref().to_vec(),
+                private_key_pkcs8: pair.to_pkcs8v1().ok()?.as_ref().to_vec(),
+            })
+        }
+        KeyPairKind::Ed25519 => {
+            let pair = ::aws_lc_rs::signature::Ed25519KeyPair::generate().ok()?;
+            Some(GeneratedKeyPair {
+                public_key_spki: pair.public_key().as_der().ok()?.as_ref().to_vec(),
+                private_key_pkcs8: pair.to_pkcs8v1().ok()?.as_ref().to_vec(),
+            })
+        }
+        // The `sm2` crate derives a public key from a scalar but draws no scalar of
+        // its own here: the bytes come from the same OS CSPRNG every other key this
+        // service generates is drawn from, and a draw that is not a valid scalar is
+        // redrawn rather than reduced, so every scalar is uniform over the curve
+        // order.
+        KeyPairKind::Sm2 => (0..SM2_SCALAR_ATTEMPTS).find_map(|_| {
+            let scalar = random_bytes(SM2_SCALAR_LEN)?;
+            let secret = ::sm2::SecretKey::from_slice(&scalar).ok()?;
+            Some(GeneratedKeyPair {
+                public_key_spki: secret.public_key().to_public_key_der().ok()?.as_ref().to_vec(),
+                private_key_pkcs8: secret.to_pkcs8_der().ok()?.as_bytes().to_vec(),
+            })
+        }),
+    }
+}
+
+/// The PUBLIC half of the key pair `private_key_pkcs8` is the private half of, as a
+/// DER-encoded X.509 `SubjectPublicKeyInfo`.
+///
+/// It is COMPUTED from the private key by the library that implements the algorithm
+/// `key_spec` names, so the public half a caller downloads is the public half of the
+/// private key this store holds — whether that key was generated here or imported.
+///
+/// `None` means the bytes are not a private key of the key pair `key_spec` names, or
+/// the library refused to encode its public half.
+pub fn public_key_spki(key_spec: &str, private_key_pkcs8: &[u8]) -> Option<Vec<u8>> {
+    use ::aws_lc_rs::encoding::AsDer;
+    use ::aws_lc_rs::signature::KeyPair as _;
+    use ::sm2::pkcs8::EncodePublicKey;
+
+    match key_pair_kind(key_spec)? {
+        KeyPairKind::Rsa(modulus_bits) => {
+            let private_key =
+                ::aws_lc_rs::rsa::PrivateDecryptingKey::from_pkcs8(private_key_pkcs8).ok()?;
+            if private_key.key_size_bits() != modulus_bits {
+                return None;
+            }
+            Some(private_key.public_key().as_der().ok()?.as_ref().to_vec())
+        }
+        KeyPairKind::Ecdsa(signing_algorithm) => {
+            let pair =
+                ::aws_lc_rs::signature::EcdsaKeyPair::from_pkcs8(signing_algorithm, private_key_pkcs8)
+                    .ok()?;
+            Some(pair.public_key().as_der().ok()?.as_ref().to_vec())
+        }
+        KeyPairKind::Ed25519 => {
+            let pair = ::aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8(private_key_pkcs8).ok()?;
+            Some(pair.public_key().as_der().ok()?.as_ref().to_vec())
+        }
+        KeyPairKind::Sm2 => {
+            let secret =
+                <::sm2::SecretKey as ::sm2::pkcs8::DecodePrivateKey>::from_pkcs8_der(
+                    private_key_pkcs8,
+                )
+                .ok()?;
+            Some(secret.public_key().to_public_key_der().ok()?.as_ref().to_vec())
+        }
+    }
+}
+
+/// The `aws-lc-rs` RSA key size for a modulus of `modulus_bits` bits, or `None` for a
+/// modulus size that library does not generate. Every `RSA_<bits>` key spec KMS
+/// declares is one of these.
+fn rsa_key_size(modulus_bits: usize) -> Option<::aws_lc_rs::rsa::KeySize> {
+    match modulus_bits {
+        2048 => Some(::aws_lc_rs::rsa::KeySize::Rsa2048),
+        3072 => Some(::aws_lc_rs::rsa::KeySize::Rsa3072),
+        4096 => Some(::aws_lc_rs::rsa::KeySize::Rsa4096),
+        _ => None,
+    }
+}
+
+/// The key material a key of `profile`'s spec is minted with.
+///
+/// Symmetric and HMAC material is drawn from the OS CSPRNG; an asymmetric spec is
+/// minted a key pair of that spec ([`generate_key_pair`]), of which the store keeps
+/// the private half. A spec whose key pair no library reachable from here generates
+/// yields [`KeyMaterial::KeyPairNotGenerated`]: the KMS key is still real, and the
+/// operations that would use its private half say so rather than inventing bytes that
+/// are not a key pair. Material a caller IMPORTS is [`imported_key_pair`].
+///
+/// `None` means the platform refused to produce entropy or a key pair; the caller
+/// answers a modelled server error rather than minting a key with predictable
+/// material.
+pub fn mint_material(profile: &KeySpecProfile) -> Option<KeyMaterial> {
+    match profile.material {
         MaterialKind::Aes256 => {
             let mut material = [0u8; MATERIAL_LEN];
             SystemRandom::new().fill(&mut material).ok()?;
@@ -2969,7 +3151,12 @@ pub fn mint_material(kind: MaterialKind) -> Option<KeyMaterial> {
             SystemRandom::new().fill(&mut material).ok()?;
             Some(KeyMaterial::Hmac(material))
         }
-        MaterialKind::KeyPair => Some(KeyMaterial::KeyPairNotGenerated),
+        MaterialKind::KeyPair if key_pair_kind(profile.key_spec).is_none() => {
+            Some(KeyMaterial::KeyPairNotGenerated)
+        }
+        MaterialKind::KeyPair => Some(KeyMaterial::PrivateKeyPkcs8(
+            generate_key_pair(profile.key_spec)?.private_key_pkcs8,
+        )),
     }
 }
 
@@ -4418,11 +4605,14 @@ pub const WRAPPING_KEY_SPEC_RSA_4096: &str = "RSA_4096";
 
 /// The RSA key size a `WrappingKeySpec` names, or `None` for a spec that is not an RSA
 /// key pair this service generates.
+///
+/// The accepted specs are the catalog above; the modulus size is read from the spec's
+/// own name through [`rsa_key_size`], the one place a modulus size becomes a key size.
 fn wrapping_key_size(wrapping_key_spec: &str) -> Option<::aws_lc_rs::rsa::KeySize> {
     match wrapping_key_spec {
-        WRAPPING_KEY_SPEC_RSA_2048 => Some(::aws_lc_rs::rsa::KeySize::Rsa2048),
-        WRAPPING_KEY_SPEC_RSA_3072 => Some(::aws_lc_rs::rsa::KeySize::Rsa3072),
-        WRAPPING_KEY_SPEC_RSA_4096 => Some(::aws_lc_rs::rsa::KeySize::Rsa4096),
+        WRAPPING_KEY_SPEC_RSA_2048 | WRAPPING_KEY_SPEC_RSA_3072 | WRAPPING_KEY_SPEC_RSA_4096 => {
+            rsa_key_size(wrapping_key_spec.strip_prefix("RSA_")?.parse().ok()?)
+        }
         _ => None,
     }
 }
