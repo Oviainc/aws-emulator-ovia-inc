@@ -91,12 +91,11 @@ fn matches_filters(
     record: &crate::state::VirtualClusterRecord,
     input: &ListVirtualClustersInput,
 ) -> bool {
-    // `states` keeps the clusters in any listed `VirtualClusterState`. An empty list names
-    // no state to keep out, so it constrains nothing.
-    if let Some(states) = input.states.as_ref().filter(|states| !states.is_empty()) {
-        if !states.contains(&record.state) {
-            return false;
-        }
+    // `states` keeps the clusters in any listed `VirtualClusterState` — one of the filters
+    // every paginated listing in this service shares, so it is applied out of the one place
+    // that holds it ([`crate::state::within_listed_states`]).
+    if !crate::state::within_listed_states(&record.state, input.states.as_deref()) {
+        return false;
     }
     // `containerProviderId` and `containerProviderType` name the container cluster the
     // virtual cluster is registered with, matched exactly against the provider the record
@@ -125,24 +124,13 @@ fn matches_filters(
     if input.eks_access_entry_integrated == Some(true) {
         return false;
     }
-    // `createdBefore` / `createdAfter` bound `createdAt` strictly, so the two together
-    // name an open interval and neither ever returns the cluster created exactly at a
-    // bound.
-    if input
-        .created_before
-        .as_ref()
-        .is_some_and(|bound| record.created_at_millis >= crate::state::millis_of(bound))
-    {
-        return false;
-    }
-    if input
-        .created_after
-        .as_ref()
-        .is_some_and(|bound| record.created_at_millis <= crate::state::millis_of(bound))
-    {
-        return false;
-    }
-    true
+    // The `createdBefore` / `createdAfter` window is shared the same way
+    // ([`crate::state::within_created_bounds`]).
+    crate::state::within_created_bounds(
+        record.created_at_millis,
+        input.created_before.as_ref(),
+        input.created_after.as_ref(),
+    )
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
