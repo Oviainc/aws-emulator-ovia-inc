@@ -154,15 +154,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
 
-        // This operation identifies the domain by pool AND name (`UserPoolId` is
-        // **required** here, unlike on `DescribeUserPoolDomain`), so the pool is
-        // resolved first: a request naming a pool that does not exist names no
-        // domain to delete either.
+        // This operation addresses the domain by the PAIR `UserPoolId` +
+        // `Domain` (`UserPoolId` is **required** here, unlike on
+        // `DescribeUserPoolDomain`), and the pair is resolved as a unit: a pool
+        // that is not stored holds no domain, exactly as a stored pool holds
+        // none under a name it never took, so both are the same refusal.
         let Some(pool) = guard.pool_mut(&input.user_pool_id) else {
-            return Err(not_found(format!(
-                "User pool {} does not exist.",
-                input.user_pool_id
-            )));
+            return Err(no_such_domain());
         };
 
         // "Given a user pool ID and domain identifier, deletes a user pool
@@ -171,10 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the clock has it in. A name the pool does not hold — including one
         // another pool holds — names no resource of this pool's.
         if pool.remove_domain_named(&input.domain).is_none() {
-            return Err(not_found(format!(
-                "User pool {} has no domain {}.",
-                input.user_pool_id, input.domain
-            )));
+            return Err(no_such_domain());
         }
         // The pool itself changed: the domain it used to report is gone.
         pool.last_modified_date = now;
@@ -186,13 +181,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// This operation's `ResourceNotFoundException`: "thrown when the Amazon Cognito
-/// service can't find the requested resource" (this service's model), which is
-/// what a request naming an absent pool, or a domain that pool does not hold,
-/// asks this operation to delete.
-fn not_found(message: String) -> DeleteUserPoolDomainError {
-    DeleteUserPoolDomainErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(message),
+/// This operation's refusal of a request whose `UserPoolId` + `Domain` pair
+/// holds no stored domain — a pool that is not stored, or one that holds no
+/// domain of that name (including a name another pool holds).
+///
+/// The pair names the domain to delete, so failing to resolve it is a bad
+/// parameter rather than a resource this operation looked up by its own id:
+/// `InvalidParameterException` is "thrown when the Amazon Cognito service
+/// encounters an invalid parameter" (this service's model), and the one sentence
+/// it carries ([`crate::state::NO_SUCH_DOMAIN_MESSAGE`]) reports the pair
+/// without naming either half.
+fn no_such_domain() -> DeleteUserPoolDomainError {
+    DeleteUserPoolDomainErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(crate::state::NO_SUCH_DOMAIN_MESSAGE.to_string()),
+        // `ReasonCode` is an optional machine code AWS fills in for a few
+        // specific refusals only, so none is invented here.
+        reason_code: None,
     })
     .into()
 }
