@@ -1243,6 +1243,23 @@
 //! [`InstanceRecord::spot_instance_request_id`] of the request that launched it rather than
 //! Spot Instances being kept in a store of their own.
 //!
+//! ## Spot Fleet requests
+//!
+//! [`ComAmazonawsEc2Amazonec2State::spot_fleet_requests`] holds the Spot Fleet requests
+//! `RequestSpotFleet` mints as [`SpotFleetRequestRecord`]s: the modelled
+//! [`SpotFleetRequestConfig`] `DescribeSpotFleetRequests` reports, plus the move the clock
+//! owes a `submitted` request and the Spot Instance requests the fleet placed to cover its
+//! target capacity. Keyed by `SpotFleetRequestId` in a [`BTreeMap`], like every other store
+//! here, so a pagination token can name the id the next page starts at.
+//!
+//! A Spot Fleet is a COMPOSITE of the Spot Instance requests it places: "the Spot Fleet only
+//! places the required requests" (`SpotFleetRequestConfigData$Type`), so the capacity it
+//! reports fulfilled is derived from those requests — which are records of
+//! [`ComAmazonawsEc2Amazonec2State::spot_instance_requests`], fulfilled into instances by
+//! the one clock-owed move every Spot Instance request already has — rather than written on
+//! the fleet by whoever asked about it
+//! ([`ComAmazonawsEc2Amazonec2State::materialize_due_spot_fleet_requests`]).
+//!
 //! ## Placement groups
 //!
 //! [`ComAmazonawsEc2Amazonec2State::placement_groups`] holds the account's placement
@@ -3357,6 +3374,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `InstanceCount` of them — the same arrangement as
     /// [`Self::dedicated_host_client_tokens`].
     pub spot_instance_request_client_tokens: HashMap<String, Vec<String>>,
+    /// Every Spot Fleet request the account holds, by `SpotFleetRequestId` — see the module
+    /// docs. Ordered by id, which is the order `DescribeSpotFleetRequests` reports and pages
+    /// over.
+    pub spot_fleet_requests: BTreeMap<String, SpotFleetRequestRecord>,
+    /// A `RequestSpotFleet` `ClientToken` and the Spot Fleet request that call minted, so a
+    /// repeat of the same request answers with that fleet instead of placing more capacity.
+    /// One token names ONE fleet, because one call mints one — the same arrangement as
+    /// [`Self::capacity_reservation_fleet_client_tokens`].
+    pub spot_fleet_request_client_tokens: HashMap<String, String>,
     /// A `&'static str` so only a member of the modelled `SnapshotBlockPublicAccessState`
     /// catalog can ever be stored here: the word comes from this module's own constants,
     /// never from a request. Read it through
@@ -3639,6 +3665,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             capacity_reservation_fleet_client_tokens: HashMap::new(),
             spot_instance_requests: BTreeMap::new(),
             spot_instance_request_client_tokens: HashMap::new(),
+            // A fresh account holds no Spot Fleet request until `RequestSpotFleet` mints
+            // one, and no token names one.
+            spot_fleet_requests: BTreeMap::new(),
+            spot_fleet_request_client_tokens: HashMap::new(),
             placement_groups: BTreeMap::new(),
             replace_root_volume_tasks: BTreeMap::new(),
             replace_root_volume_task_client_tokens: HashMap::new(),
@@ -7071,6 +7101,10 @@ impl ComAmazonawsEc2Amazonec2State {
         self.complete_due_import_image_tasks(now);
         self.materialize_due_capacity_reservation_fleet_moves(now);
         self.materialize_due_spot_instance_requests(now);
+        // AFTER the Spot Instance requests a Spot Fleet placed: the capacity a fleet reports
+        // fulfilled is derived from the state of those requests, so they are moved first and
+        // the fleet then reads the states a caller is about to be shown.
+        self.materialize_due_spot_fleet_requests(now);
         self.expire_due_store_image_tasks(now);
         self.fulfill_due_reserved_instances_modifications(now);
     }
@@ -7437,6 +7471,62 @@ pub fn validate_kernel_or_ramdisk_id<E>(
     Ok(())
 }
 
+/// Refuse a maximum hourly price that is not one.
+///
+/// "The maximum price per unit hour that you are willing to pay for a Spot Instance"
+/// (`RequestSpotInstancesRequest$SpotPrice`, `SpotFleetRequestConfigData$SpotPrice` and the
+/// per-pool and per-fleet totals beside it) is a non-negative number. Every one of those
+/// members is a plain `String` in the model, so this is the ONE place all of them are held to
+/// that, and `member` names the one that was wrong so a caller can fix the request from the
+/// message alone.
+pub fn validate_hourly_price<E>(
+    member: &str,
+    price: Option<&str>,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    let Some(price) = price else {
+        return Ok(());
+    };
+    let valid = price
+        .parse::<f64>()
+        .is_ok_and(|parsed| parsed.is_finite() && parsed >= 0.0);
+    if !valid {
+        return Err(invalid_parameter_value(format!(
+            "Invalid value '{price}' for {member}. It must be a non-negative hourly price"
+        )));
+    }
+    Ok(())
+}
+
+/// The modelled word `requested` names out of `catalog`, `default` when it names none, or a
+/// refusal naming `member`.
+///
+/// `catalog` is a GENERATED `*_VALUES` constant, so an enum's members live in exactly one
+/// place; answering a `&'static str` out of it is what keeps a request's own text out of the
+/// store. A `None` default is for the members AWS documents no default for: those report
+/// nothing at all rather than a guess. The ONE lookup of this kind in the crate, so two
+/// operations cannot refuse one enum two ways.
+pub fn modelled_catalog_word<E>(
+    requested: Option<&str>,
+    catalog: &'static [&'static str],
+    member: &str,
+    default: Option<&'static str>,
+) -> Result<Option<&'static str>, crate::scaffolded::Scaffolded<E>> {
+    match requested {
+        None => Ok(default),
+        Some(requested) => catalog
+            .iter()
+            .copied()
+            .find(|modelled| *modelled == requested)
+            .map(Some)
+            .ok_or_else(|| {
+                invalid_parameter_value(format!(
+                    "Invalid value '{requested}' for {member}. Valid values: {}",
+                    catalog.join(" | ")
+                ))
+            }),
+    }
+}
+
 /// The bytes a tag map holds.
 pub fn tag_bytes(tags: &BTreeMap<String, String>) -> usize {
     tags.iter().map(|(key, value)| key.len() + value.len()).sum()
@@ -7669,6 +7759,7 @@ impl ComAmazonawsEc2Amazonec2State {
             security_groups,
             snapshots => view,
             spot_instance_requests => view,
+            spot_fleet_requests => view,
             subnet_cidr_reservations,
             subnets,
             traffic_mirror_filters,
@@ -29653,10 +29744,13 @@ pub const DEFAULT_USE_LONG_IDS: bool = true;
 /// The resource portion of an account's root-user ARN.
 pub const IAM_ROOT_RESOURCE: &str = "root";
 
+/// The resource prefix of an IAM ROLE's ARN (`arn:aws:iam::<account>:role/<name>`).
+pub const IAM_ROLE_RESOURCE_PREFIX: &str = "role/";
+
 /// The resource prefixes of the two kinds of IAM principal that are not the root user,
 /// as an IAM ARN spells them (`arn:aws:iam::<account>:user/<name>`,
 /// `…:role/<name>`).
-const IAM_PRINCIPAL_PREFIXES: [&str; 2] = ["user/", "role/"];
+const IAM_PRINCIPAL_PREFIXES: [&str; 2] = ["user/", IAM_ROLE_RESOURCE_PREFIX];
 
 /// The most bytes the path-and-name part of an IAM user or role ARN may carry: the IAM
 /// quotas on the two ("Path: 512 characters", "Role name / User name: 64 characters" — IAM
@@ -29699,16 +29793,24 @@ pub fn longer_ids_are_permanent_for(resource: &str) -> bool {
     PERMANENT_LONGER_ID_RESOURCE_TYPES.contains(&resource)
 }
 
-/// Is `arn` the ARN of an IAM principal of the account this store belongs to — "an IAM
-/// user, IAM role, or the root user" (`ModifyIdentityIdFormatRequest$PrincipalArn`)?
+/// Is `arn` the ARN of an IAM principal of one of `prefixes` — `root` too when `allow_root`
+/// — and, when `this_account_only`, of the account this store belongs to?
 ///
 /// `arn:<partition>:iam::<account>:root`, `…:user/<path><name>` or `…:role/<path><name>`,
-/// with the empty Region segment IAM's global ARNs carry and with `<account>` the account
-/// this emulator serves: the ID format settings of another account's principals are not
-/// this account's to set. The path-and-name part is bounded by
-/// [`IAM_PRINCIPAL_PATH_AND_NAME_MAX`] and limited to the characters IAM admits in the
-/// two, so a request cannot name an unbounded principal.
-pub fn iam_principal_arn_is_well_formed(arn: &str) -> bool {
+/// with the empty Region segment IAM's global ARNs carry. The path-and-name part is bounded
+/// by [`IAM_PRINCIPAL_PATH_AND_NAME_MAX`] and limited to the characters IAM admits in a user
+/// or role name, so a request cannot name an unbounded principal.
+///
+/// The ONE reading of an IAM principal ARN in this crate, so every operation that takes one
+/// agrees on its shape: [`iam_principal_arn_is_well_formed`] for the ID format operations'
+/// "an IAM user, IAM role, or the root user", and [`iam_role_arn_is_well_formed`] for the
+/// members that take a role the SERVICE assumes.
+fn iam_principal_arn_names(
+    arn: &str,
+    prefixes: &[&str],
+    allow_root: bool,
+    this_account_only: bool,
+) -> bool {
     let fields: Vec<&str> = arn.split(':').collect();
     let [prefix, partition, service, region, account, resource] = fields.as_slice() else {
         return false;
@@ -29717,18 +29819,23 @@ pub fn iam_principal_arn_is_well_formed(arn: &str) -> bool {
         && partition
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let account_is_well_formed = if this_account_only {
+        *account == ::engine::emulator_account_id()
+    } else {
+        !account.is_empty() && account.bytes().all(|byte| byte.is_ascii_digit())
+    };
     if *prefix != "arn"
         || !partition_is_well_formed
         || *service != "iam"
         || !region.is_empty()
-        || *account != ::engine::emulator_account_id()
+        || !account_is_well_formed
     {
         return false;
     }
-    if *resource == IAM_ROOT_RESOURCE {
+    if allow_root && *resource == IAM_ROOT_RESOURCE {
         return true;
     }
-    IAM_PRINCIPAL_PREFIXES
+    prefixes
         .iter()
         .filter_map(|kind| resource.strip_prefix(kind))
         .any(|path_and_name| {
@@ -29739,6 +29846,28 @@ pub fn iam_principal_arn_is_well_formed(arn: &str) -> bool {
                     byte.is_ascii_alphanumeric() || b"+=,.@_-/".contains(&byte)
                 })
         })
+}
+
+/// Is `arn` the ARN of an IAM principal of the account this store belongs to — "an IAM
+/// user, IAM role, or the root user" (`ModifyIdentityIdFormatRequest$PrincipalArn`)?
+///
+/// `<account>` has to be the account this emulator serves: the ID format settings of another
+/// account's principals are not this account's to set.
+pub fn iam_principal_arn_is_well_formed(arn: &str) -> bool {
+    iam_principal_arn_names(arn, &IAM_PRINCIPAL_PREFIXES, true, true)
+}
+
+/// Is `arn` the ARN of an IAM ROLE — `arn:<partition>:iam::<account>:role/<path><name>`?
+///
+/// The shape of a member that names a role the SERVICE assumes, as
+/// `SpotFleetRequestConfigData$IamFleetRole` does ("the Amazon Resource Name (ARN) of an
+/// Identity and Access Management (IAM) role that grants the Spot Fleet the permission to
+/// request, launch, terminate, and tag instances on your behalf"). The ACCOUNT is not held to
+/// this emulator's own: the role is the caller's, and a request naming a role of the account
+/// it is made for is not this emulator's to second-guess. The root user is not a role, so it
+/// is not one of these either.
+pub fn iam_role_arn_is_well_formed(arn: &str) -> bool {
+    iam_principal_arn_names(arn, &[IAM_ROLE_RESOURCE_PREFIX], false, false)
 }
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -30585,6 +30714,627 @@ impl ComAmazonawsEc2Amazonec2State {
             PRODUCT_DESCRIPTION_WINDOWS
         } else {
             PRODUCT_DESCRIPTION_LINUX_UNIX
+        }
+    }
+}
+
+// =============================================================================
+// Spot Fleet requests
+// =============================================================================
+
+use crate::ops::types::{
+    LaunchSpecification, SpotFleetRequestConfig, SpotFleetRequestConfigData,
+};
+
+/// The prefix of every Spot Fleet request id, which an `sfr-` id carries a UUID after the
+/// way an EC2 Fleet id does ([`FLEET_ID_PREFIX`]).
+pub const SPOT_FLEET_REQUEST_ID_PREFIX: &str = "sfr-";
+
+/// The `submitted` member of the modelled `BatchState` catalog
+/// ([`crate::ops::types::BATCH_STATE_VALUES`]): where a Spot Fleet request AWS has just
+/// accepted sits, before it is `active`.
+pub const SPOT_FLEET_STATE_SUBMITTED: &str = "submitted";
+
+/// The `active` member of [`crate::ops::types::BATCH_STATE_VALUES`]: a Spot Fleet request
+/// that is placing and holding capacity.
+pub const SPOT_FLEET_STATE_ACTIVE: &str = "active";
+
+/// The `pending_fulfillment` member of the modelled `ActivityStatus` catalog
+/// ([`crate::ops::types::ACTIVITY_STATUS_VALUES`]): "After all requests are placed, the
+/// status is `pending_fulfillment`" (`SpotFleetRequestConfig$ActivityStatus`).
+pub const SPOT_FLEET_ACTIVITY_PENDING_FULFILLMENT: &str = "pending_fulfillment";
+
+/// The `fulfilled` member of [`crate::ops::types::ACTIVITY_STATUS_VALUES`]: "If the size of
+/// the fleet is equal to or greater than its target capacity, the status is `fulfilled`"
+/// (`SpotFleetRequestConfig$ActivityStatus`).
+pub const SPOT_FLEET_ACTIVITY_FULFILLED: &str = "fulfilled";
+
+/// The `request` member of [`FLEET_TYPE_VALUES`]: a Spot Fleet request that "only places the
+/// required requests" and does not replenish them
+/// (`SpotFleetRequestConfigData$Type`).
+pub const FLEET_TYPE_REQUEST: &str = "request";
+
+/// The resource type a `RequestSpotFleet` tag specification may name: "The value for
+/// `ResourceType` must be `spot-fleet-request`, otherwise the Spot Fleet request fails"
+/// (`SpotFleetRequestConfigData$TagSpecifications`), a member of the modelled `ResourceType`
+/// catalog.
+pub const RESOURCE_TYPE_SPOT_FLEET_REQUEST: &str = "spot-fleet-request";
+
+/// The `lowestPrice` member of the modelled `AllocationStrategy` catalog
+/// ([`crate::ops::types::ALLOCATION_STRATEGY_VALUES`]), which is also the member of
+/// `OnDemandAllocationStrategy` both strategies default to: "if you do not specify a value,
+/// Spot Fleet defaults to `lowestPrice`" (`SpotFleetRequestConfigData$OnDemandAllocationStrategy`).
+pub const SPOT_FLEET_ALLOCATION_STRATEGY_LOWEST_PRICE: &str = "lowestPrice";
+
+/// The `diversified` member of [`crate::ops::types::ALLOCATION_STRATEGY_VALUES`]: the
+/// strategy that spreads a fleet's target capacity over its pools rather than placing it in
+/// one ("you can specify that the Spot Fleet distribute the target capacity across the Spot
+/// pools included in its launch specifications", `RequestSpotFleet`).
+pub const SPOT_FLEET_ALLOCATION_STRATEGY_DIVERSIFIED: &str = "diversified";
+
+/// The most Spot pools one Spot Fleet request may describe — launch specifications, or
+/// launch template overrides.
+///
+/// Neither list carries a modelled `@length`, so this is what bounds the per-pool work one
+/// call asks for: an AMI, a subnet, a security-group and a launch-template resolution each.
+pub const MAX_SPOT_FLEET_POOLS: usize = 100;
+
+/// How many Spot Fleet requests this store holds, on the ceiling every store of this module
+/// that mints its own ids is held to ([`MAX_STORED_RECORDS_PER_STORE`]).
+pub const MAX_SPOT_FLEET_REQUESTS: usize = MAX_STORED_RECORDS_PER_STORE;
+
+/// The most Spot Instances ONE Spot Fleet request places in this emulator.
+///
+/// `TargetCapacity` is a plain modelled `Integer` with no `@range`, and a fleet places one
+/// Spot Instance request per instance its capacity takes, so this is what bounds the work
+/// and the memory one call can ask for. A fleet whose target capacity needs more than this
+/// places this many and keeps the activity status
+/// [`SPOT_FLEET_ACTIVITY_PENDING_FULFILLMENT`], which is the status AWS reports for a fleet
+/// whose size is below its target — never a capacity it did not place.
+pub const MAX_SPOT_FLEET_SPOT_INSTANCES: usize = MAX_INSTANCES_PER_RUN as usize;
+
+/// `InvalidSpotFleetRequestId.Malformed` (HTTP 400): the request named something that is not
+/// a Spot Fleet request id at all, so there is nothing to look up.
+pub const INVALID_SPOT_FLEET_REQUEST_ID_MALFORMED: &str = "InvalidSpotFleetRequestId.Malformed";
+
+/// `InvalidSpotFleetRequestId.NotFound` (HTTP 400): the request named a Spot Fleet request id
+/// this account holds no Spot Fleet request for.
+pub const INVALID_SPOT_FLEET_REQUEST_ID_NOT_FOUND: &str = "InvalidSpotFleetRequestId.NotFound";
+
+/// Whether `id` is a well-formed Spot Fleet request id: [`SPOT_FLEET_REQUEST_ID_PREFIX`] and
+/// the UUID [`uuid_suffixed_id_is_well_formed`] reads, the form AWS issues one in
+/// (`sfr-73fbd2ce-aa30-494c-8788-1cee4ffcbc91`) and the form
+/// [`ComAmazonawsEc2Amazonec2State::mint_spot_fleet_request_id`] mints.
+pub fn spot_fleet_request_id_is_well_formed(id: &str) -> bool {
+    uuid_suffixed_id_is_well_formed(id, SPOT_FLEET_REQUEST_ID_PREFIX)
+}
+
+/// Refuse something that is not a Spot Fleet request id at all: HTTP 400
+/// [`INVALID_SPOT_FLEET_REQUEST_ID_MALFORMED`], answered BEFORE any lookup so a caller can
+/// tell a typo from a fleet the account does not hold.
+pub fn invalid_spot_fleet_request_id_malformed<E>(request_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SPOT_FLEET_REQUEST_ID_MALFORMED,
+        400,
+        format!("Invalid id: \"{request_id}\""),
+    )
+}
+
+/// Refuse a well-formed Spot Fleet request id this account holds no fleet for: HTTP 400
+/// [`INVALID_SPOT_FLEET_REQUEST_ID_NOT_FOUND`].
+pub fn invalid_spot_fleet_request_id_not_found<E>(request_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SPOT_FLEET_REQUEST_ID_NOT_FOUND,
+        400,
+        format!("The spot fleet request ID '{request_id}' does not exist"),
+    )
+}
+
+/// The move the clock owes one Spot Fleet request: a [`ClockTransition`] to the `BatchState`
+/// member it becomes, as a `&'static str` so only a word from this module's own catalog
+/// constants can be stored — never a request's text.
+pub type SpotFleetRequestTransition = ClockTransition<&'static str>;
+
+/// One Spot Instance request a Spot Fleet placed to cover part of its target capacity.
+///
+/// The request ITSELF is a record of
+/// [`ComAmazonawsEc2Amazonec2State::spot_instance_requests`], named here by id: the fleet
+/// keeps only what is true of the request *as the fleet's* — how many capacity units the
+/// instance it launches provides — so the state the fleet derives from a request is always
+/// the one the Spot Instance request store holds.
+#[derive(Debug, Clone)]
+pub struct SpotFleetPlacement {
+    /// The `SpotInstanceRequestId`, a key of
+    /// [`ComAmazonawsEc2Amazonec2State::spot_instance_requests`].
+    pub spot_instance_request_id: String,
+    /// "The number of units provided by the specified instance type"
+    /// (`SpotFleetLaunchSpecification$WeightedCapacity`) the launched instance provides.
+    pub weighted_capacity: f64,
+}
+
+/// One stored Spot Fleet request: the modelled [`SpotFleetRequestConfig`]
+/// `DescribeSpotFleetRequests` reports, plus the two facts that shape carries no member for.
+///
+/// `RequestSpotFleet` answers the id of the view stored here and `DescribeSpotFleetRequests`
+/// reports the view itself, so the two cannot describe one fleet differently.
+#[derive(Debug, Clone)]
+pub struct SpotFleetRequestRecord {
+    /// The fleet as the model shapes it, carrying the state reached so far and the capacity
+    /// its placements have fulfilled.
+    pub view: SpotFleetRequestConfig,
+    /// The move the clock owes this fleet, while one is owed.
+    pub pending: Option<SpotFleetRequestTransition>,
+    /// The Spot Instance requests this fleet placed, in placement order.
+    pub placements: Vec<SpotFleetPlacement>,
+    /// The Region the request was signed for, which the instances its placements launch need
+    /// for their private DNS names. Not a member of any modelled Spot Fleet shape.
+    pub region: String,
+}
+
+impl SpotFleetRequestRecord {
+    /// This fleet's own `SpotFleetRequestId`, which is also the key the store holds it under.
+    pub fn spot_fleet_request_id(&self) -> &str {
+        self.view.spot_fleet_request_id.as_deref().unwrap_or_default()
+    }
+
+    /// This fleet's `BatchState` as it was last reported.
+    pub fn state(&self) -> &str {
+        self.view
+            .spot_fleet_request_state
+            .as_deref()
+            .unwrap_or_default()
+    }
+
+    /// The fleet's configuration, as the request gave it and this module normalised it.
+    pub fn config(&self) -> Option<&SpotFleetRequestConfigData> {
+        self.view.spot_fleet_request_config.as_ref()
+    }
+
+    /// "The number of units to request for the Spot Fleet"
+    /// (`SpotFleetRequestConfigData$TargetCapacity`).
+    pub fn target_capacity(&self) -> f64 {
+        self.config()
+            .map_or(0.0, |config| f64::from(config.target_capacity))
+    }
+
+    /// Apply what the clock owes this fleet: the state move that has fallen due, and the
+    /// capacity its placements have fulfilled by now.
+    ///
+    /// Both are owed to the CLOCK rather than to a caller — the move was due at this instant
+    /// whether or not anybody called, and the fulfilled capacity is derived from the Spot
+    /// Instance requests the fleet placed — so a reporting operation may apply them.
+    fn apply_due_move(&mut self, now: Instant, fulfilled: f64) {
+        let due = self
+            .pending
+            .as_ref()
+            .filter(|pending| now >= pending.due_at)
+            .map(|pending| pending.to);
+        if let Some(to) = due {
+            self.view.spot_fleet_request_state = Some(to.to_string());
+            self.pending = None;
+        }
+        let target = self.target_capacity();
+        let on_demand = self
+            .config()
+            .and_then(|config| config.on_demand_fulfilled_capacity)
+            .unwrap_or_default();
+        if let Some(config) = self.view.spot_fleet_request_config.as_mut() {
+            config.fulfilled_capacity = Some(fulfilled);
+        }
+        // "If the size of the fleet is equal to or greater than its target capacity, the
+        // status is `fulfilled`" — and until then the requests are placed and waiting, which
+        // is `pending_fulfillment`.
+        self.view.activity_status = Some(
+            if fulfilled + on_demand >= target {
+                SPOT_FLEET_ACTIVITY_FULFILLED
+            } else {
+                SPOT_FLEET_ACTIVITY_PENDING_FULFILLMENT
+            }
+            .to_string(),
+        );
+    }
+}
+
+/// The capacity one Spot Fleet's `placements` have FULFILLED: the weighted capacity of every
+/// placement whose Spot Instance request has launched its instance.
+///
+/// The ONE definition of "`FulfilledCapacity`": "The number of units fulfilled by this
+/// request compared to the set target capacity. You cannot set this value"
+/// (`SpotFleetRequestConfigData$FulfilledCapacity`) — so it is derived from the instances the
+/// fleet's requests actually launched, never taken from a request and never counted for a
+/// request that has launched nothing.
+pub fn spot_fleet_fulfilled_capacity(
+    placements: &[SpotFleetPlacement],
+    requests: &BTreeMap<String, SpotInstanceRequestRecord>,
+) -> f64 {
+    placements
+        .iter()
+        .filter(|placement| {
+            requests
+                .get(&placement.spot_instance_request_id)
+                .is_some_and(|record| record.view.instance_id.is_some())
+        })
+        .map(|placement| placement.weighted_capacity)
+        .sum()
+}
+
+/// How many Spot Instances each pool of a Spot Fleet places to cover `spot_target` capacity
+/// units, given each pool's weighted capacity, never more than `cap` instances in total.
+///
+/// "By default, the Spot Fleet requests Spot Instances in the Spot Instance pool where the
+/// price per unit is the lowest", and "alternatively, you can specify that the Spot Fleet
+/// distribute the target capacity across the Spot pools included in its launch
+/// specifications" (`RequestSpotFleet`) — so a `diversified` fleet splits the target evenly
+/// across its pools and every other strategy places it all on one pool. This emulator holds
+/// no Spot price history, so the lowest-priced pool cannot be told from the others: the one
+/// pool is the FIRST the request gave, which is the order every other member of the
+/// specification is read in.
+///
+/// How many instances a pool's share takes is that share divided by what one instance of the
+/// pool provides, rounded UP, because an instance is not launched in
+/// fractions — the same arithmetic a Capacity Reservation Fleet's instance count is made by.
+/// `cap` is what bounds the whole computation: a target capacity the model leaves unbounded
+/// can ask for more instances than this store will ever place, and the pools then place `cap`
+/// of them between them.
+pub fn spot_fleet_placement_counts(
+    weights: &[f64],
+    spot_target: f64,
+    diversified: bool,
+    cap: usize,
+) -> Vec<usize> {
+    let mut counts = vec![0usize; weights.len()];
+    if weights.is_empty() || !spot_target.is_finite() || spot_target <= 0.0 || cap == 0 {
+        return counts;
+    }
+    let pools = if diversified { weights.len() } else { 1 };
+    // `pools` is at least 1 here, so the share is finite and positive.
+    let share = spot_target / pools as f64;
+    let mut placed = 0usize;
+    for (count, weight) in counts.iter_mut().zip(weights).take(pools) {
+        let weight = if weight.is_finite() && *weight > 0.0 {
+            *weight
+        } else {
+            DEFAULT_FLEET_INSTANCE_WEIGHT
+        };
+        let needed = (share / weight).ceil();
+        let needed = if !needed.is_finite() || needed <= 0.0 {
+            0
+        } else if needed >= cap as f64 {
+            cap
+        } else {
+            // Inside `cap` and integral after `ceil`, so this conversion is exact.
+            needed as usize
+        };
+        *count = needed.min(cap.saturating_sub(placed));
+        placed = placed.saturating_add(*count);
+    }
+    counts
+}
+
+/// One pool of a Spot Fleet as a writer has already resolved it: the launch the fleet places
+/// in that pool, what one of its instances provides, and how many of them to place.
+#[derive(Debug, Clone)]
+pub struct SpotFleetPoolPlacement {
+    /// The launch every Spot Instance request of this pool carries, as the modelled
+    /// [`LaunchSpecification`] a Spot Instance request reports — resolved from the fleet's
+    /// own launch specification or from the launch template it names, so the store holds one
+    /// shape however the fleet described the launch.
+    pub launch: LaunchSpecification,
+    /// "The number of units provided by the specified instance type"
+    /// (`SpotFleetLaunchSpecification$WeightedCapacity`), defaulted to
+    /// [`DEFAULT_FLEET_INSTANCE_WEIGHT`].
+    pub weighted_capacity: f64,
+    /// "The maximum price per unit hour that you are willing to pay for a Spot Instance" of
+    /// this pool, or the fleet's own maximum when the pool named none.
+    pub spot_price: Option<String>,
+    /// How many Spot Instance requests this pool places
+    /// ([`spot_fleet_placement_counts`]).
+    pub count: usize,
+}
+
+/// What a writer must say to store a Spot Fleet request; everything else about the record —
+/// the fleet's id, the state and activity status it starts in, the Spot Instance requests it
+/// places and the bytes it charges — is derived by
+/// [`ComAmazonawsEc2Amazonec2State::insert_spot_fleet_request`].
+#[derive(Debug, Clone)]
+pub struct SpotFleetRequestSpec {
+    /// The Region the request was signed for.
+    pub region: String,
+    /// The configuration as the request gave it, with the documented defaults applied and
+    /// the members a caller cannot set ([`SpotFleetRequestConfigData::fulfilled_capacity`])
+    /// left for the store to derive.
+    pub config: SpotFleetRequestConfigData,
+    /// The tags the request's `TagSpecifications` assign to the fleet.
+    pub tags: Vec<Tag>,
+    /// The pools the fleet places its Spot capacity in.
+    pub pools: Vec<SpotFleetPoolPlacement>,
+    /// The `SpotInstanceType` every Spot Instance request of this fleet is placed as, out of
+    /// [`SPOT_INSTANCE_TYPES`]: a fleet that maintains its capacity places requests that
+    /// outlive their instances.
+    pub spot_request_type: &'static str,
+    /// The interruption behaviour every Spot Instance request of this fleet carries, out of
+    /// [`crate::ops::types::INSTANCE_INTERRUPTION_BEHAVIOR_VALUES`].
+    pub interruption_behavior: &'static str,
+}
+
+/// The caller-chosen bytes one stored Spot Fleet request holds: the strings of its
+/// configuration and its tags.
+///
+/// The ONE definition of that charge: `RequestSpotFleet` asks it before the write and
+/// [`ComAmazonawsEc2Amazonec2State::insert_spot_fleet_request`] charges exactly it. The Spot
+/// Instance requests the fleet places charge their own bytes through
+/// [`spot_instance_request_payload_bytes`], the one definition of THAT charge, so no path
+/// stores caller-chosen bytes uncharged.
+pub fn spot_fleet_request_payload_bytes(
+    config: &SpotFleetRequestConfigData,
+    tags: &[Tag],
+) -> usize {
+    let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
+    let launch_bytes: usize = config
+        .launch_specifications
+        .iter()
+        .flatten()
+        .map(|launch| {
+            text(&launch.image_id)
+                .saturating_add(text(&launch.instance_type))
+                .saturating_add(text(&launch.key_name))
+                .saturating_add(text(&launch.subnet_id))
+                .saturating_add(text(&launch.user_data))
+                .saturating_add(text(&launch.kernel_id))
+                .saturating_add(text(&launch.ramdisk_id))
+                .saturating_add(text(&launch.addressing_type))
+                .saturating_add(text(&launch.spot_price))
+                .saturating_add(
+                    launch
+                        .placement
+                        .as_ref()
+                        .map_or(0, |placement| text(&placement.availability_zone)),
+                )
+                .saturating_add(
+                    launch
+                        .security_groups
+                        .iter()
+                        .flatten()
+                        .map(|group| text(&group.group_id).saturating_add(text(&group.group_name)))
+                        .fold(0usize, usize::saturating_add),
+                )
+        })
+        .fold(0usize, usize::saturating_add);
+    let template_bytes: usize = config
+        .launch_template_configs
+        .iter()
+        .flatten()
+        .map(|entry| {
+            let specification = entry.launch_template_specification.as_ref().map_or(0, |spec| {
+                text(&spec.launch_template_id)
+                    .saturating_add(text(&spec.launch_template_name))
+                    .saturating_add(text(&spec.version))
+            });
+            let overrides = entry
+                .overrides
+                .iter()
+                .flatten()
+                .map(|over| {
+                    text(&over.instance_type)
+                        .saturating_add(text(&over.subnet_id))
+                        .saturating_add(text(&over.availability_zone))
+                        .saturating_add(text(&over.availability_zone_id))
+                        .saturating_add(text(&over.spot_price))
+                })
+                .fold(0usize, usize::saturating_add);
+            specification.saturating_add(overrides)
+        })
+        .fold(0usize, usize::saturating_add);
+    config
+        .iam_fleet_role
+        .len()
+        .saturating_add(text(&config.client_token))
+        .saturating_add(text(&config.context))
+        .saturating_add(text(&config.spot_price))
+        .saturating_add(text(&config.spot_max_total_price))
+        .saturating_add(text(&config.on_demand_max_total_price))
+        .saturating_add(launch_bytes)
+        .saturating_add(template_bytes)
+        .saturating_add(tag_list_bytes(tags))
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// A fresh, unused `SpotFleetRequestId`.
+    ///
+    /// The form [`spot_fleet_request_id_is_well_formed`] reads, minted by the one helper that
+    /// renders this store's monotonic counter into a UUID
+    /// ([`Self::mint_uuid_suffixed_id`]), so the id is unique without being drawn from a
+    /// request and is never the null UUID.
+    pub fn mint_spot_fleet_request_id(&mut self) -> String {
+        self.mint_uuid_suffixed_id(SPOT_FLEET_REQUEST_ID_PREFIX)
+    }
+
+    /// Whether another Spot Fleet request fits inside the store's ceiling
+    /// ([`MAX_SPOT_FLEET_REQUESTS`]).
+    ///
+    /// The same contract as [`Self::has_capacity_reservation_fleet_capacity`]: a writer asks
+    /// first and refuses instead of growing the store past its ceiling.
+    pub fn has_spot_fleet_request_capacity(&self) -> bool {
+        self.spot_fleet_requests.len() < MAX_SPOT_FLEET_REQUESTS
+    }
+
+    /// Store one Spot Fleet request, placing the Spot Instance requests its target capacity
+    /// takes, and answer it as it was stored.
+    ///
+    /// The one way a Spot Fleet request is stored, so the id it carries, the state and
+    /// activity status it starts in, the requests it places and the bytes it charges cannot
+    /// be built two ways.
+    ///
+    /// The CALL places the requests — "the Spot Fleet only places the required requests"
+    /// (`SpotFleetRequestConfigData$Type`) — so they are facts of this write; what the fleet
+    /// still owes the clock is its own STATE word (`submitted` -> `active`) and the capacity
+    /// those requests fulfil, which falls due when the requests themselves launch their
+    /// instances. Every placed request is an ordinary Spot Instance request of this account,
+    /// fulfilled by the one clock-owed move every Spot Instance request has, so a fleet
+    /// cannot report an instance the instance store does not hold.
+    pub fn insert_spot_fleet_request(&mut self, spec: SpotFleetRequestSpec) -> SpotFleetRequestConfig {
+        let fleet_id = self.mint_spot_fleet_request_id();
+        let created_at = SystemTime::now();
+        let placements = self.place_spot_fleet_capacity(&spec);
+        let mut config = spec.config;
+        // "The number of units fulfilled by this request compared to the set target
+        // capacity. You cannot set this value" (`$FulfilledCapacity`): both are derived from
+        // the placements, so whatever the request carried is replaced here. A fleet stored
+        // through this writer holds no On-Demand capacity — `RequestSpotFleet` refuses a
+        // request that asks for any, because an On-Demand Instance is launched by the fleet
+        // directly rather than placed through a Spot Instance request — so none is reported
+        // fulfilled either.
+        config.fulfilled_capacity = Some(0.0);
+        config.on_demand_fulfilled_capacity = Some(0.0);
+        // The tags are reported on the fleet itself (`SpotFleetRequestConfig$Tags`), so the
+        // specification that carried them is not echoed back as part of the configuration.
+        config.tag_specifications = None;
+        self.add_stored_bytes(
+            spot_fleet_request_payload_bytes(&config, &spec.tags)
+                .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
+        );
+        let view = SpotFleetRequestConfig {
+            // The requests have been placed by this call, so the fleet is waiting for them
+            // to be fulfilled; the derivation below is what moves it on.
+            activity_status: Some(SPOT_FLEET_ACTIVITY_PENDING_FULFILLMENT.to_string()),
+            create_time: Some(system_time_to_date_time(created_at)),
+            spot_fleet_request_config: Some(config),
+            spot_fleet_request_id: Some(fleet_id.clone()),
+            spot_fleet_request_state: Some(SPOT_FLEET_STATE_SUBMITTED.to_string()),
+            tags: Some(spec.tags),
+        };
+        self.spot_fleet_requests.insert(
+            fleet_id.clone(),
+            SpotFleetRequestRecord {
+                view,
+                pending: Some(SpotFleetRequestTransition::starting_now(
+                    SPOT_FLEET_STATE_ACTIVE,
+                )),
+                placements,
+                region: spec.region,
+            },
+        );
+        // Read back through the one derivation of the fulfilled capacity and the activity
+        // status, so the create answers exactly what a describe in the same instant reports.
+        self.materialize_due_spot_fleet_requests(Instant::now());
+        self.spot_fleet_requests
+            .get(&fleet_id)
+            .map(|record| record.view.clone())
+            .unwrap_or_default()
+    }
+
+    /// Place the Spot Instance requests one Spot Fleet's Spot capacity takes, and answer what
+    /// was placed.
+    ///
+    /// "Amazon EC2 calculates the difference between the total capacity and On-Demand
+    /// capacity, and launches the difference as Spot capacity" (`RequestSpotFleet`), so the
+    /// capacity placed here is the fleet's target less its On-Demand target. Each request is
+    /// stored through [`Self::insert_spot_instance_request`], the one writer of a Spot
+    /// Instance request, so each is fulfilled into an instance by the clock exactly as a
+    /// request a caller placed itself would be.
+    fn place_spot_fleet_capacity(&mut self, spec: &SpotFleetRequestSpec) -> Vec<SpotFleetPlacement> {
+        let created_at = SystemTime::now();
+        // "The end date and time of the request … After the end date and time, no new Spot
+        // Instance requests are placed or able to fulfill the request. If no value is
+        // specified, the Spot Fleet request remains until you cancel it"
+        // (`SpotFleetRequestConfigData$ValidUntil`): a fleet with no end date places requests
+        // that do not expire on their own, so their validity runs to this module's clock
+        // horizon rather than to the seven days a bare `RequestSpotInstances` call gets.
+        let valid_until = spec.config.valid_until;
+        let valid_until_at = valid_until.map_or_else(
+            || due_instant(MAX_CLOCK_HORIZON),
+            |at| due_instant(duration_until(date_time_to_system_time(at))),
+        );
+        // "By default, Amazon EC2 starts fulfilling the request immediately"
+        // (`$ValidFrom`), and a start date in the future is when the fulfillment falls due
+        // instead — never sooner than the span this crate gives every clock-owed move, so a
+        // caller reading the fleet straight back still sees it waiting.
+        let until_fulfilled = spec
+            .config
+            .valid_from
+            .map(date_time_to_system_time)
+            .map_or(TRANSITION_DELAY, duration_until)
+            .max(TRANSITION_DELAY);
+        let mut placements: Vec<SpotFleetPlacement> = Vec::new();
+        for pool in &spec.pools {
+            let product_description = self
+                .spot_product_description(pool.launch.image_id.as_deref())
+                .to_string();
+            for _ in 0..pool.count {
+                let view = SpotInstanceRequest {
+                    spot_instance_request_id: None,
+                    state: Some(SPOT_REQUEST_STATE_OPEN.to_string()),
+                    status: Some(SpotInstanceStatus {
+                        code: Some(SPOT_STATUS_PENDING_EVALUATION.to_string()),
+                        message: Some(SPOT_STATUS_MESSAGE_PENDING_EVALUATION.to_string()),
+                        update_time: Some(system_time_to_date_time(created_at)),
+                    }),
+                    create_time: Some(system_time_to_date_time(created_at)),
+                    r#type: Some(spec.spot_request_type.to_string()),
+                    instance_interruption_behavior: Some(spec.interruption_behavior.to_string()),
+                    valid_from: spec.config.valid_from,
+                    valid_until,
+                    // A fleet's requests are launched and terminated as the fleet decides,
+                    // not as a launch group: neither member is a fleet's to set.
+                    launch_group: None,
+                    availability_zone_group: None,
+                    spot_price: pool.spot_price.clone(),
+                    product_description: Some(product_description.clone()),
+                    launch_specification: Some(pool.launch.clone()),
+                    // The fleet's tags tag the FLEET; nothing tags the request it placed.
+                    tags: Some(Vec::new()),
+                    instance_id: None,
+                    launched_availability_zone: None,
+                    launched_availability_zone_id: None,
+                    // "Deprecated" (`SpotInstanceRequest$BlockDurationMinutes` and
+                    // `ActualBlockHourlyPrice`): Spot blocks are not offered any more.
+                    block_duration_minutes: None,
+                    actual_block_hourly_price: None,
+                    fault: None,
+                };
+                let spot_instance_request_id = self.insert_spot_instance_request(
+                    view,
+                    Some(SpotTransition::due_in(until_fulfilled)),
+                    valid_until_at,
+                    &spec.region,
+                    None,
+                );
+                placements.push(SpotFleetPlacement {
+                    spot_instance_request_id,
+                    weighted_capacity: pool.weighted_capacity,
+                });
+            }
+        }
+        placements
+    }
+
+    /// Apply what the clock owes every stored Spot Fleet request, as of `now`.
+    ///
+    /// Called by [`Self::materialize_due_transitions`] AFTER the Spot Instance requests have
+    /// been moved, which is the one place every owed move is applied from: a fleet's
+    /// fulfilled capacity is derived from the requests it placed, so those have to be in the
+    /// state the caller is about to be shown before a fleet reads them.
+    fn materialize_due_spot_fleet_requests(&mut self, now: Instant) {
+        if self.spot_fleet_requests.is_empty() {
+            return;
+        }
+        // One immutable pass to derive each fleet's fulfilled capacity from the Spot Instance
+        // request store, then one mutable pass to write it: a fleet's capacity cannot be read
+        // off the request store while that fleet is being mutated.
+        let derived: Vec<(String, f64)> = self
+            .spot_fleet_requests
+            .iter()
+            .map(|(fleet_id, record)| {
+                (
+                    fleet_id.clone(),
+                    spot_fleet_fulfilled_capacity(&record.placements, &self.spot_instance_requests),
+                )
+            })
+            .collect();
+        for (fleet_id, fulfilled) in derived {
+            if let Some(record) = self.spot_fleet_requests.get_mut(&fleet_id) {
+                record.apply_due_move(now, fulfilled);
+            }
         }
     }
 }
@@ -32955,13 +33705,14 @@ pub const FLEET_ID_PREFIX: &str = "fleet-";
 /// made once for the whole module; the recorded unit does not settle case either way.
 const FLEET_ID_UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
 
-/// Whether `id` is a well-formed EC2 Fleet id: [`FLEET_ID_PREFIX`] and the UUID
-/// [`FLEET_ID_UUID_GROUPS`] describes.
+/// Whether `id` is `prefix` followed by the UUID [`FLEET_ID_UUID_GROUPS`] describes.
 ///
-/// EC2 answers [`INVALID_FLEET_ID_MALFORMED`] for anything else, BEFORE it looks the id up,
-/// so a caller can tell "not a fleet id" from "no such fleet".
-pub fn fleet_id_is_well_formed(id: &str) -> bool {
-    let Some(uuid) = id.strip_prefix(FLEET_ID_PREFIX) else {
+/// The form of every id of this service that AWS issues as `<prefix><uuid>` rather than as
+/// `<prefix>-<8|17 hex>` — an EC2 Fleet's [`fleet_id_is_well_formed`] and a Spot Fleet
+/// request's [`spot_fleet_request_id_is_well_formed`] — so the two cannot read one id form
+/// two ways, and a malformed-id refusal is defined once for both.
+pub fn uuid_suffixed_id_is_well_formed(id: &str, prefix: &str) -> bool {
+    let Some(uuid) = id.strip_prefix(prefix) else {
         return false;
     };
     let mut groups = uuid.split('-');
@@ -32977,8 +33728,18 @@ pub fn fleet_id_is_well_formed(id: &str) -> bool {
             return false;
         }
     }
-    // Nothing may follow the fifth group: `fleet-<uuid>-<anything>` is not a fleet id.
+    // Nothing may follow the fifth group: `<prefix><uuid>-<anything>` is not one of these
+    // ids.
     groups.next().is_none()
+}
+
+/// Whether `id` is a well-formed EC2 Fleet id: [`FLEET_ID_PREFIX`] and the UUID
+/// [`FLEET_ID_UUID_GROUPS`] describes.
+///
+/// EC2 answers [`INVALID_FLEET_ID_MALFORMED`] for anything else, BEFORE it looks the id up,
+/// so a caller can tell "not a fleet id" from "no such fleet".
+pub fn fleet_id_is_well_formed(id: &str) -> bool {
+    uuid_suffixed_id_is_well_formed(id, FLEET_ID_PREFIX)
 }
 
 /// `InvalidFleetId.Malformed` (HTTP 400): the request named something that is not an EC2
@@ -33170,21 +33931,30 @@ pub fn fleet_payload_bytes(
 }
 
 impl ComAmazonawsEc2Amazonec2State {
-    /// A fresh, unused `FleetId`.
+    /// A fresh, unused id of the form `<prefix><uuid>`
+    /// ([`uuid_suffixed_id_is_well_formed`]).
     ///
-    /// The form [`fleet_id_is_well_formed`] reads — `fleet-` and a UUID — with the store's
-    /// own monotonic counter rendered into the UUID's first and last groups, so the id is
-    /// unique without being drawn from a request and is never the null UUID. The three
-    /// middle groups are deliberately reserved zeros: nothing distinguishes two fleets but
-    /// the counter, and a reader comparing ids never needs them.
-    pub fn mint_fleet_id(&mut self) -> String {
+    /// The store's own monotonic counter is rendered into the UUID's first and last groups,
+    /// so the id is unique without being drawn from a request and is never the null UUID.
+    /// The three middle groups are deliberately reserved zeros: nothing distinguishes two of
+    /// these resources but the counter, and a reader comparing ids never needs them.
+    ///
+    /// The one mint of this id form, so an EC2 Fleet's `FleetId` and a Spot Fleet request's
+    /// `SpotFleetRequestId` are issued the same way and draw on the same counter.
+    pub fn mint_uuid_suffixed_id(&mut self, prefix: &str) -> String {
         self.id_counter = self.id_counter.saturating_add(1);
         let counter = self.id_counter;
         format!(
-            "{FLEET_ID_PREFIX}{:08x}-0000-0000-0000-{:012x}",
+            "{prefix}{:08x}-0000-0000-0000-{:012x}",
             counter >> 48,
             counter & 0xffff_ffff_ffff
         )
+    }
+
+    /// A fresh, unused `FleetId`: the form [`fleet_id_is_well_formed`] reads — `fleet-` and a
+    /// UUID — minted by [`Self::mint_uuid_suffixed_id`].
+    pub fn mint_fleet_id(&mut self) -> String {
+        self.mint_uuid_suffixed_id(FLEET_ID_PREFIX)
     }
 
     /// Whether another EC2 Fleet fits inside the store's ceiling
