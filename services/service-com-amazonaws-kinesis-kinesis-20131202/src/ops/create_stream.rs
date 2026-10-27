@@ -491,6 +491,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encryption_starts: Vec::new(),
             encryption_stops: Vec::new(),
             tags: input.tags.unwrap_or_default(),
+            // No consumer is registered with the stream until `RegisterStreamConsumer`
+            // registers one.
+            consumers: Vec::new(),
         };
 
         store.streams.insert(
