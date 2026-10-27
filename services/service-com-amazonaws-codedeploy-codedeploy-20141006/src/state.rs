@@ -427,6 +427,37 @@ pub const RESOURCE_ARN_MISSING: &str = "Resource ARN is missing";
 /// `RevisionRequiredException` (HTTP 400). See [`APPLICATION_NAME_MISSING`].
 pub const REVISION_MISSING: &str = "Revision is missing";
 
+/// `InvalidArnException` (HTTP 400): the ARN the caller sent, which is the one
+/// thing they have to change, quoted whole — `ResourceArn` carries a modelled
+/// maximum length, so what a refusal quotes back is already bounded.
+pub fn malformed_resource_arn_message(resource_arn: &str) -> String {
+    format!("The ARN {resource_arn} is not in a valid format")
+}
+
+/// `ArnNotSupportedException` (HTTP 400): a well-formed ARN naming a resource
+/// this service's tagging operations do not act on, quoted as
+/// [`malformed_resource_arn_message`] quotes it.
+pub fn resource_arn_not_supported_message(resource_arn: &str) -> String {
+    format!("The ARN {resource_arn} is not supported")
+}
+
+/// `TagRequiredException` (HTTP 400): a tagging call that named no tag at all.
+pub const TAG_MISSING: &str = "A tag was not specified";
+
+/// `InvalidTagsToAddException` (HTTP 400): the shape every tag of a tagging
+/// request has to have; see [`tag_key_value`] for the rule.
+pub const TAGS_TO_ADD_MALFORMED: &str =
+    "Each tag must carry both a key and a value, and a key cannot be an empty string";
+
+/// `InvalidTagsToAddException` (HTTP 400): the call would leave the resource
+/// carrying more than [`MAX_TAGS_PER_RESOURCE`] tags.
+pub fn too_many_tags_message(projected: usize) -> String {
+    format!(
+        "The maximum number of tags for a resource is {MAX_TAGS_PER_RESOURCE}; this call would \
+         leave it with {projected}"
+    )
+}
+
 /// `InstanceNotRegisteredException` (HTTP 400) as the single-instance READER
 /// answers it: the host the request asked about, after the delimiter.
 ///
@@ -870,14 +901,19 @@ pub const MAX_REVISIONS_PER_APPLICATION: usize = 500;
 /// limit, and enforcing it keeps one call's work bounded.
 pub const MAX_INSTANCE_NAMES_PER_CALL: usize = 100;
 
-/// How many tags one on-premises instance may carry, the bound
-/// `TagLimitExceededException` answers.
+/// How many tags one resource may carry.
 ///
-/// CodeDeploy publishes no per-instance tag count this emulator can cite, so
+/// CodeDeploy publishes no per-resource tag count this emulator can cite, so
 /// this bound is CHOSEN at the 50 tags per resource AWS's own tagging guidance
-/// uses; enforcing it is also what keeps a stored instance from growing without
-/// limit on repeated `AddTagsToOnPremisesInstances` calls.
-pub const MAX_TAGS_PER_ON_PREMISES_INSTANCE: usize = 50;
+/// uses; enforcing it is also what keeps a stored record from growing without
+/// limit on repeated tagging calls.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// How many tags one on-premises instance may carry, the bound
+/// `TagLimitExceededException` answers: [`MAX_TAGS_PER_RESOURCE`], the same
+/// guidance applied to an instance, so the two tagging paths cannot disagree
+/// about how many tags a resource holds.
+pub const MAX_TAGS_PER_ON_PREMISES_INSTANCE: usize = MAX_TAGS_PER_RESOURCE;
 
 /// The `deploymentStyle` a deployment group HAS, given what a request asked for.
 ///
@@ -1262,6 +1298,10 @@ pub struct DeploymentConfig {
     pub zonal_config: Option<ZonalConfig>,
     pub compute_platform: String,
     pub create_time_ms: i64,
+    /// The tags this configuration carries. `CreateDeploymentConfig` takes none,
+    /// so a configuration is created untagged and gains tags only through the
+    /// resource-tagging operations.
+    pub tags: Vec<Tag>,
 }
 
 /// The `RegistrationStatus` of an on-premises instance that is still
@@ -1315,13 +1355,7 @@ impl OnPremisesInstance {
     /// request's tag list, which a tagging request is refused against BEFORE
     /// this runs).
     pub fn projected_tag_count(&self, tags: &[(&str, &str)]) -> usize {
-        let known: HashSet<&str> = self.tags.iter().filter_map(|tag| tag.key.as_deref()).collect();
-        let added: HashSet<&str> = tags
-            .iter()
-            .map(|(key, _)| *key)
-            .filter(|key| !known.contains(key))
-            .collect();
-        self.tags.len() + added.len()
+        projected_tag_count(&self.tags, tags)
     }
 
     /// Drop the tag `key` holding exactly `value`, answering whether the
@@ -1344,17 +1378,41 @@ impl OnPremisesInstance {
     /// Set `key` to `value`, replacing the value of a key already present so an
     /// instance never carries two entries for one key.
     pub fn set_tag(&mut self, key: &str, value: &str) {
-        match self
-            .tags
-            .iter_mut()
-            .find(|tag| tag.key.as_deref() == Some(key))
-        {
-            Some(existing) => existing.value = Some(value.to_string()),
-            None => self.tags.push(Tag {
-                key: Some(key.to_string()),
-                value: Some(value.to_string()),
-            }),
-        }
+        set_tag(&mut self.tags, key, value);
+    }
+}
+
+/// How many tags a record carrying `tags` would carry once `added` were applied:
+/// a tag REPLACES the value of a key the record already carries rather than
+/// adding a second entry for it, so only genuinely new keys count.
+///
+/// Set-keyed rather than list-scanned, so the cost is linear in the number of
+/// keys rather than quadratic in it; both sides are bounded anyway
+/// ([`MAX_TAGS_PER_RESOURCE`] stored, and the same bound on a request's tag
+/// list, which a tagging request is refused against BEFORE this runs).
+pub fn projected_tag_count(tags: &[Tag], added: &[(&str, &str)]) -> usize {
+    let known: HashSet<&str> = tags.iter().filter_map(|tag| tag.key.as_deref()).collect();
+    let new_keys: HashSet<&str> = added
+        .iter()
+        .map(|(key, _)| *key)
+        .filter(|key| !known.contains(key))
+        .collect();
+    tags.len() + new_keys.len()
+}
+
+/// Set `key` to `value` in `tags`, replacing the value a key already present
+/// holds so no record carries two entries for one key.
+///
+/// The one rule every tagging operation of this service writes through, so the
+/// tags of an on-premises instance and the tags of an application, deployment
+/// group or deployment configuration are merged the same way.
+pub fn set_tag(tags: &mut Vec<Tag>, key: &str, value: &str) {
+    match tags.iter_mut().find(|tag| tag.key.as_deref() == Some(key)) {
+        Some(existing) => existing.value = Some(value.to_string()),
+        None => tags.push(Tag {
+            key: Some(key.to_string()),
+            value: Some(value.to_string()),
+        }),
     }
 }
 
@@ -1706,6 +1764,7 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                 zonal_config: None,
                 compute_platform: builtin.compute_platform.to_string(),
                 create_time_ms: now_ms,
+                tags: Vec::new(),
             });
         }
     }
@@ -1751,6 +1810,78 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
             .filter(|name| self.deployment_configs.contains_key(*name))
             .cloned()
             .collect()
+    }
+
+    /// The tags the resource a `ResourceArn` named carries, for reading.
+    ///
+    /// The tags of a resource live ON that resource's own record, so a tagging
+    /// operation and the operation that creates or reads the resource see one
+    /// list and not two copies of it.
+    pub fn tags_of(&self, resource: &TaggedResource) -> Result<&[Tag], MissingResource> {
+        match resource {
+            TaggedResource::Application(name) => self
+                .applications
+                .get(name)
+                .map(|application| application.tags.as_slice())
+                .ok_or_else(|| MissingResource::Application(name.clone())),
+            TaggedResource::DeploymentGroup {
+                application_name,
+                deployment_group_name,
+            } => {
+                let application = self
+                    .applications
+                    .get(application_name)
+                    .ok_or_else(|| MissingResource::Application(application_name.clone()))?;
+                application
+                    .deployment_groups
+                    .get(deployment_group_name)
+                    .map(|group| group.tags.as_slice())
+                    .ok_or_else(|| {
+                        MissingResource::DeploymentGroup(deployment_group_name.clone())
+                    })
+            }
+            TaggedResource::DeploymentConfig(name) => self
+                .deployment_configs
+                .get(name)
+                .map(|config| config.tags.as_slice())
+                .ok_or_else(|| MissingResource::DeploymentConfig(name.clone())),
+        }
+    }
+
+    /// The tags of the resource a `ResourceArn` named, for writing; see
+    /// [`Self::tags_of`].
+    pub fn tags_of_mut(
+        &mut self,
+        resource: &TaggedResource,
+    ) -> Result<&mut Vec<Tag>, MissingResource> {
+        match resource {
+            TaggedResource::Application(name) => self
+                .applications
+                .get_mut(name)
+                .map(|application| &mut application.tags)
+                .ok_or_else(|| MissingResource::Application(name.clone())),
+            TaggedResource::DeploymentGroup {
+                application_name,
+                deployment_group_name,
+            } => {
+                let application = self
+                    .applications
+                    .get_mut(application_name)
+                    .ok_or_else(|| MissingResource::Application(application_name.clone()))?;
+                application
+                    .deployment_groups
+                    .get_mut(deployment_group_name)
+                    .map(|group| &mut group.tags)
+                    .ok_or_else(|| {
+                        MissingResource::DeploymentGroup(deployment_group_name.clone())
+                    })
+            }
+            TaggedResource::DeploymentConfig(name) => self
+                .deployment_configs
+                .get_mut(name)
+                .map(|config| &mut config.tags)
+                .ok_or_else(|| MissingResource::DeploymentConfig(name.clone())),
+        }
     }
 
     /// Materialise every deployment transition that was already due at `now_ms`:
@@ -2978,6 +3109,161 @@ pub fn is_iam_user_arn(candidate: &str) -> bool {
 /// `RegisterOnPremisesInstance$iamSessionArn` associates with the instance.
 pub fn is_iam_session_arn(candidate: &str) -> bool {
     is_arn_of(candidate, "sts", "assumed-role")
+}
+
+/// The resource-type segment of an application's ARN:
+/// `arn:aws:codedeploy:<region>:<account>:application:<applicationName>`, the
+/// form the CodeDeploy User Guide gives for an application resource.
+const ARN_TYPE_APPLICATION: &str = "application";
+
+/// The resource-type segment of a deployment group's ARN:
+/// `…:deploymentgroup:<applicationName>/<deploymentGroupName>` — a group is
+/// named INSIDE its application, which is why its identifier carries both names.
+const ARN_TYPE_DEPLOYMENT_GROUP: &str = "deploymentgroup";
+
+/// The resource-type segment of a deployment configuration's ARN:
+/// `…:deploymentconfig:<deploymentConfigName>`.
+const ARN_TYPE_DEPLOYMENT_CONFIG: &str = "deploymentconfig";
+
+/// The ARN of an application; see [`ARN_TYPE_APPLICATION`]. The account segment
+/// comes from the engine, never from a literal.
+pub fn application_arn(region: &str, application_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{ARN_TYPE_APPLICATION}:{application_name}"),
+    )
+}
+
+/// The ARN of a deployment group; see [`ARN_TYPE_DEPLOYMENT_GROUP`].
+pub fn deployment_group_arn(
+    region: &str,
+    application_name: &str,
+    deployment_group_name: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{ARN_TYPE_DEPLOYMENT_GROUP}:{application_name}/{deployment_group_name}"),
+    )
+}
+
+/// The ARN of a deployment configuration; see [`ARN_TYPE_DEPLOYMENT_CONFIG`].
+pub fn deployment_config_arn(region: &str, deployment_config_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{ARN_TYPE_DEPLOYMENT_CONFIG}:{deployment_config_name}"),
+    )
+}
+
+/// A resource this service's `ResourceArn` operations act on, with the identity
+/// its ARN carries: the three CodeDeploy resource kinds that hold tags of their
+/// own, which is also what the errors those operations model name
+/// (`smithy_query(query="operation",operation="TagResource")`:
+/// `ApplicationDoesNotExistException`, `DeploymentGroupDoesNotExistException`,
+/// `DeploymentConfigDoesNotExistException`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// An application, by name.
+    Application(String),
+    /// A deployment group, by its application's name and its own.
+    DeploymentGroup {
+        application_name: String,
+        deployment_group_name: String,
+    },
+    /// A deployment configuration, by name.
+    DeploymentConfig(String),
+}
+
+/// Why CodeDeploy will not read a `ResourceArn` as one of its taggable
+/// resources. Each operation maps it to the modelled error IT declares, so every
+/// operation taking a `ResourceArn` refuses one by the same rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArnRefusal {
+    /// The value is not in the ARN format, or the identifier its resource part
+    /// should carry is missing: `InvalidArnException`.
+    Malformed,
+    /// A well-formed ARN naming something else — another service's resource, or
+    /// a CodeDeploy resource kind that is not tagged through these operations:
+    /// `ArnNotSupportedException`.
+    Unsupported,
+}
+
+/// Read `candidate` as the ARN of a resource this service tags.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, and for
+/// the three taggable CodeDeploy kinds the resource part is
+/// `<type>:<identifier>`. The region and the account are NOT matched against
+/// this emulator's own: an ARN identifies the resource by the name it carries,
+/// which is what the lookup uses.
+pub fn parse_tagged_resource_arn(candidate: &str) -> Result<TaggedResource, ArnRefusal> {
+    let mut fields = candidate.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some(service),
+        Some(_region),
+        Some(_account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return Err(ArnRefusal::Malformed);
+    };
+    if partition.is_empty() || resource.is_empty() {
+        return Err(ArnRefusal::Malformed);
+    }
+    if service != ARN_SERVICE {
+        return Err(ArnRefusal::Unsupported);
+    }
+    // Every taggable kind's resource part opens on its type; a CodeDeploy
+    // resource whose ARN is not of that shape — an on-premises instance's
+    // `instance/<name>`, say — is tagged through its own operations, so it is
+    // not a resource THESE operations act on.
+    let Some((kind, identifier)) = resource.split_once(':') else {
+        return Err(ArnRefusal::Unsupported);
+    };
+    match kind {
+        ARN_TYPE_APPLICATION => Ok(TaggedResource::Application(named(identifier)?)),
+        ARN_TYPE_DEPLOYMENT_GROUP => {
+            let (application_name, deployment_group_name) =
+                identifier.split_once('/').ok_or(ArnRefusal::Malformed)?;
+            Ok(TaggedResource::DeploymentGroup {
+                application_name: named(application_name)?,
+                deployment_group_name: named(deployment_group_name)?,
+            })
+        }
+        ARN_TYPE_DEPLOYMENT_CONFIG => Ok(TaggedResource::DeploymentConfig(named(identifier)?)),
+        _ => Err(ArnRefusal::Unsupported),
+    }
+}
+
+/// One name out of an ARN's resource part: an ARN of a known kind that carries
+/// no name for it names no resource, so it is not in a valid format.
+fn named(identifier: &str) -> Result<String, ArnRefusal> {
+    if identifier.is_empty() {
+        return Err(ArnRefusal::Malformed);
+    }
+    Ok(identifier.to_string())
+}
+
+/// The resource a `ResourceArn` named that the store does not hold, so each
+/// operation can answer it with the modelled error it declares for that kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissingResource {
+    /// No application of this name.
+    Application(String),
+    /// The application exists, but holds no deployment group of this name.
+    DeploymentGroup(String),
+    /// No deployment configuration of this name.
+    DeploymentConfig(String),
 }
 
 /// A stored on-premises instance as the modelled `InstanceInfo`.

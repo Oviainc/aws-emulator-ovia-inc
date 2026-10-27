@@ -17,6 +17,8 @@ mod assistant_association;
 mod assistant_lifecycle;
 #[path = "all/content_upload.rs"]
 mod content_upload;
+#[path = "all/idempotency_contents_and_refusal_fidelity.rs"]
+mod idempotency_contents_and_refusal_fidelity;
 #[path = "all/knowledge_base_lifecycle.rs"]
 mod knowledge_base_lifecycle;
 #[path = "all/quick_response.rs"]
