@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMLTransform
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMLTransform`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMLTransform::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the one machine learning transform a `TransformId` addresses: "Gets an Glue
+//! machine learning transform artifact and all its corresponding metadata". The answer is
+//! the record `CreateMLTransform` stored under that id — the same projection the transform
+//! listings serve for it ([`crate::state::MlTransformEntry::to_ml_transform`]), member for
+//! member — and an id this account holds no transform under is refused rather than
+//! answered with an empty transform.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -199,18 +199,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMLTransform` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMLTransformErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMLTransform"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(GetMLTransformErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "the Glue machine learning transform store is unavailable".into(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A read of a transform is a pure read: the status a create leaves a transform in
+        // is moved by a task run that teaches it and never by the clock, so there is
+        // nothing here for the clock to settle and nothing for this call to write.
+        let store = state.lock();
+        // `TransformId` is `@required` with `length 1..255`, so an absent or over-long one
+        // is refused at the boundary: reaching here, the only question is whether this
+        // account holds a transform under that id. The id is the whole address of one —
+        // a name is not, since "Names are not guaranteed unique" (`MLTransform$Name`).
+        let Some(entry) = store.ml_transforms.get(&input.transform_id) else {
+            return Err(GetMLTransformErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::ml_transform_not_found(
+                        &input.transform_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // The stored record's own projection, so this single read and the transform
+        // listings can never disagree about one transform; this response spells that shape
+        // out member by member rather than nesting it.
+        let transform = entry.to_ml_transform();
+        Ok(GetMLTransformOutput {
+            transform_id: transform.transform_id,
+            name: transform.name,
+            description: transform.description,
+            status: transform.status,
+            created_on: transform.created_on,
+            last_modified_on: transform.last_modified_on,
+            input_record_tables: transform.input_record_tables,
+            parameters: transform.parameters,
+            evaluation_metrics: transform.evaluation_metrics,
+            label_count: transform.label_count,
+            schema: transform.schema,
+            role: transform.role,
+            glue_version: transform.glue_version,
+            max_capacity: transform.max_capacity,
+            worker_type: transform.worker_type,
+            number_of_workers: transform.number_of_workers,
+            timeout: transform.timeout,
+            max_retries: transform.max_retries,
+            transform_encryption: transform.transform_encryption,
+        })
     }
 }

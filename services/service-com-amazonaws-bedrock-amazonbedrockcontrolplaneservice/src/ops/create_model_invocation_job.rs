@@ -319,6 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::MODEL_INVOCATION_JOB_STATUS_SUBMITTED,
             in_progress_due_at: Some(now + crate::state::MODEL_INVOCATION_JOB_BEGINS_AFTER),
             completed_due_at: None,
+            stopped_due_at: None,
             submit_time: now,
             last_modified_at: now,
             ended_at: None,

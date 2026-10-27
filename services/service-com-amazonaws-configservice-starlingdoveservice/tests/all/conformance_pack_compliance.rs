@@ -54,10 +54,12 @@ const NOT_APPLICABLE: &str = "NOT_APPLICABLE";
 /// `PutConformancePack`'s own model doc.
 const CONFIG_RULE_TYPE: &str = "AWS::Config::ConfigRule";
 
-/// How Config words `NoSuchConfigRuleInConformancePackException` for the filtered rule
-/// names the pack deployed no rule for: the fixed sentence, then the names themselves.
-const NO_SUCH_RULE_SENTENCE: &str =
-    "One or more config rules in the conformance pack are not valid. Name(s): ";
+/// How Config words `NoSuchConfigRuleInConformancePackException` for a filtered rule
+/// name the pack deployed no rule for: the fixed sentence, carrying the rule name the
+/// request sent and the pack it asked about.
+fn no_such_rule(rule_name: &str, pack: &str) -> String {
+    format!("No rule with name {rule_name} exists in conformance pack {pack}")
+}
 
 /// One row of the filter table: the case, the request members merged into the read, and
 /// the `(ConfigRuleName, ComplianceType)` pairs that filter is expected to select.
@@ -67,7 +69,10 @@ type FilterCase<'a> = (&'a str, Value, Vec<(String, &'a str)>);
 ///
 /// `S3_BUCKET_VERSIONING_ENABLED` is a Config managed rule identifier, and `Source` is
 /// what CloudFormation requires of an `AWS::Config::ConfigRule`.
-fn template(declared: &[&str]) -> String {
+///
+/// `pub(crate)` because every suite about what a DEPLOYED pack's rules report needs
+/// exactly this template (`conformance_pack_compliance_details` is the other one).
+pub(crate) fn template(declared: &[&str]) -> String {
     let mut body = String::from("Resources:\n");
     for (index, name) in declared.iter().enumerate() {
         body.push_str(&format!(
@@ -82,7 +87,14 @@ fn template(declared: &[&str]) -> String {
 /// Deploy the pack `pack` from a template declaring one rule per name in `declared`,
 /// wait for the deployment the clock owes, and answer the names Config gave the deployed
 /// rules — in the same order as `declared`.
-async fn deploy(case: &str, emulator: &Emulator, pack: &str, declared: &[&str]) -> Vec<String> {
+///
+/// `pub(crate)` for the same reason as [`template`].
+pub(crate) async fn deploy(
+    case: &str,
+    emulator: &Emulator,
+    pack: &str,
+    declared: &[&str],
+) -> Vec<String> {
     emulator
         .ok(
             "PutConformancePack",
@@ -335,8 +347,8 @@ async fn a_request_the_pack_cannot_answer_is_refused() {
 
     // Rows differ along what the request asks for that the pack cannot answer: a pack
     // this account holds none of, a rule name nothing holds, a rule name another pack
-    // holds, two unknown names (the refusal lists them as the request carried them), a
-    // name differing from a deployed one only in case, a compliance type this report
+    // holds, two unknown names (the refusal names the first of them the request carried),
+    // a name differing from a deployed one only in case, a compliance type this report
     // does not hold, and tokens outside the opaque form this operation issues.
     let cases: [(&str, Value, &str, Option<String>); 9] = [
         (
@@ -349,7 +361,7 @@ async fn a_request_the_pack_cannot_answer_is_refused() {
             "a rule name nothing holds",
             request("mine", json!({ "Filters": { "ConfigRuleNames": ["phantom"] } })),
             "NoSuchConfigRuleInConformancePackException",
-            Some(format!("{NO_SUCH_RULE_SENTENCE}phantom")),
+            Some(no_such_rule("phantom", "mine")),
         ),
         (
             "a rule name another pack holds",
@@ -358,7 +370,7 @@ async fn a_request_the_pack_cannot_answer_is_refused() {
                 json!({ "Filters": { "ConfigRuleNames": [theirs[0].clone()] } }),
             ),
             "NoSuchConfigRuleInConformancePackException",
-            Some(format!("{NO_SUCH_RULE_SENTENCE}{}", theirs[0])),
+            Some(no_such_rule(&theirs[0], "mine")),
         ),
         (
             "an unknown name beside one the pack deployed",
@@ -367,7 +379,7 @@ async fn a_request_the_pack_cannot_answer_is_refused() {
                 json!({ "Filters": { "ConfigRuleNames": [mine[0].clone(), "phantom"] } }),
             ),
             "NoSuchConfigRuleInConformancePackException",
-            Some(format!("{NO_SUCH_RULE_SENTENCE}phantom")),
+            Some(no_such_rule("phantom", "mine")),
         ),
         (
             "two unknown names",
@@ -376,7 +388,7 @@ async fn a_request_the_pack_cannot_answer_is_refused() {
                 json!({ "Filters": { "ConfigRuleNames": ["phantom", "ghost-rule"] } }),
             ),
             "NoSuchConfigRuleInConformancePackException",
-            Some(format!("{NO_SUCH_RULE_SENTENCE}phantom, ghost-rule")),
+            Some(no_such_rule("phantom", "mine")),
         ),
         (
             "the same two unknown names in the other order",
@@ -385,7 +397,7 @@ async fn a_request_the_pack_cannot_answer_is_refused() {
                 json!({ "Filters": { "ConfigRuleNames": ["ghost-rule", "phantom"] } }),
             ),
             "NoSuchConfigRuleInConformancePackException",
-            Some(format!("{NO_SUCH_RULE_SENTENCE}ghost-rule, phantom")),
+            Some(no_such_rule("ghost-rule", "mine")),
         ),
         (
             "a name differing from a deployed one only in case",
@@ -394,7 +406,7 @@ async fn a_request_the_pack_cannot_answer_is_refused() {
                 json!({ "Filters": { "ConfigRuleNames": [mine[0].to_uppercase()] } }),
             ),
             "NoSuchConfigRuleInConformancePackException",
-            Some(format!("{NO_SUCH_RULE_SENTENCE}{}", mine[0].to_uppercase())),
+            Some(no_such_rule(&mine[0].to_uppercase(), "mine")),
         ),
         (
             "a token that is not base64 at all",

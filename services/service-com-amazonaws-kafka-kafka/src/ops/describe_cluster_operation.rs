@@ -5,22 +5,23 @@
 //! is.
 //!
 //! Reporting only — every member is computed from the stored
-//! [`crate::state::ClusterOperation`] and the reading instant, so the operation's
-//! state moves because the clock moved, never because somebody polled it.
+//! [`crate::state::ClusterOperation`] and the reading instant, through
+//! [`crate::state::ClusterOperation::to_cluster_operation_info`], so the
+//! operation's state moves because the clock moved, never because somebody polled
+//! it.
 //!
 //! A well-formed operation ARN this region holds no operation for is a
 //! `NotFoundException`; a value that is not an operation ARN at all is a
 //! `BadRequestException`.
 //!
 //! PARTIAL SCOPE, deliberately: the registry this reads
-//! ([`crate::state::ComAmazonawsKafkaKafkaState::cluster_operations`]) is written by
-//! `UpdateStorage` only, so an operation ARN minted by another path — the one
-//! `UpdateConnectivity` answers with, or the create operation ARN `CreateChannel`
-//! reports — is still answered `NotFoundException` here. Routing those through
-//! [`crate::state::ComAmazonawsKafkaKafkaState::start_storage_update`]'s generalised
-//! form belongs with those operations' own files (`update_connectivity.rs`,
-//! `create_channel.rs`), which this change does not own; the registry and this reader
-//! are what they need.
+//! ([`crate::state::ComAmazonawsKafkaKafkaState::cluster_operations`]) holds the
+//! operations every cluster UPDATE files — they all come through
+//! [`crate::state::ComAmazonawsKafkaKafkaState::start_cluster_update`] — so an
+//! operation ARN minted by another path, such as the create operation ARN
+//! `CreateChannel` reports, is still answered `NotFoundException` here. Filing
+//! those belongs with those operations' own files (`create_channel.rs`), which
+//! this change does not own; the registry and this reader are what they need.
 //!
 //! ## Shape of an operation
 //!

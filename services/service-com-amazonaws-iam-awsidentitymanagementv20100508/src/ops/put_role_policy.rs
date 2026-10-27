@@ -215,22 +215,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let role_name = role.role_name.clone();
         // Which service a role is linked to is carried by its path, read through the
         // one definition of that rule in `crate::state`.
-        let linked_service =
-            crate::state::service_linked_role_principal(&role.path).map(str::to_string);
+        let service_linked = crate::state::is_service_linked_role_path(&role.path);
 
         // A service-linked role is a protected resource: only the service that
         // depends on it may change it, so an embed from any other caller is refused
-        // with the modelled `UnmodifiableEntityException`, whose documentation says
-        // the message "includes the name of the service that depends on this
-        // service-linked role".
-        if let Some(linked_service) = linked_service {
+        // with the modelled `UnmodifiableEntityException`, stated in the one sentence
+        // this service words that protection with
+        // (`crate::state::protected_role_message`).
+        if service_linked {
             return Err(PutRolePolicyErrorModeled::UnmodifiableEntityException(
                 UnmodifiableEntityException {
-                    message: Some(format!(
-                        "Service role policies may not be modified: the role {role_name} is a \
-                         service-linked role for {linked_service}, so the change must be \
-                         requested through that service"
-                    )),
+                    message: Some(crate::state::protected_role_message(&input.role_name)),
                 },
             )
             .into());

@@ -3946,6 +3946,13 @@ pub fn cursor_application_grants(application_arn: &str) -> String {
     format!("applicationGrants|{application_arn}")
 }
 
+/// Cursor scope of a `ListApplicationAuthenticationMethods` enumeration: the operation
+/// and the application whose authentication methods it walks, since the key (the
+/// method's type) only distinguishes rows WITHIN one application.
+pub fn cursor_application_authentication_methods(application_arn: &str) -> String {
+    format!("applicationAuthenticationMethods|{application_arn}")
+}
+
 /// Cursor scope of a `ListApplicationAssignmentsForPrincipal` enumeration: the operation
 /// and the whole filter that selected the rows — the instance whose applications it walks,
 /// the principal whose assignments it reports and the `ListApplicationAssignmentsFilter`'s

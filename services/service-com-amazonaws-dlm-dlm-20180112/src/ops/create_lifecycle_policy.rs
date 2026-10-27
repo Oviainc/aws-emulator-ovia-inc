@@ -251,10 +251,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The documented numeric domain of a default policy's cadence, which the
         // members' `@range(min: 1)` cannot express: the creation frequency's
         // 1-to-7 days, the retention period's 2-to-14 days, and a retention
-        // period greater than the creation frequency. Judged wherever the
-        // request states them — the request body or `PolicyDetails` — and
-        // refused before anything is stored, so a policy AWS would never have
-        // created is never persisted for a read to report.
+        // period greater than the creation frequency. The magnitudes are judged
+        // wherever the request states them — the request body or
+        // `PolicyDetails` — and the ordering on the pair the policy would run
+        // on, each member the request leaves out taking the default its
+        // documentation publishes. Refused before anything is stored, so a
+        // policy AWS would never have created is never persisted for a read to
+        // report.
         if let Some(refusal) = (crate::state::Cadence {
             body_create_interval: input.create_interval,
             body_retain_interval: input.retain_interval,
