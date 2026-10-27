@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetClientToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetClientToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetClientToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The OAuth 2.0 client-credentials grant of a user pool: the app client the request
+//! names authenticates with its own stored secret and gets back ONE signed access
+//! token, issued to that app client rather than to any user.
+//!
+//! Everything the answer carries comes from stored state — the pool's signing key, the
+//! app client's configured access-token validity, and the scopes the request asked for
+//! or, when it asked for none, the ones the stored app client is configured with.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +182,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetClientToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetClientTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetClientToken"))
+        // Request metadata only: the app client in the body names the pool, and
+        // `ClientMetadata` is "input for any custom workflows that this action triggers"
+        // through "Lambda functions to user pool triggers" (this operation's own doc),
+        // which this emulator invokes none of.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // Every refusal this grant owes is decided first, under the one lock, so nothing
+        // is minted for a request a later check refuses.
+        let Grant {
+            user_pool_id,
+            scopes,
+        } = resolve(&guard, &input)?;
+
+        let result = guard
+            .issue_client_token(&user_pool_id, &input.client_id, &scopes, now)
+            .ok_or_else(internal_error)?;
+        Ok(GetClientTokenOutput {
+            client_authentication_result: Some(result),
+        })
     }
 }
+
+/// This service's state, as the handler holds it under the lock.
+type State =
+    crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState;
+
+/// What the stored state decided this request is: the pool whose app client the token is
+/// minted for, and the scopes that token authorizes.
+struct Grant {
+    user_pool_id: String,
+    scopes: Vec<String>,
+}
+
+/// The message a request whose `Scopes` name something no resource server of the pool
+/// defines is refused with: the rule as this operation's own `Scopes` member states it in
+/// the model, word for word. It names no value from the request, so every such refusal
+/// carries this one sentence.
+const SCOPE_NOT_ON_A_RESOURCE_SERVER: &str =
+    "Each scope must belong to a resource server in your user pool.";
+
+/// Resolve the request against stored state: the app client, its secret, the
+/// machine-to-machine configuration it has to carry, and the scopes the token is
+/// authorized for.
+///
+/// A PURE read — every refusal this operation owes is decided here, before anything is
+/// written.
+fn resolve(state: &State, input: &GetClientTokenInput) -> Result<Grant, GetClientTokenError> {
+    // This operation models no `UserPoolId`: the app client the request names is what
+    // resolves the pool whose token is issued.
+    let pool = state
+        .pool_of_client(&input.client_id)
+        .ok_or_else(|| client_not_found(&input.client_id))?;
+    let client = pool
+        .clients
+        .get(&input.client_id)
+        .ok_or_else(|| client_not_found(&input.client_id))?;
+
+    // "Your app client provides its client ID and secret", and "you must configure the
+    // app client with a client secret" (this operation's own doc), so this grant is
+    // authorized by the secret the STORED app client holds and by nothing else: a client
+    // that holds no secret has nothing a request could prove it knows, and a presented
+    // value that is not the stored secret proves nothing either. `Secret` is a required
+    // member, so the request always presents one.
+    if client.client_secret.is_none() || !client.accepts_client_secret(Some(&input.secret)) {
+        return Err(not_authorized("Invalid client secret."));
+    }
+
+    // "To use this operation, you must ... enable the ALLOW_CLIENT_TOKEN_AUTH
+    // authentication flow" (this operation's own doc), so an app client whose stored
+    // `ExplicitAuthFlows` do not carry that flow is not configured for machine-to-machine
+    // authorization, however good the secret it proved is.
+    if !client.allows_client_token_auth() {
+        return Err(invalid_parameter(
+            crate::state::auth_flow_not_enabled_message(crate::state::CLIENT_TOKEN_AUTH_FLOW),
+        ));
+    }
+
+    // "The custom scopes to authorize in the access token, in the format
+    // resource-server-identifier/scope-name. Each scope must belong to a resource server
+    // in your user pool. If you don't specify any scopes, Amazon Cognito authorizes the
+    // scopes that are configured for the app client" (`Scopes`). So a request that asks
+    // for scopes is served only when the POOL defines every one of them, and one that
+    // asks for none falls back to the app client's stored `AllowedOAuthScopes` — a client
+    // configured with none gets a token that authorizes none.
+    let requested = input.scopes.as_deref().unwrap_or_default();
+    let scopes = if requested.is_empty() {
+        client.allowed_oauth_scopes.clone().unwrap_or_default()
+    } else {
+        if requested.iter().any(|scope| !pool.defines_scope(scope)) {
+            return Err(invalid_parameter(SCOPE_NOT_ON_A_RESOURCE_SERVER.to_string()));
+        }
+        requested.to_vec()
+    };
+
+    Ok(Grant {
+        user_pool_id: pool.id.clone(),
+        scopes,
+    })
+}
+
+/// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
+fn client_not_found(client_id: &str) -> GetClientTokenError {
+    GetClientTokenErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool client {client_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> GetClientTokenError {
+    GetClientTokenErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> GetClientTokenError {
+    GetClientTokenErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> GetClientTokenError {
+    GetClientTokenErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+
