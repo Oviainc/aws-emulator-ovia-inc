@@ -523,6 +523,11 @@ pub struct OrganizationRecommendationEntry {
     /// (`engine::EMULATOR_ACCOUNT_ID`), so the seed records that account's
     /// recommendation for the same check; the member set is a list so an
     /// organization with more accounts needs no second shape.
+    ///
+    /// A SET held in a `Vec`: every read of it goes through
+    /// [`member_recommendations_of`](ComAmazonawsTrustedadvisorTrustedadvisorState::member_recommendations_of),
+    /// which yields each member recommendation once, so no organization-level
+    /// view reports or counts one twice.
     pub member_recommendation_arns: Vec<String>,
     pub created_at_millis: i64,
     pub last_updated_at_millis: i64,
@@ -657,6 +662,40 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
         }
     }
 
+    /// The member accounts' recommendations one organization recommendation
+    /// aggregates: each ONCE, in ARN order.
+    ///
+    /// [`OrganizationRecommendationEntry::member_recommendation_arns`] is a SET
+    /// of member recommendations stored in a `Vec`, so a member named twice is
+    /// still ONE member recommendation — one resource of this service, with one
+    /// account, one lifecycle and one set of resources. Every organization-level
+    /// view is derived through here (the accounts list, the resource union and
+    /// both aggregates), so none of them can report or count a member a second
+    /// time, and ARN order is the stable sequence the organization lists page
+    /// in.
+    ///
+    /// An ARN naming no stored organization recommendation aggregates no
+    /// member, so the set is empty.
+    pub fn member_recommendations_of(
+        &self,
+        organization_recommendation_arn: &str,
+    ) -> Vec<&str> {
+        let Some(entry) = self
+            .organization_recommendations
+            .get(organization_recommendation_arn)
+        else {
+            return Vec::new();
+        };
+        let mut members: Vec<&str> = entry
+            .member_recommendation_arns
+            .iter()
+            .map(String::as_str)
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        members
+    }
+
     /// `resourcesAggregates` for an organization recommendation, SUMMED over
     /// the member accounts' recommendations it aggregates: an organization
     /// recommendation owns no resources, so its counters are the counters of
@@ -675,12 +714,7 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
             error_count: 0,
             excluded_count: Some(0),
         };
-        let members = self
-            .organization_recommendations
-            .get(organization_recommendation_arn)
-            .map(|entry| entry.member_recommendation_arns.as_slice())
-            .unwrap_or_default();
-        for member in members {
+        for member in self.member_recommendations_of(organization_recommendation_arn) {
             let aggregates = self.aggregates_for(member);
             total.ok_count += aggregates.ok_count;
             total.warning_count += aggregates.warning_count;
@@ -778,11 +812,8 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
         &self,
         organization_recommendation_arn: &str,
     ) -> Option<RecommendationPillarSpecificAggregates> {
-        let entry = self
-            .organization_recommendations
-            .get(organization_recommendation_arn)?;
         let mut totals: Option<(f64, f64)> = None;
-        for member in &entry.member_recommendation_arns {
+        for member in self.member_recommendations_of(organization_recommendation_arn) {
             if let Some((savings, spend)) = self.cost_totals(member) {
                 let (total_savings, total_spend) = totals.unwrap_or((0.0, 0.0));
                 totals = Some((total_savings + savings, total_spend + spend));

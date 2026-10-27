@@ -174,10 +174,7 @@ pub(crate) fn wrap(
         "RSA_AES_KEY_WRAP_SHA_1" => (&aws_lc_rs::rsa::OAEP_SHA1_MGF1SHA1, true),
         other => panic!("case {case}: {other} is not a wrapping algorithm this test uses"),
     };
-    let public_key = aws_lc_rs::rsa::PublicEncryptingKey::from_der(public_key)
-        .unwrap_or_else(|error| panic!("case {case}: the public key is DER: {error}"));
-    let oaep = aws_lc_rs::rsa::OaepPublicEncryptingKey::new(public_key)
-        .unwrap_or_else(|error| panic!("case {case}: the public key wraps: {error}"));
+    let oaep = oaep_wrapping_key(case, public_key);
 
     // What the RSA public key encrypts: the material itself, or the ephemeral AES key
     // that wrapped it.
@@ -221,6 +218,18 @@ pub(crate) fn unb64(case: &str, payload: &Value, member: &str) -> Vec<u8> {
         .unwrap_or_else(|| panic!("case {case}: expected {member} in {payload}"));
     aws_smithy_types::base64::decode(encoded)
         .unwrap_or_else(|error| panic!("case {case}: {member} is not base64: {error}"))
+}
+
+/// The RSA wrapping key an X.509 `SubjectPublicKeyInfo` DER public key carries, which
+/// is what a caller does with the `PublicKey` member before wrapping key material.
+pub(crate) fn oaep_wrapping_key(
+    case: &str,
+    public_key: &[u8],
+) -> aws_lc_rs::rsa::OaepPublicEncryptingKey {
+    let parsed = aws_lc_rs::rsa::PublicEncryptingKey::from_der(public_key)
+        .unwrap_or_else(|error| panic!("case {case}: the public key is DER: {error}"));
+    aws_lc_rs::rsa::OaepPublicEncryptingKey::new(parsed)
+        .unwrap_or_else(|error| panic!("case {case}: the public key wraps: {error}"))
 }
 
 /// Create a key and return its `KeyMetadata`.

@@ -178,22 +178,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(&ctx.parts().headers);
         let mut store = state.lock();
 
+        // The tags the create persists, read once from the request: the same map goes
+        // into the fingerprint below and onto the stored record.
+        let tags = input.tags.clone().unwrap_or_default();
+
+        // What this create's `@idempotencyToken` identifies: every member the record
+        // below is built from, with the tag map fingerprinted in key order
+        // (`crate::state::tags_fingerprint`) so the same tag set written in another order
+        // is one request.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.name.clone(),
+            input.r#type.clone(),
+            input.description.clone().unwrap_or_default(),
+            format!("{:?}", input.server_side_encryption_configuration),
+            crate::state::tags_fingerprint(&tags),
+        ]);
+
         // A replayed `@idempotencyToken` answers with the assistant it already created
-        // rather than creating a second one. The token is scoped to this operation, so
-        // the same token on another create is another resource.
-        let replay_key = input
-            .client_token
-            .as_deref()
-            .map(|token| crate::state::idempotency_key("CreateAssistant", token));
-        if let Some(created) = replay_key
-            .as_ref()
-            .and_then(|key| store.idempotency.get(key).cloned())
-        {
-            if let Some(assistant) = store.assistant(&created) {
-                return Ok(CreateAssistantOutput {
-                    assistant: Some(assistant.to_assistant_data()),
-                });
+        // rather than creating a second one, while the same token carrying a DIFFERENT
+        // request is the modelled idempotency conflict rather than a record the caller did
+        // not ask for. The token is scoped to this operation, so the same token on another
+        // create is another resource.
+        match store.replayed_create(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Conflict => {
+                return Err(CreateAssistantErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT.to_string()),
+                })
+                .into())
             }
+            crate::state::Replay::Retry(created) => {
+                if let Some(assistant) = store.assistant(&created) {
+                    return Ok(CreateAssistantOutput {
+                        assistant: Some(assistant.to_assistant_data()),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
         }
 
         // An assistant's name identifies it, so a create under a name this account
@@ -243,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ready: there is no later status change for the clock to owe it.
             status: crate::state::ASSISTANT_STATUS_ACTIVE.to_string(),
             description: input.description.clone(),
-            tags: input.tags.clone().unwrap_or_default(),
+            tags: tags.clone(),
             server_side_encryption_configuration: input
                 .server_side_encryption_configuration
                 .clone(),
@@ -259,9 +279,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sessions: ::std::collections::HashMap::new(),
         };
         store.insert_assistant(assistant);
-        if let Some(key) = replay_key {
-            store.idempotency.insert(key, assistant_id.clone());
-        }
+        store.remember_create(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &assistant_id,
+        );
 
         // Render out of the INSERTED record rather than out of the request: what this
         // call answers is what a later read of the assistant answers.

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSpotPriceHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSpotPriceHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: answers the Spot price history of the Region the request was signed for —
+//! one entry per price change of every Availability Zone, instance type and product
+//! description the request narrows to, at each change point inside the `StartTime`/`EndTime`
+//! window plus the last change at or before `StartTime` ("the effective price as of the
+//! start time") — paged by `MaxResults`/`NextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSpotPriceHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A Spot price is DERIVED rather than stored, the way a Region's Availability Zones and its
+//! instance type offerings are (see [`crate::state`]): it is a function of the instance
+//! type's published vCPUs and memory, the platform the product description names, the zone
+//! and the change point. So this describe writes nothing at all, and two calls that name the
+//! same zone, instance type, platform and change point report the same price. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +169,737 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSpotPriceHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSpotPriceHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            FilterPattern, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget,
+            availability_zone_of_region, availability_zones_in_region, decode_page_token,
+            encode_page_token, instance_type_record, invalid_pagination_token_for,
+            offered_instance_types, request_region,
+        };
+
+        // A Spot price is a fact of a Region derived from the instance type catalog and the
+        // Region's zones (see this module's docs and [`crate::state`]), so this operation
+        // reports one without reading or writing the store, exactly as
+        // `DescribeInstanceTypeOfferings` and `DescribeCapacityBlockOfferings` do — and two
+        // calls therefore cannot report one price differently.
+        let _ = &self.engine;
+
+        // "The maximum number of items to return for this request": the model declares no
+        // `@range` on the member, so the handler is the only place a page size can be
+        // bounded, and it is bounded by the largest page this service serves.
+        if let Some(max_results) = input.max_results {
+            if max_results < 1 {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. It must be at least 1"
+                )));
+            }
+            if usize::try_from(max_results).unwrap_or(0) > MAX_PAGE_SIZE {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{max_results}' for maxResults. It must be at most \
+                     {MAX_PAGE_SIZE}"
+                )));
+            }
+        }
+
+        // Narrowing cost is filters x values x value length x candidate prices, and the
+        // model bounds none of them, so the request-controlled factors are capped here,
+        // before any work proportional to them is done — the caps every other describe of
+        // this crate applies.
+        let named_types = input.instance_types.as_deref().unwrap_or_default();
+        if named_types.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "InstanceTypes carries {} entries, above the maximum of {MAX_RESOURCE_IDS}",
+                named_types.len()
+            )));
+        }
+        let named_products = input.product_descriptions.as_deref().unwrap_or_default();
+        if named_products.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "ProductDescriptions carries {} entries, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                named_products.len()
+            )));
+        }
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            // A filter name this operation does not document is refused whether or not
+            // anything would have matched it, so a misspelled filter can never read as "no
+            // prices" — the answer every other describe of this crate gives.
+            if !DOCUMENTED_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+        }
+
+        // "The token returned from a previous paginated request. Pagination continues from
+        // the end of the items returned by the previous request" — anything else is refused
+        // rather than read as a cursor, and it is refused before any member that selects
+        // what to report is looked at, so whether a bogus token is caught never depends on
+        // the rest of the request.
+        let fingerprint = search_fingerprint(&input);
+        let resumed = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let cursor =
+                    decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?;
+                let cursor =
+                    parse_page_cursor(&cursor).ok_or_else(|| invalid_pagination_token_for(token))?;
+                // A token minted for one search names a position inside THAT sequence of
+                // prices, so presenting it back against another search is refused rather
+                // than resumed at a position inside a set it never described.
+                if cursor.fingerprint != fingerprint {
+                    return Err(invalid_pagination_token_for(token));
+                }
+                Some(cursor)
+            }
+        };
+
+        // "Either AvailabilityZone or AvailabilityZoneId can be specified, but not both"
+        // (both members' own doc): naming a zone two ways is a parameter combination EC2
+        // does not accept, whether or not the two name the same zone.
+        if input.availability_zone.is_some() && input.availability_zone_id.is_some() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "Either AvailabilityZone or AvailabilityZoneId can be specified, but not both",
+            ));
+        }
+
+        // EC2 is a regional service reached through a regional endpoint: the Region the
+        // caller signed for is the Region whose Spot prices it is asking about.
+        let region = request_region(ctx.parts());
+        let region_zones = availability_zones_in_region(&region);
+
+        // "Filters the results by the specified Availability Zone" / "by the specified ID of
+        // the Availability Zone": a zone the Region does not have names nothing whose prices
+        // could be reported, so it is refused rather than answered with an empty history —
+        // through the one lookup both spellings of a zone share. Each zone is kept with its
+        // POSITION in the Region's zone list, which is what its share of the On-Demand rate
+        // is read from, so narrowing a request cannot change the price it reports.
+        let zones: Vec<(usize, &crate::state::AvailabilityZoneRecord)> =
+            match (&input.availability_zone, &input.availability_zone_id) {
+                (Some(zone_name), _) => {
+                    let zone = availability_zone_of_region(
+                        &region_zones,
+                        &region,
+                        "availabilityZone",
+                        zone_name,
+                        |zone| zone.zone_name.as_str(),
+                    )?;
+                    vec![(zone_position(&region_zones, zone), zone)]
+                }
+                (_, Some(zone_id)) => {
+                    let zone = availability_zone_of_region(
+                        &region_zones,
+                        &region,
+                        "availabilityZoneId",
+                        zone_id,
+                        |zone| zone.zone_id.as_str(),
+                    )?;
+                    vec![(zone_position(&region_zones, zone), zone)]
+                }
+                (None, None) => region_zones.iter().enumerate().collect(),
+            };
+
+        // DryRun sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead. ("Filters the results by the specified instance types" needs
+        // no check of its own: `InstanceTypes` is a list of the modelled `InstanceType` enum,
+        // so a value the model does not declare is refused by the request walk before this
+        // handler runs, and a type that reaches here is one the catalog offers.)
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // Each documented filter compares against ONE field of a history entry, so the
+        // field each one names is narrowed BEFORE any entry is priced: a filter value is
+        // compiled once and compared against the zones, the instance type catalog, the
+        // product descriptions or the change points, never against every combination of
+        // them. That is the same answer as testing every built entry, at a cost
+        // proportional to the sum of those sets rather than to their product.
+        let compiled: Vec<(&str, Vec<FilterPattern>)> = filters
+            .iter()
+            .map(|filter| {
+                let patterns = filter
+                    .values
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|wanted| FilterPattern::compile(wanted))
+                    .collect();
+                (filter.name.as_deref().unwrap_or_default(), patterns)
+            })
+            .collect();
+        // "If you specify multiple filters, the filters are joined with an AND"; and within
+        // one filter, "If you specify multiple values for a filter, the values are joined
+        // with an OR" (the `Filter` shape's own doc). `candidates` are the values ONE entry
+        // holds for the field — a timestamp holds the two renderings it is written in.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSpotPriceHistory"))
+        // Every comparison is charged to ONE budget, which is what bounds the PRODUCT of
+        // zones, instance types, product descriptions, change points, filter values and
+        // value length however the caller combines them — no per-factor cap can do that.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let admitted = |field: &str, candidates: &[&str], budget: &mut MatchBudget| -> bool {
+            compiled
+                .iter()
+                .filter(|(name, _)| *name == field)
+                .all(|(_, patterns)| {
+                    patterns.iter().any(|pattern| {
+                        candidates
+                            .iter()
+                            .any(|candidate| pattern.matches_within(candidate, budget))
+                    })
+                })
+        };
+
+        let zones: Vec<(usize, &crate::state::AvailabilityZoneRecord)> = zones
+            .into_iter()
+            .filter(|(_, zone)| {
+                admitted(
+                    "availability-zone",
+                    &[zone.zone_name.as_str()],
+                    &mut budget,
+                ) && admitted(
+                    "availability-zone-id",
+                    &[zone.zone_id.as_str()],
+                    &mut budget,
+                )
+            })
+            .collect();
+
+        // The instance types priced, each with the facts its price is computed from, read
+        // once per type rather than once per entry.
+        let named_types: ::std::collections::BTreeSet<&str> =
+            named_types.iter().map(String::as_str).collect();
+        let instance_types: Vec<(&'static str, crate::state::InstanceTypeRecord)> =
+            offered_instance_types()
+                .iter()
+                .copied()
+                .filter(|instance_type| {
+                    named_types.is_empty() || named_types.contains(instance_type)
+                })
+                .filter(|instance_type| {
+                    admitted("instance-type", &[*instance_type], &mut budget)
+                })
+                .filter_map(|instance_type| {
+                    instance_type_record(instance_type).map(|record| (instance_type, record))
+                })
+                .collect();
+
+        // "Filters the results by the specified basic product descriptions": the product
+        // descriptions a Spot price can be reported for are the values of the modelled
+        // `RIProductDescription` enum, which is what `SpotPrice$ProductDescription` carries
+        // (`smithy_query(query="shape",shape="SpotPrice")`), so a description outside it
+        // names no priced product and selects nothing. Unlike a filter value, these are
+        // compared exactly: the member names descriptions, not patterns.
+        let product_descriptions: Vec<&'static str> = R_I_PRODUCT_DESCRIPTION_VALUES
+            .iter()
+            .copied()
+            .filter(|product| {
+                named_products.is_empty()
+                    || named_products.iter().any(|named| named == product)
+            })
+            .filter(|product| admitted("product-description", &[*product], &mut budget))
+            .collect();
+
+        // The window the history is read over, against the clock as the one conversion this
+        // crate writes an instant with reads it. "The date and time, up to the current date,
+        // from which to stop retrieving the price history data" bounds `EndTime` at now, and
+        // "up to the past 90 days" bounds `StartTime` at [`MAX_HISTORY_DAYS`] back; a
+        // request that names no start asks for the price effective at the end of the window,
+        // which is "the last price change before the start time".
+        let now = crate::state::system_time_to_date_time(::std::time::SystemTime::now()).secs();
+        let end = input
+            .end_time
+            .map_or(now, |end_time| end_time.secs())
+            .min(now);
+        let start = input
+            .start_time
+            .map_or(end, |start_time| start_time.secs())
+            .max(now.saturating_sub(MAX_HISTORY_DAYS * SECONDS_PER_DAY));
+        // A price change point is named by the period it starts, so the window's first point
+        // is the change in force AT `start` — the one at or before it — and its last is the
+        // change in force at `end`. A `NextToken` walk carries the pair, so a page minted
+        // before a change point fell due is resumed over the same window rather than over a
+        // window the clock has since moved.
+        //
+        // Whatever the pair's provenance, it is then INTERSECTED with the window the CLOCK
+        // permits: no change point after the one in force now, and none older than the
+        // published history. A token is opaque but not unforgeable, so this is what keeps the
+        // number of change points a request can ask to be priced at [`MAX_HISTORY_DAYS`] + 1
+        // rather than at anything a cursor names; a pair that lies entirely outside that
+        // window intersects it in nothing, which is an empty history rather than one entry
+        // stamped at a boundary the request never asked about.
+        let (first_period, last_period) = match &resumed {
+            Some(cursor) => (cursor.first_period, cursor.last_period),
+            None => (
+                start.div_euclid(SECONDS_PER_PRICE_PERIOD),
+                end.div_euclid(SECONDS_PER_PRICE_PERIOD),
+            ),
+        };
+        let earliest_period = now
+            .saturating_sub(MAX_HISTORY_DAYS * SECONDS_PER_DAY)
+            .div_euclid(SECONDS_PER_PRICE_PERIOD);
+        let latest_period = now.div_euclid(SECONDS_PER_PRICE_PERIOD);
+        let first_period = first_period.max(earliest_period);
+        let last_period = last_period.min(latest_period);
+
+        // The change points of that window, most recent first, with the two renderings the
+        // `timestamp` filter compares against: the UTC form the member's own doc gives
+        // (`ddd MMM dd HH:mm:ss UTC YYYY`) and the ISO 8601 form the response carries the
+        // member in. A change point so far out that it has no such rendering is no instant a
+        // price could be reported with, so it is left out rather than reported unwritten.
+        let mut change_points: Vec<(i64, ::aws_smithy_types::DateTime)> = Vec::new();
+        for period in (first_period..=last_period).rev() {
+            let at = ::aws_smithy_types::DateTime::from_secs(
+                period.saturating_mul(SECONDS_PER_PRICE_PERIOD),
+            );
+            let Ok(iso) = at.fmt(::aws_smithy_types::date_time::Format::DateTime) else {
+                continue;
+            };
+            let legacy = legacy_utc_timestamp(at);
+            let renderings: Vec<&str> = match &legacy {
+                Some(legacy) => vec![iso.as_str(), legacy.as_str()],
+                None => vec![iso.as_str()],
+            };
+            if admitted("timestamp", &renderings, &mut budget) {
+                change_points.push((period, at));
+            }
+        }
+
+        // A request that names no page size gets the largest page this service serves, so
+        // the `NextToken` path behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // `spot-price` is the one documented filter that compares against a value no
+        // candidate set holds — the price itself — so it is the only one left to evaluate per
+        // entry, against the same budget the narrowing above spent from.
+        let price_filters: Vec<&Vec<FilterPattern>> = compiled
+            .iter()
+            .filter(|(name, _)| *name == SPOT_PRICE_FILTER)
+            .map(|(_, patterns)| patterns)
+            .collect();
+
+        // The sequence the window prices: every combination of the narrowed zones, instance
+        // types, product descriptions and change points. Its ORDER is zone, then instance
+        // type, then product description, then change point most recent first — so a
+        // one-item page answers the price in force now — and a position in it decomposes
+        // into one index per set, which is what lets a `NextToken` resume at the position it
+        // names instead of re-walking the entries already answered. The length is the
+        // product of four sets this service's own catalogs bound, saturating so no catalog
+        // can overflow it.
+        //
+        // A filter that carries no values admits no value at all, so a `spot-price` filter
+        // spelled that way prices nothing: the sequence is empty rather than walked to its
+        // end to answer nothing. The narrowing filters need no such guard — one of those
+        // leaves its own set empty, which empties the product.
+        let priced_by_no_value = price_filters.iter().any(|patterns| patterns.is_empty());
+        let total = if priced_by_no_value {
+            0
+        } else {
+            zones
+                .len()
+                .saturating_mul(instance_types.len())
+                .saturating_mul(product_descriptions.len())
+                .saturating_mul(change_points.len())
+        };
+        let mut history: Vec<SpotPrice> = Vec::new();
+        // Where the next page starts: the position of the first priced entry this page had
+        // no room for.
+        let mut next_position: Option<usize> = None;
+        let mut position = resumed.as_ref().map_or(0, |cursor| cursor.index).min(total);
+        // The scan stops the moment the budget is spent, so the budget bounds the work this
+        // request DOES rather than only the work it reports.
+        while position < total && !budget.exhausted() {
+            // Reached only when `total` is non-zero, so every set below is non-empty and
+            // every divisor is above zero; each lookup is checked all the same, so no index
+            // derived from a cursor can reach past its set.
+            let point_index = position % change_points.len();
+            let rest = position / change_points.len();
+            let product_index = rest % product_descriptions.len();
+            let rest = rest / product_descriptions.len();
+            let type_index = rest % instance_types.len();
+            let zone_slot = rest / instance_types.len();
+            let (Some((zone_index, zone)), Some((instance_type, record))) =
+                (zones.get(zone_slot), instance_types.get(type_index))
+            else {
+                break;
+            };
+            let (Some(product_description), Some((period, at))) = (
+                product_descriptions.get(product_index),
+                change_points.get(point_index),
+            ) else {
+                break;
+            };
+
+            let platform = platform_of(product_description);
+            let price = format_price_micros(spot_price_micros(
+                on_demand_micros(record, platform),
+                *zone_index,
+                *period,
+            ));
+            let priced = price_filters.iter().all(|patterns| {
+                patterns
+                    .iter()
+                    .any(|pattern| pattern.matches_within(&price, &mut budget))
+            });
+            if priced {
+                if history.len() >= limit {
+                    next_position = Some(position);
+                    break;
+                }
+                history.push(SpotPrice {
+                    availability_zone: Some(zone.zone_name.clone()),
+                    availability_zone_id: Some(zone.zone_id.clone()),
+                    instance_type: Some((*instance_type).to_string()),
+                    product_description: Some((*product_description).to_string()),
+                    spot_price: Some(price),
+                    timestamp: Some(*at),
+                });
+            }
+            position = position.saturating_add(1);
+        }
+        // A scan that ran out of budget answers an INCOMPLETE set, which is not something to
+        // report as a result: the request asked for more filtering than one call will do, and
+        // is told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // "This value is an empty string ("") or null when there are no more items to
+        // return" (`DescribeSpotPriceHistoryResult$NextToken`): a token only when a priced
+        // entry follows this page, and it names the position in THIS window that the next
+        // page starts at.
+        let next_token = next_position.map(|position| {
+            encode_page_token(&page_cursor(
+                &fingerprint,
+                first_period,
+                last_period,
+                position,
+            ))
+        });
+
+        Ok(DescribeSpotPriceHistoryOutput {
+            spot_price_history: Some(history),
+            next_token,
+        })
     }
+}
+
+/// Every filter name `DescribeSpotPriceHistoryRequest$Filters` documents, in the order the
+/// member lists them:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeSpotPriceHistoryRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+const DOCUMENTED_FILTERS: [&str; 6] = [
+    "availability-zone",
+    "availability-zone-id",
+    "instance-type",
+    "product-description",
+    SPOT_PRICE_FILTER,
+    "timestamp",
+];
+
+/// The one documented filter that compares against a value only a priced entry holds, so it
+/// cannot narrow a candidate set before the prices are computed.
+const SPOT_PRICE_FILTER: &str = "spot-price";
+
+/// The seconds in one day, the unit [`MAX_HISTORY_DAYS`] is given in.
+pub const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+
+/// How far back a Spot price history reaches: "The date and time, up to the past 90 days,
+/// from which to start retrieving the price history data"
+/// (`DescribeSpotPriceHistoryRequest$StartTime`), so a start earlier than that reads as the
+/// earliest the history holds.
+pub const MAX_HISTORY_DAYS: i64 = 90;
+
+/// How often a Spot price changes: the span between two consecutive change points, which is
+/// what makes the history a list of CHANGES rather than one entry per instant.
+///
+/// CHOSEN, like [`crate::state::CAPACITY_BLOCK_FEE_CENTS_PER_UNIT_HOUR`]: AWS publishes no
+/// schedule on which a Spot price moves, and neither the model nor a request carries one. A
+/// caller can rely on the RULE — a price changes at a point on this grid, is in force until
+/// the next one, and is reported with the instant it took effect — not on the span.
+pub const SECONDS_PER_PRICE_PERIOD: i64 = SECONDS_PER_DAY;
+
+/// Where `zone` sits in `zones`, the Availability Zones of its Region: the zone's own
+/// position, which is what [`spot_share_percent`] reads a per-zone share from. A zone the
+/// list does not hold cannot be reached — both callers took `zone` out of `zones` — and is
+/// read as the Region's first.
+fn zone_position(
+    zones: &[crate::state::AvailabilityZoneRecord],
+    zone: &crate::state::AvailabilityZoneRecord,
+) -> usize {
+    zones
+        .iter()
+        .position(|candidate| candidate.zone_id == zone.zone_id)
+        .unwrap_or(0)
+}
+
+/// The product description of a Spot price with the Amazon VPC qualifier stripped: the
+/// PLATFORM the price is for.
+///
+/// `Linux/UNIX` and `Linux/UNIX (Amazon VPC)` are the same platform reported for the two
+/// network kinds a Spot Instance can run in, and AWS prices them alike, so the qualifier is
+/// removed before anything is priced rather than being priced as a second platform.
+fn platform_of(product_description: &str) -> &str {
+    product_description
+        .strip_suffix(AMAZON_VPC_QUALIFIER)
+        .unwrap_or(product_description)
+}
+
+/// The qualifier a `RIProductDescription` carries for the VPC form of a platform.
+const AMAZON_VPC_QUALIFIER: &str = " (Amazon VPC)";
+
+/// The platform whose price carries a licence premium: the `Windows` member of the modelled
+/// `RIProductDescription` enum, as [`platform_of`] reads it.
+const WINDOWS_PLATFORM: &str = "Windows";
+
+/// The micro-dollars one vCPU of an instance costs for one hour at the On-Demand rate.
+///
+/// CHOSEN, with [`MICROS_PER_GIB_HOUR`] and [`WINDOWS_LICENCE_MICROS_PER_VCPU_HOUR`]: AWS's
+/// price list is published outside the model, and neither the model nor a request carries it.
+/// What a caller can rely on is the RULE — a price is a function of the instance type's
+/// published vCPUs and memory and of the platform's licence premium, so a larger size of one
+/// family costs more than a smaller one and a Windows price is above the Linux price of the
+/// same type — not these rates.
+const MICROS_PER_VCPU_HOUR: u64 = 21_000;
+
+/// The micro-dollars one GiB of an instance's memory costs for one hour at the On-Demand
+/// rate. CHOSEN, see [`MICROS_PER_VCPU_HOUR`].
+const MICROS_PER_GIB_HOUR: u64 = 5_000;
+
+/// The micro-dollars per vCPU-hour a `Windows` platform adds to the On-Demand rate: the
+/// licence premium AWS charges on top of the compute. CHOSEN, see [`MICROS_PER_VCPU_HOUR`].
+const WINDOWS_LICENCE_MICROS_PER_VCPU_HOUR: u64 = 46_000;
+
+/// The MiB in one GiB, for reading an instance type's memory (which the catalog publishes in
+/// MiB) at the per-GiB rate.
+const MIB_PER_GIB: u64 = 1_024;
+
+/// The lowest percentage of the On-Demand rate a Spot price falls to, and the highest. A
+/// Spot price is the On-Demand rate discounted into that band, which is what keeps every
+/// reported price below the On-Demand rate and above zero.
+///
+/// CHOSEN, see [`MICROS_PER_VCPU_HOUR`]: AWS publishes the discount as varying with supply
+/// and demand, which this emulator holds no data for.
+const SPOT_FLOOR_PERCENT: u64 = 30;
+
+/// The top of that band. See [`SPOT_FLOOR_PERCENT`].
+const SPOT_CEILING_PERCENT: u64 = 70;
+
+/// How far along the band the share moves from one change point to the next, and how far it
+/// is offset for each further Availability Zone of the Region.
+///
+/// CHOSEN, with the band itself: the two only have to be shares of the rate that MOVE — a
+/// price history whose price never changed would be a history of nothing, and two zones of a
+/// Region do not sell their spare capacity at one price. Both steps are coprime with the
+/// band's width, so the share walks the whole band before it repeats.
+const SHARE_STEP_PERCENT: u64 = 7;
+
+/// The per-zone offset. See [`SHARE_STEP_PERCENT`].
+const ZONE_SHARE_OFFSET_PERCENT: u64 = 13;
+
+/// The micro-dollars a reported price is a whole multiple of: AWS publishes a Spot price to
+/// four decimal places of the currency, which is this many micro-dollars.
+const PRICE_QUANTUM_MICROS: u64 = 100;
+
+/// What one hour of `record`'s instance type costs On-Demand on `platform`, in
+/// micro-dollars: its vCPUs and its memory at the rates above, plus the platform's licence
+/// premium per vCPU.
+fn on_demand_micros(record: &crate::state::InstanceTypeRecord, platform: &str) -> u64 {
+    let vcpus = u64::from(record.default_vcpus.unsigned_abs());
+    let memory_mib = record.memory_mib.unsigned_abs();
+    let compute = vcpus.saturating_mul(MICROS_PER_VCPU_HOUR);
+    let memory = memory_mib.saturating_mul(MICROS_PER_GIB_HOUR) / MIB_PER_GIB;
+    let licence = if platform == WINDOWS_PLATFORM {
+        vcpus.saturating_mul(WINDOWS_LICENCE_MICROS_PER_VCPU_HOUR)
+    } else {
+        0
+    };
+    compute.saturating_add(memory).saturating_add(licence)
+}
+
+/// The share of the On-Demand rate the Spot price of the Region's `zone_index`-th
+/// Availability Zone is at the change point `period`, as a percentage inside the band
+/// [`SPOT_FLOOR_PERCENT`]..=[`SPOT_CEILING_PERCENT`].
+///
+/// The share walks the band in [`SHARE_STEP_PERCENT`] steps, one step per change point,
+/// offset by [`ZONE_SHARE_OFFSET_PERCENT`] per zone: so it moves from each change point to
+/// the next, two zones of one Region differ at the same change point, and the same zone and
+/// change point always answer the same share.
+fn spot_share_percent(zone_index: usize, period: i64) -> u64 {
+    let band = SPOT_CEILING_PERCENT - SPOT_FLOOR_PERCENT + 1;
+    let zone = u64::try_from(zone_index).unwrap_or(0);
+    // The change point is a count of periods since the epoch, which is negative before it;
+    // `rem_euclid` is what keeps the walk inside the band on either side of it.
+    let steps = period
+        .rem_euclid(i64::try_from(band).unwrap_or(1))
+        .unsigned_abs();
+    let walked = steps
+        .saturating_mul(SHARE_STEP_PERCENT)
+        .saturating_add(zone.saturating_mul(ZONE_SHARE_OFFSET_PERCENT));
+    SPOT_FLOOR_PERCENT + walked % band
+}
+
+/// The Spot price in force from change point `period` in the Region's `zone_index`-th
+/// Availability Zone, for an instance type whose On-Demand rate on the priced platform is
+/// `on_demand_micros`, in micro-dollars: that rate at the share [`spot_share_percent`] gives.
+///
+/// DERIVED, not drawn: the same inputs always answer the same price, so repeated calls report
+/// a stable price and nothing has to be stored for one. The SHARE is a property of the zone
+/// at a change point rather than of one instance type — spare capacity is what a zone has, not
+/// what a type has — so at any one change point every type of a zone is discounted alike, and
+/// a price therefore stays ordered by the On-Demand rate it is a share of.
+fn spot_price_micros(on_demand_micros: u64, zone_index: usize, period: i64) -> u64 {
+    let micros = on_demand_micros.saturating_mul(spot_share_percent(zone_index, period)) / 100;
+    // Rounded to the places a price is published to, and never to nothing: a priced instance
+    // type costs something, however small its share of the rate is.
+    let rounded = micros
+        .saturating_add(PRICE_QUANTUM_MICROS / 2)
+        .saturating_div(PRICE_QUANTUM_MICROS)
+        .saturating_mul(PRICE_QUANTUM_MICROS);
+    rounded.max(PRICE_QUANTUM_MICROS)
+}
+
+/// `micros` micro-dollars as `SpotPrice$SpotPrice` carries a price: a decimal amount with
+/// the six fractional digits AWS publishes a Spot price with.
+fn format_price_micros(micros: u64) -> String {
+    format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
+}
+
+/// `at` in the UTC form the `timestamp` filter's own doc gives — `ddd MMM dd HH:mm:ss UTC
+/// YYYY` — or `None` when `at` is not an instant that form can be written in.
+///
+/// Built by rearranging the `HttpDate` rendering (`Wed, 01 Jan 2025 00:00:00 GMT`), which
+/// carries exactly the day and month names this form needs, rather than by a second calendar
+/// of this crate's own.
+fn legacy_utc_timestamp(at: ::aws_smithy_types::DateTime) -> Option<String> {
+    let http_date = at.fmt(::aws_smithy_types::date_time::Format::HttpDate).ok()?;
+    let mut fields = http_date.split_whitespace();
+    let day_name = fields.next()?.trim_end_matches(',');
+    let day = fields.next()?;
+    let month = fields.next()?;
+    let year = fields.next()?;
+    let time = fields.next()?;
+    Some(format!("{day_name} {month} {day} {time} UTC {year}"))
+}
+
+/// The marker a page cursor of this operation carries, ahead of the search it belongs to and
+/// the position inside it — so a cursor another operation of this service minted is
+/// detectable rather than read as a position here.
+const PAGE_CURSOR_VERSION: &str = "ec2-sph-1";
+
+/// What separates a page cursor's fields. Neither the marker nor the fingerprint nor a
+/// number can carry it.
+const CURSOR_SEPARATOR: char = '|';
+
+/// Where one page of a history walk starts: the search the walk belongs to, the window it is
+/// being read over, and the position in that window's sequence of prices the page starts at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageCursor {
+    /// The fingerprint of the search, as [`search_fingerprint`] builds it.
+    fingerprint: String,
+    /// The first change point of the window, as the request that opened the walk resolved it.
+    first_period: i64,
+    /// Its last change point.
+    last_period: i64,
+    /// The position this page starts at, counted over every combination the window prices in
+    /// the order the scan walks them — so resuming starts AT that position rather than
+    /// walking the entries already answered.
+    index: usize,
+}
+
+/// The cursor naming the position `index` of the window `first_period..=last_period` inside
+/// the search `fingerprint`.
+fn page_cursor(fingerprint: &str, first_period: i64, last_period: i64, index: usize) -> String {
+    format!(
+        "{PAGE_CURSOR_VERSION}{CURSOR_SEPARATOR}{fingerprint}{CURSOR_SEPARATOR}{first_period}\
+         {CURSOR_SEPARATOR}{last_period}{CURSOR_SEPARATOR}{index}"
+    )
+}
+
+/// The position a cursor names, or `None` for anything this operation did not mint.
+fn parse_page_cursor(cursor: &str) -> Option<PageCursor> {
+    let mut fields = cursor.split(CURSOR_SEPARATOR);
+    if fields.next()? != PAGE_CURSOR_VERSION {
+        return None;
+    }
+    let fingerprint = fields.next()?.to_string();
+    let first_period = fields.next()?.parse().ok()?;
+    let last_period = fields.next()?.parse().ok()?;
+    let index = fields.next()?.parse().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(PageCursor {
+        fingerprint,
+        first_period,
+        last_period,
+        index,
+    })
+}
+
+/// The fingerprint of the search `input` describes: the members that SELECT which prices are
+/// reported, as the request gives them.
+///
+/// The WINDOW is deliberately not part of it — it moves with the clock, and a token must not
+/// stop working because a change point fell due; the cursor carries the resolved window
+/// instead, so a walk reads one window from beginning to end, and the handler holds that
+/// window to the published history before pricing anything.
+///
+/// The digest only has to agree with ITSELF, inside one running emulator: a token is
+/// presented back to the process that minted it and nothing persists one, so a hasher whose
+/// output is stable per build rather than across builds is enough. It is not an integrity
+/// check either — that is [`crate::state::decode_page_token`]'s — only a statement of which
+/// search a position belongs to.
+fn search_fingerprint(input: &DescribeSpotPriceHistoryInput) -> String {
+    use ::std::hash::{Hash, Hasher};
+
+    let mut hasher = ::std::hash::DefaultHasher::new();
+    input.availability_zone.hash(&mut hasher);
+    input.availability_zone_id.hash(&mut hasher);
+    input.instance_types.hash(&mut hasher);
+    input.product_descriptions.hash(&mut hasher);
+    for filter in input.filters.as_deref().unwrap_or_default() {
+        filter.name.hash(&mut hasher);
+        filter.values.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
 }
