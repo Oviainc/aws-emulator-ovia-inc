@@ -15,3 +15,5 @@
 mod stack_fleet_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_stack.rs"]
+mod update_stack;
