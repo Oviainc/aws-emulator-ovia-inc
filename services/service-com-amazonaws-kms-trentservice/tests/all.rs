@@ -55,6 +55,8 @@ mod key_last_usage;
 mod key_lifecycle;
 #[path = "all/key_policy.rs"]
 mod key_policy;
+#[path = "all/key_policy_conditions.rs"]
+mod key_policy_conditions;
 #[path = "all/key_rotation_on_demand.rs"]
 mod key_rotation_on_demand;
 #[path = "all/key_rotation_schedule.rs"]
