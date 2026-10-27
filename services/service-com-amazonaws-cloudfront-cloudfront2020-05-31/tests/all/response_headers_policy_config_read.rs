@@ -12,10 +12,13 @@
 //!   readable here exactly as one this account created is.
 //! * One id outside both sources is refused with `NoSuchResponseHeadersPolicy` (HTTP 404)
 //!   whatever shape it takes, and the MESSAGE is what tells the two conditions apart,
-//!   because the code and the status cannot: an identifier outside the shape every response
-//!   headers policy id takes (the 8-4-4-4-12 lowercase hex of a UUID) is refused as an
-//!   unusable identifier, while a well-formed id that names no policy is refused as an
-//!   absent policy. Both sentences are fixed text and neither echoes the id back.
+//!   because the code and the status cannot: a read that ADDRESSES the policy by the id
+//!   examines the identifier's shape before the lookup, so an identifier outside the shape
+//!   every response headers policy id takes (the 8-4-4-4-12 lowercase hex of a UUID) is
+//!   refused as an unusable identifier while a well-formed id that names no policy is refused
+//!   as an absent policy — whereas the listing that resolves the id as a lookup key into
+//!   another resource prechecks nothing and refuses every unknown id as an absent policy.
+//!   Both sentences are fixed text and neither echoes the id back.
 //!
 //! The rows span what those rules generalise over. The round trip walks the crate's whole
 //! configuration table (`crate::response_headers_policy_lifecycle::policy_table`) plus every
@@ -37,6 +40,7 @@ use crate::distributions_by_response_headers_policy_id::list_by_policy;
 use crate::response_headers_policy_lifecycle::{
     assert_config, create_policy, get_policy, policy_table, text, Policy,
 };
+use crate::response_headers_policy_refusal_message::echoes_the_identifier;
 
 /// `GET /2020-05-31/response-headers-policy/{Id}/config` — the route the model binds this
 /// operation to.
@@ -193,8 +197,8 @@ async fn a_published_policy_is_readable_through_the_config_path() {
     }
 }
 
-/// One id no policy holds, as submitted to each reader of this family, and the sentence the
-/// refusal must carry for it.
+/// One id no policy holds, as submitted to each reader of this family, and the sentence a
+/// reader that ADDRESSES the policy by that id must carry for it.
 struct Unknown {
     case: &'static str,
     id: String,
@@ -288,9 +292,12 @@ fn unknown_ids(minted: &str) -> Vec<Unknown> {
 }
 
 /// Every reader of a response headers policy id refuses an id no policy holds with
-/// `NoSuchResponseHeadersPolicy` (HTTP 404), and states in the MESSAGE which condition it
-/// is: an unusable identifier, or a well-formed id that names no policy. The refusals leave
-/// the policy that does exist readable, with its configuration and version untouched.
+/// `NoSuchResponseHeadersPolicy` (HTTP 404). A reader that ADDRESSES the policy by the id
+/// states in the MESSAGE which condition it is — an unusable identifier, or a well-formed id
+/// that names no policy — while the listing that resolves the id as a lookup key into another
+/// resource answers the absent-policy sentence for every id it holds no policy for. The
+/// refusals leave the policy that does exist readable, with its configuration and version
+/// untouched.
 #[tokio::test]
 async fn the_refusal_tells_an_unusable_id_from_an_absent_policy() {
     let router = emulator();
@@ -316,16 +323,27 @@ async fn the_refusal_tells_an_unusable_id_from_an_absent_policy() {
         let candidate = &unknown.id;
         // The three readers that resolve a response headers policy id: the config read this
         // suite is about, the whole-policy read beside it, and the listing that is about one
-        // policy. All three answer from the one refusal, so none of them can drift.
+        // policy. The first two ADDRESS the policy by the id and so precheck its shape; the
+        // listing resolves it as a lookup key and refuses every unknown id as an absent
+        // policy, whatever shape it takes.
         let answers = [
-            ("GetResponseHeadersPolicyConfig", get_policy_config(&router, candidate).await),
-            ("GetResponseHeadersPolicy", get_policy(&router, candidate).await),
+            (
+                "GetResponseHeadersPolicyConfig",
+                get_policy_config(&router, candidate).await,
+                unknown.message,
+            ),
+            (
+                "GetResponseHeadersPolicy",
+                get_policy(&router, candidate).await,
+                unknown.message,
+            ),
             (
                 "ListDistributionsByResponseHeadersPolicyId",
                 list_by_policy(&router, candidate, "").await,
+                NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
             ),
         ];
-        for (reader, answer) in answers {
+        for (reader, answer, expected) in answers {
             assert_eq!(
                 answer.status, 404,
                 "case {case} ({reader}, {candidate:?}): expected HTTP 404, got {} with {}",
@@ -340,12 +358,11 @@ async fn the_refusal_tells_an_unusable_id_from_an_absent_policy() {
             );
             let message = answer.root().find_text("Message").unwrap_or_default();
             assert_eq!(
-                message, unknown.message,
-                "case {case} ({reader}, {candidate:?}): expected {:?}, got {message:?}",
-                unknown.message
+                message, expected,
+                "case {case} ({reader}, {candidate:?}): expected {expected:?}, got {message:?}"
             );
             assert!(
-                !message.contains(candidate.as_str()),
+                !echoes_the_identifier(message, candidate),
                 "case {case} ({reader}, {candidate:?}): the refusal must not echo the id, got \
                  {message:?}"
             );
