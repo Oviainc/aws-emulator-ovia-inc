@@ -43,6 +43,8 @@ mod harness;
 mod idle_recommendations;
 #[path = "all/idle_recommendations_export.rs"]
 mod idle_recommendations_export;
+#[path = "all/include_member_accounts.rs"]
+mod include_member_accounts;
 #[path = "all/lambda_function_recommendations.rs"]
 mod lambda_function_recommendations;
 #[path = "all/lambda_function_recommendations_export.rs"]
