@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-backup-cryocontrollerusermanager service.
 //!
-//! The vault / backup-job slice of AWS Backup is modelled here as three records
+//! The vault / backup-job slice of AWS Backup is modelled here as four records
 //! plus one index, so every operation computes its answer from the SAME stored
 //! resource:
 //!
@@ -11,6 +11,8 @@
 //!   applies to it.
 //! * [`RecoveryPoint`] — what `StartBackupJob` stores inside the named vault.
 //! * [`BackupJob`] — the job that produced that recovery point.
+//! * [`BackupPlanRecord`] — the plan `CreateBackupPlan` inserts, whose body
+//!   every plan read projects through [`BackupPlanRecord::backup_plan`].
 //!
 //! `recovery_points_by_vault` is the ONLY per-vault list: both
 //! `ListRecoveryPointsByBackupVault`'s page and `DescribeBackupVault`'s
@@ -29,7 +31,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AlreadyExistsException, InvalidParameterValueException, Lifecycle, ResourceNotFoundException,
+    AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupRule, BackupRuleInput,
+    InvalidParameterValueException, Lifecycle, ResourceNotFoundException, ScanSetting,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -140,6 +143,17 @@ pub const MAX_RECOVERY_POINTS: usize = 10_000;
 /// the reason given on [`MAX_VAULTS`].
 pub const MAX_BACKUP_JOBS: usize = 10_000;
 
+/// The most backup plans this emulator keeps. An EMULATOR-CHOSEN ceiling, for
+/// the reason given on [`MAX_VAULTS`]; AWS caps the backup plans an account may
+/// hold and answers `LimitExceededException` too.
+pub const MAX_BACKUP_PLANS: usize = 500;
+
+/// The most rules this emulator keeps in ONE backup plan. An EMULATOR-CHOSEN
+/// ceiling, for the reason given on [`MAX_VAULTS`]: the rule list is sized by
+/// the request, so it is capped before the plan is stored. AWS caps the rules a
+/// plan may hold too, and answers `LimitExceededException` for a plan past it.
+pub const MAX_RULES_PER_PLAN: usize = 100;
+
 /// The most `IdempotencyToken` records this emulator keeps. An EMULATOR-CHOSEN
 /// ceiling: the key is a string the CALLER picks, so this is one of the two
 /// stores whose keys a caller controls (the other is
@@ -210,6 +224,16 @@ pub fn kms_key_arn(region: &str, key_id: &str) -> String {
 /// The ARN of a recovery point: `arn:aws:backup:<region>:<account>:recovery-point:<id>`.
 pub fn recovery_point_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("recovery-point:{id}"))
+}
+
+/// The ARN of a backup plan: `arn:aws:backup:<region>:<account>:backup-plan:<id>`.
+///
+/// `backup-plan` is the resource type a Backup plan is addressed by — the form
+/// an IAM policy and a CloudFormation `BackupPlanArn` carry — so it is spelled
+/// in full here, as [`backup_vault_arn`] spells `backup-vault`; the model's doc
+/// example for the member abbreviates it.
+pub fn backup_plan_arn(region: &str, plan_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("backup-plan:{plan_id}"))
 }
 
 /// The region this request's ARNs carry: the one the caller signed for, from the
@@ -334,6 +358,18 @@ pub const ERROR_CODE_VAULT_ALREADY_EXISTS: &str = "ERROR_1101";
 /// The sentence AWS states for that condition — fixed, like the one above.
 pub const MESSAGE_VAULT_ALREADY_EXISTS: &str = "Backup vault with the same name already exists";
 
+/// The sentence AWS states for "the backup plan asked about is not one this
+/// account holds" — fixed, and worded as this service words the same condition
+/// for a backup job ([`MESSAGE_BACKUP_JOB_NOT_FOUND`]): it names no part of the
+/// request, so neither the plan id nor the version asked about appears in it.
+/// No `Code`: this condition has no observed token.
+pub const MESSAGE_BACKUP_PLAN_NOT_FOUND: &str = "Cannot find Backup plan";
+
+/// The sentence AWS states for "a backup plan of this name already exists",
+/// worded as this service words the same condition for a vault
+/// ([`MESSAGE_VAULT_ALREADY_EXISTS`]) — fixed, and with no observed `Code`.
+pub const MESSAGE_PLAN_ALREADY_EXISTS: &str = "Backup plan with the same name already exists";
+
 /// `Code` for "`MaxResults` is outside the range the model declares".
 pub const ERROR_CODE_MAX_RESULTS_INVALID: &str = "ERROR_3607";
 /// The sentence AWS states for that condition — fixed, like the ones above.
@@ -365,6 +401,71 @@ pub fn vault_already_exists() -> AlreadyExistsException {
         message: Some(MESSAGE_VAULT_ALREADY_EXISTS.to_string()),
         ..Default::default()
     }
+}
+
+/// The modelled refusal for a backup plan id (or a version of it) this account
+/// does not hold.
+pub fn backup_plan_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(MESSAGE_BACKUP_PLAN_NOT_FOUND.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a create naming a plan that already exists.
+///
+/// `Arn` and `CreatorRequestId` are left UNSET for the reason given on
+/// [`vault_already_exists`].
+pub fn plan_already_exists() -> AlreadyExistsException {
+    AlreadyExistsException {
+        message: Some(MESSAGE_PLAN_ALREADY_EXISTS.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a backup window outside the span the model
+/// documents for it, or `None` when the caller's value is one it admits
+/// (including an absent one).
+///
+/// ONE check for every window this service takes — a backup job's own windows
+/// and the windows of a backup plan's rules — so the two cannot drift in bounds
+/// or in wording. `minimum` is the member's own documented floor
+/// ([`MIN_START_WINDOW_MINUTES`] for a start window); the ceiling is
+/// [`MAX_WINDOW_MINUTES`], which the model documents for both.
+pub fn rejected_window_minutes(
+    member: &str,
+    minutes: Option<i64>,
+    minimum: i64,
+) -> Option<InvalidParameterValueException> {
+    let value = minutes?;
+    if (minimum..=MAX_WINDOW_MINUTES).contains(&value) {
+        return None;
+    }
+    Some(InvalidParameterValueException {
+        message: Some(format!(
+            "{member} must be between {minimum} and {MAX_WINDOW_MINUTES} minutes"
+        )),
+        ..Default::default()
+    })
+}
+
+/// The modelled refusal for a member the model types as `ARN` with no pattern
+/// whose value is not one, or `None` when it is.
+///
+/// ONE check and ONE sentence for every such member in this service, for the
+/// reason given on [`rejected_window_minutes`]; see [`is_arn`] for what being
+/// one means.
+pub fn rejected_arn(member: &str, value: &str) -> Option<InvalidParameterValueException> {
+    if is_arn(value) {
+        return None;
+    }
+    Some(InvalidParameterValueException {
+        message: Some(format!(
+            "{member} must be an ARN of the form \
+             arn:<partition>:<service>:<region>:<account>:<resource>"
+        )),
+        ..Default::default()
+    })
 }
 
 /// The modelled refusal for a `MaxResults` outside
@@ -705,6 +806,85 @@ pub struct IdempotencyRecord {
     pub recorded_at: SystemTime,
 }
 
+/// A backup plan as `CreateBackupPlan` stored it: the plan body the caller gave,
+/// plus the identifiers this service minted for it.
+///
+/// A plan is identified by the ID this service mints, never by its body, so the
+/// body is kept verbatim (with a `RuleId` added to each rule, which only the
+/// service can mint) and every read projects it through
+/// [`Self::backup_plan`] \u2014 one projection, so two readers of a plan can never
+/// report two different bodies.
+#[derive(Debug, Clone)]
+pub struct BackupPlanRecord {
+    pub plan_id: String,
+    pub arn: String,
+    /// The id of the version of the plan this record holds. A plan has exactly
+    /// one version until an update makes another: "Unique, randomly generated,
+    /// Unicode, UTF-8 encoded strings that are at most 1,024 bytes long. They
+    /// cannot be edited" (model doc for `VersionId`).
+    pub version_id: String,
+    pub name: String,
+    /// The plan's rules in the order the caller gave them, each carrying the
+    /// `RuleId` this service minted for it.
+    pub rules: Vec<BackupRule>,
+    pub advanced_backup_settings: Vec<AdvancedBackupSetting>,
+    pub scan_settings: Vec<ScanSetting>,
+    pub creator_request_id: Option<String>,
+    pub creation_date: SystemTime,
+    /// When the plan was deleted; `None` while the account still holds it.
+    pub deletion_date: Option<SystemTime>,
+    /// The last time one of this plan's rules ran. `None` until one does: this
+    /// emulator starts a backup job only when a caller asks for one, so nothing
+    /// has run a scheduled rule.
+    pub last_execution_date: Option<SystemTime>,
+    /// The tags `BackupPlanTags` assigned to the plan.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl BackupPlanRecord {
+    /// The plan body a read reports. The ONE place a stored plan's wire body is
+    /// computed.
+    pub fn backup_plan(&self) -> BackupPlan {
+        BackupPlan {
+            backup_plan_name: self.name.clone(),
+            rules: self.rules.clone(),
+            advanced_backup_settings: self.advanced_backup_settings_view(),
+            scan_settings: (!self.scan_settings.is_empty()).then(|| self.scan_settings.clone()),
+        }
+    }
+
+    /// `AdvancedBackupSettings` as a response reports it: "The list is populated
+    /// only if the advanced option is set for the backup plan" (model doc), so a
+    /// plan configured with none reports none rather than an empty list.
+    pub fn advanced_backup_settings_view(&self) -> Option<Vec<AdvancedBackupSetting>> {
+        (!self.advanced_backup_settings.is_empty()).then(|| self.advanced_backup_settings.clone())
+    }
+}
+
+/// One rule of a plan as it is STORED: the rule the caller configured, plus the
+/// `RuleId` this service minted for it ("RuleId: Uniquely identifies a rule that
+/// is used to schedule the backup of a selection of resources", a member only
+/// the service fills).
+pub fn stored_backup_rule(rule: BackupRuleInput, rule_id: String) -> BackupRule {
+    BackupRule {
+        rule_name: rule.rule_name,
+        target_backup_vault_name: rule.target_backup_vault_name,
+        target_logically_air_gapped_backup_vault_arn: rule
+            .target_logically_air_gapped_backup_vault_arn,
+        schedule_expression: rule.schedule_expression,
+        start_window_minutes: rule.start_window_minutes,
+        completion_window_minutes: rule.completion_window_minutes,
+        lifecycle: rule.lifecycle,
+        recovery_point_tags: rule.recovery_point_tags,
+        rule_id: Some(rule_id),
+        copy_actions: rule.copy_actions,
+        enable_continuous_backup: rule.enable_continuous_backup,
+        schedule_expression_timezone: rule.schedule_expression_timezone,
+        index_actions: rule.index_actions,
+        scan_actions: rule.scan_actions,
+    }
+}
+
 /// Per-service state for com-amazonaws-backup-cryocontrollerusermanager. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
@@ -718,6 +898,8 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     pub recovery_points_by_vault: BTreeMap<String, Vec<String>>,
     /// Backup jobs by `BackupJobId`. Bounded by [`MAX_BACKUP_JOBS`].
     pub backup_jobs: BTreeMap<String, BackupJob>,
+    /// Backup plans by `BackupPlanId`. Bounded by [`MAX_BACKUP_PLANS`].
+    pub backup_plans: BTreeMap<String, BackupPlanRecord>,
     /// `StartBackupJob`'s `IdempotencyToken` -> what it replays. Bounded by
     /// [`MAX_IDEMPOTENCY_TOKENS`] and [`IDEMPOTENCY_TOKEN_TTL`].
     pub idempotency_tokens: BTreeMap<String, IdempotencyRecord>,
@@ -754,6 +936,43 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
             ((seq >> 48) & 0xffff) as u16,
             seq & 0xffff_ffff_ffff,
         )
+    }
+
+    /// Resolve a backup plan for a read, by the id it is stored under and
+    /// optionally the version asked for.
+    ///
+    /// A plan id this account does not hold, or a `VersionId` that names no
+    /// version of the plan it does hold, is one condition: the resource asked
+    /// about is not there, so both answer the same modelled refusal and neither
+    /// tells the caller which half of the pair was wrong.
+    pub fn backup_plan(
+        &self,
+        plan_id: &str,
+        version_id: Option<&str>,
+    ) -> Result<&BackupPlanRecord, ResourceNotFoundException> {
+        self.backup_plans
+            .get(plan_id)
+            .filter(|plan| version_id.is_none_or(|version| version == plan.version_id))
+            .ok_or_else(backup_plan_not_found)
+    }
+
+    /// The plan a `CreatorRequestId` names, if this account holds one: "If the
+    /// request includes a CreatorRequestId that matches an existing backup plan,
+    /// that plan is returned" (model doc for the member), so a create that
+    /// repeats a token answers with the plan it already made rather than making
+    /// a second one.
+    pub fn backup_plan_by_creator_request_id(
+        &self,
+        creator_request_id: &str,
+    ) -> Option<&BackupPlanRecord> {
+        self.backup_plans
+            .values()
+            .find(|plan| plan.creator_request_id.as_deref() == Some(creator_request_id))
+    }
+
+    /// Whether this account already holds a backup plan of this name.
+    pub fn holds_backup_plan_named(&self, name: &str) -> bool {
+        self.backup_plans.values().any(|plan| plan.name == name)
     }
 
     /// Materialise the transition the clock has already made due, for ONE

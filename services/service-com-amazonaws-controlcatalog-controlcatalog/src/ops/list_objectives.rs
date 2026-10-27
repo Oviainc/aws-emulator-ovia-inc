@@ -83,19 +83,20 @@ const MAX_LIST_OBJECTIVES_RESULTS: i32 = 100;
 
 /// Project a stored objective into the modeled `ObjectiveSummary`, resolving its
 /// domain out of the same catalog ListDomains reports.
+///
+/// The domain summary is built by `crate::state::associated_parent_summary` — the one
+/// rule for every parent summary this service reports, shared with the summaries
+/// ListCommonControls carries, because reporting the ARN the child stores and the parent's
+/// name only when that ARN resolves belongs to the class and not to this member.
 fn objective_summary(
     objective: &crate::state::Objective,
     domains: &std::collections::BTreeMap<String, crate::state::Domain>,
 ) -> ObjectiveSummary {
-    let domain = domains.get(&objective.domain_arn);
     ObjectiveSummary {
         arn: objective.arn.clone(),
         name: objective.name.clone(),
         description: objective.description.clone(),
-        domain: AssociatedDomainSummary {
-            arn: Some(objective.domain_arn.clone()),
-            name: domain.map(|domain| domain.name.clone()),
-        },
+        domain: crate::state::associated_parent_summary(domains, &objective.domain_arn),
         create_time: ::aws_smithy_types::DateTime::from_secs(objective.create_time),
         last_update_time: ::aws_smithy_types::DateTime::from_secs(objective.last_update_time),
     }
