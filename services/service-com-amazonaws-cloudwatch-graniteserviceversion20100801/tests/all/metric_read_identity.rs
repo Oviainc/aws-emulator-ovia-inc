@@ -595,9 +595,12 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
             operation: "GetMetricStatistics",
             request: statistics_request(at, json!({"Statistics": ["p90"]})),
             code: "InvalidParameterValue",
-            // The value, and the request member path it arrived on as this service names one.
+            // The element's own request member path, down to the list's target shape, and the
+            // value set its enumerated type declares — the set, not the submitted value, is
+            // what locates the repair (`statistic_name_refusals`, which asserts the sentence
+            // over a table of names and positions).
             message: MessageCheck::Exact(
-                "The value p90 for parameter Statistics.member.1 is invalid.".to_string(),
+                crate::statistic_name_refusals::value_in_set_message(1),
             ),
         },
         RefusalRow {
@@ -606,7 +609,7 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
             request: statistics_request(at, json!({"Statistics": ["Sum", "Median"]})),
             code: "InvalidParameterValue",
             message: MessageCheck::Exact(
-                "The value Median for parameter Statistics.member.2 is invalid.".to_string(),
+                crate::statistic_name_refusals::value_in_set_message(2),
             ),
         },
         RefusalRow {
