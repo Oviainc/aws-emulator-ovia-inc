@@ -13,7 +13,8 @@ use std::time::SystemTime;
 use crate::ops::types::{
     AIAgentConfigurationData, AssistantAssociationData, AssistantAssociationInputData,
     AssistantAssociationOutputData, AssistantCapabilityConfiguration, AssistantData,
-    AssistantIntegrationConfiguration, AssistantSummary, ExternalBedrockKnowledgeBaseConfig,
+    AssistantIntegrationConfiguration, AssistantSummary, ContentData, ContentSummary,
+    ExternalBedrockKnowledgeBaseConfig,
     GroupingConfiguration, KnowledgeBaseAssociationData, KnowledgeBaseData, KnowledgeBaseSummary,
     OrchestratorConfigurationEntry,
     QuickResponseContentProvider, QuickResponseContents, QuickResponseData, QuickResponseSummary,
@@ -369,6 +370,75 @@ pub const MAX_CONTENT_UPLOADS: usize = 1_000;
 /// than stored.
 pub const MAX_CONTENT_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
 
+/// The `ContentStatus` a `CreateContent` answers with: the service takes the uploaded
+/// asset and ingests it, so the content is reported in progress by the very call that
+/// started that work (`smithy_query(query="shape",shape="ContentStatus")` declares
+/// `CREATE_IN_PROGRESS`, `CREATE_FAILED`, `ACTIVE`, `DELETE_IN_PROGRESS`,
+/// `DELETE_FAILED`, `DELETED` and `UPDATE_FAILED`).
+pub const CONTENT_STATUS_CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
+
+/// The terminal `ContentStatus` of an ingested content, and the one every read reports
+/// once [`CONTENT_ACTIVATION_DELAY`] has passed.
+pub const CONTENT_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// How long after the create a content's ingestion is due to finish.
+///
+/// CHOSEN, not documented: the create answers `CREATE_IN_PROGRESS`, so the move to
+/// `ACTIVE` is a transition the CLOCK owes, and this is the span this emulator owes it
+/// over. It is never zero — a caller that reads the content straight after creating it
+/// sees the transient status the service reported — and it is short enough that nothing
+/// has to wait on it for long.
+pub const CONTENT_ACTIVATION_DELAY: ::std::time::Duration =
+    ::std::time::Duration::from_millis(500);
+
+/// The most contents one knowledge base holds at once.
+///
+/// A content stays until something deletes it or its knowledge base goes, so the
+/// ceiling is the bound on that growth: it is a resource guard this emulator owns, NOT
+/// an AWS-published quota, and a create past it is refused with the error the model
+/// declares for exactly this on `CreateContent`, a 402 `ServiceQuotaExceededException`.
+pub const MAX_CONTENTS_PER_KNOWLEDGE_BASE: usize = 1_000;
+
+/// The most asset bytes this store holds across EVERY content, so the
+/// contents x bytes-per-content PRODUCT is finite and not just each factor: a content's
+/// asset lives in this process's heap until the content goes, and each one may carry up
+/// to [`MAX_CONTENT_UPLOAD_BYTES`]. Refused the same way as
+/// [`MAX_CONTENTS_PER_KNOWLEDGE_BASE`].
+pub const MAX_STORED_CONTENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// The sentence a `CreateContent` past either content ceiling is refused with. It states
+/// what the caller can DO about it and names no figure of the store, which is this
+/// emulator's own rather than an AWS-published quota.
+pub fn message_content_store_full() -> String {
+    "This endpoint holds as many contents as its store keeps. Delete a content before \
+     creating another."
+        .to_string()
+}
+
+/// The fixed text for a request addressed to a content its knowledge base does not
+/// hold. See [`MESSAGE_ASSISTANT_NOT_FOUND`].
+pub const MESSAGE_CONTENT_NOT_FOUND: &str = "Content does not exist.";
+
+/// The sentence a `NotifyRecommendationsReceived` entry carries for a
+/// `recommendationId` the session's feed does not hold.
+///
+/// It is a PER-ENTRY error inside a successful answer, not a refusal: the call reports
+/// which of the ids it was given it could not acknowledge, and names the id in the
+/// entry's own `recommendationId` member rather than in this sentence.
+pub const MESSAGE_RECOMMENDATION_NOT_AVAILABLE: &str =
+    "The recommendation is not an available recommendation of this session.";
+
+/// The fixed text of the modelled `ValidationException` a `CreateContent` naming an
+/// `uploadId` this service never issued (or one already consumed, or one whose URL has
+/// expired) is refused with — the sentence the recorded answer of this endpoint carries
+/// for that class.
+pub const MESSAGE_INVALID_UPLOAD_ID: &str = "Invalid uploadId";
+
+/// The fixed text the recorded `UntagResource` answer carries for a `resourceArn` that
+/// names no resource of this account. See [`crate::scaffolded::NOT_FOUND_CODE`] for why
+/// that answer's error code is not the modelled shape name.
+pub const MESSAGE_UNTAG_RESOURCE_NOT_FOUND: &str = "Resource was not found";
+
 /// The header an upload's `PUT` carries the `contentType` the upload was started for
 /// under: an upload URL is minted for ONE media type, exactly as an S3 presigned `PUT`
 /// signed over a content type is.
@@ -466,6 +536,20 @@ pub fn session_arn(region: &str, assistant_id: &str, session_id: &str) -> String
         ARN_NAMESPACE,
         region,
         &format!("session/{assistant_id}/{session_id}"),
+    )
+}
+
+/// This service's ARN for a content, which names its parent knowledge base too:
+/// `arn:aws:wisdom:<region>:<account>:content/<knowledgeBaseId>/<contentId>`.
+///
+/// The same two-id-segment form [`assistant_association_arn`] uses, for the same
+/// reason: it is what the modelled `Arn` pattern admits for a nested resource, and what
+/// [`resolve_id`] reads the content's own id back out of.
+pub fn content_arn(region: &str, knowledge_base_id: &str, content_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("content/{knowledge_base_id}/{content_id}"),
     )
 }
 
@@ -664,7 +748,7 @@ pub struct RecommendationFeed {
 /// beside them.
 ///
 /// A recommendation stays available until something acknowledges it
-/// (`NotifyRecommendationsReceived`, still a scaffold stub with its own issue), so an
+/// ([`RecommendationFeed::acknowledge`], which `NotifyRecommendationsReceived` is), so an
 /// unbounded feed would let a session nobody acknowledges grow this process's heap
 /// without limit: the cap is the bound on that growth. It is a resource guard this
 /// emulator owns, NOT an AWS-published quota, and it equals the largest page
@@ -705,9 +789,47 @@ impl RecommendationFeed {
         }
     }
 
-    /// The page of at most `max_results` available recommendations, oldest first, and the
-    /// triggers that produced the recommendations IN that page.
+    /// Acknowledge receipt of `recommendation_ids`: every id this feed holds is REMOVED
+    /// from it — which is what the acknowledgement does, in the operation's own words
+    /// ("Removes the specified recommendations from the specified assistant's queue of
+    /// newly available recommendations") — and answered in the first list, while an id
+    /// the feed does not hold is answered in the second.
     ///
+    /// A trigger no held recommendation names any more is forgotten with them, the way
+    /// [`Self::publish`] drops one. An id named twice in one call is acknowledged once:
+    /// the second mention names a recommendation the feed no longer holds.
+    pub fn acknowledge(&mut self, recommendation_ids: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut received = Vec::new();
+        let mut unknown = Vec::new();
+        for id in recommendation_ids {
+            let held = self
+                .recommendations
+                .iter()
+                .any(|recommendation| recommendation.recommendation_id == *id);
+            if held {
+                self.recommendations
+                    .retain(|recommendation| recommendation.recommendation_id != *id);
+                received.push(id.clone());
+            } else {
+                unknown.push(id.clone());
+            }
+        }
+        let still_held: HashSet<String> = self
+            .recommendations
+            .iter()
+            .map(|recommendation| recommendation.recommendation_id.clone())
+            .collect();
+        self.triggers.retain(|trigger| {
+            trigger
+                .recommendation_ids
+                .iter()
+                .any(|id| still_held.contains(id))
+        });
+        (received, unknown)
+    }
+
+    /// The page of at most `max_results` available recommendations, oldest first, and the
+    /// triggers that produced the recommendations IN that page.    ///
     /// `recommendation_type` is the modelled `recommendationType` filter — "the type of
     /// recommendation being requested" — so a call that names one is served only the
     /// recommendations of that `RecommendationType`.
@@ -1192,11 +1314,6 @@ pub struct AssistantAssociation {
     pub association_type: String,
     pub target: AssociationTarget,
     pub tags: HashMap<String, String>,
-    /// The fingerprint of the create that minted this record — see
-    /// [`association_fingerprint`]. What a replayed `@idempotencyToken` is compared
-    /// against, so a token reused with different parameters is told it conflicts instead
-    /// of being handed a resource it did not ask for.
-    pub fingerprint: String,
     /// When the create that minted this record ran, as every other record here keeps it.
     /// `AssistantAssociationData` models no creation-time member, so nothing reports it.
     pub created_at: SystemTime,
@@ -1218,35 +1335,73 @@ impl AssistantAssociation {
     }
 }
 
-/// The fingerprint of a `CreateAssistantAssociation` request: what its
-/// `@idempotencyToken` identifies.
+/// A stable fingerprint of the request members a create's `@idempotencyToken`
+/// identifies.
 ///
 /// An idempotency token identifies ONE request, so a replay carrying the identical
 /// request is a retry and answers with the resource the first call created, while the
 /// same token carrying a DIFFERENT request is an idempotency conflict and is refused.
-/// The fingerprint therefore covers every member the created record is made of — the
-/// association type, the association target ([`input_target_key`]) and the tags — and
-/// nothing else; the tag pairs are sorted, so the same request written in another order
-/// is one request.
-pub fn association_fingerprint(
-    association_type: &str,
-    target: &str,
-    tags: &HashMap<String, String>,
-) -> String {
-    let mut pairs: Vec<String> = tags.iter().map(|(key, tag)| format!("{key}={tag}")).collect();
-    pairs.sort();
-    format!(
-        "{association_type}\u{1f}{target}\u{1f}{}",
-        pairs.join("\u{1e}")
-    )
+/// The fingerprint is what tells those two apart, so a create fingerprints every member
+/// the record it inserts is made of and nothing else — never the token itself, which both
+/// requests share.
+///
+/// Every part is length-prefixed, so no value can run into its neighbour and leave the
+/// fingerprint unchanged (`["a", "bc"]` and `["ab", "c"]` differ), and an optional member
+/// the request omitted goes in as an empty part rather than being left out, so "absent"
+/// and "present but empty" are different requests.
+pub fn request_fingerprint<S: AsRef<str>>(parts: &[S]) -> String {
+    let mut rendered = String::new();
+    for part in parts {
+        let part = part.as_ref();
+        rendered.push_str(&part.len().to_string());
+        rendered.push('\u{1f}');
+        rendered.push_str(part);
+        rendered.push('\u{1e}');
+    }
+    rendered
+}
+
+/// A tag map as ONE part of a [`request_fingerprint`]: the pairs in key order, so the
+/// same tag set written in another order is one request.
+pub fn tags_fingerprint(tags: &HashMap<String, String>) -> String {
+    let mut pairs: Vec<(&str, &str)> = tags
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    pairs.sort_unstable();
+    let flattened: Vec<&str> = pairs.into_iter().flat_map(|(key, value)| [key, value]).collect();
+    request_fingerprint(&flattened)
+}
+
+/// What a `clientToken` a create used names: the resource that call created, and the
+/// [`request_fingerprint`] of the request it created it from.
+#[derive(Debug, Clone)]
+pub struct IdempotentCreate {
+    /// The id of the resource the first call carrying this token created.
+    pub resource_id: String,
+    /// The fingerprint of that call's idempotency-relevant members.
+    pub fingerprint: String,
+}
+
+/// What a create's `@idempotencyToken` says about THIS request — see
+/// [`ComAmazonawsQconnectWisdomserviceState::replayed_create`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replay {
+    /// No create has used this token (or the request carries none): mint a resource.
+    Fresh,
+    /// The same token AND the same request: a retry, answered with the resource the
+    /// first call created.
+    Retry(String),
+    /// The same token carrying a DIFFERENT request: an idempotency conflict.
+    Conflict,
 }
 
 /// What the association target a request names comes down to: the member of the
 /// `AssistantAssociationInputData` union it carries, and the values that identify the
 /// resource under it.
 ///
-/// Taken from the REQUEST, so [`association_fingerprint`] can be computed before the
-/// target is resolved: a retry whose token is known is answered out of the record the
+/// Taken from the REQUEST, so the create's [`request_fingerprint`] can be computed before
+/// the target is resolved: a retry whose token is known is answered out of the record the
 /// first call made even when the resource it named has since been deleted.
 pub fn input_target_key(association: &AssistantAssociationInputData) -> String {
     match association {
@@ -1311,6 +1466,164 @@ impl ContentUpload {
         self.headers_to_include
             .iter()
             .all(|(name, value)| sent(name).as_deref() == Some(value.as_str()))
+    }
+}
+
+/// What a request to a published content-asset URL names: the knowledge-base label and
+/// the content id, as [`content_asset_path`] words them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentAssetTarget {
+    pub knowledge_base_label: String,
+    pub content_id: String,
+}
+
+/// The path the asset plane serves one content's bytes under.
+///
+/// It sits under the content it belongs to, one segment deeper than the modelled read of
+/// that content (`GET /knowledgeBases/{knowledgeBaseId}/contents/{contentId}`), so it
+/// names no modelled operation and the service serves it from its routing-error seam the
+/// way [`content_upload_path`] is served.
+pub fn content_asset_path(knowledge_base_id: &str, content_id: &str) -> String {
+    format!("/knowledgeBases/{knowledge_base_id}/contents/{content_id}/asset")
+}
+
+/// The content a request path names, or `None` when the path is not one this service
+/// publishes.
+pub fn parse_content_asset_path(path: &str) -> Option<ContentAssetTarget> {
+    let rest = path.strip_prefix("/knowledgeBases/")?;
+    let mut segments = rest.split('/');
+    let (
+        Some(knowledge_base_label),
+        Some("contents"),
+        Some(content_id),
+        Some("asset"),
+        None,
+    ) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    )
+    else {
+        return None;
+    };
+    if knowledge_base_label.is_empty() || content_id.is_empty() {
+        return None;
+    }
+    Some(ContentAssetTarget {
+        knowledge_base_label: knowledge_base_label.to_string(),
+        content_id: content_id.to_string(),
+    })
+}
+
+/// The URL a content's asset is read from: the endpoint the caller reached, plus the
+/// content's own asset path.
+///
+/// NO SigV4 signature is attached, for the reason [`content_upload_url`] states: the
+/// content id is the receipt that names the asset, and the URL stops being usable at the
+/// `urlExpiry` the same record carries.
+pub fn content_asset_url(host: &str, knowledge_base_id: &str, content_id: &str) -> String {
+    format!(
+        "https://{host}{}",
+        content_asset_path(knowledge_base_id, content_id)
+    )
+}
+
+/// One content of a knowledge base, as this emulator persists it.
+///
+/// `CreateContent` finalizes the asset a `StartContentUpload` URL received into one of
+/// these, and every later read of that content — `GetContent`, and the `contentArn` a
+/// tagging call addresses — is answered out of this one record.
+#[derive(Debug, Clone)]
+pub struct Content {
+    pub content_id: String,
+    pub content_arn: String,
+    /// The `knowledgeBaseId` this content lives in — the resolved id, never the label
+    /// form the request used.
+    pub knowledge_base_id: String,
+    pub knowledge_base_arn: String,
+    pub name: String,
+    /// `ContentData$title`, which the model requires: the title the create gave, or the
+    /// content's own name when it gave none.
+    pub title: String,
+    /// `ContentData$revisionId`: which revision of this content a read is of. It changes
+    /// when the content's asset does, which is what makes it a revision rather than a
+    /// second name for the content id.
+    pub revision_id: String,
+    /// The media type the upload this content was created from was started for, so the
+    /// content reports the type its asset actually is.
+    pub content_type: String,
+    pub metadata: HashMap<String, String>,
+    pub tags: HashMap<String, String>,
+    pub link_out_uri: Option<String>,
+    /// The URL the asset is read from, kept so the record and the locator cannot drift.
+    pub url: String,
+    /// When that URL stops being usable — a read of the asset at or after it is refused.
+    pub url_expiry: SystemTime,
+    /// The asset bytes, as the upload plane received them.
+    pub body: Vec<u8>,
+    pub created_at: SystemTime,
+    /// When the ingestion this create started is due to finish, after which every read
+    /// reports the content ACTIVE. See [`CONTENT_ACTIVATION_DELAY`].
+    pub active_at: SystemTime,
+}
+
+impl Content {
+    /// The `ContentStatus` this content carries at `now`: the ingestion the create
+    /// started is in progress until the clock reaches [`Self::active_at`], and the
+    /// content is `ACTIVE` from then on. Computed rather than stored, so nothing has to
+    /// be written for the transition the clock already made due.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.active_at {
+            CONTENT_STATUS_CREATE_IN_PROGRESS
+        } else {
+            CONTENT_STATUS_ACTIVE
+        }
+    }
+
+    /// Whether this content's asset URL is no longer usable at `now`.
+    pub fn has_expired_url(&self, now: SystemTime) -> bool {
+        now >= self.url_expiry
+    }
+
+    /// This content as the `ContentSummary` shape `ListContents` and `SearchContent`
+    /// report, which is `ContentData` without the asset locator: the summary names the
+    /// content, not a URL to download it.
+    pub fn to_summary(&self, now: SystemTime) -> ContentSummary {
+        ContentSummary {
+            content_arn: self.content_arn.clone(),
+            content_id: self.content_id.clone(),
+            knowledge_base_arn: self.knowledge_base_arn.clone(),
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            name: self.name.clone(),
+            revision_id: self.revision_id.clone(),
+            title: self.title.clone(),
+            content_type: self.content_type.clone(),
+            status: self.status(now).to_string(),
+            metadata: self.metadata.clone(),
+            tags: tags_out(&self.tags),
+        }
+    }
+
+    /// This content as the `ContentData` shape `CreateContent` and `GetContent` return.
+    pub fn to_content_data(&self, now: SystemTime) -> ContentData {
+        ContentData {
+            content_arn: self.content_arn.clone(),
+            content_id: self.content_id.clone(),
+            knowledge_base_arn: self.knowledge_base_arn.clone(),
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            name: self.name.clone(),
+            revision_id: self.revision_id.clone(),
+            title: self.title.clone(),
+            content_type: self.content_type.clone(),
+            status: self.status(now).to_string(),
+            metadata: self.metadata.clone(),
+            tags: tags_out(&self.tags),
+            link_out_uri: self.link_out_uri.clone(),
+            url: self.url.clone(),
+            url_expiry: ::aws_smithy_types::DateTime::from(self.url_expiry),
+        }
     }
 }
 
@@ -1414,11 +1727,12 @@ pub struct ComAmazonawsQconnectWisdomserviceState {
     /// `name` -> `assistantId`: an assistant's name identifies it, so a second create
     /// under a live name is the conflict `ConflictException` describes.
     pub assistant_name_index: HashMap<String, String>,
-    /// `clientToken` -> the id of the resource that token created, so a replayed
-    /// `@idempotencyToken` answers with the resource it already made instead of
-    /// creating a second one. Keyed through [`idempotency_key`], so one token used on
-    /// two different creates does not collide.
-    pub idempotency: HashMap<String, String>,
+    /// `clientToken` -> what that token created and the request it created it from, so a
+    /// replayed `@idempotencyToken` answers with the resource it already made instead of
+    /// creating a second one, and the same token carrying a DIFFERENT request is refused
+    /// as the conflict it is. Keyed through [`idempotency_key`], so one token used on
+    /// two different creates does not collide. See [`Self::replayed_create`].
+    pub idempotency: HashMap<String, IdempotentCreate>,
     /// The id mint's sequence: every mint takes the next number, so no two minted ids
     /// can be the same candidate.
     next_id_seq: u64,
@@ -1427,6 +1741,10 @@ pub struct ComAmazonawsQconnectWisdomserviceState {
     /// [`MAX_CONTENT_UPLOAD_BYTES`] bytes. An entry is reclaimed once its URL expires
     /// or its knowledge base is deleted.
     pub content_uploads: HashMap<String, ContentUpload>,
+    /// Every content `CreateContent` finalized, keyed by its `contentId`. Each record
+    /// names the knowledge base it lives in, so a lookup is always scoped to the parent
+    /// the route named.
+    pub contents: HashMap<String, Content>,
 }
 
 impl ComAmazonawsQconnectWisdomserviceState {
@@ -1457,6 +1775,109 @@ impl ComAmazonawsQconnectWisdomserviceState {
         (0..MINT_ATTEMPTS as u64)
             .map(|attempt| mint_candidate(seq, attempt))
             .find(|candidate| !self.content_uploads.contains_key(candidate))
+    }
+
+    /// A `contentId` no stored content holds, or `None` when [`MINT_ATTEMPTS`]
+    /// candidates of this sequence number's block were all taken.
+    pub fn mint_content_id(&mut self) -> Option<String> {
+        let seq = self.next_seq();
+        (0..MINT_ATTEMPTS as u64)
+            .map(|attempt| mint_candidate(seq, attempt))
+            .find(|candidate| !self.contents.contains_key(candidate))
+    }
+
+    /// What a create's `clientToken` says about a request whose idempotency-relevant
+    /// members fingerprint to `fingerprint`.
+    ///
+    /// THE ONE PLACE this service decides retry-or-conflict, so every `@idempotencyToken`
+    /// create of this service decides it the same way: an idempotency token identifies
+    /// ONE request, so the same token carrying the same request is a retry
+    /// ([`Replay::Retry`]) while the same token carrying a different one is an
+    /// idempotency conflict ([`Replay::Conflict`]). `scope` is the call the token was
+    /// given to — and, for a nested resource, its parent — so the same token handed to
+    /// two different creates is two different tokens here.
+    ///
+    /// A token whose resource has since been deleted has its entry dropped by the delete,
+    /// so it replays as [`Replay::Fresh`].
+    pub fn replayed_create(
+        &self,
+        scope: &str,
+        client_token: Option<&str>,
+        fingerprint: &str,
+    ) -> Replay {
+        let Some(token) = client_token else {
+            return Replay::Fresh;
+        };
+        match self.idempotency.get(&idempotency_key(scope, token)) {
+            None => Replay::Fresh,
+            Some(known) if known.fingerprint == fingerprint => {
+                Replay::Retry(known.resource_id.clone())
+            }
+            Some(_) => Replay::Conflict,
+        }
+    }
+
+    /// Remember which resource this create made, and the request it made it from, so a
+    /// later call carrying the same token is answered by [`Self::replayed_create`].
+    pub fn remember_create(
+        &mut self,
+        scope: &str,
+        client_token: Option<&str>,
+        fingerprint: &str,
+        resource_id: &str,
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        self.idempotency.insert(
+            idempotency_key(scope, token),
+            IdempotentCreate {
+                resource_id: resource_id.to_string(),
+                fingerprint: fingerprint.to_string(),
+            },
+        );
+    }
+
+    /// The content a (resolved `knowledgeBaseId`, `UuidOrArn` label) pair names, or
+    /// `None` when that knowledge base holds none under that label — including a content
+    /// of ANOTHER knowledge base, which this one does not hold.
+    pub fn content(&self, knowledge_base_id: &str, label: &str) -> Option<&Content> {
+        self.contents
+            .get(resolve_id(label))
+            .filter(|content| content.knowledge_base_id == knowledge_base_id)
+    }
+
+    /// Every content of one knowledge base, in `contentId` order, so what a read reports
+    /// does not depend on map iteration order.
+    pub fn contents_of(&self, knowledge_base_id: &str) -> Vec<&Content> {
+        let mut contents: Vec<&Content> = self
+            .contents
+            .values()
+            .filter(|content| content.knowledge_base_id == knowledge_base_id)
+            .collect();
+        contents.sort_by(|left, right| left.content_id.cmp(&right.content_id));
+        contents
+    }
+
+    /// Persist a finalized content under the knowledge base it names. `false` — nothing
+    /// stored — when that knowledge base already holds
+    /// [`MAX_CONTENTS_PER_KNOWLEDGE_BASE`], or when the store already holds
+    /// [`MAX_STORED_CONTENT_BYTES`] of assets, so both bounds hold however the caller
+    /// reaches this.
+    pub fn insert_content(&mut self, content: Content) -> bool {
+        if self.contents_of(&content.knowledge_base_id).len() >= MAX_CONTENTS_PER_KNOWLEDGE_BASE {
+            return false;
+        }
+        let stored_bytes: usize = self
+            .contents
+            .values()
+            .map(|content| content.body.len())
+            .sum();
+        if stored_bytes.saturating_add(content.body.len()) > MAX_STORED_CONTENT_BYTES {
+            return false;
+        }
+        self.contents.insert(content.content_id.clone(), content);
+        true
     }
 
     /// The upload an `uploadId` names, whatever its state.
@@ -1572,9 +1993,10 @@ impl ComAmazonawsQconnectWisdomserviceState {
     /// `UntagResource` take an `Arn` rather than one family's path label
     /// (`smithy_query(query="operation",operation="ListTagsForResource")`), so the lookup
     /// covers EVERY family this store holds a tag map for — assistants, knowledge bases,
-    /// sessions, assistant associations and quick responses — and reads the tags off that
-    /// one stored record. Nothing is copied into a second place: a tag a create persisted on its
-    /// resource is the tag reported here, and a resource a delete removed holds none.
+    /// contents, sessions, assistant associations and quick responses — and reads the tags
+    /// off that one stored record. Nothing is copied into a second place: a tag a create
+    /// persisted on its resource is the tag reported here, and a resource a delete removed
+    /// holds none.
     ///
     /// The ARN is matched against the one the record itself carries, not merely against
     /// the id [`resolve_id`] reads out of it, so an ARN that pairs a stored id with
@@ -1603,6 +2025,13 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .filter(|association| association.assistant_association_arn == resource_arn)
         {
             return Some(&association.tags);
+        }
+        if let Some(content) = self
+            .contents
+            .get(id)
+            .filter(|content| content.content_arn == resource_arn)
+        {
+            return Some(&content.tags);
         }
         if let Some(quick_response) = self
             .quick_responses
@@ -1667,6 +2096,13 @@ impl ComAmazonawsQconnectWisdomserviceState {
                 .map(|association| &mut association.tags);
         }
         if self
+            .contents
+            .get(&id)
+            .is_some_and(|content| content.content_arn == resource_arn)
+        {
+            return self.contents.get_mut(&id).map(|content| &mut content.tags);
+        }
+        if self
             .quick_responses
             .get(&id)
             .is_some_and(|quick_response| quick_response.quick_response_arn == resource_arn)
@@ -1715,6 +2151,18 @@ impl ComAmazonawsQconnectWisdomserviceState {
     pub fn remove_knowledge_base(&mut self, label: &str) -> Option<KnowledgeBase> {
         let knowledge_base = self.knowledge_bases.remove(resolve_id(label))?;
         self.knowledge_base_name_index.remove(&knowledge_base.name);
+        // A content exists only inside its knowledge base, so it goes with it — and the
+        // `clientToken` entries that created either are dropped below, since a token
+        // whose resource is gone must not resurrect it on a replay.
+        let contents: Vec<String> = self
+            .contents
+            .values()
+            .filter(|content| content.knowledge_base_id == knowledge_base.knowledge_base_id)
+            .map(|content| content.content_id.clone())
+            .collect();
+        for content_id in &contents {
+            self.contents.remove(content_id);
+        }
         // A quick response lives INSIDE the knowledge base it was created under, so a
         // knowledge base that is gone takes its quick responses with it: a later read of
         // one names nothing, and the name and shortcut key it held are released.
@@ -1730,8 +2178,9 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .idempotency
             .iter()
             .filter(|(_, created)| {
-                *created == &knowledge_base.knowledge_base_id
-                    || orphaned.contains(*created)
+                created.resource_id == knowledge_base.knowledge_base_id
+                    || contents.contains(&created.resource_id)
+                    || orphaned.contains(&created.resource_id)
             })
             .map(|(token, _)| token.clone())
             .collect();
@@ -1866,9 +2315,9 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .idempotency
             .iter()
             .filter(|(_, created)| {
-                *created == &assistant.assistant_id
-                    || assistant.sessions.contains_key(created.as_str())
-                    || associations.contains(*created)
+                created.resource_id == assistant.assistant_id
+                    || assistant.sessions.contains_key(created.resource_id.as_str())
+                    || associations.contains(&created.resource_id)
             })
             .map(|(token, _)| token.clone())
             .collect();
@@ -1961,7 +2410,7 @@ impl ComAmazonawsQconnectWisdomserviceState {
         let gone: Vec<String> = self
             .idempotency
             .iter()
-            .filter(|(_, created)| *created == &id)
+            .filter(|(_, created)| created.resource_id == id)
             .map(|(token, _)| token.clone())
             .collect();
         for token in gone {
