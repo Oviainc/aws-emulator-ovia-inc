@@ -6,7 +6,11 @@
 //! resolves the `SiteId` against this service's store,
 //! mints an `OutpostId` / `OutpostArn`, persists the Outpost against that site and
 //! answers the stored record. `GetOutpost`, `ListOutposts` and `DeleteOutpost` read
-//! that same store, and `DeleteSite` refuses a site this still references.
+//! that same store, and `DeleteSite` refuses a site this still references. The
+//! Outpost is created with no hardware and in the non-terminal
+//! [`crate::state::LIFE_CYCLE_STATUS_PENDING`], which it holds until an order placed
+//! on it (`CreateOrder`) has delivered hardware and that hardware has been installed
+//! ([`crate::state::order_progression`]).
 //!
 //! ## Shape of an operation
 //!
@@ -262,9 +266,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             site_id: Some(site_id),
             name: Some(input.name),
             description: input.description,
-            // A just-created Outpost is still being provisioned, so it reports the
-            // pending status until the transition the clock owes falls due; every
-            // read materialises it through `settle_outposts`.
+            // A just-created Outpost has no hardware on it and nothing on the way:
+            // it reports the pending status until hardware ordered for it is
+            // installed, which is the transition `settle_orders` makes due.
             life_cycle_status: Some(crate::state::LIFE_CYCLE_STATUS_PENDING.to_string()),
             availability_zone,
             availability_zone_id,
@@ -293,7 +297,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // (`CreatePrivateConnectivityConfig`), so a just-created Outpost
                 // has none and `GetPrivateConnectivityConfig` reports none.
                 private_connectivity: None,
-                active_at: Some(std::time::Instant::now() + crate::state::OUTPOST_PROVISIONING),
+                // Nothing in this API installs hardware on request, and creating the
+                // Outpost orders none: the install that takes it out of the pending
+                // status is owed by the fulfilment of an order placed on it
+                // (`CreateOrder`), so this call leaves none owed.
+                active_at: None,
                 // A just-created Outpost is one nobody has asked to decommission;
                 // `StartOutpostDecommission` is what records that request.
                 decommission_requested_at: None,

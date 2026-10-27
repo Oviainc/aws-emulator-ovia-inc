@@ -25,6 +25,8 @@ mod archive_replay;
 mod connection_authorization;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/connection_refusal_wording.rs"]
+mod connection_refusal_wording;
 #[path = "all/dead_letter_error_code.rs"]
 mod dead_letter_error_code;
 #[path = "all/entry_level_semantics.rs"]

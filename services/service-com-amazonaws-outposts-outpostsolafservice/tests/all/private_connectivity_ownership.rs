@@ -22,7 +22,7 @@
 
 use serde_json::{json, Value};
 
-use crate::site_and_outpost_lifecycle::{segment, settle, text, Outposts};
+use crate::site_and_outpost_lifecycle::{install_hardware, segment, text, Outposts};
 
 /// The route both operations are bound to:
 /// `(GET|POST) /outposts/{OutpostId}/privateConnectivity`, from
@@ -31,8 +31,8 @@ fn route(outpost_id: &str) -> String {
     format!("/outposts/{outpost_id}/privateConnectivity")
 }
 
-/// The `LifeCycleStatus` an Outpost settles in once its provisioning transition has
-/// fallen due, as [`crate::site_and_outpost_projection`] states it.
+/// The `LifeCycleStatus` an Outpost settles in once the hardware ordered for it has
+/// been installed, as [`crate::site_and_outpost_projection`] states it.
 const LIFE_CYCLE_ACTIVE: &str = "ACTIVE";
 
 /// A `CreatePrivateConnectivityConfig` payload naming one VPC and one subnet. The
@@ -59,8 +59,8 @@ fn config_of(output: &Value) -> Value {
 
 /// One change made to an Outpost BETWEEN configuring its private connectivity and
 /// reading that configuration back. Each variant is a call the API models against the
-/// Outpost (or, for [`Change::Settle`], the passage of time the service itself owes
-/// it) that says nothing about private connectivity.
+/// Outpost (or, for [`Change::Settle`], the install the service owes it once hardware
+/// has been ordered) that says nothing about private connectivity.
 #[derive(Debug)]
 enum Change {
     /// Nothing at all: the baseline row.
@@ -75,7 +75,8 @@ enum Change {
     HardwareType(&'static str),
     /// `TagResource` on the Outpost's ARN.
     Tag(&'static str, &'static str),
-    /// Waiting past the Outpost's clock-owed `PENDING` -> `ACTIVE` transition.
+    /// Hardware ordered for the Outpost and installed on it, which is what takes it
+    /// from `PENDING` to `ACTIVE`.
     Settle,
 }
 
@@ -147,7 +148,7 @@ impl Change {
                 );
             }
             Change::Settle => {
-                settle();
+                install_hardware(outposts, outpost_id).await;
                 let outpost = outposts.get_outpost(outpost_id).await;
                 let status = text(&outpost, "LifeCycleStatus");
                 assert_eq!(

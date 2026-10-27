@@ -383,6 +383,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.put_billing_group(updated.clone());
         }
 
+        // `Size` — "the number of accounts in the particular billing group" — is not
+        // held on the record: the membership a billing period reports is kept per period
+        // on the account memberships themselves, so the count comes from the same state
+        // method every other reader of a group answers with
+        // (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::billing_group_sizes_in`,
+        // which `ListBillingGroups` uses). A membership is in force from the period it
+        // was made in onward, so the count this write reports is the one for the period
+        // the call is made in, and a group nothing is a member of then counts 0.
+        let size = state
+            .billing_group_sizes_in(
+                ::std::slice::from_ref(&group_arn),
+                &crate::state::current_billing_period(),
+            )
+            .get(&group_arn)
+            .copied()
+            .unwrap_or_default();
+
         // The audit record for a state-changing call: who asked, what changed and that
         // it succeeded. Never a `@sensitive` member (the group's name and description) —
         // only the access key id the caller presented and the ARN it addressed.
@@ -393,21 +410,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             outcome = if changed { "updated" } else { "unchanged" },
             "billing group update served"
         );
-        Ok(render(&updated))
+        Ok(render(&updated, size))
     }
 }
 
-/// The stored group as this operation reports it. `Size`, `Status` and `StatusReason`
-/// are derived from the record by the same methods every other reader of a group uses
-/// (`ListBillingGroups`), so the two views cannot drift.
-fn render(group: &crate::state::BillingGroupRecord) -> UpdateBillingGroupOutput {
+/// The stored group as this operation reports it. `Status` and `StatusReason` are derived
+/// from the record by the same methods every other reader of a group uses
+/// (`ListBillingGroups`), and `Size` is passed in because it is derived from the account
+/// membership index rather than held on the record — by the one method that listing reads
+/// it through too, so the two views cannot drift.
+fn render(group: &crate::state::BillingGroupRecord, size: i64) -> UpdateBillingGroupOutput {
     UpdateBillingGroupOutput {
         arn: Some(group.arn.clone()),
         name: Some(group.name.clone()),
         description: group.description.clone(),
         primary_account_id: group.primary_account_id.clone(),
         pricing_plan_arn: Some(group.pricing_plan_arn.clone()),
-        size: group.size(),
+        size,
         last_modified_time: group.last_modified_time_millis,
         status: Some(group.status().to_string()),
         status_reason: group.status_reason(),

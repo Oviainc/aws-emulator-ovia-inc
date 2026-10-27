@@ -177,10 +177,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // does not narrow to its values.
         if let Some(wanted) = input.authorization_type.as_deref() {
             if !CONNECTION_AUTHORIZATION_TYPE_VALUES.contains(&wanted) {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(crate::scaffolded::Scaffolded::validation(refused(&format!(
                     "Parameter AuthorizationType is not valid. Reason: {wanted:?} is not one of {}.",
                     CONNECTION_AUTHORIZATION_TYPE_VALUES.join(" | ")
-                )));
+                ))));
             }
         }
 
@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|oauth| oauth.authorization_endpoint.as_deref())
             .and_then(crate::state::authorization_endpoint_violation)
         {
-            return Err(crate::scaffolded::Scaffolded::validation(reason));
+            return Err(crate::scaffolded::Scaffolded::validation(refused(&reason)));
         }
 
         let region = crate::state::request_region(ctx.parts());
@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(stored) = store.connection(&input.name) else {
                 return Err(UpdateConnectionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::no_such_connection(&input.name)),
+                        message: Some(crate::state::no_such_connection(VERB, &input.name)),
                     },
                 )
                 .into());
@@ -222,10 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if stored.is_being_removed() {
                 return Err(UpdateConnectionErrorModeled::ConcurrentModificationException(
                     ConcurrentModificationException {
-                        message: Some(format!(
+                        message: Some(refused(&format!(
                             "Connection '{}' is being deleted and cannot be updated.",
                             input.name
-                        )),
+                        ))),
                     },
                 )
                 .into());
@@ -243,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.auth_parameters.as_ref(),
                 changes_type,
             ) {
-                return Err(crate::scaffolded::Scaffolded::validation(reason));
+                return Err(crate::scaffolded::Scaffolded::validation(refused(&reason)));
             }
 
             let Some(connection) = store.connection_mut(&input.name) else {
@@ -336,6 +336,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         Ok(updated)
     }
+}
+
+/// The verb of THIS call, as the clause every one of its refusals opens with
+/// names it ([`crate::state::connection_refusal`]).
+const VERB: &str = "update";
+
+/// One refusal of this call: the clause naming the call that failed and then
+/// `reason`.
+fn refused(reason: &str) -> String {
+    crate::state::connection_refusal(VERB, reason)
 }
 
 /// Why the submitted authorization parameters do not match the authorization type

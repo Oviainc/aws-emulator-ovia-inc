@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.connection(&input.name) else {
             return Err(DescribeConnectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::no_such_connection(&input.name)),
+                    message: Some(crate::state::no_such_connection(VERB, &input.name)),
                 },
             )
             .into());
@@ -169,3 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(stored.to_describe_output())
     }
 }
+
+/// The verb of THIS call, as the clause every one of its refusals opens with
+/// names it ([`crate::state::connection_refusal`]).
+const VERB: &str = "describe";

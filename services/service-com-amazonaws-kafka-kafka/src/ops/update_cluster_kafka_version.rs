@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateClusterKafkaVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateClusterKafkaVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates the Apache Kafka version the brokers of a provisioned cluster run, and
+//! applies the custom configuration the request names for that new version.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateClusterKafkaVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The call is ACCEPTED, not completed: it records a cluster operation, moves the
+//! cluster to `UPDATING` and hands it the change the clock applies at
+//! [`crate::state::CLUSTER_UPDATE_DELAY`], which is also when the cluster's next
+//! `CurrentVersion` is generated. The operation this returns is readable through
+//! `DescribeClusterOperation`, and the applied version through `DescribeCluster`'s
+//! `CurrentBrokerSoftwareInfo`.
+//!
+//! A request this region holds no cluster for is a `NotFoundException` whatever its
+//! body asks for: the resource named in the URI is resolved before anything in the
+//! body is judged.
+//!
+//! `TargetKafkaVersion` must be one of the versions the cluster's current version
+//! can be updated to — the same ladder `GetCompatibleKafkaVersions` reports, which
+//! both derive from [`crate::state::compatible_target_versions`], so no update can
+//! land a version that reader would not offer.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +162,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateClusterKafkaVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClusterKafkaVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateClusterKafkaVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateClusterKafkaVersionErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                UpdateClusterKafkaVersionErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // The cluster is resolved FIRST: an update against an ARN this region
+        // holds no cluster for is a resource that cannot be found, whatever the
+        // body asks for. The settling lookup materialises only the transitions
+        // the clock already owed THIS cluster, so the checks below judge the
+        // software it is actually running.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
+            return Err(
+                UpdateClusterKafkaVersionErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+        // Copied out of the record: the checks below are followed by a write, so
+        // the borrow of the registry has to end here.
+        let cluster_state = cluster.state.clone();
+        let current_version = cluster.current_version.clone();
+        let kafka_version = cluster.kafka_version.clone();
+        let is_serverless = cluster.is_serverless();
+
+        // This update reinstalls the brokers' Apache Kafka software, and a
+        // serverless cluster has no brokers to reinstall: MSK Serverless manages
+        // the Apache Kafka version itself.
+        if is_serverless {
+            return Err(
+                UpdateClusterKafkaVersionErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::PROVISIONED_ONLY_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // Only a cluster whose brokers are serving can take an update: one still
+        // being provisioned, or already applying a change, has no settled
+        // configuration to update from.
+        if cluster_state != crate::state::CLUSTER_STATE_ACTIVE {
+            return Err(
+                UpdateClusterKafkaVersionErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "The cluster is in the {cluster_state} state; it must be {} to be updated.",
+                        crate::state::CLUSTER_STATE_ACTIVE
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The version is the one the caller is updating FROM, so a stale one
+        // means the caller has not seen the cluster's current configuration.
+        if input.current_version != current_version {
+            return Err(
+                UpdateClusterKafkaVersionErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("currentVersion".to_string()),
+                    message: Some(format!(
+                        "The cluster's current version is {current_version}, not {}.",
+                        input.current_version
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The target must be one of the versions this cluster's version can be
+        // updated to: MSK updates Apache Kafka in place, so a version at or
+        // below the one the brokers run, one MSK has deprecated, and one it does
+        // not offer at all are each refused rather than installed. The ladder is
+        // the one `GetCompatibleKafkaVersions` reports, so an update can only
+        // land a version that reader offers for this cluster.
+        if !crate::state::compatible_target_versions(&kafka_version)
+            .contains(&input.target_kafka_version)
+        {
+            return Err(
+                UpdateClusterKafkaVersionErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("targetKafkaVersion".to_string()),
+                    message: Some(format!(
+                        "A cluster running Apache Kafka version {kafka_version} cannot be updated \
+                         to {}. GetCompatibleKafkaVersions reports the versions it can be updated \
+                         to.",
+                        input.target_kafka_version
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // A custom configuration is applied ON the new version, so the revision
+        // the request names has to be one this region actually holds: the stored
+        // reference is what every reader then reports as the cluster's
+        // `ConfigurationArn` and `ConfigurationRevision`.
+        if let Some(configuration_info) = input.configuration_info.as_ref() {
+            let Some(configuration) = state.configuration_in(&region, &configuration_info.arn)
+            else {
+                return Err(UpdateClusterKafkaVersionErrorModeled::BadRequestException(
+                    crate::state::configuration_arn_not_found(),
+                )
+                .into());
+            };
+            if configuration.revision(configuration_info.revision).is_none() {
+                return Err(
+                    UpdateClusterKafkaVersionErrorModeled::BadRequestException(
+                        BadRequestException {
+                            invalid_parameter: Some("Revision".to_string()),
+                            message: Some(crate::state::configuration_revision_missing_message(
+                                &configuration_info.arn,
+                                configuration_info.revision,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The registry starts the operation: it records what changes, moves the
+        // cluster to UPDATING and stores the instant the change comes due.
+        let Some(operation_arn) = state.start_kafka_version_update(
+            &region,
+            &input.cluster_arn,
+            now,
+            input.target_kafka_version,
+            input.configuration_info,
+        ) else {
+            return Err(
+                UpdateClusterKafkaVersionErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some(
+                            "the cluster vanished while its update was starting".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(UpdateClusterKafkaVersionOutput {
+            cluster_arn: Some(input.cluster_arn),
+            cluster_operation_arn: Some(operation_arn),
+        })
     }
 }

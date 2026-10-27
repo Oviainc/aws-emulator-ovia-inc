@@ -102,11 +102,11 @@ async fn stored_address(outposts: &Outposts, site_id: &str, address_type: &str) 
 /// Put a stored order in `status`.
 ///
 /// Most of the modelled `OrderStatus` values are reached by hardware being built,
-/// shipped and installed, which leaves a record this emulator does not have, so a case
-/// about what a status HOLDS UP reaches it through the same store seam
-/// [`crate::order_cancellation`] finishes an order through. The clock-owed transition
-/// goes with it, so the status the row set is the one the next call reads. Every
-/// assertion still goes over the wire.
+/// shipped and installed over spans no case may sleep for, so a case about what a
+/// status HOLDS UP reaches it through the same store seam
+/// [`crate::order_cancellation`] finishes an order through. The transitions the clock
+/// still owed go with it, so the status the row set is the one the next call reads.
+/// Every assertion still goes over the wire.
 fn set_order_status(outposts: &Outposts, order_id: &str, status: &str, case: &str) {
     let store = outposts.store();
     let mut store = store.lock();
@@ -115,7 +115,7 @@ fn set_order_status(outposts: &Outposts, order_id: &str, status: &str, case: &st
         .get_mut(order_id)
         .unwrap_or_else(|| panic!("case {case:?}: the order {order_id} this case placed is stored"));
     record.order.status = Some(status.to_string());
-    record.in_progress_at = None;
+    record.pending.clear();
 }
 
 /// A site with a shipping address already stored, an Outpost at it and an order placed

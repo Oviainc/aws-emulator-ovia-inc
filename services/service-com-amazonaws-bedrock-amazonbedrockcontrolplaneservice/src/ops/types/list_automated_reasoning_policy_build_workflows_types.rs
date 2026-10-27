@@ -26,7 +26,16 @@ pub struct ListAutomatedReasoningPolicyBuildWorkflowsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#AutomatedReasoningPolicyBuildWorkflowSummary")]
+/// `AutomatedReasoningPolicyBuildWorkflowSummary`, the row this listing carries. Its
+/// schema and codec come from [`bedrock_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `createdAt` and `updatedAt` carry
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyBuildWorkflowSummary")`),
+/// which the derive does not put on a member schema — see `types/date_time_wire.rs` for
+/// that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct AutomatedReasoningPolicyBuildWorkflowSummary {
     pub policy_arn: String,
@@ -36,4 +45,32 @@ pub struct AutomatedReasoningPolicyBuildWorkflowSummary {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+bedrock_schema_and_codec!(
+    AutomatedReasoningPolicyBuildWorkflowSummary,
+    AUTOMATED_REASONING_POLICY_BUILD_WORKFLOW_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrock#AutomatedReasoningPolicyBuildWorkflowSummary",
+    "com.amazonaws.bedrock",
+    "AutomatedReasoningPolicyBuildWorkflowSummary",
+    (M_POLICY_ARN, policy_arn, "policyArn", 0, req, string),
+    (
+        M_BUILD_WORKFLOW_ID,
+        build_workflow_id,
+        "buildWorkflowId",
+        1,
+        req,
+        string
+    ),
+    (M_STATUS, status, "status", 2, req, string),
+    (
+        M_BUILD_WORKFLOW_TYPE,
+        build_workflow_type,
+        "buildWorkflowType",
+        3,
+        req,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 4, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 5, req, date_time),
+);
 

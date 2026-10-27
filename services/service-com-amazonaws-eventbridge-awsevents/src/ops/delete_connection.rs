@@ -142,7 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.connection_mut(&input.name) else {
             return Err(DeleteConnectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::no_such_connection(&input.name)),
+                    message: Some(crate::state::no_such_connection(VERB, &input.name)),
                 },
             )
             .into());
@@ -157,9 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteConnectionErrorModeled::ConcurrentModificationException(
                     ConcurrentModificationException {
-                        message: Some(format!(
-                            "Connection '{}' is in state {} and cannot be deleted.",
-                            stored.name, stored.state
+                        message: Some(crate::state::connection_refusal(
+                            VERB,
+                            &format!(
+                                "Connection '{}' is in state {} and cannot be deleted.",
+                                stored.name, stored.state
+                            ),
                         )),
                     },
                 )
@@ -184,3 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The verb of THIS call, as the clause every one of its refusals opens with
+/// names it ([`crate::state::connection_refusal`]).
+const VERB: &str = "delete";
