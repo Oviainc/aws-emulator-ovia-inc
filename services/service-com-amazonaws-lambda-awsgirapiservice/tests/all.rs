@@ -31,6 +31,8 @@ mod alias_update;
 mod alias_update_not_found_sentence;
 #[path = "all/alias_version_not_found_sentence.rs"]
 mod alias_version_not_found_sentence;
+#[path = "all/alias_write_not_found_sentence.rs"]
+mod alias_write_not_found_sentence;
 #[path = "all/async_invocation.rs"]
 mod async_invocation;
 #[path = "all/capacity_provider_bounds.rs"]
@@ -57,6 +59,8 @@ mod concurrency_quota_refusal_rules;
 mod durable_execution_bound;
 #[path = "all/durable_execution_listing.rs"]
 mod durable_execution_listing;
+#[path = "all/event_source_mapping_delete_in_use.rs"]
+mod event_source_mapping_delete_in_use;
 #[path = "all/event_source_mapping_deletion.rs"]
 mod event_source_mapping_deletion;
 #[path = "all/event_source_mapping_queue_visibility.rs"]
@@ -123,6 +127,8 @@ mod provisioned_concurrency_resolution;
 mod read_representation_and_download_plane;
 #[path = "all/refusal_message_rules.rs"]
 mod refusal_message_rules;
+#[path = "all/refused_value_echo.rs"]
+mod refused_value_echo;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_policy_document.rs"]

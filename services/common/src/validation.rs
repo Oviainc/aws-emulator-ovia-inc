@@ -53,10 +53,14 @@
 //! therefore comes with its own finite bounds, chosen here and not derived from the
 //! request:
 //!
-//! * [`MAX_RESTORED_ECHO`] (16 KiB) — the largest single value restored into a clause.
-//!   64x the largest `@length` maximum an emulated member declares today (256), so the
+//! * [`MAX_RESTORED_ECHO`] (16 KiB) — the largest single value restored into a clause by
+//!   default. 64x the largest `@length` maximum most emulated members declare (256), so the
 //!   fidelity this exists for — echoing a 300-character id, an over-long ARN, a rejected
-//!   enum value — always lands, while one clause can never carry request-sized content.
+//!   enum value — always lands, while one clause can never carry request-sized content. A
+//!   service whose model declares a member LONGER than this (a policy document, say) states
+//!   its own ceiling from that member's declared maximum
+//!   ([`refusing_violations_quoting_up_to`]), which is a model constant rather than a
+//!   request-sized one.
 //! * [`MAX_RESTORED_TOTAL`] (64 KiB) — the restored bytes ALL clauses of one message may
 //!   carry together, so `violations x value size` is bounded as a product. For scale, the
 //!   framework's own ceiling on the same text is 100 clauses x 256 bytes ~= 25 KiB, so
@@ -143,6 +147,26 @@ use smithy_server_runtime::{DeserializableStruct, Operation, ServerHttpProtocol}
 /// rather than a literal of its own that can drift from it
 /// (`grep -rn 'MAX_VIOLATIONS' services/*/src` lists the copies left to migrate here).
 pub const MAX_VIOLATIONS: usize = 100;
+
+/// As [`refusing_violations`], with the largest single value one clause may quote stated
+/// by the SERVICE rather than taken from this module's own [`MAX_RESTORED_ECHO`].
+///
+/// What it is for: the flat bound is sized for the members most models declare, and a
+/// model that declares a `@length` maximum ABOVE it has refusals whose value could never
+/// be quoted in full — the one thing an AWS constraint message always does. A service
+/// whose model declares such a member states its own ceiling here, from that member's
+/// declared maximum, so the ceiling is a MODEL constant and no response is sized by the
+/// request. Everything else is [`refusing_violations`]'s: the same collecting walk, the
+/// same violations, the same per-message total ([`MAX_RESTORED_TOTAL`]), which still
+/// bounds `violations x value size` as a product.
+#[must_use]
+pub fn refusing_violations_quoting_up_to<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    max_echo: usize,
+) -> Vec<Violation> {
+    violations_in::<O>(protocol, req, Echoes::SubmittedUpTo(max_echo)).violations
+}
 
 /// Every violation that refuses `req` before `O`'s handler runs — a `@required` member
 /// absent, or a value outside a declared constraint — with each value echo restored to the
@@ -255,6 +279,9 @@ pub fn refusing_violations_with_echoes<O: Operation>(
 pub(crate) enum Echoes {
     /// Restore each echo through [`with_submitted_values`].
     Submitted,
+    /// Restore each echo, quoting one value up to the bound the SERVICE states
+    /// ([`with_submitted_values_up_to`]) instead of [`MAX_RESTORED_ECHO`].
+    SubmittedUpTo(usize),
     /// Leave the framework's own rendering in place.
     Rendered,
     /// Restore each echo, and collect the request's lists too ([`submitted_lists`]).
@@ -289,6 +316,16 @@ pub(crate) fn violations_in<O: Operation>(
             match echoes {
                 Echoes::Submitted => Refusing {
                     violations: with_submitted_values(violations, &input, O::INPUT_SCHEMA),
+                    lists: HashMap::new(),
+                    echoes: Vec::new(),
+                },
+                Echoes::SubmittedUpTo(max_echo) => Refusing {
+                    violations: with_submitted_values_up_to(
+                        violations,
+                        &input,
+                        O::INPUT_SCHEMA,
+                        max_echo,
+                    ),
                     lists: HashMap::new(),
                     echoes: Vec::new(),
                 },
@@ -347,7 +384,8 @@ pub(crate) fn violations_in<O: Operation>(
     }
 }
 
-/// The largest single submitted value restored into a clause (see the module docs).
+/// The largest single submitted value restored into a clause by default, and the ceiling a
+/// service that states none is held to (see the module docs).
 const MAX_RESTORED_ECHO: usize = 16 * 1024;
 
 /// The restored bytes all clauses of one message may carry together.
@@ -389,16 +427,32 @@ const MAX_RENDERED_CHILDREN: usize = 256;
 /// than the stated bounds allow.
 #[must_use]
 pub fn with_submitted_values(
+    violations: Vec<Violation>,
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+) -> Vec<Violation> {
+    with_submitted_values_up_to(violations, input, schema, MAX_RESTORED_ECHO)
+}
+
+/// [`with_submitted_values`], with the largest single value one clause may quote stated by
+/// the caller rather than taken from [`MAX_RESTORED_ECHO`].
+///
+/// `max_echo` is the only difference: the walk, the matching of a stored echo against the
+/// leaf it was elided from, and the per-message total ([`MAX_RESTORED_TOTAL`]) are the
+/// same. See [`refusing_violations_quoting_up_to`] for when a service states its own.
+#[must_use]
+pub fn with_submitted_values_up_to(
     mut violations: Vec<Violation>,
     input: &dyn SerializableStruct,
     schema: &Schema,
+    max_echo: usize,
 ) -> Vec<Violation> {
     // Nothing to re-echo: a walk over the whole input is not worth doing for a refusal
     // that states no value at all (an absent `@required` member is the common case).
     if violations.iter().all(|violation| violation.value.is_none()) {
         return violations;
     }
-    let leaves = submitted_leaves(input, schema);
+    let leaves = submitted_leaves_up_to(input, schema, max_echo);
     // ONE pass over the leaves builds every lookup the loop below needs, so the cost is
     // O(leaves) rather than O(violations x leaves).
     let index = Submitted::of(&leaves);
@@ -422,7 +476,7 @@ pub fn with_submitted_values(
             continue;
         };
         // And only within the stated bounds.
-        if restored.len() > MAX_RESTORED_ECHO || restored.len() > budget {
+        if restored.len() > max_echo || restored.len() > budget {
             continue;
         }
         budget -= restored.len();
@@ -756,7 +810,7 @@ pub fn submitted_lists(
     input: &dyn SerializableStruct,
     schema: &Schema,
 ) -> HashMap<String, String> {
-    let (leaves, complete) = collected_leaves(input, schema);
+    let (leaves, complete) = collected_leaves(input, schema, MAX_RESTORED_ECHO);
     if !complete {
         return HashMap::new();
     }
@@ -796,7 +850,24 @@ pub fn submitted_leaves(
     input: &dyn SerializableStruct,
     schema: &Schema,
 ) -> Vec<(String, String)> {
-    collected_leaves(input, schema).0
+    collected_leaves(input, schema, MAX_RESTORED_ECHO).0
+}
+
+/// [`submitted_leaves`], collecting a leaf up to `max_value` bytes rather than up to
+/// [`MAX_RESTORED_ECHO`].
+///
+/// A leaf no clause could quote is not copied at all, so the collection bound and the
+/// quoting bound are the same number: a service that states its own ceiling
+/// ([`refusing_violations_quoting_up_to`]) collects to that ceiling. The COUNT and TOTAL
+/// bounds ([`MAX_RECORDED_LEAVES`], [`MAX_RECORDED_BYTES`]) are unchanged, so the walk is
+/// still never a second full copy of a request's strings.
+#[must_use]
+pub fn submitted_leaves_up_to(
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+    max_value: usize,
+) -> Vec<(String, String)> {
+    collected_leaves(input, schema, max_value).0
 }
 
 /// The collected leaves of `input`, and whether the collection is COMPLETE — false once any
@@ -809,8 +880,12 @@ pub fn submitted_leaves(
 fn collected_leaves(
     input: &dyn SerializableStruct,
     schema: &Schema,
+    max_value: usize,
 ) -> (Vec<(String, String)>, bool) {
-    let mut walk = SubmittedValues::default();
+    let mut walk = SubmittedValues {
+        max_value: Some(max_value),
+        ..SubmittedValues::default()
+    };
     // The root input is a struct; drive it the way a codec — and the validating walk —
     // does.
     let _ = walk.write_struct(schema, input);
@@ -994,6 +1069,11 @@ struct SubmittedValues {
     /// Whether this walk composes renderings at all. Off by default, so a caller that
     /// only reads leaves pays neither the frames nor the owned text for them.
     renders: bool,
+    /// The largest single leaf this walk copies, or `None` for [`MAX_RESTORED_ECHO`], the
+    /// bound this module states. A caller that quotes a value up to a ceiling of its own
+    /// ([`submitted_leaves_up_to`]) collects to that same ceiling, because a leaf no clause
+    /// could quote is not worth copying.
+    max_value: Option<usize>,
     /// The composites currently open, innermost last, collecting the children each
     /// renders from. Pushed and popped with `collections`.
     open: Vec<Composite>,
@@ -1013,6 +1093,11 @@ struct SubmittedValues {
 }
 
 impl SubmittedValues {
+    /// The largest single leaf this walk copies; see [`Self::max_value`].
+    fn value_bound(&self) -> usize {
+        self.max_value.unwrap_or(MAX_RESTORED_ECHO)
+    }
+
     /// True once no further leaf can be recorded, so the rest of the walk is skipped.
     ///
     /// Counted over every leaf VISITED rather than over the leaves kept: a leaf dropped
@@ -1095,7 +1180,7 @@ impl SubmittedValues {
         // now has a hole in it, which `skipped` records.
         let leaf_path = path::join(&self.path);
         let bytes = leaf_path.len() + value.len();
-        if value.len() > MAX_RESTORED_ECHO || self.recorded + bytes > MAX_RECORDED_BYTES {
+        if value.len() > self.value_bound() || self.recorded + bytes > MAX_RECORDED_BYTES {
             self.skipped = true;
             return;
         }

@@ -49,6 +49,8 @@ mod email_identity_feedback_attributes;
 mod email_identity_lifecycle;
 #[path = "all/email_identity_policies.rs"]
 mod email_identity_policies;
+#[path = "all/email_templates.rs"]
+mod email_templates;
 #[path = "all/list_tenants.rs"]
 mod list_tenants;
 #[path = "all/multi_region_endpoints.rs"]

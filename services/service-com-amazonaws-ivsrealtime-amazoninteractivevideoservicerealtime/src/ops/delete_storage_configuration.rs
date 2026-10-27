@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStorageConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStorageConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStorageConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +142,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStorageConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStorageConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStorageConfiguration"))
+        // The configuration is resolved in this request's own region's view of the
+        // account: one of another region is not a resource this request can delete.
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                DeleteStorageConfigurationErrorModeled::InternalServerException,
+            )
+        })?;
+        let mut store = state.lock();
+        // The transitions the clock has already made due are written down FIRST, so the
+        // refusal below decides against the same store a read at this instant would
+        // report: a composition whose stop the clock has already finished is gone, and
+        // holds nothing back.
+        store.materialize_due_compositions(::std::time::SystemTime::now());
+
+        // A delete of a resource this store does not hold is the modelled
+        // `ResourceNotFoundException` (HTTP 404), the same answer `DeleteEncoderConfiguration`
+        // and `DeleteStage` give — so a second delete of the same ARN is refused rather
+        // than silently accepted.
+        if store
+            .storage_configuration_in(&region, &input.arn)
+            .is_none()
+        {
+            return Err(crate::state::resource_not_found(
+                DeleteStorageConfigurationErrorModeled::ResourceNotFoundException,
+                &input.arn,
+            ));
+        }
+
+        // "If you try to delete a storage configuration that is used by a Composition, you
+        // will get an error (409 ConflictException). To avoid this, for all Compositions
+        // that reference the storage configuration, first use StopComposition and wait for
+        // it to complete": the compositions using it are the ones whose destinations refer
+        // to this ARN and whose stop has not completed (`composition_using`, the one lookup
+        // for that question), so the modelled `ConflictException` is answered and the
+        // configuration stays exactly as a read reports it.
+        if let Some(composition) = store.composition_using(&input.arn) {
+            let message = crate::state::resource_in_use_by_composition_message(
+                &input.arn,
+                &composition.arn,
+                &composition.state,
+            );
+            return Err(crate::state::conflict(
+                DeleteStorageConfigurationErrorModeled::ConflictException,
+                message,
+            ));
+        }
+
+        // The configuration is gone; the stages whose `autoParticipantRecordingConfiguration`
+        // named it keep the reference they were configured with (no cascade is documented
+        // for it), and a recording has nowhere to go while that reference names nothing,
+        // which is what `crate::state::participant_recording_location` already reports.
+        store.storage_configurations.remove(&input.arn);
+        Ok(DeleteStorageConfigurationOutput {})
     }
 }

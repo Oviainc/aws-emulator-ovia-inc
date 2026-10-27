@@ -64,15 +64,67 @@
 //! READ: it answers the same bytes twice and changes nothing a later caller sees. A URL
 //! whose object this emulator holds no bytes for — an S3-sourced package it does not
 //! resolve — is a `404`, because nothing may be served that was not stored.
+//!
+//! ## How a broken constraint is stated
+//!
+//! An AWS constraint message is built from the REQUEST — `1 validation error detected:
+//! Value '<value>' at '<member path>' failed to satisfy constraint: <requirement>` — and
+//! the value between the quotes is the one the caller SUBMITTED, whole. One part of that
+//! sentence the framework cannot produce from the violations alone is exactly that value:
+//! its constraint walk stores the echo ELIDED (a byte-bounded prefix plus
+//! `... [<n> bytes]`, a marker AWS never emits), because the clause interpolates whatever
+//! is stored and a caller controls the length, and the unelided value is recoverable only
+//! from the built input — which [`Service::override_refusal`] is never handed.
+//!
+//! [`StatedPerOperation`] is where it comes from: every modelled operation is served
+//! wrapped in it, the wrapper asks `service_common::validation` for the framework's OWN
+//! violations against that operation's input schema with each echo restored to the bytes
+//! the caller sent (up to [`LARGEST_QUOTED_VALUE_BYTES`]), and [`stated_violations`] —
+//! which `override_refusal` goes through as well — words them, so the two refusal paths
+//! cannot drift.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_schema_server::ProtocolError;
 use aws_smithy_types::body::SdkBody;
 use service_common::event_stream::EventStreamRoute;
 use service_common::shared_path::SharedPathArn;
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
+    Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The largest single value ONE clause of this service's validation refusal quotes back.
+///
+/// An AWS constraint message always quotes the value it refused in full, and the shared
+/// restorer's own ceiling (`service_common::validation`, 16 KiB) is sized for the members
+/// most models declare — so a member this model declares LONGER than that could never have
+/// its refusal quoted in full. The ceiling is therefore stated from the model: twice the
+/// largest `@length` maximum this model puts on a string member, `ResourcePolicy`'s 20480
+/// (`smithy_query(query="shape", shape="ResourcePolicy")`), so a document up to twice the
+/// size that member admits is quoted whole. It is a MODEL constant times a fixed factor,
+/// not a request-sized one; past it the framework's own shortened rendering stands, which
+/// is a deliberate bound on the size of a response and leaves that one divergence where it
+/// belongs — the frozen crate stores only the elided value, which
+/// `services/common/src/validation.rs` records as the core seam this whole re-read exists
+/// until.
+const LARGEST_QUOTED_VALUE_BYTES: usize = 2 * 20_480;
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`StatedPerOperation`] and keyed by its operation shape name — the routing key
+/// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(StatedPerOperation::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
+}
 
 /// The order this service states one enum's value set in, one row per enum.
 ///
@@ -179,6 +231,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     response_stream: EventStreamRoute<
         crate::ops::invoke_with_response_stream::ResponseStreamEntry<Eng>,
     >,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`StatedPerOperation`] so a refused request QUOTES the value it refused rather
+    /// than the framework's shortened rendering of it. Keyed by the routing key the
+    /// protocol resolves — the key the generated table uses — and built from the SAME
+    /// shared engine, so a wrapped operation reads and writes the one store.
+    stated: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -186,6 +244,107 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut stated = OperationRoutingTable::new();
+        // EVERY operation the generated table holds, because the rule is the SERVICE's and
+        // not one operation's: an operation whose input declares no constraint simply never
+        // has a violation to state, which the wrapper reads off that operation's own input
+        // schema. An operation added later is added here too, or its refusal quotes the
+        // shortened value again; `every_modelled_operation_is_wrapped` below fails when one
+        // is missing. `InvokeWithResponseStream` is the one exception, and not an omission:
+        // its output binds a `@streaming` union, so it implements no
+        // `smithy_server_runtime::Operation` at all and is served by `response_stream`
+        // below, which reads and checks its own input against the model.
+        wrap_operations!(
+            stated,
+            engine,
+            add_layer_version_permission::AddLayerVersionPermission,
+            add_permission::AddPermission,
+            checkpoint_durable_execution::CheckpointDurableExecution,
+            create_alias::CreateAlias,
+            create_capacity_provider::CreateCapacityProvider,
+            create_code_signing_config::CreateCodeSigningConfig,
+            create_event_source_mapping::CreateEventSourceMapping,
+            create_function::CreateFunction,
+            create_function_url_config::CreateFunctionUrlConfig,
+            delete_alias::DeleteAlias,
+            delete_capacity_provider::DeleteCapacityProvider,
+            delete_code_signing_config::DeleteCodeSigningConfig,
+            delete_event_source_mapping::DeleteEventSourceMapping,
+            delete_function::DeleteFunction,
+            delete_function_code_signing_config::DeleteFunctionCodeSigningConfig,
+            delete_function_concurrency::DeleteFunctionConcurrency,
+            delete_function_event_invoke_config::DeleteFunctionEventInvokeConfig,
+            delete_function_url_config::DeleteFunctionUrlConfig,
+            delete_layer_version::DeleteLayerVersion,
+            delete_provisioned_concurrency_config::DeleteProvisionedConcurrencyConfig,
+            delete_resource_policy::DeleteResourcePolicy,
+            get_account_settings::GetAccountSettings,
+            get_alias::GetAlias,
+            get_capacity_provider::GetCapacityProvider,
+            get_code_signing_config::GetCodeSigningConfig,
+            get_durable_execution::GetDurableExecution,
+            get_durable_execution_history::GetDurableExecutionHistory,
+            get_durable_execution_state::GetDurableExecutionState,
+            get_event_source_mapping::GetEventSourceMapping,
+            get_function::GetFunction,
+            get_function_code_signing_config::GetFunctionCodeSigningConfig,
+            get_function_concurrency::GetFunctionConcurrency,
+            get_function_configuration::GetFunctionConfiguration,
+            get_function_event_invoke_config::GetFunctionEventInvokeConfig,
+            get_function_recursion_config::GetFunctionRecursionConfig,
+            get_function_scaling_config::GetFunctionScalingConfig,
+            get_function_url_config::GetFunctionUrlConfig,
+            get_layer_version::GetLayerVersion,
+            get_layer_version_by_arn::GetLayerVersionByArn,
+            get_layer_version_policy::GetLayerVersionPolicy,
+            get_policy::GetPolicy,
+            get_provisioned_concurrency_config::GetProvisionedConcurrencyConfig,
+            get_resource_policy::GetResourcePolicy,
+            get_runtime_management_config::GetRuntimeManagementConfig,
+            invoke::Invoke,
+            invoke_async::InvokeAsync,
+            list_aliases::ListAliases,
+            list_capacity_providers::ListCapacityProviders,
+            list_code_signing_configs::ListCodeSigningConfigs,
+            list_durable_executions_by_function::ListDurableExecutionsByFunction,
+            list_event_source_mappings::ListEventSourceMappings,
+            list_function_event_invoke_configs::ListFunctionEventInvokeConfigs,
+            list_function_url_configs::ListFunctionUrlConfigs,
+            list_function_versions_by_capacity_provider::ListFunctionVersionsByCapacityProvider,
+            list_functions::ListFunctions,
+            list_functions_by_code_signing_config::ListFunctionsByCodeSigningConfig,
+            list_layer_versions::ListLayerVersions,
+            list_layers::ListLayers,
+            list_provisioned_concurrency_configs::ListProvisionedConcurrencyConfigs,
+            list_tags::ListTags,
+            list_versions_by_function::ListVersionsByFunction,
+            publish_layer_version::PublishLayerVersion,
+            publish_version::PublishVersion,
+            put_function_code_signing_config::PutFunctionCodeSigningConfig,
+            put_function_concurrency::PutFunctionConcurrency,
+            put_function_event_invoke_config::PutFunctionEventInvokeConfig,
+            put_function_recursion_config::PutFunctionRecursionConfig,
+            put_function_scaling_config::PutFunctionScalingConfig,
+            put_provisioned_concurrency_config::PutProvisionedConcurrencyConfig,
+            put_resource_policy::PutResourcePolicy,
+            put_runtime_management_config::PutRuntimeManagementConfig,
+            remove_layer_version_permission::RemoveLayerVersionPermission,
+            remove_permission::RemovePermission,
+            send_durable_execution_callback_failure::SendDurableExecutionCallbackFailure,
+            send_durable_execution_callback_heartbeat::SendDurableExecutionCallbackHeartbeat,
+            send_durable_execution_callback_success::SendDurableExecutionCallbackSuccess,
+            stop_durable_execution::StopDurableExecution,
+            tag_resource::TagResource,
+            untag_resource::UntagResource,
+            update_alias::UpdateAlias,
+            update_capacity_provider::UpdateCapacityProvider,
+            update_code_signing_config::UpdateCodeSigningConfig,
+            update_event_source_mapping::UpdateEventSourceMapping,
+            update_function_code::UpdateFunctionCode,
+            update_function_configuration::UpdateFunctionConfiguration,
+            update_function_event_invoke_config::UpdateFunctionEventInvokeConfig,
+            update_function_url_config::UpdateFunctionUrlConfig,
+        );
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             response_stream: EventStreamRoute(
@@ -193,8 +352,115 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                     &engine,
                 )),
             ),
-            downloads: Downloads { engine },
+            downloads: Downloads {
+                engine: Arc::clone(&engine),
+            },
+            stated,
         }
+    }
+}
+
+/// One modelled operation, served so that a refused request is stated the way this service
+/// states it: with the value as SUBMITTED between the quotes.
+///
+/// Nothing else is re-implemented. A request this wrapper does not refuse is handed to the
+/// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
+/// serialize, telemetry and every modelled error. The violations come from the framework's
+/// own machinery ([`stated_refusal`]), so this cannot refuse a request the framework's own
+/// walk would accept, nor accept one it would refuse, and the WORDING is the same
+/// [`stated_violations`] that [`Service::override_refusal`] uses — so the two refusal paths
+/// cannot drift. The cost is that a request this wrapper does not refuse is read twice,
+/// once here and once in the operation's own sequence, because the framework hands no
+/// already-built input to an operation — including on the data-plane operations, where a
+/// `Payload` blob makes that second read the larger one. What the second read KEEPS is
+/// bounded whatever the request's size (`service_common::validation` collects at most 256
+/// leaves and 64 KiB of them, and a blob contributes no leaf at all), so only the parse is
+/// paid twice; removing even that needs the core seam `services/common/src/validation.rs`
+/// records — handing a handler, or `override_refusal`, the input the framework already
+/// built.
+struct StatedPerOperation<O> {
+    operation: O,
+}
+
+impl<O> StatedPerOperation<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+/// This service's answer to every modelled constraint `req` breaks, for the operation `O`:
+/// the violations the framework's own walk finds — each value echo restored to the bytes
+/// the caller sent, up to [`LARGEST_QUOTED_VALUE_BYTES`] — and the wording
+/// [`stated_violations`] gives them. `None` when the request breaks none, and for a failure
+/// that is NOT a refusal (a body the codec cannot read at all, a member of the wrong type),
+/// which the framework's own walk answers in its own envelope.
+fn stated_refusal<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<(Vec<Violation>, Refused)> {
+    let violations = service_common::validation::refusing_violations_quoting_up_to::<O>(
+        protocol,
+        req,
+        LARGEST_QUOTED_VALUE_BYTES,
+    );
+    let stated = stated_violations(&violations)?;
+    Some((violations, stated))
+}
+
+/// How this service words a constraint refusal, from the violations alone: the code, the
+/// envelope and the `@pattern` rendering are `service-common`'s, and the ORDER an enum's
+/// value set is listed in is this service's ([`reported_enum_order`]).
+///
+/// The ONE renderer both refusal paths go through — [`StatedPerOperation`] for a request a
+/// wrapped operation refuses, and [`Service::override_refusal`] for one the centralized
+/// walk refuses — so a caller cannot be told the same broken constraint two ways.
+fn stated_violations(violations: &[Violation]) -> Option<Refused> {
+    if violations.is_empty() {
+        return None;
+    }
+    let restated: Vec<Violation> = violations
+        .iter()
+        .map(|violation| match &violation.kind {
+            ViolationKind::EnumValue(allowed) => Violation {
+                path: violation.path.clone(),
+                kind: ViolationKind::EnumValue(reported_enum_order(allowed)),
+                value: violation.value.clone(),
+            },
+            _ => violation.clone(),
+        })
+        .collect();
+    service_common::aws_validation_refusal(&Refusal::Invalid(restated))
+}
+
+impl<O> ErasedOperation for StatedPerOperation<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The definition is read, used and dropped inside this statement:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let refused = stated_refusal::<O>(svc.definition().protocol(), req);
+            if let Some((violations, stated)) = refused {
+                return svc
+                    .definition()
+                    .refusal_response(ProtocolError::Invalid(violations), Some(stated));
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not change
+    /// which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
     }
 }
 
@@ -424,7 +690,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if crate::ops::invoke_with_response_stream::addresses_response_streaming_invocations(req) {
             return Some(&self.response_stream as &dyn ErasedOperation);
         }
-        None
+        // Every other modelled operation is served WRAPPED. This is NOT a re-route: the
+        // key is the one the generated table's own protocol resolves, and the operation it
+        // names is the one served — wrapped in `StatedPerOperation` so a refused request
+        // quotes the value it refused (see that type). A key the model does not name
+        // resolves to `None` here exactly as it does in the generated table, so the
+        // router's routing-error path is unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.stated.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -436,8 +709,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // TWO renderings are stated here, neither of which a model records:
         //
-        // * the ORDER of an enum's value set (see [`reported_enum_order`]), which is
-        //   this service's own and is applied below;
+        // * the ORDER of an enum's value set (see [`reported_enum_order`]);
         // * how a `@pattern` requirement quotes its expression. AWS states it WITHOUT
         //   the `^`/`$` anchors a whole-value Smithy pattern wraps it in, so a
         //   `TaggableResource` the tagging URIs refuse is reported as
@@ -446,24 +718,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //   protocol, so it lives in `service-common` and is delegated to rather than
         //   restated — the CHECK still uses the model's pattern as written, and only
         //   the rendering drops the pair.
+        //
+        // Both live in [`stated_violations`], which is also what every wrapped operation
+        // words its refusal through. What this path cannot do is quote the value as
+        // SUBMITTED: a refusal reaches here with the violations alone, and the unelided
+        // value is only recoverable from the built input — which is why the operations are
+        // wrapped. A refusal that reaches here is one no wrapped operation saw.
         let Refusal::Invalid(violations) = refusal else {
             // An unauthenticated caller keeps the framework's 403 code and wording.
             return None;
         };
-        let restated: Vec<Violation> = violations
-            .iter()
-            .map(|violation| match &violation.kind {
-                ViolationKind::EnumValue(allowed) => Violation {
-                    path: violation.path.clone(),
-                    kind: ViolationKind::EnumValue(reported_enum_order(allowed)),
-                    value: violation.value.clone(),
-                },
-                _ => violation.clone(),
-            })
-            .collect();
-        // The code, the envelope and the `@pattern` rendering are `service-common`'s;
-        // the value set order above is this service's.
-        service_common::aws_validation_refusal(&Refusal::Invalid(restated))
+        stated_violations(violations)
     }
 
     fn override_routing_error(
@@ -492,5 +757,69 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The one thing about the wiring above that a wire test cannot see: that the
+    //! hand-maintained `wrap_operations!` list is the WHOLE surface.
+
+    use super::*;
+
+    /// This service's Smithy model, as it ships beside this crate. Read at test time
+    /// rather than embedded: it is JSON that no non-test build needs.
+    const MODEL_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-lambda-awsgirapiservice.json"
+    );
+
+    /// The one modelled operation `wrap_operations!` does not carry, because it
+    /// implements no `smithy_server_runtime::Operation` to wrap: its output binds a
+    /// `@streaming` union, so it is served by its own hand-written entry, which reads and
+    /// checks its own input against the model (`crate::ops::invoke_with_response_stream`).
+    const SERVED_BY_ITS_OWN_ENTRY: &str = "InvokeWithResponseStream";
+
+    /// RULE applied to the whole surface: every operation the model declares is served
+    /// behind [`StatedPerOperation`], under the same key the generated routing table is
+    /// keyed by — so every one of them quotes a refused value as submitted.
+    ///
+    /// The names come from the MODEL rather than from a second hand list, so an operation
+    /// added to the model and not to `wrap_operations!` fails here instead of silently
+    /// answering a refusal with the value shortened, and a key spelled differently from
+    /// the generated table's fails here instead of silently never being reached by
+    /// `override_operation`.
+    #[test]
+    fn every_modelled_operation_is_wrapped() {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: serde_json::Value =
+            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let shapes = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares shapes");
+        let operations: Vec<&str> = shapes
+            .iter()
+            .filter(|(_, shape)| shape["type"] == "operation")
+            .filter_map(|(id, _)| id.rsplit('#').next())
+            .filter(|name| *name != SERVED_BY_ITS_OWN_ENTRY)
+            .collect();
+        assert!(
+            operations.len() > 80,
+            "case the model's surface: expected this service's whole operation surface, \
+             got {} operations",
+            operations.len()
+        );
+
+        let service = EmulatedService::new(Arc::new(engine::InMemoryEngine::new()));
+        for operation in operations {
+            assert!(
+                service.stated.get(operation).is_some(),
+                "case {operation}: every modelled operation is served behind \
+                 StatedPerOperation; this one is missing from wrap_operations!, so a value \
+                 its refusal quotes is the framework's shortened rendering instead of the \
+                 bytes the caller sent"
+            );
+        }
     }
 }

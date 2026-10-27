@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMediaInsightsPipelineStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMediaInsightsPipelineStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMediaInsightsPipelineStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pauses or resumes the stored media insights pipeline the `Identifier` names — its id or
+//! its ARN: an identifier the store does not hold is the modelled 404
+//! `NotFoundException`, and a pipeline in a status the change cannot be made from is the
+//! modelled 409 `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +72,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The `MediaPipelineStatusUpdate` value that asks for a pause; the other value the
+/// enumeration carries is `Resume`. Source:
+/// `smithy_query(query="shape", shape="MediaPipelineStatusUpdate")`.
+const UPDATE_STATUS_PAUSE: &str = "Pause";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -177,18 +177,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMediaInsightsPipelineStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMediaInsightsPipelineStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMediaInsightsPipelineStatus"))
+        let _ = ctx;
+        // A blank `Identifier`, and an `UpdateStatus` outside the modelled
+        // `Pause | Resume` enumeration, never reach here: both are refused up front, and
+        // `service.rs` words that refusal as this service's 400 `BadRequestException`.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateMediaInsightsPipelineStatusErrorModeled::ServiceFailureException(
+                    crate::state::service_failure("The media pipeline store is unavailable."),
+                )
+                .into(),
+            );
+        };
+
+        let pause = input.update_status == UPDATE_STATUS_PAUSE;
+        let mut store = state.lock();
+        let updated = store
+            .set_insights_pipeline_paused(
+                &input.identifier,
+                pause,
+                ::std::time::SystemTime::now(),
+            )
+            // Nothing of the record is reported (the modelled output shape has no
+            // members), so the refusal is all this operation carries out of the store.
+            .map(|_| ());
+        match updated {
+            Ok(_) => Ok(UpdateMediaInsightsPipelineStatusOutput),
+            // Nothing in the store under that id or ARN: the modelled 404, and the normal
+            // outcome of a not-found probe.
+            Err(crate::state::StatusUpdateRefused::NoSuchPipeline) => Err(
+                UpdateMediaInsightsPipelineStatusErrorModeled::NotFoundException(
+                    crate::state::not_found(format!(
+                        "No media insights pipeline identified by {} exists.",
+                        input.identifier
+                    )),
+                )
+                .into(),
+            ),
+            // The pipeline exists but is not in a status the requested change can be made
+            // from, which is a clash with the current state of the resource.
+            Err(crate::state::StatusUpdateRefused::WrongStatus(status)) => Err(
+                UpdateMediaInsightsPipelineStatusErrorModeled::ConflictException(
+                    crate::state::conflict(format!(
+                        "The media insights pipeline identified by {} is {status}, so its \
+                         status cannot be updated to {}.",
+                        input.identifier, input.update_status
+                    )),
+                )
+                .into(),
+            ),
+        }
     }
 }

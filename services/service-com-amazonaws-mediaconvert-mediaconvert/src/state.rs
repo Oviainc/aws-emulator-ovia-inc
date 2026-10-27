@@ -3213,7 +3213,10 @@ impl JobsQueryRecord {
     /// objects, each containing a Key with an associated Values array. Note that
     /// MediaConvert queries jobs using OR logic." So a job matches when it matches ANY
     /// term — any value of any filter — and a query carrying no term at all narrows
-    /// nothing and matches every job, as a listing with no filter does.
+    /// nothing and matches every job, as a listing with no filter does. A stored query
+    /// has no term ONLY when the caller named no filter: a filter that would contribute
+    /// none — no key, or no value to compare the key's job detail with — is refused when
+    /// the query is started, so no filter list can widen a query by being dropped.
     pub fn matches(&self, job: &JobRecord) -> bool {
         self.terms.is_empty()
             || self

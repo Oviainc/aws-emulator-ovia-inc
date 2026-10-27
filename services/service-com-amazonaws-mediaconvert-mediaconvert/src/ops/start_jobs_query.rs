@@ -172,9 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Provide one or more JobsQueryFilter objects, each containing a Key with an
-        // associated Values array": a filter naming no key describes no job detail to
-        // match on, so it is a problem in the request, refused naming the member it is
-        // in. The key itself targets the `JobsQueryFilterKey` enum, so a key the model
+        // associated Values array": a filter is a key-value pair, so BOTH halves have to
+        // be there for it to describe anything to match — one naming no key names no job
+        // detail, and one carrying no value (absent or empty) names nothing to compare
+        // that detail with. Either way the request asks to narrow by a filter that cannot
+        // narrow, which is a problem in the request, refused naming the member it is in
+        // rather than silently dropped (a dropped filter would WIDEN the query to every
+        // job). The key itself targets the `JobsQueryFilterKey` enum, so a key the model
         // does not declare is already refused before this handler runs.
         let mut terms = Vec::new();
         for filter in input.filter_list.iter().flatten() {
@@ -189,7 +193,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            for value in filter.values.iter().flatten() {
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.is_empty() {
+                return Err(StartJobsQueryErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(
+                            "You must specify Values for each JobsQueryFilter in filterList."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            for value in values {
                 terms.push(crate::state::JobsQueryTerm {
                     key: key.to_string(),
                     value: value.clone(),

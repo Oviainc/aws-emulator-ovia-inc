@@ -101,12 +101,19 @@ async fn listed_jobs(service: &HealthLake, datastore_id: &str) -> Vec<Value> {
 /// `S3Uri` matches `^s3://[a-z0-9][\.\-a-z0-9]{1,61}[a-z0-9](/.*)?$` (len
 /// ..1024) and `KmsKeyId` matches the `EncryptionKeyID` pattern (a bare key id,
 /// an `alias/...`, or a full KMS ARN; len 1..400).
-fn output_data_config(s3_uri: &str, kms_key_id: &str) -> Value {
+///
+/// `pub(crate)` beside [`start_request`] so the sibling suites of this test
+/// target build a start the same way rather than each growing its own copy.
+pub(crate) fn output_data_config(s3_uri: &str, kms_key_id: &str) -> Value {
     json!({ "S3Configuration": { "S3Uri": s3_uri, "KmsKeyId": kms_key_id } })
 }
 
 /// A `StartFHIRExportJob` request body for `datastore_id`.
-fn start_request(datastore_id: &str, job_name: Option<&str>, output: &Value) -> Value {
+///
+/// `pub(crate)` so the sibling suites of this test target send the same start
+/// this one does: `tests/all/idempotency_replay_precedes_state_gates.rs` repeats
+/// one of these under one `ClientToken`.
+pub(crate) fn start_request(datastore_id: &str, job_name: Option<&str>, output: &Value) -> Value {
     let mut request = json!({
         "DatastoreId": datastore_id,
         "DataAccessRoleArn": DATA_ACCESS_ROLE_ARN,

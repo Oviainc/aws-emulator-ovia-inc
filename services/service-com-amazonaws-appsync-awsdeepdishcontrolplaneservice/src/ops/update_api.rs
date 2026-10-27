@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: replaces the stored `Api`'s configuration with what the request carries,
+//! keeping the identity its create minted, and answers from the record it wrote — the
+//! same record `GetApi` projects.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApi"))
+        // Which API is updated, and to what, depends only on the request body and the
+        // `apiId` in its URI: the API already exists, so nothing here is derived from
+        // the request's metadata (its ARN and endpoints were minted by the create).
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateApiErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(UpdateApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The configuration the API is to be left with has to be well formed on the
+        // same grounds as the one it was created with — an authorization type that is
+        // set up through a member of its own needs that member, no type may be set up
+        // twice, an OIDC issuer has to be an absolute URL, and every authorization mode
+        // has to name a type the configuration's own providers set up. The rules live
+        // in [`crate::state::event_config_refusal`], shared with `CreateApi`, and are
+        // checked BEFORE anything is written, so a refused update leaves the stored API
+        // exactly as it was.
+        if let Some(message) = crate::state::event_config_refusal(&input.event_config) {
+            return Err(UpdateApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let mut guard = state.lock();
+        // Only an `Api` is updated here: a GraphQL API is a resource of its own, so its
+        // id names no `Api` and this call is a not-found.
+        let Some(record) = guard.event_apis.get_mut(&input.api_id) else {
+            return Err(UpdateApiErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // "Updates an Api": the request carries the API's whole configuration (`name`
+        // and `eventConfig` are required on it), so the submitted configuration
+        // REPLACES the stored one member for member — a member the request omits is
+        // left absent rather than carried over from the previous configuration, exactly
+        // as the same member omitted on the create would have been.
+        record.name = input.name;
+        record.owner_contact = input.owner_contact;
+        record.event_config = input.event_config;
+
+        // Everything the update request carries no member for is the API's identity or
+        // was fixed when it was created, so it survives the update untouched: the
+        // `apiId`, the ARN, the endpoints (`dns`), the creation instant, the tags (which
+        // `TagResource` and `UntagResource` own), the X-Ray flag, the associated web
+        // ACL, and the channel namespaces and API keys held under the API.
+
+        // Answer from the STORED record, so this body is the one `GetApi` and `ListApis`
+        // answer with afterwards.
+        Ok(UpdateApiOutput {
+            api: Some(record.to_api()),
+        })
     }
 }

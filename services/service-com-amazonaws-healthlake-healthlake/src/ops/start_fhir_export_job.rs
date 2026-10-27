@@ -18,7 +18,10 @@
 //! `ClientToken` is this operation's `@idempotencyToken`: a repeat of the SAME
 //! call carrying a token already seen answers out of the job that token started
 //! instead of starting a second one, and a token reused with a DIFFERENT request
-//! is refused.
+//! is refused. That replay is resolved BEFORE the gates above — the retry a
+//! token exists to make safe is answered out of the record it minted, so a
+//! change made to the data store after the first start cannot turn the repeat
+//! into a refusal.
 //!
 //! WRITING THE EXPORTED DATA to the destination bucket is a transmission this
 //! emulator cannot perform (it opens no connection and reaches no bucket), so
@@ -201,6 +204,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_lifecycle();
         store.settle_export_jobs();
 
+        // `ClientToken` is this operation's `@idempotencyToken`: a repeat of the
+        // SAME call carrying a token already seen is answered out of the job
+        // that token started, so one token starts one export job. A token reused
+        // with a different request is a different request, and is refused rather
+        // than answered with the earlier job.
+        //
+        // Resolved BEFORE any gate on the data store this start names, like
+        // every other idempotent mint here: the retry a token exists to make
+        // safe is answered out of the record that token minted, so a change
+        // made to the data store AFTER the first start cannot turn the repeat
+        // into a refusal. A first start — one no held job carries the token of —
+        // finds nothing here and falls through to the same gates it always did.
+        let fingerprint = request_fingerprint(&input);
+        if let Some(started) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.export_job_for_client_token(token))
+        {
+            if started.request_fingerprint != fingerprint {
+                return Err(StartFHIRExportJobErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "ClientToken was already used for a different StartFHIRExportJob \
+                             request"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            // Answered out of the STORED record, so a repeat cannot report a
+            // status the job has already left.
+            return Ok(StartFHIRExportJobOutput {
+                job_id: started.id.clone(),
+                job_status: started.status.as_wire().to_string(),
+                datastore_id: Some(started.datastore_id.clone()),
+            });
+        }
+
         // How many FHIR resources the data store holds is what this export
         // would have to transmit, so it is read in the same borrow that
         // resolves the data store's state.
@@ -249,38 +291,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             datastore.fhir_resources.len()
         };
-
-        // `ClientToken` is this operation's `@idempotencyToken`: a repeat of the
-        // SAME call carrying a token already seen is answered out of the job
-        // that token started, so one token starts one export job. A token reused
-        // with a different request is a different request, and is refused rather
-        // than answered with the earlier job.
-        let fingerprint = request_fingerprint(&input);
-        if let Some(started) = input
-            .client_token
-            .as_deref()
-            .and_then(|token| store.export_job_for_client_token(token))
-        {
-            if started.request_fingerprint != fingerprint {
-                return Err(StartFHIRExportJobErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(
-                            "ClientToken was already used for a different StartFHIRExportJob \
-                             request"
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into());
-            }
-            // Answered out of the STORED record, so a repeat cannot report a
-            // status the job has already left.
-            return Ok(StartFHIRExportJobOutput {
-                job_id: started.id.clone(),
-                job_status: started.status.as_wire().to_string(),
-                datastore_id: Some(started.datastore_id.clone()),
-            });
-        }
 
         // The store holds a bounded number of job records. A job is only dropped
         // with the data store it exported from, so there is nothing to reap

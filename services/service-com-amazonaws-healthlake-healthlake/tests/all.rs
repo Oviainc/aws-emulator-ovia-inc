@@ -49,6 +49,8 @@ mod fhir_import_job_listing;
 mod fhir_rest_and_validate_source;
 #[path = "all/fhir_update_interaction.rs"]
 mod fhir_update_interaction;
+#[path = "all/idempotency_replay_precedes_state_gates.rs"]
+mod idempotency_replay_precedes_state_gates;
 #[path = "all/list_data_transformation_profile_versions.rs"]
 mod list_data_transformation_profile_versions;
 #[path = "all/list_data_transformation_profiles.rs"]

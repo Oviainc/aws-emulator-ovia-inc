@@ -25,6 +25,8 @@ mod connector_deletion;
 mod connector_lifecycle;
 #[path = "all/connector_oidc_parameters.rs"]
 mod connector_oidc_parameters;
+#[path = "all/connector_projection_agreement.rs"]
+mod connector_projection_agreement;
 #[path = "all/connector_vpc_endpoint.rs"]
 mod connector_vpc_endpoint;
 #[path = "all/region_isolation.rs"]

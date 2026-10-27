@@ -163,26 +163,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // transition the clock already owed.
         store.settle_clock(::std::time::SystemTime::now());
 
-        let Some(pipeline) = store.capture_pipeline(&input.media_pipeline_id) else {
-            return Err(GetMediaPipelineErrorModeled::NotFoundException(
-                crate::state::not_found(format!(
-                    "No media pipeline with the ID {} exists.",
-                    input.media_pipeline_id
-                )),
-            )
-            .into());
-        };
+        // One id space across the kinds, so the id is looked for among every kind the
+        // store holds and the member for the kind it names is the one populated.
+        if let Some(pipeline) = store.capture_pipeline(&input.media_pipeline_id) {
+            return Ok(GetMediaPipelineOutput {
+                media_pipeline: Some(MediaPipeline {
+                    media_capture_pipeline: Some(pipeline.as_modeled()),
+                    media_live_connector_pipeline: None,
+                    media_concatenation_pipeline: None,
+                    media_insights_pipeline: None,
+                    media_stream_pipeline: None,
+                }),
+            });
+        }
+        if let Some(pipeline) = store.insights_pipeline(&input.media_pipeline_id) {
+            return Ok(GetMediaPipelineOutput {
+                media_pipeline: Some(MediaPipeline {
+                    media_capture_pipeline: None,
+                    media_live_connector_pipeline: None,
+                    media_concatenation_pipeline: None,
+                    media_insights_pipeline: Some(pipeline.as_modeled()),
+                    media_stream_pipeline: None,
+                }),
+            });
+        }
 
-        Ok(GetMediaPipelineOutput {
-            media_pipeline: Some(MediaPipeline {
-                // The id names a CAPTURE pipeline, so only that member is
-                // populated; the members for the other kinds stay absent.
-                media_capture_pipeline: Some(pipeline.as_modeled()),
-                media_live_connector_pipeline: None,
-                media_concatenation_pipeline: None,
-                media_insights_pipeline: None,
-                media_stream_pipeline: None,
-            }),
-        })
+        Err(GetMediaPipelineErrorModeled::NotFoundException(
+            crate::state::not_found(format!(
+                "No media pipeline with the ID {} exists.",
+                input.media_pipeline_id
+            )),
+        )
+        .into())
     }
 }

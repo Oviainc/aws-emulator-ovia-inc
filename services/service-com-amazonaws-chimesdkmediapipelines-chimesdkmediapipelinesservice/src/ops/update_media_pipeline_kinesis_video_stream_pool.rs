@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMediaPipelineKinesisVideoStreamPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMediaPipelineKinesisVideoStreamPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMediaPipelineKinesisVideoStreamPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a retention change to the stored Kinesis Video Stream pool the `Identifier`
+//! names — its name or its ARN — reporting the stored record, and answers the modelled
+//! 404 `NotFoundException` when it names none.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMediaPipelineKinesisVideoStreamPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMediaPipelineKinesisVideoStreamPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMediaPipelineKinesisVideoStreamPool"))
+        let _ = ctx;
+        // A blank `Identifier`, and a `DataRetentionInHours` below the modelled minimum of
+        // 1, never reach here: both are refused up front, and `service.rs` words that
+        // refusal as this service's 400 `BadRequestException`.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateMediaPipelineKinesisVideoStreamPoolErrorModeled::ServiceFailureException(
+                    crate::state::service_failure("The media pipeline store is unavailable."),
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The change the clock already owed is materialised first, so an update is applied
+        // to the status the pool is really in.
+        store.settle_clock(now);
+
+        let retention = input
+            .stream_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.data_retention_in_hours);
+        let Some(updated) = store.update_stream_pool(&input.identifier, retention, now) else {
+            return Err(
+                UpdateMediaPipelineKinesisVideoStreamPoolErrorModeled::NotFoundException(
+                    crate::state::not_found(format!(
+                        "No Kinesis Video Stream pool identified by {} exists.",
+                        input.identifier
+                    )),
+                )
+                .into(),
+            );
+        };
+
+        Ok(UpdateMediaPipelineKinesisVideoStreamPoolOutput {
+            kinesis_video_stream_pool_configuration: Some(updated.as_modeled()),
+        })
     }
 }
