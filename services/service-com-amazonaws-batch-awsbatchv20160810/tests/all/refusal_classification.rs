@@ -572,11 +572,15 @@ async fn a_malformed_name_states_the_pattern_requirement_for_its_member() {
             let detail = format!("{member} should match a valid pattern.");
             let (status, refused) = batch.call(uri, body).await;
             assert_enveloped_refusal(&case, status, &refused, &detail);
-            // The sentence states the rule, not a bound the caller could encode.
-            let message = error_message(&refused);
+            // The sentence states the rule, not a bound the caller could encode. The
+            // assertion reads the STATED sentence out of the envelope rather than the
+            // whole message, because the envelope also carries the refused call's
+            // freshly minted request id — per-run hex whose digits can spell any
+            // literal, which is not something a claim about the WORDING may read.
+            let (stated, _request_id) = enveloped(&case, &error_message(&refused));
             assert!(
-                !message.contains("128") && !message.contains("underscores"),
-                "case {case:?}: the refusal must publish no length or charset, got {message:?}"
+                !stated.contains("128") && !stated.contains("underscores"),
+                "case {case:?}: the refusal must publish no length or charset, got {stated:?}"
             );
             assert_eq!(
                 state::name_pattern_detail(member),

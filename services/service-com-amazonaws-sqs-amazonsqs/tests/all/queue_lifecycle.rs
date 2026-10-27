@@ -9,9 +9,8 @@
 //!
 //! - re-creating an existing name answers with that queue's url when the request asks
 //!   for nothing different about it, and is refused `QueueNameExists` when it does; the
-//!   attributes left out of that comparison are the crate's own catalog
-//!   ([`ATTRIBUTES_NOT_COMPARED_ON_RECREATE`]), and a tag set the request supplies is
-//!   part of it;
+//!   access policy is part of that comparison (its own rows live in
+//!   `recreate_and_tag_rules`), and so is a tag set the request supplies;
 //! - "If you delete a queue, you must wait at least 60 seconds before creating a queue
 //!   with the same name" — the re-create inside that interval is refused
 //!   `QueueDeletedRecently` and creates nothing;
@@ -28,40 +27,13 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{
-    ATTRIBUTES_NOT_COMPARED_ON_RECREATE, LIST_QUEUES_MAX_RESULTS_RANGE, POLICY,
-    RESERVED_TAG_KEY_PREFIX,
+    LIST_QUEUES_MAX_RESULTS_RANGE, RESERVED_TAG_KEY_PREFIX,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{
-    all_attributes, call, create, create_ok, emulator, error_code, list_tags, message_counts, ok,
+    call, create, create_ok, emulator, error_code, list_tags, message_counts, ok,
 };
-
-/// Two different, valid values for one attribute the re-create comparison leaves out,
-/// so a row can assert that a DIFFERENT value for it is still idempotent.
-///
-/// The catalog is the crate's own [`ATTRIBUTES_NOT_COMPARED_ON_RECREATE`]; the test
-/// below asserts this function covers every entry of it, so adding an attribute there
-/// without a value pair here fails rather than silently going untested.
-fn values_for(attribute: &str) -> Option<(String, String)> {
-    let policy = |sid: &str| {
-        json!({
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Sid": sid,
-                "Effect": "Allow",
-                "Principal": {"AWS": "arn:aws:iam::210987654321:root"},
-                "Action": "sqs:SendMessage",
-                "Resource": "*",
-            }],
-        })
-        .to_string()
-    };
-    match attribute {
-        POLICY => Some((policy("first"), policy("second"))),
-        _ => None,
-    }
-}
 
 /// Create the queue `name` with `tags` and return its url.
 async fn create_tagged(router: &MultiServiceRouter, name: &str, tags: &Value) -> String {
@@ -81,77 +53,6 @@ async fn create_tagged(router: &MultiServiceRouter, name: &str, tags: &Value) ->
 async fn held(router: &MultiServiceRouter, url: &str) -> i64 {
     let (available, delayed, _in_flight) = message_counts(router, url).await;
     available + delayed
-}
-
-/// An attribute the re-create comparison leaves out does not make a re-create conflict:
-/// the second call is answered with the existing queue's url whether it names a
-/// different value for that attribute, names none at all, or adds one the first did
-/// not — and the queue keeps the value it was created with either way.
-#[tokio::test]
-async fn re_creating_a_name_ignores_the_attributes_outside_the_compared_set() {
-    let router = emulator();
-
-    // Every attribute in the catalog has a value pair, so the rows below span it.
-    let uncovered: Vec<&str> = ATTRIBUTES_NOT_COMPARED_ON_RECREATE
-        .iter()
-        .copied()
-        .filter(|attribute| values_for(attribute).is_none())
-        .collect();
-    assert!(
-        uncovered.is_empty(),
-        "case the catalog of attributes outside the comparison: no value pair for {uncovered:?}"
-    );
-
-    for attribute in ATTRIBUTES_NOT_COMPARED_ON_RECREATE {
-        let (first, second) = values_for(attribute).expect("every entry has a value pair");
-        // (case, what the first create set, what the second create asks for, the value
-        // the queue must still carry)
-        let rows: Vec<(String, Value, Value, Option<String>)> = vec![
-            (
-                format!("{attribute} changed by the second create"),
-                json!({ *attribute: first.clone() }),
-                json!({ *attribute: second.clone() }),
-                Some(first.clone()),
-            ),
-            (
-                format!("{attribute} dropped by the second create"),
-                json!({ *attribute: first.clone() }),
-                json!({}),
-                Some(first.clone()),
-            ),
-            (
-                format!("{attribute} added by the second create"),
-                json!({}),
-                json!({ *attribute: second.clone() }),
-                None,
-            ),
-            (
-                format!("{attribute} identical in both creates"),
-                json!({ *attribute: first.clone() }),
-                json!({ *attribute: first.clone() }),
-                Some(first.clone()),
-            ),
-        ];
-
-        for (index, (case, created_with, re_created_with, still_carried)) in
-            rows.iter().enumerate()
-        {
-            let name = format!("uncompared-{attribute}-{index}");
-            let url = create_ok(&router, &name, created_with).await;
-            let (status, parsed) = create(&router, &name, re_created_with).await;
-            assert_eq!(
-                (status, parsed["QueueUrl"].as_str()),
-                (200, Some(url.as_str())),
-                "case {case}: expected the existing url {url}, got {status} with {parsed}"
-            );
-            let reported = all_attributes(&router, &url).await;
-            assert_eq!(
-                reported.get(*attribute),
-                still_carried.as_ref(),
-                "case {case}: the re-create must leave the stored attribute alone, got {reported:?}"
-            );
-        }
-    }
 }
 
 /// A re-create that supplies TAGS is idempotent only for the tag set the queue already

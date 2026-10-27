@@ -2400,6 +2400,16 @@ pub const DASHBOARD_TYPE_MANAGED: &str = "MANAGED";
 pub const DASHBOARD_STATUS_CREATING: &str = "CREATING";
 /// See [`DASHBOARD_STATUS_CREATING`]: a dashboard that has finished loading.
 pub const DASHBOARD_STATUS_CREATED: &str = "CREATED";
+/// See [`DASHBOARD_STATUS_CREATING`]: a dashboard whose last write was an update.
+///
+/// It is the status a dashboard reports from the moment an update returns for it: a
+/// read that follows a successful update observes the dashboard already updated, which
+/// is what the recorded read straight after an update reports. The model's `UPDATING`
+/// is the status CloudTrail reports while an update is still in flight, and an update
+/// this service has answered is not — nothing here claims a write it already finished
+/// is still running. `DELETING` likewise belongs to a dashboard on its way out, and
+/// `DeleteDashboard` releases the record rather than holding it in that status.
+pub const DASHBOARD_STATUS_UPDATED: &str = "UPDATED";
 
 /// Whether a dashboard created without a `TerminationProtectionEnabled` member is
 /// protected from deletion.
@@ -2445,7 +2455,9 @@ pub const LIST_DASHBOARDS_MAX_PAGE_SIZE: usize = 1_000;
 /// time to fully load the resource", so a new dashboard IS loaded asynchronously.
 /// CloudTrail publishes no duration for that load, so this span is the emulator's
 /// own: short enough not to stall a workflow, non-zero so a caller that reads the
-/// dashboard straight after creating it still sees the transient status.
+/// dashboard straight after creating it still sees the transient status. An UPDATE
+/// owes no such span: a dashboard an update has returned for already reads
+/// [`DASHBOARD_STATUS_UPDATED`] (see [`DashboardRecord::record_update`]).
 pub const DASHBOARD_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
 /// `RefreshScheduleFrequencyUnit` as the model enumerates it (`HOURS | DAYS`).
@@ -2515,7 +2527,8 @@ pub struct DashboardRecord {
     pub dashboard_type: String,
     /// A `DashboardStatus` value; see [`DashboardRecord::settle`].
     pub status: String,
-    /// When `CREATING` is due to settle into `CREATED`.
+    /// When `CREATING` is due to settle into `CREATED`; see
+    /// [`DashboardRecord::settle`].
     pub settles_at: SystemTime,
     pub widgets: Vec<Widget>,
     pub refresh_schedule: Option<RefreshSchedule>,
@@ -2538,11 +2551,29 @@ impl DashboardRecord {
     ///
     /// A reporting operation may call this: the transition was due at `settles_at`
     /// whether or not anybody read the dashboard, so applying it changes nothing a
-    /// later caller would otherwise have seen.
+    /// later caller would otherwise have seen. A dashboard whose last write was an
+    /// update is owed nothing — that write settled its own status (see
+    /// [`Self::record_update`]) — so this leaves it where it stands.
     pub fn settle(&mut self, now: SystemTime) {
         if self.status == DASHBOARD_STATUS_CREATING && now >= self.settles_at {
             self.status = DASHBOARD_STATUS_CREATED.to_string();
         }
+    }
+
+    /// Record that this dashboard has just been updated: it was updated now, and the
+    /// status it reports is [`DASHBOARD_STATUS_UPDATED`].
+    ///
+    /// The updated status is reported from the moment the update returns — a read
+    /// that follows a successful update observes the dashboard already updated, which
+    /// is what the recorded read straight after an update reports — so an update owes
+    /// the clock nothing and leaves no transition behind for [`Self::settle`].
+    ///
+    /// Only a call the service documents as updating the dashboard may do this: it is
+    /// the write half of the same status machine [`Self::settle`] reads, so the
+    /// dashboard's configuration writer and its readers cannot drift.
+    pub fn record_update(&mut self, now: SystemTime) {
+        self.updated_at = now;
+        self.status = DASHBOARD_STATUS_UPDATED.to_string();
     }
 
     /// Whether this is the CloudTrail-managed Highlights dashboard.

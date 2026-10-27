@@ -3817,7 +3817,11 @@ impl Table {
     }
 
     /// Whether `attribute` is one of this table's OWN key attributes.
-    fn is_table_key(&self, attribute: &str) -> bool {
+    ///
+    /// `pub`: a `Query`'s `FilterExpression` "does not allow key attributes", so the
+    /// handler judges the attributes an expression reads against this one reading of
+    /// the key schema rather than a second copy of it.
+    pub fn is_table_key(&self, attribute: &str) -> bool {
         self.key_schema
             .iter()
             .any(|element| element.attribute_name == attribute)

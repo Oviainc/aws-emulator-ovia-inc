@@ -33,7 +33,8 @@ use crate::ops::types::{
     TermsDescriptionType, TermsType, TokenValidityUnitsType, UserAttributeUpdateSettingsType,
     UserImportJobType,
     UserPoolAddOnsType,
-    UserPoolClientType, UserPoolDescriptionType, UserPoolPolicyType, UserPoolType, UserType,
+    UserPoolClientType, UserPoolDescriptionType, UserPoolPolicyType, UserPoolReplicaType,
+    UserPoolType, UserType,
     UsernameConfigurationType, VerificationMessageTemplateType, WebAuthnConfigurationType,
 };
 
@@ -429,6 +430,57 @@ pub const DOMAIN_STATUS_UPDATING: &str = "UPDATING";
 pub const DOMAIN_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
+// User pool replicas
+//
+// A replica's `Status` is COMPUTED from what is stored plus the clock, so a
+// read renders the status the replica is in at that instant and writes
+// nothing. Each status below is one of the modelled
+// [`crate::ops::types::REPLICA_STATUS_TYPE_VALUES`] and each role one of the
+// modelled [`crate::ops::types::REPLICA_ROLE_TYPE_VALUES`].
+// ---------------------------------------------------------------------------
+
+/// "`CREATING`: The replica is being created" (`UserPoolReplicaType.Status`):
+/// what a created secondary replica reports until the clock makes its
+/// activation due.
+pub const REPLICA_STATUS_CREATING: &str = "CREATING";
+
+/// "`ACTIVE`: The replica is available for both end-user and administrator
+/// operations" (`UserPoolReplicaType.Status`).
+pub const REPLICA_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// "`INACTIVE`: The replica has been created, but is not accepting requests for
+/// end-users. Administrator configuration operations are supported"
+/// (`UserPoolReplicaType.Status`).
+pub const REPLICA_STATUS_INACTIVE: &str = "INACTIVE";
+
+/// "`PRIMARY`: The primary replica supports all end user and administrator
+/// operations" (`UserPoolReplicaType.Role`): the role the pool holds in the
+/// Region it was created in.
+pub const REPLICA_ROLE_PRIMARY: &str = "PRIMARY";
+
+/// "`SECONDARY`: The secondary replica supports a limited set of end user and
+/// administrator operations" (`UserPoolReplicaType.Role`): the role of every
+/// replica a `CreateUserPoolReplica` call adds.
+pub const REPLICA_ROLE_SECONDARY: &str = "SECONDARY";
+
+/// How long a created secondary replica stays `CREATING` before the clock owes
+/// it `ACTIVE`.
+///
+/// A chosen span, not a documented duration: the model gives a replica that
+/// "is being created" its own status without saying how long creating takes, so
+/// a replica is NOT ready when the call returns and this emulator makes the
+/// transition due shortly after instead of waiting minutes. Never zero, so a
+/// caller listing the replicas straight after creating one still sees
+/// `CREATING`.
+pub const REPLICA_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
+
+/// The feature a tier refusal names for a replica: replicating a user pool to
+/// another Region needs a feature plan other than [`LITE_USER_POOL_TIER`], and
+/// a refusal reports it through [`feature_unavailable_in_tier_message`] the way
+/// every other tier refusal does.
+pub const REPLICATION_FEATURE: &str = "Multi-Region user pool replication";
+
+// ---------------------------------------------------------------------------
 // User import jobs
 //
 // A job's `Status` is COMPUTED from what is stored plus the clock, so a read
@@ -530,6 +582,9 @@ pub const MAX_RESOURCE_SERVERS_PER_POOL: usize = 1_000;
 
 /// The most identity providers one user pool holds.
 pub const MAX_IDENTITY_PROVIDERS_PER_POOL: usize = 1_000;
+
+/// The most secondary replicas one user pool holds.
+pub const MAX_REPLICAS_PER_POOL: usize = 100;
 
 /// The most user import jobs one user pool holds: `UserImportJobsListType`, the
 /// list `ListUserImportJobs` answers a pool's jobs in, is modelled with a
@@ -1201,6 +1256,13 @@ pub struct UserPool {
     /// This pool's custom domain, once one is created: `UserPoolType.CustomDomain`
     /// is a single value too, so a pool holds at most one of those as well.
     pub custom_domain: Option<UserPoolDomain>,
+    /// This pool's SECONDARY replicas, keyed by the Region each was created in
+    /// — one Region holds at most one replica of a pool, and the key is what
+    /// `UpdateUserPoolReplica` and `DeleteUserPoolReplica` name. Ascending by
+    /// Region, which is the order a listing of them serves. The PRIMARY replica
+    /// is the pool itself in [`UserPool::region`], so it is not stored a second
+    /// time here.
+    pub replicas: BTreeMap<String, UserPoolReplica>,
     pub clients: HashMap<String, UserPoolClient>,
     /// Users keyed by [`UserPool::user_key`], so a pool configured
     /// case-insensitive treats `Alice` and `alice` as one user.
@@ -2091,6 +2153,51 @@ impl UserPool {
         }
     }
 
+    /// The ARN of this pool in `region`: a replicated user pool keeps ONE id
+    /// across the Regions it is replicated to (`CreateUserPoolReplica` takes
+    /// the pool's id and a Region and mints no second id), so a replica's ARN
+    /// is this pool's id under that Region. For [`UserPool::region`] this is
+    /// the pool's own stored ARN.
+    pub fn arn_in_region(&self, region: &str) -> String {
+        if region == self.region {
+            return self.arn.clone();
+        }
+        ::engine::emulator_arn(SIGNING_NAME, region, &format!("userpool/{}", self.id))
+    }
+
+    /// The modelled view of this pool's PRIMARY replica: the pool itself, in
+    /// the Region it was created in. `ListUserPoolReplicas` lists "both primary
+    /// and secondary replicas", and the pool serves every operation in its own
+    /// Region, which is what [`REPLICA_STATUS_ACTIVE`] reports.
+    pub fn to_primary_replica(&self) -> UserPoolReplicaType {
+        UserPoolReplicaType {
+            region_name: Some(self.region.clone()),
+            status: Some(REPLICA_STATUS_ACTIVE.to_string()),
+            role: Some(REPLICA_ROLE_PRIMARY.to_string()),
+            user_pool_arn: Some(self.arn.clone()),
+        }
+    }
+
+    /// Every Region this pool holds a replica in, ASCENDING: its own Region,
+    /// where the primary lives, beside every secondary a create added. The
+    /// stable order a page token indexes into.
+    pub fn replica_regions(&self) -> Vec<String> {
+        let mut regions: Vec<String> = self.replicas.keys().cloned().collect();
+        regions.push(self.region.clone());
+        regions.sort();
+        regions.dedup();
+        regions
+    }
+
+    /// The modelled view of this pool's replica in `region` as of `now`, or
+    /// `None` when the pool holds none there.
+    pub fn to_replica_in(&self, region: &str, now: SystemTime) -> Option<UserPoolReplicaType> {
+        if let Some(replica) = self.replicas.get(region) {
+            return Some(replica.to_user_pool_replica_type(now));
+        }
+        (region == self.region).then(|| self.to_primary_replica())
+    }
+
     /// The modelled view of this pool, rendered from what is stored.
     pub fn to_user_pool_type(&self) -> UserPoolType {
         UserPoolType {
@@ -2154,9 +2261,10 @@ impl UserPool {
             last_modified_date: Some(to_date_time(self.last_modified_date)),
             creation_date: Some(to_date_time(self.creation_date)),
             // "A list of Amazon Web Services Regions where replicas of this
-            // user pool exist" — nothing in this emulator stores a replica, so
-            // there is no replication to report for any pool.
-            replica_regions: None,
+            // user pool exist": exactly the Regions `ListUserPoolReplicas`
+            // reports a replica in, so the two readers never disagree. A pool
+            // nothing replicated reports none rather than its own Region alone.
+            replica_regions: (!self.replicas.is_empty()).then(|| self.replica_regions()),
         }
     }
 }
@@ -2272,6 +2380,78 @@ impl UserPoolDomain {
             custom_domain_config: self.custom_domain_config.clone(),
             managed_login_version: Some(self.managed_login_version),
             routing: self.routing.clone(),
+        }
+    }
+}
+
+/// One stored SECONDARY replica of a user pool: what `CreateUserPoolReplica`
+/// persisted and every later read of that replica renders.
+///
+/// The PRIMARY replica is the pool itself in [`UserPool::region`], rendered by
+/// [`UserPool::to_primary_replica`], so it is not stored here a second time.
+#[derive(Debug, Clone)]
+pub struct UserPoolReplica {
+    /// The Region the replica was created in, which is this resource's key.
+    pub region_name: String,
+    /// The ARN of the replica user pool: this pool's id under the replica's
+    /// Region ([`UserPool::arn_in_region`]).
+    pub user_pool_arn: String,
+    /// The tags the create submitted. "You can maintain tags independently on
+    /// replica user pools" (`CreateUserPoolReplica.UserPoolTags`), so these are
+    /// the replica's own rather than the pool's.
+    pub tags: HashMap<String, String>,
+    /// When the replica was created.
+    pub creation_date: SystemTime,
+    /// The instant the clock owes this replica's `CREATING` -> `ACTIVE` move.
+    /// Stored, never slept on: a read computes the status from it.
+    pub active_at: SystemTime,
+    /// The status an `UpdateUserPoolReplica` call last wrote, which SUPERSEDES
+    /// the clock-owed one: that operation is how a caller "modif[ies] the
+    /// status to activate or deactivate the replica", so the status it set is
+    /// the status every later read reports. `None` until a call sets one.
+    pub requested_status: Option<String>,
+}
+
+impl UserPoolReplica {
+    /// A new secondary replica in `region_name`, `CREATING` until the clock
+    /// makes its activation due one [`REPLICA_ACTIVATION_SPAN`] from `now`.
+    pub fn new(
+        region_name: String,
+        user_pool_arn: String,
+        tags: HashMap<String, String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            region_name,
+            user_pool_arn,
+            tags,
+            creation_date: now,
+            active_at: now + REPLICA_ACTIVATION_SPAN,
+            requested_status: None,
+        }
+    }
+
+    /// This replica's `ReplicaStatusType` as of `now`: the status a call last
+    /// set, else `CREATING` until the clock has made its activation due and
+    /// `ACTIVE` from then on.
+    pub fn status(&self, now: SystemTime) -> &str {
+        if let Some(status) = &self.requested_status {
+            return status;
+        }
+        if now >= self.active_at {
+            REPLICA_STATUS_ACTIVE
+        } else {
+            REPLICA_STATUS_CREATING
+        }
+    }
+
+    /// The modelled view of this replica, rendered from what is stored.
+    pub fn to_user_pool_replica_type(&self, now: SystemTime) -> UserPoolReplicaType {
+        UserPoolReplicaType {
+            region_name: Some(self.region_name.clone()),
+            status: Some(self.status(now).to_string()),
+            role: Some(REPLICA_ROLE_SECONDARY.to_string()),
+            user_pool_arn: Some(self.user_pool_arn.clone()),
         }
     }
 }
@@ -5341,6 +5521,7 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         tags: HashMap::new(),
         domain: None,
         custom_domain: None,
+        replicas: BTreeMap::new(),
         clients: HashMap::new(),
         users: HashMap::new(),
         groups: BTreeMap::new(),

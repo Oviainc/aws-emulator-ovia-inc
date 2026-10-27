@@ -180,6 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "MaxResults",
                 sqs::LIST_DEAD_LETTER_SOURCE_QUEUES_MAX_RESULTS_RANGE,
                 requested,
+                // The same sentence `ListQueues` answers with: this listing's
+                // `MaxResults` publishes the same range in the same words ("Value range
+                // is 1 to 1000"), so the refusal states that range the same way.
+                sqs::MaxResultsWording::IntegerBetween,
             ) {
                 return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(why));
             }
