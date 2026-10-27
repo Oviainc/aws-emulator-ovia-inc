@@ -292,18 +292,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // The attachment itself: the disk names the instance it is attached
             // to and the path it is exposed at, and its state is `in-use` for as
-            // long as that stands. The modelled `DiskState` enum has no
-            // "attaching" member — `pending` is a disk being provisioned — so
-            // there is no transient state for a span to show here; what the clock
-            // owes is the operation-log entry's terminal status, exactly as it
-            // does for every other mutating Lightsail call.
+            // long as that stands — with nothing the clock still owes that would
+            // release the attachment, which is what `StoredDisk::attach_to`
+            // records. The modelled `DiskState` enum has no "attaching" member —
+            // `pending` is a disk being provisioned — so there is no transient
+            // state for a span to show here; what the clock owes is the
+            // operation-log entry's terminal status, exactly as it does for every
+            // other mutating Lightsail call.
             let Some(disk) = store.disk_mut(&disk_name) else {
                 // Unreachable: the disk was read above under this same lock.
                 return Err(not_found(crate::state::RESOURCE_TYPE_DISK, &disk_name));
             };
-            disk.attached_to = Some(instance_name.clone());
-            disk.path = Some(disk_path);
-            disk.state = crate::state::DISK_STATE_IN_USE;
+            disk.attach_to(instance_name, disk_path);
 
             // `operations` is a list because other Lightsail calls act on
             // several resources at once; `AttachDisk` acts on exactly one disk,

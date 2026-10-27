@@ -129,7 +129,15 @@ pub(crate) async fn create_running_instance(emulator: &Emulator, name: &str, zon
 
 /// Create the disk `name` of `size_in_gb` in `zone` and wait until it is
 /// available.
-async fn create_available_disk(emulator: &Emulator, name: &str, zone: &str, size_in_gb: i64) {
+///
+/// `pub(crate)` so a sibling suite in this test target stands a disk up the same
+/// way rather than writing the create a second time.
+pub(crate) async fn create_available_disk(
+    emulator: &Emulator,
+    name: &str,
+    zone: &str,
+    size_in_gb: i64,
+) {
     emulator
         .ok(
             "CreateDisk",
