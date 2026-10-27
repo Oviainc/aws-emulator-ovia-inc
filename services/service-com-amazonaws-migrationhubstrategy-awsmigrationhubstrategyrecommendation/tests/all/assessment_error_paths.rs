@@ -14,13 +14,14 @@
 //!    at all and so has no value to refuse, reports an account with no assessment as a
 //!    missing resource (`ResourceNotFoundException`, 404) — the whole input-less class is
 //!    tabled in `input_less_reads.rs`.
-//! 2. A constraint a request member's documentation states in prose that its `@pattern`
-//!    and `@length` cannot express — "the bucket name must begin with
-//!    `migrationhub-strategy-`" — is enforced by the handler, which refuses the request
-//!    with `ValidationException` (400) before any state is created: naming the member and
-//!    the prefix when the operation cannot run without a bucket it was not given, and
-//!    naming the prefix requirement and the permissions reason behind it when the name it
-//!    was given is not one the service may reach.
+//! 2. A bucket member the operation cannot run without is refused with
+//!    `ValidationException` (400) naming the member and the documented
+//!    `migrationhub-strategy-` prefix, and a bucket member naming a bucket the service
+//!    cannot use is refused with the same status under the reason of the condition that
+//!    holds — here, in an emulator holding no object storage at all, the missing-bucket
+//!    one, which names the bucket the request sent. Which of the two bucket refusals a
+//!    name earns is tabled in `start_call_bucket_reachability.rs`; both are decided before
+//!    any state is created.
 //!
 //! Every row goes through the router, so each case exercises routing, the boundary
 //! validator, the handler and error serialization — the same path a client takes.
@@ -37,11 +38,10 @@ use crate::import_and_assess::{
 /// than taken from the crate so a wrong constant in `src/state.rs` fails this test.
 const REQUIRED_PREFIX: &str = "migrationhub-strategy-";
 
-/// The failure reason a refusal of a bucket name that does not carry that prefix has to
-/// name: the PERMISSIONS one, which tells the caller the name has to be fixed — and never
-/// the not-found one, which says the service could not reach a bucket that may appear
-/// later and which a client is expected to retry. Spelled out here for the same reason as
-/// the prefix.
+/// The failure reason a refusal of a bucket name no bucket of this account answers to has
+/// to carry — the not-found one, which tells the caller to create or correct the bucket —
+/// and the one it must NOT carry, the permissions reason, which says the bucket is there
+/// and the service may not reach it. Spelled out here for the same reason as the prefix.
 const PERMISSIONS_REASON: &str = "[S3PermissionsIsIncorrect]";
 const NOT_FOUND_REASON: &str = "[S3BucketNotFound]";
 
@@ -200,9 +200,10 @@ enum Refusal {
     /// The operation cannot run without the bucket and was not given one: the message
     /// names the MEMBER and the prefix a bucket for it has to carry.
     Missing(&'static str),
-    /// The member names a bucket the service may not reach: the message names the prefix
-    /// a usable name has to begin with, under the permissions failure reason.
-    Prefix,
+    /// The member names a bucket this account holds none of — this emulator mounts no
+    /// object storage, so every name it does not provision for itself is one: the message
+    /// names the submitted bucket, under the not-found failure reason.
+    Unreachable(&'static str),
 }
 
 /// A `StartImportFileTask` request with the two members that are not buckets filled in.
@@ -246,19 +247,19 @@ fn bucket_cases() -> Vec<BucketCase> {
             case: "StartAssessment with a pattern-legal bucket that has no prefix",
             operation: "StartAssessment",
             request: json!({"s3bucketForAnalysisData": "my-bucket"}),
-            refusal: Some(Refusal::Prefix),
+            refusal: Some(Refusal::Unreachable("my-bucket")),
         },
         BucketCase {
             case: "StartAssessment with the prefix one character short",
             operation: "StartAssessment",
             request: json!({"s3bucketForAnalysisData": "migrationhub-strategy"}),
-            refusal: Some(Refusal::Prefix),
+            refusal: Some(Refusal::Unreachable("migrationhub-strategy")),
         },
         BucketCase {
             case: "StartAssessment with the prefix somewhere other than the start",
             operation: "StartAssessment",
             request: json!({"s3bucketForAnalysisData": "x-migrationhub-strategy-analysis"}),
-            refusal: Some(Refusal::Prefix),
+            refusal: Some(Refusal::Unreachable("x-migrationhub-strategy-analysis")),
         },
         BucketCase {
             case: "StartAssessment with the shortest conforming analysis bucket",
@@ -273,7 +274,7 @@ fn bucket_cases() -> Vec<BucketCase> {
                 "s3bucketForAnalysisData": "migrationhub-strategy-analysis",
                 "s3bucketForReportData": "my-reports",
             }),
-            refusal: Some(Refusal::Prefix),
+            refusal: Some(Refusal::Unreachable("my-reports")),
         },
         BucketCase {
             case: "StartAssessment with both buckets conforming",
@@ -289,13 +290,13 @@ fn bucket_cases() -> Vec<BucketCase> {
             case: "StartImportFileTask with a bare import bucket",
             operation: "StartImportFileTask",
             request: import_request("my-bucket", None),
-            refusal: Some(Refusal::Prefix),
+            refusal: Some(Refusal::Unreachable("my-bucket")),
         },
         BucketCase {
             case: "StartImportFileTask with a conforming import bucket and a bare report bucket",
             operation: "StartImportFileTask",
             request: import_request("migrationhub-strategy-import", Some("reports")),
-            refusal: Some(Refusal::Prefix),
+            refusal: Some(Refusal::Unreachable("reports")),
         },
         BucketCase {
             case: "StartImportFileTask with both buckets conforming",
@@ -309,11 +310,11 @@ fn bucket_cases() -> Vec<BucketCase> {
     ]
 }
 
-/// A bucket the operation cannot run without and was not given, or a bucket name that
-/// does not begin with the documented prefix, is refused with `ValidationException`
-/// (HTTP 400) — the first naming the member and the prefix, the second naming the prefix
-/// requirement under the permissions failure reason — and nothing is minted. A conforming
-/// request is accepted on the same path.
+/// A bucket the operation cannot run without and was not given, or a bucket name no bucket
+/// of this account answers to, is refused with `ValidationException` (HTTP 400) — the first
+/// naming the member and the prefix, the second naming the submitted bucket under the
+/// not-found failure reason — and nothing is minted. A conforming request is accepted on
+/// the same path.
 #[tokio::test]
 async fn a_bucket_name_is_held_to_the_documented_prefix() {
     for BucketCase {
@@ -367,21 +368,22 @@ async fn a_bucket_name_is_held_to_the_documented_prefix() {
                      got {message:?}"
                 );
             }
-            Refusal::Prefix => {
+            Refusal::Unreachable(bucket) => {
                 assert!(
-                    message.contains(PERMISSIONS_REASON),
-                    "case {case:?}: a name that does not carry the prefix is a permissions \
-                     failure, so the refusal must name {PERMISSIONS_REASON:?}, got {message:?}"
+                    message.contains(NOT_FOUND_REASON),
+                    "case {case:?}: a name no bucket of this account answers to is a \
+                     missing bucket, so the refusal must carry {NOT_FOUND_REASON:?}, got \
+                     {message:?}"
                 );
                 assert!(
-                    !message.contains(NOT_FOUND_REASON),
-                    "case {case:?}: a permanent naming failure must NOT be reported as the \
-                     transient {NOT_FOUND_REASON:?}, got {message:?}"
+                    !message.contains(PERMISSIONS_REASON),
+                    "case {case:?}: a bucket that is not there must NOT be reported under \
+                     {PERMISSIONS_REASON:?}, which says it is, got {message:?}"
                 );
                 assert!(
-                    message.contains(REQUIRED_PREFIX.trim_end_matches('-')),
-                    "case {case:?}: the refusal must name the prefix a usable bucket name \
-                     begins with, got {message:?}"
+                    message.contains(bucket),
+                    "case {case:?}: the refusal must name the submitted bucket \
+                     {bucket:?}, got {message:?}"
                 );
             }
         }

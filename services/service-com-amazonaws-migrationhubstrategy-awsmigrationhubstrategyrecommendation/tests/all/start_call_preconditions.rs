@@ -14,13 +14,15 @@
 //!    import declares the resources to assess and does not collect from them. The same
 //!    request against an account that HAS a data source is accepted.
 //!
-//! 2. A bucket member whose name does not carry the documented `migrationhub-strategy-`
-//!    prefix is refused as a PERMISSIONS failure — the message names the prefix a usable
-//!    name begins with, under the `[S3PermissionsIsIncorrect]` reason — and never as the
-//!    not-found one, which stands for a bucket the service could not reach and which a
-//!    client is documented to retry: a permanent naming mistake reported as a transient
-//!    condition sends a retrying client round a loop that can never finish. The rule holds
-//!    for every bucket member of both start calls, and nothing is minted either way.
+//! 2. A bucket member naming a bucket this account does not hold is refused as the MISSING
+//!    bucket it is — the message names the bucket the request sent, under the
+//!    `[S3BucketNotFound]` reason — and never as the permissions one, which asserts that
+//!    the bucket is there and that only its name keeps the service out: a client told that
+//!    renames a bucket that does not exist instead of creating it. The rule holds for every
+//!    bucket member of both start calls, and nothing is minted either way. The emulator
+//!    here mounts no object storage, so no name it does not provision for itself answers to
+//!    a bucket; which refusal each case earns when object storage IS mounted is tabled in
+//!    `start_call_bucket_reachability.rs`.
 //!
 //! The rows span what each rule generalises over: for the first, what the request carries
 //! (every `AssessmentDataSourceType`, targets, a report bucket) across accounts with no
@@ -51,14 +53,10 @@ const ASSESSMENT_DATA_SOURCE_TYPES: &[&str] = &[
     "StrategyRecommendationsApplicationDataCollector",
 ];
 
-/// The prefix every bucket member of this service documents, spelled out here rather than
-/// taken from the crate so a wrong constant in `src/state.rs` fails this test.
-const REQUIRED_PREFIX: &str = "migrationhub-strategy-";
-
-/// The failure reason a name that does not carry that prefix has to be reported under, and
-/// the one it must NOT be reported under.
-const PERMISSIONS_REASON: &str = "[S3PermissionsIsIncorrect]";
+/// The failure reason a name no bucket of this account answers to has to be reported
+/// under, and the one it must NOT be reported under.
 const NOT_FOUND_REASON: &str = "[S3BucketNotFound]";
+const PERMISSIONS_REASON: &str = "[S3PermissionsIsIncorrect]";
 
 /// A bucket name that satisfies the prefix, for the members a row is not probing.
 const CONFORMING_BUCKET: &str = "migrationhub-strategy-analysis";
@@ -297,11 +295,11 @@ async fn import_task_count(router: &MultiServiceRouter) -> usize {
         .unwrap_or_default()
 }
 
-/// A bucket name that does not carry the documented prefix is refused as a permissions
-/// failure naming the prefix — not as a bucket that could not be found — and no task and no
-/// assessment is created against it.
+/// A bucket name this account holds no bucket for is refused as the missing bucket it is,
+/// by a message naming the submitted name — not as a bucket the service may not reach — and
+/// no task and no assessment is created against it.
 #[tokio::test]
-async fn a_name_without_the_prefix_is_refused_as_a_permissions_failure() {
+async fn a_name_no_bucket_answers_to_is_refused_as_a_missing_bucket() {
     for row in bucket_rows() {
         let case = format!("{}${} = {:?}", row.operation, row.member, row.bucket);
         // A fresh emulator per row, with a registered collector, so an assessment row is
@@ -316,7 +314,7 @@ async fn a_name_without_the_prefix_is_refused_as_a_permissions_failure() {
 
         assert_eq!(
             answer.status, 400,
-            "case {case:?}: a name that does not carry the prefix is refused, got {} with {:?}",
+            "case {case:?}: a name no bucket answers to is refused, got {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
@@ -327,19 +325,19 @@ async fn a_name_without_the_prefix_is_refused_as_a_permissions_failure() {
         );
         let message = answer.string("/message");
         assert!(
-            message.contains(PERMISSIONS_REASON),
-            "case {case:?}: the refusal must carry the permissions failure reason \
-             {PERMISSIONS_REASON:?}, got {message:?}"
+            message.contains(NOT_FOUND_REASON),
+            "case {case:?}: the refusal must carry the missing-bucket reason \
+             {NOT_FOUND_REASON:?}, got {message:?}"
         );
         assert!(
-            !message.contains(NOT_FOUND_REASON),
-            "case {case:?}: a permanent naming failure must not be reported under the \
-             transient {NOT_FOUND_REASON:?}, got {message:?}"
+            !message.contains(PERMISSIONS_REASON),
+            "case {case:?}: a bucket that is not there must not be reported under \
+             {PERMISSIONS_REASON:?}, which says it is, got {message:?}"
         );
         assert!(
-            message.contains(REQUIRED_PREFIX.trim_end_matches('-')),
-            "case {case:?}: the refusal must name the prefix a usable bucket name begins \
-             with, got {message:?}"
+            message.contains(row.bucket),
+            "case {case:?}: the refusal must name the submitted bucket {:?}, got {message:?}",
+            row.bucket
         );
 
         // And nothing was created against the name the service refused.

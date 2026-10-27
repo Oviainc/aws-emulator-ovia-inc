@@ -24,12 +24,16 @@
 //! calendar this service publishes (`DescribeClusterVersions`), so the two cannot
 //! disagree about which versions Amazon EKS offers.
 //!
-//! `force` overrides the one upgrade readiness check this service can run: "if your
+//! `force` overrides the one upgrade readiness check that BLOCKS an update here: "if your
 //! cluster has managed node groups attached to it, all of your node groups' Kubernetes
 //! versions must match the cluster's Kubernetes version in order to update the cluster to
 //! a new Kubernetes version", which is reported as the modelled `InvalidStateException`.
-//! No other readiness issue is invented: a cluster insight is a resource this service
-//! does not hold yet, so there is none to block on.
+//! The mismatch itself is read through
+//! [`crate::state::ComAmazonawsEksAwswesleyfrontendState::mismatched_nodegroup_versions`],
+//! the same walk the cluster's `UPGRADE_READINESS` insight reports it from
+//! (`ListInsights`), so what blocks an update and what a caller is told to call
+//! `ListInsights` for cannot drift apart. No other readiness issue blocks an update:
+//! the remaining insights of a cluster are reported, not enforced.
 //!
 //! `rollbackConfig.timeoutMinutes` is "the length of time in minutes to wait before
 //! cancelling the update", a minimum-bound wait of at least 120 minutes — far longer than
@@ -426,11 +430,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // issue this service holds the state to detect, and `force` is documented as what
         // "override[s] upgrade-blocking or rollback-blocking readiness checks".
         if !input.force {
-            let lagging: Vec<String> = guard
-                .nodegroups_of(&region, &cluster_name)
-                .filter(|nodegroup| nodegroup.version != current_version)
-                .map(|nodegroup| format!("{} ({})", nodegroup.nodegroup_name, nodegroup.version))
-                .collect();
+            let lagging = guard.mismatched_nodegroup_versions(&region, &cluster_name, &current_version);
             if !lagging.is_empty() {
                 return Err(invalid_state(
                     &cluster_name,

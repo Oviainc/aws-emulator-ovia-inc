@@ -191,7 +191,7 @@ async fn an_import_key_must_name_an_object() {
 /// RULE: a bucket member is held to its `@pattern [0-9a-z]+[0-9a-z\.\-]*[0-9a-z]+` — a
 /// lower-case name of at least two characters that starts and ends with a letter or a
 /// digit — on EVERY member of EVERY start call that names a bucket, so a name the model
-/// does not admit is refused before the service's own prefix rule is reached and nothing
+/// does not admit is refused before the service's own bucket rules are reached and nothing
 /// is minted.
 #[tokio::test]
 async fn a_bucket_member_is_held_to_the_pattern_the_model_declares() {
@@ -236,29 +236,29 @@ async fn a_bucket_member_is_held_to_the_pattern_the_model_declares() {
         assert_refused(&case, &start_assessment(&router, both).await);
     }
 
-    // A name the pattern admits but the service may not use is a DIFFERENT refusal: the
-    // service's permissions sentence for a bucket outside the documented prefix, which is
-    // what tells a caller the name is the problem rather than its spelling.
+    // A name the pattern admits but that names no bucket this emulator holds is a
+    // DIFFERENT refusal: the service's missing-bucket sentence, which names the bucket the
+    // request sent rather than complaining about how it is spelled. Which of the two
+    // non-pattern refusals a name earns is tabled in `start_call_bucket_reachability.rs`.
+    let unreachable = "not-a-strategy-bucket";
     let outside_prefix = start_import_file_task(
         &router,
         json!({
             "name": "bucket-rule",
-            "S3Bucket": "not-a-strategy-bucket",
+            "S3Bucket": unreachable,
             "s3key": "servers.json",
         }),
     )
     .await;
     assert_eq!(
         outside_prefix.status, 400,
-        "a bucket outside the documented prefix must be refused, got {} with {:?}",
+        "a bucket this emulator does not hold must be refused, got {} with {:?}",
         outside_prefix.status, outside_prefix.body
     );
     assert!(
-        outside_prefix
-            .string("/message")
-            .contains("migrationhub-strategy"),
-        "a bucket outside the documented prefix must earn the service's prefix refusal, \
-         got {:?}",
+        outside_prefix.string("/message").contains(unreachable),
+        "a bucket this emulator does not hold must be refused by a message naming \
+         {unreachable:?}, got {:?}",
         outside_prefix.body
     );
 
