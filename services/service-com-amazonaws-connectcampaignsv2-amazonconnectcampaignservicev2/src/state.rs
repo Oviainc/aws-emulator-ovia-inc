@@ -403,11 +403,11 @@ pub fn communication_time_violation(
     None
 }
 
-/// Encode a `ListCampaigns` cursor: the creation sequence number of the last
-/// campaign on the page just returned, hex-encoded so the token is opaque rather
-/// than a readable position.
+/// Encode a cursor-paged list's cursor: the sequence number of the last record on
+/// the page just returned, hex-encoded so the token is opaque rather than a
+/// readable position.
 ///
-/// The cursor is a sequence number rather than an id so that a campaign deleted
+/// The cursor is a sequence number rather than an id so that a record deleted
 /// between two pages does not invalidate a token already handed out: the next
 /// page is simply everything created after that point.
 pub fn encode_next_token(last_sequence: u64) -> String {
@@ -421,6 +421,83 @@ pub fn decode_next_token(token: &str) -> Option<u64> {
         .ok()?
         .parse()
         .ok()
+}
+
+/// The page size a cursor-paged list uses when the caller names no `maxResults`:
+/// the upper bound the model declares for it (`MaxResults`, range 1..50), so an
+/// unpaged call sees as much as one page can carry.
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+
+/// A `nextToken` a caller sent that [`encode_next_token`] did not mint, which a
+/// paged list answers as a `ValidationException` carrying
+/// [`Self::message`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnissuedCursor;
+
+impl UnissuedCursor {
+    /// The sentence a paged list refuses a token this service did not issue with.
+    /// The one place that text lives, so two lists cannot word the same refusal
+    /// differently.
+    pub fn message(self) -> String {
+        "nextToken is not a cursor this service issued".to_string()
+    }
+}
+
+/// One page of a cursor-paged list: the window of items it reports and the token
+/// the call after it resumes from.
+#[derive(Debug)]
+pub struct CursorPage<'a, T> {
+    /// The items on this page, in the stored order they were given in.
+    pub page: &'a [T],
+    /// The cursor the next page starts after, absent when this page reached the
+    /// end of the items — which is how a client knows to stop paging.
+    pub next_token: Option<String>,
+}
+
+/// The window `next_token` and `max_results` name over `items`, already in stored
+/// order, each item's cursor position read by `sequence_of`.
+///
+/// The one place the rule the opaque cursor is built around lives, beside the codec
+/// that mints it ([`encode_next_token`] / [`decode_next_token`]), so every paged
+/// list of this service pages identically: the page starts at the first item whose
+/// sequence is past the cursor, runs for `max_results` items (or
+/// [`DEFAULT_PAGE_SIZE`] when the caller named none) clamped to what is left, and
+/// hands back a token — the sequence of the item it ended at — only while items
+/// remain beyond it.
+///
+/// A cursor names a position in the stored order rather than a record, so an item
+/// removed between two pages does not invalidate a token already handed out. A
+/// token this codec did not mint resolves to no position at all, which is
+/// [`UnissuedCursor`] rather than a page.
+pub fn cursor_page<'a, T>(
+    items: &'a [T],
+    sequence_of: impl Fn(&T) -> u64,
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+) -> Result<CursorPage<'a, T>, UnissuedCursor> {
+    let start = match next_token {
+        None => 0,
+        Some(token) => {
+            let after = decode_next_token(token).ok_or(UnissuedCursor)?;
+            items
+                .iter()
+                .position(|item| sequence_of(item) > after)
+                .unwrap_or(items.len())
+        }
+    };
+    let page_size = max_results
+        .and_then(|max| usize::try_from(max).ok())
+        .unwrap_or(DEFAULT_PAGE_SIZE);
+    let end = start.saturating_add(page_size).min(items.len());
+    let page = &items[start..end];
+    Ok(CursorPage {
+        next_token: if end < items.len() {
+            page.last().map(|item| encode_next_token(sequence_of(item)))
+        } else {
+            None
+        },
+        page,
+    })
 }
 
 /// `at` as the `(seconds, nanoseconds)` pair an `::aws_smithy_types::DateTime`

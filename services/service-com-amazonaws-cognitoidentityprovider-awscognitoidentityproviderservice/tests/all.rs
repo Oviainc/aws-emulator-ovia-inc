@@ -59,6 +59,8 @@ mod error_message_wording;
 mod explicit_auth_flows;
 #[path = "all/forgot_password_caller_identity.rs"]
 mod forgot_password_caller_identity;
+#[path = "all/get_client_token.rs"]
+mod get_client_token;
 #[path = "all/get_identity_provider_by_identifier.rs"]
 mod get_identity_provider_by_identifier;
 #[path = "all/get_tokens_from_refresh_token.rs"]
