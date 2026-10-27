@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApiDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApiDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApiDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates an API destination IN PLACE: each member the request carries replaces
+//! the stored one, every member it leaves out keeps its prior value, and the
+//! destination's identity — its `ApiDestinationArn` and its `CreationTime` —
+//! does not move, so every rule target naming the destination still names it
+//! after the update. Only `LastModifiedTime` advances. A name this account holds
+//! no destination under is the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +159,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApiDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApiDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApiDestination"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateApiDestinationErrorModeled::InternalException(
+                InternalException {
+                    message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `HttpMethod` is a modelled enum, which the boundary validator does not
+        // narrow to its values — so a method the enum does not have is refused
+        // here rather than stored and reported back as one AWS accepted, exactly
+        // as the create refuses it.
+        if let Some(method) = input.http_method.as_deref() {
+            if !API_DESTINATION_HTTP_METHOD_VALUES.contains(&method) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Parameter HttpMethod is not valid. Reason: {:?} is not one of {}.",
+                    method,
+                    API_DESTINATION_HTTP_METHOD_VALUES.join(" | ")
+                )));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A connection whose clock has already moved it on is settled first, so
+        // the connection this update points the destination at — and the state
+        // the response reports — are the ones they are at this instant.
+        store.settle_connections(now);
+
+        // The destination the request names is resolved BEFORE anything is
+        // written, and a name this store holds nothing under is the modelled
+        // missing-resource refusal naming the destination that was asked for.
+        if store.api_destination(&input.name).is_none() {
+            return Err(UpdateApiDestinationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::no_such_api_destination("update", &input.name)),
+                },
+            )
+            .into());
+        }
+        // A connection the request names has to exist: a destination may not be
+        // left pointing at a connection that can authorize no invocation at all.
+        if let Some(arn) = input.connection_arn.as_deref() {
+            if store.connection_by_arn(arn).is_none() {
+                return Err(UpdateApiDestinationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "{} {}",
+                            crate::state::api_destination_call_failed("update"),
+                            crate::state::no_such_connection(arn)
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        // The same account quota the create is held to: an update asking to be
+        // invoked faster than the account may invoke is refused rather than
+        // stored as a rate nothing would honour.
+        if let Some(rate) = input.invocation_rate_limit_per_second {
+            if rate > crate::state::MAX_API_DESTINATION_RATE_LIMIT {
+                return Err(UpdateApiDestinationErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "InvocationRateLimitPerSecond {rate} exceeds the maximum of {} \
+                             requests per second for an api destination.",
+                            crate::state::MAX_API_DESTINATION_RATE_LIMIT
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(destination) = store.api_destination_mut(&input.name) else {
+            return Err(UpdateApiDestinationErrorModeled::InternalException(
+                InternalException {
+                    message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        // Each member the request carries replaces the stored one; a member it
+        // leaves out leaves that setting as it was. The ARN was minted when the
+        // destination was created and is NOT re-minted, and `CreationTime` is
+        // when it was created and does not move because it was updated — only
+        // `LastModifiedTime` does.
+        if let Some(description) = input.description {
+            // `ApiDestinationDescription` is modelled `len 0..512`, so the empty
+            // description is the absence of one and clears it.
+            destination.description = (!description.is_empty()).then_some(description);
+        }
+        if let Some(arn) = input.connection_arn {
+            destination.connection_arn = arn;
+        }
+        if let Some(endpoint) = input.invocation_endpoint {
+            destination.invocation_endpoint = endpoint;
+        }
+        if let Some(method) = input.http_method {
+            destination.http_method = method;
+        }
+        if let Some(rate) = input.invocation_rate_limit_per_second {
+            destination.invocation_rate_limit_per_second = rate;
+        }
+        destination.last_modified = now;
+        let updated = destination.clone();
+
+        // Reported from the STORED record rather than from the request, so this
+        // response and `DescribeApiDestination`'s cannot disagree — the state
+        // included, which follows the connection the destination now invokes
+        // through.
+        Ok(UpdateApiDestinationOutput {
+            api_destination_arn: Some(updated.arn.clone()),
+            api_destination_state: Some(store.api_destination_state(&updated)),
+            creation_time: Some(crate::state::to_wire_timestamp(updated.created)),
+            last_modified_time: Some(crate::state::to_wire_timestamp(updated.last_modified)),
+        })
     }
 }
+

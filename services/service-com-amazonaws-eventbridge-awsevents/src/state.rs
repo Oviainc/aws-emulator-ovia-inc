@@ -2394,6 +2394,20 @@ impl ComAmazonawsEventbridgeAwseventsState {
         self.api_destinations.get(name)
     }
 
+    /// The API destination `name` names, mutably. Creates nothing: a destination
+    /// comes into existence through `CreateApiDestination`.
+    pub fn api_destination_mut(&mut self, name: &str) -> Option<&mut ApiDestinationRecord> {
+        self.api_destinations.get_mut(name)
+    }
+
+    /// Remove the API destination `name` names, answering the record that was
+    /// removed — and `None` when this store held none under that name, which is
+    /// what makes a second delete a missing-resource refusal rather than a
+    /// second removal.
+    pub fn remove_api_destination(&mut self, name: &str) -> Option<ApiDestinationRecord> {
+        self.api_destinations.remove(name)
+    }
+
     /// The `ApiDestinationState` of `destination`, derived from the connection it
     /// invokes through.
     ///
@@ -3373,6 +3387,31 @@ pub fn no_such_archive(archive_name: &str) -> String {
 /// built from the request. Written once, for the reason [`no_such_rule`] gives.
 pub fn no_such_replay(replay_name: &str) -> String {
     format!("Replay {replay_name} does not exist.")
+}
+
+/// The clause every refusal of an API-destination call opens with, for the call
+/// whose own verb is `verb` ("describe", "update", "create", "delete").
+///
+/// EventBridge's api-destination refusals say first WHICH call could not be
+/// served and then why, so the reason that follows is read against the operation
+/// that failed rather than against the resource alone. Written once, so every
+/// operation on this resource opens its refusals in the same words.
+pub fn api_destination_call_failed(verb: &str) -> String {
+    format!("Failed to {verb} the api-destination(s).")
+}
+
+/// What any operation on the API-destination resource reports for a name this
+/// store holds no destination for: the failing call
+/// ([`api_destination_call_failed`]) and then the destination the request named.
+///
+/// Written once, for the reason [`no_such_rule`] gives: a read, an update and a
+/// delete of a destination that does not exist all refuse it in the same words,
+/// differing only in the verb of the call that failed.
+pub fn no_such_api_destination(verb: &str, name: &str) -> String {
+    format!(
+        "{} An api-destination '{name}' does not exist.",
+        api_destination_call_failed(verb)
+    )
 }
 
 /// Why a replay cannot be cancelled in the state it is in.
