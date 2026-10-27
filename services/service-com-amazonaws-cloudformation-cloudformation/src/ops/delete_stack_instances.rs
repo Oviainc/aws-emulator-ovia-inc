@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStackInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStackInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStackInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: deletes the stack instances the request selects — the account and Region
+//! pairs the StackSet really holds an instance for — deleting each instance's own stack
+//! unless `RetainStacks` asks for it to be kept, and records the StackSet operation whose
+//! `OperationId` it answers, which `DescribeStackSetOperation` monitors and whose conclusion
+//! is what takes the deleted instances out of the StackSet.
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +106,25 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::{
+    detailed_status, instance_status, operation_action, operation_status, target_accounts,
+    StoredStackSetOperation,
+};
+use crate::state::status;
+
+/// One stack instance this request deletes, as the write block hands it to the deletion walk
+/// that deletes its stack's resources in the services that own them.
+struct Removal {
+    /// The target account the instance belongs to.
+    account: String,
+    /// The target Region the instance's stack lives in — where its resources were created,
+    /// and so where they are deleted.
+    region: String,
+    /// The instance's stack, by id.
+    stack_id: String,
+    /// The resources that stack still holds, which the walk deletes.
+    resources: Vec<crate::state::StoredResource>,
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -183,18 +198,291 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStackInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStackInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStackInstances"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store holding instances
+            // to delete, so nothing was written and 501 is the only honest answer.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteStackInstances",
+            ));
+        };
+        let accounts =
+            target_accounts(input.accounts.as_deref(), input.deployment_targets.as_ref())
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "The Amazon Web Services Regions where you want to delete StackSet instances."
+        if input.regions.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "You must specify at least one value for Regions",
+            ));
+        }
+        // "Deletes stack instances for the specified accounts, in the specified Amazon Web
+        // Services Regions": one instance per account and Region pair, so the PRODUCT of the
+        // two lists is what this request asks the store to walk — and both lists are the
+        // caller's. A product past the ceiling one StackSet's instances are bounded by names
+        // more pairs than that StackSet can hold an instance for, so it is refused HERE,
+        // before the store is read at all, and no oversized request drives work under the
+        // store lock. The model declares no `LimitExceededException` for this operation, so
+        // the refusal is a bad request rather than a modelled quota failure.
+        if accounts.len().saturating_mul(input.regions.len())
+            > crate::state::stack_sets::MAX_INSTANCES_PER_STACK_SET
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Accounts and Regions select more than the {} stack instances a StackSet can \
+                 hold",
+                crate::state::stack_sets::MAX_INSTANCES_PER_STACK_SET
+            )));
+        }
+        // The DISTINCT pairs the request selects: a repeated account or Region names the same
+        // account and Region pair, which carries at most ONE instance of a StackSet, so the
+        // walk below costs one lookup per distinct pair however often a request repeats one.
+        // Bounded by the product refused above.
+        let requested: ::std::collections::BTreeSet<(&str, &str)> = accounts
+            .iter()
+            .flat_map(|account| {
+                input
+                    .regions
+                    .iter()
+                    .map(move |target_region| (account.as_str(), target_region.as_str()))
+            })
+            .collect();
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        // "The operation ID also functions as an idempotency token": the caller's when it
+        // named one, otherwise the one CloudFormation assigns the operation.
+        let operation_id = input
+            .operation_id
+            .clone()
+            .unwrap_or_else(crate::state::new_operation_id);
+
+        // The store lock is taken for the write and RELEASED at the end of this block: the
+        // calls that delete each instance's resources run after it, and each of those
+        // reaches another service's own handler, which takes that service's lock.
+        let (stack_set_id, removals) = {
+            let mut store = state.lock();
+            store.settle(now);
+            let stack_set = store
+                .resolve_stack_set(&region, &input.stack_set_name)
+                .ok_or_else(|| {
+                    DeleteStackInstancesErrorModeled::StackSetNotFoundException(
+                        StackSetNotFoundException {
+                            message: Some(crate::state::stack_set_does_not_exist(
+                                &input.stack_set_name,
+                            )),
+                        },
+                    )
+                })?;
+            // "Only one operation can be performed for a stack set at a given time."
+            if stack_set.operation_in_progress() {
+                return Err(
+                    DeleteStackInstancesErrorModeled::OperationInProgressException(
+                        OperationInProgressException {
+                            message: Some(
+                                "Another operation is currently in progress for this StackSet. \
+                                 Only one operation can be performed for a stack set at a given \
+                                 time."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // "The specified operation ID already exists": the same id names the operation
+            // that already ran, so this request is not performed a second time.
+            if stack_set.operation(&operation_id).is_some() {
+                return Err(
+                    DeleteStackInstancesErrorModeled::OperationIdAlreadyExistsException(
+                        OperationIdAlreadyExistsException {
+                            message: Some(format!("Operation id {operation_id} already exists")),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let stack_set_id = stack_set.stack_set_id.clone();
+            // The operation runs as the roles the stack set carries, the way every other
+            // operation on it does.
+            let administration_role_arn = stack_set.administration_role_arn.clone();
+            let execution_role_name = stack_set.execution_role_name.clone();
+            // The deletion acts on the pairs that really carry an instance of this StackSet.
+            // A pair it holds no instance for has nothing to delete — the request asks for a
+            // state the store is already in — so it is passed over rather than refused, and
+            // the deletion of the pairs that do carry one still goes through. The pairs the
+            // StackSet holds are indexed in ONE pass, so the selection costs one lookup per
+            // requested pair rather than a scan per pair.
+            let held: ::std::collections::BTreeMap<(&str, &str), Option<String>> = stack_set
+                .instances
+                .iter()
+                .map(|instance| {
+                    (
+                        (instance.account.as_str(), instance.region.as_str()),
+                        instance.stack_id.clone(),
+                    )
+                })
+                .collect();
+            let selected: Vec<(String, String, Option<String>)> = requested
+                .iter()
+                .filter_map(|pair| {
+                    held.get(pair).map(|stack_id| {
+                        (pair.0.to_string(), pair.1.to_string(), stack_id.clone())
+                    })
+                })
+                .collect();
+
+            let mut removals: Vec<Removal> = Vec::new();
+            // The instances' own records, in ONE pass over them: the deletion is "currently
+            // in progress" in each selected account and Region until the operation concludes,
+            // and the operation that last touched those instances is this one. The StackSet
+            // is resolved once for the pass rather than once per pair.
+            let selected_pairs: ::std::collections::BTreeSet<(&str, &str)> = selected
+                .iter()
+                .map(|(account, target_region, _)| (account.as_str(), target_region.as_str()))
+                .collect();
+            if let Some(stack_set) = store.resolve_stack_set_mut(&region, &stack_set_id) {
+                for instance in &mut stack_set.instances {
+                    if !selected_pairs
+                        .contains(&(instance.account.as_str(), instance.region.as_str()))
+                    {
+                        continue;
+                    }
+                    instance.detailed_status = detailed_status::RUNNING.to_string();
+                    instance.status_reason = None;
+                    instance.last_operation_id = operation_id.clone();
+                }
+            }
+            // "Removes the stack instances from the specified StackSet, but doesn't delete
+            // the stacks": a retained stack is left exactly as it is, so only the instance
+            // records go. Otherwise each selected instance's stack is deleted, the way
+            // `DeleteStack` deletes one.
+            if !input.retain_stacks {
+                for (account, target_region, stack_id) in &selected {
+                    let Some(stack_id) = stack_id else {
+                        continue;
+                    };
+                    // The instance's stack lives in the instance's OWN Region, which is the
+                    // Region its resources were created in.
+                    let Some(stack) = store.resolve_mut(target_region, stack_id) else {
+                        continue;
+                    };
+                    if !stack.is_live() {
+                        continue;
+                    }
+                    stack.begin_transition(
+                        now,
+                        status::DELETE_IN_PROGRESS,
+                        status::DELETE_COMPLETE,
+                        Some(operation_id.clone()),
+                        Some(operation_id.clone()),
+                    );
+                    removals.push(Removal {
+                        account: account.clone(),
+                        region: target_region.clone(),
+                        stack_id: stack_id.clone(),
+                        resources: stack.current_resources().to_vec(),
+                    });
+                }
+            }
+            // The operation this call started, which `DescribeStackSetOperation` monitors:
+            // RUNNING now, SUCCEEDED once the clock makes its conclusion due — and that
+            // conclusion is what takes the deleted instances out of the StackSet.
+            if let Some(stack_set) = store.resolve_stack_set_mut(&region, &stack_set_id) {
+                let mut operation = StoredStackSetOperation::running(
+                    operation_id.clone(),
+                    operation_action::DELETE,
+                    now,
+                );
+                operation.preferences = input
+                    .operation_preferences
+                    .as_ref()
+                    .map(crate::state::stack_sets::stored_preferences);
+                // "For StackSet operations of action type DELETE, specifies whether to
+                // remove the stack instances from the specified StackSet, but doesn't delete
+                // the stacks."
+                operation.retain_stacks = Some(input.retain_stacks);
+                operation.administration_role_arn = administration_role_arn;
+                operation.execution_role_name = execution_role_name;
+                stack_set.record_operation(operation);
+            }
+            (stack_set_id, removals)
+        };
+
+        // Each instance's resources are deleted in the services that own them, in the
+        // instance's own Region, with the store unlocked — every one of those calls reaches
+        // another service's handler, which takes that service's lock.
+        let mut failed_instances: Vec<(String, String, String)> = Vec::new();
+        for removal in removals {
+            let deleted =
+                crate::state::provisioning::delete(ctx, &removal.region, &removal.resources).await;
+            let failure = deleted.failure.clone();
+            let mut store = state.lock();
+            if let Some(stack) = store.resolve_mut(&removal.region, &removal.stack_id) {
+                // The resources' own transitions come BEFORE the stack's terminal event: the
+                // event stream is what the deletion did, in the order it did it.
+                stack.schedule_resource_events(&deleted.transitions);
+                stack.record_materialised_resources(deleted.resources);
+                if let Some(failure) = failure.clone() {
+                    // A resource the owning service refused to delete: the stack stays, in
+                    // DELETE_FAILED with that service's own refusal as the reason, rather
+                    // than reporting a deletion that did not happen.
+                    let concluded = ::std::time::SystemTime::now();
+                    stack.record_resource_deletion_statuses(&deleted.transitions, concluded);
+                    stack.fail_transition(concluded, status::DELETE_FAILED, failure);
+                }
+            }
+            if let Some(failure) = failure {
+                failed_instances.push((removal.account, removal.region, failure));
+            }
+        }
+
+        if !failed_instances.is_empty() {
+            let mut store = state.lock();
+            if let Some(stack_set) = store.resolve_stack_set_mut(&region, &stack_set_id) {
+                for (account, target_region, reason) in &failed_instances {
+                    if let Some(instance) = stack_set
+                        .instances
+                        .iter_mut()
+                        .find(|held| held.is_in(account, target_region))
+                    {
+                        // "INOPERABLE: A DeleteStackInstances operation has failed and left
+                        // the stack in an unstable state" — the instance stays, reporting
+                        // why its stack could not be deleted.
+                        instance.status = instance_status::INOPERABLE.to_string();
+                        instance.detailed_status = detailed_status::FAILED.to_string();
+                        instance.status_reason = Some(reason.clone());
+                    }
+                }
+                let failed = i32::try_from(failed_instances.len()).unwrap_or(i32::MAX);
+                let reason = failed_instances
+                    .first()
+                    .map(|(_, _, reason)| reason.clone());
+                if let Some(operation) = stack_set
+                    .operations
+                    .iter_mut()
+                    .find(|held| held.operation_id == operation_id)
+                {
+                    // "FAILED: The operation exceeded the specified failure tolerance",
+                    // which for an operation with no tolerance stated is any failure at all.
+                    // The deletions ran with the store UNLOCKED, so the clock may already
+                    // have concluded the operation by the time this records what it found:
+                    // the failure is then written onto the CONCLUDED record rather than
+                    // dropped, so nothing reports a success for a deletion that failed.
+                    match operation.pending.as_mut() {
+                        Some(pending) => {
+                            pending.status = operation_status::FAILED.to_string();
+                            pending.failed_stack_instances_count = Some(failed);
+                            pending.status_reason = reason;
+                        }
+                        None => {
+                            operation.status = operation_status::FAILED.to_string();
+                            operation.failed_stack_instances_count = Some(failed);
+                            operation.status_reason = reason;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(DeleteStackInstancesOutput {
+            operation_id: Some(operation_id),
+        })
     }
 }
