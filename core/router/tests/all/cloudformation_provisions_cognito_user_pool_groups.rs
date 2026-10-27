@@ -36,6 +36,9 @@ use smithy_server_runtime::MultiServiceRouter;
 // The awsQuery form encoder and the XML element readers this crate writes ONCE
 // (`tests/all/query_wire.rs`): "Nothing new should write another one — call this module."
 use super::query_wire::{elements, form_encode, opt_element};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 
 /// Long enough for the stack's clock-owed span (`STATUS_TRANSITION_DELAY`, 500 ms) to come
 /// due, so the stack reports the template it deployed.
@@ -754,9 +757,26 @@ async fn a_group_declaring_no_user_pool_fails_the_stack() {
         Some("ROLLBACK_COMPLETE"),
         "case {case:?}: expected the failed create to be rolled back, got {described}"
     );
+    // The STACK's reason is the summary naming the resource that failed; WHICH property
+    // the declaration lacks is that resource's own diagnosis, on its event.
     let reason = opt_element(&described, "StackStatusReason").unwrap_or_default();
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::CREATE, ["Group"]),
+        "case {case:?}: expected the stack reason to summarise what failed, got {reason:?}"
+    );
+    let (_, events) = cloudformation(
+        &router,
+        region,
+        "DescribeStackEvents",
+        &[("StackName", "group-no-pool")],
+    )
+    .await;
     assert!(
-        reason.contains("UserPoolId"),
-        "case {case:?}: expected the failure to name the missing property, got {reason:?}"
+        elements(&events, "ResourceStatusReason")
+            .iter()
+            .any(|reported| reported.contains("UserPoolId")),
+        "case {case:?}: expected the failing resource's event to name the missing \
+         property, got {events}"
     );
 }
