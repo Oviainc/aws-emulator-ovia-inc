@@ -518,3 +518,7 @@ mod cloudformation_provisions_msk_clusters;
 mod logs_emf_metric_extraction;
 #[path = "all/cloudformation_provisions_kms_keys.rs"]
 mod cloudformation_provisions_kms_keys;
+#[path = "all/cloudformation_provisions_mq_brokers.rs"]
+mod cloudformation_provisions_mq_brokers;
+#[path = "all/cloudformation_refuses_mq_brokers.rs"]
+mod cloudformation_refuses_mq_brokers;
