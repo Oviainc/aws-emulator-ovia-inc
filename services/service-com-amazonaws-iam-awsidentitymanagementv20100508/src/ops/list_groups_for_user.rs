@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGroupsForUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGroupsForUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGroupsForUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the groups the IAM user the request names belongs to, in the group
+//! collection's own key order and paged by `Marker`/`MaxItems`. A pure READ — nothing
+//! here writes, so a later caller sees exactly what this one did.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +156,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGroupsForUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGroupsForUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGroupsForUser"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListGroupsForUserErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // IAM names "are not distinguished by case", so the request's spelling is folded
+        // to the key the user is held under — the same keying `GetUser` and
+        // `AddUserToGroup` resolve a name through.
+        let user_key = crate::state::name_key(&input.user_name);
+        // `maxItemsType` is range 1..1000 and the boundary validator has already refused
+        // anything outside it, so the only choice left here is the default for an absent
+        // `MaxItems`: "if you do not include this parameter, the number of items defaults
+        // to 100". `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it reports the memberships the account persists and writes nothing.
+        let store = state.lock();
+
+        // The user whose groups the request addresses, if the account holds one. The
+        // LOOKUP comes first but the answer to it is withheld until the call has been
+        // authorized, because IAM decides a call against the caller's policies before it
+        // reads the resource: a caller that may not read a user's groups learns that it
+        // may not, never whether that user exists.
+        let held = store.users.get(&user_key);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any group is reported. The decision is made on the ARN of the
+        // USER the request addresses — the held user's own ARN, or, for a name the account
+        // holds no user under, the ARN that name would carry at the default path, since
+        // there is no other path to attribute it to. A refusal names that user as the
+        // request named it (`user Bob`) rather than by ARN.
+        let resource = held.map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_GROUPS_FOR_USER,
+            &resource,
+            &format!("user {}", input.user_name),
+        )?;
+
+        // The groups reported are those of an IAM user the account holds: a name the
+        // account does not hold names no user whose groups could be listed, which is the
+        // modelled client error this operation declares.
+        if held.is_none() {
+            return Err(ListGroupsForUserErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The page resumes strictly after the POSITION the marker names in THIS user's
+        // membership order, so a token this service did not issue while paging this
+        // user's groups is refused rather than read as "start from the beginning".
+        let scope = crate::state::user_groups_marker_scope(&user_key);
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(&scope, marker) {
+                Some(key) => Some(key),
+                None => {
+                    // Neither modelled error fits a token that is not one this service
+                    // issued, so the refusal goes through the crate's generic
+                    // client-input channel (HTTP 400, `ValidationException`).
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Invalid Marker: the value is not a marker this service issued \
+                         for this user's groups",
+                    ));
+                }
+            },
+            None => None,
+        };
+
+        // The groups this user belongs to, read from the store's ONE membership map
+        // through the accessor every caller that asks what a user belongs to shares, in
+        // the group collection's own key order — the order `ListGroups` pages in. A
+        // membership naming a group the account no longer holds names no group to report,
+        // so it is passed over rather than reported as a half-filled record.
+        let memberships = store
+            .group_keys_held_by(&user_key)
+            .filter(|group_key| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| group_key.as_str() > after)
+            })
+            .filter_map(|group_key| store.groups.get(group_key).map(|group| (group_key, group)));
+
+        let mut groups: Vec<Group> = Vec::new();
+        // The token the NEXT page resumes from, minted only where this page left a group
+        // unreported. Truncation is read back off it, so a truncated page always carries
+        // the `Marker` a client needs to make progress — a page reported truncated with
+        // no marker would send a client that drains the pages round forever.
+        let mut next_marker = None;
+        let mut last_key = None;
+        for (group_key, group) in memberships {
+            if groups.len() == page_size {
+                // At least one more group follows, so the caller needs another page to
+                // see it, resuming strictly after the last group this one reported.
+                next_marker = last_key
+                    .as_deref()
+                    .map(|group_key| crate::state::encode_marker(&scope, group_key));
+                break;
+            }
+            // Every member of `Group` is `@required` and this listing withholds none of
+            // them, so the stored record is what the page reports.
+            groups.push(group.clone());
+            last_key = Some(group_key.clone());
+        }
+
+        Ok(ListGroupsForUserOutput {
+            // "A list of groups" — the member is required, and a user belonging to none
+            // of them is reported as the empty list.
+            groups,
+            // "A flag that indicates whether there are more items to return", which is
+            // exactly the question the next page's token answers.
+            is_truncated: next_marker.is_some(),
+            // "When IsTruncated is true, this element is present and contains the value to
+            // use for the Marker parameter in a subsequent pagination request"
+            // (`$Marker`), so a complete page carries none.
+            marker: next_marker,
+        })
     }
 }
