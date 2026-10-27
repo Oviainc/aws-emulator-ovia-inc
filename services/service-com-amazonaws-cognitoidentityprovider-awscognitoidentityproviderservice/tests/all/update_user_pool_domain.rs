@@ -621,20 +621,23 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
             }),
             (400, "InvalidParameterException"),
         ),
+        // The pair `UserPoolId` + `Domain` is what addresses the domain to
+        // update, so a pair that holds no stored domain — whichever half of it
+        // is wrong — is the one bad-parameter refusal.
         (
             "a domain the named pool does not hold",
             json!({ "UserPoolId": user_pool_id, "Domain": "never-created", "ManagedLoginVersion": 2 }),
-            (404, "ResourceNotFoundException"),
+            (400, "InvalidParameterException"),
         ),
         (
             "a domain another pool holds",
             json!({ "UserPoolId": other_pool, "Domain": "refusal-prefix", "ManagedLoginVersion": 2 }),
-            (404, "ResourceNotFoundException"),
+            (400, "InvalidParameterException"),
         ),
         (
             "a user pool that does not exist",
             json!({ "UserPoolId": "us-east-1_absent", "Domain": "refusal-prefix" }),
-            (404, "ResourceNotFoundException"),
+            (400, "InvalidParameterException"),
         ),
         (
             "an absent pool whose other members are invalid too",
@@ -643,7 +646,7 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
                 "Domain": "refusal-prefix",
                 "ManagedLoginVersion": 3,
             }),
-            (404, "ResourceNotFoundException"),
+            (400, "InvalidParameterException"),
         ),
     ] {
         let (status, payload) = call(&router, "UpdateUserPoolDomain", &body).await;
@@ -674,8 +677,8 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
     )
     .await;
     assert_eq!(
-        (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
+        (status, payload["DomainDescription"].clone()),
+        (200, json!({})),
         "a refused update stores no domain, got {payload}"
     );
 

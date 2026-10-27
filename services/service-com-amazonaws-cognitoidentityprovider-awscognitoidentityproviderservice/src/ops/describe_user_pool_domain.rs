@@ -3,7 +3,9 @@
 //! @op DescribeUserPoolDomain
 //! Renders the STORED user pool domain the request names. A pure read: it
 //! computes the domain's `DomainStatusType` from the activation instant the
-//! create stored and changes nothing a later caller sees.
+//! create stored and changes nothing a later caller sees. A domain string no
+//! pool holds is REPORTED, not refused: the answer is a 200 whose
+//! `DomainDescription` binds no member.
 //!
 //! ## Shape of an operation
 //!
@@ -163,23 +165,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A reporting operation: the state is read under the lock and nothing is
         // written, so two reads of one domain answer the same thing.
         let guard = state.lock();
-        let stored = guard
+        // A domain string no pool holds names no configuration to report, and
+        // this operation reports that by binding NO member of the description
+        // rather than by refusing: the answer is a 200 carrying an empty
+        // `DomainDescription`.
+        let domain_description = guard
             .domain(&input.domain)
-            .ok_or_else(|| domain_not_found(&input.domain))?;
+            .map_or_else(DomainDescriptionType::default, |stored| {
+                stored.to_domain_description(now)
+            });
         Ok(DescribeUserPoolDomainOutput {
-            domain_description: Some(stored.to_domain_description(now)),
+            domain_description: Some(domain_description),
         })
     }
-}
-
-/// This operation's `ResourceNotFoundException` for a domain no pool holds:
-/// "thrown when the Amazon Cognito service can't find the requested resource"
-/// (this service's model), and this operation names the domain alone.
-fn domain_not_found(domain: &str) -> DescribeUserPoolDomainError {
-    DescribeUserPoolDomainErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool domain {domain} does not exist.")),
-    })
-    .into()
 }
 
 /// The modelled server error for an engine this service cannot reach.

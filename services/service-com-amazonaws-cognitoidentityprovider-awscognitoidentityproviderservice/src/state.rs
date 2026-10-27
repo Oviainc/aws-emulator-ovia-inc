@@ -249,7 +249,7 @@ pub const DEVICE_NOT_FOUND_MESSAGE: &str = "Device does not exist.";
 /// remembering for the user pool" (this service's model), so a pool that
 /// provided none remembers no device and has no device surface to serve.
 pub const DEVICE_REMEMBERING_NOT_CONFIGURED_MESSAGE: &str =
-    "Device tracking is not configured for this user pool.";
+    "Device tracking not currently enabled for this pool.";
 
 /// The message a `ResourceNotFoundException` carries when the group an operation
 /// names is not one the named pool holds.
@@ -504,6 +504,14 @@ pub const DOMAIN_STATUS_UPDATING: &str = "UPDATING";
 /// instead of waiting minutes. Never zero, so a caller reading the domain right
 /// after creating it still sees `CREATING`.
 pub const DOMAIN_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
+
+/// The message an operation that resolves a domain by the PAIR it is addressed
+/// by — a `UserPoolId` and a `Domain` — carries when that pair holds no domain.
+///
+/// The pair is resolved as a unit, so the refusal reports the pair and names
+/// neither half: one fixed sentence for a pool that holds no domain of that
+/// name, whichever of the two the caller got wrong.
+pub const NO_SUCH_DOMAIN_MESSAGE: &str = "No such domain or user pool exists.";
 
 // ---------------------------------------------------------------------------
 // User pool replicas
@@ -5267,6 +5275,16 @@ pub fn delivery_medium(attribute: &str) -> Option<&'static str> {
         .find(|(_, addressed_by)| *addressed_by == attribute)
         .map(|(medium, _)| *medium)
 }
+
+/// The message the refusal of a request for a verification code of an attribute
+/// outside the verifiable set carries.
+///
+/// Only an attribute whose stored value ADDRESSES a message can have a code sent
+/// to it ([`DELIVERY_MEDIUM_ATTRIBUTES`]), and the refusal states that permitted
+/// set rather than the name the request asked for, so it is one fixed sentence
+/// for every other attribute name.
+pub const UNVERIFIABLE_ATTRIBUTE_MESSAGE: &str =
+    "Invalid attribute name. Only phone_number and email can be verified.";
 
 /// The user attribute whose stored value addresses a message delivered over
 /// `medium` — the inverse of [`delivery_medium`] — or `None` for a value no

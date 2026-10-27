@@ -29,6 +29,10 @@ mod pls_alphabet_support;
 mod pls_document_validity;
 #[path = "all/pls_replacement_measurement.rs"]
 mod pls_replacement_measurement;
+// The shared PLS document fixture, driven through the path the suites that share it
+// drive.
+#[path = "all/shared_pls_fixture.rs"]
+mod shared_pls_fixture;
 #[path = "all/ssml_vocabulary.rs"]
 mod ssml_vocabulary;
 #[path = "all/state_roundtrip.rs"]
