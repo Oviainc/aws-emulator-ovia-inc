@@ -63,6 +63,8 @@ mod ec2_alarm_actions;
 mod forced_state_actions;
 #[path = "all/forced_state_lifetime.rs"]
 mod forced_state_lifetime;
+#[path = "all/forced_state_reclaim.rs"]
+mod forced_state_reclaim;
 #[path = "all/get_dashboard_reader.rs"]
 mod get_dashboard_reader;
 #[path = "all/harness.rs"]

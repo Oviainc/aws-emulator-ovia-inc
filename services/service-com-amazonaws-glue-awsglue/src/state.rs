@@ -2735,6 +2735,59 @@ impl PartitionCreateRefusal {
     }
 }
 
+/// Why a partition of a table could not be updated.
+///
+/// One refusal reason per way an update can fail ON the table it addresses, so the
+/// single-partition update and each item of a batch update accept and refuse exactly the
+/// same entries: the batch reports it as a per-item [`ErrorDetail`] inside
+/// `BatchUpdatePartitionFailureEntry` — "the errors encountered when trying to update the
+/// requested partitions" — and a single-partition update raises the matching modelled
+/// exception named by [`Self::error_code`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionUpdateRefusal {
+    /// The submitted `PartitionInput` named no partition value at all. "Although this
+    /// parameter is not required by the SDK, you must specify this parameter for a valid
+    /// input" (`PartitionInput$Values`), the same requirement a create is held to.
+    ValuesRequired,
+    /// The submitted `PartitionInput` named values other than the ones the entry
+    /// addresses. "The Values property can't be changed. If you want to change the
+    /// partition key values for a partition, delete and recreate the partition"
+    /// (`UpdatePartitionRequest$PartitionInput`), so an update cannot move a partition to
+    /// another address.
+    ValuesCannotBeChanged,
+    /// The addressed table holds no partition at those values, so there is nothing to
+    /// update.
+    NotFound,
+}
+
+impl PartitionUpdateRefusal {
+    /// The modelled error shape this refusal is reported under: the `ErrorCode` of a
+    /// batch's per-item [`ErrorDetail`], and the exception a single-partition update
+    /// raises.
+    pub fn error_code(self) -> &'static str {
+        match self {
+            Self::ValuesRequired | Self::ValuesCannotBeChanged => "InvalidInputException",
+            Self::NotFound => "EntityNotFoundException",
+        }
+    }
+
+    /// This refusal's wording. See [`messages`] for how this crate's refusals are worded.
+    pub fn message(self) -> String {
+        match self {
+            Self::ValuesRequired => messages::PARTITION_VALUES_REQUIRED.to_string(),
+            Self::ValuesCannotBeChanged => {
+                messages::PARTITION_VALUES_CANNOT_BE_CHANGED.to_string()
+            }
+            Self::NotFound => messages::PARTITION_NOT_FOUND.to_string(),
+        }
+    }
+
+    /// This refusal as the per-item error shape a batch reports it in.
+    pub fn to_error_detail(self) -> ErrorDetail {
+        catalog_error_detail(self.error_code(), self.message())
+    }
+}
+
 /// A stored partition of a table: the client-settable definition plus the one member
 /// only the server sets, `CreationTime`.
 #[derive(Debug, Clone)]
@@ -2775,6 +2828,27 @@ impl PartitionEntry {
             // read and the key material produced (see [`TableEntry::create_partition`]).
             encryption: None,
         }
+    }
+
+    /// Overwrite this partition's definition with the one the client submitted.
+    ///
+    /// `PartitionInput` is the WHOLE client-settable definition of a partition — the same
+    /// shape a create submits — so an update writes every member it carries and clears the
+    /// ones it omits; what the client sent is exactly what the next read reports. The
+    /// members only the server sets keep their own history: the partition stays at the
+    /// address it was created under and reports the `CreationTime` the create wrote,
+    /// because an update produces no new partition.
+    ///
+    /// `encryption` is the key material THIS write is encrypted under, which replaces the
+    /// create's: "the specified encryption is applied to every catalog write thereafter"
+    /// (`PutDataCatalogEncryptionSettings`), so the stored definition is read back through
+    /// the key the write that stored it used (see [`catalog_encryption`]).
+    pub fn apply_input(&mut self, input: &PartitionInput, encryption: Option<ObjectEncryption>) {
+        self.storage_descriptor = input.storage_descriptor.clone();
+        self.parameters = input.parameters.clone();
+        self.last_access_time = input.last_access_time;
+        self.last_analyzed_time = input.last_analyzed_time;
+        self.encryption = encryption;
     }
 
     /// Rebuild the modelled `Partition` output shape from what is stored.
@@ -2941,6 +3015,39 @@ impl TableEntry {
         // catalog's settings and had KMS produce before taking the store's guard.
         entry.encryption = encryption;
         Ok(self.partitions.entry(values).or_insert(entry))
+    }
+
+    /// Update ONE partition of this table from a client's `PartitionInput`, or say why it
+    /// cannot be updated.
+    ///
+    /// The whole update decision for a single partition, in one place, so the
+    /// single-partition update and each entry of a batch update accept and refuse exactly
+    /// the same entries: a partition is addressed by the values it was created under, an
+    /// update replaces its definition rather than its address, and a value list this table
+    /// holds no partition for is nothing to update.
+    ///
+    /// `values` is the ADDRESS the entry names (`PartitionValueList`) and `input` the
+    /// definition to write; `encryption` is the key material this write is encrypted
+    /// under, resolved from the catalog's own settings by the caller before it took the
+    /// store's guard, exactly as a create's is.
+    pub fn update_partition(
+        &mut self,
+        values: &[String],
+        input: &PartitionInput,
+        encryption: Option<ObjectEncryption>,
+    ) -> Result<&PartitionEntry, PartitionUpdateRefusal> {
+        let submitted = input.values.as_deref().unwrap_or_default();
+        if submitted.is_empty() {
+            return Err(PartitionUpdateRefusal::ValuesRequired);
+        }
+        if submitted != values {
+            return Err(PartitionUpdateRefusal::ValuesCannotBeChanged);
+        }
+        let Some(entry) = self.partitions.get_mut(values) else {
+            return Err(PartitionUpdateRefusal::NotFound);
+        };
+        entry.apply_input(input, encryption);
+        Ok(entry)
     }
 
     /// This table's client-settable definition, in the `TableInput` shape a client
@@ -7673,8 +7780,20 @@ pub mod messages {
     /// requested values.
     pub const PARTITION_ALREADY_EXISTS: &str = "Partition already exists.";
 
+    /// A partition update (`UpdatePartition`, one entry of `BatchUpdatePartition`) whose
+    /// `PartitionInput` names values other than the partition the request addresses. NOT
+    /// recorded: what is pinned is the behaviour — `InvalidInputException`, per entry for a
+    /// batch update — and the sentence states the documented rule the entry broke, that an
+    /// update writes a partition's definition and never moves it to another address
+    /// (`UpdatePartitionRequest$PartitionInput`). No stored value is disclosed.
+    pub const PARTITION_VALUES_CANNOT_BE_CHANGED: &str =
+        "PartitionInput must specify the values of the partition being updated; the Values \
+         property can't be changed.";
+
     /// A partition read (`GetPartition`) for a value list the addressed table holds no
-    /// partition for. RECORDED constant: the whole sentence is fixed — it names neither
+    /// partition for, and an update (`UpdatePartition`, one entry of
+    /// `BatchUpdatePartition`) of such a value list, which has no partition to write to
+    /// either. RECORDED constant: the whole sentence is fixed — it names neither
     /// the values the request addressed nor the table they were looked for in.
     pub const PARTITION_NOT_FOUND: &str = "Cannot find partition.";
 

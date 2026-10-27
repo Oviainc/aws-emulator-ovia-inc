@@ -273,14 +273,23 @@ fn delete_stream(
 
     // "If this parameter is unset (null) or if you set it to false, and the stream has
     // registered consumers, the call to DeleteStream fails with a ResourceInUseException"
-    // (`DeleteStreamInput$EnforceConsumerDeletion`): no consumer is registered until
-    // `RegisterStreamConsumer` registers one, so no stream of this emulator has one
-    // standing in the way of its removal whichever way the member is set.
-    //
+    // (`DeleteStreamInput$EnforceConsumerDeletion`): the consumers registered with the
+    // stream stand in the way of its removal unless the request asks for them to go with it.
+    let registered = stream.consumers.len();
+    if registered > 0 && !input.enforce_consumer_deletion.unwrap_or(false) {
+        return Err(DeleteStreamErrorModeled::ResourceInUseException(
+            ResourceInUseException {
+                message: Some(crate::state::stream_has_consumers_message(&stream.name)),
+            },
+        )
+        .into());
+    }
+
     // DELETING is not terminal: the stream is owed its removal, and the instant that is due
     // is stored rather than slept on. "When you delete a stream, any shards in that stream
     // are also deleted, and any tags are dissociated from the stream" — the whole record
-    // goes, so nothing of it is read once the removal falls due.
+    // goes, so nothing of it is read once the removal falls due, the consumers registered
+    // with it included.
     stream.deleted_at = Some(now + crate::state::DELETION_DELAY);
     Ok(())
 }

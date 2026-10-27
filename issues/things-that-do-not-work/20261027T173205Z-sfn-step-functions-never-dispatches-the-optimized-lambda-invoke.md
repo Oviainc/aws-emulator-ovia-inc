@@ -1,0 +1,47 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: sfn.deep-sfn-1-sfn-sync-lambda-function-timeout-is-sandbox-timedout-not-states-timeout sfn.deep-sfn-1-sfn-sync-lambda-unhandled-exception-error-and-json-cause
+Issue-Shape-Id: com.amazonaws.sfn#AWSStepFunctions
+Issue-Key: sfn.deep-sfn-1-sfn-sync-lambda-function-timeout-is-sandbox-timedout-not-states-timeout|run#11|AssertionError|assert d.get("error") == "Sandbox.Timedout", (
+Issue-Key: sfn.deep-sfn-1-sfn-sync-lambda-unhandled-exception-error-and-json-cause|run#13|AssertionError|assert d.get("error") == "CustomBoomError", (
+Issue-Commit: ae39651d3d6fa8c047ec612a360f74eed7077718
+
+# Step Functions never dispatches the optimized lambda:invoke Task integration: a Lambda task fails States.Runtime instead of surfacing the function's error (Sandbox.Timedout / the thrown exception name) (1 cause)
+
+> _Note: this issue was identified against the code base at commit `ae39651d3d6fa8c047ec612a360f74eed7077718`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+StartExecution
+
+## Description
+Cause 1 of 1 — the Task-state integration dispatcher in the Step Functions interpreter has no handler for the optimized Lambda integration `arn:aws:states:::lambda:invoke`, so a well-formed Lambda Task is never called and the execution fails with an interpreter-level error instead of the function's outcome. Failing checks: sfn.deep-sfn-1-sfn-sync-lambda-function-timeout-is-sandbox-timedout-not-states-timeout, sfn.deep-sfn-1-sfn-sync-lambda-unhandled-exception-error-and-json-cause.
+
+AWS: a Task whose `Resource` is `arn:aws:states:::lambda:invoke` calls Lambda Invoke with the state's `Parameters` (FunctionName, Payload) and maps the invocation result into the task's outcome. Smithy (sfn): TaskFailedEventDetails requires `resourceType` ("The service name of the resource in a task state") and `resource` ("The action of the resource called by a task state") and carries `error` (max 256) / `cause` (max 32768); ExecutionFailedEventDetails carries the same error/cause pair. For this integration AWS sets resourceType = the integration's service token and resource = the integration's action — i.e. the fixed strings `lambda` and `invoke`, derived from the Resource ARN, not per-run values. Two documented outcomes are asserted here, both recorded behaviour of the integration plus the Lambda error contract:
+  (a) the function overruns its own configured Timeout: TaskFailed.error is the fixed string `Sandbox.Timedout`, and TaskFailed.cause parses as JSON whose `errorType` is `Sandbox.Timedout` and whose `errorMessage` is the fixed sentence `Task timed out after <N> seconds`, where `<N>` is the function's configured Timeout formatted with two decimals (a request-derived value, e.g. `2.00` for Timeout=2). Because the error name is `Sandbox.Timedout` and NOT `States.Timeout`, a `Retry` on `States.Timeout` does not match: the function is scheduled exactly once (one TaskScheduled event) and no TaskTimedOut event is emitted. ExecutionFailed.error is the same `Sandbox.Timedout`.
+  (b) the function throws an unhandled exception: TaskFailed.error is the exception's own name as reported by the runtime (a value taken from the function's code, e.g. the class name of the thrown error), and TaskFailed.cause parses as a JSON object with exactly the members `errorType`, `errorMessage` and `trace`, where `errorType` repeats that name, `errorMessage` is the thrown message (which here embeds a value from this execution's input) and `trace` is the runtime stack trace.
+
+Emulator: in both scenarios the execution ends FAILED with TaskFailed.error = `States.Runtime` and TaskFailed.cause = the emulator-authored sentence "state 'Invoke': 'arn:aws:states:::lambda:invoke' names an integration with 'lambda', which is not one of the services this emulator makes a 'Task' state's integration call to, so nothing was run for it". The function is never invoked, so neither the Sandbox.Timedout name and its `Task timed out after <N> seconds` cause, nor the thrown exception's name and its {errorType, errorMessage, trace} cause, nor the resourceType=`lambda`/resource=`invoke` attribution can ever appear. This is a distinct dispatcher gap from the open issues that already own other Task behaviour: 20261023T114649Z-sfn-step-functions-never-executes-task-states-every-execution.md (Task type not executed at all, different cause string), 20261024T043150Z-sfn-step-functions-interpreter-does-not-run-the-workflow.md, 20261024T190039Z-events-lambda-sfn-http-task-arn-aws-states-http-invoke-is.md (http:invoke), 20261027T000406Z-sfn-sns-sqs-the-sns-publish-optimized-task-integration-is-never.md (sns:publish) and 20261027T010944Z-sfn-step-functions-refuses-the-sync-service-integration-pattern.md (.sync pattern); none of them names the `lambda:invoke` integration dispatch or the Lambda error-to-TaskFailed mapping.
+
+Why: a client cannot orchestrate Lambda at all, and every error-handling contract built on the Lambda error taxonomy is wrong. A Retry/Catch on `States.Timeout` would wrongly fire (or, as here, the whole taxonomy collapses to one name), a Catch keyed on the function's own exception name never matches, and code that parses TaskFailed.cause as Lambda's {errorType, errorMessage, trace} JSON gets an emulator prose sentence instead. Because the single reported name is `States.Runtime` — which AWS reserves for interpreter-level faults — a client cannot even tell a target failure from a definition fault.
+
+Fix: the Task state's integration dispatch in the Step Functions interpreter (the Resource-ARN-to-integration routing for the optimized `lambda:invoke` service integration), the Lambda-invoke result mapping that turns a function error into TaskFailed/ExecutionFailed error+cause (including the Sandbox.Timedout name and its `Task timed out after <N> seconds` cause JSON, and the {errorType, errorMessage, trace} envelope for an unhandled exception), the resourceType/resource attribution on the TaskFailed history event, and the Retry matcher so a Lambda function timeout is not matched by `States.Timeout`.
+
+Traces: sfn.deep-sfn-1-sfn-sync-lambda-function-timeout-is-sandbox-timedout-not-states-timeout (assertion: "the TaskFailed error was 'States.Runtime' ... expected Sandbox.Timedout"), sfn.deep-sfn-1-sfn-sync-lambda-unhandled-exception-error-and-json-cause (assertion: "the TaskFailed error was 'States.Runtime', expected the thrown CustomBoomError").
+
+## Evidence
+Check sfn.deep-sfn-1-sfn-sync-lambda-function-timeout-is-sandbox-timedout-not-states-timeout
+Expected: DescribeExecution status FAILED with exactly one TaskFailed whose error is `Sandbox.Timedout`; cause parses as JSON with errorType=`Sandbox.Timedout` and errorMessage containing `Task timed out after 2.00 seconds` (2.00 = the function's configured Timeout of 2s, a request-derived value); exactly one TaskScheduled event; no TaskTimedOut event; ExecutionFailed.error = `Sandbox.Timedout`.
+Actual: AssertionError: the TaskFailed error was 'States.Runtime' (cause "state 'Invoke': 'arn:aws:states:::lambda:invoke' names an integration with 'lambda', which is not one of the services this emulator makes a 'Task' state's integration call to, so nothing was run for it"), expected Sandbox.Timedout.
+
+Check sfn.deep-sfn-1-sfn-sync-lambda-unhandled-exception-error-and-json-cause
+Expected: exactly one TaskFailed with resourceType=`lambda`, resource=`invoke` (both fixed strings from the Resource ARN), error = the thrown exception's name, and cause parsing as a JSON object with exactly {errorType, errorMessage, trace} where errorMessage carries the message the handler threw (embedding this execution's input value).
+Actual: AssertionError: the TaskFailed error was 'States.Runtime', expected the thrown CustomBoomError; the cause is the same emulator-authored "...names an integration with 'lambda', which is not one of the services this emulator makes a 'Task' state's integration call to..." sentence, which is not JSON.
+
+In both cases the Lambda function is never invoked (no Lambda-side effect, no function-authored payload or trace in the history).
+
+## Steps to Reproduce
+1. CreateFunction a Lambda whose handler throws an unhandled named exception (and, for the second leg, one that sleeps longer than its configured Timeout, e.g. Timeout=2 with a 5s sleep).
+2. CreateRole trusted by states.amazonaws.com granting lambda:InvokeFunction on that function ARN; CreateStateMachine (STANDARD) with a single state: {"Type":"Task","Resource":"arn:aws:states:::lambda:invoke","Parameters":{"FunctionName":<fn arn>,"Payload.$":"$"},"End":true} — for the timeout leg add "Retry":[{"ErrorEquals":["States.Timeout"],"MaxAttempts":2,"IntervalSeconds":1}].
+3. StartExecution with input {"seed":"<any>"} and poll DescribeExecution to a terminal status.
+4. GetExecutionHistory and read the TaskFailed event: observe error 'States.Runtime' and the cause "state 'Invoke': 'arn:aws:states:::lambda:invoke' names an integration with 'lambda', which is not one of the services this emulator makes a 'Task' state's integration call to, so nothing was run for it", instead of Sandbox.Timedout / the thrown exception name with a JSON cause and resourceType 'lambda' / resource 'invoke'.

@@ -338,8 +338,7 @@ fn service_does_not_exist(name: &str) -> GetContainerLogError {
 /// the current deployment is that whole set).
 fn has_run_container(container: &str, service: &crate::state::StoredContainerService) -> bool {
     service
-        .current_deployment
-        .as_ref()
+        .current_deployment()
         .is_some_and(|deployment| deployment.containers.contains_key(container))
 }
 
@@ -357,7 +356,7 @@ fn container_does_not_exist(
     service_name: &str,
     service: &crate::state::StoredContainerService,
 ) -> GetContainerLogError {
-    let known = match service.current_deployment.as_ref() {
+    let known = match service.current_deployment() {
         None => "no deployment of it has become active yet, so no container has run on it"
             .to_string(),
         Some(deployment) => format!(

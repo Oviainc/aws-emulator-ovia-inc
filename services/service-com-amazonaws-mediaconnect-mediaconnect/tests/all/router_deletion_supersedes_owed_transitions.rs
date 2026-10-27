@@ -307,9 +307,10 @@ async fn delete(emulator: &Emulator, kind: Router, arn: &str) -> (u16, Option<St
 /// Read `arn` back through this resource's own implemented reader and answer the HTTP status
 /// with the resource the reader reported (`Value::Null` when it reported none).
 ///
-/// GetRouterInput and GetRouterOutput read one resource each; GetRouterNetworkInterface is
-/// still scaffolded, so an interface is read back through BatchGetRouterNetworkInterface, the
-/// way `tests/all/router_network_interface_deletion.rs` reads one.
+/// GetRouterInput and GetRouterOutput read one resource each; an interface is read back here
+/// through BatchGetRouterNetworkInterface, the way
+/// `tests/all/router_network_interface_deletion.rs` reads one — its single-resource reader
+/// (GetRouterNetworkInterface) is pinned by `tests/all/get_router_network_interface.rs`.
 async fn read_back(emulator: &Emulator, kind: Router, arn: &str) -> (u16, Value) {
     match kind {
         Router::Input => {

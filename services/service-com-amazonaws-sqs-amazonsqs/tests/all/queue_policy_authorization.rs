@@ -10,7 +10,9 @@
 //! about it in those identity-based policies, or one in the queue's policy that names the
 //! CALLER rather than its account), and anything else is refused `AccessDenied` at HTTP 403
 //! with no effect. The queue's owner — the account's own published credential — keeps full
-//! control of it, and only an explicit deny refuses that.
+//! control of it, and only an explicit deny refuses that. A permissions boundary attached to
+//! the principal CAPS what its identity-based policies grant and grants nothing of its own,
+//! so a refusal names the document the grant was missing from.
 //!
 //! Two rules ride on it, both about the document rather than the decision: a `Policy` is
 //! VALIDATED when it is written (an action outside this service's action set, or a principal
@@ -27,7 +29,8 @@
 //! (identity-based or resource-based), the principal spelling a statement names (the
 //! caller's own ARN, its account's root, the wildcard, a role behind a session), the action
 //! and resource patterns, the effect, a condition key the request can answer and one it
-//! cannot, and the operation (and therefore the action) being judged.
+//! cannot, whether a permissions boundary is attached and what it admits, and the operation
+//! (and therefore the action) being judged.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -233,6 +236,34 @@ impl Emulator {
         (arn, key)
     }
 
+    /// Create a managed policy carrying `document` and set it as `user_name`'s permissions
+    /// boundary — the ceiling IAM caps that user's identity-based grants with — answering
+    /// the policy's ARN.
+    async fn boundary(&self, case: &str, user_name: &str, document: &Value) -> String {
+        let created = self
+            .iam(
+                case,
+                "CreatePolicy",
+                &[
+                    ("PolicyName", format!("{user_name}-ceiling")),
+                    ("PolicyDocument", document.to_string()),
+                ],
+            )
+            .await;
+        let arn = xml_element(&created, "Arn")
+            .unwrap_or_else(|| panic!("case {case:?}: CreatePolicy answered {created}"));
+        self.iam(
+            case,
+            "PutUserPermissionsBoundary",
+            &[
+                ("UserName", user_name.to_string()),
+                ("PermissionsBoundary", arn.clone()),
+            ],
+        )
+        .await;
+        arn
+    }
+
     /// Create an IAM role, assume it through STS with `session_tags`, and answer
     /// `(the role's ARN, the session's access key id)`.
     async fn assumed_role(
@@ -315,13 +346,26 @@ fn policy(statements: Value) -> Value {
     json!({"Version": "2012-10-17", "Statement": statements})
 }
 
+/// The refusal a request the policies in force do not allow carries, as IAM words it: the
+/// principal, the action in the lower case this service names it in, the resource, and
+/// `reason` — the fact about those policies that refused it, which names the document the
+/// grant was missing from.
+fn refusal_message(principal: &str, action: &str, resource: &str, reason: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
+         {reason}"
+    )
+}
+
 /// The refusal a request no policy allows carries, as IAM words it: the principal, the
 /// action in the lower case this service names it in, the resource, and the fact that no
 /// policy in force allows the action.
 fn implicit_denial(principal: &str, action: &str, resource: &str) -> String {
-    format!(
-        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
-         because no identity-based policy allows the {action} action"
+    refusal_message(
+        principal,
+        action,
+        resource,
+        &format!("because no identity-based policy allows the {action} action"),
     )
 }
 
@@ -639,6 +683,192 @@ async fn a_send_is_allowed_only_where_the_policies_in_force_allow_it() {
                 "case {:?}: a refused send must enqueue nothing, got {attributes:?}",
                 row.case
             );
+        }
+    }
+}
+
+/// One row of the permissions-boundary table: the documents in force on the caller, and
+/// what the gate must answer for a send.
+struct BoundaryRow {
+    case: &'static str,
+    /// The caller's inline identity policy, built from the queue's ARN.
+    identity_policy: fn(&str) -> Option<Value>,
+    /// The permissions boundary attached to the caller, built from the queue's ARN.
+    boundary: fn(&str) -> Option<Value>,
+    /// The clause the refusal must carry, or `None` when the send must be allowed.
+    refusal: Option<&'static str>,
+}
+
+/// The permissions boundary attached to the calling principal CAPS what its identity-based
+/// policies grant and grants nothing of its own: a send is allowed only where both allow
+/// it, a boundary that withheld the grant is the document the refusal names, and an
+/// explicit `Deny` in the boundary refuses whatever the identity policy says.
+#[tokio::test]
+async fn a_permissions_boundary_caps_an_identity_grant_and_never_grants_one() {
+    /// The clause for a request the identity policies allowed and the boundary did not.
+    const NO_BOUNDARY_ALLOW: &str =
+        "because no permissions boundary allows the sqs:sendmessage action";
+    /// The clause for a request nothing allowed, which a boundary-only permission is.
+    const NO_IDENTITY_ALLOW: &str =
+        "because no identity-based policy allows the sqs:sendmessage action";
+
+    let rows: &[BoundaryRow] = &[
+        BoundaryRow {
+            case: "a boundary admitting the action the identity policy grants",
+            identity_policy: |queue| {
+                Some(policy(json!([{
+                    "Effect": "Allow",
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue,
+                }])))
+            },
+            boundary: |queue| {
+                Some(policy(json!([{
+                    "Effect": "Allow",
+                    "Action": "sqs:*",
+                    "Resource": queue,
+                }])))
+            },
+            refusal: None,
+        },
+        BoundaryRow {
+            case: "no boundary at all",
+            identity_policy: |queue| {
+                Some(policy(json!([{
+                    "Effect": "Allow",
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue,
+                }])))
+            },
+            boundary: |_| None,
+            refusal: None,
+        },
+        BoundaryRow {
+            case: "a boundary admitting another action only",
+            identity_policy: |queue| {
+                Some(policy(json!([{
+                    "Effect": "Allow",
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue,
+                }])))
+            },
+            boundary: |queue| {
+                Some(policy(json!([{
+                    "Effect": "Allow",
+                    "Action": "sqs:ReceiveMessage",
+                    "Resource": queue,
+                }])))
+            },
+            refusal: Some(NO_BOUNDARY_ALLOW),
+        },
+        BoundaryRow {
+            case: "a boundary admitting the action on another queue only",
+            identity_policy: |queue| {
+                Some(policy(json!([{
+                    "Effect": "Allow",
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue,
+                }])))
+            },
+            boundary: |_| {
+                Some(policy(json!([{
+                    "Effect": "Allow",
+                    "Action": "sqs:SendMessage",
+                    "Resource": expected_arn("somewhere-else"),
+                }])))
+            },
+            refusal: Some(NO_BOUNDARY_ALLOW),
+        },
+        BoundaryRow {
+            case: "a boundary denying the action it otherwise admits",
+            identity_policy: |queue| {
+                Some(policy(json!([{
+                    "Effect": "Allow",
+                    "Action": "sqs:SendMessage",
+                    "Resource": queue,
+                }])))
+            },
+            boundary: |queue| {
+                Some(policy(json!([
+                    {"Effect": "Allow", "Action": "sqs:*", "Resource": queue},
+                    {"Effect": "Deny", "Action": "sqs:SendMessage", "Resource": queue},
+                ])))
+            },
+            refusal: Some("with an explicit deny in a permissions boundary"),
+        },
+        BoundaryRow {
+            // The boundary is no grant: with nothing else allowing the call, the refusal
+            // names the identity-based policies rather than the boundary.
+            case: "a boundary admitting the action with no identity grant at all",
+            identity_policy: |_| None,
+            boundary: |queue| {
+                Some(policy(json!([{
+                    "Effect": "Allow",
+                    "Action": "sqs:*",
+                    "Resource": queue,
+                }])))
+            },
+            refusal: Some(NO_IDENTITY_ALLOW),
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let emulator = Emulator::new();
+        let name = format!("ceiling-{index}");
+        let url = emulator.queue(row.case, &name).await;
+        let arn = expected_arn(&name);
+        let user_name = format!("bounded-{index}");
+        let (caller, key) = emulator
+            .user(
+                row.case,
+                &user_name,
+                (row.identity_policy)(&arn).as_ref(),
+                &[],
+            )
+            .await;
+        if let Some(document) = (row.boundary)(&arn) {
+            emulator.boundary(row.case, &user_name, &document).await;
+        }
+
+        let reply = emulator
+            .sqs(
+                &key,
+                "SendMessage",
+                &json!({"QueueUrl": url, "MessageBody": format!("body of {}", row.case)}),
+            )
+            .await;
+        match row.refusal {
+            None => {
+                assert_eq!(
+                    reply.0, 200,
+                    "case {:?}: expected the send to be allowed, got {} with {}",
+                    row.case, reply.0, reply.1
+                );
+                assert!(
+                    reply.1["MessageId"].is_string(),
+                    "case {:?}: an allowed send must answer a MessageId, got {}",
+                    row.case,
+                    reply.1
+                );
+            }
+            Some(reason) => {
+                let message = denial(row.case, reply);
+                assert_eq!(
+                    message,
+                    refusal_message(&caller, "sqs:sendmessage", &arn, reason),
+                    "case {:?}: expected the refusal to name the document that withheld \
+                     the grant, got {message:?}",
+                    row.case
+                );
+                // Nothing was enqueued: the queue still holds no message.
+                let attributes = emulator.attributes(row.case, &url).await;
+                assert_eq!(
+                    attributes.get("ApproximateNumberOfMessages").map(String::as_str),
+                    Some("0"),
+                    "case {:?}: a refused send must enqueue nothing, got {attributes:?}",
+                    row.case
+                );
+            }
         }
     }
 }

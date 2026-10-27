@@ -252,8 +252,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                     .filter(|service| service.domain_token == target.domain_token)
                     .map(|service| {
                         service
-                            .current_deployment
-                            .as_ref()
+                            .current_deployment()
                             .is_some_and(|deployment| deployment.public_endpoint.is_some())
                     })
             })

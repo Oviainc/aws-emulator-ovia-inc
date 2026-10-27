@@ -239,8 +239,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; this operation needs none of it.
-        let _ = ctx;
+        // `ctx` carries the request metadata the identity gate reports: SES
+        // identities are per-Region, so the Region this send is scoped to is part
+        // of the refusal naming an unverified sender.
+        let region = crate::state::region_from_request(ctx.parts());
         let source = crate::state::addr_spec(&input.source).to_string();
         let destinations = recipients(&input.destination);
 
@@ -327,9 +329,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // you attempt to send email using a non-verified address or domain, the
         // operation results in an 'Email address not verified' error."
         if !state.is_verified_sender(&source) {
-            return Err(rejected(format!(
-                "Email address is not verified. The following identities failed the check: \
-                 {source}"
+            return Err(rejected(crate::state::unverified_identities_message(
+                &region,
+                &[source.as_str()],
             )));
         }
 

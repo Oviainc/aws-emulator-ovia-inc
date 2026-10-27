@@ -365,3 +365,9 @@ mod profile_share_quota;
 // a new suite does not collide with another insertion.
 #[path = "all/workload_industry_type.rs"]
 mod workload_industry_type;
+
+// Appended at the end of this list rather than inserted among the other agent suites, for
+// the reason the notes above give: an insertion into this list's sorted middle is what
+// repeatedly refused to merge.
+#[path = "all/agent_recommendation_items.rs"]
+mod agent_recommendation_items;

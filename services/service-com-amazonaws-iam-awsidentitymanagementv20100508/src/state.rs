@@ -1765,6 +1765,68 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         Some(collected)
     }
 
+    /// The document of the managed policy `policy_arn` names that is IN FORCE: its
+    /// DEFAULT version's, "the one that is in effect for the IAM users, groups, and
+    /// roles to which the policy is attached" (`SetDefaultPolicyVersion`). `None` when
+    /// this emulator holds no document for that ARN — an entry of AWS's catalog it does
+    /// not carry — which is the one attachment that resolves to nothing. A record whose
+    /// default version is not recorded is read at the version every policy is created
+    /// with ([`FIRST_POLICY_VERSION_ID`]), the one it would be in force at.
+    ///
+    /// ONE resolution, shared by every reader of what an attached policy grants: the
+    /// collection of an identity's own policies ([`Self::principal_sourced_policies`])
+    /// and the ceiling attached to it ([`Self::permissions_boundary_document`]), so the
+    /// two cannot read one policy differently.
+    pub fn default_version_document(&self, policy_arn: &str) -> Option<String> {
+        let policy = self.resolve_policy(policy_arn)?;
+        let default = policy
+            .policy
+            .default_version_id
+            .unwrap_or_else(|| FIRST_POLICY_VERSION_ID.to_string());
+        policy
+            .versions
+            .get(&default)
+            .and_then(|version| version.document.clone())
+    }
+
+    /// The permissions boundary document in force on the IAM identity whose ARN is
+    /// `arn`, or `None` when it carries none — or carries one whose document this
+    /// emulator does not hold, a ceiling it cannot read and so cannot apply.
+    ///
+    /// A boundary is attached as a MANAGED policy — "the ARN of the managed policy
+    /// that is used to set the permissions boundary"
+    /// (`AttachedPermissionsBoundary$PermissionsBoundaryArn`) — so the document in
+    /// force is that policy's DEFAULT version, read through the resolution every
+    /// attached policy's document is read through ([`Self::default_version_document`]).
+    /// Only a user and a role can carry one, so a group's ARN names no boundary.
+    ///
+    /// ONE definition of "the ceiling in force on this identity", consulted by this
+    /// service's own authorizer, by its policy simulator and by every other service
+    /// that decides a call against this store's principals, so none of them caps a
+    /// principal differently from the others. A READ: it only consults the store.
+    ///
+    /// The identity is resolved by NAME, the key the account holds it under, because an
+    /// entity carries exactly one boundary whatever path an ARN spells for it — the
+    /// question here is which ceiling that entity carries, not whether the ARN is a
+    /// well-formed spelling of the entity.
+    pub fn permissions_boundary_document(&self, arn: &str) -> Option<String> {
+        let entity = parse_entity_arn(arn)?;
+        let key = name_key(&entity.name);
+        let attached = match entity.kind {
+            EntityKind::User => self
+                .users
+                .get(&key)
+                .and_then(|user| permissions_boundary_arn(user.permissions_boundary.as_ref())),
+            EntityKind::Role => self
+                .roles
+                .get(&key)
+                .and_then(|role| permissions_boundary_arn(role.permissions_boundary.as_ref())),
+            EntityKind::Group => None,
+        }?
+        .to_string();
+        self.default_version_document(&attached)
+    }
+
     /// The identity-based policies the IAM identity whose ARN is `arn` carries, each
     /// with WHERE it comes from, or `None` when `arn` names no identity the account
     /// holds.
@@ -1846,16 +1908,9 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             });
         }
         for policy_arn in attached {
-            let document = self.resolve_policy(&policy_arn).and_then(|policy| {
-                let default = policy
-                    .policy
-                    .default_version_id
-                    .unwrap_or_else(|| FIRST_POLICY_VERSION_ID.to_string());
-                policy
-                    .versions
-                    .get(&default)
-                    .and_then(|version| version.document.clone())
-            });
+            // The DEFAULT version's document, the operative one (see
+            // [`Self::default_version_document`]).
+            let document = self.default_version_document(&policy_arn);
             collected.push(SourcedPolicy {
                 source: PolicySource::Managed {
                     aws_owned: is_aws_managed_policy_arn(&policy_arn),

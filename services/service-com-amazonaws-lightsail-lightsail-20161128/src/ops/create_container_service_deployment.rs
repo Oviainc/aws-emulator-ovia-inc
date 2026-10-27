@@ -209,8 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The new deployment is the one WAITING to become active: whatever is
             // running keeps serving until the clock activates this one, and a
             // deployment that was still waiting is superseded by it — only one
-            // deployment can be next, as only one can be active.
-            service.next_deployment = Some(deployment);
+            // deployment can be next, as only one can be active. Both stay in
+            // the service's deployment history, which is what
+            // `GetContainerServiceDeployments` reports.
+            service.record_deployment(deployment);
             service.next_deployment_version = version.saturating_add(1);
             // Launching a deployment is what puts a container service in
             // `DEPLOYING`, and `RUNNING` is the phase it settles into once that
