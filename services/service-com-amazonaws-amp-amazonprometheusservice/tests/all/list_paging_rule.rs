@@ -106,6 +106,7 @@ async fn seeded(which: Which, region: &str) -> (Amp, Listing) {
                 let scraper_id = format!("scraper-{index:03}");
                 seed(
                     &amp,
+                    region,
                     &scraper(
                         &scraper_id,
                         Some("paged"),

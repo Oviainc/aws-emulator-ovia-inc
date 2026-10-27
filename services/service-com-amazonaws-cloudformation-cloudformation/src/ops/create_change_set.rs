@@ -22,6 +22,14 @@
 //! template or resources. The stack will be in the REVIEW_IN_PROGRESS state until you
 //! execute the change set"); `ExecuteChangeSet` is what puts the template on it.
 //!
+//! An UPDATE change set is the PLAN of an update of the stack as it stands, so the statuses
+//! that take a plan are the statuses that take the update
+//! (`crate::state::status_takes_an_update`): a stack whose own failure another operation has
+//! to resolve first (a deletion or a rollback that could not be carried out, a create that
+//! was rolled back), one with an operation still in flight, and one a `CREATE` change set
+//! brought into existence are refused with the `ValidationError` `UpdateStack` answers,
+//! naming the stack and the state it really is in.
+//!
 //! CloudFormation answers this call while it is still computing the change set ("After the
 //! CreateChangeSet call successfully completes, CloudFormation starts creating the change
 //! set"), so the change set is answered `CREATE_PENDING` and settles to `CREATE_COMPLETE`
@@ -480,16 +488,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // set compares against it, and a CREATE change set for a stack still in
         // REVIEW_IN_PROGRESS targets that same record. `None` means this call mints it.
         let target_stack_id = match &existing {
-            Some((stack_id, _)) => {
-                if !creates_the_stack && in_review {
-                    // A stack a CREATE change set created and nothing has executed yet has
-                    // no template to compare an update against — the same refusal
-                    // `UpdateStack` answers for it.
+            Some((stack_id, stack_status)) => {
+                // An UPDATE change set is the PLAN of an update of the stack as it stands,
+                // so the statuses that take a plan are the statuses that take the update
+                // ([`crate::state::status_takes_an_update`]): a stack whose own failure
+                // another operation has to resolve first, one with an operation still in
+                // flight, and one a CREATE change set brought into existence — which holds
+                // no template to compare an update against — answer the refusal
+                // `UpdateStack` answers, naming the state the stack really is in.
+                if !creates_the_stack && !crate::state::status_takes_an_update(stack_status) {
                     return Err(crate::scaffolded::Scaffolded::validation_error(
-                        crate::state::stack_cannot_be_updated(
-                            stack_id,
-                            status::REVIEW_IN_PROGRESS,
-                        ),
+                        crate::state::stack_cannot_be_updated(stack_id, stack_status),
                     ));
                 }
                 Some(stack_id.clone())

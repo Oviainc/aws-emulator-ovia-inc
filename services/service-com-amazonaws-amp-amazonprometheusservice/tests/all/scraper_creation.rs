@@ -51,9 +51,9 @@ async fn create_workspace(amp: &Amp, region: &str) -> String {
     text(&reply.body["arn"])
 }
 
-/// How many scrapers the store HOLDS — what a refusal must leave unchanged.
-fn stored_count(amp: &Amp) -> usize {
-    amp.store().lock().scrapers.len()
+/// How many scrapers the store of `region` HOLDS — what a refusal must leave unchanged.
+fn stored_count(amp: &Amp, region: &str) -> usize {
+    amp.store().lock().region(region).scrapers.len()
 }
 
 /// An EKS source, as `EksConfiguration` models it: `clusterArn` and `subnetIds` are
@@ -382,7 +382,8 @@ async fn a_create_persists_the_scraper_and_reports_it_from_the_record() {
     let roles: std::collections::BTreeSet<String> = {
         let store = amp.store();
         let held = store.lock();
-        held.scrapers
+        held.region(region)
+            .scrapers
             .values()
             .map(|record| record.role_arn.clone())
             .collect()
@@ -512,10 +513,10 @@ async fn replaying_a_create_with_its_client_token_answers_the_same_scraper() {
                  got {repeat:?}"
             );
             assert_eq!(
-                stored_count(&amp),
+                stored_count(&amp, region),
                 1,
                 "case {case:?}: the replay must not create a second scraper, got {} held",
-                stored_count(&amp)
+                stored_count(&amp, region)
             );
             // The replay answers from the RECORD, so once the clock has settled it the
             // same token reports the status the record holds now.
@@ -533,10 +534,10 @@ async fn replaying_a_create_with_its_client_token_answers_the_same_scraper() {
                  {settled:?}"
             );
             assert_eq!(
-                stored_count(&amp),
+                stored_count(&amp, region),
                 1,
                 "case {case:?}: no replay may add a record, got {} held",
-                stored_count(&amp)
+                stored_count(&amp, region)
             );
         } else {
             assert_ne!(
@@ -545,10 +546,10 @@ async fn replaying_a_create_with_its_client_token_answers_the_same_scraper() {
                  got {repeat:?}"
             );
             assert_eq!(
-                stored_count(&amp),
+                stored_count(&amp, region),
                 2,
                 "case {case:?}: the store must hold both scrapers, got {} held",
-                stored_count(&amp)
+                stored_count(&amp, region)
             );
         }
     }
@@ -615,7 +616,7 @@ async fn a_destination_naming_no_workspace_this_account_holds_is_not_found() {
     ];
 
     for (case, destination, missing) in cases {
-        let held_before = stored_count(&amp);
+        let held_before = stored_count(&amp, region);
         let reply = create(
             &amp,
             region,
@@ -640,10 +641,10 @@ async fn a_destination_naming_no_workspace_this_account_holds_is_not_found() {
                 "case {case:?}: the destination must be persisted as sent, got {stored:?}"
             );
             assert_eq!(
-                stored_count(&amp),
+                stored_count(&amp, region),
                 held_before + 1,
                 "case {case:?}: an accepted create must persist one scraper, got {} held",
-                stored_count(&amp)
+                stored_count(&amp, region)
             );
             continue;
         };
@@ -675,10 +676,10 @@ async fn a_destination_naming_no_workspace_this_account_holds_is_not_found() {
             "case {case:?}: the refusal must name the resource type, got {reply:?}"
         );
         assert_eq!(
-            stored_count(&amp),
+            stored_count(&amp, region),
             held_before,
             "case {case:?}: a refused create must persist nothing, got {} held",
-            stored_count(&amp)
+            stored_count(&amp, region)
         );
     }
 }
@@ -747,10 +748,10 @@ async fn a_create_carrying_a_reserved_tag_key_is_refused() {
             "case {case:?}: expected the modelled ValidationException, got {reply:?}"
         );
         assert_eq!(
-            stored_count(&amp),
+            stored_count(&amp, region),
             0,
             "case {case:?}: a refused create must persist nothing, got {} held",
-            stored_count(&amp)
+            stored_count(&amp, region)
         );
     }
 }
@@ -775,6 +776,7 @@ async fn a_create_past_the_per_account_quota_is_refused() {
         for index in 0..held {
             seed(
                 &amp,
+                region,
                 &seeded_scraper(
                     &format!("s-quota-{index}"),
                     None,
@@ -785,10 +787,10 @@ async fn a_create_past_the_per_account_quota_is_refused() {
             );
         }
         assert_eq!(
-            stored_count(&amp),
+            stored_count(&amp, region),
             held,
             "case {case:?}: the store must hold the seeded scrapers, got {} held",
-            stored_count(&amp)
+            stored_count(&amp, region)
         );
 
         let reply = create(
@@ -808,10 +810,10 @@ async fn a_create_past_the_per_account_quota_is_refused() {
                 "case {case:?}: a create below the bound must be accepted, got {reply:?}"
             );
             assert_eq!(
-                stored_count(&amp),
+                stored_count(&amp, region),
                 held + 1,
                 "case {case:?}: the accepted create must persist one scraper, got {} held",
-                stored_count(&amp)
+                stored_count(&amp, region)
             );
             continue;
         }
@@ -845,10 +847,10 @@ async fn a_create_past_the_per_account_quota_is_refused() {
             "case {case:?}: quotaCode is @required, got {reply:?}"
         );
         assert_eq!(
-            stored_count(&amp),
+            stored_count(&amp, region),
             held,
             "case {case:?}: a refused create must persist nothing, got {} held",
-            stored_count(&amp)
+            stored_count(&amp, region)
         );
     }
 }
@@ -929,10 +931,10 @@ async fn a_created_scraper_settles_to_active_and_is_then_deletable() {
         "expected the service's not-found sentence, got {gone:?}"
     );
     assert_eq!(
-        stored_count(&amp),
+        stored_count(&amp, region),
         0,
         "the store must hold no scraper once the deletion settled, got {} held",
-        stored_count(&amp)
+        stored_count(&amp, region)
     );
     let listing = amp.call("GET", "/scrapers", region, "").await;
     assert_eq!(

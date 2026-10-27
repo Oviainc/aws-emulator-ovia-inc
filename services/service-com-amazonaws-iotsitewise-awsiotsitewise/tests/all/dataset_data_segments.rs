@@ -380,17 +380,17 @@ fn table() -> Vec<Row> {
 
 /// A table second as the absolute `timeInSeconds` the wire carries, anchored
 /// inside the window `BatchPutAssetPropertyValue` accepts; see `super::support`.
-fn at(seconds: i64) -> i64 {
+pub(crate) fn at(seconds: i64) -> i64 {
     anchor() + seconds
 }
 
 /// The inverse of [`at`].
-fn relative(seconds: i64) -> i64 {
+pub(crate) fn relative(seconds: i64) -> i64 {
     seconds - anchor()
 }
 
 /// A modelled `TimeInNanos` at the table instant `(seconds, nanos)`.
-fn instant(seconds: i64, nanos: i32) -> TimeInNanos {
+pub(crate) fn instant(seconds: i64, nanos: i32) -> TimeInNanos {
     TimeInNanos {
         time_in_seconds: at(seconds),
         offset_in_nanos: Some(nanos),
@@ -398,7 +398,7 @@ fn instant(seconds: i64, nanos: i32) -> TimeInNanos {
 }
 
 /// The same, on the wire.
-fn wire_instant(seconds: i64, nanos: i32) -> Value {
+pub(crate) fn wire_instant(seconds: i64, nanos: i32) -> Value {
     json!({ "timeInSeconds": at(seconds), "offsetInNanos": nanos })
 }
 
@@ -422,7 +422,11 @@ impl Streams {
 
 /// `POST /datasets`: create a dataset of `dataset_type` in `workspace` and answer
 /// its minted id.
-async fn create_dataset(
+///
+/// Shared with the association suite (`dataset_data_segment_association`), which
+/// drives the producer side of the same data segments these suites delete, rather
+/// than growing a second copy of this helper and the four below it.
+pub(crate) async fn create_dataset(
     router: &MultiServiceRouter,
     name: &str,
     dataset_type: Option<&str>,
@@ -451,7 +455,7 @@ async fn create_dataset(
 
 /// Ingest a DOUBLE sample at each of `seconds` against `alias`, which CREATES the
 /// data stream that alias names.
-async fn ingest(router: &MultiServiceRouter, alias: &str, seconds: &[i64]) {
+pub(crate) async fn ingest(router: &MultiServiceRouter, alias: &str, seconds: &[i64]) {
     let entries: Vec<Value> = seconds
         .iter()
         .map(|second| {
@@ -481,7 +485,7 @@ async fn ingest(router: &MultiServiceRouter, alias: &str, seconds: &[i64]) {
 }
 
 /// The `timeSeriesId` `DescribeTimeSeries` reports for `alias`.
-async fn time_series_id(router: &MultiServiceRouter, alias: &str) -> String {
+pub(crate) async fn time_series_id(router: &MultiServiceRouter, alias: &str) -> String {
     let (status, body) = call(
         router,
         "GET",

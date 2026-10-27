@@ -163,10 +163,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a scraper created in another Region is not
+        // reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.materialize_due(now);
 
-        let Some(scraper) = store.scrapers.get_mut(&input.scraper_id) else {
+        // A Region this account holds nothing in holds no scraper either, so it answers
+        // the same refusal the missing scraper does.
+        let Some(scraper) = store
+            .held_region_mut(&region)
+            .and_then(|store| store.scrapers.get_mut(&input.scraper_id))
+        else {
             return Err(DeleteScraperErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::SCRAPER_NOT_FOUND_MESSAGE.to_string(),

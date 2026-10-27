@@ -255,20 +255,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(token) = input.client_token.as_deref() {
             if let Some(prior) = state.scheduled_report_client_tokens.get(token) {
-                let message = if prior.in_progress_at(now) {
-                    format!(
-                        "A scheduled report creation is already in progress for client token {token}"
-                    )
-                } else if prior.request_fingerprint == fingerprint {
+                if !prior.in_progress_at(now) && prior.request_fingerprint == fingerprint {
                     return Ok(CreateScheduledReportOutput {
                         arn: prior.arn.clone(),
                     });
-                } else {
-                    format!(
-                        "Client token {token} was already used to create scheduled report {} with different request parameters",
-                        prior.arn
-                    )
-                };
+                }
+                // Both refusals are worded by the record of the create the token already
+                // started ([`crate::state::ScheduledReportCreation::conflict_message`]),
+                // which owns the two texts: the in-flight one, which tells the caller to
+                // retry, and the already-exists one, whose only value is the stored ARN.
+                // Neither carries the presented token.
+                let message = prior.conflict_message(now);
                 crate::state::record_state_change(ctx, Self::NAME, "-", "ConflictException");
                 return Err(CreateScheduledReportErrorModeled::ConflictException(
                     ConflictException { message },

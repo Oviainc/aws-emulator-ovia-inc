@@ -27,7 +27,7 @@
 //! on this crate's `smithy-model/`: `ENABLE_BASELINE` | `DISABLE_BASELINE` |
 //! `UPDATE_ENABLED_BASELINE` | `RESET_ENABLED_BASELINE`, and `SUCCEEDED` | `FAILED` |
 //! `IN_PROGRESS`. The two types this slice can produce are asserted here; the other two
-//! belong to the `UpdateEnabledBaseline` / `ResetEnabledBaseline` stub issues.
+//! belong to the `enabled_baseline_update` / `enabled_baseline_reset` suites.
 
 use crate::landing_zone_lifecycle::{
     call, emulator, is_operation_identifier, past_the_settle_span, simple_manifest, Answer,

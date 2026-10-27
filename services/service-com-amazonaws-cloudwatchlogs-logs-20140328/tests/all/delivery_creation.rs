@@ -8,8 +8,9 @@
 //! account does not hold is refused `ResourceNotFoundException` and adds nothing — mints the
 //! delivery's id, ARN and destination type itself, stores the optional configuration the
 //! request carries, and reports the delivery `GetDelivery` and `DescribeDeliveries` then
-//! report. A second create of a pair the account already holds is refused
-//! `ConflictException`.
+//! report. A second create of a pair the account already holds creates nothing and answers
+//! that stored delivery — the idempotence `tests/all/delivery_idempotence.rs` is about —
+//! while the same source paired with another destination is another delivery.
 //!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so a
@@ -349,9 +350,10 @@ async fn a_create_naming_a_resource_this_account_does_not_hold_is_refused() {
 }
 
 /// A delivery IS the pair of its source and its destination, so a second create of one pair
-/// is a conflict — while the same source paired with another destination is another delivery.
+/// answers the delivery that pair already names — while the same source paired with another
+/// destination is another delivery.
 #[tokio::test]
-async fn a_second_create_of_one_pair_is_a_conflict() {
+async fn a_second_create_of_one_pair_answers_the_delivery_it_already_names() {
     let logs = Logs::new();
     delivery_source(&logs, "vpc-flow-logs", "/vended/pairs-one").await;
     delivery_source(&logs, "waf_logs", "/vended/pairs-two").await;
@@ -382,20 +384,23 @@ async fn a_second_create_of_one_pair_is_a_conflict() {
         CONFLICT,
         "case a destination a delivery is associated with: the delete is refused"
     );
-    let code = logs
-        .err(
-            CREATE,
-            &json!({"deliverySourceName": "vpc-flow-logs", "deliveryDestinationArn": first}),
-        )
-        .await;
+    let again = delivery(
+        &logs
+            .ok(
+                CREATE,
+                &json!({"deliverySourceName": "vpc-flow-logs", "deliveryDestinationArn": first}),
+            )
+            .await,
+        "the same pair twice",
+    );
     assert_eq!(
-        code, CONFLICT,
-        "case the same pair twice: expected {CONFLICT}, got {code}"
+        again, created,
+        "case the same pair twice: the create answers the stored delivery, got {again:?}"
     );
     assert_eq!(
         described(&logs).await.len(),
         1,
-        "case the same pair twice: the refused create added nothing"
+        "case the same pair twice: the repeated create added nothing"
     );
 
     // (case, the pair, how many deliveries the account holds afterwards)

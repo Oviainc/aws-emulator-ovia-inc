@@ -1991,6 +1991,46 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         });
         Some(operation_identifier)
     }
+
+    /// Start a `RESET_ENABLED_BASELINE` against the enablement `arn` names and return the
+    /// operation's `operationIdentifier`.
+    ///
+    /// A reset RE-APPLIES the configuration the enablement already carries rather than a new
+    /// one, so it parks no pending change: the applied version and parameters read the same
+    /// before, during and after it, exactly as a control's reset re-deploys the configuration
+    /// that control already carries ([`record_enabled_control_reset`]). What the
+    /// re-application settles is inheritance drift — an enablement cannot be assessed against
+    /// a configuration still being applied, so the drift status goes back to UNASSESSED here
+    /// and [`settle`] assesses it again once the clock has made the operation due.
+    ///
+    /// `None` when `arn` names no stored enablement, so a handler answers the modelled
+    /// `ResourceNotFoundException` and NOTHING is written. Writes no new resource, so it is
+    /// not bounded by [`MAX_ENABLED_BASELINES`]; the operation it appends is bounded by the
+    /// log's own retention rule.
+    ///
+    /// The caller refuses a reset that overlaps a baseline operation still in flight against
+    /// `arn` with the modelled `ConflictException`, the same rule `UpdateEnabledBaseline`
+    /// applies: neither call is `@idempotent`, so a second one starting while the first is
+    /// half applied is a refusal rather than a repeat.
+    ///
+    /// [`settle`]: Self::settle
+    /// [`record_enabled_control_reset`]: Self::record_enabled_control_reset
+    pub fn record_enabled_baseline_reset(&mut self, arn: &str, now: SystemTime) -> Option<String> {
+        if !self.enabled_baselines.contains_key(arn) {
+            return None;
+        }
+
+        let operation_identifier =
+            self.record_baseline_operation(BaselineOperationType::ResetEnabledBaseline, arn, now);
+        let enabled_baseline = self.enabled_baselines.get_mut(arn)?;
+        // The enablement is changing until the reset is due; the status is derived from the
+        // log by `settle`, and set to match here so a caller reading straight after the call
+        // sees the transient state.
+        enabled_baseline.status = EnablementStatus::UnderChange;
+        enabled_baseline.last_operation_identifier = operation_identifier.clone();
+        enabled_baseline.inheritance_drift_status = None;
+        Some(operation_identifier)
+    }
 }
 
 /// One record of an asynchronous operation log, as the shared retention bound reads it.

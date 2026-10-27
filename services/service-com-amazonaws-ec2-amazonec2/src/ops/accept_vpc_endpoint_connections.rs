@@ -2,7 +2,7 @@
 
 //! @op AcceptVpcEndpointConnections
 //! IMPLEMENTED: accepts the pending connections to the account's own VPC endpoint service
-//! that the request names, moving each out of `PendingAcceptance` towards `Available`, and
+//! that the request names, moving each out of `pendingAcceptance` towards `available`, and
 //! answers with the endpoints it could not accept. This is the ONLY file to touch for this
 //! operation.
 //!
@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state_handle = state::require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();
-        // A connection whose own move has fallen due is already `Available`, so whether
+        // A connection whose own move has fallen due is already `available`, so whether
         // each acceptance is admissible is asked of the state the connection is ACTUALLY
         // in.
         store.materialize_due_transitions();
@@ -264,8 +264,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Every accepted connection moves to the non-terminal `Pending` now, with the clock
-        // owing it `Available`; the span is never zero, so a caller describing the
+        // Every accepted connection moves to the non-terminal `pending` now, with the clock
+        // owing it `available`; the span is never zero, so a caller describing the
         // connections straight after this call still sees the transient state.
         for endpoint_id in accepted {
             if let Some(connection) = store.vpc_endpoint_connections.get_mut(&endpoint_id) {

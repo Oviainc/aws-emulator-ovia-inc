@@ -86,10 +86,12 @@ pub(crate) async fn delete_logging(
     amp.call("DELETE", &uri, region, "").await
 }
 
-/// The configuration the store holds for one workspace, or `None` once it holds none.
-fn stored(amp: &Amp, workspace_id: &str) -> Option<LoggingConfiguration> {
+/// The configuration the store of `region` holds for one workspace, or `None` once it
+/// holds none.
+fn stored(amp: &Amp, region: &str, workspace_id: &str) -> Option<LoggingConfiguration> {
     amp.store()
         .lock()
+        .region(region)
         .workspaces
         .get(workspace_id)
         .and_then(|workspace| workspace.logging_configuration.clone())
@@ -111,10 +113,17 @@ async fn active_configuration(amp: &Amp, region: &str, alias: &str, arn: &str) -
 /// Put the workspace and its configuration in the statuses named, with nothing owed by
 /// the clock. Written straight into the store the handlers read, because `CREATION_FAILED`
 /// and the rest are statuses this emulator's own calls never reach.
-fn force_statuses(amp: &Amp, workspace_id: &str, workspace_status: &str, logging_status: &str) {
+fn force_statuses(
+    amp: &Amp,
+    region: &str,
+    workspace_id: &str,
+    workspace_status: &str,
+    logging_status: &str,
+) {
     let store = amp.store();
     let mut guard = store.lock();
     let workspace = guard
+        .region_mut_for_create(region)
         .workspaces
         .get_mut(workspace_id)
         .unwrap_or_else(|| panic!("the store holds workspace {workspace_id:?}"));
@@ -202,7 +211,7 @@ async fn deleting_a_configuration_moves_it_to_deleting_then_the_clock_removes_it
         let arn = log_group_arn(partition, region, &log_group_name);
         let amp = Amp::new();
         let workspace_id = active_configuration(&amp, region, "to-delete", &arn).await;
-        force_statuses(&amp, &workspace_id, STATUS_ACTIVE, LOGGING_STATUS_ACTIVE);
+        force_statuses(&amp, region, &workspace_id, STATUS_ACTIVE, LOGGING_STATUS_ACTIVE);
 
         let reply = delete_logging(&amp, region, &workspace_id, client_token).await;
         assert_eq!(
@@ -210,7 +219,7 @@ async fn deleting_a_configuration_moves_it_to_deleting_then_the_clock_removes_it
             "case {name:?}: DeleteLoggingConfiguration is modelled 202, got {reply:?}"
         );
 
-        let pending = stored(&amp, &workspace_id).unwrap_or_else(|| {
+        let pending = stored(&amp, region, &workspace_id).unwrap_or_else(|| {
             panic!("case {name:?}: the record must still be held while the removal is owed")
         });
         assert_eq!(
@@ -266,11 +275,11 @@ async fn deleting_a_configuration_moves_it_to_deleting_then_the_clock_removes_it
             "case {name:?}: a removed configuration must answer 404, got {gone:?}"
         );
         assert_eq!(
-            stored(&amp, &workspace_id).map(|record| record.status_code),
+            stored(&amp, region, &workspace_id).map(|record| record.status_code),
             None,
             "case {name:?}: the workspace must hold no configuration once the removal is \
              due, got {:?}",
-            stored(&amp, &workspace_id)
+            stored(&amp, region, &workspace_id)
         );
         assert_eq!(
             text(&gone.body["message"]),
@@ -324,12 +333,12 @@ async fn a_delete_while_the_removal_is_owed_is_the_same_request() {
         first.status, 202,
         "the first delete must be accepted, got {first:?}"
     );
-    let owed = stored(&amp, &workspace_id).and_then(|record| record.transition_due);
+    let owed = stored(&amp, region, &workspace_id).and_then(|record| record.transition_due);
     assert!(
         owed.is_some(),
         "the delete must leave a removal owed, got {owed:?}"
     );
-    let modified = stored(&amp, &workspace_id).map(|record| record.modified_at);
+    let modified = stored(&amp, region, &workspace_id).map(|record| record.modified_at);
 
     for repeat_token in [Some(token), None, Some("delete-logging-other")] {
         let repeat = delete_logging(&amp, region, &workspace_id, repeat_token).await;
@@ -338,7 +347,7 @@ async fn a_delete_while_the_removal_is_owed_is_the_same_request() {
             "case {repeat_token:?}: a deletion already under way must still be accepted, \
              got {repeat:?}"
         );
-        let record = stored(&amp, &workspace_id).unwrap_or_else(|| {
+        let record = stored(&amp, region, &workspace_id).unwrap_or_else(|| {
             panic!("case {repeat_token:?}: the record is held until the removal is due")
         });
         assert_eq!(
@@ -396,7 +405,7 @@ async fn a_delete_is_refused_unless_the_configuration_and_its_workspace_are_acti
         let case = format!("workspace {workspace_status} / configuration {logging_status}");
         let amp = Amp::new();
         let workspace_id = active_configuration(&amp, region, "conflicted", &arn).await;
-        force_statuses(&amp, &workspace_id, workspace_status, logging_status);
+        force_statuses(&amp, region, &workspace_id, workspace_status, logging_status);
 
         let reply = delete_logging(&amp, region, &workspace_id, Some("delete-conflict")).await;
         assert_eq!(
@@ -425,7 +434,7 @@ async fn a_delete_is_refused_unless_the_configuration_and_its_workspace_are_acti
              {message:?}"
         );
 
-        let record = stored(&amp, &workspace_id)
+        let record = stored(&amp, region, &workspace_id)
             .unwrap_or_else(|| panic!("case {case:?}: a refused delete removes nothing"));
         assert_eq!(
             record.status_code, logging_status,
@@ -501,11 +510,11 @@ async fn an_absent_workspace_or_configuration_is_not_found() {
     }
 
     assert_eq!(
-        stored(&amp, &held).map(|record| record.status_code),
+        stored(&amp, region, &held).map(|record| record.status_code),
         Some(LOGGING_STATUS_ACTIVE.to_string()),
         "a delete that named another workspace must leave this configuration where it \
          was, got {:?}",
-        stored(&amp, &held)
+        stored(&amp, region, &held)
     );
 
     for workspace_status in WORKSPACE_STATUS_CODE_VALUES {
@@ -515,6 +524,7 @@ async fn an_absent_workspace_or_configuration_is_not_found() {
             let store = amp.store();
             let mut guard = store.lock();
             let workspace = guard
+                .region_mut_for_create(region)
                 .workspaces
                 .get_mut(&workspace_id)
                 .expect("the store holds the workspace just created");
@@ -565,7 +575,7 @@ async fn a_delete_touches_only_the_configuration_it_names() {
             &log_group_arn("aws", region, &format!("/aws/prometheus/{alias}")),
         )
         .await;
-        force_statuses(&amp, &workspace_id, STATUS_ACTIVE, LOGGING_STATUS_ACTIVE);
+        force_statuses(&amp, region, &workspace_id, STATUS_ACTIVE, LOGGING_STATUS_ACTIVE);
         workspace_ids.push(workspace_id);
     }
 
@@ -577,7 +587,7 @@ async fn a_delete_touches_only_the_configuration_it_names() {
     );
 
     for workspace_id in &workspace_ids {
-        let record = stored(&amp, workspace_id).unwrap_or_else(|| {
+        let record = stored(&amp, region, workspace_id).unwrap_or_else(|| {
             panic!("case {workspace_id:?}: every configuration is still held")
         });
         if workspace_id == deleted {
@@ -619,7 +629,7 @@ async fn a_delete_touches_only_the_configuration_it_names() {
             "case {workspace_id:?}: expected {expected_status} once the owed removal is \
              due, got {described:?}"
         );
-        let held = stored(&amp, workspace_id).is_some();
+        let held = stored(&amp, region, workspace_id).is_some();
         assert_eq!(
             held,
             workspace_id != deleted,

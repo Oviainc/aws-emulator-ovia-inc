@@ -175,12 +175,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // This service is REGIONAL, so the store that answers this call is the one of
+        // the Region the request was signed for: a workspace created in another Region is
+        // not reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // The transitions the clock already owes (a detector's move out of CREATING or
         // UPDATING, and the removal of one whose DELETING span is up) are materialised
         // first, so this listing reports the same state a caller would read through
         // `DescribeAnomalyDetector` at this instant.
         store.materialize_due(::std::time::SystemTime::now());
+        // A report reaches that store through a SHARED borrow of the whole store
+        // (`&*store`), so the compiler itself refuses here any accessor that could bring a
+        // Region's store into being: only a create may do that, and only under the ceiling
+        // on Regions held at once.
+        let held = &*store;
+        let store = held.region(&region);
 
         // The detectors listed are the ones "in a workspace", so without that workspace
         // there is nothing to list: `ResourceNotFoundException` (404), the same refusal

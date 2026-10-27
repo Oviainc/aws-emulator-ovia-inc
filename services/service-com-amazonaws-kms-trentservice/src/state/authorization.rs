@@ -228,7 +228,16 @@ pub fn authorize(
         return Ok(());
     }
 
-    Err(no_identity_policy_message(&caller.arn, &action, &key.arn))
+    // WHICH document has to change is what AWS's two implicit-deny sentences say, and the
+    // key policy decides which one applies: a policy that does not allow the action for
+    // this caller or its account withholds it outright, and no identity policy can widen a
+    // key policy that grants nothing — while a policy that DELEGATES to the account leaves
+    // the principal's own identity policies as the permission it is missing.
+    Err(if delegates {
+        no_identity_policy_message(&caller.arn, &action, &key.arn)
+    } else {
+        no_resource_policy_message(&caller.arn, &action, &key.arn)
+    })
 }
 
 /// The condition keys a statement of these documents is judged under: the keys that name
@@ -265,6 +274,21 @@ pub fn no_identity_policy_message(principal: &str, action: &str, resource: &str)
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} \
          because no identity-based policy allows the {action} action"
+    )
+}
+
+/// How AWS words an authorization failure the RESOURCE's own policy withheld: who was
+/// refused, which action, on which resource, and that no resource-based policy allows the
+/// action — the sentence for a key whose policy does not allow the action for this caller
+/// or for its account at all, which is the document that has to change.
+///
+/// One function for the whole service, so no two operations word the same refusal
+/// differently.
+#[must_use]
+pub fn no_resource_policy_message(principal: &str, action: &str, resource: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} \
+         because no resource-based policy allows the {action} action"
     )
 }
 

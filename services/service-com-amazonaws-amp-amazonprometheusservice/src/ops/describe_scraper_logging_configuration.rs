@@ -150,7 +150,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DescribeScraperLoggingConfigurationErrorModeled::InternalServerException(
@@ -163,11 +162,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // This service is REGIONAL, so the store that answers this call is the one of
+        // the Region the request was signed for: a scraper created in another Region is
+        // not reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // Every lifecycle transition the clock already owed at this instant was owed
         // whether or not anybody called, so a read reports the record as of now rather
         // than as of the last write.
         store.materialize_due(::std::time::SystemTime::now());
+        // A report reaches that store through a SHARED borrow of the whole store
+        // (`&*store`), so the compiler itself refuses here any accessor that could bring a
+        // Region's store into being: only a create may do that, and only under the ceiling
+        // on Regions held at once.
+        let held = &*store;
+        let store = held.region(&region);
 
         // The configuration is a child of the scraper, so a scraper this account does
         // not hold has no configuration to report and is itself the missing resource —

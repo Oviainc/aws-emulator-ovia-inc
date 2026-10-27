@@ -36,7 +36,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 };
 
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
-use super::package_associations::UNKNOWN_PACKAGE_ID;
+use super::package_associations::{SERVICE_PACKAGE_ID, UNKNOWN_PACKAGE_ID};
 
 /// The largest page size `GetPackageVersionHistory` publishes: `MaxResults` is
 /// `@range(max: 100)` with `@default(0)` and no minimum
@@ -47,11 +47,6 @@ const PUBLISHED_MAX_RESULTS: i32 = 100;
 /// (`smithy_query(query="shape",shape="CommitMessage")`), so this and the empty string
 /// are the bounds a stored message is reported at.
 const MAX_COMMIT_MESSAGE: usize = 160;
-
-/// A `PackageID` of the OTHER form the model's pattern admits
-/// (`^([FG][0-9]+)$|^(pkg-[a-f0-9]+)$`): the form that addresses a package the service
-/// itself publishes, which this account holds none of.
-const SERVICE_PACKAGE_ID: &str = "F123456789";
 
 /// An instant with no sub-second part, so a seeded version's `CreatedAt` is reported
 /// as exactly the epoch seconds this test wrote. Its value is arbitrary: what the

@@ -143,7 +143,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -154,10 +153,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: an ARN naming another Region's resource
+        // resolves to nothing here, as it does for that resource's own operations.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.materialize_due(::std::time::SystemTime::now());
 
-        let Some(tags) = store.tags_of_arn_mut(&input.resource_arn) else {
+        let Some(tags) = store
+            .held_region_mut(&region)
+            .and_then(|store| store.tags_of_arn_mut(&input.resource_arn))
+        else {
             // The same refusal `TagResource` answers for an ARN that resolves to no live
             // resource — one composition for all three tagging operations.
             return Err(crate::state::arn_not_found());

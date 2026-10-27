@@ -35,6 +35,8 @@ mod patient_insights_job_lifecycle;
 mod region_scoping;
 #[path = "all/reserved_tag_key_prefix.rs"]
 mod reserved_tag_key_prefix;
+#[path = "all/resource_tag_removal.rs"]
+mod resource_tag_removal;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/shared_pagination_policy.rs"]

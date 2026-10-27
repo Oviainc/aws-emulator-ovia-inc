@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIntegrationResourceProperty
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIntegrationResourceProperty`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIntegrationResourceProperty::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the processing properties of ONE resource of an integration — the Glue
+//! connection an integration reads from, or the Glue database it writes into — into this
+//! account's per-resource namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::integration_resource_properties`]),
+//! keyed by that resource's ARN. There is one record per resource: a create for a resource
+//! that already has one writes THAT record, keeping the `ResourcePropertyArn` the first
+//! create minted. `GetIntegrationResourceProperty` reads the record back.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +166,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIntegrationResourceProperty` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIntegrationResourcePropertyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIntegrationResourceProperty"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(
+                CreateIntegrationResourcePropertyErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "the Glue integration resource property store is unavailable".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // "The connection ARN of the source, or the database ARN of the target": a value
+        // that is neither names no resource whose properties this call could set.
+        let resource = match crate::state::integration_resource_reference(&input.resource_arn) {
+            Ok(resource) => resource,
+            Err(message) => {
+                return Err(
+                    CreateIntegrationResourcePropertyErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(message),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        let mut store = state.lock();
+        // The properties are the named resource's own, so that resource has to exist: an
+        // ARN of a connection or a database this endpoint does not hold — including one of
+        // another account or another Region — names nothing here.
+        if store.resource_tags(&resource).is_none() {
+            return Err(
+                CreateIntegrationResourcePropertyErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        message: Some(crate::state::tagged_resource_not_found_message(
+                            &resource,
+                            &input.resource_arn,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // One record per resource: a create for a resource that already has one is that
+        // record's next write and mints no second record, so nothing here refuses it as a
+        // duplicate and the `ResourcePropertyArn` the first create minted survives.
+        let stored_already = store
+            .integration_resource_properties
+            .contains_key(&input.resource_arn);
+        if !stored_already && !store.can_store_integration_resource_property() {
+            // The store is resident memory and this create is reachable by any caller, so
+            // the number of records one process will hold is bounded. This operation models
+            // no limit error, so the refusal is the closest client error it does model.
+            return Err(
+                CreateIntegrationResourcePropertyErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} integration resource \
+                             properties",
+                            crate::state::MAX_INTEGRATION_RESOURCE_PROPERTIES
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let stored = store
+            .integration_resource_properties
+            .entry(input.resource_arn.clone())
+            .or_insert_with(|| {
+                crate::state::IntegrationResourcePropertyEntry::from_create_input(&input)
+            });
+        if stored_already {
+            stored.apply_create(&input);
+        }
+
+        ::tracing::info!(
+            operation = "CreateIntegrationResourceProperty",
+            resource = %stored.resource_arn,
+            stored_already,
+            "wrote the processing properties of a Glue integration resource"
+        );
+
+        // Every member comes from the record that is now stored, so what this create
+        // reports is what a later read of that record reports.
+        Ok(CreateIntegrationResourcePropertyOutput {
+            resource_arn: stored.resource_arn.clone(),
+            resource_property_arn: Some(stored.arn(&region)),
+            source_processing_properties: stored.source_processing_properties.clone(),
+            target_processing_properties: stored.target_processing_properties.clone(),
+        })
     }
 }

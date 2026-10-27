@@ -85,3 +85,5 @@ mod signatures;
 mod state_roundtrip;
 #[path = "all/update_custom_key_store.rs"]
 mod update_custom_key_store;
+#[path = "all/via_service_confinement.rs"]
+mod via_service_confinement;

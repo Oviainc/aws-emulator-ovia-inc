@@ -12,6 +12,10 @@
 //! resolves a named resource answers such a value with `BadRequestException` (400) naming
 //! the member, and leaves the store exactly as it was.
 //!
+//! The rule holds at every depth a queue reference arrives at: the last case below drives
+//! it through `HopDestination$Queue`, which points at a queue resource exactly as the
+//! top-level `Queue` does, on all three operations that accept a hop list.
+//!
 //! The other side of the same rule is that a value which DOES carry characters is never
 //! normalised: surrounding whitespace is part of the key, so a padded name creates its own
 //! resource and reads back verbatim (`tests/all/queue_name_identity.rs` pins that for
@@ -22,6 +26,7 @@
 //! asserted is the bytes a client would see.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_mediaconvert_mediaconvert::state::not_found_message;
 
 use super::job_lifecycle::{settings as job_settings, Emulator, Reply, ROLE};
 use super::job_template_crud::settings as template_settings;
@@ -303,6 +308,29 @@ async fn a_name_that_carries_characters_keeps_its_whitespace() {
     }
 }
 
+/// Assert `reply` is the lookup refusal this service words for a hop destination whose
+/// `Queue` carries characters but names no stored queue.
+fn assert_hop_not_found(case: &str, reply: &Reply) {
+    assert_eq!(
+        reply.status, 404,
+        "case {case:?}: expected HTTP 404, got {} with body {}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error_type.as_deref(),
+        Some("NotFoundException"),
+        "case {case:?}: expected NotFoundException, got {:?} with body {}",
+        reply.error_type,
+        reply.body
+    );
+    assert_eq!(
+        reply.string("/message"),
+        not_found_message("hopDestinations"),
+        "case {case:?}: expected the member-naming lookup refusal, got body {}",
+        reply.body
+    );
+}
+
 /// The same rule on the members that REFERENCE a named resource rather than mint one: a
 /// reference carrying no characters resolves to nothing, so it is the modelled bad request
 /// naming the member, never a stored record pointing at nothing.
@@ -403,4 +431,192 @@ async fn a_resource_reference_carrying_no_characters_is_refused() {
         "a refused update must change nothing, got body {}",
         after.body
     );
+}
+
+/// The queue the jobs in the hop-destination case are submitted to. A hop destination
+/// "cannot be the original queue to which the job is submitted", so the source queue is one
+/// the fixture creates rather than the account's default.
+const HOP_SOURCE_QUEUE: &str = "blank-hop-source";
+
+/// A stored queue whose own name is padded with whitespace: the other side of the rule
+/// keeps it, so a hop naming it resolves byte for byte while its trimmed spelling names no
+/// queue at all.
+const PADDED_HOP_QUEUE: &str = "  padded hop  ";
+
+/// What the doors that accept a hop list answer for one row of it.
+enum Expect {
+    /// The list sets up a hop: the request is accepted and the list is stored.
+    Accepted,
+    /// A `Queue` carrying no characters: the modelled bad request naming the member.
+    BlankRefusal,
+    /// A `Queue` that carries characters but names no stored queue: the lookup refusal.
+    NotFound,
+}
+
+/// `HopDestination$Queue` is a queue reference exactly as the top-level `Queue` is, so the
+/// same rule holds there: an entry stating a queue that carries no characters is the
+/// modelled bad request naming the member, never a lookup of a name nothing could hold.
+///
+/// The table spans what the rule generalises over: every blank form, the entry's position
+/// in the list (the only one, and a later one after a resolvable entry), and — as the
+/// boundary — an entry that names a stored queue whose name is itself padded, that queue's
+/// trimmed spelling (which names nothing, so it is the LOOKUP refusal), and an entry that
+/// names no queue at all (the member left out, which moves a job to the default queue).
+/// Every row is driven through all three operations that carry `HopDestinations`, so the
+/// rule is asserted wherever it holds.
+#[tokio::test]
+async fn a_hop_destination_queue_carrying_no_characters_is_refused() {
+    let emulator = Emulator::new();
+    for name in [HOP_SOURCE_QUEUE, PADDED_HOP_QUEUE] {
+        let created = emulator.create_queue(json!({ "name": name })).await;
+        assert_eq!(
+            created.status, 201,
+            "the fixture queue {name:?} must be created: got {} with body {}",
+            created.status, created.body
+        );
+    }
+    let fixture = emulator
+        .create_job_template(json!({
+            "name": "hopping-template",
+            "settings": template_settings(1, 1),
+        }))
+        .await;
+    assert_eq!(
+        fixture.status, 201,
+        "the fixture template must be created: got {} with body {}",
+        fixture.status, fixture.body
+    );
+
+    let mut rows: Vec<(String, Value, Expect)> = Vec::new();
+    for blank in blanks() {
+        rows.push((
+            format!("the only entry states a queue of {}", blank.label),
+            json!([{ "queue": blank.value, "waitMinutes": 10 }]),
+            Expect::BlankRefusal,
+        ));
+        rows.push((
+            format!(
+                "a second entry states a queue of {}, after a resolvable one",
+                blank.label
+            ),
+            json!([
+                { "queue": PADDED_HOP_QUEUE, "waitMinutes": 10 },
+                { "queue": blank.value, "waitMinutes": 20 },
+            ]),
+            Expect::BlankRefusal,
+        ));
+    }
+    rows.push((
+        "an entry naming the stored queue whose name is padded".to_string(),
+        json!([{ "queue": PADDED_HOP_QUEUE, "waitMinutes": 10 }]),
+        Expect::Accepted,
+    ));
+    rows.push((
+        "an entry naming that queue's trimmed spelling".to_string(),
+        json!([{ "queue": PADDED_HOP_QUEUE.trim(), "waitMinutes": 10 }]),
+        Expect::NotFound,
+    ));
+    rows.push((
+        "an entry naming no queue at all".to_string(),
+        json!([{ "waitMinutes": 10 }]),
+        Expect::Accepted,
+    ));
+
+    for (index, (case, hops, expect)) in rows.into_iter().enumerate() {
+        // What the addressed template carries BEFORE the update, so a refused update can be
+        // shown to have changed nothing whatever an earlier row left there.
+        let before = emulator.get_job_template("hopping-template").await;
+        let before_hops = before.at("/jobTemplate/hopDestinations").clone();
+
+        let job = emulator
+            .create_job(json!({
+                "role": ROLE,
+                "queue": HOP_SOURCE_QUEUE,
+                "hopDestinations": hops.clone(),
+                "settings": job_settings("s3://example-bucket/in/a.mp4", "_a"),
+            }))
+            .await;
+        let created_name = format!("hopping-{index}");
+        let template = emulator
+            .create_job_template(json!({
+                "name": created_name,
+                "hopDestinations": hops.clone(),
+                "settings": template_settings(1, 1),
+            }))
+            .await;
+        let updated = emulator
+            .update_job_template("hopping-template", json!({ "hopDestinations": hops.clone() }))
+            .await;
+
+        match expect {
+            Expect::Accepted => {
+                for (operation, reply, accepted) in [
+                    ("CreateJob", &job, 201),
+                    ("CreateJobTemplate", &template, 201),
+                    ("UpdateJobTemplate", &updated, 200),
+                ] {
+                    assert_eq!(
+                        reply.status, accepted,
+                        "case {operation}: {case:?}: expected HTTP {accepted}, got {} with \
+                         body {}",
+                        reply.status, reply.body
+                    );
+                }
+                assert_eq!(
+                    job.at("/job/hopDestinations"),
+                    &hops,
+                    "case {case:?}: the created job must carry the hop list it was given, \
+                     got body {}",
+                    job.body
+                );
+                let after = emulator.get_job_template("hopping-template").await;
+                assert_eq!(
+                    after.at("/jobTemplate/hopDestinations"),
+                    &hops,
+                    "case {case:?}: an accepted update must store the hop list it was given, \
+                     got body {}",
+                    after.body
+                );
+                continue;
+            }
+            Expect::BlankRefusal => {
+                for (operation, reply) in [
+                    ("CreateJob", &job),
+                    ("CreateJobTemplate", &template),
+                    ("UpdateJobTemplate", &updated),
+                ] {
+                    assert_blank_refusal(
+                        &format!("{operation}: {case}"),
+                        "HopDestinations.Queue",
+                        reply,
+                    );
+                }
+            }
+            Expect::NotFound => {
+                for (operation, reply) in [
+                    ("CreateJob", &job),
+                    ("CreateJobTemplate", &template),
+                    ("UpdateJobTemplate", &updated),
+                ] {
+                    assert_hop_not_found(&format!("{operation}: {case}"), reply);
+                }
+            }
+        }
+
+        // Every refusal above left the store exactly as it was: no template under the name
+        // the refused create named, and the addressed template's hop list unchanged.
+        let fetched = emulator.get_job_template(&created_name).await;
+        assert_eq!(
+            fetched.status, 404,
+            "case {case:?}: a refused create must persist nothing, got {} with body {}",
+            fetched.status, fetched.body
+        );
+        let after = emulator.get_job_template("hopping-template").await;
+        assert_eq!(
+            after.at("/jobTemplate/hopDestinations"),
+            &before_hops,
+            "case {case:?}: a refused update must change nothing, got body {}",
+            after.body
+        );
+    }
 }

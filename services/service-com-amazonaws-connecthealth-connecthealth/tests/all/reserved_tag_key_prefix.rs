@@ -33,8 +33,10 @@
 //!   `state::MAX_TAG_VALUE_LEN`), which is what this suite imports rather than restating.
 //! * `smithy_query(query="digest")` — the operations whose input carries a `TagMap` are
 //!   `CreateDomain` (`POST /domain`, 201) and `TagResource` (`POST /tags/{resourceArn}`,
-//!   204); `UntagResource` carries a `TagKeyList` of keys to REMOVE and is still a 501
-//!   stub, so it has no row here.
+//!   204); `UntagResource` carries a `TagKeyList` of keys to REMOVE rather than a
+//!   `TagMap`, and the namespace rule holds for those keys too — removing a reserved tag
+//!   is refused exactly as setting one is, which its own suite asserts
+//!   (`tests/all/resource_tag_removal.rs`).
 
 use std::collections::BTreeMap;
 

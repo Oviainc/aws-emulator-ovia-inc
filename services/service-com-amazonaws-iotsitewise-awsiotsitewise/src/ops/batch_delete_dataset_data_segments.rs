@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 errors.push(failed(
                     entry,
                     ERROR_CODE_VALIDATION_ERROR,
-                    "endTimestamp must be later than startTimestamp.".to_string(),
+                    crate::state::empty_span_message(),
                 ));
                 continue;
             }

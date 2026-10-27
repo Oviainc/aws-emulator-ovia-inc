@@ -33,7 +33,15 @@
 //! 1. `dedicatedHostId` and `placementGroupId` cannot be used together in one
 //!    `HostInfoForCreate`.
 //! 2. A VLAN subnet CIDR block is between /24 and /28, and no two of an
-//!    environment's VLAN subnets may overlap.
+//!    environment's VLAN subnets may overlap. A VLAN subnet Amazon EVS provisions
+//!    PUBLIC is narrowed further, to exactly a /28: "If you plan to use a public HCX
+//!    VLAN subnet, the following requirements must be met: Must have a /28 netmask"
+//!    (`InitialVlans$hcx` doc) — the extra requirement the public case carries, which
+//!    the general range alone would admit a larger block for. The other requirements
+//!    of that same list (the block allocated from the account's public IPAM pool, added
+//!    to the VPC as a secondary CIDR block, and two Elastic IP addresses allocated from
+//!    that pool) name no member of this request, so this operation has nothing to
+//!    decide them from and refuses nothing for them.
 //! 3. `hcxNetworkAclId` is required when `isHcxPublic` is true.
 //! 4. An environment name is unique within the account and Region.
 //! 5. `termsAccepted` must be true: it is the caller's confirmation that it holds the
@@ -933,6 +941,25 @@ fn release<Eng: Send + Sync + 'static>(
 const MAX_VLAN_PREFIX_LEN: u8 = 28;
 /// The smallest VLAN subnet prefix length. See [`MAX_VLAN_PREFIX_LEN`].
 const MIN_VLAN_PREFIX_LEN: u8 = 24;
+/// The one prefix length a VLAN subnet Amazon EVS provisions PUBLIC may carry: "If you
+/// plan to use a public HCX VLAN subnet, the following requirements must be met: Must
+/// have a /28 netmask" (`InitialVlans$hcx` doc).
+const PUBLIC_VLAN_PREFIX_LEN: u8 = 28;
+
+/// The prefix lengths a VLAN subnet block may carry: the published /24../28 range in
+/// general, narrowed to exactly [`PUBLIC_VLAN_PREFIX_LEN`] for a VLAN Amazon EVS
+/// provisions public, which the public case's own requirement adds.
+///
+/// Keyed on whether the VLAN is PUBLIC, not on which `InitialVlans` member it came
+/// from: the narrowing belongs to the public provisioning, so it holds for every VLAN
+/// a request asks to be public.
+fn allowed_prefix_lens(is_public: bool) -> std::ops::RangeInclusive<u8> {
+    if is_public {
+        PUBLIC_VLAN_PREFIX_LEN..=PUBLIC_VLAN_PREFIX_LEN
+    } else {
+        MIN_VLAN_PREFIX_LEN..=MAX_VLAN_PREFIX_LEN
+    }
+}
 
 /// One VLAN subnet `CreateEnvironment` is about to materialise.
 struct PlannedVlan<'a> {
@@ -1106,8 +1133,9 @@ fn plan_vlans(initial: &InitialVlans) -> Vec<PlannedVlan<'_>> {
 }
 
 /// Every rule the request's VLAN subnets break: the HCX network ACL the public HCX
-/// VLAN requires, and, per VLAN subnet, a parsable CIDR block of an allowed size that
-/// overlaps none of the environment's other VLAN subnets.
+/// VLAN requires, and, per VLAN subnet, a parsable CIDR block of a size that VLAN is
+/// allowed ([`allowed_prefix_lens`], which narrows for a public one) and that overlaps
+/// none of the environment's other VLAN subnets.
 fn vlan_failures(
     initial: &InitialVlans,
     planned: &[PlannedVlan<'_>],
@@ -1136,14 +1164,21 @@ fn vlan_failures(
             continue;
         };
         let prefix_len = network.prefix_len;
-        if !(MIN_VLAN_PREFIX_LEN..=MAX_VLAN_PREFIX_LEN).contains(&prefix_len) {
-            failures.push(crate::state::field_failure(
-                member,
-                &format!(
-                    "must have a prefix length between /{MIN_VLAN_PREFIX_LEN} and \
-                     /{MAX_VLAN_PREFIX_LEN}, but was /{prefix_len}"
-                ),
-            ));
+        let allowed = allowed_prefix_lens(vlan.is_public);
+        if !allowed.contains(&prefix_len) {
+            let (smallest, largest) = (*allowed.start(), *allowed.end());
+            let problem = if smallest == largest {
+                format!(
+                    "must have a /{smallest} netmask when the VLAN subnet is provisioned \
+                     public, but was /{prefix_len}"
+                )
+            } else {
+                format!(
+                    "must have a prefix length between /{smallest} and /{largest}, but \
+                     was /{prefix_len}"
+                )
+            };
+            failures.push(crate::state::field_failure(member, &problem));
         }
         // "Amazon EVS VLAN subnet CIDR blocks must not overlap with other subnets"
         // (`InitialVlans` doc).

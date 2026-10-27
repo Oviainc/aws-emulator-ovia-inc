@@ -17,6 +17,8 @@
 //!   `JOB_STATUS` matches the job's status, any of an entry's values matching and several
 //!   entries narrowing cumulatively; a filter name the operation does not document is the
 //!   modelled `ClientException` (HTTP 400);
+//! * a job requires the resource only while it can still consume it: a job that reached a
+//!   terminal status is reported by no listing of that resource, under any filter;
 //! * paging with `maxResults`/`nextToken` sees every job exactly once in the unpaged
 //!   order, `maxResults` is accepted on both published bounds and refused one past either,
 //!   a request that names none is still bounded at the documented default, and a
@@ -29,8 +31,6 @@
 //!   reports differs from what `DescribeJobs` reports, and it moves no quantity of the
 //!   resource it lists.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 use service_com_amazonaws_batch_awsbatchv20160810::state::{
@@ -40,7 +40,7 @@ use service_com_amazonaws_batch_awsbatchv20160810::state::{
 
 use crate::job_lifecycle::{
     arn, compute_environment, container_properties, describe_job, error_code, error_message,
-    job_queue, Batch,
+    job_queue, until_status, Batch,
 };
 
 /// `ListJobsByConsumableResource`'s route (`smithy_query(query="operation",
@@ -82,8 +82,9 @@ struct Submission {
 /// single job requires, and one that nothing requires at all.
 const RESOURCES: [&str; 3] = ["cr-gpu", "cr-license", "cr-idle"];
 
-/// The ARN this region and account give the consumable resource `name`.
-fn resource_arn(name: &str) -> String {
+/// The ARN this region and account give the consumable resource `name`. Shared with the
+/// release suite, so both name the resource in exactly one form.
+pub(crate) fn resource_arn(name: &str) -> String {
     arn(&format!("consumable-resource/{name}"))
 }
 
@@ -222,12 +223,12 @@ async fn fixture() -> Fixture {
 }
 
 /// `ListJobsByConsumableResource` over the wire: the status and the decoded body.
-async fn list(batch: &Batch, body: Value) -> (u16, Value) {
+pub(crate) async fn list(batch: &Batch, body: Value) -> (u16, Value) {
     batch.call(LIST, body).await
 }
 
 /// `ListJobsByConsumableResource` over the wire, requiring the 200.
-async fn listed(batch: &Batch, case: &str, body: Value) -> Value {
+pub(crate) async fn listed(batch: &Batch, case: &str, body: Value) -> Value {
     let (status, decoded) = list(batch, body).await;
     assert_eq!(
         status, 200,
@@ -237,7 +238,7 @@ async fn listed(batch: &Batch, case: &str, body: Value) -> Value {
 }
 
 /// The `jobName`s of a listing, in the order it answered them.
-fn job_names(body: &Value) -> Vec<String> {
+pub(crate) fn job_names(body: &Value) -> Vec<String> {
     body["jobs"]
         .as_array()
         .cloned()
@@ -266,24 +267,8 @@ fn summary_of(body: &Value, job_name: &str) -> Value {
 /// Poll every submitted job until it reports `RUNNABLE`, where a job with nothing to place
 /// it on comes to rest. Driven off OBSERVED state rather than a fixed sleep.
 async fn wait_until_resting(fixture: &Fixture) {
-    let span = u64::try_from(
-        service_com_amazonaws_batch_awsbatchv20160810::state::JOB_PHASE_MILLIS,
-    )
-    .unwrap_or(500);
     for (job_name, job_id) in &fixture.jobs {
-        for _ in 0..60 {
-            let detail = describe_job(&fixture.batch, job_id).await;
-            if detail["status"].as_str() == Some("RUNNABLE") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis((span / 20).max(1))).await;
-        }
-        let detail = describe_job(&fixture.batch, job_id).await;
-        assert_eq!(
-            detail["status"].as_str(),
-            Some("RUNNABLE"),
-            "case {job_name}: expected the job to come to rest in RUNNABLE, got {detail}"
-        );
+        until_status(&fixture.batch, job_name, job_id, "RUNNABLE").await;
     }
 }
 
@@ -510,8 +495,9 @@ async fn a_listing_honours_the_documented_filters() {
     }
 }
 
-/// RULE: the listing follows the writes — a terminate moves a job's status and reason, and
-/// the status filter then selects it there — and reports no quantity of its own invention.
+/// RULE: the listing follows the writes — a terminate moves a job's status and reason,
+/// which releases the requirement that put it in this listing, so the listing drops it
+/// while every job still requiring the resource keeps its own quantity.
 #[tokio::test]
 async fn a_listing_follows_what_the_writes_left() {
     let fixture = fixture().await;
@@ -525,6 +511,17 @@ async fn a_listing_follows_what_the_writes_left() {
         )
         .await;
 
+    // The write itself landed: the job is terminal and carries the caller's reason.
+    let detail = describe_job(&fixture.batch, &fixture.job_id("gpu-zero")).await;
+    assert_eq!(
+        (
+            detail["status"].as_str(),
+            detail["statusReason"].as_str()
+        ),
+        (Some("FAILED"), Some(reason)),
+        "case after the terminate: expected the terminate's status and reason, got {detail}"
+    );
+
     let body = listed(
         &fixture.batch,
         "after the terminate",
@@ -536,19 +533,35 @@ async fn a_listing_follows_what_the_writes_left() {
     .await;
     assert_eq!(
         job_names(&body),
-        vec!["gpu-zero".to_string()],
-        "case after the terminate: expected only the terminated job, got {body}"
+        Vec::<String>::new(),
+        "case after the terminate: a terminal job requires the resource no longer, so no \
+         status filter reports it, got {body}"
     );
-    let summary = summary_of(&body, "gpu-zero");
+
+    // The jobs that are still live are untouched, each with the quantity it requires.
+    let body = listed(
+        &fixture.batch,
+        "the live jobs after the terminate",
+        json!({"consumableResource": RESOURCES[0]}),
+    )
+    .await;
+    let mut answered = job_names(&body);
+    answered.sort();
     assert_eq!(
-        summary["statusReason"].as_str(),
-        Some(reason),
-        "case after the terminate: expected the reason the terminate stored, got {summary}"
+        answered,
+        vec![
+            "GPU-By-Arn".to_string(),
+            "gpu-and-license".to_string(),
+            "gpu-by-name".to_string()
+        ],
+        "case the live jobs after the terminate: expected every job still requiring the \
+         resource, got {body}"
     );
     assert_eq!(
-        summary["quantity"].as_i64(),
-        Some(0),
-        "case after the terminate: expected the quantity the job requires, got {summary}"
+        summary_of(&body, "gpu-by-name")["quantity"].as_i64(),
+        Some(2),
+        "case the live jobs after the terminate: expected the quantity that job requires, \
+         got {body}"
     );
 }
 

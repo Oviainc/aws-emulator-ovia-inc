@@ -7,9 +7,10 @@
 //!
 //! Nothing stored may still REFERENCE the component type: a contained
 //! control-plane resource is deleted only once the resources built on it are
-//! gone, so a component type an entity's component instantiates, or another
-//! component type extends or composes, is refused with the modelled
-//! `ValidationException` (HTTP 400) rather than deleted out from under them.
+//! gone, so a component type an entity's component or composite component
+//! instantiates, or another component type extends or composes, is refused with
+//! the modelled `ValidationException` (HTTP 400) rather than deleted out from
+//! under them.
 //! [`crate::state::Workspace::component_type_references`] is the one place that
 //! says what counts as a reference.
 //!

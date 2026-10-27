@@ -339,7 +339,8 @@ fn rules() -> &'static [Rule] {
                 1,
                 None,
             ),
-            // NANP three-part numbers, and the ITU-T E.164 international form.
+            // NANP numbers — the three-part form, then the subscriber number on its
+            // own — and the ITU-T E.164 international form.
             rule(
                 "PHONE",
                 Evidence::Format,
@@ -348,6 +349,21 @@ fn rules() -> &'static [Rule] {
                 None,
             ),
             rule("PHONE", Evidence::Format, r"\+\d{10,15}\b", 0, None),
+            // The NANP subscriber number written on its own, without the area code
+            // the rule above carries: a central-office code — NXX, so its first
+            // digit is 2-9 — then the four-digit line number, separated the way the
+            // three-part form separates them. A space-separated seven-digit run is
+            // not admitted on form alone, because it is two numbers as often as one;
+            // the rule after this one admits it where the text names it as a
+            // telephone number, under the same bound on the office code.
+            rule("PHONE", Evidence::Format, r"\b[2-9]\d{2}[.\-]\d{4}\b", 0, None),
+            rule(
+                "PHONE",
+                Evidence::Context,
+                r"(?i)\b(?:phone|telephone|tel|mobile|cell|fax)(?:\s*(?:number|no\.?|#))?\s*(?:#|:|=|is|at)?\s*([2-9]\d{2}[ .\-]?\d{4})\b",
+                1,
+                None,
+            ),
             // A street address: house number, street name, and a USPS (or Spanish)
             // street-suffix word.
             rule(

@@ -260,6 +260,7 @@ async fn one_of_every_kind(amp: &Amp) -> Vec<Row> {
     let scraper_arn = seeded.arn.clone();
     amp.store()
         .lock()
+        .region_mut_for_create(REGION)
         .scrapers
         .insert(seeded.scraper_id.clone(), seeded.clone());
 

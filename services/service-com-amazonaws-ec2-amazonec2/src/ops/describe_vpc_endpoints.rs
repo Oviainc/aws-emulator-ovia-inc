@@ -247,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state_handle = state::require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();
-        // A `Pending` endpoint reaches `Available` at an instant the clock owes it, whether
+        // A `pending` endpoint reaches `available` at an instant the clock owes it, whether
         // or not anybody called — so the moves already due are applied before this report
         // reads the store, and two reports either side of that instant differ because the
         // CLOCK passed it and not because this call changed anything
@@ -404,9 +404,9 @@ fn documented_filter_name(name: &str) -> Option<&str> {
 /// it selects nothing — which is the answer for `ip-address-type` on a gateway endpoint,
 /// whose type has none. `name` is a name [`documented_filter_name`] resolved.
 ///
-/// `vpc-endpoint-state` compares against BOTH spellings of the endpoint's state: the stored
-/// value is the model's own `State` enum member, while the filter documents its own
-/// spelling of the same state — see [`crate::state::VPC_ENDPOINT_STATE_FILTER_VALUES`].
+/// `vpc-endpoint-state` compares against the state the endpoint reports, which is the
+/// spelling the filter's own doc list publishes — see
+/// [`crate::state::VPC_ENDPOINT_STATE_VALUES`].
 fn filter_values<'a>(endpoint: &'a VpcEndpoint, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
     use ::std::borrow::Cow;
 
@@ -433,14 +433,7 @@ fn filter_values<'a>(endpoint: &'a VpcEndpoint, name: &str) -> Vec<::std::borrow
             .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
             .collect(),
         "vpc-endpoint-id" => text(endpoint.vpc_endpoint_id.as_deref()),
-        "vpc-endpoint-state" => {
-            let state = endpoint.state.as_deref();
-            let mut values = text(state);
-            if let Some(documented) = state.and_then(documented_state_value) {
-                values.push(Cow::Borrowed(documented));
-            }
-            values
-        }
+        "vpc-endpoint-state" => text(endpoint.state.as_deref()),
         "vpc-endpoint-type" => text(endpoint.vpc_endpoint_type.as_deref()),
         "vpc-id" => text(endpoint.vpc_id.as_deref()),
         // Unreachable: `documented_filter_name` has already refused every other name. An
@@ -448,14 +441,4 @@ fn filter_values<'a>(endpoint: &'a VpcEndpoint, name: &str) -> Vec<::std::borrow
         // if that check were bypassed.
         _ => Vec::new(),
     }
-}
-
-/// How the `vpc-endpoint-state` filter spells the modelled state `state`, when that
-/// spelling differs from the modelled one; `None` for a state the filter documents no value
-/// for (the `State` enum's `Expired` and `Partial`, which name states of other resources).
-fn documented_state_value(state: &str) -> Option<&'static str> {
-    crate::state::VPC_ENDPOINT_STATE_FILTER_VALUES
-        .iter()
-        .find(|(documented, modelled)| *modelled == state && *documented != state)
-        .map(|(documented, _)| *documented)
 }

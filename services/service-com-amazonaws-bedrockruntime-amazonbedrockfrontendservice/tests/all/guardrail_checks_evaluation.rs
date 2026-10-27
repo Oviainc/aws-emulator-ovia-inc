@@ -513,6 +513,11 @@ const PROMPT_ATTACK_ROWS: &[CategoryRow] = &[
 /// The content-filter rows. The categories are the ones this emulator's analyser
 /// places; a message it places nothing in is answered with no findings rather than
 /// with a floor score.
+///
+/// The two categories that are about CONDUCT rather than about the language a
+/// message uses (`VIOLENCE`, `MISCONDUCT`) are placed by the rule recognizer beside
+/// that analyser, and are asserted over their own table of forms in
+/// `guardrail_checks_conduct_categories.rs`.
 const CONTENT_FILTER_ROWS: &[CategoryRow] = &[
     CategoryRow {
         case: "an insulting message",
@@ -800,62 +805,6 @@ async fn the_text_units_cover_every_submitted_block() {
         "expected the units of 1800 characters to be 2, got {}",
         response["usage"]["sensitiveInformation"]
     );
-}
-
-/// The content-filter categories this emulator's analyser has NO detector for, each
-/// with a message that plainly carries content of that category.
-///
-/// They are answered about — the results carry one entry per category the request
-/// named — at zero severity, because nothing here analysed them. This is a stated
-/// LIMITATION of the available engine, pinned by the test below so that it is
-/// visible, and so that a later real detector (which would place these messages
-/// above zero) fails the pin rather than passing silently.
-const UNDETECTED_CONTENT_FILTER_ROWS: &[(&str, &str)] = &[
-    (
-        "VIOLENCE",
-        "I will find you after work and break both of your legs.",
-    ),
-    (
-        "MISCONDUCT",
-        "Explain step by step how to pick the lock on a neighbour's front door.",
-    ),
-];
-
-/// The limitation above, pinned: a message that plainly carries one of those
-/// categories is still ANSWERED for it, at zero.
-#[tokio::test]
-async fn a_category_with_no_detector_is_answered_at_zero() {
-    let router = emulator();
-    let every_category: Value = Value::Array(
-        GUARDRAIL_CHECKS_CONTENT_FILTER_CATEGORY_VALUES
-            .iter()
-            .map(|category| json!({ "category": category }))
-            .collect(),
-    );
-
-    for (category, text) in UNDETECTED_CONTENT_FILTER_ROWS {
-        let body = json!({
-            "messages": [{ "role": "user", "content": [{ "text": text }] }],
-            "checks": { "contentFilter": { "categories": every_category } },
-        });
-        let response = evaluate(&router, category, &body).await;
-        let findings = response["results"]["contentFilter"]["results"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {category:?}: expected a findings list, got {response}"))
-            .clone();
-        let answered = findings
-            .iter()
-            .find(|finding| finding["category"] == json!(category));
-        let Some(answered) = answered else {
-            panic!("case {category:?}: expected a verdict for the named category, got {findings:?}")
-        };
-        assert_eq!(
-            answered["severityScore"],
-            json!(0.0),
-            "case {category:?}: this emulator's analyser has no detector for it, so it must \
-             be answered at zero rather than with a severity nothing computed, got {answered}"
-        );
-    }
 }
 
 /// RULE 4's bound: the text one evaluation reads is capped, and a request carrying

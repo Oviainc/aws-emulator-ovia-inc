@@ -341,17 +341,25 @@ pub const POLICY_NOT_FOUND_MESSAGE: &str = "Resource-based policy not found.";
 /// it, so they cannot drift apart.
 pub const QUERY_LOGGING_NOT_FOUND_MESSAGE: &str = "Workspace logging configuration not found.";
 
-/// How many workspaces the store holds before `CreateWorkspace` refuses with the
-/// modelled `ServiceQuotaExceededException`.
+/// How many workspaces ONE REGION's store holds before `CreateWorkspace` refuses with
+/// the modelled `ServiceQuotaExceededException`.
 ///
 /// Amazon Managed Service for Prometheus publishes an adjustable quota on workspaces
 /// per account per Region, and this emulator models neither Service Quotas nor an
 /// account's adjustments — so this is the emulator's OWN bound on the store, not a
-/// claim about any account's limit. It sits far above any workflow an emulator serves,
-/// and it is what stops the state growing without end: every record it bounds is
-/// released by `DeleteWorkspace`, which also forgets that workspace's client tokens, so
-/// that map cannot outgrow it either.
+/// claim about any account's limit. It is counted per Region because the published quota
+/// is, and because the workspaces of one Region are all a caller signed for it can
+/// reach. It sits far above any workflow an emulator serves, and it is what stops the
+/// state growing without end: every record it bounds is released by `DeleteWorkspace`,
+/// which also forgets that workspace's client tokens, so that map cannot outgrow it
+/// either.
 pub const WORKSPACE_QUOTA: usize = 1_000;
+
+/// How this service partitions its state by Region, what each Region's store holds, and
+/// what bounds the partitioning. Re-exported, so a handler names `crate::state::…` for a
+/// Region's store exactly as it does for a workspace.
+pub mod regions;
+pub use regions::*;
 
 /// How many rule groups namespaces ONE workspace holds before
 /// `CreateRuleGroupsNamespace` refuses with the modelled
@@ -529,14 +537,15 @@ pub fn workspace_refuses_new_detector_message(workspace_status: &str) -> String 
     format!("The workspace is {workspace_status}; it cannot take new anomaly detectors")
 }
 
-/// How many scrapers this account holds before `CreateScraper` refuses with the modelled
-/// `ServiceQuotaExceededException`.
+/// How many scrapers ONE REGION's store holds before `CreateScraper` refuses with the
+/// modelled `ServiceQuotaExceededException`.
 ///
 /// Amazon Managed Service for Prometheus publishes an adjustable quota on scrapers per
 /// account per Region, and this emulator models neither Service Quotas nor an account's
 /// adjustments — so this is the emulator's OWN bound on the store, the role
-/// [`WORKSPACE_QUOTA`] plays for workspaces. It is what stops the scraper map (and the
-/// create-token map the same deletion releases) growing without end.
+/// [`WORKSPACE_QUOTA`] plays for workspaces, and counted per Region as that quota and the
+/// published one both are. It is what stops the scraper map (and the create-token map the
+/// same deletion releases) growing without end.
 pub const SCRAPERS_PER_ACCOUNT_QUOTA: usize = 1_000;
 
 /// The PromQL aggregation operators a Random Cut Forest query may be wrapped by.
@@ -977,43 +986,14 @@ pub struct AnomalyDetector {
     pub update_token: Option<String>,
 }
 
-/// Per-service state for com-amazonaws-amp-amazonprometheusservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
-pub struct ComAmazonawsAmpAmazonprometheusserviceState {
-    /// Every workspace this emulator holds, keyed by `workspaceId`.
-    pub workspaces: HashMap<String, Workspace>,
-    /// Every scraper this emulator holds, keyed by `scraperId` — what `ListScrapers`
-    /// reports. Ordered, so a page boundary means the same thing on every call.
-    pub scrapers: BTreeMap<String, Scraper>,
-    /// Each workspace's query logging configuration, keyed by `workspaceId`. A
-    /// workspace holds at most one, and it is dropped with the workspace.
-    pub query_logging: HashMap<String, QueryLoggingConfiguration>,
-    /// Each scraper's logging configuration, keyed by `scraperId`. A scraper holds at
-    /// most one, and it is dropped with the scraper.
-    pub scraper_logging: HashMap<String, ScraperLoggingConfiguration>,
-    /// `clientToken -> workspaceId`, which is what makes `CreateWorkspace`
-    /// idempotent per its `@idempotencyToken`.
-    pub client_tokens: HashMap<String, String>,
-    /// `clientToken -> scraperId`, which is what makes `CreateScraper` idempotent per its
-    /// `@idempotencyToken` — the role [`ComAmazonawsAmpAmazonprometheusserviceState::client_tokens`]
-    /// plays for a workspace. Kept apart from that map because a token is scoped to the
-    /// request that carried it: the same string may create a workspace and a scraper, and
-    /// neither create may then answer with the other's resource. An entry is forgotten
-    /// with the scraper it names, so the map cannot outgrow the scrapers it indexes.
-    pub scraper_tokens: HashMap<String, String>,
-    /// Counts the identifiers this store has minted — workspace ids and resource-policy
-    /// revision ids both; see [`mint_workspace_id`] and [`mint_revision_id`].
-    pub next_id: u64,
-}
-
-impl ComAmazonawsAmpAmazonprometheusserviceState {
-    /// Apply every lifecycle transition the clock already owes at `now`.
+/// The transitions the clock owes inside ONE Region's store, and the ARN-addressed
+/// lookups over its records. The store itself — and what bounds how many of them there
+/// are — lives in [`regions`].
+impl RegionalState {
+    /// Apply every lifecycle transition the clock already owes at `now` in this Region.
     ///
-    /// Each pending transition was due at an instant recorded when the call that
-    /// started it ran, so it is owed whether or not anybody calls again; applying it
-    /// here is materialising a change the clock made, not a side effect of the read.
-    /// Call it FIRST in every handler, so each one sees the same state a caller
-    /// would after any other.
+    /// Driven by [`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`], which
+    /// every handler calls first; see there for why a reporting operation may write this.
     pub fn materialize_due(&mut self, now: SystemTime) {
         let mut deleted: Vec<String> = Vec::new();
         for workspace in self.workspaces.values_mut() {
@@ -1189,7 +1169,8 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
         }
     }
 
-    /// The taggable resource the ARN `resource_arn` names, when this store holds one.
+    /// The taggable resource the ARN `resource_arn` names, when THIS REGION's store holds
+    /// one.
     ///
     /// `TagResource` enumerates the kinds there are — "The only resources that can be
     /// tagged are rule groups namespaces, scrapers, and workspaces" — and an anomaly
@@ -1201,7 +1182,9 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
     ///
     /// Resolved by looking at the stored records, so there is no index that can
     /// disagree with them about which resource an ARN names, miss a kind, or outlive
-    /// the resource it named.
+    /// the resource it named. The comparison is exact and every stored ARN carries the
+    /// Region of the store holding it, so an ARN naming another Region resolves to
+    /// nothing here — which is what a caller addressing this Region's endpoint is told.
     pub fn taggable_of_arn(&self, resource_arn: &str) -> Option<TaggedResource> {
         for (workspace_id, workspace) in &self.workspaces {
             if workspace.arn == resource_arn {
@@ -1386,8 +1369,7 @@ pub fn revision_matches(policy: Option<&ResourcePolicy>, revision_id: Option<&st
 
 /// Apply every rule-groups-namespace transition the clock owes at `now` inside one
 /// workspace: a namespace whose due instant has passed becomes `ACTIVE`, or is removed
-/// when it was being deleted. Called from
-/// [`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`], for the same
+/// when it was being deleted. Called from [`RegionalState::materialize_due`], for the same
 /// reason — the transition was owed at an instant recorded when the call that started
 /// it ran, whether or not anybody calls again.
 fn materialize_namespaces_due(

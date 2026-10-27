@@ -19,7 +19,10 @@
 //!   type matches selects nothing — the read reports an empty catalog rather
 //!   than failing, because the operation models no failure at all;
 //! * the read reports and stores nothing: two calls, before and after a write to
-//!   the same store, answer identically;
+//!   the same store, answer identically, and so do two calls of the SAME
+//!   selection;
+//! * a selection is a FILTER over the one published catalog: the per-source-type
+//!   reads together cover the unfiltered read exactly once, entry for entry;
 //! * cross-operation agreement: a category and a severity the catalog publishes
 //!   are exactly what a subscription scoped to that source type may name.
 
@@ -439,6 +442,74 @@ async fn a_value_no_published_source_type_matches_reports_an_empty_catalog() {
             answer.body
         );
     }
+}
+
+#[tokio::test]
+async fn a_selection_filters_the_one_catalog_and_repeats_unchanged() {
+    let emulator = Emulator::new();
+
+    let unfiltered = read_catalog(&emulator, None).await;
+    assert_eq!(
+        unfiltered.status, 200,
+        "case the unfiltered read: expected 200, got {} with body {}",
+        unfiltered.status, unfiltered.body
+    );
+    let whole = reported_catalog(&unfiltered.body);
+
+    // One row per selection a caller can make: no `SourceType` at all, each
+    // published source type, and a value no published source type matches. A
+    // selection FILTERS the one catalog, so each row's expected answer is read
+    // off the unfiltered body rather than written out a second time.
+    let mut selections: Vec<(String, Option<String>)> =
+        vec![("the whole catalog".to_string(), None)];
+    for source_type in PUBLISHED_SOURCE_TYPES {
+        selections.push((format!("select {source_type}"), Some(source_type.to_string())));
+    }
+    selections.push((
+        "select an unpublished source type".to_string(),
+        Some("db-cluster".to_string()),
+    ));
+
+    let mut covered: Vec<CatalogEntry> = Vec::new();
+    for (case, requested) in &selections {
+        let expected: Vec<&CatalogEntry> = match requested.as_deref() {
+            None => whole.iter().collect(),
+            Some(source_type) => whole
+                .iter()
+                .filter(|entry| entry.source_type.as_deref() == Some(source_type))
+                .collect(),
+        };
+
+        // The SAME selection read twice: the second answer is the first,
+        // because a reporting read leaves nothing behind for a later caller.
+        for attempt in 1..=2u8 {
+            let answer = read_catalog(&emulator, requested.as_deref()).await;
+            assert_eq!(
+                (answer.status, answer.error_code()),
+                (200, None),
+                "case {case} (read {attempt}): expected a successful read, got {} / {:?}",
+                answer.status,
+                answer.error_code()
+            );
+            let reported = reported_catalog(&answer.body);
+            assert_eq!(
+                reported.iter().collect::<Vec<&CatalogEntry>>(),
+                expected,
+                "case {case} (read {attempt}): expected the entries the unfiltered read publishes, got {reported:?}"
+            );
+            if attempt == 2 && requested.is_some() {
+                covered.extend(reported);
+            }
+        }
+    }
+
+    // The selections together cover the published catalog exactly once: every
+    // entry is selectable by its own source type, and no entry is selected by
+    // two of them or by a value the catalog does not publish.
+    assert_eq!(
+        covered, whole,
+        "case the selections together: expected them to cover the published catalog exactly once, got {covered:?}"
+    );
 }
 
 #[tokio::test]
