@@ -177,7 +177,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let upper_limit = i32::try_from(sqs::MAX_MESSAGE_MOVE_TASKS_PER_QUEUE).unwrap_or(i32::MAX);
         let max_results = match input.max_results {
             None => sqs::DEFAULT_MESSAGE_MOVE_TASK_RESULTS,
-            Some(max) => match sqs::max_results_refusal("MaxResults", (1, upper_limit), max) {
+            Some(max) => match sqs::max_results_refusal(
+                "MaxResults",
+                (1, upper_limit),
+                max,
+                sqs::MaxResultsWording::NumberBetween,
+            ) {
                 // Inside the published range, so the conversion holds.
                 None => usize::try_from(max).unwrap_or(sqs::DEFAULT_MESSAGE_MOVE_TASK_RESULTS),
                 Some(why) => {

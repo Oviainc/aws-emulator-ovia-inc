@@ -1216,6 +1216,16 @@ pub enum StreamLookupFailure {
 pub const STREAM_IDENTIFIER_REQUIRED_MESSAGE: &str =
     "you must use either the StreamARN or the StreamName parameter, or both";
 
+/// How an operation whose ONLY stream identifier is `StreamARN` refuses a request that
+/// names no stream.
+///
+/// The SAME rule [`STREAM_IDENTIFIER_REQUIRED_MESSAGE`] states ("you must use either the
+/// StreamARN or the StreamName parameter, or both", `DescribeStream`), reduced to the one
+/// parameter such an operation has: its input carries no `StreamName`, and `StreamId` is
+/// documented "Not Implemented. Reserved for future use", so `StreamARN` is the only member
+/// that can name a stream at all.
+pub const STREAM_ARN_REQUIRED_MESSAGE: &str = "you must use the StreamARN parameter";
+
 /// How a request whose `StreamName` and `StreamARN` name different streams is refused.
 pub const STREAM_IDENTIFIER_MISMATCH_MESSAGE: &str =
     "StreamName and StreamARN name different streams; name one stream or supply only one \
@@ -1465,11 +1475,72 @@ pub fn batch_too_large_message(size: usize, maximum: usize) -> String {
 /// (the payload before base64-encoding) is added to the partition key size, the total size
 /// must not exceed the maximum record size" (`PutRecordInput$Data`). Built FROM the request
 /// and the stream, so the size at fault and the size allowed both name it.
+///
+/// This is the refusal for the TOTAL of two members, which no single member's length states;
+/// a `Data` blob that is longer than the maximum on its own is refused by
+/// [`data_too_long_message`] instead.
 pub fn record_too_large_message(size: usize, maximum: usize) -> String {
     format!(
         "the record's data and partition key total {size} bytes, past the {maximum} bytes \
          one record of this stream may carry"
     )
+}
+
+/// How a write refuses the records whose `Data` is longer than the maximum record size of
+/// the stream it addresses: one clause per member path at fault, in AWS's envelope.
+///
+/// A stream's `MaxRecordSizeInKiB` is a bound on the LENGTH of a member of the request, so
+/// it is stated as a length violation of that member, where the blob sits in the request
+/// ([`put_record_data_path`], [`put_records_data_path`]) and the number of bytes it may
+/// carry. A blob's CONTENT is not echoed, which is why a clause states the member and the
+/// requirement alone; a request that breaks the bound in several members states one clause
+/// each, the way the envelope accumulates.
+pub fn data_too_long_message(member_paths: &[String], maximum: usize) -> String {
+    let clauses: Vec<String> = member_paths
+        .iter()
+        .map(|member_path| data_too_long_clause(member_path, maximum))
+        .collect();
+    validation_envelope(&clauses)
+}
+
+/// The clause one such member contributes.
+fn data_too_long_clause(member_path: &str, maximum: usize) -> String {
+    format!(
+        "Value at '{member_path}' failed to satisfy constraint: Member must have length less \
+         than or equal to {maximum}"
+    )
+}
+
+/// AWS's envelope over the clauses of ONE refusal, which is also the envelope the
+/// framework's own constraint walk renders: `1 validation error detected: <clause>` for one
+/// clause, `N validation errors detected: <clause>; <clause>` for several — so a bound this
+/// service applies and one the model carries are stated alike.
+fn validation_envelope(clauses: &[String]) -> String {
+    match clauses {
+        [] => String::new(),
+        [clause] => format!("1 validation error detected: {clause}"),
+        clauses => format!(
+            "{} validation errors detected: {}",
+            clauses.len(),
+            clauses.join("; ")
+        ),
+    }
+}
+
+/// Where `PutRecord`'s own `Data` member sits in such a message.
+pub fn put_record_data_path() -> String {
+    ::aws_smithy_schema_server::constraints::path::member("Data")
+}
+
+/// Where the `Data` member of the `position`th entry of a `PutRecords` batch sits in such a
+/// message, counting entries the way the constraint walk counts a list element: from one.
+pub fn put_records_data_path(position: usize) -> String {
+    use ::aws_smithy_schema_server::constraints::path;
+    path::join(&[
+        path::member("Records"),
+        path::element(position),
+        path::member("Data"),
+    ])
 }
 
 /// What a `ListShards` pagination token is tagged with, so a string the service never

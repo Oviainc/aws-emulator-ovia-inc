@@ -61,8 +61,7 @@ const ELSEWHERE: &[&str] = &["eu-west-1", "ap-southeast-3", "us-gov-west-1", "sa
 const ROLE_ARN: &str = "arn:aws:iam::111122223333:role/TranscribeAccess";
 
 /// One resource family: the create that establishes a record, the read and the listing
-/// that report it, the member its name travels in, and the delete that drops it where
-/// this emulator implements one.
+/// that report it, the member its name travels in, and the delete that drops it.
 struct Family {
     case: &'static str,
     create: &'static str,
@@ -74,8 +73,8 @@ struct Family {
     list: &'static str,
     /// The member each entry of the listing carries the resource's name under.
     name_in_list: &'static str,
-    /// `None` for a family whose delete is still a stub (`DeleteMedicalVocabulary`).
-    delete: Option<&'static str>,
+    /// The delete that drops one record of this family.
+    delete: &'static str,
 }
 
 /// Every family this service holds records of, each with the create, read and listing
@@ -98,7 +97,7 @@ fn families() -> Vec<Family> {
             name_member: "TranscriptionJobName",
             list: "ListTranscriptionJobs",
             name_in_list: "TranscriptionJobName",
-            delete: Some("DeleteTranscriptionJob"),
+            delete: "DeleteTranscriptionJob",
         },
         Family {
             case: "medical transcription job",
@@ -119,7 +118,7 @@ fn families() -> Vec<Family> {
             name_member: "MedicalTranscriptionJobName",
             list: "ListMedicalTranscriptionJobs",
             name_in_list: "MedicalTranscriptionJobName",
-            delete: Some("DeleteMedicalTranscriptionJob"),
+            delete: "DeleteMedicalTranscriptionJob",
         },
         Family {
             case: "Call Analytics job",
@@ -134,7 +133,7 @@ fn families() -> Vec<Family> {
             name_member: "CallAnalyticsJobName",
             list: "ListCallAnalyticsJobs",
             name_in_list: "CallAnalyticsJobName",
-            delete: Some("DeleteCallAnalyticsJob"),
+            delete: "DeleteCallAnalyticsJob",
         },
         Family {
             case: "Medical Scribe job",
@@ -152,7 +151,7 @@ fn families() -> Vec<Family> {
             name_member: "MedicalScribeJobName",
             list: "ListMedicalScribeJobs",
             name_in_list: "MedicalScribeJobName",
-            delete: Some("DeleteMedicalScribeJob"),
+            delete: "DeleteMedicalScribeJob",
         },
         Family {
             case: "custom vocabulary",
@@ -168,7 +167,7 @@ fn families() -> Vec<Family> {
             name_member: "VocabularyName",
             list: "ListVocabularies",
             name_in_list: "VocabularyName",
-            delete: Some("DeleteVocabulary"),
+            delete: "DeleteVocabulary",
         },
         Family {
             case: "custom medical vocabulary",
@@ -186,7 +185,7 @@ fn families() -> Vec<Family> {
             name_member: "VocabularyName",
             list: "ListMedicalVocabularies",
             name_in_list: "VocabularyName",
-            delete: None,
+            delete: "DeleteMedicalVocabulary",
         },
         Family {
             case: "custom vocabulary filter",
@@ -202,7 +201,7 @@ fn families() -> Vec<Family> {
             name_member: "VocabularyFilterName",
             list: "ListVocabularyFilters",
             name_in_list: "VocabularyFilterName",
-            delete: Some("DeleteVocabularyFilter"),
+            delete: "DeleteVocabularyFilter",
         },
         Family {
             case: "custom language model",
@@ -222,7 +221,7 @@ fn families() -> Vec<Family> {
             name_member: "ModelName",
             list: "ListLanguageModels",
             name_in_list: "ModelName",
-            delete: Some("DeleteLanguageModel"),
+            delete: "DeleteLanguageModel",
         },
         Family {
             case: "Call Analytics category",
@@ -237,7 +236,7 @@ fn families() -> Vec<Family> {
             name_member: "CategoryName",
             list: "ListCallAnalyticsCategories",
             name_in_list: "CategoryName",
-            delete: Some("DeleteCallAnalyticsCategory"),
+            delete: "DeleteCallAnalyticsCategory",
         },
     ]
 }
@@ -402,9 +401,6 @@ async fn a_delete_reaches_only_its_own_regions_resource() {
     let name = "deleted-in-one-region";
 
     for family in families() {
-        if family.delete.is_none() {
-            continue;
-        }
         let case = family.case;
         for region in [HOME, ELSEWHERE[0]] {
             transcribe
@@ -419,9 +415,7 @@ async fn a_delete_reaches_only_its_own_regions_resource() {
     std::thread::sleep(PAST_EVERY_TRANSITION);
 
     for family in families() {
-        let Some(delete) = family.delete else {
-            continue;
-        };
+        let delete = family.delete;
         let case = family.case;
         let deleted_in = ELSEWHERE[0];
 

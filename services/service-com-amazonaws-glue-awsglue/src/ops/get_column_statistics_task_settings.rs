@@ -196,10 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let Some(settings) = table.column_statistics_task_settings.as_ref() else {
             return Err(not_found(
-                crate::state::messages::column_statistics_task_settings_not_found(
-                    &table.database_name,
-                    &table.name,
-                ),
+                crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND.to_string(),
             ));
         };
         let last_attempt = store.last_column_statistics_task_run(

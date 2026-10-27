@@ -234,19 +234,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // column stats generation job" (`ColumnStatisticsTaskRunningException`): the
             // statistics of ONE table are what a run generates, so a run in flight for
             // this table is what blocks another, and a run for any other table does not.
-            if let Some(running) = store.running_column_statistics_task_run(
-                &catalog_id,
-                &input.database_name,
-                &input.table_name,
-            ) {
+            // The refusal's wording is this error class's own fixed sentence
+            // ([`crate::state::messages::COLUMN_STATISTICS_TASK_RUN_ALREADY_STARTED`]) —
+            // it names nothing of the request or of the in-flight run, so a client can
+            // recognise the conflict and retry once the run has drained.
+            if store
+                .running_column_statistics_task_run(
+                    &catalog_id,
+                    &input.database_name,
+                    &input.table_name,
+                )
+                .is_some()
+            {
                 return Err(
                     StartColumnStatisticsTaskRunErrorModeled::ColumnStatisticsTaskRunningException(
                         ColumnStatisticsTaskRunningException {
                             message: Some(
-                                crate::state::messages::column_statistics_task_already_running(
-                                    &running.database_name,
-                                    &running.table_name,
-                                ),
+                                crate::state::messages::COLUMN_STATISTICS_TASK_RUN_ALREADY_STARTED
+                                    .to_string(),
                             ),
                         },
                     )

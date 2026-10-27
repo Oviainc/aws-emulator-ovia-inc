@@ -2396,10 +2396,12 @@ pub struct AccountState {
     pub suppression_validation: Option<crate::ops::types::SuppressionValidationAttributes>,
     /// `VdmAttributes$VdmEnabled`: the status of the account's VDM configuration.
     pub vdm_enabled: String,
-    /// `DashboardAttributes$EngagementMetrics`, once a request has set it.
-    pub vdm_engagement_metrics: Option<String>,
-    /// `GuardianAttributes$OptimizedSharedDelivery`, once a request has set it.
-    pub vdm_optimized_shared_delivery: Option<String>,
+    /// `VdmAttributes$DashboardAttributes`, once a request has carried them, held
+    /// as supplied so a read reports exactly what was written.
+    pub vdm_dashboard_attributes: Option<crate::ops::types::DashboardAttributes>,
+    /// `VdmAttributes$GuardianAttributes`, once a request has carried them, held as
+    /// supplied for the same reason.
+    pub vdm_guardian_attributes: Option<crate::ops::types::GuardianAttributes>,
     /// `PricingAttributes$CurrentPlan`: the plan currently active on the account.
     pub pricing_plan: String,
     /// `PricingAttributes$NextPlan`: the plan a scheduled change will activate.
@@ -2441,8 +2443,8 @@ impl Default for AccountState {
                 .collect(),
             suppression_validation: None,
             vdm_enabled: FEATURE_DISABLED.to_string(),
-            vdm_engagement_metrics: None,
-            vdm_optimized_shared_delivery: None,
+            vdm_dashboard_attributes: None,
+            vdm_guardian_attributes: None,
             pricing_plan: PRICING_PLAN_NONE.to_string(),
             next_pricing_plan: None,
             details: None,
@@ -2467,21 +2469,13 @@ impl AccountState {
     /// The modelled `VdmAttributes` view of this record.
     ///
     /// The nested dashboard and guardian attributes carry one feature status each,
-    /// and an attribute nothing has set is reported as absent rather than as a
-    /// status this account does not hold.
+    /// and a sub-attribute nothing has carried is reported as absent rather than as
+    /// a status this account does not hold.
     pub fn vdm_attributes(&self) -> crate::ops::types::VdmAttributes {
         crate::ops::types::VdmAttributes {
             vdm_enabled: self.vdm_enabled.clone(),
-            dashboard_attributes: self.vdm_engagement_metrics.clone().map(|engagement_metrics| {
-                crate::ops::types::DashboardAttributes {
-                    engagement_metrics: Some(engagement_metrics),
-                }
-            }),
-            guardian_attributes: self.vdm_optimized_shared_delivery.clone().map(
-                |optimized_shared_delivery| crate::ops::types::GuardianAttributes {
-                    optimized_shared_delivery: Some(optimized_shared_delivery),
-                },
-            ),
+            dashboard_attributes: self.vdm_dashboard_attributes.clone(),
+            guardian_attributes: self.vdm_guardian_attributes.clone(),
         }
     }
 

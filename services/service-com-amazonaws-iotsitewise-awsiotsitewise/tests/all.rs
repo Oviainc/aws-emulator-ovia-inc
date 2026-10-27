@@ -303,6 +303,12 @@ mod list_asset_model_composite_models;
 mod list_asset_models;
 #[path = "all/list_dashboards.rs"]
 mod list_dashboards;
+// In its alphabetical place inside the sorted list, rather than appended after
+// the list: the END of this file is where every concurrent iotsitewise change
+// appends a declaration of its own, and each append there lost the squash race
+// with this one.
+#[path = "all/list_datasets.rs"]
+mod list_datasets;
 #[path = "all/list_pipelines.rs"]
 mod list_pipelines;
 #[path = "all/logging_options.rs"]

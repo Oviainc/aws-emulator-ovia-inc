@@ -4772,6 +4772,32 @@ pub fn stack_cannot_be_updated(stack_id: &str, status: &str) -> String {
     format!("Stack:{stack_id} is in {status} state and can not be updated.")
 }
 
+/// Whether a stack whose last operation left it in `status` can take an UPDATE at all, or
+/// whether the request is the refusal [`stack_cannot_be_updated`] words.
+///
+/// An update changes the configuration the stack HOLDS, so it is accepted from the statuses
+/// a stack's last operation COMPLETED in — and from the two failed statuses an operation
+/// that PRESERVED what it had provisioned leaves (`UpdateStackInput$DisableRollback`:
+/// "preserve the state of previously provisioned resources when an operation fails"), where
+/// correcting the template and asking again is what preserving them is for.
+///
+/// Every other status is a stack whose own failure another operation has to resolve first,
+/// so an update of it would change nothing a client could rely on: a deletion or a rollback
+/// that could not be carried out (retried, or continued, as its own operation), a create
+/// that was rolled back, and a stack a `CREATE` change set brought into existence, which
+/// holds no template for an update to change. A stack with an operation still in flight is
+/// refused by the same rule, read off the transition it owes rather than off the status.
+pub fn status_takes_an_update(status: &str) -> bool {
+    matches!(
+        status,
+        status::CREATE_COMPLETE
+            | status::UPDATE_COMPLETE
+            | status::UPDATE_ROLLBACK_COMPLETE
+            | status::CREATE_FAILED
+            | status::UPDATE_FAILED
+    )
+}
+
 /// The message CloudFormation answers when `ContinueUpdateRollback` names a stack whose
 /// current status is not one a rollback can be continued from.
 ///

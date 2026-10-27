@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_sesv2_simpleemailservice_v2::ops::types::DashboardAttributes;
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
     AccountState, ComAmazonawsSesv2SimpleemailserviceV2State, SendQuotaState, FEATURE_ENABLED,
 };
@@ -314,7 +315,9 @@ async fn the_write_leaves_every_other_account_attribute_alone() {
         dedicated_ip_auto_warmup_enabled: false,
         production_access_enabled: true,
         vdm_enabled: FEATURE_ENABLED.to_string(),
-        vdm_engagement_metrics: Some(FEATURE_ENABLED.to_string()),
+        vdm_dashboard_attributes: Some(DashboardAttributes {
+            engagement_metrics: Some(FEATURE_ENABLED.to_string()),
+        }),
         pricing_plan: "ESSENTIALS".to_string(),
         next_pricing_plan: Some("PRO".to_string()),
         suppressed_reasons: Vec::new(),
