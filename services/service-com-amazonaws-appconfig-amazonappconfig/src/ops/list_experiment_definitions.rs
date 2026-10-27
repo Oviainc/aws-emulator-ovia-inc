@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExperimentDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExperimentDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExperimentDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the experiment definitions this account holds, optionally narrowed
+//! to one application, configuration profile, environment or status, one page at a time.
+//! Reporting only — nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -151,20 +145,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExperimentDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExperimentDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExperimentDefinitions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListExperimentDefinitionsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "AppConfig state is not reachable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Reporting only: the guard is taken for reading and nothing below writes, and an
+        // experiment definition owes the clock no transition, so this listing cannot
+        // change what a later caller sees.
+        let store = state.lock();
+
+        // "Lists the experiment definitions for an account", so the listing is the
+        // account's and `ApplicationIdentifier` ("the application ID or name to filter
+        // results") SCOPES it to the definitions one application holds. An experiment
+        // definition exists only under an application, so an identifier addressing none is
+        // the 404 this operation models — the one refusal that distinguishes it from the
+        // account listings whose requests name no resource (`ListApplications` and
+        // `ListExtensions` model no not-found error at all) — with the same message
+        // `GetExperimentDefinition` answers for that same application.
+        let scoped: Vec<&crate::state::Application> = match input.application_identifier.as_deref()
+        {
+            Some(identifier) => match store.resolve_application(identifier) {
+                Some(application) => vec![application],
+                None => {
+                    return Err(ListExperimentDefinitionsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::application_not_found(identifier)),
+                            resource_name: Some(identifier.to_string()),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => store.all_applications().collect(),
+        };
+
+        // One summary per definition the filters leave, every member read off the stored
+        // record — so a summary cannot disagree with what `GetExperimentDefinition`
+        // reports for that same definition.
+        let mut ordered: Vec<(String, ExperimentDefinitionSummary)> = Vec::new();
+        for application in scoped {
+            // `ConfigurationProfileIdentifier` and `EnvironmentIdentifier` are each the
+            // resource's "ID or name", and both resources live under an application — so
+            // each is resolved against the application whose definitions are being
+            // listed, and one name may address a different resource under another
+            // application. These two narrow the definitions reported rather than scoping
+            // the listing: an identifier the application does not hold leaves it with no
+            // matching definition, which is an empty report for that application.
+            let wanted_profile = match input.configuration_profile_identifier.as_deref() {
+                Some(identifier) => match application.resolve_profile(identifier) {
+                    Some(profile) => Some(profile.id.clone()),
+                    None => continue,
+                },
+                None => None,
+            };
+            let wanted_environment = match input.environment_identifier.as_deref() {
+                Some(identifier) => match application.resolve_environment(identifier) {
+                    Some(environment) => Some(environment.id.clone()),
+                    None => continue,
+                },
+                None => None,
+            };
+
+            ordered.extend(
+                application
+                    .experiment_definitions
+                    .values()
+                    .filter(|definition| {
+                        wanted_profile.as_deref().is_none_or(|profile_id| {
+                            definition.configuration_profile_id == profile_id
+                        }) && wanted_environment.as_deref().is_none_or(|environment_id| {
+                            definition.environment_id == environment_id
+                        }) && input
+                            .status
+                            .as_deref()
+                            .is_none_or(|wanted| definition.status == wanted)
+                    })
+                    .map(|definition| (definition.id.clone(), summary_of(definition))),
+            );
+        }
+        // Definition-id order, so the listing a caller pages through is the same listing on
+        // every call: an id is unique across every resource this service holds, so this
+        // order is TOTAL, which is what `paginate` keys its cursor on.
+        ordered.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        // The same cursor every listing of this service hands out. `None` means the
+        // `NextToken` is not one this listing minted, which is a bad request rather than
+        // "start from the beginning": answering the first page again would silently repeat
+        // entries the caller already walked.
+        let Some(page) = crate::state::paginate(
+            ordered,
+            crate::state::LISTING_EXPERIMENT_DEFINITIONS,
+            input.next_token.as_deref(),
+            input.max_results,
+        ) else {
+            return Err(ListExperimentDefinitionsErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::next_token_not_issued()),
+                    reason: None,
+                    details: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(ListExperimentDefinitionsOutput {
+            // Reported even when empty: an account holding no definition, and one whose
+            // definitions the filters excluded, have none to list — which is an empty list
+            // rather than an omitted member.
+            items: Some(page.items),
+            next_token: page.next_token,
+        })
+    }
+}
+
+/// The summary this operation reports for one stored experiment definition.
+///
+/// `ExperimentDefinitionSummary` is the definition document without the parts only the
+/// single-definition read carries (the audience, the launch criteria, the treatments and
+/// the control), so every member it does hold is read off the same record
+/// `GetExperimentDefinition` answers that definition from.
+fn summary_of(definition: &crate::state::ExperimentDefinition) -> ExperimentDefinitionSummary {
+    ExperimentDefinitionSummary {
+        application_id: Some(definition.application_id.clone()),
+        id: Some(definition.id.clone()),
+        name: Some(definition.name.clone()),
+        hypothesis: definition.hypothesis.clone(),
+        status: Some(definition.status.clone()),
+        configuration_profile_id: Some(definition.configuration_profile_id.clone()),
+        environment_id: Some(definition.environment_id.clone()),
+        flag_key: Some(definition.flag_key.clone()),
+        created_at: Some(crate::state::to_date_time(definition.created_at)),
+        updated_at: Some(crate::state::to_date_time(definition.updated_at)),
     }
 }
