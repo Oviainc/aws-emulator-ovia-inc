@@ -136,10 +136,10 @@ fn filter_cases() -> Vec<(&'static str, Option<Value>)> {
     ]
 }
 
-/// Both readers select the same rows for the same filter: the summaries count
-/// exactly the recommendations the list returns, group them by the values those
-/// recommendations carry, and total the de-duped saving the list's own de-duped
-/// view adds up to.
+/// Both readers select the same rows for the same filter: the summaries
+/// aggregate exactly the recommendations the list's own de-duped view returns —
+/// one per resource of the rows the filter selects — group them by the values
+/// those recommendations carry, and total the saving that view adds up to.
 #[tokio::test]
 async fn both_recommendation_readers_select_the_same_rows() {
     let router = enrolled_router().await;
@@ -147,9 +147,13 @@ async fn both_recommendation_readers_select_the_same_rows() {
     for (case, filter) in filter_cases() {
         let filter = filter.as_ref();
         let items = listed(&router, filter, true).await;
+        // The view a summary aggregates: one recommendation per resource, which
+        // is what the list serves without `includeAllRecommendations`.
+        let deduped = listed(&router, filter, false).await;
 
-        // Grouped by region: one group per distinct region among the selected
-        // rows, and the counts add up to exactly those rows.
+        // Grouped by region: one group per distinct region among the de-duped
+        // rows, and the counts add up to exactly those rows — one per resource
+        // of the whole selection.
         let by_region = summarised(&router, filter, "Region").await;
         let counted: i64 = by_region["items"]
             .as_array()
@@ -162,15 +166,21 @@ async fn both_recommendation_readers_select_the_same_rows() {
             .unwrap_or_default();
         assert_eq!(
             counted,
-            items.len() as i64,
-            "case {case:?}: the summaries counted {counted} recommendations where the list \
-             returned {}, so the two readers selected different rows: {by_region}",
-            items.len()
+            deduped.len() as i64,
+            "case {case:?}: the summaries counted {counted} recommendations where the list's \
+             de-duped view returned {}, so the two readers selected different rows: {by_region}",
+            deduped.len()
+        );
+        assert_eq!(
+            counted,
+            distinct(&items, "resourceId").len() as i64,
+            "case {case:?}: expected one counted recommendation per resource of the listed \
+             rows, got {by_region}"
         );
         assert_eq!(
             groups(&by_region),
-            distinct(&items, "region"),
-            "case {case:?}: expected one group per region of the listed rows, got {by_region}"
+            distinct(&deduped, "region"),
+            "case {case:?}: expected one group per region of the de-duped rows, got {by_region}"
         );
 
         // Grouped by another dimension: the same selection, so the same counts
@@ -178,13 +188,13 @@ async fn both_recommendation_readers_select_the_same_rows() {
         let by_type = summarised(&router, filter, "ResourceType").await;
         assert_eq!(
             groups(&by_type),
-            distinct(&items, "currentResourceType"),
-            "case {case:?}: expected one group per resource type of the listed rows, got {by_type}"
+            distinct(&deduped, "currentResourceType"),
+            "case {case:?}: expected one group per resource type of the de-duped rows, got \
+             {by_type}"
         );
 
         // The de-duped total is of the same view: the saving of the list's own
         // de-duped page, one recommendation per resource.
-        let deduped = listed(&router, filter, false).await;
         let expected: f64 = deduped
             .iter()
             .map(|item| item["estimatedMonthlySavings"].as_f64().unwrap_or_default())

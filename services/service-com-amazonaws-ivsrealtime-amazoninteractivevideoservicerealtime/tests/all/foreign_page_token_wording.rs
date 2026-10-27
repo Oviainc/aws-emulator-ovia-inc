@@ -136,8 +136,9 @@ struct Listing {
 
 /// Every listing this service implements, with the members each one requires. The
 /// required members come from `smithy_query(query="operation",operation="ListStages,
-/// ListStorageConfigurations,ListIngestConfigurations,ListCompositions,ListStageSessions,
-/// ListParticipants,ListParticipantEvents,ListParticipantReplicas")`.
+/// ListStorageConfigurations,ListEncoderConfigurations,ListIngestConfigurations,
+/// ListCompositions,ListStageSessions,ListParticipants,ListParticipantEvents,
+/// ListParticipantReplicas")`.
 fn listings(stage_arn: &str) -> Vec<Listing> {
     vec![
         Listing {
@@ -146,6 +147,10 @@ fn listings(stage_arn: &str) -> Vec<Listing> {
         },
         Listing {
             operation: "ListStorageConfigurations",
+            required: json!({}),
+        },
+        Listing {
+            operation: "ListEncoderConfigurations",
             required: json!({}),
         },
         Listing {

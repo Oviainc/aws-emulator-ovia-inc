@@ -18,10 +18,11 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    InputDataConfig, InsightsContext, InsightsOutput, MedicalScribeChannelDefinition,
-    MedicalScribeListeningSessionDetails, MedicalScribePostStreamActionSettingsResponse,
-    MedicalScribePostStreamActionsResult, OutputDataConfig, PatientInsightsEncounterContext,
-    PatientInsightsPatientContext, SubscriptionDescription, UserContext, WebAppConfiguration,
+    CreateWebAppConfiguration, InputDataConfig, InsightsContext, InsightsOutput,
+    MedicalScribeChannelDefinition, MedicalScribeListeningSessionDetails,
+    MedicalScribePostStreamActionSettingsResponse, MedicalScribePostStreamActionsResult,
+    OutputDataConfig, PatientInsightsEncounterContext, PatientInsightsPatientContext,
+    SubscriptionDescription, UserContext, WebAppConfiguration,
 };
 
 /// The region an emulated ARN carries when the request names none.
@@ -340,6 +341,12 @@ pub struct Domain {
     pub deleted_at: Option<SystemTime>,
     pub web_app_url: Option<String>,
     pub web_app_configuration: Option<WebAppConfigurationRecord>,
+    /// The identity of the `CreateDomain` request that created this domain
+    /// ([`domain_creation_fingerprint`]), so a repeat of that request resolves to THIS
+    /// record instead of minting a second domain — what the operation's `@idempotent`
+    /// trait requires. Written once, at creation, and never from a later call, so a
+    /// mutation of the domain afterwards does not change which request created it.
+    pub creation_fingerprint: String,
     pub created_at: SystemTime,
     pub subscriptions: BTreeMap<String, Subscription>,
     /// The patient insights jobs started in this domain, by `jobId`. Held HERE rather
@@ -451,13 +458,62 @@ impl PatientInsightsJobSpec {
         for source in self.input_data_config.s3_sources.iter().flatten() {
             parts.push(source.uri.clone());
         }
-        let mut hasher = Sha256::new();
-        for part in parts {
-            hasher.update((part.len() as u64).to_be_bytes());
-            hasher.update(part.as_bytes());
-        }
-        hex::encode(hasher.finalize())
+        fingerprint_of(parts.iter().map(String::as_str))
     }
+}
+
+/// The digest of a sequence of request values — the ONE place this crate turns the
+/// parameters a request carried into the identity of that request, so no two operations
+/// tell a repeat from a different request by different rules.
+///
+/// Every value is LENGTH-PREFIXED before it is folded in, so two different sequences
+/// cannot collide by running their text together.
+pub fn fingerprint_of<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// The identity of a `CreateDomain` REQUEST: a digest of every parameter that operation
+/// accepts — `name`, `kmsKeyArn`, `tags` and `webAppSetupConfiguration` — so a repeat of
+/// one request can be told from a different request without keeping a second copy of
+/// either around. Stored on the record the request created
+/// ([`Domain::creation_fingerprint`]) and compared by
+/// [`ComAmazonawsConnecthealthConnecthealthState::domain_created_by`].
+///
+/// `tags` is digested in KEY order, the order the store holds the set in, so the same
+/// entries presented in a different wire order are the same request; the entry count is
+/// folded in ahead of them so the sections cannot be read into one another. An absent
+/// optional member contributes a part of its own, so omitting a member and supplying it
+/// are different requests.
+pub fn domain_creation_fingerprint(
+    name: &str,
+    kms_key_arn: Option<&str>,
+    tags: &BTreeMap<String, String>,
+    web_app_setup: Option<&CreateWebAppConfiguration>,
+) -> String {
+    let mut parts: Vec<String> = vec![name.to_string()];
+    match kms_key_arn {
+        Some(arn) => parts.push(format!("kmsKeyArn:{arn}")),
+        None => parts.push(String::new()),
+    }
+    parts.push(tags.len().to_string());
+    for (key, value) in tags {
+        parts.push(key.clone());
+        parts.push(value.clone());
+    }
+    match web_app_setup {
+        Some(setup) => {
+            parts.push(setup.ehr_role.clone());
+            parts.push(setup.idc_instance_id.clone());
+            parts.push(setup.idc_region.clone());
+        }
+        None => parts.push(String::new()),
+    }
+    fingerprint_of(parts.iter().map(String::as_str))
 }
 
 /// A persisted patient insights job, stored under the `Domain` it was started in — which
@@ -703,12 +759,40 @@ impl ComAmazonawsConnecthealthConnecthealthState {
             .count()
     }
 
+    /// The LIVE domain `account_id` already holds in `region` that was created by the
+    /// request `fingerprint` identifies ([`domain_creation_fingerprint`]), or `None` when
+    /// no such domain exists — what tells a REPEAT of a `CreateDomain` request from a
+    /// first one.
+    ///
+    /// Scoped to the account and Region the create is addressed to, the scope the quota
+    /// and every lookup in this module use, so a request repeated against another
+    /// Region's endpoint addresses that Region's inventory and creates there. Only a LIVE
+    /// domain resolves one: a domain already being deleted is on its way out, so the
+    /// earlier request's effect has been undone by an intervening call and the create is
+    /// a first one again.
+    pub fn domain_created_by(
+        &self,
+        region: &str,
+        account_id: &str,
+        fingerprint: &str,
+    ) -> Option<&Domain> {
+        self.domains_in(region).find(|domain| {
+            domain.account_id == account_id
+                && domain.status == DomainStatus::Active
+                && domain.creation_fingerprint == fingerprint
+        })
+    }
+
     /// Every `Domain` record `region` holds, whatever its status, in `domainId` order.
     ///
     /// The ONE place the Region scope of this store is expressed: a reader that
     /// enumerates domains goes through here, so an enumeration and a point lookup
     /// ([`Self::held_domain`]) can never disagree about which Region holds what.
-    pub fn domains_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Domain> + 'a {
+    pub fn domains_in<'a>(&'a self, region: &str) -> impl Iterator<Item = &'a Domain> + 'a {
+        // The Region is captured by VALUE, so the iterator borrows only the store: a
+        // caller may hand in a Region that outlives nothing and still keep the records
+        // it yields.
+        let region = region.to_string();
         self.domains
             .values()
             .filter(move |domain| domain.region == region)

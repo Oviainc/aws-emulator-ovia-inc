@@ -416,10 +416,14 @@ async fn the_tagging_bounds_are_enforced_on_the_merged_set() {
             "",
         ),
     ];
-    for (case, tags, expected_status, expected_code) in &rows {
+    for (index, (case, tags, expected_status, expected_code)) in rows.iter().enumerate() {
         // A fresh domain per row, so one row's accepted entries cannot change the next
-        // row's merge.
-        let created = emulator.create_domain(&json!({ "name": "clinic" })).await;
+        // row's merge. Each row asks for a DIFFERENT domain by name: `CreateDomain` is
+        // `@idempotent`, so repeating one create resolves to the domain that request
+        // already created rather than minting another.
+        let created = emulator
+            .create_domain(&json!({ "name": format!("clinic-{index}") }))
+            .await;
         let domain_id = string_at(&created, "domainId");
         let arn = string_at(&created, "arn");
         let (status, body) = emulator
