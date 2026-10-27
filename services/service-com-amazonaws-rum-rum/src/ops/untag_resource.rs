@@ -15,6 +15,12 @@
 //! `@length` is `min: 0`, so the empty list is a modelled value — succeeds having removed
 //! nothing (see [`UntagResourceWireInput`]).
 //!
+//! A key outside the constraints the modelled `TagKey` declares is refused 400 with the
+//! tagging frontend's `BadRequestException` before anything is removed, exactly as the
+//! sibling `TagResource` refuses the same key: the constraints are the key shape's, so
+//! they hold for a key a request NAMES as much as for one it writes (see
+//! [`BAD_REQUEST_ERROR_CODE`] and `crate::state::tag_key_list_refusal`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -90,7 +96,8 @@ pub enum UntagResourceErrorModeled {
     ValidationException(ValidationException),
 }
 
-/// The error code RUM's tagging frontend names a resource it cannot find by on the wire.
+/// The error code RUM's tagging frontend names a resource it cannot find by on the wire,
+/// and the one it refuses an invalid request with.
 ///
 /// The model declares `ResourceNotFoundException` for this operation, and that shape's
 /// `@httpError` 404 and its members are what the response carries — but the code the
@@ -102,6 +109,16 @@ pub enum UntagResourceErrorModeled {
 /// `ResourceNotFoundException`. A client branches on the code it is SENT, so the emulator
 /// sends the one the service sends rather than the one the model lists.
 const NOT_FOUND_ERROR_CODE: &str = "NotFoundException";
+
+/// The error code that same frontend refuses an invalid request with — the shorter
+/// `BadRequestException`, where the model declares `ValidationException` and an
+/// app-monitor call (addressed by `Name`) answers the modelled code. The recorded units
+/// `rum.tag-resource-invalid-key-rejected` and
+/// `rum.tag-resource-invalid-key-format-rejected` pin it for a tag key the frontend
+/// refuses, the sibling [`crate::ops::tag_resource`] names the same value, and
+/// `crate::service` words a tag refusal the BOUNDARY makes with it too — so a key this
+/// handler refuses is reported under the one code whichever path found it.
+const BAD_REQUEST_ERROR_CODE: &str = "BadRequestException";
 
 // The wire code, and the status, a request IAM does not allow is refused with: this
 // service's own pair, `crate::state::ACCESS_DENIED_ERROR_CODE` and
@@ -133,9 +150,13 @@ const TAG_KEYS_MEMBER: &str = "TagKeys";
 ///
 /// Only the ABSENT case is defaulted; everything else is read exactly as the generated
 /// deserializer reads it, including `ResourceArn`, which is still refused when absent
-/// (the framework's own missing-member refusal), and the `@length`/`@pattern` constraints
-/// on the keys, which the centralized walk validates after this step against the SAME
-/// input schema.
+/// (the framework's own missing-member refusal), and the key constraints the centralized
+/// walk CAN apply after this step against the SAME input schema — `TagKeyList`'s own
+/// `@length` and its element shape's. The one constraint that walk leaves unapplied is
+/// `TagKey`'s `@pattern`, which opens with a negative lookahead its engine cannot compile
+/// (a pattern it cannot compile is treated as matching), so the handler applies that one
+/// itself before it removes anything, as the sibling `TagResource` does for the keys of
+/// its map.
 #[derive(Debug, Clone)]
 pub struct UntagResourceWireInput(pub UntagResourceInput);
 
@@ -196,8 +217,8 @@ impl ::aws_smithy_schema::serde::SerializableStruct for UntagResourceWireInput {
 /// It is NOT `crate::scaffolded::Scaffolded` any more: this operation is implemented, so
 /// it needs neither the 501 (that variant is the stub signal) nor the framework's
 /// synthetic `ValidationException` (its own model declares one). What it does need, and
-/// what no generic wrapper can express, is the one wire code above — so the channel is
-/// the modelled enum plus that single refusal.
+/// what no generic wrapper can express, are the two wire codes above — so the channel is
+/// the modelled enum plus those two refusals, exactly as `TagResource` declares it.
 #[derive(Debug)]
 pub enum UntagResourceError {
     /// One of the operation's modelled errors, rendered exactly as the model declares it.
@@ -205,6 +226,9 @@ pub enum UntagResourceError {
     /// "That ARN names no resource", carrying the modelled `ResourceNotFoundException`
     /// payload and its 404 under the [`NOT_FOUND_ERROR_CODE`] the service answers with.
     NotFound(ResourceNotFoundException),
+    /// "That request is not valid", carrying the modelled `ValidationException` payload
+    /// and its 400 under the [`BAD_REQUEST_ERROR_CODE`] the service answers with.
+    BadRequest(ValidationException),
     /// "This caller may not perform this action on this resource", carrying the modelled
     /// `AccessDeniedException` payload and its 403 (see [`ACCESS_DENIED_ERROR_CODE`]).
     AccessDenied(AccessDeniedException),
@@ -223,6 +247,7 @@ impl ::std::fmt::Display for UntagResourceError {
         match self {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::NotFound(e) => write!(f, "{NOT_FOUND_ERROR_CODE}: {}", e.message),
+            Self::BadRequest(e) => write!(f, "{BAD_REQUEST_ERROR_CODE}: {}", e.message),
             Self::AccessDenied(e) => write!(f, "{ACCESS_DENIED_ERROR_CODE}: {}", e.message),
         }
     }
@@ -231,15 +256,16 @@ impl ::std::fmt::Display for UntagResourceError {
 impl ::std::error::Error for UntagResourceError {}
 
 /// Every method delegates to the modelled error, so a modelled failure is rendered
-/// exactly as `#[operation_error]` renders it. The `NotFound` variant differs in ONE
+/// exactly as `#[operation_error]` renders it. The refusal variants differ in ONE
 /// respect — the wire code, which the framework reads from `shape_name` rather than from
-/// the schema — and is otherwise the modelled `ResourceNotFoundException`: its schema
-/// decides which members the body carries, and its `@httpError` is the status.
+/// the schema — and are otherwise the modelled shapes: each one's schema decides which
+/// members the body carries, and its `@httpError` is the status.
 impl ::smithy_server_runtime::OperationError for UntagResourceError {
     fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::as_serializable(e),
             Self::NotFound(e) => e,
+            Self::BadRequest(e) => e,
             Self::AccessDenied(e) => e,
         }
     }
@@ -248,6 +274,7 @@ impl ::smithy_server_runtime::OperationError for UntagResourceError {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::variant_schema(e),
             Self::NotFound(_) => &super::types::SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+            Self::BadRequest(_) => &super::types::SCHEMA_VALIDATION_EXCEPTION,
             Self::AccessDenied(_) => &super::types::SCHEMA_ACCESS_DENIED_EXCEPTION,
         }
     }
@@ -256,6 +283,7 @@ impl ::smithy_server_runtime::OperationError for UntagResourceError {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::shape_name(e),
             Self::NotFound(_) => NOT_FOUND_ERROR_CODE,
+            Self::BadRequest(_) => BAD_REQUEST_ERROR_CODE,
             Self::AccessDenied(_) => ACCESS_DENIED_ERROR_CODE,
         }
     }
@@ -263,9 +291,10 @@ impl ::smithy_server_runtime::OperationError for UntagResourceError {
     fn http_status(&self) -> u16 {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::http_status(e),
-            // `ResourceNotFoundException`'s own modelled `@httpError`: the code on the
-            // wire changes, the status does not.
+            // Each modelled shape's own `@httpError`: the code on the wire changes, the
+            // status does not.
             Self::NotFound(_) => 404,
+            Self::BadRequest(_) => 400,
             Self::AccessDenied(_) => ACCESS_DENIED_STATUS,
         }
     }
@@ -273,9 +302,10 @@ impl ::smithy_server_runtime::OperationError for UntagResourceError {
     fn query_error_code(&self) -> Option<&'static str> {
         match self {
             Self::Modeled(e) => ::smithy_server_runtime::OperationError::query_error_code(e),
-            // restJson1 is this service's only protocol, and the shape carries no
+            // restJson1 is this service's only protocol, and no shape here carries an
             // `awsQueryError` trait to honour in any case.
             Self::NotFound(_) => None,
+            Self::BadRequest(_) => None,
             Self::AccessDenied(_) => None,
         }
     }
@@ -335,6 +365,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The constraints the key shape declares, applied to every key the request names
+        // before anything is read or written: `TagKey`'s `@pattern` is the one constraint
+        // on these keys the boundary walk leaves unapplied (see
+        // [`UntagResourceWireInput`]), and a key outside it is refused here rather than
+        // removed — the same rule, from the same place, the sibling `TagResource` applies
+        // to the keys of its map.
+        if let Some(message) =
+            crate::state::tag_key_list_refusal(input.tag_keys.iter().map(String::as_str))
+        {
+            return Err(UntagResourceError::BadRequest(ValidationException { message }));
+        }
 
         // "Removes one or more tags from the specified resource": the resource is the one
         // whose stored ARN the request names, and an ARN naming none is refused with 404

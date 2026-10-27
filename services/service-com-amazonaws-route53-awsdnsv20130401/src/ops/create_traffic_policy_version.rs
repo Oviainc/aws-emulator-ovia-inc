@@ -202,12 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The request addresses ONE existing policy — the new version is a
         // version OF it — so an `Id` the account holds no policy under names
-        // nothing to add a version to. No version is named by the request, so
-        // the refusal reports none.
+        // nothing to add a version to, refused through the ONE place this
+        // service words a traffic policy it does not hold.
         let policy = store.traffic_policies.get_mut(&input.id).ok_or_else(|| {
-            CreateTrafficPolicyVersionErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy(
-                &input.id, None,
-            ))
+            CreateTrafficPolicyVersionErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
         })?;
 
         // The per-policy ceiling: a policy's versions only ever count upwards,

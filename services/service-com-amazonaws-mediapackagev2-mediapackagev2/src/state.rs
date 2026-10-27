@@ -66,8 +66,9 @@ pub const DEFAULT_INPUT_TYPE: &str = "HLS";
 /// says "If you don't specify a value, the default is EPOCH_LOCKED".
 pub const DEFAULT_OUTPUT_LOCKING_MODE: &str = "EPOCH_LOCKED";
 
-/// How many ingest endpoints a channel is given. MediaPackage v2 hands every channel a
-/// redundant pair, which is why `IngestEndpoints` is a list rather than a single URL.
+/// How many ingest endpoints a channel that receives ingest of its own is given.
+/// MediaPackage v2 hands such a channel a redundant pair, which is why `IngestEndpoints`
+/// is a list rather than a single URL.
 const INGEST_ENDPOINTS_PER_CHANNEL: u8 = 2;
 
 /// The most channel groups this emulator holds at once.
@@ -218,7 +219,8 @@ pub const MAX_INGESTED_BYTES: usize = 64 * 1024 * 1024;
 pub enum IngestOutcome {
     /// The object was recorded against the channel.
     Recorded,
-    /// The group or the channel the path names does not resolve; nothing was written.
+    /// The group or the channel the path names does not resolve, or the channel it names
+    /// publishes no ingest endpoint the path could belong to; nothing was written.
     NoSuchChannel,
     /// The channel already holds [`MAX_INGESTED_OBJECTS_PER_CHANNEL`] distinct objects.
     ObjectCountReached,
@@ -689,7 +691,9 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
     }
 
     /// The channel an ingest request to `region`'s data plane addresses, or `None` when
-    /// the group or the channel does not resolve there.
+    /// the group or the channel does not resolve there, or when the channel it names
+    /// publishes no ingest endpoint for the path to belong to
+    /// ([`Channel::receives_ingest`]).
     pub fn channel_at_mut(
         &mut self,
         region: &str,
@@ -698,6 +702,7 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
         self.channel_group_mut(region, &target.group)?
             .channels
             .get_mut(&target.channel)
+            .filter(|channel| channel.receives_ingest())
     }
 
     /// How many bytes the ingest data plane is retaining across every channel.
@@ -915,7 +920,17 @@ impl Channel {
     /// a channel branches on — rather than each handler inferring it from a different
     /// member.
     pub fn is_multiview(&self) -> bool {
-        self.input_type == INPUT_TYPE_MULTIVIEW
+        is_multiview_input_type(&self.input_type)
+    }
+
+    /// Whether this channel's ingest data plane serves a push.
+    ///
+    /// Read off the ingest endpoints the channel PUBLISHES rather than decided again from
+    /// the input type: the data plane serves exactly the URLs the control plane handed
+    /// out, so a channel that publishes none ([`ingest_endpoints`]) has no reachable
+    /// ingest path and cannot accumulate content it never received.
+    pub fn receives_ingest(&self) -> bool {
+        !self.ingest_endpoints.is_empty()
     }
 }
 
@@ -1749,9 +1764,21 @@ pub fn parse_ingest_path(path: &str) -> Option<IngestTarget> {
     })
 }
 
-/// The redundant pair of ingest endpoints a channel is created with, derived from the
-/// parent group's egress domain and the channel's name.
-pub fn ingest_endpoints(egress_domain: &str, group: &str, channel: &str) -> Vec<IngestEndpoint> {
+/// The ingest endpoints a channel of this input type is created with, derived from the
+/// parent group's egress domain and the channel's name: the redundant pair for a channel
+/// that receives ingest of its own, and NONE for one that does not (see
+/// [`is_multiview_input_type`]) — a channel with no ingest stream of its own has no URL
+/// for a contributing encoder to push to, and `IngestEndpoints` carries no `@required` on
+/// any channel shape, so reporting none is what the model represents that with.
+pub fn ingest_endpoints(
+    egress_domain: &str,
+    group: &str,
+    channel: &str,
+    input_type: &str,
+) -> Vec<IngestEndpoint> {
+    if is_multiview_input_type(input_type) {
+        return Vec::new();
+    }
     let host = ingest_domain(egress_domain);
     (1..=INGEST_ENDPOINTS_PER_CHANNEL)
         .map(|index| IngestEndpoint {
@@ -2597,6 +2624,18 @@ const CHANNEL_INPUT_TYPE_RULES: &[ChannelInputTypeRule] = &[
 /// The `InputType` whose channels are the only ones that carry a multiview
 /// configuration, and which require one, from the model's `InputType` enum.
 pub const INPUT_TYPE_MULTIVIEW: &str = "MULTIVIEW";
+
+/// Whether a channel of this input type composites video from the source channels in its
+/// multiview configuration instead of receiving ingest of its own, which is what the
+/// model's `InputType` doc says a [`INPUT_TYPE_MULTIVIEW`] channel does ("The channel
+/// receives no ingest of its own").
+///
+/// Takes the input type rather than a stored channel, so the create path — which settles
+/// the materialised input type before any channel record exists — decides it from the
+/// same place [`Channel::is_multiview`] does.
+pub fn is_multiview_input_type(input_type: &str) -> bool {
+    input_type == INPUT_TYPE_MULTIVIEW
+}
 
 /// The first `InputType` restriction a request breaks, as the modeled
 /// `ValidationException` to answer it with, or `None` when every member it carries is
@@ -3579,8 +3618,12 @@ mod tests {
     #[test]
     fn the_ingest_host_shares_the_groups_dns() {
         let egress = egress_domain("us-west-2", "group");
-        let endpoints = ingest_endpoints(&egress, "group", "channel");
+        let endpoints = ingest_endpoints(&egress, "group", "channel", DEFAULT_INPUT_TYPE);
         let suffix = egress.split_once(".egress.").expect("an egress label").1;
+        assert!(
+            !endpoints.is_empty(),
+            "a channel that receives ingest must publish ingest endpoints"
+        );
         for endpoint in &endpoints {
             let url = endpoint.url.as_deref().expect("an ingest url");
             assert!(
@@ -3588,6 +3631,10 @@ mod tests {
                 "ingest url {url} must share the group's DNS suffix {suffix}"
             );
         }
+        assert!(
+            ingest_endpoints(&egress, "group", "channel", INPUT_TYPE_MULTIVIEW).is_empty(),
+            "a channel that receives no ingest of its own must publish no ingest endpoint"
+        );
     }
 
     /// One row of the input-type restriction table: which member a request carries, the

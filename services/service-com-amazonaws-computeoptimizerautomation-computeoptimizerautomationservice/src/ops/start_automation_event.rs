@@ -3,11 +3,15 @@
 //! @op StartAutomationEvent
 //!
 //! IMPLEMENTED. Resolves `recommendedActionId` against the recommended actions
-//! this service holds: an id no action has is `ResourceNotFoundException` (404),
-//! and an action that is there mints one automation event, stored and reported
-//! from the store. The event the start call answers with is not terminal, and
-//! the clock settles it to the modelled `Complete` status once its run window
-//! has passed — see `crate::state::StoredEvent::settle`.
+//! this service holds: an id no action has is `ResourceNotFoundException` (404);
+//! an action of an account the caller may no longer initiate work in — a member
+//! account whose association has been removed — is `AccessDeniedException`
+//! (403), because an automation is initiated only for recommended actions of
+//! ASSOCIATED member accounts; and an action that is there mints one automation
+//! event, stored and reported from the store. The event the start call answers
+//! with is not terminal, and the clock settles it to the modelled `Complete`
+//! status once its run window has passed — see
+//! `crate::state::StoredEvent::settle`.
 //!
 //! ## Shape of an operation
 //!
@@ -260,6 +264,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .account_id
             .clone()
             .unwrap_or_else(crate::state::caller_account_id);
+        // The caller's STANDING in the account the automation would run in: an
+        // automation is initiated only for a recommended action of an
+        // associated member account. The association is read NOW rather than
+        // inferred from the action being stored, because a disassociation
+        // leaves the member's analysed actions exactly where they were — see
+        // `crate::state::…::may_initiate_in`.
+        if !guard.may_initiate_in(&account_id) {
+            return Err(access_denied());
+        }
         let event_id = guard.mint_event_id();
         let event = crate::state::event_for_action(
             event_id.clone(),
@@ -305,6 +318,18 @@ fn output_for(event: &crate::state::StoredEvent) -> StartAutomationEventOutput {
 fn not_found() -> StartAutomationEventError {
     StartAutomationEventErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.into()),
+    })
+    .into()
+}
+
+/// The modelled 403 (`AccessDeniedException`, HTTP 403), for a recommended
+/// action the caller may not initiate an automation for. The message is this
+/// service's fixed access-denied sentence: it names neither the action nor the
+/// account it belongs to, so the refusal discloses nothing about what the store
+/// holds.
+fn access_denied() -> StartAutomationEventError {
+    StartAutomationEventErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(crate::state::ACCESS_DENIED_MESSAGE.into()),
     })
     .into()
 }
