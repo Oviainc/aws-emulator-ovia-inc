@@ -134,11 +134,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// "All tags that have the specified tag key are unassigned", so the request names
     /// keys and not values, and a key the rule does not carry is simply not there to
     /// remove: unassigning is idempotent and never a failure of its own.
+    ///
+    /// A key in the namespace AWS reserves for its own tags is refused outright: a caller
+    /// may not delete one, so the request is a parameter fault and nothing it named is
+    /// unassigned — not even a key the caller does own that travelled beside it.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A fault in the request itself, so it is answered before the addressed rule is
+        // resolved and before anything is removed.
+        if crate::state::names_reserved_tag_key(input.tag_keys.iter().map(String::as_str)) {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                crate::state::reserved_tag_key_not_allowed(crate::state::TAG_KEYS_MEMBER),
+            )
+            .into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {
