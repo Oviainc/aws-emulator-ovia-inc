@@ -473,6 +473,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deleted_at: None,
             updating_until: None,
             reshards: Vec::new(),
+            // Nothing has changed encryption on the stream either, so no change of it
+            // counts towards the rolling-window ceiling yet.
+            encryption_starts: Vec::new(),
+            encryption_stops: Vec::new(),
             tags: input.tags.unwrap_or_default(),
         };
 
