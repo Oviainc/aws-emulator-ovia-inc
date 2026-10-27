@@ -62,9 +62,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    CurrentSearchProgress, EBSItemFilter, EBSResultItem, ExportSpecification, ItemFilters,
-    LongCondition, ResultItem, S3ItemFilter, S3ResultItem, SearchJobBackupsResult, SearchScope,
-    SearchScopeSummary, StringCondition, TimeCondition,
+    ConflictException, CurrentSearchProgress, EBSItemFilter, EBSResultItem, ExportSpecification,
+    ItemFilters, LongCondition, ResultItem, S3ItemFilter, S3ResultItem, SearchJobBackupsResult,
+    SearchScope, SearchScopeSummary, StringCondition, TimeCondition,
 };
 
 /// The HTTP status a successful call of this service that has NO content to report
@@ -323,6 +323,91 @@ fn expire_client_token(token: &mut Option<ClientToken>, now: SystemTime) {
     if token.as_ref().is_some_and(|held| !held.is_valid_at(now)) {
         *token = None;
     }
+}
+
+/// A record a `ClientToken` of this service can name — what [`client_token_replay`] reads
+/// off it, and the resource type a refusal about it names.
+///
+/// Implemented by the record of each operation that takes a `ClientToken` ([`SearchJob`]
+/// and [`ExportJob`]), which is what lets the replay rule below be written ONCE for both.
+pub trait TokenedRecord {
+    /// The `resourceType` a refusal about this kind of record names
+    /// ([`SEARCH_JOB_RESOURCE`], [`EXPORT_JOB_RESOURCE`]).
+    const RESOURCE_TYPE: &'static str;
+
+    /// The `ClientToken` the request that minted this record carried, if any, with the
+    /// instant its validity window closes.
+    fn held_client_token(&self) -> Option<&ClientToken>;
+
+    /// The canonical form of that request's body ([`request_fingerprint`]), which is what
+    /// tells a repeat of the same body from a different body under the same token.
+    fn held_fingerprint(&self) -> &str;
+
+    /// This record's identifier, which a refusal names as the resource in conflict.
+    fn record_identifier(&self) -> &str;
+}
+
+/// The record holding `token` as a token still inside its validity window at `now`, or
+/// `None` when no held record does.
+///
+/// ONE live-token lookup behind every `ClientToken` of this service, so the two `Start`
+/// operations cannot drift apart on which held records a token is matched against or on
+/// whether a closed window still matches. A token whose window has closed matches NOTHING
+/// here, so the call carrying it is a new request. Read off the records themselves, so the
+/// idempotency index cannot outgrow the store it indexes. At most one held record can
+/// carry a live token of a given value, because minting another under it requires that no
+/// live one exists.
+fn live_token_holder<'a, T: TokenedRecord>(
+    records: &'a HashMap<String, T>,
+    token: &str,
+    now: SystemTime,
+) -> Option<&'a T> {
+    records.values().find(|record| {
+        record
+            .held_client_token()
+            .is_some_and(|held| held.is_live(token, now))
+    })
+}
+
+/// The REPLAY RULE every `ClientToken` of this service follows, in its three steps: find
+/// a held record carrying this token still inside its validity window; answer that stored
+/// record when the request's fingerprint matches it; refuse with a conflict when it does
+/// not.
+///
+/// One rule behind both `Start` operations of this service — the model states the same
+/// window sentence on both `ClientToken` members — so which step runs first, what a
+/// non-matching fingerprint answers and whether a closed window falls through are decided
+/// here once instead of per handler. The operation named in the refusal and the record
+/// type it is about ([`TokenedRecord::RESOURCE_TYPE`]) are parameters of the refusal, not
+/// of the rule.
+///
+/// `Ok(None)` is a NEW request — no token, or none the store holds live — and the caller
+/// goes on to mint a record. `Ok(Some(record))` is a repeat, which the caller answers out
+/// of that stored record and creates nothing. `Err` is the conflict, which each caller
+/// lifts into its own modelled error channel.
+pub fn client_token_replay<'a, T: TokenedRecord>(
+    records: &'a HashMap<String, T>,
+    token: Option<&str>,
+    fingerprint: &str,
+    now: SystemTime,
+    operation: &str,
+) -> Result<Option<&'a T>, ConflictException> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let Some(record) = live_token_holder(records, token, now) else {
+        return Ok(None);
+    };
+    if record.held_fingerprint() != fingerprint {
+        return Err(ConflictException {
+            message: format!(
+                "ClientToken '{token}' was already used for a different {operation} request"
+            ),
+            resource_id: record.record_identifier().to_string(),
+            resource_type: T::RESOURCE_TYPE.to_string(),
+        });
+    }
+    Ok(Some(record))
 }
 
 /// `MaxResults`'s modelled `@default(1000)`, shared by `ListSearchJobs` and
@@ -896,6 +981,24 @@ impl SearchJob {
     }
 }
 
+/// A search job is the record a `StartSearchJob` `ClientToken` names, so the replay rule
+/// reads it through [`client_token_replay`] rather than through logic of its own.
+impl TokenedRecord for SearchJob {
+    const RESOURCE_TYPE: &'static str = SEARCH_JOB_RESOURCE;
+
+    fn held_client_token(&self) -> Option<&ClientToken> {
+        self.client_token.as_ref()
+    }
+
+    fn held_fingerprint(&self) -> &str {
+        &self.request_fingerprint
+    }
+
+    fn record_identifier(&self) -> &str {
+        &self.identifier
+    }
+}
+
 /// One recovery point of this account's backup index, WITH the items that index holds.
 ///
 /// A scan has two layers and this record carries both. The outer one is the recovery
@@ -990,6 +1093,24 @@ impl ExportJob {
         // The status and the message it comes with are written together, so a record can
         // never report a failure's text while it is still RUNNING.
         self.status_message = message;
+    }
+}
+
+/// An export job is the record a `StartSearchResultExportJob` `ClientToken` names, and the
+/// same replay rule decides what a repeat under it answers ([`client_token_replay`]).
+impl TokenedRecord for ExportJob {
+    const RESOURCE_TYPE: &'static str = EXPORT_JOB_RESOURCE;
+
+    fn held_client_token(&self) -> Option<&ClientToken> {
+        self.client_token.as_ref()
+    }
+
+    fn held_fingerprint(&self) -> &str {
+        &self.request_fingerprint
+    }
+
+    fn record_identifier(&self) -> &str {
+        &self.identifier
     }
 }
 
@@ -1164,18 +1285,22 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
             .collect()
     }
 
-    /// The job the `StartSearchJob` call carrying `token` minted, if that call was made
-    /// and its token is still inside its validity window at `now`. Read off the job
-    /// records, so the idempotency index cannot outgrow [`MAX_SEARCH_JOBS`].
+    /// What a `StartSearchJob` carrying `token` over the body `fingerprint` renders is
+    /// answered with: `Ok(None)` for a new request, `Ok(Some(job))` for a repeat to be
+    /// answered out of that stored job, `Err` for the conflict.
     ///
-    /// A token whose window has closed matches NOTHING here, so the call carrying it is
-    /// a new request: it mints a job, and a body differing from the expired call's is no
-    /// longer a conflict. At most one held record can carry a live token of a given
-    /// value, because minting another under it requires that no live one exists.
-    pub fn job_by_client_token(&self, token: &str, now: SystemTime) -> Option<&SearchJob> {
-        self.search_jobs
-            .values()
-            .find(|job| job.client_token.as_ref().is_some_and(|held| held.is_live(token, now)))
+    /// The decision is [`client_token_replay`]'s, not this method's — the same rule
+    /// [`export_job_replay`](Self::export_job_replay) applies, because the model states
+    /// the window sentence on both of this service's `ClientToken` members. `operation` is
+    /// the name the refusal reads, which each handler takes from its own operation.
+    pub fn search_job_replay(
+        &self,
+        token: Option<&str>,
+        fingerprint: &str,
+        now: SystemTime,
+        operation: &str,
+    ) -> Result<Option<&SearchJob>, ConflictException> {
+        client_token_replay(&self.search_jobs, token, fingerprint, now, operation)
     }
 
     /// Whether this store is already holding [`MAX_SEARCH_JOBS`] jobs, which is when
@@ -1226,15 +1351,18 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
         newest_first(&self.export_job_order, &self.export_jobs)
     }
 
-    /// The export job the `StartSearchResultExportJob` call carrying `token` minted, if
-    /// that call was made and its token is still inside its validity window at `now` —
-    /// the same rule [`job_by_client_token`](Self::job_by_client_token) applies, because
-    /// the model states it on both of this service's `ClientToken` members. Read off the
-    /// records themselves, so the idempotency index cannot outgrow [`MAX_EXPORT_JOBS`].
-    pub fn export_job_by_client_token(&self, token: &str, now: SystemTime) -> Option<&ExportJob> {
-        self.export_jobs
-            .values()
-            .find(|job| job.client_token.as_ref().is_some_and(|held| held.is_live(token, now)))
+    /// What a `StartSearchResultExportJob` carrying `token` over the body `fingerprint`
+    /// renders is answered with — the SAME rule
+    /// [`search_job_replay`](Self::search_job_replay) answers a search-job repeat by
+    /// ([`client_token_replay`]), over this store's export jobs.
+    pub fn export_job_replay(
+        &self,
+        token: Option<&str>,
+        fingerprint: &str,
+        now: SystemTime,
+        operation: &str,
+    ) -> Result<Option<&ExportJob>, ConflictException> {
+        client_token_replay(&self.export_jobs, token, fingerprint, now, operation)
     }
 
     /// Whether this store is already holding [`MAX_EXPORT_JOBS`] export jobs, which is

@@ -8,7 +8,8 @@
 //! state"; "By default, if you do not set the PermanentDeletionTimeInDays parameter, the
 //! CA remains restorable for 30 days. You can set the parameter from 7 to 30 days"; and
 //! "A private CA deleted in the CREATING or FAILED state has no assigned restoration
-//! period and cannot be restored."
+//! period and cannot be restored." A delete of a CA whose deletion is already pending has
+//! nothing left to delete, so it is idempotent rather than refused.
 //!
 //! The wire harness is the one `private_ca_lifecycle` builds: the same router, the same
 //! awsJson1_1 calls.
@@ -83,8 +84,7 @@ fn stored(
 
 /// Put the stored CA into `status`.
 ///
-/// Four of the seven declared statuses are reachable over no implemented operation yet
-/// (`UpdateCertificateAuthority` is still scaffolded under its own issue, and this
+/// Three of the seven declared statuses are reachable over no implemented operation (this
 /// emulator never fails or expires a CA of its own accord), so the table below reaches
 /// them through the store the handlers read. The CA's due instant is pushed ahead at the
 /// same time, so a `CREATING` row is not settled out from under the test by the
@@ -102,21 +102,33 @@ pub(crate) fn force_status(emulator: &Emulator, arn: &str, status: &str, case: &
     record.restorable_until = (status == STATUS_DELETED).then(|| now + ONE_DAY);
 }
 
-/// Every `CertificateAuthorityStatus` the model declares, against whether a CA in it can
-/// be deleted and whether that deletion opens a restoration window.
+/// What a delete does to a CA in a given status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deleting {
+    /// The status is one the operation documents a delete from, so the CA is deleted.
+    Deletes,
+    /// The CA's deletion is already pending, so the delete is an idempotent success that
+    /// changes nothing.
+    AlreadyPending,
+    /// The status allows no delete at all.
+    Refused,
+}
+
+/// Every `CertificateAuthorityStatus` the model declares, against what a delete does from
+/// it and whether that deletion opens a restoration window.
 #[tokio::test]
 async fn delete_is_allowed_only_from_the_statuses_the_operation_documents() {
     let emulator = Emulator::new();
 
-    // (status, deletable, opens a restoration window)
-    let rows: &[(&str, bool, bool)] = &[
-        (STATUS_CREATING, true, false),
-        (STATUS_PENDING_CERTIFICATE, true, true),
-        (STATUS_ACTIVE, false, false),
-        (STATUS_DISABLED, true, true),
-        (STATUS_EXPIRED, true, true),
-        (STATUS_FAILED, true, false),
-        (STATUS_DELETED, false, false),
+    // (status, what a delete does, opens a restoration window)
+    let rows: &[(&str, Deleting, bool)] = &[
+        (STATUS_CREATING, Deleting::Deletes, false),
+        (STATUS_PENDING_CERTIFICATE, Deleting::Deletes, true),
+        (STATUS_ACTIVE, Deleting::Refused, false),
+        (STATUS_DISABLED, Deleting::Deletes, true),
+        (STATUS_EXPIRED, Deleting::Deletes, true),
+        (STATUS_FAILED, Deleting::Deletes, false),
+        (STATUS_DELETED, Deleting::AlreadyPending, true),
     ];
 
     // The table spans the whole enum, so a member the model gains cannot go untested.
@@ -130,12 +142,12 @@ async fn delete_is_allowed_only_from_the_statuses_the_operation_documents() {
          {covered:?} against {declared:?}"
     );
 
-    for (index, (status, deletable, opens_window)) in rows.iter().enumerate() {
+    for (index, (status, deleting, opens_window)) in rows.iter().enumerate() {
         let case = format!("delete from {status}");
         let arn = create_ca(&emulator, &case, &format!("delete-status-{index}")).await;
         force_status(&emulator, &arn, status, &case);
 
-        if *deletable {
+        if *deleting == Deleting::Deletes {
             emulator
                 .ok(
                     &case,
@@ -162,6 +174,35 @@ async fn delete_is_allowed_only_from_the_statuses_the_operation_documents() {
             );
 
             // The same thing the wire reports.
+            let described = describe(&emulator, &arn, &case).await;
+            assert_eq!(
+                string(&described, "Status", &case),
+                STATUS_DELETED,
+                "case {case:?}: expected a described status of DELETED, got {described:?}"
+            );
+            assert_eq!(
+                described.get("RestorableUntil").is_some(),
+                *opens_window,
+                "case {case:?}: expected RestorableUntil present={opens_window}, got \
+                 {described:?}"
+            );
+        } else if *deleting == Deleting::AlreadyPending {
+            // The CA's deletion is already pending, so a repeat delete is an idempotent
+            // success that leaves every part of that pending deletion where it was.
+            let before = stored(&emulator, &arn, &case);
+            emulator
+                .ok(
+                    &case,
+                    "DeleteCertificateAuthority",
+                    &json!({"CertificateAuthorityArn": arn}),
+                )
+                .await;
+            let after = stored(&emulator, &arn, &case);
+            assert_eq!(
+                after, before,
+                "case {case:?}: a repeat delete must leave the pending deletion exactly as \
+                 it was, got {after:?} against {before:?}"
+            );
             let described = describe(&emulator, &arn, &case).await;
             assert_eq!(
                 string(&described, "Status", &case),

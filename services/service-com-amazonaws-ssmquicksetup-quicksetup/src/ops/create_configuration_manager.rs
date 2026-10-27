@@ -340,6 +340,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Each definition deploys one configuration per account and Region its
+        // parameters target, so the configurations ONE create adds are the sum of those
+        // fan-outs: the store's own bound on them is read before anything is deployed
+        // and before any id is minted, so a create past it stores nothing at all.
+        let planned_deployments: usize = input
+            .configuration_definitions
+            .iter()
+            .map(|definition| {
+                crate::state::deployment_targets(&definition.parameters, &account, &region).len()
+            })
+            .sum();
+        if let Some(why) = crate::state::configuration_capacity_rejection(
+            store.configurations.len(),
+            planned_deployments,
+        ) {
+            return Err(CreateConfigurationManagerErrorModeled::ConflictException(
+                ConflictException { message: Some(why) },
+            )
+            .into());
+        }
+
         // The modelled `ManagerArn` pattern ends in a uuid, so that is what the
         // resource segment carries; the account segment is the emulator's canonical one.
         let manager_uuid = store.fresh_uuid();
@@ -352,7 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .zip(resolved_versions)
         {
             let definition_id = store.fresh_definition_id();
-            let parameters = crate::state::to_btree_map(Some(definition.parameters));
+            let parameters = crate::state::to_shared_parameters(Some(definition.parameters));
             let record = crate::state::ConfigurationDefinitionRecord {
                 id: definition_id,
                 type_: definition.r#type,
@@ -372,7 +393,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // deploys in this manager's own account and Region. Every configuration id
             // is service-generated and distinct from the definition id it names.
             let targets =
-                crate::state::deployment_targets(&record.parameters, &account, &region);
+                crate::state::deployment_targets(&*record.parameters, &account, &region);
             store.deploy_definition(&manager_arn, &record, &targets, created_at);
             definitions.push(record);
         }

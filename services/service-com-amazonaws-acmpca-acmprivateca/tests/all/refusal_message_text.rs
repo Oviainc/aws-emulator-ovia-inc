@@ -10,8 +10,9 @@
 //!   sentence of its own — the CA is in the DELETED state and has to be restored before
 //!   the action can complete — whichever mutation it was, whichever status the CA was
 //!   deleted from and whatever restoration window the deletion opened; it is not the
-//!   sentence a CA refuses a DELETE from the wrong status with, because the two are
-//!   different refusals under one error code and a caller tells them apart by the text;
+//!   sentence `UpdateCertificateAuthority` refuses the same deleted CA with, because the
+//!   two are different refusals under one error code and a caller tells them apart by the
+//!   text;
 //! * a pagination token a listing did not issue is refused with the service's own
 //!   sentence for that class, whose only variable part is the operation that mints the
 //!   listing's tokens — not the error shape's API-reference description, and never the
@@ -25,8 +26,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_acmpca_acmprivateca::state::{
-    encode_page_token, DELETE_INVALID_STATE_MESSAGE, STATUS_DELETED, STATUS_DISABLED,
-    STATUS_EXPIRED, STATUS_PENDING_CERTIFICATE,
+    encode_page_token, STATUS_DELETED, STATUS_DISABLED, STATUS_EXPIRED, STATUS_PENDING_CERTIFICATE,
 };
 
 use crate::delete_certificate_authority::force_status;
@@ -37,6 +37,12 @@ use crate::resource_policy::error_message;
 const DELETED_STATE_MESSAGE: &str =
     "The certificate authority is in the DELETED state and must be restored to complete \
      this action.";
+
+/// What it answers an `UpdateCertificateAuthority` of a CA whose status does not allow an
+/// update — the sibling refusal of the one above: same error code, same HTTP status, its
+/// own sentence.
+const UPDATE_STATE_MESSAGE: &str =
+    "The certificate authority must be in the ACTIVE or DISABLED state to be updated";
 
 /// What it answers a `NextToken` the listing paged by `operation` never minted.
 fn invalid_next_token_message(operation: &str) -> String {
@@ -197,21 +203,21 @@ async fn a_mutation_against_a_soft_deleted_ca_is_refused_with_the_restore_senten
             "case {case:?}: a refused mutation must leave the CA as it was, got {tags:?}"
         );
 
-        // The sibling refusal under the same code and status keeps its own sentence: a
-        // second delete of the same CA is refused about the statuses a delete is allowed
-        // from, not about the restore.
+        // The sibling refusal under the same error code and status keeps its own
+        // sentence: an update of the same deleted CA is refused about the statuses an
+        // update is allowed from, not about the restore.
         let body = emulator
             .refused(
                 case,
-                "DeleteCertificateAuthority",
-                &json!({"CertificateAuthorityArn": arn}),
+                "UpdateCertificateAuthority",
+                &json!({"CertificateAuthorityArn": arn, "Status": STATUS_DISABLED}),
                 "InvalidStateException",
             )
             .await;
         let sibling = error_message(&body, case);
         assert_eq!(
-            sibling, DELETE_INVALID_STATE_MESSAGE,
-            "case {case:?}: expected the delete-from-this-status sentence, got {sibling:?}"
+            sibling, UPDATE_STATE_MESSAGE,
+            "case {case:?}: expected the update-from-this-status sentence, got {sibling:?}"
         );
         assert_ne!(
             sibling, DELETED_STATE_MESSAGE,

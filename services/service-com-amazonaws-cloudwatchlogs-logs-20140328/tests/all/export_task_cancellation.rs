@@ -63,6 +63,15 @@ const ALREADY_FINISHED: &str = "The specified export task has already finished";
 /// task a caller stopped.
 const CANCELLED_BY_USER: &str = "Export task cancelled by user";
 
+/// The whole status message an export task that finished reports beside that status code,
+/// from the same member.
+const COMPLETED_SUCCESSFULLY: &str = "Completed successfully";
+
+/// The status message the seeded failed task is stood up carrying: nothing in this emulator
+/// fails an export, so the reason a failed export would report is supplied by the seed and
+/// read back to show the report answers from the stored record.
+const SEEDED_FAILURE_REASON: &str = "Export task failed";
+
 /// The whole message a cancel naming an id the account holds no task under is refused with:
 /// the service's missing-resource sentence, naming the kind of resource that is not there.
 const TASK_NOT_FOUND: &str = "The specified export task does not exist.";
@@ -231,12 +240,12 @@ async fn a_cancel_stops_an_export_that_is_still_under_way() {
     );
 }
 
-/// `ExportTaskStatus$message` is "the status message related to the status code", and the
-/// status a CALLER put the task in is the one this service has something to say about: a
-/// cancelled task reports why it stopped, while a status the export reached on its own
-/// carries no message at all.
+/// `ExportTaskStatus$message` is "the status message related to the status code": a task that
+/// has SETTLED reports the message of the terminal status it settled at, whichever way it got
+/// there, while a task whose export is still under way has reached no outcome and so carries
+/// no message.
 #[tokio::test]
-async fn a_cancelled_task_reports_the_status_message_that_status_carries() {
+async fn a_settled_task_reports_the_status_message_that_status_carries() {
     let logs = Logs::new();
     const GROUP: &str = "/export/status-message";
     logs.ok("CreateLogGroup", &json!({"logGroupName": GROUP}))
@@ -268,10 +277,10 @@ async fn a_cancelled_task_reports_the_status_message_that_status_carries() {
     let failed_task = reported(&logs, "a task whose export failed", &failed).await;
 
     // (case, the task as it was reported, the statuses that reading admits, the message that
-    // status carries — `None` where the service has nothing to say about the status). A row
-    // admits two statuses where the read races the clock the create armed: a task read right
-    // after the create has not started exporting unless that instant has already passed, and
-    // either way it is a status the export reached on its own.
+    // status carries — `None` where the export has not reached an outcome yet). A row admits
+    // two statuses where the read races the clock the create armed: a task read right after
+    // the create has not started exporting unless that instant has already passed, and either
+    // way the export is still under way.
     let cases: Vec<(&str, &Value, Vec<&str>, Option<&str>)> = vec![
         (
             "a task whose export is under way",
@@ -289,13 +298,13 @@ async fn a_cancelled_task_reports_the_status_message_that_status_carries() {
             "a task the clock finished",
             &finished_on_the_clock,
             vec![COMPLETED],
-            None,
+            Some(COMPLETED_SUCCESSFULLY),
         ),
         (
             "a task whose export failed",
             &failed_task,
             vec![EXPORT_TASK_STATUS_FAILED],
-            None,
+            Some(SEEDED_FAILURE_REASON),
         ),
         (
             "a task cancelled before it started exporting",
@@ -484,6 +493,7 @@ fn seed_failed_task(logs: &Logs, group: &str) -> String {
     let created = now_ms() - 60 * 1_000;
     let mut record = ExportTaskRecord::new(&id, group, created - 1_000, created, "export-bucket", created);
     record.status_code = EXPORT_TASK_STATUS_FAILED.to_string();
+    record.status_message = Some(SEEDED_FAILURE_REASON.to_string());
     record.completion_time_ms = Some(created + 1_000);
     record.running_due_ms = None;
     record.completion_due_ms = None;

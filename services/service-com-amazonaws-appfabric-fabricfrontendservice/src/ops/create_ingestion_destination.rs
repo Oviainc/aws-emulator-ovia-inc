@@ -330,22 +330,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ingestion.id
             ),
         );
-        let record = crate::state::IngestionDestinationRecord {
+        let mut record = crate::state::IngestionDestinationRecord {
             id: id.clone(),
             arn: arn.clone(),
             ingestion_arn: ingestion_arn.clone(),
             processing_configuration: input.processing_configuration,
             destination_configuration: input.destination_configuration,
-            // IngestionDestinationStatus = Active | Failed. A destination this
-            // emulator accepted is usable straight away, so it is stored in the
-            // terminal `Active` state and carries no status reason.
-            status: "Active".to_string(),
+            // `mark_accepted` below writes both of these: it is the one place
+            // this crate decides what a destination whose configuration was
+            // accepted carries, so this path and the update path cannot drift
+            // apart over it.
+            status: String::new(),
             status_reason: None,
             created_at,
             updated_at: created_at,
             tags: input.tags.unwrap_or_default(),
             sequence,
         };
+        // A destination this emulator accepted is usable straight away, so it
+        // is stored in the terminal accepted state and the clock owes no
+        // transition.
+        record.mark_accepted();
         ingestion.destinations.insert(id.clone(), record);
         // Read the response back out of the store, so what the caller sees is
         // exactly what a later Get or List will see.

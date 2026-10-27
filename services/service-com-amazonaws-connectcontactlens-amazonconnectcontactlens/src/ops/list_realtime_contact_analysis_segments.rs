@@ -131,6 +131,24 @@ impl From<ListRealtimeContactAnalysisSegmentsErrorModeled> for ListRealtimeConta
     }
 }
 
+/// The message Contact Lens returns when a contact has no real-time analysis session to
+/// report.
+///
+/// The service answers this refusal with ONE fixed sentence: nothing from the request
+/// and nothing from stored state is interpolated into it, so the text is a constant
+/// rather than a template. Every not-found path in this crate builds its
+/// `ResourceNotFoundException` through [`not_found`] so no caller can grow a
+/// request-derived variant of it.
+const RESOURCE_NOT_FOUND_MESSAGE: &str = "Real-time contact analysis not found.";
+
+/// The service's `ResourceNotFoundException` (HTTP 404), carrying
+/// [`RESOURCE_NOT_FOUND_MESSAGE`] and no other member.
+fn not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
 /// The `ListRealtimeContactAnalysisSegments` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -192,13 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(session) = state.session(&key) else {
             return Err(
                 ListRealtimeContactAnalysisSegmentsErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "No real-time contact analysis session for ContactId '{}' in \
-                             InstanceId '{}'.",
-                            input.contact_id, input.instance_id
-                        )),
-                    },
+                    not_found(),
                 )
                 .into(),
             );

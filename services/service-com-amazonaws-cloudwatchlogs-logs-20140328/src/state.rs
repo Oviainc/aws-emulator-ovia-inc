@@ -673,6 +673,12 @@ pub const EXPORT_TASK_STATUS_FAILED: &str = "FAILED";
 /// text is fixed for the status: it interpolates neither the task nor the instant.
 pub const EXPORT_TASK_CANCELLED_STATUS_MESSAGE: &str = "Export task cancelled by user";
 
+/// The status message an export task that finished exporting reports beside that status code,
+/// on the same terms as [`EXPORT_TASK_CANCELLED_STATUS_MESSAGE`]: what there is to say about a
+/// task in this status is that the export ran to its end without an error. Fixed text for the
+/// status, interpolating nothing of the task.
+pub const EXPORT_TASK_COMPLETED_STATUS_MESSAGE: &str = "Completed successfully";
+
 /// How long after it is created an export task moves `PENDING` -> `RUNNING`, and how long
 /// after that it reaches `COMPLETED`.
 ///
@@ -1779,9 +1785,13 @@ pub struct ExportTaskRecord {
     pub log_stream_name_prefix: Option<String>,
     /// `ExportTaskStatus$code`, one of the [`EXPORT_TASK_STATUS_PENDING`] family.
     pub status_code: String,
-    /// `ExportTaskStatus$message` — "The status message related to the status code" — set
-    /// only for a status the service has something to say about, which is the one a CALLER
-    /// put the task in rather than one the export reached on its own.
+    /// `ExportTaskStatus$message` — "The status message related to the status code" — the
+    /// message of the status this task is IN, stamped by the transition that put it there:
+    /// the fixed text of the terminal class a task settles at
+    /// ([`EXPORT_TASK_CANCELLED_STATUS_MESSAGE`], [`EXPORT_TASK_COMPLETED_STATUS_MESSAGE`]),
+    /// or the reason an export that stopped on an error ended. `None` while the export is
+    /// still under way: there is nothing to say about a task that has not reached an outcome
+    /// yet.
     pub status_message: Option<String>,
     /// `ExportTaskExecutionInfo$creationTime`, in epoch milliseconds.
     pub creation_time_ms: i64,
@@ -1848,8 +1858,8 @@ impl ExportTaskRecord {
     /// Cancel this export task: it reaches [`EXPORT_TASK_STATUS_CANCELLED`] at `now_ms` and
     /// owes the clock no further transition, so the start and the completion it was armed for
     /// are DISCARDED rather than materialised later over the cancellation. The status message
-    /// that status carries is stamped with it, because a cancelled export stopped for a reason
-    /// this service can state. Only a task that [`Self::is_active`] has an export left to
+    /// that status carries is stamped with it, the way every terminal status an export task
+    /// reaches carries its own. Only a task that [`Self::is_active`] has an export left to
     /// cancel — "The task must be in the PENDING or RUNNING state."
     pub fn cancel(&mut self, now_ms: i64) {
         self.status_code = EXPORT_TASK_STATUS_CANCELLED.to_string();
@@ -1862,7 +1872,8 @@ impl ExportTaskRecord {
     /// Materialise the status changes the clock owes this task: a pending export whose start
     /// instant has passed is `RUNNING`, and a running one whose completion instant has passed
     /// is `COMPLETED` — each stamped AT that instant and not at the time something happened
-    /// to look.
+    /// to look. A task the clock finishes carries the status message that terminal status
+    /// carries, the way every status an export task settles at does.
     pub fn materialize_due_transitions(&mut self, now_ms: i64) {
         if let Some(due) = self.running_due_ms {
             if due <= now_ms {
@@ -1876,6 +1887,10 @@ impl ExportTaskRecord {
         if let Some(due) = self.completion_due_ms {
             if due <= now_ms {
                 self.status_code = EXPORT_TASK_STATUS_COMPLETED.to_string();
+                // The status this transition puts the task in carries its own message, so it
+                // is stamped WITH the status, exactly as the cancel transition stamps the one
+                // its status carries.
+                self.status_message = Some(EXPORT_TASK_COMPLETED_STATUS_MESSAGE.to_string());
                 self.completion_time_ms = Some(due);
                 self.completion_due_ms = None;
             }

@@ -17,7 +17,10 @@
 //! Which statistic each format admits is tabled once, in `metric_streams.rs`. What this suite
 //! adds is the rest of the rule: a configuration carries a LIST, so the refusal names the
 //! first entry the format cannot carry, and a refused request changes no state — on the
-//! create path and on the upsert path of a stream that is already live.
+//! create path and on the upsert path of a stream that is already live. The read that
+//! confirms the refused create is answered by its error code alone, with no message
+//! (`not_found_messages.rs` owns that contract for every not-found this service words that
+//! way; here it is the pair a client compares after the refusal).
 
 use crate::harness::{build_router, call, error_code, error_message, ok};
 use crate::metric_streams::put_request;
@@ -90,7 +93,9 @@ async fn the_refusal_names_the_first_statistic_the_format_cannot_carry() {
                  in CloudWatch's sentence, got {body}"
             );
 
-            // The refused create left nothing behind.
+            // The refused create left nothing behind, and the not-found that says so is
+            // answered by its error code alone: a client confirming the refusal compares
+            // the code with an empty message.
             let (get_status, get_body) = call(
                 &router,
                 "GetMetricStream",
@@ -98,10 +103,22 @@ async fn the_refusal_names_the_first_statistic_the_format_cannot_carry() {
             )
             .await;
             assert_eq!(
-                (get_status, error_code(&get_body).as_str()),
-                (404, "ResourceNotFoundException"),
+                (
+                    get_status,
+                    error_code(&get_body),
+                    error_message(&get_body)
+                ),
+                (404, "ResourceNotFoundException".to_string(), String::new()),
                 "case {case:?}: a refused PutMetricStream must persist nothing, got \
                  {get_status} {get_body}"
+            );
+
+            // Nor is the stream reported among the account's streams.
+            let listed = ok(&router, "ListMetricStreams", &json!({})).await;
+            assert_eq!(
+                listed.get("Entries"),
+                Some(&json!([])),
+                "case {case:?}: a refused create must list no stream, got {listed}"
             );
         }
     }
