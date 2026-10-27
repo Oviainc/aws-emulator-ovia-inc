@@ -162,7 +162,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state =
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
 
@@ -177,12 +176,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // IAM decides whether the caller may do this BEFORE the service looks at the
+        // request's schema document or at the index: an under-privileged principal is
+        // told it is not authorized rather than told anything the service checks for
+        // itself, and this call writes nothing. The resource is the ARN of the domain
+        // the request names, taken from the request rather than from a stored record,
+        // so the decision does not depend on whether that domain exists.
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::domain_arn(
+                &input.domain_name,
+                &crate::state::request_region(ctx.parts()),
+            ),
+        )
+        .map_err(UpdateIndexErrorModeled::AccessDeniedException)?;
+
         // The schema is a set of named sections, so a document carrying a scalar or
         // an array instead names no change to make and is refused rather than
         // becoming this index's schema.
         if !matches!(input.index_schema, ::aws_smithy_types::Document::Object(_)) {
             return Err(UpdateIndexErrorModeled::ValidationException(
                 crate::state::malformed_index_schema("IndexSchema"),
+            )
+            .into());
+        }
+
+        // What the request itself carries is bounded before it is merged or compared
+        // against the stored schema: a document nesting past the emulator's own depth
+        // bound, or already holding more values than one index may, could never be
+        // accepted, so it is refused rather than walked.
+        let depth = crate::state::index_schema_depth(&input.index_schema);
+        if depth > crate::state::INDEX_SCHEMA_MAX_DEPTH {
+            return Err(UpdateIndexErrorModeled::ValidationException(
+                crate::state::index_schema_too_deep(depth),
+            )
+            .into());
+        }
+        let requested = crate::state::index_schema_values(&input.index_schema);
+        if requested > crate::state::INDEX_SCHEMA_QUOTA {
+            return Err(UpdateIndexErrorModeled::ValidationException(
+                crate::state::index_schema_over_quota(requested),
             )
             .into());
         }
