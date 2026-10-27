@@ -625,3 +625,9 @@ mod validate_security_group_quotas_for_interface;
 // `GetImageBlockPublicAccessState` reports out of each Region's own setting.
 #[path = "all/image_block_public_access.rs"]
 mod image_block_public_access;
+// Appended at the END of this file, like the suites above it and for the reason the header
+// gives: the sorted region of this file is where every new ec2 suite inserts its lines, so a
+// line added there loses serialized squash merges. What `CreateTransitGatewayRouteTable`
+// mints and persists for the gateway it names, and what it refuses.
+#[path = "all/create_transit_gateway_route_table.rs"]
+mod create_transit_gateway_route_table;
