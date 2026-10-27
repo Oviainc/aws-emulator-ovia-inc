@@ -203,6 +203,10 @@ pub(super) const AWS_JSON_1_1: &str = "application/x-amz-json-1.1";
 /// the awsJson versions above.
 pub(super) const REST_JSON: &str = "application/json";
 
+/// The media type a REST-XML service's requests and answers carry ([`call_rest_xml`]): a
+/// `restXml` service (Amazon Route 53) takes an XML document rather than a JSON one.
+pub(super) const REST_XML: &str = "application/xml";
+
 /// What the service that owns a resource answered when it created it.
 ///
 /// `physical_resource_id` is set only by a type whose id that service ASSIGNS (an FIS
@@ -1390,6 +1394,58 @@ pub(super) async fn call_rest_json(
         return Ok(document);
     }
     Err(refusal_of(status, &document))
+}
+
+/// Call one REST-XML operation of another emulated service in-process and read the XML
+/// document it answers with. `Err(refusal)` is that service's own refusal: the error CODE
+/// it carries, and the message it worded.
+///
+/// A `restXml` service (Amazon Route 53) binds each operation to a method and a URI like a
+/// REST-JSON one, and takes an XML document rather than a JSON one — so the caller passes
+/// the binding the called operation's model declares and the body it writes, and what comes
+/// back is the answer's text, read with [`xml_element`] and [`xml_scalar_children`].
+/// `body` is `None` for an operation whose input is entirely in the URI.
+///
+/// A 501 is a refusal like any other, exactly as it is for [`call_json_rpc`]: the
+/// difference between the two is only the wire the called service publishes.
+pub(super) async fn call_rest_xml(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    signing_name: &str,
+    region: &str,
+    method: &'static str,
+    uri: &str,
+    body: Option<&str>,
+) -> Result<String, Refusal> {
+    let payload = body.map(str::as_bytes).unwrap_or_default().to_vec();
+    let headers = vec![("content-type", REST_XML.to_string())];
+    let (status, answer) = dispatch(ctx, signing_name, region, method, uri, headers, payload)
+        .await
+        .map_err(|message| Refusal {
+            code: "InternalFailure".to_string(),
+            message,
+        })?;
+    let document = String::from_utf8_lossy(&answer).into_owned();
+    if (200..300).contains(&status) {
+        return Ok(document);
+    }
+    // A restXml error answer is `<ErrorResponse><Error><Type/><Code/><Message/></Error>…`,
+    // and the code is the one the model's error shape carries (`NoSuchHostedZone`), which is
+    // what a client branches on.
+    Err(Refusal {
+        code: xml_element(&document, "Code")
+            .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}")),
+        message: xml_element(&document, "Message").unwrap_or_default(),
+    })
+}
+
+/// One element carrying TEXT, as a restXml request body spells a scalar member:
+/// `<Name>value</Name>`, with the five predefined entities escaped by the same maintained
+/// XML implementation that reads the answers back ([`xml_element`]) — so a value carrying
+/// `&` or `<` reaches the called operation as the text it is rather than as markup.
+///
+/// The element NAME is the called model's own member name, never caller text.
+pub(super) fn xml_leaf(name: &str, value: &str) -> String {
+    format!("<{name}>{}</{name}>", ::quick_xml::escape::escape(value))
 }
 
 /// What an awsQuery parameter name or value is percent-encoded against: everything

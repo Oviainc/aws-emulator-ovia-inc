@@ -217,14 +217,13 @@ pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
     xml_texts(xml, tag).into_iter().next()
 }
 
-/// A `DescribeStacks` answer's `Outputs`, as the key/value map a client reads it as. Each
-/// `member` of the list carries exactly one `OutputKey` and one `OutputValue`, so the two
-/// document-ordered lists pair up.
+/// A `DescribeStacks` answer's `Outputs`, as the key/value map a client reads it as.
+///
+/// The one reader, in `all/query_wire.rs`: it pairs each `OutputKey` with the `OutputValue`
+/// of the same `<member>`, where this used to zip two document-ordered lists. The name stays
+/// here so the suites that already import it are unchanged.
 pub(crate) fn outputs_of(xml: &str) -> BTreeMap<String, String> {
-    xml_texts(xml, "OutputKey")
-        .into_iter()
-        .zip(xml_texts(xml, "OutputValue"))
-        .collect()
+    super::query_wire::outputs_of(xml)
 }
 
 /// Create a stack from `template` and answer its id, failing the case with the response
