@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDomainNameAccessAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDomainNameAccessAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDomainNameAccessAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the one stored `DomainNameAccessAssociation` the ARN addresses, so
+//! the reads that reported it (`GetDomainNameAccessAssociations`, `GetTags` by that ARN)
+//! stop reporting it. An ARN this service cannot read as one of ITS access association
+//! ARNs is the modelled `BadRequestException` (400); a well-formed one no stored record
+//! answers to is the modelled `NotFoundException` (404), which is what makes a second
+//! delete of one record — or two concurrent ones — resolve to one success and one 404
+//! rather than to a conflict. The lookup and the removal share ONE hold of the store.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +72,29 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::TaggedResource;
+
+/// The identifier the stored record is keyed by, read out of the ARN this operation takes.
+///
+/// The variant matched is the one whose ARN resource portion is this operation's own read
+/// URI (`smithy_query(query="operation", operation="DeleteDomainNameAccessAssociation")`:
+/// `/domainnameaccessassociations/{domainNameAccessAssociationArn}`), which is also the
+/// path the stored record's ARN was spelled with.
+///
+/// The ARN goes through [`crate::state::parse_tagged_resource`] — the one place this
+/// service reads a caller-supplied ARN — and is then held to the kind of resource this
+/// member names, so a value that is not an ARN, an ARN of another vendor, or an ARN naming
+/// another kind of API Gateway resource is refused here the way it is everywhere else in
+/// this service: a request to fix, not a resource that is not there.
+fn access_association_id_of(value: &str) -> Option<String> {
+    match crate::state::parse_tagged_resource(value) {
+        Some(TaggedResource::DomainNameAccessAssociation {
+            access_association_id,
+        }) => Some(access_association_id),
+        _ => None,
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -171,18 +192,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDomainNameAccessAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDomainNameAccessAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The ARN is read BEFORE the store is reached, so a value this service cannot read
+        // resolves nothing: a malformed ARN is a client error (400), a different answer
+        // from a well-formed ARN naming a record that does not exist (404). The member is
+        // held to the kind of resource it names, so the ARN of some other API Gateway
+        // resource is refused the way a non-ARN is.
+        let id = access_association_id_of(&input.domain_name_access_association_arn).ok_or_else(
+            || {
+                DeleteDomainNameAccessAssociationErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::invalid_arn(
+                            &input.domain_name_access_association_arn,
+                        )),
+                    },
+                )
+            },
+        )?;
+
+        let mut store = state.lock();
+        // "Deletes the DomainNameAccessAssociation resource": removing the record is what
+        // makes the account's `GetDomainNameAccessAssociations` listing — and a tag read by
+        // this ARN — stop reporting it. Nothing the association carries conditions the
+        // removal, and nothing else of this service depends on it; the domain name it was
+        // created against keeps its own record, which `DeleteDomainName` removes once no
+        // association names it any more.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDomainNameAccessAssociation"))
+        // "Only the AWS account that created the DomainNameAccessAssociation resource can
+        // delete it": this emulator serves one account, so every stored record is one that
+        // account created and the lookup is the whole check. Rejecting ANOTHER account's
+        // association is `RejectDomainNameAccessAssociation`'s own call.
+        //
+        // The lookup and the removal are ONE operation on the store under ONE hold of its
+        // lock, so two concurrent deletes of one record cannot both remove it: exactly one
+        // sees the record and succeeds, and every other is refused the same
+        // `NotFoundException` an identifier no record answers to earns — the sentence every
+        // reader of this ARN answers with, rather than a silent success.
+        let removed = store.domain_name_access_associations.remove(&id).ok_or_else(|| {
+            DeleteDomainNameAccessAssociationErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_ACCESS_ASSOCIATION.to_string()),
+            })
+        })?;
+        // The store lock is released before the outcome is recorded: the critical section
+        // covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome — the
+        // one record `crate::state::AUDIT_TARGET` documents, as the sibling
+        // `DeleteDomainName` handler emits it. Metadata only; the association's tags and
+        // its source identifier are the caller's data and are never fields.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            domain_name_access_association = ?removed.id,
+            outcome = "deleted",
+            "domain name access association deleted",
+        );
+        Ok(DeleteDomainNameAccessAssociationOutput)
     }
 }

@@ -261,6 +261,12 @@ mod create_dataset_bounds;
 // there collided with this one.
 #[path = "all/create_workspace_bounds.rs"]
 mod create_workspace_bounds;
+// In its alphabetical place INSIDE the sorted list rather than appended after it:
+// the end of this file is where every concurrent iotsitewise change appends a
+// declaration of its own, and three appends there lost the squash race with this
+// one.
+#[path = "all/dashboard_delete.rs"]
+mod dashboard_delete;
 #[path = "all/dataset_export_jobs.rs"]
 mod dataset_export_jobs;
 #[path = "all/describe_asset_property.rs"]

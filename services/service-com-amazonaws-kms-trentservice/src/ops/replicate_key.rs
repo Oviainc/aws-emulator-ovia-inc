@@ -312,14 +312,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A disabled key has its own modelled refusal here — "the specified KMS key
         // is not enabled" — and any other key state outside `Enabled` (a key awaiting
         // deletion, one awaiting imported key material, or a replica still being
-        // created) is a key state this operation is not compatible with.
+        // created) is a key state this operation is not compatible with. So is the
+        // transient state of a primary-Region move the clock still owes the set:
+        // "while the key state is Updating, you can use the keys in cryptographic
+        // operations, but you cannot replicate the new primary key"
+        // (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`), which is why the
+        // cryptographic usability of the key is not the whole of the judgement here.
         if key.key_state == crate::state::KEY_STATE_DISABLED {
             return Err(ReplicateKeyErrorModeled::DisabledException(DisabledException {
                 message: Some(crate::state::invalid_state_message(key)),
             })
             .into());
         }
-        if !key.is_usable() {
+        if !key.is_usable() || key.is_updating_primary_region() {
             return Err(ReplicateKeyErrorModeled::KMSInvalidStateException(
                 KMSInvalidStateException {
                     message: Some(crate::state::invalid_state_message(key)),

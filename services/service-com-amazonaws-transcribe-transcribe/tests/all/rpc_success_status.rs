@@ -18,8 +18,8 @@
 //!
 //! The second test is the rule's boundary: a FAILED call is not flattened with the
 //! successes — it answers the status its own failure carries (this service's
-//! client-error status for a modelled client error, named in the body's `__type`; the
-//! scaffold's 501 for an operation nobody has written yet), which
+//! client-error status for a modelled client error, named in the body's `__type`,
+//! whatever `@httpError` the model records for that shape), which
 //! `crate::scaffolded::wire_status` is the single home of.
 
 use serde_json::{json, Value};
@@ -255,8 +255,8 @@ async fn a_success_answers_200_whatever_the_modelled_http_code_is() {
 
 /// The boundary of the rule: a FAILED call is not flattened to 200 — it answers the
 /// status its own kind of failure carries (this service's client-error status for a
-/// modelled client error, with the shape named in the body's `__type`, and the
-/// scaffold's 501 for an operation nobody has written yet).
+/// modelled client error, with the shape named in the body's `__type`, whatever
+/// `@httpError` the model records for that shape).
 #[tokio::test]
 async fn a_refusal_keeps_its_own_status() {
     let transcribe = Transcribe::new();
@@ -274,10 +274,11 @@ async fn a_refusal_keeps_its_own_status() {
         .ok("create the vocabulary the rows below address");
 
     // One row per kind of refusal reachable here: a resource that does not exist, a
-    // resource the service is still processing, a boundary constraint violation, and
-    // the scaffold's own not-implemented. The client-error rows carry this service's
-    // own client-error status (`crate::scaffolded::wire_status`) with the error shape
-    // in the body's `__type`; none of them is 200.
+    // resource the service is still processing, a boundary constraint violation, and a
+    // name already taken — whose shape the model gives an `@httpError` of its own (409)
+    // that this RPC protocol does not put on the wire. The client-error rows carry this
+    // service's own client-error status (`crate::scaffolded::wire_status`) with the
+    // error shape in the body's `__type`; none of them is 200.
     let rows: Vec<(&str, &str, Value, u16, &str)> = vec![
         (
             "an unknown vocabulary",
@@ -308,11 +309,15 @@ async fn a_refusal_keeps_its_own_status() {
             "ValidationException",
         ),
         (
-            "an operation that is still a stub",
-            "UpdateLanguageModel",
-            json!({"ModelName": "never-created"}),
-            501,
-            "NotImplemented",
+            "a create of a vocabulary name that already exists",
+            "CreateVocabulary",
+            json!({
+                "VocabularyName": "refusal-vocab",
+                "LanguageCode": "en-US",
+                "Phrases": ["Aardvark"]
+            }),
+            400,
+            "ConflictException",
         ),
     ];
 

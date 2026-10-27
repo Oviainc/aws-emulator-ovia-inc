@@ -242,6 +242,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkDeveloperId
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
+        // The identity named is what this call unlinks the identifier FROM, and it is the
+        // FIRST of the two resources this request names to be resolved: an operation that
+        // requires an identity id decides its not-found refusal on that identity, so an
+        // identity this service does not hold is what is reported missing even when the
+        // pool named beside it is unknown too. The pool-scoped operations, which take no
+        // identity of their own to resolve, keep reporting the pool.
+        let identity_pool_id_of_identity = match store.identities.get(&input.identity_id) {
+            Some(identity) => identity.identity_pool_id.clone(),
+            None => {
+                return Err(
+                    UnlinkDeveloperIdentityErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "Identity '{}' not found.",
+                                input.identity_id
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
         // The mapping this call forgets belongs to a pool, so the pool has to be one this
         // service holds.
         let Some(pool) = store.identity_pools.get(&input.identity_pool_id) else {
@@ -279,21 +302,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkDeveloperId
         }
         let developer_provider = input.developer_provider_name.clone();
 
-        // The identity named is what this call unlinks the identifier FROM: it has to be
-        // one this service holds, and one of THIS pool's — an identity belongs to the pool
-        // that minted it and never moves, so a request reaching an identity of another pool
-        // is refused as one the caller may not reach here.
-        let Some(identity) = store.identities.get(&input.identity_id) else {
-            return Err(
-                UnlinkDeveloperIdentityErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!("Identity '{}' not found.", input.identity_id)),
-                    },
-                )
-                .into(),
-            );
-        };
-        if identity.identity_pool_id != input.identity_pool_id {
+        // The identity resolved above has to be one of THIS pool's — an identity belongs to
+        // the pool that minted it and never moves, so a request reaching an identity of
+        // another pool is refused as one the caller may not reach here.
+        if identity_pool_id_of_identity != input.identity_pool_id {
             return Err(
                 UnlinkDeveloperIdentityErrorModeled::NotAuthorizedException(
                     NotAuthorizedException {

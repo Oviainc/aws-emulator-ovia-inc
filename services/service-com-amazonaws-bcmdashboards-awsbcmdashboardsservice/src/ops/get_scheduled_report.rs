@@ -172,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         Ok(GetScheduledReportOutput {
-            scheduled_report: report.report(),
+            scheduled_report: state.scheduled_report_detail(report),
         })
     }
 }

@@ -76,7 +76,10 @@ pub(crate) fn association_body(domain_name_arn: &str, source: &str) -> Value {
 }
 
 /// `GetDomainNameAccessAssociations` with `query` appended when it is not empty.
-async fn list_associations(gateway: &Gateway, query: &str) -> Answer {
+///
+/// Shared with the `delete_domain_name_access_association` suite, which reads the
+/// collection back to show which records a delete left.
+pub(crate) async fn list_associations(gateway: &Gateway, query: &str) -> Answer {
     let uri = if query.is_empty() {
         "/domainnameaccessassociations".to_string()
     } else {
@@ -87,7 +90,10 @@ async fn list_associations(gateway: &Gateway, query: &str) -> Answer {
 
 /// `CreateDomainName` for a PRIVATE custom domain name, answering the ARN of the record it
 /// stored — the value an access association names its domain name by.
-async fn private_domain(gateway: &Gateway, domain_name: &str) -> String {
+///
+/// Shared with the `delete_domain_name_access_association` suite, which needs the same
+/// kind of domain name to create the associations it removes.
+pub(crate) async fn private_domain(gateway: &Gateway, domain_name: &str) -> String {
     let created = created_domain(
         gateway,
         domain_name,
@@ -102,7 +108,7 @@ async fn private_domain(gateway: &Gateway, domain_name: &str) -> String {
 }
 
 /// The `domainNameAccessAssociationArn` of every record on a page, in page order.
-fn listed_arns(body: &Value, case: &str) -> Vec<String> {
+pub(crate) fn listed_arns(body: &Value, case: &str) -> Vec<String> {
     page_items(body, case)
         .iter()
         .map(|item| string_member(item, "domainNameAccessAssociationArn", case))
