@@ -252,15 +252,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // value that is not an ARN at all names no role. The model types the
         // member as a plain `__string`, so the framework cannot refuse it at
         // the boundary.
-        if !crate::state::is_arn_for(
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "serviceExecutionRoleArn",
             &input.service_execution_role_arn,
             crate::state::IAM_ARN_SERVICE,
         ) {
             return Err(CreateConnectorErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::invalid_parameter_because(
-                    "serviceExecutionRoleArn",
-                    crate::state::INVALID_ARN,
-                )),
+                message: Some(message),
             })
             .into());
         }
@@ -297,6 +295,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         for plugin in &input.plugins {
             let reference = &plugin.custom_plugin;
+            // A value that is not a kafkaconnect ARN at all names no plugin,
+            // so it is incorrect input rather than a plugin that is absent:
+            // the modelled 400, blaming the member that carried it.
+            if let Some(message) = crate::state::arn_syntax_refusal(
+                "customPluginArn",
+                &reference.custom_plugin_arn,
+                crate::state::ARN_SERVICE,
+            ) {
+                return Err(CreateConnectorErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
             // A plugin lives in one region: a connector can only be backed by a
             // plugin of its own region, so a `customPluginArn` minted elsewhere
             // names no plugin this endpoint holds.
@@ -344,6 +357,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // create is refused rather than stored as a dangling reference the read
         // operations would then echo back.
         if let Some(reference) = &input.worker_configuration {
+            // A value that is not a kafkaconnect ARN at all names no
+            // configuration, so it is incorrect input rather than a
+            // configuration that is absent: the modelled 400, blaming the
+            // member that carried it.
+            if let Some(message) = crate::state::arn_syntax_refusal(
+                "workerConfigurationArn",
+                &reference.worker_configuration_arn,
+                crate::state::ARN_SERVICE,
+            ) {
+                return Err(CreateConnectorErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
             match state.worker_configuration_in(&region, &reference.worker_configuration_arn) {
                 Some(stored) if stored.state != crate::state::WORKER_CONFIGURATION_ACTIVE => {
                     // A configuration the service is deleting is on its way out
