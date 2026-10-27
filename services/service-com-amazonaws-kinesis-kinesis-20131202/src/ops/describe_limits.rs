@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLimits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLimits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLimits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the shard and on-demand stream QUOTAS this emulator authorizes for the account
+//! and region the request was signed for, beside the usage the store actually holds
+//! against them: the open shards of every stream the region holds, and how many of those
+//! streams carry the on-demand capacity mode. A reporting operation, so it writes nothing.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -87,10 +84,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `DescribeLimitsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#DescribeLimits")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#DescribeLimits",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models
+    // it ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer
+    // for a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum DescribeLimitsErrorModeled {
     LimitExceededException(LimitExceededException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -141,21 +146,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        _input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLimits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLimitsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLimits"))
+        // "Describes the shard limits and usage for the account": the shard and stream
+        // quotas AWS publishes are per account AND region, and a stream "is also scoped by
+        // Amazon Web Services Region" (`CreateStream`), so the usage reported here is the
+        // usage of the region the request's credential scope names — the same region the
+        // operations that open a shard count their ceilings in.
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeLimitsError::from(DescribeLimitsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        // A read reports what the store holds AT this instant and leaves it exactly as it
+        // was: a stream whose removal has already fallen due is held by nobody, so it
+        // counts towards neither figure without this call pruning anything.
+        let (open_shard_count, on_demand_stream_count) = {
+            let store = state.lock();
+            (
+                store.open_shards_held_in(now, &region),
+                store.on_demand_streams_held_in(now, &region),
+            )
+        };
+
+        Ok(DescribeLimitsOutput {
+            // "The maximum number of shards" — the ceiling this emulator authorizes for an
+            // account and region, which is the one every operation that opens a shard
+            // (`CreateStream`, `UpdateShardCount`, `SplitShard`, `MergeShards`) is refused
+            // past, so the quota reported here is the quota that is actually enforced.
+            shard_limit: i32::try_from(crate::state::MAX_SHARDS_PER_REGION).unwrap_or(i32::MAX),
+            // "The number of open shards": the region's usage against that quota.
+            open_shard_count,
+            // "Indicates the number of data streams with the on-demand capacity mode".
+            on_demand_stream_count: i32::try_from(on_demand_stream_count).unwrap_or(i32::MAX),
+            // "The maximum number of data streams with the on-demand capacity mode" — the
+            // ceiling a create and a mode change are refused past, as above.
+            on_demand_stream_count_limit: i32::try_from(
+                crate::state::MAX_ON_DEMAND_STREAMS_PER_REGION,
+            )
+            .unwrap_or(i32::MAX),
+            // The channel members are the only optional ones, and this emulator holds no
+            // channels at all: nothing creates one, so there is no count and no ceiling to
+            // report — a zero beside a limit would claim this service already serves that
+            // resource kind. Both stay absent until the channel operations exist.
+            channel_count: None,
+            channel_count_limit: None,
+        })
     }
 }
+

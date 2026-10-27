@@ -158,6 +158,17 @@ pub const MAX_SHARDS_PER_STREAM: u32 = 500;
 /// authorizes, at the order of AWS's own default per-region shard quota.
 pub const MAX_SHARDS_PER_REGION: u32 = 1_000;
 
+/// The most streams of the on-demand capacity mode one region of this emulator holds
+/// across every stream, which is the quota `DescribeLimits` reports as
+/// `OnDemandStreamCountLimit`.
+///
+/// `CreateStream` answers `LimitExceededException` for a request past "the default shard or
+/// on-demand throughput limits for an Amazon Web Services account" and names no number for
+/// them, so this is the on-demand stream count this emulator authorizes — its OWN ceiling,
+/// at the order of AWS's own default per-account and region on-demand stream quota, and
+/// refused past by every operation that gives a stream that capacity mode.
+pub const MAX_ON_DEMAND_STREAMS_PER_REGION: usize = 50;
+
 /// The most streams one region of this emulator holds. `CreateStream` is the only thing
 /// that adds one and the store lives for the life of the process, so the store needs a
 /// maximum entry count; the emulator's OWN ceiling, not a modelled limit.
@@ -1371,6 +1382,36 @@ impl ComAmazonawsKinesisKinesis20131202State {
             })
     }
 
+    /// How many of the shards `region`'s endpoint holds at `now` are OPEN, across every
+    /// stream it holds.
+    ///
+    /// A shard a re-tiling closed still carries the records written to it, so the store
+    /// holds it ([`Self::shards_held_in`]) while it provides no capacity any more — and it
+    /// is the OPEN ones that are the region's shard usage, which is what `DescribeLimits`
+    /// reports as `OpenShardCount` ("The number of open shards").
+    pub fn open_shards_held_in(&self, now: SystemTime, region: &str) -> i32 {
+        self.streams
+            .values()
+            .filter(|stream| stream.region == region && stream.is_held(now))
+            .fold(0i32, |open, stream| {
+                open.saturating_add(stream.open_shard_count())
+            })
+    }
+
+    /// How many streams of the on-demand capacity mode `region`'s endpoint holds at `now`,
+    /// which is what [`MAX_ON_DEMAND_STREAMS_PER_REGION`] bounds and what `DescribeLimits`
+    /// reports as `OnDemandStreamCount`.
+    pub fn on_demand_streams_held_in(&self, now: SystemTime, region: &str) -> usize {
+        self.streams
+            .values()
+            .filter(|stream| {
+                stream.region == region
+                    && stream.is_held(now)
+                    && stream.stream_mode == STREAM_MODE_ON_DEMAND
+            })
+            .count()
+    }
+
     /// How many streams this emulator holds at `now` across every region, which is what
     /// [`MAX_STREAMS_TOTAL`] bounds: the ceiling no request can partition.
     pub fn streams_held(&self, now: SystemTime) -> usize {
@@ -1523,6 +1564,21 @@ pub fn stream_on_demand_message(stream_name: &str) -> String {
     format!(
         "Request is invalid. Stream {stream_name} under account {} is in On-Demand mode.",
         ::engine::emulator_account_id()
+    )
+}
+
+/// How a request that would leave a region holding more streams of the on-demand capacity
+/// mode than it may ([`MAX_ON_DEMAND_STREAMS_PER_REGION`]) is refused. Built FROM the
+/// store, so the count the ceiling was taken against names it.
+///
+/// ONE sentence for the one rule: a stream takes that capacity mode at a create and at a
+/// mode change, so both refuse the ceiling identically rather than each wording it — the
+/// same shape as the per-region ceilings `CreateStream` is refused past.
+pub fn on_demand_stream_ceiling_exceeded_message(held: usize) -> String {
+    format!(
+        "this region holds {held} streams with the {STREAM_MODE_ON_DEMAND} capacity mode, \
+         and one more would exceed the {MAX_ON_DEMAND_STREAMS_PER_REGION} on-demand streams \
+         authorized for this account and region"
     )
 }
 
