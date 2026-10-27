@@ -166,14 +166,21 @@ impl Emulator {
 }
 
 /// One `GetContainerServiceMetricData` request body.
+///
+/// Each window bound is whatever JSON number names the instant it is: this
+/// protocol carries a modelled `timestamp` as seconds since the epoch, whole
+/// (`i64`) or fractional (`f64`), so a case passes the one its instant needs and
+/// the request shape still has one source here.
 fn request(
     service_name: &str,
     metric_name: &str,
     period: i64,
-    start_time: i64,
-    end_time: i64,
+    start_time: impl Into<Value>,
+    end_time: impl Into<Value>,
     statistics: &[&str],
 ) -> Value {
+    let start_time = start_time.into();
+    let end_time = end_time.into();
     json!({
         "serviceName": service_name,
         "metricName": metric_name,
@@ -546,6 +553,210 @@ async fn a_request_that_describes_no_series_is_refused_as_invalid_input() {
         "case the container service record after every refusal: expected {before:?}, \
          got {after:?}"
     );
+}
+
+/// A window this operation refuses, and the text the refusal has to name each of
+/// its bounds by.
+///
+/// Every bound here is a dyadic fraction of a second, so the JSON number a case
+/// sends is the instant it names exactly and the rendering is a fixed string
+/// rather than a tolerance.
+struct RefusedWindow {
+    case: &'static str,
+    start: f64,
+    end: f64,
+    start_text: &'static str,
+    end_text: &'static str,
+    metric_name: &'static str,
+    period: i64,
+    statistics: &'static [&'static str],
+}
+
+/// The windows the refusal's wording is pinned over. The rows differ along what
+/// the rule generalises over: the sign of each bound, its magnitude, its
+/// sub-second part, and how far apart the two instants are — whole seconds, a
+/// half, a quarter and an eighth of a second, across the epoch, and not at all.
+const REFUSED_WINDOWS: &[RefusedWindow] = &[
+    RefusedWindow {
+        case: "inverted by whole seconds",
+        start: 1_700_000_000.0,
+        end: 1_699_999_000.0,
+        start_text: "1700000000",
+        end_text: "1699999000",
+        metric_name: "CPUUtilization",
+        period: 300,
+        statistics: &["Average"],
+    },
+    RefusedWindow {
+        case: "inverted inside one second",
+        start: 1_700_000_000.75,
+        end: 1_700_000_000.25,
+        start_text: "1700000000.75",
+        end_text: "1700000000.25",
+        metric_name: "MemoryUtilization",
+        period: MIN_PERIOD,
+        statistics: &["Maximum", "Minimum"],
+    },
+    RefusedWindow {
+        case: "inverted by an eighth of a second, ending on a whole one",
+        start: 1_700_000_000.125,
+        end: 1_700_000_000.0,
+        start_text: "1700000000.125",
+        end_text: "1700000000",
+        metric_name: "CPUUtilization",
+        period: MAX_PERIOD,
+        statistics: &["Sum", "SampleCount"],
+    },
+    RefusedWindow {
+        case: "inverted across the epoch",
+        start: 0.5,
+        end: -0.5,
+        start_text: "0.5",
+        end_text: "-0.5",
+        metric_name: "MemoryUtilization",
+        period: 300,
+        statistics: &["Average"],
+    },
+    RefusedWindow {
+        case: "inverted before the epoch, inside one second",
+        start: -0.25,
+        end: -0.75,
+        start_text: "-0.25",
+        end_text: "-0.75",
+        metric_name: "CPUUtilization",
+        period: 3_600,
+        statistics: &["Minimum"],
+    },
+    RefusedWindow {
+        case: "inverted before the epoch, by whole seconds",
+        start: -100.0,
+        end: -200.0,
+        start_text: "-100",
+        end_text: "-200",
+        metric_name: "MemoryUtilization",
+        period: MAX_PERIOD,
+        statistics: &["Average", "Maximum"],
+    },
+    RefusedWindow {
+        case: "the same whole second twice",
+        start: 1_700_000_000.0,
+        end: 1_700_000_000.0,
+        start_text: "1700000000",
+        end_text: "1700000000",
+        metric_name: "CPUUtilization",
+        period: 300,
+        statistics: &["Average"],
+    },
+    RefusedWindow {
+        case: "the same sub-second instant twice",
+        start: 1_700_000_000.5,
+        end: 1_700_000_000.5,
+        start_text: "1700000000.5",
+        end_text: "1700000000.5",
+        metric_name: "MemoryUtilization",
+        period: MIN_PERIOD,
+        statistics: &["Sum"],
+    },
+];
+
+/// RULE: the refusal of an inverted window names each bound as the INSTANT that
+/// member carried — its sub-second part and its sign included — so a window
+/// inverted inside one second, or one lying before the epoch, states the reason
+/// for its own refusal rather than two equal whole seconds. The sentence is the
+/// one this service answers that pair with wherever it takes one, which the
+/// `inverted_time_window` suite pins across every operation that takes it.
+#[tokio::test]
+async fn an_inverted_window_refusal_names_each_bound_as_the_instant_it_carried() {
+    let emulator = Emulator::new();
+    let region = "us-east-1";
+    let service = "sub-second-service";
+    emulator.create_service(region, service, "nano", 1).await;
+
+    for window in REFUSED_WINDOWS {
+        let case = window.case;
+        let (status, refused) = emulator
+            .call(
+                region,
+                "GetContainerServiceMetricData",
+                request(
+                    service,
+                    window.metric_name,
+                    window.period,
+                    window.start,
+                    window.end,
+                    window.statistics,
+                ),
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case a window {case}: expected HTTP 400, got {status} {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "InvalidInputException",
+            "case a window {case}: expected the wire error InvalidInputException, got {refused:?}"
+        );
+        let want = crate::inverted_time_window::inverted_window_message(
+            window.start_text,
+            window.end_text,
+        );
+        assert_eq!(
+            refused["message"].as_str(),
+            Some(want.as_str()),
+            "case a window {case}: expected the refusal to name both instants, {want:?}, \
+             got {refused:?}"
+        );
+    }
+}
+
+/// RULE: the ordering is what the refusal keys on, so a window whose end follows
+/// its start by a fraction of a second — or that lies wholly before the epoch —
+/// is served like any other, with the stored (empty) series.
+#[tokio::test]
+async fn a_forward_window_inside_one_second_is_served() {
+    let emulator = Emulator::new();
+    let region = "us-west-2";
+    let service = "forward-window-service";
+    emulator.create_service(region, service, "nano", 1).await;
+
+    // The mirror of the refused rows above: the same instants in the order that
+    // makes them a window, differing along the sub-second part, the sign and the
+    // distance between the bounds.
+    let windows: &[(&str, f64, f64)] = &[
+        ("half a second", 1_700_000_000.25, 1_700_000_000.75),
+        ("an eighth of a second", 1_700_000_000.0, 1_700_000_000.125),
+        ("across the epoch", -0.5, 0.5),
+        ("wholly before the epoch", -200.0, -100.0),
+    ];
+
+    for (case, start, end) in windows {
+        let body = emulator
+            .ok(
+                region,
+                "GetContainerServiceMetricData",
+                request(
+                    service,
+                    "CPUUtilization",
+                    MIN_PERIOD,
+                    *start,
+                    *end,
+                    &["Average"],
+                ),
+                200,
+            )
+            .await;
+        assert_eq!(
+            body["metricName"].as_str(),
+            Some("CPUUtilization"),
+            "case a window of {case}: expected the requested metric name back, got {body:?}"
+        );
+        let data = metric_data(case, &body);
+        assert!(
+            data.is_empty(),
+            "case a window of {case}: expected no datapoints, got {data:?}"
+        );
+    }
 }
 
 /// RULE: a name no container service of the request's region answers to — never
