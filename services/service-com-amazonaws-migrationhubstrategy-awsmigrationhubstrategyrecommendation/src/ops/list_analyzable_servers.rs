@@ -272,11 +272,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let page = page_of(input.max_results, input.next_token, order)?;
 
-        // A read: the store is only looked at here, so running ListAnalyzableServers
-        // changes nothing a later caller sees. The inventory is the one of the Region
-        // this request was signed for.
+        // A read: the only write it makes is materialising what the clock already owed
+        // this portfolio (`RegionState::settle_all`) — owed at this same instant even if
+        // nobody had called — so the servers an import whose completion is already due
+        // fetched are in the inventory this list reports. The inventory is the one of the
+        // Region this request was signed for: a Region nothing was imported in reads as
+        // empty and gets no partition minted for it.
         let region = crate::state::request_region(ctx.parts());
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        if let Some(portfolio) = store.region_mut(&region) {
+            portfolio.settle_all(now);
+        }
         // The servers a collector fetched, each beside the inventory id that orders it: a
         // server the service holds no discovery data for is not an analyzable server and
         // is left out rather than reported as an empty summary.
