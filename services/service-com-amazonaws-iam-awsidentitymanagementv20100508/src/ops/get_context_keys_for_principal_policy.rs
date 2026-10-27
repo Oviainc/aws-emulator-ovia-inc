@@ -197,20 +197,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // context keys that are referenced" — each entry has to BE an IAM JSON policy
         // document, which `policyDocumentType`'s own pattern does not ask for, so one
         // that is not is an "invalid … value … supplied for an input parameter". The
-        // rule is the shared one every operation taking a policy document applies.
+        // rule, and the fixed sentence each defect is refused with, are the shared ones
+        // every operation taking a policy document applies.
         let supplied = input.policy_input_list.unwrap_or_default();
-        if let Some(position) = supplied
+        if let Some(defect) = supplied
             .iter()
-            .position(|document| !crate::state::is_policy_document(document))
+            .find_map(|document| crate::state::policy_document_defect(document))
         {
             return Err(
                 GetContextKeysForPrincipalPolicyErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some(format!(
-                            "Syntax errors in policy: PolicyInputList member {} must be a \
-                             JSON object carrying a Statement element",
-                            position + 1
-                        )),
+                        message: Some(defect.message().to_string()),
                     },
                 )
                 .into(),
