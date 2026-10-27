@@ -21,7 +21,8 @@
 //! The rows span what the rule generalises over rather than one recorded call: how many
 //! writes the item has taken (none, one, several), which billing period each takes
 //! effect in (the generation's own, a later one), whether a write names a range at all
-//! and whether that range has an end, how a month is spelled (`2019-1` / `2019-01`),
+//! and whether that range has an end, how a month is spelled (one-digit / zero-padded
+//! month),
 //! which attribute a write changes, where a filter's span falls relative to a
 //! generation's (before, at the start, inside, across, after, open at either end), the
 //! page size (each published bound of `MaxCustomLineItemResults` and one past each), and
@@ -246,6 +247,38 @@ fn period_key(value: &str) -> Option<i64> {
     Some(year.parse::<i64>().ok()? * 12 + month.parse::<i64>().ok()?)
 }
 
+/// The `BillingPeriod` `months` after the CURRENT billing period (negative for
+/// earlier), in the zero-padded spelling the modelled `BillingPeriod` pattern
+/// `^\d{4}-(0?[1-9]|1[012])$` allows.
+///
+/// A create may put an item only into the current or the previous billing period, which
+/// the wall clock decides, so every period here is named relative to the service's own
+/// current billing period rather than by a fixed month: the fixtures create in the
+/// PREVIOUS one ([`period(-1)`](period)) and the writes that follow take effect from
+/// there on.
+fn period(months: i64) -> String {
+    let current =
+        service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
+    let (year, month) = current
+        .split_once('-')
+        .expect("the current billing period is spelled YYYY-MM");
+    let total = year.parse::<i64>().expect("a four-digit year") * 12
+        + month.parse::<i64>().expect("a month")
+        - 1
+        + months;
+    format!("{:04}-{:02}", total.div_euclid(12), total.rem_euclid(12) + 1)
+}
+
+/// The same billing period with its month spelled without a leading zero — the other
+/// spelling the modelled `BillingPeriod` pattern allows. A month from October on has
+/// only the one spelling, so for those this is the value it was given.
+fn one_digit_month(billing_period: &str) -> String {
+    let (year, month) = billing_period
+        .split_once('-')
+        .expect("a billing period is spelled YYYY-MM");
+    format!("{year}-{}", month.trim_start_matches('0'))
+}
+
 /// Do two values name the same billing period, whatever their spelling? `None` on
 /// either side names no period, so only two absent bounds agree.
 fn same_period(actual: Option<&str>, expected: Option<&str>) -> bool {
@@ -350,7 +383,7 @@ fn assert_refused(
 /// One version's billing-period span as a row expects it:
 /// `(StartBillingPeriod, EndBillingPeriod)`, the end absent when the generation is
 /// open-ended.
-type Span = (&'static str, Option<&'static str>);
+type Span = (String, Option<String>);
 
 /// One row of the history table: the case, the range the create names, the update
 /// bodies to apply in order, and the span of every version expected afterwards, oldest
@@ -389,78 +422,81 @@ async fn the_history_is_one_version_per_billing_period_the_item_was_in_effect_in
     let rows: Vec<HistoryRow> = vec![
         (
             "a create and nothing else",
-            period_range("2019-01", None),
+            period_range(&period(-1), None),
             vec![],
-            vec![("2019-01", None)],
+            vec![(period(-1), None)],
         ),
         (
             "one update in a later billing period",
-            period_range("2019-01", None),
-            vec![json!({ "BillingPeriodRange": period_range("2019-03", None) })],
-            vec![("2019-01", Some("2019-03")), ("2019-03", None)],
+            period_range(&period(-1), None),
+            vec![json!({ "BillingPeriodRange": period_range(&period(1), None) })],
+            vec![(period(-1), Some(period(1))), (period(1), None)],
         ),
         (
             "two updates in later billing periods",
-            period_range("2019-01", None),
+            period_range(&period(-1), None),
             vec![
-                json!({ "BillingPeriodRange": period_range("2019-02", None) }),
-                json!({ "BillingPeriodRange": period_range("2019-05", None) }),
+                json!({ "BillingPeriodRange": period_range(&period(0), None) }),
+                json!({ "BillingPeriodRange": period_range(&period(3), None) }),
             ],
             vec![
-                ("2019-01", Some("2019-02")),
-                ("2019-02", Some("2019-05")),
-                ("2019-05", None),
+                (period(-1), Some(period(0))),
+                (period(0), Some(period(3))),
+                (period(3), None),
             ],
         ),
         (
             "four writes, one per consecutive billing period",
-            period_range("2019-01", None),
+            period_range(&period(-1), None),
             vec![
-                json!({ "BillingPeriodRange": period_range("2019-02", None) }),
-                json!({ "BillingPeriodRange": period_range("2019-03", None) }),
-                json!({ "BillingPeriodRange": period_range("2019-04", None) }),
+                json!({ "BillingPeriodRange": period_range(&period(0), None) }),
+                json!({ "BillingPeriodRange": period_range(&period(1), None) }),
+                json!({ "BillingPeriodRange": period_range(&period(2), None) }),
             ],
             vec![
-                ("2019-01", Some("2019-02")),
-                ("2019-02", Some("2019-03")),
-                ("2019-03", Some("2019-04")),
-                ("2019-04", None),
+                (period(-1), Some(period(0))),
+                (period(0), Some(period(1))),
+                (period(1), Some(period(2))),
+                (period(2), None),
             ],
         ),
         (
             "an update in the generation's own billing period replaces it",
-            period_range("2019-01", None),
+            period_range(&period(-1), None),
             vec![json!({
                 "Name": "renamed",
-                "BillingPeriodRange": period_range("2019-01", None),
+                "BillingPeriodRange": period_range(&period(-1), None),
             })],
-            vec![("2019-01", None)],
+            vec![(period(-1), None)],
         ),
         (
             "an update naming no range at all stays in the generation",
-            period_range("2019-01", None),
+            period_range(&period(-1), None),
             vec![json!({ "Name": "renamed" })],
-            vec![("2019-01", None)],
+            vec![(period(-1), None)],
         ),
         (
             "a successor closes a generation before the end its own write named",
-            period_range("2019-01", Some("2019-06")),
-            vec![json!({ "BillingPeriodRange": period_range("2019-03", None) })],
-            vec![("2019-01", Some("2019-03")), ("2019-03", None)],
+            period_range(&period(-1), Some(&period(4))),
+            vec![json!({ "BillingPeriodRange": period_range(&period(1), None) })],
+            vec![(period(-1), Some(period(1))), (period(1), None)],
         ),
         (
             "the newest generation ends where its own write said",
-            period_range("2019-01", None),
+            period_range(&period(-1), None),
             vec![json!({
-                "BillingPeriodRange": period_range("2019-01", Some("2019-04")),
+                "BillingPeriodRange": period_range(&period(-1), Some(&period(2))),
             })],
-            vec![("2019-01", Some("2019-04"))],
+            vec![(period(-1), Some(period(2)))],
         ),
         (
             "a month spelled without its leading zero names the same period",
-            period_range("2019-1", None),
-            vec![json!({ "BillingPeriodRange": period_range("2019-03", None) })],
-            vec![("2019-01", Some("2019-3")), ("2019-3", None)],
+            period_range(&one_digit_month(&period(-1)), None),
+            vec![json!({ "BillingPeriodRange": period_range(&period(1), None) })],
+            vec![
+                (period(-1), Some(one_digit_month(&period(1)))),
+                (one_digit_month(&period(1)), None),
+            ],
         ),
     ];
 
@@ -482,12 +518,12 @@ async fn the_history_is_one_version_per_billing_period_the_item_was_in_effect_in
             actual.iter().zip(expected.iter()).enumerate()
         {
             assert!(
-                same_period(start.as_deref(), Some(expected_start)),
+                same_period(start.as_deref(), Some(expected_start.as_str())),
                 "case {case:?}: expected version {index} to start in {expected_start:?}, got \
                  {start:?}"
             );
             assert!(
-                same_period(end.as_deref(), *expected_end),
+                same_period(end.as_deref(), expected_end.as_deref()),
                 "case {case:?}: expected version {index} to end at {expected_end:?}, got {end:?}"
             );
         }
@@ -574,11 +610,11 @@ async fn each_version_reports_the_values_that_generation_held() {
 
     for (case, change, path, frozen_value, newest_value) in rows {
         let (emulator, group, item) =
-            fixture(json!({ "BillingPeriodRange": period_range("2019-01", None) })).await;
+            fixture(json!({ "BillingPeriodRange": period_range(&period(-1), None) })).await;
         let mut update = object(&change);
         update.insert(
             "BillingPeriodRange".to_string(),
-            period_range("2019-03", None),
+            period_range(&period(1), None),
         );
         emulator
             .update_ok(case, &item, Value::Object(update))
@@ -634,7 +670,7 @@ async fn each_version_reports_the_values_that_generation_held() {
         // ROUND TRIP: the newest version is the item a read of the item itself reports
         // for the billing period that generation applies in.
         let stored = emulator
-            .item(case, &item, "2019-03")
+            .item(case, &item, &period(1))
             .await
             .unwrap_or_else(|| panic!("case {case:?}: expected {item} to be readable"));
         for member in [
@@ -673,7 +709,7 @@ async fn a_frozen_version_keeps_the_association_size_it_had() {
             "original",
             json!({
                 "ChargeDetails": { "Type": "FEE", "Percentage": { "PercentageValue": 10.0 } },
-                "BillingPeriodRange": period_range("2019-01", None),
+                "BillingPeriodRange": period_range(&period(-1), None),
             }),
         )
         .await;
@@ -691,7 +727,7 @@ async fn a_frozen_version_keeps_the_association_size_it_had() {
         .update_ok(
             case,
             &item,
-            json!({ "BillingPeriodRange": period_range("2019-03", None) }),
+            json!({ "BillingPeriodRange": period_range(&period(1), None) }),
         )
         .await;
     emulator
@@ -722,74 +758,77 @@ async fn a_frozen_version_keeps_the_association_size_it_had() {
 /// anywhere inside it — both of its bounds inclusive, an absent bound open.
 #[tokio::test]
 async fn the_billing_period_filter_selects_the_versions_in_effect_in_that_span() {
-    // The fixture's generations: [2019-01, 2019-03), [2019-03, 2019-06), [2019-06, ..).
+    // The fixture's generations: [period(-1), period(1)), [period(1), period(4)),
+    // [period(4), ..).
     // (case, the filter, the StartBillingPeriod of every expected version)
-    let rows: Vec<(&str, Value, Vec<&str>)> = vec![
-        ("no filter at all", json!({}), vec!["2019-01", "2019-03", "2019-06"]),
+    let generations: Vec<String> = vec![period(-1), period(1), period(4)];
+    let rows: Vec<(&str, Value, Vec<String>)> = vec![
+        ("no filter at all", json!({}), generations.clone()),
         (
             "an empty filter",
             json!({ "Filters": {} }),
-            vec!["2019-01", "2019-03", "2019-06"],
+            generations.clone(),
         ),
         (
             "one period, the first generation's own start",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": "2019-01", "EndBillingPeriod": "2019-01" } } }),
-            vec!["2019-01"],
+                "StartBillingPeriod": period(-1), "EndBillingPeriod": period(-1) } } }),
+            vec![period(-1)],
         ),
         (
             "one period inside the middle generation",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": "2019-04", "EndBillingPeriod": "2019-04" } } }),
-            vec!["2019-03"],
+                "StartBillingPeriod": period(2), "EndBillingPeriod": period(2) } } }),
+            vec![period(1)],
         ),
         (
             "a span across two generations",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": "2019-02", "EndBillingPeriod": "2019-03" } } }),
-            vec!["2019-01", "2019-03"],
+                "StartBillingPeriod": period(0), "EndBillingPeriod": period(1) } } }),
+            vec![period(-1), period(1)],
         ),
         (
             "a span open at its end",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": "2019-03" } } }),
-            vec!["2019-03", "2019-06"],
+                "StartBillingPeriod": period(1) } } }),
+            vec![period(1), period(4)],
         ),
         (
             "a span open at its start",
             json!({ "Filters": { "BillingPeriodRange": {
-                "EndBillingPeriod": "2019-02" } } }),
-            vec!["2019-01"],
+                "EndBillingPeriod": period(0) } } }),
+            vec![period(-1)],
         ),
         (
             "a span entirely after the last generation began",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": "2019-09", "EndBillingPeriod": "2019-11" } } }),
-            vec!["2019-06"],
+                "StartBillingPeriod": period(7), "EndBillingPeriod": period(9) } } }),
+            vec![period(4)],
         ),
         (
             "a span entirely before the item existed",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": "2018-01", "EndBillingPeriod": "2018-12" } } }),
+                "StartBillingPeriod": period(-13), "EndBillingPeriod": period(-2) } } }),
             vec![],
         ),
         (
             "months spelled without their leading zeroes",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": "2019-6", "EndBillingPeriod": "2019-6" } } }),
-            vec!["2019-06"],
+                "StartBillingPeriod": one_digit_month(&period(4)),
+                "EndBillingPeriod": one_digit_month(&period(4)) } } }),
+            vec![period(4)],
         ),
     ];
 
     for (case, request, expected) in rows {
         let (emulator, _, item) =
-            fixture(json!({ "BillingPeriodRange": period_range("2019-01", None) })).await;
-        for start in ["2019-03", "2019-06"] {
+            fixture(json!({ "BillingPeriodRange": period_range(&period(-1), None) })).await;
+        for start in [period(1), period(4)] {
             emulator
                 .update_ok(
                     case,
                     &item,
-                    json!({ "BillingPeriodRange": period_range(start, None) }),
+                    json!({ "BillingPeriodRange": period_range(&start, None) }),
                 )
                 .await;
         }
@@ -804,7 +843,7 @@ async fn the_billing_period_filter_selects_the_versions_in_effect_in_that_span()
         );
         for (index, ((start, _), expected_start)) in starts.iter().zip(expected.iter()).enumerate() {
             assert!(
-                same_period(start.as_deref(), Some(expected_start)),
+                same_period(start.as_deref(), Some(expected_start.as_str())),
                 "case {case:?}: expected the selected version {index} to start in \
                  {expected_start:?}, got {start:?}"
             );
@@ -818,13 +857,13 @@ async fn the_billing_period_filter_selects_the_versions_in_effect_in_that_span()
 #[tokio::test]
 async fn paging_walks_every_version_once_in_order() {
     let (emulator, _, item) =
-        fixture(json!({ "BillingPeriodRange": period_range("2019-01", None) })).await;
-    for start in ["2019-02", "2019-03", "2019-04"] {
+        fixture(json!({ "BillingPeriodRange": period_range(&period(-1), None) })).await;
+    for start in [period(0), period(1), period(2)] {
         emulator
             .update_ok(
                 "the paged fixture",
                 &item,
-                json!({ "BillingPeriodRange": period_range(start, None) }),
+                json!({ "BillingPeriodRange": period_range(&start, None) }),
             )
             .await;
     }
@@ -892,12 +931,12 @@ async fn paging_walks_every_version_once_in_order() {
 async fn either_spelling_of_the_arn_reports_the_same_history_and_a_read_changes_nothing() {
     let case = "both spellings of the Arn";
     let (emulator, _, item) =
-        fixture(json!({ "BillingPeriodRange": period_range("2019-01", None) })).await;
+        fixture(json!({ "BillingPeriodRange": period_range(&period(-1), None) })).await;
     emulator
         .update_ok(
             case,
             &item,
-            json!({ "BillingPeriodRange": period_range("2019-03", None) }),
+            json!({ "BillingPeriodRange": period_range(&period(1), None) }),
         )
         .await;
 
@@ -915,7 +954,7 @@ async fn either_spelling_of_the_arn_reports_the_same_history_and_a_read_changes_
         again, by_arn,
         "case {case:?}: expected a repeated read to report the same history, got {again:?}"
     );
-    let stored = emulator.item(case, &item, "2019-03").await;
+    let stored = emulator.item(case, &item, &period(1)).await;
     assert!(
         stored.is_some(),
         "case {case:?}: expected the item itself to be unchanged by the reads"
@@ -928,7 +967,7 @@ async fn either_spelling_of_the_arn_reports_the_same_history_and_a_read_changes_
 #[tokio::test]
 async fn a_request_the_store_or_the_model_cannot_serve_is_refused() {
     let (emulator, _, item) =
-        fixture(json!({ "BillingPeriodRange": period_range("2019-01", None) })).await;
+        fixture(json!({ "BillingPeriodRange": period_range(&period(-1), None) })).await;
     let absent_arn = format!(
         "arn:aws:billingconductor::{}:customlineitem/BBBBBBBBBB",
         ::engine::emulator_account_id()
@@ -955,7 +994,7 @@ async fn a_request_the_store_or_the_model_cannot_serve_is_refused() {
             "a filter range whose end precedes its start",
             item.clone(),
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": "2019-05", "EndBillingPeriod": "2019-03" } } }),
+                "StartBillingPeriod": period(3), "EndBillingPeriod": period(1) } } }),
             Some("ILLEGAL_BILLING_PERIOD_RANGE"),
             Some("Filters.BillingPeriodRange.EndBillingPeriod"),
         ),
