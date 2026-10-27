@@ -5,9 +5,23 @@
 //! This API has two resources. An **Outpost** carries the S3 on Outposts
 //! capacity and is reported by `ListOutpostsWithS3`; an **endpoint** is what a
 //! VPC reaches that capacity through, minted by `CreateEndpoint`, reported by
-//! `ListEndpoints` / `ListSharedEndpoints` and removed by `DeleteEndpoint`.
+//! `ListEndpoints` / `ListSharedEndpoints` and torn down by `DeleteEndpoint`.
 //! [`OutpostRecord`] and [`EndpointRecord`] below are the one copy of each that
 //! every handler of this service reads and writes.
+//!
+//! ## An endpoint an accepted call is still working on
+//!
+//! Neither `CreateEndpoint` nor `DeleteEndpoint` is finished when it answers —
+//! each documents that "it can take up to 5 minutes for this action to finish" —
+//! so an accepted call leaves the endpoint in the transient `EndpointStatus`
+//! value for that action (`Pending`, `Deleting`) together with the
+//! [`PendingTransition`] the clock owes it: the status the create ends in, or the
+//! removal the teardown ends in. Until that instant the record is a record like
+//! any other: the listings report it with its transient status, it still holds
+//! the subnet, security group and CIDR it committed, and a second delete of it
+//! resolves. [`ComAmazonawsS3outpostsS3outpostsState::settle_all`] is what
+//! materialises everything already owed, so nothing sleeps and nothing depends
+//! on being called.
 //!
 //! ## Why the store starts with NO Outposts
 //!
@@ -70,6 +84,10 @@ pub const ENDPOINT_STATUS_PENDING: &str = "Pending";
 /// `EndpointStatus`'s ready value: "Available".
 pub const ENDPOINT_STATUS_AVAILABLE: &str = "Available";
 
+/// `EndpointStatus`'s teardown value: "Deleting" — what an endpoint whose
+/// deletion has been accepted reports while the teardown is still running.
+pub const ENDPOINT_STATUS_DELETING: &str = "Deleting";
+
 /// `EndpointAccessType`'s "Private", which `CreateEndpointRequest$AccessType`
 /// documents as "the default access type value".
 pub const ACCESS_TYPE_PRIVATE: &str = "Private";
@@ -84,14 +102,16 @@ pub const ACCESS_TYPE_CUSTOMER_OWNED_IP: &str = "CustomerOwnedIp";
 /// `ListOutpostsWithS3Request$MaxResults` documents "The limit is 100".
 pub const PAGE_LIMIT: i32 = 100;
 
-/// How long a new endpoint stays `Pending` before the clock owes it
-/// `Available`.
+/// How long an endpoint stays in the transient status an accepted call put it
+/// in before the clock owes it the next one: `Pending` before `Available` after
+/// a create, `Deleting` before the record is gone after a delete.
 ///
-/// `CreateEndpoint` documents that "it can take up to 5 minutes for this action
-/// to finish"; the emulator chooses a span instead, and it is deliberately NOT
-/// zero, so a caller listing endpoints straight after the create still sees the
-/// transient status. The due instant is stored on the record and materialised by
-/// whichever later call reports the endpoint — nothing sleeps.
+/// `CreateEndpoint` and `DeleteEndpoint` each document that "it can take up to 5
+/// minutes for this action to finish"; the emulator chooses a span instead, and
+/// it is deliberately NOT zero, so a caller listing endpoints straight after
+/// either call still sees the transient status. The due instant is stored on the
+/// record and materialised by whichever later call reports the endpoint —
+/// nothing sleeps.
 pub const ENDPOINT_TRANSITION: Duration = Duration::from_millis(500);
 
 /// The Region a request is served in when it carries no SigV4 credential scope to
@@ -154,12 +174,52 @@ pub fn parse_provisioned_outposts(setting: &str) -> Vec<OutpostRecord> {
 /// commitments — and so the largest number of endpoints the store holds at once.
 const ENDPOINT_CIDR_BLOCK_COUNT: u32 = 1024;
 
-/// A status change the clock owes an endpoint: the instant it falls due, and the
-/// status the endpoint carries from then on.
+/// What the clock owes an endpoint once the due instant has passed.
+///
+/// Both of this service's asynchronous actions are the same shape — the call is
+/// accepted, the endpoint reports a transient status, and the work completes
+/// later — but they differ in what completion IS: a create ends with the
+/// endpoint in another status, a delete ends with no record at all.
+#[derive(Debug, Clone)]
+pub enum PendingEffect {
+    /// The endpoint carries this `EndpointStatus` value from the due instant on.
+    Status(String),
+    /// The endpoint is gone from the due instant on: the teardown an accepted
+    /// delete started has finished, so the record and everything it held are
+    /// released.
+    Removal,
+}
+
+/// A change the clock owes an endpoint: the instant it falls due, and what
+/// becomes of the endpoint from then on.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
     pub due: SystemTime,
-    pub status: String,
+    pub effect: PendingEffect,
+}
+
+impl PendingTransition {
+    /// The status change `due` owes, as an accepted create owes `Available`.
+    pub fn to_status(due: SystemTime, status: &str) -> Self {
+        Self {
+            due,
+            effect: PendingEffect::Status(status.to_string()),
+        }
+    }
+
+    /// The removal `due` owes, as an accepted delete owes the end of the
+    /// endpoint's teardown.
+    pub fn to_removal(due: SystemTime) -> Self {
+        Self {
+            due,
+            effect: PendingEffect::Removal,
+        }
+    }
+
+    /// Whether `now` has reached the instant this change falls due.
+    pub fn is_due(&self, now: SystemTime) -> bool {
+        now >= self.due
+    }
 }
 
 /// One Outpost with S3 on Outposts capacity, as this emulator persists it.
@@ -299,16 +359,44 @@ impl EndpointRecord {
     /// past its due instant.
     ///
     /// Only `status` moves: `CreationTime` is "the time the endpoint was
-    /// created" and never changes.
+    /// created" and never changes. A removal the clock owes is NOT materialised
+    /// here — the record does not own whether it is stored, so
+    /// [`ComAmazonawsS3outpostsS3outpostsState::settle_all`] completes that one,
+    /// off [`Self::removal_due`].
     pub fn settle(&mut self, now: SystemTime) {
         let Some(pending) = self.pending.as_ref() else {
             return;
         };
-        if now < pending.due {
+        if !pending.is_due(now) {
             return;
         }
-        self.status = pending.status.clone();
-        self.pending = None;
+        if let PendingEffect::Status(status) = &pending.effect {
+            self.status = status.clone();
+            self.pending = None;
+        }
+    }
+
+    /// True when the clock owes this endpoint's REMOVAL by `now`: an accepted
+    /// delete started its teardown and the span that teardown takes has passed.
+    pub fn removal_due(&self, now: SystemTime) -> bool {
+        self.pending.as_ref().is_some_and(|pending| {
+            matches!(pending.effect, PendingEffect::Removal) && pending.is_due(now)
+        })
+    }
+
+    /// Accept this endpoint's deletion: it reports `Deleting` from `now` on, and
+    /// the clock owes its removal once [`ENDPOINT_TRANSITION`] has passed.
+    ///
+    /// Whatever the clock owed before is replaced — a create still `Pending`
+    /// when the delete arrives is torn down rather than completed — but a
+    /// teardown already running is left exactly as it was: a repeated delete
+    /// does not push the completion of the first one further out.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        if self.status == ENDPOINT_STATUS_DELETING {
+            return;
+        }
+        self.status = ENDPOINT_STATUS_DELETING.to_string();
+        self.pending = Some(PendingTransition::to_removal(now + ENDPOINT_TRANSITION));
     }
 
     /// The `Endpoint` structure every list operation reports.
@@ -339,7 +427,8 @@ impl EndpointRecord {
             // delete endpoint operation", so it belongs to an endpoint in
             // `Create_Failed` or `Delete_Failed`. No path in this emulator
             // reaches either status — a create either stores the endpoint or is
-            // refused up front — so there is never a failure reason to report.
+            // refused up front, and a teardown this emulator accepted always
+            // completes — so there is never a failure reason to report.
             failed_reason: None,
         }
     }
@@ -533,6 +622,10 @@ impl ComAmazonawsS3outpostsS3outpostsState {
     /// decides who may REPORT or REMOVE it (`ListEndpoints`, `DeleteEndpoint`),
     /// never whether the resources it already holds are free for another
     /// endpoint.
+    ///
+    /// An endpoint whose teardown is still running holds them too: what it
+    /// committed is released when that teardown completes, not when the delete
+    /// was accepted, so a create inside that window conflicts with it.
     pub fn endpoint_committing(
         &self,
         outpost_id: &str,
@@ -546,9 +639,24 @@ impl ComAmazonawsS3outpostsS3outpostsState {
         })
     }
 
-    /// Materialise every status change the clock owes, for a caller that is
-    /// about to report on all of them.
+    /// Materialise every change the clock owes, for a caller that is about to
+    /// report on or resolve against all of them: an endpoint whose teardown has
+    /// finished is removed (releasing what it held), and every other owed status
+    /// change is applied.
+    ///
+    /// Nothing here depends on being called: each change was already owed at
+    /// `now` whether or not anybody asked, so two callers reading at the same
+    /// instant see the same endpoints.
     pub fn settle_all(&mut self, now: SystemTime) {
+        let completed: Vec<(String, String)> = self
+            .endpoints
+            .iter()
+            .filter(|(_, endpoint)| endpoint.removal_due(now))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &completed {
+            self.remove_endpoint(key);
+        }
         for endpoint in self.endpoints.values_mut() {
             endpoint.settle(now);
         }
@@ -558,6 +666,11 @@ impl ComAmazonawsS3outpostsS3outpostsState {
     /// `/26` it committed is offered to a later endpoint again, and the VPC
     /// mapping for its subnet is dropped once no endpoint is left in that
     /// subnet.
+    ///
+    /// This is the END of a teardown, not its start: `DeleteEndpoint` only
+    /// accepts the deletion ([`EndpointRecord::begin_deletion`]), and
+    /// [`Self::settle_all`] calls this for the endpoint whose teardown the clock
+    /// has since completed.
     ///
     /// Releasing the mapping is what keeps [`Self::subnet_vpcs`] bounded by
     /// [`Self::endpoints`]: no sequence of creates and deletes can leave an
