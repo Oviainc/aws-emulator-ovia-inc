@@ -23,7 +23,8 @@
 //! applied on append ([`ComAmazonawsSesSimpleemailserviceState::log_sent_message`])
 //! and [`MAX_SENT_LOG_ENTRIES`] as the backstop. The text one log entry keeps is
 //! capped at [`MAX_LOGGED_TEXT`]. The template store is bounded the same way, at
-//! [`MAX_TEMPLATES`].
+//! [`MAX_TEMPLATES`], and the custom verification email templates at
+//! [`MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES`].
 //!
 //! A listing this store serves a page at a time hands the caller an OPAQUE,
 //! self-verifying cursor ([`encode_page_token`]), so a token this service never
@@ -133,6 +134,23 @@ pub const MAX_RECEIPT_FILTER_NAME: usize = MAX_RECEIPT_RULE_SET_NAME;
 /// creation past it is refused rather than letting caller input grow this store
 /// without end.
 pub const MAX_TEMPLATES: usize = 10_000;
+
+/// The custom verification email templates one account may hold, and so the
+/// ceiling on that store: SES documents a limit of 50 custom verification email
+/// templates per account per Region, and a creation past it is refused rather
+/// than letting caller input grow this store without end.
+pub const MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES: usize = 50;
+
+/// Whether the account a freshly booted emulator serves has been granted
+/// production access.
+///
+/// A new Amazon SES account is in the sandbox, which is the same account state
+/// the stored sandbox quota ([`SANDBOX_MAX_24_HOUR_SEND`]) already describes. No
+/// operation of this service's model moves an account out of it — leaving the
+/// sandbox is a separate, unmodelled account-review request — so nothing a
+/// caller does changes this, and an operation that requires production access is
+/// refused while [`AccountSettings::production_access_granted`] is false.
+pub const PRODUCTION_ACCESS_AT_ACCOUNT_START: bool = false;
 
 /// The bytes one sending-authorization policy document may carry.
 ///
@@ -434,6 +452,12 @@ pub struct AccountSettings {
     /// (`UpdateAccountSendingEnabled`); a send is refused with
     /// `AccountSendingPausedException` while it is false.
     pub sending_enabled: bool,
+    /// Whether this account has been granted production access, which is the
+    /// opposite of being in the sandbox. An operation that SES serves only to an
+    /// account out of the sandbox — `SendCustomVerificationEmail`, whose
+    /// `ProductionAccessNotGrantedException` reports exactly this — is refused
+    /// while it is false. Starts at [`PRODUCTION_ACCESS_AT_ACCOUNT_START`].
+    pub production_access_granted: bool,
 }
 
 impl Default for AccountSettings {
@@ -442,6 +466,7 @@ impl Default for AccountSettings {
             max_24_hour_send: SANDBOX_MAX_24_HOUR_SEND,
             max_send_rate: SANDBOX_MAX_SEND_RATE,
             sending_enabled: true,
+            production_access_granted: PRODUCTION_ACCESS_AT_ACCOUNT_START,
         }
     }
 }
@@ -577,6 +602,17 @@ pub struct ComAmazonawsSesSimpleemailserviceState {
     /// one stable (lexicographic) order, which is what makes `ListTemplates`'
     /// pagination resumable. Bounded at [`MAX_TEMPLATES`].
     pub templates: BTreeMap<String, EmailTemplate>,
+    /// The custom verification email templates a `SendCustomVerificationEmail`
+    /// may name, keyed by template name and held as the modelled
+    /// [`crate::ops::types::CustomVerificationEmailTemplate`] shape so a
+    /// template a caller wrote is reported back unchanged instead of being
+    /// projected through a second copy of the same structure. A `BTreeMap` so
+    /// every listing is in one stable (lexicographic) order, which is what makes
+    /// `ListCustomVerificationEmailTemplates`' pagination resumable. Grown ONLY
+    /// through [`Self::put_custom_verification_email_template`], which is where
+    /// its ceiling ([`MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES`]) is applied.
+    pub custom_verification_email_templates:
+        BTreeMap<String, crate::ops::types::CustomVerificationEmailTemplate>,
     /// How many opaque ids this store has minted, which is what makes the next
     /// one UNIQUE rather than merely unlikely to repeat: every id digests this
     /// counter, and the counter is never reused. Written only by
@@ -651,6 +687,36 @@ impl ComAmazonawsSesSimpleemailserviceState {
         }
         self.templates.insert(name.clone(), template);
         self.templates.get(&name)
+    }
+
+    /// Record `template` under the template name it carries, replacing any
+    /// custom verification email template already stored under that name, and
+    /// hand back the stored record.
+    ///
+    /// `None` when the store already holds
+    /// [`MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES`] templates and this is a new
+    /// one: the caller refuses the request rather than growing the store past the
+    /// account's limit. Replacing a template already in the store always
+    /// succeeds, since it adds nothing. A template carrying no name is refused
+    /// the same way, since the name is its key.
+    ///
+    /// `CreateCustomVerificationEmailTemplate` is the intended caller — it is
+    /// still a scaffold stub, carried by its own issue — so until it lands the
+    /// only writers are the suites that seed a template to send.
+    pub fn put_custom_verification_email_template(
+        &mut self,
+        template: crate::ops::types::CustomVerificationEmailTemplate,
+    ) -> Option<&crate::ops::types::CustomVerificationEmailTemplate> {
+        let name = template.template_name.clone()?;
+        if !self.custom_verification_email_templates.contains_key(&name)
+            && self.custom_verification_email_templates.len()
+                >= MAX_CUSTOM_VERIFICATION_EMAIL_TEMPLATES
+        {
+            return None;
+        }
+        self.custom_verification_email_templates
+            .insert(name.clone(), template);
+        self.custom_verification_email_templates.get(&name)
     }
 
     /// Append an accepted message to the send log, bounding it as it grows.
@@ -1415,6 +1481,34 @@ pub fn logged_text(text: Option<&str>) -> Option<String> {
         Some((cut, _)) => text[..cut].to_string(),
         None => text.to_string(),
     })
+}
+
+/// How a send refuses an address that is not an address, for every operation
+/// that takes one.
+///
+/// `SendEmail` states the rule and the consequence: a recipient address that "is
+/// not in the format UserName@[SubDomain.]Domain.TopLevelDomain" makes the whole
+/// message rejected. One wording here, so the operations that share that reading
+/// ([`is_email_address`]) also share how they report it.
+pub fn illegal_address_message(value: &str) -> String {
+    format!(
+        "Illegal address: {value:?} is not of the form \
+         UserName@[SubDomain.]Domain.TopLevelDomain"
+    )
+}
+
+/// How a send refuses a message that would take the account past its 24-hour
+/// sending quota, for every operation that counts against it.
+///
+/// `GetSendQuota$Max24HourSend` is "the maximum number of emails the user is
+/// allowed to send in a 24-hour interval" and `SentLast24Hours` what has been
+/// sent in it, so the refusal names both. One wording, for the same reason as
+/// [`illegal_address_message`].
+pub fn daily_quota_exceeded_message(quota: f64, already_sent: f64) -> String {
+    format!(
+        "Daily message quota exceeded: this account may send {quota} messages per 24 hours \
+         and has sent {already_sent}"
+    )
 }
 
 /// 64 bits of entropy this process did not choose, salting a minted id so it is
