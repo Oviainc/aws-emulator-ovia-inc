@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomainName
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomainName`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomainName::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one custom domain name and reports the `DomainNameConfig` it stored: the
+//! endpoint AppSync serves the domain through, minted from this service's own state,
+//! plus the certificate and description the request named.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +144,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomainName` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainNameErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomainName"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDomainNameErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut guard = state.lock();
+
+        // A custom domain is addressed by its domain name, so a create under a name
+        // this account already holds conflicts with the domain holding it rather than
+        // replacing it (and its endpoint, and whatever API it is associated with).
+        if guard.domain_names.contains_key(&input.domain_name) {
+            return Err(CreateDomainNameErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::DOMAIN_NAME_EXISTS_MESSAGE.to_string()),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // The store is bounded, so a repeated create cannot grow it without limit:
+        // AppSync's quota is 25 custom domain names per account per Region. This
+        // operation models no limit error, so a create past the quota is refused as
+        // the bad request it is, naming the cap it exceeded. This emulator serves one
+        // Region's worth of state, so the cap applies to the whole store.
+        if guard.domain_names.len() >= DOMAIN_NAMES_PER_REGION {
+            return Err(CreateDomainNameErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "an account may hold at most {DOMAIN_NAMES_PER_REGION} custom domain names \
+                     in a Region"
+                )),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        let seq = guard.next_seq();
+        let record = crate::state::DomainNameRecord {
+            seq,
+            domain_name: input.domain_name.clone(),
+            description: input.description,
+            certificate_arn: input.certificate_arn,
+            // The endpoint the domain is served through is the service's to issue, so
+            // it is minted from this state rather than derived from the request: two
+            // domains never share one.
+            appsync_domain_name: guard.mint_appsync_domain_name(),
+            hosted_zone_id: crate::state::CLOUDFRONT_HOSTED_ZONE_ID.to_string(),
+            domain_name_arn: ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                &region,
+                &crate::state::domain_name_resource(&input.domain_name),
+            ),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // Creating the domain maps it onto no API: `AssociateApi` is what does
+            // that.
+            api_association: None,
+        };
+
+        // Answer from the STORED record, so this body is the one `GetDomainName`
+        // answers with later: the response is projected from the store rather than from
+        // the record that went into it, so it cannot report a domain the store does not
+        // hold.
+        guard.domain_names.insert(input.domain_name.clone(), record);
+        let domain_name_config = guard
+            .domain_names
+            .get(&input.domain_name)
+            .map(crate::state::DomainNameRecord::to_domain_name_config);
+
+        Ok(CreateDomainNameOutput {
+            domain_name_config,
+        })
     }
 }
+
+/// The AppSync service quota for custom domain names an account holds in one Region,
+/// which bounds this service's domain-name store.
+const DOMAIN_NAMES_PER_REGION: usize = 25;

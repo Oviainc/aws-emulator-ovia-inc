@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatasetExportJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatasetExportJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatasetExportJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation does
+//!
+//! Enumerates the dataset export jobs of ONE workspace, narrowed by the optional
+//! status `filter` the request carries and paged by `maxResults` / `nextToken`. A
+//! pure READ: every member a summary reports is read off the job
+//! `CreateDatasetExportJob` persisted or DERIVED from the instant it started it
+//! ([`crate::state::DatasetExportJobRecord::status`]), so a listing moves no job
+//! on, two listings of one unchanged store agree, and a summary can never
+//! disagree with what `DescribeDatasetExportJob` reports for the same job.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +157,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatasetExportJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatasetExportJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatasetExportJobs"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // A read: every member reported below is read off the stored job or DERIVED
+        // from the instant the create started it, so this listing moves no job on and
+        // two readers of one job cannot disagree about where it has got to.
+        let store = state.lock();
+
+        // The listing is scoped to ONE workspace, so a workspace this service holds no
+        // record of is the modelled refusal rather than an empty page, which would
+        // report absence as success. "Holds" is decided by the STORE, and a job stored
+        // under a workspace is such a record: the create keys a job by
+        // `(workspaceName, jobId)` without consulting the workspace registry, so
+        // refusing on the registry alone would hide jobs this service really holds.
+        // Resolved BEFORE the filter and the paging arguments are read, as every
+        // handler in this crate resolves the resource its path names first, so a
+        // request that is wrong in both ways reports the resource that is absent.
+        let holds_workspace = store.workspaces.contains_key(&input.workspace_name)
+            || store
+                .dataset_export_jobs
+                .keys()
+                .any(|(workspace, _)| *workspace == input.workspace_name);
+        if !holds_workspace {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            )));
+        }
+
+        // "The optional filter that returns only jobs matching the given filter value.
+        // Defaults to ALL": `ALL` is the filter that narrows nothing, and every other
+        // value of the filter enum names one status. The member is a modelled enum, so
+        // the runtime refuses a value outside its set BEFORE this handler runs.
+        let wanted_status = match input.filter.as_deref().unwrap_or(FILTER_ALL) {
+            FILTER_ALL => None,
+            status => Some(status),
+        };
+
+        // Every job of the named workspace that matches the filter: a `jobId` is
+        // unique only within its workspace, so the workspace half of the key is what
+        // scopes the enumeration. The status compared against is the one the CLOCK has
+        // made due, which is the same one the summary reports, so a filtered page can
+        // never disagree with the summaries in it.
+        let mut selected: Vec<&crate::state::DatasetExportJobRecord> = store
+            .dataset_export_jobs
+            .values()
+            .filter(|record| record.workspace_name == input.workspace_name)
+            .filter(|record| wanted_status.is_none_or(|wanted| record.status(now) == wanted))
+            .collect();
+
+        // A stable total order is what makes `nextToken` resumable: oldest first, ties
+        // broken by id so two jobs started in the same instant still order
+        // deterministically.
+        selected.sort_by(|left, right| {
+            left.started_at
+                .cmp(&right.started_at)
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+
+        // This enumeration's resume point is a job's `jobId`, and the page walk every
+        // paginated listing of this service shares takes it from there: it resumes at
+        // the token's job, refusing a token whose resume point is not in this
+        // enumeration rather than answering an empty page; it cuts the page at "The
+        // maximum number of results to return for each paginated request"; and it
+        // mints "the token for the next set of results" off the job that follows the
+        // page, leaving it null when the page ends the listing.
+        let page = crate::state::page_of(
+            &selected,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |record| record.job_id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
+
+        // `get` rather than a slice index: the bounds above are derived from the
+        // request, so the page is taken in a form that cannot panic whatever they
+        // resolve to.
+        let jobs = selected.get(page.start..page.end).unwrap_or_default();
+
+        Ok(ListDatasetExportJobsOutput {
+            jobs: jobs.iter().map(|record| summary(record, now)).collect(),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The `filter` value that narrows nothing, which is also the one this operation
+/// documents as its default ("Defaults to ALL").
+const FILTER_ALL: &str = "ALL";
+
+/// The page size this listing answers with when the caller gives no `maxResults`.
+///
+/// CHOSEN, not documented: the member is documented only as "The maximum number of
+/// results to return for each paginated request". It is the default this service's
+/// other paginated listings already use, so a client that pages without asking for
+/// a size sees one page size across the service.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// One stored job as the summary this operation reports: "summary information about
+/// a dataset export job", read straight off the record `CreateDatasetExportJob`
+/// persisted, with the status and the completion instant DERIVED from the instant
+/// the job started — the same derivation `DescribeDatasetExportJob` reports, so a
+/// listed job and a described one never disagree.
+fn summary(
+    record: &crate::state::DatasetExportJobRecord,
+    now: ::std::time::SystemTime,
+) -> ExportJobSummary {
+    ExportJobSummary {
+        job_id: record.job_id.clone(),
+        status: record.status(now).to_string(),
+        started_at: crate::state::to_date_time(record.started_at),
+        completed_at: record.completed_at(now).map(crate::state::to_date_time),
+        destination_s3_uri: record.destination_s3_uri.clone(),
+    }
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued.
+fn invalid_token() -> ListDatasetExportJobsError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> ListDatasetExportJobsError {
+    ListDatasetExportJobsErrorModeled::InvalidRequestException(InvalidRequestException { message })
+        .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> ListDatasetExportJobsError {
+    ListDatasetExportJobsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+    })
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> ListDatasetExportJobsError {
+    ListDatasetExportJobsErrorModeled::InternalFailureException(InternalFailureException { message })
+        .into()
 }
