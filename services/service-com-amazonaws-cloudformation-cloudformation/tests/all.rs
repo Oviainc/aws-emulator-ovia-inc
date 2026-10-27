@@ -131,6 +131,8 @@ mod sam_deployed_resources;
 mod sam_transform;
 #[path = "all/scratch.rs"]
 mod scratch;
+#[path = "all/stack_delete_failure_reason.rs"]
+mod stack_delete_failure_reason;
 #[path = "all/stack_event_timeline.rs"]
 mod stack_event_timeline;
 #[path = "all/stack_exports.rs"]
@@ -141,6 +143,8 @@ mod stack_failure_reason;
 mod stack_lifecycle;
 #[path = "all/stack_output_resolution.rs"]
 mod stack_output_resolution;
+#[path = "all/stack_own_subnets_db_subnet_group.rs"]
+mod stack_own_subnets_db_subnet_group;
 #[path = "all/stack_outputs.rs"]
 mod stack_outputs;
 #[path = "all/stack_reported_members.rs"]

@@ -2646,6 +2646,42 @@ impl StoredStack {
         self.reevaluate_outputs();
     }
 
+    /// Leave each of the stack's resource records in the status the DELETION left it in.
+    ///
+    /// `StackResource$ResourceStatus` is the resource's "Current status", so once a deletion
+    /// an owning service refused has ended, the resource it refused reports the failed
+    /// delete status and that service's refusal, and one the same walk DID delete reports its
+    /// deletion as complete: the per-resource view and the event stream of one deletion
+    /// cannot disagree about what became of each resource. A record the walk never reached —
+    /// one it stopped before, or one no owning service holds — keeps the status it carried,
+    /// because nothing happened to that resource.
+    ///
+    /// A deletion that COMPLETES disposes of every record at once
+    /// ([`disposed_resources`]); this is the counterpart for the one that could not.
+    pub fn record_resource_deletion_statuses(
+        &mut self,
+        transitions: &[provisioning::ResourceTransition],
+        at: SystemTime,
+    ) {
+        for transition in transitions {
+            if transition.status != resource_status::DELETE_COMPLETE
+                && transition.status != resource_status::DELETE_FAILED
+            {
+                continue;
+            }
+            let Some(deployed) = self
+                .resources
+                .iter_mut()
+                .find(|deployed| deployed.resource.logical_id == transition.logical_id)
+            else {
+                continue;
+            };
+            deployed.status = transition.status.clone();
+            deployed.status_reason = transition.reason.clone();
+            deployed.status_timestamp = at;
+        }
+    }
+
     /// Record that the operation in flight could not be carried out: the stack takes the
     /// failed status with the reason, the clock is owed nothing more, and the event log
     /// carries the failure.
