@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTenantResourceAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTenantResourceAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTenantResourceAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the association between the resource the request names and the tenant it
+//! names: both inputs are resolved against the store BEFORE anything is removed, and
+//! the removal is idempotent — a resource and a tenant that both exist answer the empty
+//! 200 whether or not an association was there to remove. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +137,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTenantResourceAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTenantResourceAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTenantResourceAssociation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteTenantResourceAssociation without the shared emulator state",
+            ));
+        };
+
+        let tenant_name = input.tenant_name;
+        let resource_arn = input.resource_arn;
+        // The model binds only `length 1..` on `TenantName`; the documented form is the
+        // handler's to enforce, with the `BadRequestException` the model binds for "the
+        // input you provided is invalid" — the same check every operation taking a
+        // `TenantName` applies, so a name no tenant could carry is refused as malformed
+        // rather than reported missing.
+        if !crate::state::tenant_name_is_well_formed(&tenant_name) {
+            return Err(DeleteTenantResourceAssociationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_tenant_name(&tenant_name)),
+                },
+            )
+            .into());
+        }
+
+        // The kinds of resource a tenant may hold are fixed, so a `ResourceArn` naming
+        // anything else addresses nothing this surface could have associated and is
+        // refused on the input — before any lookup and before any write — with the
+        // `BadRequestException` the model binds. That same read words how a resource of
+        // a kind a tenant MAY hold is reported when the account holds no such resource,
+        // which is why it is taken once, here.
+        let Some(resource_not_found) = crate::state::tenant_resource_not_found(&resource_arn)
+        else {
+            return Err(DeleteTenantResourceAssociationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::UNSUPPORTED_RESOURCE_ARN.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The resource this call can reach is one of the account the request is
+        // authenticated for, in the Region its own credential scope names.
+        let scope = crate::state::CallerScope::of(ctx.parts());
+
+        let mut store = state.lock();
+
+        // Both inputs are resolved BEFORE anything is removed, so a refusal leaves the
+        // association table exactly as it was. The tenant is resolved first, as this
+        // surface's create does.
+        if !store.tenants.contains_key(&tenant_name) {
+            return Err(DeleteTenantResourceAssociationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::requested_tenant_not_found(&tenant_name)),
+                },
+            )
+            .into());
+        }
+
+        // "The resource you attempted to access doesn't exist": an association names a
+        // resource, so an ARN resolving to no record the account holds is reported as
+        // the missing resource it names rather than removing anything.
+        if !store.holds_resource(&resource_arn, &scope) {
+            return Err(DeleteTenantResourceAssociationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(resource_not_found),
+                },
+            )
+            .into());
+        }
+
+        // "The resource itself is not deleted, only its association with the specific
+        // tenant is removed": the resource and the tenant both stay, and so does every
+        // other association either of them holds — the one record keyed by this pair is
+        // what goes. Removal is idempotent: a pair holding no association is already in
+        // the state the call asks for, so it answers the empty 200 rather than a
+        // refusal.
+        store
+            .tenant_resource_associations
+            .remove(&(resource_arn, tenant_name));
+
+        // The response carries no members: the removal is observed through the listings
+        // that read the table just written.
+        Ok(DeleteTenantResourceAssociationOutput {})
     }
 }
