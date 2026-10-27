@@ -844,10 +844,13 @@ pub struct QueryLoggingConfiguration {
     /// answers from the stored record after later updates, which is what
     /// `@idempotencyToken` asks for.
     pub create_token: Option<String>,
-    /// The `clientToken` of the call that last CHANGED this configuration (an update or
-    /// the start of a deletion). Replaying that exact token is the SAME request, so a
-    /// handler answers from the stored record instead of applying the change twice.
-    pub client_token: Option<String>,
+    /// The `clientToken` of the call that last UPDATED this configuration. Replaying
+    /// that exact token is the SAME update, so `UpdateQueryLoggingConfiguration` answers
+    /// from the stored record instead of applying the change twice. Kept apart from
+    /// [`Self::create_token`] so a replay is only ever matched against the token the
+    /// SAME operation recorded: a token another operation used names a different
+    /// request, which this one has never carried out.
+    pub update_token: Option<String>,
 }
 
 /// One scraper's logging configuration: every member
