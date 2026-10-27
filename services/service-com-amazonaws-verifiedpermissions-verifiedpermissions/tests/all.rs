@@ -57,5 +57,7 @@ mod tagging;
 mod template_linked_policies;
 #[path = "all/update_and_delete_lifecycle.rs"]
 mod update_and_delete_lifecycle;
+#[path = "all/validation_exception_contents.rs"]
+mod validation_exception_contents;
 #[path = "all/wire_fidelity.rs"]
 mod wire_fidelity;
