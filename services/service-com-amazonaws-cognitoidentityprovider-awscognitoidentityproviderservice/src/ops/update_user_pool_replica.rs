@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUserPoolReplica
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUserPoolReplica`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUserPoolReplica::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,20 +153,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUserPoolReplica` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUserPoolReplicaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUserPoolReplica"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // The write and the read that renders the response happen under ONE
+        // hold of the state lock, so two calls that race on the same replica
+        // are serialized: each stores its own `Status` and answers with the
+        // value it stored, and the replica keeps whichever of them wrote last.
+        let mut guard = state.lock();
+
+        let Some(pool) = guard.pool_mut(&input.user_pool_id) else {
+            return Err(user_pool_not_found(&input.user_pool_id));
+        };
+
+        // Only a replica this pool holds in the named Region is updated. The
+        // pool's own Region is never one of them — it holds the PRIMARY
+        // replica, which is the pool itself and which no create adds — so it
+        // names no replica whose status this operation sets, just as a Region
+        // nothing was replicated to does not.
+        let Some(replica) = pool.replicas.get_mut(&input.region_name) else {
+            return Err(replica_not_found());
+        };
+
+        // "You can modify the status to activate or deactivate the replica":
+        // the status the request names is what is stored, so it supersedes the
+        // activation the clock owed a replica that is still coming up and is
+        // what every later read reports until another call sets one.
+        replica.requested_status = Some(input.status.clone());
+
+        // Rendered from the STORED replica under the same lock hold, so the
+        // response carries the status THIS call stored.
+        let updated = replica.to_user_pool_replica_type(now);
+        pool.last_modified_date = now;
+        Ok(UpdateUserPoolReplicaOutput {
+            user_pool_replica: Some(updated),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> UpdateUserPoolReplicaError {
+    UpdateUserPoolReplicaErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a Region this pool holds no
+/// replica in, whose message is fixed text: it interpolates no value.
+fn replica_not_found() -> UpdateUserPoolReplicaError {
+    UpdateUserPoolReplicaErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some("Replica not found in the requested region".to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> UpdateUserPoolReplicaError {
+    UpdateUserPoolReplicaErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

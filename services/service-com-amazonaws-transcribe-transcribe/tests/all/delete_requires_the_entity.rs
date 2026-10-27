@@ -11,9 +11,10 @@
 //! resource succeeds.
 //!
 //! The table spans the whole delete class rather than one operation: one row per
-//! family whose delete this emulator serves (custom vocabulary, vocabulary filter,
-//! custom language model, transcription job, Call Analytics category, Call Analytics
-//! job, Medical Scribe job), crossed with the forms of name the name members' shared
+//! family whose delete this emulator serves (custom vocabulary, custom medical
+//! vocabulary, vocabulary filter, custom language model, transcription job, Call
+//! Analytics category, Call Analytics job, Medical Scribe job), crossed with the forms
+//! of name the name members' shared
 //! `@length(1..200)` / `@pattern(^[0-9a-zA-Z._-]+$)` constraint allows
 //! (`smithy_query(query="operation", operation="DeleteVocabulary")`): the shortest
 //! allowed name, every allowed punctuation character, a plainly spelled one, and a
@@ -63,9 +64,7 @@ struct Deletable {
     create_body: fn(&str) -> Value,
 }
 
-/// Every family whose delete this emulator serves. `DeleteMedicalVocabulary` is
-/// absent on purpose: it is still a stub (HTTP 501), so there is no delete of its own
-/// to assert a rule about yet.
+/// Every family whose delete this emulator serves.
 fn deletables() -> Vec<Deletable> {
     vec![
         Deletable {
@@ -79,6 +78,22 @@ fn deletables() -> Vec<Deletable> {
                     "VocabularyName": name,
                     "LanguageCode": "en-US",
                     "Phrases": ["Aardvark", "Transcribe"]
+                })
+            },
+        },
+        Deletable {
+            kind: "medical vocabulary",
+            create: "CreateMedicalVocabulary",
+            read: "GetMedicalVocabulary",
+            delete: "DeleteMedicalVocabulary",
+            name_member: "VocabularyName",
+            create_body: |name| {
+                json!({
+                    "VocabularyName": name,
+                    // "US English (en-US) is the only language supported with Amazon
+                    // Transcribe Medical" (model doc for the medical language code).
+                    "LanguageCode": "en-US",
+                    "VocabularyFileUri": "s3://DOC-EXAMPLE-BUCKET/clinical-terms.txt"
                 })
             },
         },
