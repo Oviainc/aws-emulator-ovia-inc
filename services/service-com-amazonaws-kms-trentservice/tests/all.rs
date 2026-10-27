@@ -37,6 +37,8 @@ mod error_semantics;
 mod get_key_policy_reads;
 #[path = "all/get_key_rotation_status_reads.rs"]
 mod get_key_rotation_status_reads;
+#[path = "all/grant_authorization.rs"]
+mod grant_authorization;
 #[path = "all/grants.rs"]
 mod grants;
 #[path = "all/harness.rs"]
@@ -69,6 +71,8 @@ mod multi_region_primary;
 mod public_key;
 #[path = "all/re_encrypt.rs"]
 mod re_encrypt;
+#[path = "all/refusal_and_rotation_contracts.rs"]
+mod refusal_and_rotation_contracts;
 #[path = "all/replicate_key.rs"]
 mod replicate_key;
 #[path = "all/resource_tags.rs"]

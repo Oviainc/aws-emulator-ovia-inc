@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListGlossaryTerms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListGlossaryTerms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListGlossaryTerms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the glossary terms this account holds WITHIN one business glossary: every
+//! stored term recorded against the glossary the request's `GlossaryIdentifier` names
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::glossary_terms`]), from the same records
+//! `CreateGlossaryTerm` wrote and `GetGlossaryTerm` reads back, projected to the three
+//! summary members `GlossaryTermItem` declares and served one `MaxResults`-sized page at a
+//! time in term-name order with a `NextToken` that resumes the walk. Reporting only —
+//! nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +73,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`ListGlossaryTermsRequest$MaxResults`, `PageSize` range 1..1000) — and so the page size
+/// for a request that names none.
+const MAX_PAGE_SIZE: i32 = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +150,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListGlossaryTerms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListGlossaryTermsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListGlossaryTerms"))
+        // Glossary terms live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(ListGlossaryTermsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue glossary store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The maximum number of results to return in the response" (`MaxResults`, range
+        // 1..1000). Absent, the page is the largest the model accepts for it; the clamp
+        // re-states that range here so the page size is never 0 even if the boundary
+        // validator ever stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        // Reporting only: the stored terms are projected out and nothing is written.
+        let store = state.lock();
+        // A term records the glossary it belongs to, so the listing of one glossary is the
+        // stored terms carrying that identifier. The records are keyed by their opaque id,
+        // so they are ordered here by the member that identifies a term within its
+        // glossary — its name, which `CreateGlossaryTerm` keeps unique there — and one page
+        // therefore follows another deterministically. The glossary itself is not resolved:
+        // this operation models no not-found error, and a term keeps the glossary it was
+        // created in even once that glossary is gone, exactly as `GetGlossaryTerm` reports
+        // it.
+        let mut matching: Vec<&crate::state::GlossaryTermEntry> = store
+            .glossary_terms
+            .values()
+            .filter(|term| term.glossary_id == input.glossary_identifier)
+            .collect();
+        matching.sort_by(|left, right| left.name.cmp(&right.name));
+
+        // The token is the last name of the previous page, so the page resumes at the first
+        // stored name strictly after it — which stays correct across terms created or
+        // deleted between two calls.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => matching.partition_point(|term| term.name.as_str() <= cursor),
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose can
+        // never index outside the set.
+        let page: Vec<GlossaryTermItem> = matching
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .map(|term| GlossaryTermItem {
+                // `GlossaryTermItem` is a SUMMARY: the model gives it an id, a name and the
+                // short description only, so the long description a term may carry is
+                // reported by `GetGlossaryTerm` and not here.
+                id: Some(term.id.clone()),
+                name: Some(term.name.clone()),
+                short_description: term.short_description.clone(),
+            })
+            .collect();
+        let end = start.saturating_add(page.len());
+        // "A continuation token, present if the current segment is not the last": it names
+        // the last entry of the page, taken from the page itself so there is no index
+        // arithmetic to underflow on an empty page.
+        let next_token = if end < matching.len() {
+            page.last().and_then(|item| item.name.clone())
+        } else {
+            None
+        };
+
+        Ok(ListGlossaryTermsOutput {
+            items: Some(page),
+            next_token,
+        })
     }
 }

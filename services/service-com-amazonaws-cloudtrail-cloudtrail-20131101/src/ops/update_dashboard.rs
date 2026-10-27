@@ -20,10 +20,12 @@
 //! * the CloudTrail-managed Highlights dashboard keeps its own widgets and its
 //!   documented refresh schedule.
 //!
-//! The dashboard's `DashboardStatus` is left as it stands: the model declares
-//! `UPDATING`/`UPDATED`, but no recording shows whether CloudTrail moves a dashboard
-//! back into a transient status for an update, so this handler does not invent one —
-//! it stamps `UpdatedTimestamp` and leaves the status the create path settled.
+//! A successful update also moves the dashboard's `DashboardStatus`: the modelled
+//! enum carries `UPDATED` beside the create path's `CREATING`/`CREATED`, and a read
+//! that follows a successful update reports the dashboard already updated — so this
+//! handler stamps `UpdatedTimestamp` and the updated status together, through
+//! [`crate::state::DashboardRecord::record_update`], and every later read of the
+//! dashboard reports what it left.
 //!
 //! ## Shape of an operation
 //!
@@ -332,7 +334,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(enabled) = input.termination_protection_enabled {
             record.termination_protection_enabled = enabled;
         }
-        record.updated_at = now;
+        // The dashboard has just been updated, which is both the timestamp it reports
+        // and the status it reports: a dashboard an update has returned for reads the
+        // updated status straight away, not the one its create settled.
+        record.record_update(now);
 
         // Report the stored record, so the response and every later read of this
         // dashboard are the same values.

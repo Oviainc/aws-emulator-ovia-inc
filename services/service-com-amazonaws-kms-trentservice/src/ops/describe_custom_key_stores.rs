@@ -259,7 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(position) => position + 1,
                     None => {
                         return Err(DescribeCustomKeyStoresErrorModeled::InvalidMarkerException(
-                            InvalidMarkerException { message: None },
+                            InvalidMarkerException {
+                                message: crate::state::invalid_marker_message(),
+                            },
                         )
                         .into());
                     }
