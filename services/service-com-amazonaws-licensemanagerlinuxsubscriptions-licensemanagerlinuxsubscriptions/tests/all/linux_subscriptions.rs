@@ -2,8 +2,9 @@
 
 //! End-to-end tests for the two discovery lists — `ListLinuxSubscriptions` and
 //! `ListLinuxSubscriptionInstances` — driven over the real wire path: every call goes
-//! through the router's `dispatch`, so the request is deserialized, constraint-checked,
-//! handled and serialized exactly as a client's would be.
+//! through the shared harness's `dispatch`, so the request is deserialized,
+//! constraint-checked, handled and serialized exactly as a client's would be, and this
+//! suite states no second copy of what an SDK client's request looks like on the wire.
 //!
 //! The rules under test, each asserted over a SET of inputs rather than one request:
 //!
@@ -27,21 +28,10 @@
 //!   value — is refused with `ValidationException` (HTTP 400) rather than silently
 //!   answering an empty page.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{call, harness, seed_discovered_instance, Harness, Reply};
 use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::state::DiscoveredInstanceRecord;
-use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::{
-    ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState,
-    EmulatedService,
-};
-
-/// This service's sigv4 signing name (`OPERATIONS.md`, "Wire protocol").
-const SIGNING_NAME: &str = "license-manager-linux-subscriptions";
-/// The region the test requests are signed for.
-const REGION: &str = "us-west-2";
 
 /// `POST /subscription/ListLinuxSubscriptions` (`OPERATIONS.md`).
 const SUBSCRIPTIONS: &str = "/subscription/ListLinuxSubscriptions";
@@ -169,31 +159,11 @@ const EXPECTED_SUBSCRIPTIONS: &[(&str, &str, i64)] = &[
     ("Ubuntu Pro", TYPE_MARKETPLACE, 0),
 ];
 
-/// One emulator: the router that dispatches, plus the shared engine its service was built
-/// from (so a test can pre-fill the store the handlers read).
-struct Harness {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
-}
-
-fn harness() -> Harness {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // The tests sign nothing; authentication is the framework's concern, not this
-    // service's.
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(Arc::clone(&engine)));
-    Harness { router, engine }
-}
-
-/// Put `DISCOVERED` in the store directly: discovery reads the account's EC2 inventory,
-/// which no operation of THIS service writes, so the store is pre-filled to exercise the
-/// projection the two list operations perform over it.
+/// Put `DISCOVERED` in the store directly, through the shared harness's seeding seam:
+/// discovery reads the account's EC2 inventory, which no operation of THIS service writes,
+/// so the store is pre-filled to exercise the projection the two list operations perform
+/// over it.
 fn discover(h: &Harness, rows: &[Row]) {
-    let state = h
-        .engine
-        .state::<ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState>();
-    let mut state = state.lock();
     for row in rows {
         let (
             instance_id,
@@ -208,8 +178,8 @@ fn discover(h: &Harness, rows: &[Row]) {
             subscription_name,
             subscription_type,
         ) = *row;
-        state.discovered_instances.insert(
-            instance_id.to_string(),
+        seed_discovered_instance(
+            h,
             DiscoveredInstanceRecord {
                 instance_id: instance_id.to_string(),
                 account_id: account_id.to_string(),
@@ -226,80 +196,6 @@ fn discover(h: &Harness, rows: &[Row]) {
                 ..DiscoveredInstanceRecord::default()
             },
         );
-    }
-}
-
-/// What a call answered: the HTTP status, the wire error code (if any) and the body.
-#[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: Option<String>,
-    body: Value,
-}
-
-impl Reply {
-    fn ok(&self, case: &str) -> &Value {
-        assert_eq!(
-            self.status, 200,
-            "case {case:?}: expected HTTP 200, got {} with body {:?}",
-            self.status, self.body
-        );
-        &self.body
-    }
-
-    /// Assert this reply is the modelled client error `code` with HTTP `status`.
-    fn error(&self, case: &str, status: u16, code: &str) {
-        assert_eq!(
-            self.status, status,
-            "case {case:?}: expected HTTP {status}, got {} with body {:?}",
-            self.status, self.body
-        );
-        let actual = self.error_type.as_deref().unwrap_or("<none>");
-        assert!(
-            actual.ends_with(code),
-            "case {case:?}: expected error code {code}, got {actual:?} with body {:?}",
-            self.body
-        );
-    }
-}
-
-async fn call(h: &Harness, path: &str, body: &Value) -> Reply {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://{SIGNING_NAME}.{REGION}.amazonaws.com{path}"))
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTEXAMPLE/20260101/{REGION}/{SIGNING_NAME}\
-                 /aws4_request, SignedHeaders=host, Signature=0"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-    let response = h.router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let header_error = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let body: Value = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    let error_type = header_error.or_else(|| {
-        body.get("__type")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    });
-    Reply {
-        status,
-        error_type,
-        body,
     }
 }
 
