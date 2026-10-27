@@ -29,6 +29,8 @@ mod call_analytics_job_queueing;
 mod call_analytics_job_results;
 #[path = "all/call_analytics_job_start_limits.rs"]
 mod call_analytics_job_start_limits;
+#[path = "all/call_analytics_job_start_preconditions.rs"]
+mod call_analytics_job_start_preconditions;
 #[path = "all/call_analytics_job_tagging.rs"]
 mod call_analytics_job_tagging;
 #[path = "all/call_analytics_jobs.rs"]
