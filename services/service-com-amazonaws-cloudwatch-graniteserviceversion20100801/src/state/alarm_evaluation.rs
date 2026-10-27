@@ -63,21 +63,30 @@
 //! datapoint of the series it watches arrives before then.
 //!
 //! What is NOT evaluated here keeps the state it has, rather than being answered with a
-//! state nothing computed: an alarm over a `Metrics` query array (metric math), one with
-//! `EvaluationCriteria` (a PromQL query), one whose threshold is an anomaly-detection band
-//! (`ThresholdMetricId`, or one of the `…LowerOrGreaterThanUpper…` comparisons) and one whose
-//! configuration names no stored metric at all.
+//! state nothing computed: an alarm with `EvaluationCriteria` (a PromQL query), one whose
+//! threshold is an anomaly-detection band (`ThresholdMetricId`, or one of the
+//! `…LowerOrGreaterThanUpper…` comparisons), one whose configuration names no stored metric at
+//! all, and one over a `Metrics` query array this engine cannot resolve to a single time
+//! series.
+//!
+//! An alarm configured with a `Metrics` query array IS evaluated: "Use the `Metrics` parameter
+//! to create an alarm based on a metric math expression" (`PutMetricAlarmInput$Metrics`), and
+//! the series it grades is the value of the query that array returns — the EXPRESSION's output,
+//! computed over the same stored datapoints `GetMetricData` answers the same array from
+//! ([`super::metric_query`]) — against the same threshold, the same m-of-n predicate and the
+//! same explanation as an alarm over one metric.
 
 use ::serde_json::{Map, Value};
 
 use super::alarm_actions::AlarmNotification;
+use super::metric_math::MathValue;
 use super::{
     dimension_set, to_timestamp, weighted_percentile, AlarmStateSnapshot, BasicStatistics,
     ComAmazonawsCloudwatchGraniteserviceversion20100801State as State, MetricKey, StoredDatum,
     ALARM_STATE_ALARM, ALARM_STATE_INSUFFICIENT_DATA, ALARM_STATE_OK, ALARM_TYPE_METRIC,
     HISTORY_DATA_VERSION, MAX_STATE_REASON_DATA_LEN,
 };
-use crate::ops::types::{AlarmHistoryItem, MetricAlarm, STATISTIC_VALUES};
+use crate::ops::types::{AlarmHistoryItem, MetricAlarm, MetricDataQuery, STATISTIC_VALUES};
 
 /// How long after the write that configured an alarm its FIRST evaluation is owed, and how
 /// long after an evaluation the NEXT one is owed.
@@ -273,12 +282,59 @@ enum Datapoint {
 /// the identity its evaluation reads and the one a datapoint is stored under.
 ///
 /// The one place an alarm's configuration is turned into a series identity, so the evaluation,
-/// the forced-state span and [`State::make_alarms_due`] can never resolve it three ways.
+/// the forced-state span and [`watched_series_set`] can never resolve it three ways.
 pub(super) fn watched_series(alarm: &MetricAlarm) -> MetricKey {
     MetricKey {
         namespace: alarm.namespace.clone().unwrap_or_default(),
         metric_name: alarm.metric_name.clone().unwrap_or_default(),
         dimensions: dimension_set(alarm.dimensions.as_deref()),
+    }
+}
+
+/// EVERY series one alarm's evaluation reads, each beside the `Unit` it reads that series
+/// under.
+///
+/// An alarm over one metric reads the series its own members name, under its own `Unit`; an
+/// alarm configured with a query array reads the series each of that array's `MetricStat`
+/// queries names, each under that query's own `Unit`. It is what [`State::make_alarms_due`]
+/// matches an arriving datapoint against, resolved from the same members the evaluation itself
+/// reads the store by.
+pub(super) fn watched_series_set(alarm: &MetricAlarm) -> Vec<(MetricKey, Option<String>)> {
+    let Some(queries) = alarm.metrics.as_deref() else {
+        return vec![(watched_series(alarm), alarm.unit.clone())];
+    };
+    queries
+        .iter()
+        .filter_map(|query| query.metric_stat.as_ref())
+        .filter_map(|stat| {
+            super::metric_query::query_series_key(stat).map(|key| (key, stat.unit.clone()))
+        })
+        .collect()
+}
+
+/// The width of the windows an alarm's query ARRAY is graded in.
+///
+/// "The granularity, in seconds, of the returned data points" (`MetricDataQuery$Period`) when
+/// the returning query names one, and the `MetricStat$Period` when that query IS a metric —
+/// the granularity the shared resolution folds that query at
+/// ([`super::metric_query::query_period`]). Otherwise the period of the metrics the expression
+/// reads — the widest of them, the granularity every one of those series has a value at —
+/// because the period of an expression is the one of the metrics it is computed from.
+fn graded_period(queries: &[MetricDataQuery], graded: &MetricDataQuery) -> f64 {
+    if graded.period.is_some() || graded.metric_stat.is_some() {
+        return super::metric_query::query_period(graded);
+    }
+    let widest = queries
+        .iter()
+        .filter(|query| query.period.is_some() || query.metric_stat.is_some())
+        .map(super::metric_query::query_period)
+        .fold(0.0_f64, f64::max);
+    if widest >= 1.0 {
+        widest
+    } else {
+        // An array that reads no metric at all computes its series on the default expression
+        // grid, which is the granularity it is then graded in.
+        super::metric_query::DEFAULT_EXPRESSION_PERIOD
     }
 }
 
@@ -305,14 +361,57 @@ fn carries_alarm_unit(alarm: &MetricAlarm, datum: &StoredDatum) -> bool {
 /// Whether a datapoint carrying `unit` is one this alarm GRADES: "If you specify a unit, the
 /// operation returns only data that was collected with that unit specified." An alarm naming no
 /// unit grades every datapoint of the series it watches.
+fn alarm_grades_unit(alarm: &MetricAlarm, unit: Option<&str>) -> bool {
+    grades_unit(alarm.unit.as_deref(), unit)
+}
+
+/// Whether a datapoint carrying `unit` is one a reader selecting `selector` GRADES: "If you
+/// specify a unit, the operation returns only data that was collected with that unit
+/// specified." A reader naming no unit grades every datapoint of the series.
 ///
 /// The one definition of that selector, so the evaluation fold, the forced-state span and
-/// [`State::make_alarms_due`] cannot answer "is this data for this alarm?" three ways.
-pub(super) fn alarm_grades_unit(alarm: &MetricAlarm, unit: Option<&str>) -> bool {
-    alarm
-        .unit
-        .as_deref()
-        .is_none_or(|wanted| unit == Some(wanted))
+/// [`State::make_alarms_due`] cannot answer "is this data for this alarm?" three ways —
+/// whether the unit is the alarm's own or the one its query names.
+pub(super) fn grades_unit(selector: Option<&str>, unit: Option<&str>) -> bool {
+    selector.is_none_or(|wanted| unit == Some(wanted))
+}
+
+/// One window of the series an alarm GRADES: the value it took, and how many observations it
+/// aggregated where the series is one metric's.
+#[derive(Debug, Clone, Copy)]
+struct GradedDatapoint {
+    /// The value the graded series took over the window.
+    value: f64,
+    /// How many observations that window aggregated, for a window of one metric's series;
+    /// `None` where the value was computed rather than measured.
+    sample_count: Option<f64>,
+}
+
+/// The series ONE alarm grades, window by window.
+struct GradedSeries<'alarm> {
+    /// The statistic the series was folded by, for an alarm that names one; `None` for a
+    /// series a query array computed, which no single statistic describes.
+    statistic: Option<AlarmStatistic<'alarm>>,
+    /// How wide one window is, in seconds.
+    period: f64,
+    /// What each window of the evaluation range took, newest first — index 0 being the window
+    /// the evaluation instant falls in — and `None` for a window the series has no value for.
+    windows: Vec<Option<GradedDatapoint>>,
+}
+
+/// What ONE evaluation grades its series against: the alarm's threshold and comparison, how
+/// many of its periods the verdict covers, and what it does with a window that has no value.
+#[derive(Debug, Clone, Copy)]
+struct GradedAgainst<'alarm> {
+    /// "The value to compare with the specified statistic." (`MetricAlarm$Threshold`)
+    threshold: f64,
+    /// The comparison the alarm makes between a datapoint and that threshold.
+    comparison: Comparison,
+    /// How many of the alarm's periods the verdict is made over — its `EvaluationPeriods`.
+    evaluation_periods: usize,
+    /// "Sets how this alarm is to handle missing data points."
+    /// (`MetricAlarm$TreatMissingData`)
+    treat_missing: &'alarm str,
 }
 
 /// One datapoint ONE evaluation evaluated.
@@ -539,19 +638,93 @@ impl State {
         now_secs: f64,
         budget: &mut EvaluationBudget,
     ) -> Option<Evaluation> {
-        // An alarm over a metric-math query array, a PromQL query or an anomaly-detection
-        // band is not evaluated from one stored series, so nothing is computed for it.
-        if alarm.metrics.is_some()
-            || alarm.evaluation_criteria.is_some()
-            || alarm.threshold_metric_id.is_some()
-        {
+        // An alarm over a PromQL query, and one whose threshold is an anomaly-detection band
+        // rather than a number, is not graded against a static threshold at all, so nothing
+        // is computed for it.
+        if alarm.evaluation_criteria.is_some() || alarm.threshold_metric_id.is_some() {
             return None;
         }
         let threshold = alarm.threshold?;
         let comparison = comparison_of(alarm.comparison_operator.as_deref()?)?;
+        let evaluation_periods = evaluated_periods(alarm)?;
+        // The windows of the EVALUATION RANGE: window 0 is the period the evaluation instant
+        // falls in, window i the period before it, and the range reaches further back than the
+        // look-back ([`EVALUATION_RANGE_FACTOR`]).
+        let range_periods = evaluation_range_periods(evaluation_periods);
+        // The series this alarm GRADES, as the value each of those windows took.
+        let graded = self.graded_series(alarm, range_periods, now_secs, budget)?;
+
+        let treat_missing = alarm.treat_missing_data.as_deref().unwrap_or(MISSING_MISSING);
+        // The REAL datapoints of the range, newest first and at most `EvaluationPeriods` of
+        // them: "all real data points in the evaluation range are included in the
+        // evaluation", and where the range holds more than the alarm evaluates, it is the
+        // most recent ones it evaluates.
+        let mut evaluated: Vec<Evaluated> = Vec::with_capacity(evaluation_periods);
+        for (index, window) in graded.windows.iter().enumerate() {
+            if evaluated.len() == evaluation_periods {
+                break;
+            }
+            let Some(datapoint) = window else {
+                continue;
+            };
+            evaluated.push(Evaluated {
+                window: Some(index),
+                value: Some(datapoint.value),
+                // How many observations the window stood for, which is what a decision record
+                // reports beside the value the statistic took over them.
+                sample_count: datapoint.sample_count,
+                datapoint: if (comparison.breaches)(datapoint.value, threshold) {
+                    Datapoint::Breaching
+                } else {
+                    Datapoint::NotBreaching
+                },
+            });
+        }
+        self.graded_evaluation(
+            alarm,
+            &graded,
+            GradedAgainst {
+                threshold,
+                comparison,
+                evaluation_periods,
+                treat_missing,
+            },
+            evaluated,
+            now_secs,
+        )
+    }
+
+    /// The series ONE alarm grades, as the value each window of its evaluation range took.
+    ///
+    /// Which series that is, is what the alarm's configuration says: an alarm over one metric
+    /// grades that metric folded by its own `Statistic` over its own `Period`, and an alarm
+    /// configured with a query array ("Use the `Metrics` parameter to create an alarm based on
+    /// a metric math expression", `PutMetricAlarmInput$Metrics`) grades the value of the query
+    /// that array RETURNS — the expression's output, not the metrics it reads. Either way the
+    /// values come from the datapoints `PutMetricData` stored and from nothing else.
+    fn graded_series<'alarm>(
+        &self,
+        alarm: &'alarm MetricAlarm,
+        range_periods: usize,
+        now_secs: f64,
+        budget: &mut EvaluationBudget,
+    ) -> Option<GradedSeries<'alarm>> {
+        match alarm.metrics.as_deref() {
+            Some(queries) => self.graded_query_array(queries, range_periods, now_secs, budget),
+            None => self.graded_metric(alarm, range_periods, now_secs, budget),
+        }
+    }
+
+    /// The windows of the ONE metric an alarm names, folded by the statistic it names.
+    fn graded_metric<'alarm>(
+        &self,
+        alarm: &'alarm MetricAlarm,
+        range_periods: usize,
+        now_secs: f64,
+        budget: &mut EvaluationBudget,
+    ) -> Option<GradedSeries<'alarm>> {
         let statistic = AlarmStatistic::of(alarm)?;
         let period = f64::from(alarm.period.filter(|period| *period >= 1)?);
-        let evaluation_periods = evaluated_periods(alarm)?;
         let key = watched_series(alarm);
         // An alarm this engine evaluates names the series it watches, which `watched_series`
         // resolves from those same members.
@@ -559,10 +732,7 @@ impl State {
             return None;
         }
 
-        // One pass over the series fills every window of the EVALUATION RANGE: window 0 is
-        // the period the evaluation instant falls in, window i the period before it, and the
-        // range reaches further back than the look-back ([`EVALUATION_RANGE_FACTOR`]).
-        let range_periods = evaluation_range_periods(evaluation_periods);
+        // One pass over the series fills every window of the evaluation range.
         let mut windows: Vec<Vec<&StoredDatum>> = vec![Vec::new(); range_periods];
         let series = self.metrics.get(&key);
         // The period the evaluation instant falls in, as a count of whole periods since the
@@ -594,32 +764,179 @@ impl State {
             }
         }
 
-        let treat_missing = alarm.treat_missing_data.as_deref().unwrap_or(MISSING_MISSING);
-        // The REAL datapoints of the range, newest first and at most `EvaluationPeriods` of
-        // them: "all real data points in the evaluation range are included in the
-        // evaluation", and where the range holds more than the alarm evaluates, it is the
-        // most recent ones it evaluates.
-        let mut evaluated: Vec<Evaluated> = Vec::with_capacity(evaluation_periods);
-        for (index, window) in windows.iter().enumerate() {
-            if evaluated.len() == evaluation_periods {
-                break;
+        Some(GradedSeries {
+            // The statistic the alarm folded its windows by, which its decision record names.
+            statistic: Some(statistic),
+            period,
+            windows: windows
+                .iter()
+                .map(|window| {
+                    statistic.over(window).map(|value| GradedDatapoint {
+                        value,
+                        // How many observations the window stood for, which is what a
+                        // decision record reports beside the value over them.
+                        sample_count: Some(window.iter().map(|datum| datum.sample_count).sum()),
+                    })
+                })
+                .collect(),
+        })
+    }
+
+    /// The windows of the series an alarm's `Metrics` query ARRAY grades: the value of the
+    /// query that array returns, computed over the same stored datapoints `GetMetricData`
+    /// answers the same array from ([`super::metric_query`]).
+    ///
+    /// `None` for an array this engine cannot resolve to ONE series — a malformed or
+    /// unevaluable expression, a query naming no stored metric, a value that is a number or
+    /// several series rather than one — so such an alarm keeps the state it has rather than
+    /// being given one nothing computed.
+    fn graded_query_array(
+        &self,
+        queries: &[MetricDataQuery],
+        range_periods: usize,
+        now_secs: f64,
+        budget: &mut EvaluationBudget,
+    ) -> Option<GradedSeries<'static>> {
+        // "When used in PutMetricAlarm, specify true for the one expression result to use as
+        // the alarm." … "If you omit this, the default of true is used."
+        // (`MetricDataQuery$ReturnData`) — the query that returns data is the one the alarm
+        // grades, whether it is an expression or a metric.
+        let graded = queries
+            .iter()
+            .find(|query| query.return_data != Some(false))?;
+        let period = graded_period(queries, graded);
+        // The range the array is resolved over is exactly the windows the evaluation grades:
+        // anchored at multiples of the period, the newest being the one this instant falls in.
+        let current_period = (now_secs / period).floor();
+        #[allow(clippy::cast_precision_loss)]
+        let start = (current_period - (range_periods.saturating_sub(1) as f64)) * period;
+        let end = (current_period + 1.0) * period;
+
+        // How much work this array asks for is bounded BEFORE anything is parsed or folded:
+        // the queries of the array and the windows of the range are the factors of every walk
+        // below, so an array past what one resolution may do leaves the alarm in the state it
+        // has rather than being graded from a part of itself.
+        if budget.spent()
+            || super::metric_query::resolution_refusal(queries, start, end).is_some()
+        {
+            return None;
+        }
+        // Every expression is parsed, and the order they are evaluated in settled, before any
+        // of them is evaluated, exactly as a request over the same array is answered.
+        let parsed = super::metric_query::parse_queries(queries).ok()?;
+        let order = super::metric_query::evaluation_order(queries, &parsed).ok()?;
+        let mut resolution = super::metric_query::Resolution::default();
+        for query in queries {
+            // The queries of ONE array are the second factor of this pass's work, so the
+            // budget is checked between them too: an array the budget does not reach leaves the
+            // alarm due for the next call rather than being graded from a part of itself.
+            if budget.spent() {
+                return None;
             }
-            let Some(value) = statistic.over(window) else {
+            let Some(stat) = query.metric_stat.as_ref() else {
                 continue;
             };
-            evaluated.push(Evaluated {
-                window: Some(index),
-                value: Some(value),
-                // How many observations the window stood for, which is what a decision record
-                // reports beside the value the statistic took over them.
-                sample_count: Some(window.iter().map(|datum| datum.sample_count).sum()),
-                datapoint: if (comparison.breaches)(value, threshold) {
-                    Datapoint::Breaching
-                } else {
-                    Datapoint::NotBreaching
-                },
-            });
+            // The datapoints this query's fold is about to visit, charged before it visits
+            // them, as for an alarm over one metric.
+            budget.charge_datapoints(
+                super::metric_query::query_series_key(stat)
+                    .and_then(|key| self.metrics.get(&key))
+                    .map_or(0, Vec::len),
+            );
+            let series =
+                super::metric_query::retrieved_series(self, query, stat, start, end, now_secs)
+                    .ok()?;
+            resolution.retrieve(query, series).ok()?;
         }
+        for id in order {
+            if budget.spent() {
+                return None;
+            }
+            let tree = parsed.get(id)?;
+            let evaluated = resolution
+                .evaluate(
+                    id,
+                    tree,
+                    &super::metric_query::StoreSeriesSource {
+                        store: self,
+                        requested_start: start,
+                        end,
+                        now: now_secs,
+                    },
+                    (start, end),
+                    period,
+                )
+                .ok()?;
+            resolution.record(id, evaluated);
+        }
+
+        // "Any expression used in a PutMetricAlarm operation must return a single time
+        // series." (`MetricDataQuery`) — a number is no series at all, and an array of
+        // several is not the one series an alarm watches.
+        let points = match resolution.value(&graded.id)? {
+            MathValue::Series(series) => &series.points,
+            MathValue::Array(series) if series.len() == 1 => &series.first()?.points,
+            _ => return None,
+        };
+        // Which window each point of that series belongs to is decided by its own time stamp,
+        // the same anchoring an alarm over one metric folds its datapoints by; where a series
+        // carries several points inside one window — an expression spaced finer than the
+        // period it is graded in — the window took the NEWEST of them.
+        let mut graded_windows: Vec<Option<(f64, GradedDatapoint)>> = vec![None; range_periods];
+        for (timestamp, value) in points {
+            // A point the arithmetic produced no finite number for is not a value the alarm
+            // can grade, and it is reported as dropped rather than graded as a zero.
+            if !value.is_finite() {
+                continue;
+            }
+            let periods_back = (current_period - (timestamp / period).floor()).max(0.0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let index = periods_back as usize;
+            let Some(slot) = graded_windows.get_mut(index) else {
+                continue;
+            };
+            if slot.is_none_or(|(held, _)| *timestamp >= held) {
+                *slot = Some((
+                    *timestamp,
+                    GradedDatapoint {
+                        value: *value,
+                        // Nothing measured a sample count for a value an expression computed:
+                        // the series is not one metric's observations.
+                        sample_count: None,
+                    },
+                ));
+            }
+        }
+        Some(GradedSeries {
+            // No single statistic describes a series a query array computed, so its decision
+            // record names none.
+            statistic: None,
+            period,
+            windows: graded_windows
+                .into_iter()
+                .map(|slot| slot.map(|(_, datapoint)| datapoint))
+                .collect(),
+        })
+    }
+
+    /// The state the alarm's "M out of N" predicate puts it in over the datapoints `evaluated`,
+    /// with the explanation it reports — the one verdict every metric alarm is decided by,
+    /// whatever series it grades.
+    fn graded_evaluation(
+        &self,
+        alarm: &MetricAlarm,
+        graded: &GradedSeries<'_>,
+        against: GradedAgainst<'_>,
+        mut evaluated: Vec<Evaluated>,
+        now_secs: f64,
+    ) -> Option<Evaluation> {
+        let GradedAgainst {
+            threshold,
+            comparison,
+            evaluation_periods,
+            treat_missing,
+        } = against;
+        let period = graded.period;
         // What the missing-data treatment fills the slots no real datapoint filled with: a
         // substituted datapoint under `breaching` and `notBreaching`, and nothing at all
         // under `missing` and `ignore`, which leave the evaluation with fewer datapoints.
@@ -729,7 +1046,7 @@ impl State {
                 &cited_datapoints(&evaluated, now_secs, period),
             ),
             reason_data: state_reason_data(
-                &statistic,
+                graded.statistic.as_ref(),
                 period,
                 threshold,
                 now_secs,
@@ -813,6 +1130,7 @@ fn comparison_of(comparison: &str) -> Option<Comparison> {
 }
 
 /// The statistic one alarm aggregates each of its windows with.
+#[derive(Debug, Clone, Copy)]
 enum AlarmStatistic<'a> {
     /// "The statistic for the metric specified in MetricName" — one of the basic five
     /// (`MetricAlarm$Statistic`).
@@ -1130,8 +1448,11 @@ fn decimal_text(value: f64) -> String {
 /// truncated to fit: the datapoint list is dropped instead when an alarm evaluates more
 /// windows than the bound holds. Every instant inside it is written in the form a document of
 /// this service stamps an instant with ([`super::document_instant`]).
+///
+/// The statistic is the one the graded series was FOLDED by, so a series a query array
+/// computed — which no single statistic describes — contributes no statistic member.
 fn state_reason_data(
-    statistic: &AlarmStatistic<'_>,
+    statistic: Option<&AlarmStatistic<'_>>,
     period: f64,
     threshold: f64,
     now_secs: f64,
@@ -1155,12 +1476,14 @@ fn state_reason_data(
     {
         document.insert("startDate".to_string(), Value::from(at));
     }
-    let member = if statistic.is_percentile() {
-        "extendedStatistic"
-    } else {
-        "statistic"
-    };
-    document.insert(member.to_string(), Value::from(statistic.name()));
+    if let Some(statistic) = statistic {
+        let member = if statistic.is_percentile() {
+            "extendedStatistic"
+        } else {
+            "statistic"
+        };
+        document.insert(member.to_string(), Value::from(statistic.name()));
+    }
     document.insert("period".to_string(), Value::from(period));
     document.insert("threshold".to_string(), Value::from(threshold));
     // The values the evaluation really had, oldest first — the order they were observed in.
