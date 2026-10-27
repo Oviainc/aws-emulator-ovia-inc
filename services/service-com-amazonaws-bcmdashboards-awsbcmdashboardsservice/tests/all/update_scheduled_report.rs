@@ -104,9 +104,21 @@ fn cases(other_dashboard: &str, other_widget: &str) -> Vec<UpdateCase> {
             )],
         },
         UpdateCase {
+            // The report keeps the widget id it was created with, which belongs to the
+            // dashboard it no longer points at — so the stored configuration no longer
+            // resolves, and the health every view derives from the store says so.
             label: "dashboard re-pointed at another stored dashboard",
             request: json!({"dashboardArn": other_dashboard}),
-            expected: vec![("dashboardArn", Some(json!(other_dashboard)))],
+            expected: vec![
+                ("dashboardArn", Some(json!(other_dashboard))),
+                (
+                    "healthStatus",
+                    Some(json!({
+                        "statusCode": "UNHEALTHY",
+                        "statusReasons": ["WIDGET_ID_NOT_FOUND"]
+                    })),
+                ),
+            ],
         },
         UpdateCase {
             label: "execution role replaced",
@@ -146,9 +158,21 @@ fn cases(other_dashboard: &str, other_widget: &str) -> Vec<UpdateCase> {
             )],
         },
         UpdateCase {
+            // The replacement names a widget of the OTHER dashboard, which the report
+            // still does not point at — the same mismatch, reached from the other side,
+            // so the derived health reports it too.
             label: "widget ids replaced with another dashboard's widget",
             request: json!({"widgetIds": [other_widget]}),
-            expected: vec![("widgetIds", Some(json!([other_widget])))],
+            expected: vec![
+                ("widgetIds", Some(json!([other_widget]))),
+                (
+                    "healthStatus",
+                    Some(json!({
+                        "statusCode": "UNHEALTHY",
+                        "statusReasons": ["WIDGET_ID_NOT_FOUND"]
+                    })),
+                ),
+            ],
         },
         UpdateCase {
             // `WidgetIdList` admits the empty list (len ..1), and an empty list present is
