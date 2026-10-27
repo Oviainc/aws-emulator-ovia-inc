@@ -71,6 +71,8 @@ mod state_roundtrip;
 mod update_fleet;
 #[path = "all/update_project.rs"]
 mod update_project;
+#[path = "all/update_report_group.rs"]
+mod update_report_group;
 #[path = "all/webhook_access_token.rs"]
 mod webhook_access_token;
 #[path = "all/webhook_lifecycle.rs"]
