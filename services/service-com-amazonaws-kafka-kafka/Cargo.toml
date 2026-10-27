@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Matches a replication flow's TopicsToReplicate / TopicsToExclude patterns, which
+# the model documents as regular expressions, against a source cluster's topics.
+regex = "1.13"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
