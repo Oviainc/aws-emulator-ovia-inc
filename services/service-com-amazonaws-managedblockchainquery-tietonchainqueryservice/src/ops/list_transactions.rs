@@ -101,6 +101,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Which members of this request bound the window the listing covers, for the shared
+/// window rule (`crate::state::InstantWindow`).
+///
+/// The `fieldList` entry names `BlockchainInstant`, the shape BOTH members target, because
+/// the rule is about the pair rather than about either member on its own.
+const WINDOW_MEMBERS: crate::state::WindowMembers = crate::state::WindowMembers {
+    field: "BlockchainInstant",
+    from: "fromBlockchainInstant",
+    to: "toBlockchainInstant",
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -182,31 +193,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validation::list_transactions_input(&input)
             .map_err(ListTransactionsErrorModeled::ValidationException)?;
 
+        // `fromBlockchainInstant`/`toBlockchainInstant` bound the window the listing
+        // covers. Both halves of that rule — which pairs of bounds are refused, and which
+        // records a window keeps — are `crate::state::InstantWindow`'s, shared with the
+        // other listing a request narrows by an instant window, so the two can never
+        // disagree about a boundary. Like the validation above it, this runs before the
+        // store is reached.
+        let window = crate::state::InstantWindow::from_bounds(
+            input.from_blockchain_instant.as_ref(),
+            input.to_blockchain_instant.as_ref(),
+            WINDOW_MEMBERS,
+        )
+        .map_err(|field| {
+            ListTransactionsErrorModeled::ValidationException(crate::state::validation_exception(
+                vec![field],
+            ))
+        })?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTransactionsErrorModeled::InternalServerException(crate::state::store_unavailable())
         })?;
         let state = state.lock();
-
-        // `fromBlockchainInstant`/`toBlockchainInstant` bound the window the listing
-        // covers; a window that ends before it starts selects nothing a caller could
-        // have meant, so it is refused rather than answered with an empty page. The
-        // model cannot state an ordering between two members, so this is a rule of this
-        // service: the generic message, with the explanation in `fieldList` under the
-        // shape BOTH members target, which is the field the rule is about.
-        let from = crate::state::instant_to_secs(input.from_blockchain_instant.as_ref());
-        let to = crate::state::instant_to_secs(input.to_blockchain_instant.as_ref());
-        if let (Some(earliest), Some(latest)) = (from, to) {
-            if earliest > latest {
-                return Err(ListTransactionsErrorModeled::ValidationException(
-                    crate::state::field_validation_exception(
-                        "BlockchainInstant",
-                        "The 'time' field in fromBlockchainInstant must be less than or equal \
-                         to the 'time' field in toBlockchainInstant.",
-                    ),
-                )
-                .into());
-            }
-        }
 
         // `ListTransactionsSort$sortOrder`: "Not providing SortOrder will default to
         // ASCENDING." `sortBy` declares exactly one value, TRANSACTION_TIMESTAMP, which
@@ -227,12 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|ledger| ledger.for_address(&input.address))
             .unwrap_or_default()
             .into_iter()
-            .filter(|transaction| {
-                from.is_none_or(|earliest| transaction.transaction_timestamp >= earliest)
-            })
-            .filter(|transaction| {
-                to.is_none_or(|latest| transaction.transaction_timestamp <= latest)
-            })
+            .filter(|transaction| window.contains(transaction.transaction_timestamp))
             // `ConfirmationStatusFilter$include`: "Transactions that have reached
             // finality are always part of the response", so the filter decides only
             // whether the transactions that have NOT reached it are included too.

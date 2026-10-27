@@ -1015,6 +1015,83 @@ pub fn now_secs() -> i64 {
         .unwrap_or_default()
 }
 
+/// Which members of one request bound the instant window its listing covers.
+///
+/// A listing carries the window as its own pair of members —
+/// `fromBlockchainInstant`/`toBlockchainInstant` on one, `timeFilter.from`/`timeFilter.to`
+/// on another — so the member paths are what an operation supplies to the one window rule
+/// below, and each refusal still names the members a caller would repair.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowMembers {
+    /// The `ValidationExceptionField$name` a refused window is reported under: the member
+    /// the rule is stated about, or the shape both members target when the rule is about
+    /// the pair itself (see [`validation_field`]).
+    pub field: &'static str,
+    /// The dotted path of the member carrying the START of the window.
+    pub from: &'static str,
+    /// The dotted path of the member carrying the END of the window.
+    pub to: &'static str,
+}
+
+/// The instant window a listing covers, in whole seconds: each bound the request carried,
+/// INCLUSIVE, and nothing bounded at an end it carried none for.
+///
+/// The one home of the two-part window rule every listing a request can narrow by an
+/// instant shares — which pairs of bounds are refused ([`InstantWindow::from_bounds`]) and
+/// which records a window keeps ([`InstantWindow::contains`]) — so no two listings can
+/// disagree about either half, and a later change to a boundary reaches all of them.
+#[derive(Debug, Clone, Copy)]
+pub struct InstantWindow {
+    /// The earliest instant listed, inclusive; `None` bounds nothing below.
+    pub from: Option<i64>,
+    /// The latest instant listed, inclusive; `None` bounds nothing above.
+    pub to: Option<i64>,
+}
+
+impl InstantWindow {
+    /// The window a request bounded at neither end: it keeps every record.
+    pub const UNBOUNDED: Self = Self {
+        from: None,
+        to: None,
+    };
+
+    /// The window a request's pair of `BlockchainInstant` members names, or the
+    /// `fieldList` entry that refuses it.
+    ///
+    /// A window that ends before it starts selects nothing a caller could have meant, so
+    /// it is refused rather than answered with an empty page. The model cannot state an
+    /// ordering between two members, so this is a rule of this service: the generic
+    /// message, with the explanation in `fieldList` under the member `members` names.
+    pub fn from_bounds(
+        from: Option<&BlockchainInstant>,
+        to: Option<&BlockchainInstant>,
+        members: WindowMembers,
+    ) -> Result<Self, ValidationExceptionField> {
+        let window = Self {
+            from: instant_to_secs(from),
+            to: instant_to_secs(to),
+        };
+        match (window.from, window.to) {
+            (Some(earliest), Some(latest)) if earliest > latest => Err(validation_field(
+                members.field,
+                format!(
+                    "The 'time' field in {} must be less than or equal to the 'time' field \
+                     in {}.",
+                    members.from, members.to
+                ),
+            )),
+            _ => Ok(window),
+        }
+    }
+
+    /// Whether a record at `instant` (whole seconds) is inside the window: every bound the
+    /// request carried is inclusive, so a record exactly ON a bound is listed.
+    pub fn contains(&self, instant: i64) -> bool {
+        self.from.is_none_or(|earliest| instant >= earliest)
+            && self.to.is_none_or(|latest| instant <= latest)
+    }
+}
+
 /// A transaction hash or id reduced to the form the ledger is keyed by.
 ///
 /// The modelled `QueryTransactionHash`/`QueryTransactionId` pattern
