@@ -9,10 +9,14 @@
 //! ARN is echoed back exactly as it was sent.
 //!
 //! The tables span what that rule generalises over: every implemented operation that
-//! resolves an ARN (read, delete, update, list, create-under-a-parent), all three
-//! resource levels (cluster, control panel, routing control) and several fillings of the
-//! ARN's own variable parts — account id, a lowercase UUID, an upper-case-hex UUID and a
-//! non-UUID tail.
+//! ADDRESSES a resource by ARN (read, delete, update, list), all three resource levels
+//! (cluster, control panel, routing control) and several fillings of the ARN's own
+//! variable parts — account id, a lowercase UUID, an upper-case-hex UUID and a non-UUID
+//! tail.
+//!
+//! A create that merely REFERENCES a parent by ARN is NOT in this table: it resolves no
+//! resource of its own, so it is refused on its input instead — see
+//! `tests/all/rejection_error_classes.rs`.
 
 use serde_json::{json, Value};
 
@@ -97,22 +101,6 @@ fn cluster_cases(cluster_arn: &str) -> Vec<Case> {
             noun: "cluster",
             requested_arn: cluster_arn.to_string(),
         },
-        Case {
-            label: format!("CreateControlPanel(ClusterArn={cluster_arn})"),
-            method: "POST",
-            path: "/controlpanel".to_string(),
-            body: Some(json!({ "ClusterArn": cluster_arn, "ControlPanelName": "orphan-panel" })),
-            noun: "cluster",
-            requested_arn: cluster_arn.to_string(),
-        },
-        Case {
-            label: format!("CreateRoutingControl(ClusterArn={cluster_arn})"),
-            method: "POST",
-            path: "/routingcontrol".to_string(),
-            body: Some(json!({ "ClusterArn": cluster_arn, "RoutingControlName": "orphan-rc" })),
-            noun: "cluster",
-            requested_arn: cluster_arn.to_string(),
-        },
     ]
 }
 
@@ -176,8 +164,7 @@ async fn an_unresolvable_arn_is_refused_with_the_no_record_sentence() {
 
     // A real cluster exists throughout, so a refusal is about the ARN the request names
     // and not about an empty store.
-    let present = create_cluster(&router, json!({ "ClusterName": "present" })).await;
-    let present_arn = present["ClusterArn"].as_str().unwrap_or_default().to_string();
+    create_cluster(&router, json!({ "ClusterName": "present" })).await;
 
     let mut cases: Vec<Case> = Vec::new();
     for account in ACCOUNTS {
@@ -190,22 +177,6 @@ async fn an_unresolvable_arn_is_refused_with_the_no_record_sentence() {
             cases.extend(routing_control_cases(&control_arn));
         }
     }
-
-    // A control panel ARN that resolves to nothing UNDER a cluster that does exist: the
-    // refusal names the panel, the resource that could not be resolved.
-    let unknown_panel = arn("000000000000", "controlpanel/22222222-2222-2222-2222-222222222222");
-    cases.push(Case {
-        label: format!("CreateRoutingControl(ControlPanelArn={unknown_panel}) under a real cluster"),
-        method: "POST",
-        path: "/routingcontrol".to_string(),
-        body: Some(json!({
-            "ClusterArn": present_arn,
-            "ControlPanelArn": unknown_panel,
-            "RoutingControlName": "orphan-of-a-real-cluster",
-        })),
-        noun: "control panel",
-        requested_arn: unknown_panel.clone(),
-    });
 
     for case in cases {
         let (status, answer) = call(&router, case.method, &case.path, case.body.clone()).await;

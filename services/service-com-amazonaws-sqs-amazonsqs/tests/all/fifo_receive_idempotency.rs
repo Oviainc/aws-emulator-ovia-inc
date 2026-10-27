@@ -32,7 +32,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{
     all_attributes, as_map, attribute_count, call, create, create_ok, emulator,
-    emulator_over_engine, error_code, messages, ok,
+    emulator_over_engine, error_code, fifo_attributes as fifo, messages, ok,
 };
 
 /// What one receive handed over, as the tuple a retry must reproduce exactly: the
@@ -50,16 +50,6 @@ type AttributePairRow<'a> = (&'a str, &'a [(&'a str, &'a str)], bool);
 /// One row of the `SetQueueAttributes` table: the case, the queue, the attributes to set
 /// and whether the call is accepted.
 type SetAttributeRow<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)], bool);
-
-/// The attributes a FIFO queue is created with here; a FIFO queue name always carries
-/// the `.fifo` suffix.
-fn fifo(extra: &[(&str, &str)]) -> Value {
-    let mut attributes = json!({ "FifoQueue": "true" });
-    for (name, value) in extra {
-        attributes[*name] = json!(value);
-    }
-    attributes
-}
 
 /// Send one message to a FIFO queue and return the `MessageId` it was accepted under.
 async fn send_one(

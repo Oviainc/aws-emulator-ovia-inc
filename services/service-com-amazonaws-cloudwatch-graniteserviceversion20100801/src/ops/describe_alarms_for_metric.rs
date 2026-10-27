@@ -160,6 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // actions those transitions owe — exactly as `DescribeAlarms` does: which call a
         // client happens to read an alarm through cannot change the state it is told.
         crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+        // And, exactly as `DescribeAlarms` does, it leaves the clock running for the
+        // evaluations that are not due yet, whose actions deliver on their own targets.
+        crate::state::alarm_actions::drive_alarm_clock(&self.engine, ctx);
         let store = state.lock();
 
         // "The dimensions associated with the metric. If the metric has any associated

@@ -437,15 +437,11 @@ fn user_detail(store: &IamStore, user_key: &str, user: &User) -> UserDetail {
         // "A list of IAM groups that the user is in": the memberships the account
         // holds, each reported by the group's name as the account holds it — the
         // membership is keyed by the case-folded name, so the name comes from the
-        // group's own record — in the key order that map is ordered on. While
-        // `AddUserToGroup` is a scaffolded 501 nothing fills the map, which this
-        // derivation answers with an empty list of its own accord.
+        // group's own record — in the key order that map is ordered on.
         group_list: Some(
             store
-                .group_members
-                .iter()
-                .filter(|(_, members)| members.contains(user_key))
-                .filter_map(|(group_key, _)| store.groups.get(group_key))
+                .group_keys_held_by(user_key)
+                .filter_map(|group_key| store.groups.get(group_key))
                 .map(|group| group.group_name.clone())
                 .collect(),
         ),

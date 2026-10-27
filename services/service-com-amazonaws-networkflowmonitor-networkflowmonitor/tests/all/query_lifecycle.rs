@@ -16,9 +16,10 @@
 //! 2. A `StartQuery*` request whose `endTime` precedes its `startTime` names no
 //!    window and is refused with the modelled `ValidationException`.
 //! 3. A started query is a record in this service's store: its status moves
-//!    `QUEUED` -> `RUNNING` -> `SUCCEEDED` on the clock alone, `StopQuery*` moves it
-//!    to the terminal `CANCELED`, its results are reported only once it has
-//!    SUCCEEDED, and then in the unit of the metric it was STARTED with.
+//!    `QUEUED` -> `RUNNING` -> `SUCCEEDED` on the clock alone, `StopQuery*` moves a
+//!    query that is still moving to the terminal `CANCELED` and leaves a terminal
+//!    one as it is, its results are reported only once it has SUCCEEDED, and then
+//!    in the unit of the metric it was STARTED with.
 
 use std::time::Duration;
 
@@ -561,16 +562,14 @@ async fn query_results_report_the_unit_of_the_metric_the_query_was_started_with(
     // The catalog is the two metric enums crossed with `MetricUnit`
     // (`smithy_query(query="shape", shape="MonitorMetric,WorkloadInsightsMetric,
     // MetricUnit")`): a byte count for data transferred, a duration for a round
-    // trip, a plain count for the two event metrics. Every value of `MonitorMetric`
-    // is here, not just the issue's `DATA_TRANSFERRED`.
+    // trip, a plain count for the two event metrics.
     // Every value of `MonitorMetric` is here, not just the issue's
     // `DATA_TRANSFERRED`; `WorkloadInsightsMetric` declares three of the four, and
-    // only the DATA query models a `unit` member.
+    // only the DATA query models a `unit` member that is `@required`, so it is the
+    // one family that reports a unit for a result set with no rows. The monitor
+    // family's own `unit` is OPTIONAL and is covered, over the same metrics, by
+    // `query_terminal_and_result_reporting.rs`.
     let rows: &[(Family, &str, &str)] = &[
-        (Family::Monitor, "DATA_TRANSFERRED", "Bytes"),
-        (Family::Monitor, "ROUND_TRIP_TIME", "Milliseconds"),
-        (Family::Monitor, "TIMEOUTS", "Count"),
-        (Family::Monitor, "RETRANSMISSIONS", "Count"),
         (Family::WorkloadInsightsData, "DATA_TRANSFERRED", "Bytes"),
         (Family::WorkloadInsightsData, "TIMEOUTS", "Count"),
         (Family::WorkloadInsightsData, "RETRANSMISSIONS", "Count"),
@@ -732,7 +731,7 @@ async fn stopping_a_query_cancels_it_and_a_second_stop_is_a_replay() {
 }
 
 #[tokio::test]
-async fn stopping_a_query_that_already_finished_is_refused() {
+async fn stopping_a_query_that_already_finished_is_accepted_and_changes_nothing() {
     let plane = Plane::new().await;
 
     for family in FAMILIES {
@@ -754,24 +753,19 @@ async fn stopping_a_query_that_already_finished_is_refused() {
             settled.text("status")
         );
 
+        // The stop is an idempotent fire-and-forget: there is nothing left to stop,
+        // so it succeeds without overwriting the outcome the query reached.
         let stopped = plane.stop(*family, &query_id).await;
         assert_eq!(
-            stopped.status, 400,
-            "case {family:?}: expected 400 for stopping a finished query, got {} with body {}",
+            stopped.status, 200,
+            "case {family:?}: expected 200 for stopping a finished query, got {} with body {}",
             stopped.status, stopped.body
         );
-        assert!(
-            is_error(&stopped, "ValidationException"),
-            "case {family:?}: expected ValidationException, got {:?} / body {}",
-            stopped.error_type,
-            stopped.body
-        );
-        // The refused stop changed nothing.
         let after = plane.status(*family, &query_id).await;
         assert_eq!(
             after.text("status"),
             "SUCCEEDED",
-            "case {family:?}: a refused stop leaves the query as it was, got {:?}",
+            "case {family:?}: the stop must leave the terminal outcome alone, got {:?}",
             after.text("status")
         );
     }

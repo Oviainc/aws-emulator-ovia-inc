@@ -70,12 +70,15 @@ fn transition_window() -> Duration {
 /// record has a standby zone to preserve), the Region and Availability Zone the
 /// database lives in, and which parameter is left waiting for the engine to come
 /// back up.
+///
+/// `pub(crate)` together with [`ROWS`] and the helpers below so a sibling suite
+/// drives the same set of databases rather than keeping a second table of them.
 #[derive(Debug)]
-struct Row {
-    case: &'static str,
+pub(crate) struct Row {
+    pub(crate) case: &'static str,
     blueprint_id: &'static str,
     bundle_id: &'static str,
-    availability_zone: &'static str,
+    pub(crate) availability_zone: &'static str,
     region: &'static str,
     /// A parameter of THIS row's engine, from the set
     /// `GetRelationalDatabaseParameters` publishes for it, and a value inside the
@@ -85,7 +88,7 @@ struct Row {
 }
 
 /// The databases every case here stops and starts.
-const ROWS: &[Row] = &[
+pub(crate) const ROWS: &[Row] = &[
     Row {
         case: "mysql, smallest standard bundle",
         blueprint_id: "mysql_8_4",
@@ -150,7 +153,7 @@ fn create_body(row: &Row, name: &str) -> Value {
 
 /// Create the database `name` for `row` and answer the emulator it lives in, once
 /// the clock has settled it into `available`.
-async fn with_available_database(row: &Row, name: &str) -> Emulator {
+pub(crate) async fn with_available_database(row: &Row, name: &str) -> Emulator {
     let emulator = Emulator::new();
     emulator
         .ok("CreateRelationalDatabase", create_body(row, name))
@@ -160,7 +163,7 @@ async fn with_available_database(row: &Row, name: &str) -> Emulator {
 }
 
 /// The stored database `name`, as `GetRelationalDatabase` reports it.
-async fn database(emulator: &Emulator, name: &str) -> Value {
+pub(crate) async fn database(emulator: &Emulator, name: &str) -> Value {
     emulator
         .ok(
             "GetRelationalDatabase",
@@ -171,7 +174,7 @@ async fn database(emulator: &Emulator, name: &str) -> Value {
 }
 
 /// The stored database `name`, once the clock has settled it into `state`.
-async fn wait_for_state(emulator: &Emulator, name: &str, state: &str) -> Value {
+pub(crate) async fn wait_for_state(emulator: &Emulator, name: &str, state: &str) -> Value {
     let deadline = Instant::now() + SETTLE_TIMEOUT;
     loop {
         let read = database(emulator, name).await;
@@ -188,7 +191,7 @@ async fn wait_for_state(emulator: &Emulator, name: &str, state: &str) -> Value {
 
 /// `record` without its `member`, so two reads can be compared on everything
 /// else.
-fn without(record: &Value, member: &str) -> Value {
+pub(crate) fn without(record: &Value, member: &str) -> Value {
     let mut copy = record.clone();
     if let Some(object) = copy.as_object_mut() {
         object.remove(member);
