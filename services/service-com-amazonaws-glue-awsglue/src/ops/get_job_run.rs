@@ -173,11 +173,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only write a read makes: the state changes the clock had already made due.
         job.settle_due_runs(now);
 
+        // A run this job does not hold is refused in the service's own fixed words for
+        // that miss ([`crate::state::messages::JOB_RUN_NOT_FOUND`]), which carry neither
+        // the requested run id nor the job name: the refusal a client matches on does not
+        // depend on what was asked.
         let Some(run) = job.run(&input.run_id) else {
-            return Err(not_found(format!(
-                "Job run {} not found for job {}",
-                input.run_id, input.job_name
-            )));
+            return Err(not_found(
+                crate::state::messages::JOB_RUN_NOT_FOUND.to_string(),
+            ));
         };
 
         // `PredecessorsIncluded` asks for "a list of predecessor runs", which are the
