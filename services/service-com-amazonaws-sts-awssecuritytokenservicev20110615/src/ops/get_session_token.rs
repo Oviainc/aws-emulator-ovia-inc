@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = ctx.credential_store();
         let now = ::std::time::SystemTime::now();
-        let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+        let access_key_id = ::service_common::request_access_key_id(ctx.parts());
         // The identity a long-term key speaks for comes from the IAM store, read before
         // the session lock is taken so the two are never held at once.
         let long_term = {

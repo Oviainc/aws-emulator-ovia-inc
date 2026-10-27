@@ -119,6 +119,38 @@ Expected: XML ErrorResponse, code InvalidIdentityToken, HTTP 400, message "The I
 
 Cause 9 — sts.the-assume-role-allow-decision-is-served-from-cache-after-the-trust-policy-tightens: "AssertionError: AssumeRole was refused on the FIRST attempt after the trust policy was tightened, with no cached ALLOW observed: the control plane reported the new document at 0.0s and the refusal arrived at 0.0s."
 
+## Resolution
+
+Causes 2, 4, 5 and 7 are implemented; cause 3 is implemented in STS; causes 6 and 8 were
+already correct by the time this was worked and are now pinned by tests. Three causes are
+NOT implemented and stay open work — they are recorded here so they remain discoverable:
+
+- Cause 1 (temporary access key ids are not ASIA-class) is BLOCKED in the read-only core.
+  Every credential is minted by the core credential store, which hardcodes the class
+  (`vendor/server/src/aws_credentials.rs:47` mints `EMULATORAK`, `:57` mints `EMULATORAS`,
+  and `:12-15` states the choice deliberately), and no service can define another kind:
+  `CredentialKind` is sealed by a `pub(crate)` module
+  (`vendor/server/src/credential_store.rs:17` and `:92`) and `create` takes only a
+  `&'static dyn CredentialKind` (`:33`). The core change needed is in `AwsSession::mint` /
+  `AwsAccessKey::mint` (or a key-class parameter on `CredentialKind`): emit `ASIA` for a
+  session and `AKIA` for a long-term key. The tree already expects that class —
+  `services/common/src/management_events.rs:88-121` classifies a caller as `AssumedRole`
+  by the `ASIA` prefix and therefore never fires.
+- Cause 3's cross-service half (an assumed-role session REFUSED on `iam:ListRoles` /
+  `s3:ListObjectsV2` when its `aws:PrincipalTag` does not satisfy the role's permission
+  policy) needs identity-policy enforcement for STS sessions in those services. IAM has
+  the evaluation but allows a session credential outright
+  (`services/service-com-amazonaws-iam-awsidentitymanagementv20100508/src/state/authorization.rs:213-217`)
+  and cannot read the STS session registry, because STS depends on IAM
+  (`services/service-com-amazonaws-sts-awssecuritytokenservicev20110615/Cargo.toml`), so
+  the registry would have to move into `services/common`; S3 has no identity-policy
+  evaluation at all.
+- Cause 9 (an `AssumeRole` ALLOW served from cache for ~5 minutes after the trust policy
+  tightens) is not modelled: the window is an undocumented per-run latency of AWS's
+  internal caches, and the emulator implements the stricter invariant that every
+  `AssumeRole` decides against the document stored at that moment, pinned by
+  `services/service-com-amazonaws-sts-awssecuritytokenservicev20110615/tests/all/trust_policy_convergence.rs`.
+
 ## Steps to Reproduce
 1. Clone the repo, boot the emulator and replay suite simparity-behavioral-ga-prod-v1.
 2. Re-replay exactly the check ids listed in trace_ids; each cause's checks are named under its own 'Traces:' line in the description.

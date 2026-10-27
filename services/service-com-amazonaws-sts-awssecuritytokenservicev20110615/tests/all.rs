@@ -20,11 +20,20 @@ mod malformed_session_policy;
 #[path = "all/packed_policy_budget.rs"]
 mod packed_policy_budget;
 
+#[path = "all/query_parameter_signing.rs"]
+mod query_parameter_signing;
+
+#[path = "all/session_tag_conditions.rs"]
+mod session_tag_conditions;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
 #[path = "all/sts_authorization.rs"]
 mod sts_authorization;
+
+#[path = "all/sts_refusal_wording.rs"]
+mod sts_refusal_wording;
 
 #[path = "all/sts_sessions.rs"]
 mod sts_sessions;
