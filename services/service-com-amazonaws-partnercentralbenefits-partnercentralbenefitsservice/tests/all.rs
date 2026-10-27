@@ -29,6 +29,8 @@ mod benefit_allocations;
 mod benefit_application_lifecycle;
 #[path = "all/benefit_catalog_record.rs"]
 mod benefit_catalog_record;
+#[path = "all/catalog_refusal_one_construction.rs"]
+mod catalog_refusal_one_construction;
 #[path = "all/cancel_client_token_idempotency.rs"]
 mod cancel_client_token_idempotency;
 #[path = "all/client_token_idempotency.rs"]

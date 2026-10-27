@@ -273,16 +273,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                 })?;
-            // "Only one operation can be performed for a stack set at a given time."
-            if stack_set.operation_in_progress() {
+            // "Only one operation can be performed for a stack set at a given time": the
+            // refusal names the StackSet it is about and the operation that still holds it.
+            if let Some(in_flight) = stack_set.operation_in_flight() {
                 return Err(
                     CreateStackInstancesErrorModeled::OperationInProgressException(
                         OperationInProgressException {
                             message: Some(
-                                "Another operation is currently in progress for this StackSet. \
-                                 Only one operation can be performed for a stack set at a given \
-                                 time."
-                                    .to_string(),
+                                crate::state::stack_sets::operation_in_progress_message(
+                                    &stack_set.stack_set_arn,
+                                    &in_flight.operation_id,
+                                ),
                             ),
                         },
                     )

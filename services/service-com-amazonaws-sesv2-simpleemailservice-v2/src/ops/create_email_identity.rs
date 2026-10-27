@@ -244,13 +244,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|tag| (tag.key, tag.value))
             .collect();
 
-        let output = CreateEmailIdentityOutput {
-            identity_type: Some(record.identity_kind.as_str().to_string()),
-            verified_for_sending_status: record.verified_for_sending,
-            dkim_attributes: Some(record.dkim_attributes()),
-        };
+        let identity_type = Some(record.identity_kind.as_str().to_string());
+        let verified_for_sending_status = record.verified_for_sending;
+        // The DKIM attributes are reported from the store, not from the new record on
+        // its own: an address identity under a domain identity carries no DKIM
+        // configuration of its own, so this response states the attributes every
+        // later read of the new identity states.
+        let dkim_attributes = Some(store.dkim_attributes_of(&record));
         store.identities.insert(key, record);
-        Ok(output)
+        Ok(CreateEmailIdentityOutput {
+            identity_type,
+            verified_for_sending_status,
+            dkim_attributes,
+        })
     }
 }
 

@@ -196,9 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // them, by the wire values the model's own `ConfigurationSetAttribute`
             // enum carries (`crate::ops::CONFIGURATION_SET_ATTRIBUTE_VALUES`).
             //
-            // `eventDestinations`: no operation of this emulator records one yet,
-            // so a stored set has none and the list is empty.
-            event_destinations: asked_for("eventDestinations").then(Vec::new),
+            // `eventDestinations`: the destinations the set carries, in the
+            // order they were added. A set nobody has added one to reports an
+            // empty list rather than none, because the group WAS asked for.
+            event_destinations: asked_for("eventDestinations")
+                .then(|| configuration_set.event_destinations.clone()),
             // `trackingOptions`: present exactly while the set carries the
             // association the tracking-options operations write.
             tracking_options: asked_for("trackingOptions")

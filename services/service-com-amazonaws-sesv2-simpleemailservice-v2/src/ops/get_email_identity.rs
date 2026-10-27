@@ -196,7 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             identity_type: Some(record.identity_kind.as_str().to_string()),
             feedback_forwarding_status: record.feedback_forwarding,
             verified_for_sending_status: record.verified_for_sending,
-            dkim_attributes: Some(record.dkim_attributes()),
+            // Resolved from the identity whose DNS zone publishes the DKIM records
+            // this identity's mail is signed with, which for an address identity
+            // under a domain identity is that domain's.
+            dkim_attributes: Some(store.dkim_attributes_of(record)),
             // The custom MAIL FROM configuration
             // `PutEmailIdentityMailFromAttributes` persisted, when one is enabled
             // for this identity.
@@ -205,9 +208,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: Some(record.tag_list()),
             configuration_set_name: record.configuration_set_name.clone(),
             verification_status: Some(record.verification_status.as_str().to_string()),
-            // `VerificationInfo` reports what SES found while probing the domain's
-            // DNS; this emulator probes nothing, so it reports nothing.
-            verification_info: None,
+            // What the search of that same DNS zone found, and when it last ran.
+            verification_info: store.verification_info_of(record),
         })
     }
 }

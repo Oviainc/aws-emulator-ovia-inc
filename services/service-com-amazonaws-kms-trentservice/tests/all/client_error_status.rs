@@ -331,21 +331,17 @@ fn the_status_mapping_collapses_only_the_client_band() {
 #[tokio::test]
 async fn a_scaffolded_operation_still_answers_501() {
     let router = router();
-    let metadata = described_key(&router, "stub census").await;
-    let key_id = text("setup", &metadata, "KeyId");
 
-    // Rows: operations this crate has not implemented yet, control plane and data
-    // plane (`grep -l 'SCAFFOLDED, NOT IMPLEMENTED' src/ops/`).
+    // Rows: operations this crate has not implemented yet
+    // (`grep -l 'SCAFFOLDED, NOT IMPLEMENTED' src/ops/`).
     let cases: Vec<(&str, Value)> = vec![
-        (
-            "Verify",
-            json!({"KeyId": key_id, "Message": b64(b"still a stub"),
-                   "Signature": b64(b"still a stub"),
-                   "SigningAlgorithm": "RSASSA_PSS_SHA_256"}),
-        ),
         (
             "CreateCustomKeyStore",
             json!({"CustomKeyStoreName": "still-a-stub"}),
+        ),
+        (
+            "DeleteCustomKeyStore",
+            json!({"CustomKeyStoreId": "cks-still-a-stub"}),
         ),
     ];
     for (operation, body) in cases {

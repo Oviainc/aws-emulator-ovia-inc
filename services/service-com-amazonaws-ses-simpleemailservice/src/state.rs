@@ -96,6 +96,21 @@ pub const MAX_CONFIGURATION_SETS: usize = 10_000;
 /// fewer".
 pub const MAX_CONFIGURATION_SET_NAME: usize = 64;
 
+/// The characters an event destination name may be built from, and the longest
+/// such name.
+///
+/// `EventDestination$Name` states the rule: the name must "contain only ASCII
+/// letters (a-z, A-Z), numbers (0-9), underscores (_), or dashes (-)" and
+/// "contain 64 characters or fewer".
+pub const MAX_EVENT_DESTINATION_NAME: usize = 64;
+
+/// The event destinations one configuration set may hold, and so the ceiling on
+/// the list each set carries: Amazon SES allows a configuration set ten of them,
+/// and a create past that is refused with the modelled `LimitExceeded` — "a
+/// resource could not be created because of service limits" — rather than
+/// letting caller input grow a set without end.
+pub const MAX_EVENT_DESTINATIONS: usize = 10;
+
 /// The entries the send log may hold at once.
 ///
 /// The account's own quota is the real ceiling — a day's accepted sends are at
@@ -692,6 +707,19 @@ pub struct ConfigurationSet {
     /// Written only by [`Self::set_sending_enabled`], which is where that rule
     /// lives.
     pub last_fresh_start: Option<SystemTime>,
+    /// The event destinations this set publishes its sending events to, in the
+    /// order they were added.
+    ///
+    /// Held as the modelled [`crate::ops::types::EventDestination`] shape, so a
+    /// destination a caller wrote is reported back unchanged by
+    /// `DescribeConfigurationSet` instead of being projected through a second
+    /// copy of the same structure. Grown ONLY through
+    /// [`Self::add_event_destination`], which is where its ceiling
+    /// ([`MAX_EVENT_DESTINATIONS`]) is applied; a destination's `Name` is its
+    /// key within the set, which is what
+    /// `CreateConfigurationSetEventDestination`'s
+    /// `EventDestinationAlreadyExistsException` reports a conflict on.
+    pub event_destinations: Vec<crate::ops::types::EventDestination>,
 }
 
 impl ConfigurationSet {
@@ -710,6 +738,36 @@ impl ConfigurationSet {
             self.last_fresh_start = Some(at);
         }
         self.sending_enabled = enabled;
+    }
+
+    /// This set's event destination named `name`, and `None` while it carries
+    /// none of that name.
+    ///
+    /// The name is a key, so it is compared exactly: `EventDestination$Name`
+    /// admits both letter cases and nothing normalises one into the other.
+    pub fn event_destination(&self, name: &str) -> Option<&crate::ops::types::EventDestination> {
+        self.event_destinations
+            .iter()
+            .find(|destination| destination.name == name)
+    }
+
+    /// Record `destination` on this set, and say whether it was recorded.
+    ///
+    /// `false` when the set already holds [`MAX_EVENT_DESTINATIONS`]
+    /// destinations: the caller refuses the request with the modelled
+    /// `LimitExceeded` rather than growing the set past the limit. The caller
+    /// has already decided that the name is free — a name the set already
+    /// carries is a naming conflict, which
+    /// `EventDestinationAlreadyExistsException` reports.
+    pub fn add_event_destination(
+        &mut self,
+        destination: crate::ops::types::EventDestination,
+    ) -> bool {
+        if self.event_destinations.len() >= MAX_EVENT_DESTINATIONS {
+            return false;
+        }
+        self.event_destinations.push(destination);
+        true
     }
 }
 
@@ -1211,6 +1269,9 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     // A set whose sending has never been disabled and later
                     // re-enabled has had no fresh start.
                     last_fresh_start: None,
+                    // And it publishes to no event destination:
+                    // `CreateConfigurationSetEventDestination` is what adds one.
+                    event_destinations: Vec::new(),
                 }),
         )
     }
@@ -1876,6 +1937,224 @@ pub fn resolve_sns_topic<'value>(value: &'value str, region: &str) -> Result<&'v
     }
 }
 
+/// Why an `EventDestination` a request supplies is not one Amazon SES could
+/// publish email sending events to, and so WHICH refusal reports it.
+///
+/// `CreateConfigurationSetEventDestination` and
+/// `UpdateConfigurationSetEventDestination` model one error per destination
+/// class — `InvalidCloudWatchDestinationException`,
+/// `InvalidFirehoseDestinationException`, `InvalidSNSDestinationException`, each
+/// documented as "See the error message for details" — and none for the
+/// destination-independent half of the rule (the name's form, which event types
+/// it matches, and that exactly one destination is provided), which is a
+/// parameter violation. Each variant carries the sentence its refusal reports.
+#[derive(Debug, Clone)]
+pub enum EventDestinationFault {
+    /// A member of the event destination itself carries a value the operation
+    /// cannot act on, which no modelled error of it covers.
+    Parameter(String),
+    /// The Amazon CloudWatch destination is invalid.
+    CloudWatch(String),
+    /// The Amazon Kinesis Firehose destination is invalid.
+    Firehose(String),
+    /// The Amazon SNS destination is invalid.
+    Sns(String),
+}
+
+/// The Amazon Kinesis Firehose delivery stream an event destination publishes
+/// to: `arn:<partition>:firehose:<region>:<account>:deliverystream/<name>`.
+const FIREHOSE_DELIVERY_STREAM: ::service_common::arn::Requirement =
+    ::service_common::arn::Requirement {
+        vendor: "firehose",
+        resource_type: Some("deliverystream"),
+        label: "an Amazon Kinesis Firehose delivery stream",
+    };
+
+/// The longest Amazon CloudWatch dimension name, and the characters one may be
+/// built from.
+///
+/// `CloudWatchDimensionConfiguration$DimensionName` states the rule: the name
+/// must "contain only ASCII letters (a-z, A-Z), numbers (0-9), underscores (_),
+/// dashes (-), or colons (:)" and "contain 256 characters or fewer".
+const MAX_DIMENSION_NAME: usize = 256;
+
+/// The longest default value of an Amazon CloudWatch dimension, and the
+/// characters one may be built from.
+///
+/// `CloudWatchDimensionConfiguration$DefaultDimensionValue` states the rule: the
+/// value must "contain only ASCII letters (a-z, A-Z), numbers (0-9),
+/// underscores (_), dashes (-), at signs (@), or periods (.)" and "contain 256
+/// characters or fewer".
+const MAX_DEFAULT_DIMENSION_VALUE: usize = 256;
+
+/// Whether `value` is an Amazon CloudWatch dimension name, under the rule
+/// [`MAX_DIMENSION_NAME`] states.
+fn is_dimension_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= MAX_DIMENSION_NAME
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | ':')
+        })
+}
+
+/// Whether `value` is a default dimension value, under the rule
+/// [`MAX_DEFAULT_DIMENSION_VALUE`] states.
+fn is_default_dimension_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= MAX_DEFAULT_DIMENSION_VALUE
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '@' | '.')
+        })
+}
+
+/// What an `EventDestination` a request supplies has to carry, or the reason it
+/// describes nothing Amazon SES could publish to.
+///
+/// `EventDestination` states the destination-independent half of the rule: a
+/// `Name` of the documented form ([`is_event_destination_name`]), event types
+/// drawn from the ones the model names
+/// ([`crate::ops::EVENT_TYPE_VALUES`]), and — "when you create or update an
+/// event destination, you must provide one, and only one, destination" — exactly
+/// one of the three destination members. Each destination is then read for what
+/// its own members have to name: an ARN names ONE account's resource in ONE
+/// Region, and this emulator serves a single account
+/// ([`names_a_resource_here`]), so a stream, a topic or a role of another
+/// account, partition or Region is one this caller could not publish through.
+/// Whether the resource EXISTS is the owning service's own state, which this
+/// service does not hold — the same reading [`resolve_sns_topic`] makes.
+///
+/// Shared by `CreateConfigurationSetEventDestination` and
+/// `UpdateConfigurationSetEventDestination`, which hold a destination to one
+/// rule between them; each wraps the fault in its own modelled error.
+pub fn check_event_destination(
+    destination: &crate::ops::types::EventDestination,
+    region: &str,
+) -> Result<(), EventDestinationFault> {
+    if !is_event_destination_name(&destination.name) {
+        return Err(EventDestinationFault::Parameter(format!(
+            "Invalid EventDestination.Name {:?}: Name must contain only ASCII letters (a-z, A-Z), \
+             numbers (0-9), underscores (_), or dashes (-), and {MAX_EVENT_DESTINATION_NAME} \
+             characters or fewer",
+            destination.name
+        )));
+    }
+    // The model declares the value set of `MatchingEventTypes`, so the boundary
+    // validator normally refuses anything else; this is the belt-and-braces
+    // refusal, so an event type this service cannot publish is never stored as
+    // one it can.
+    if let Some(unknown) = destination
+        .matching_event_types
+        .iter()
+        .find(|event_type| !crate::ops::EVENT_TYPE_VALUES.contains(&event_type.as_str()))
+    {
+        return Err(EventDestinationFault::Parameter(format!(
+            "Invalid EventDestination.MatchingEventTypes entry {unknown:?}: each entry must be \
+             one of {}",
+            crate::ops::EVENT_TYPE_VALUES.join(", ")
+        )));
+    }
+    let provided = [
+        destination.cloud_watch_destination.is_some(),
+        destination.kinesis_firehose_destination.is_some(),
+        destination.sns_destination.is_some(),
+    ]
+    .into_iter()
+    .filter(|provided| *provided)
+    .count();
+    if provided != 1 {
+        return Err(EventDestinationFault::Parameter(format!(
+            "You must provide one, and only one, destination: this EventDestination provides \
+             {provided} of CloudWatchDestination, KinesisFirehoseDestination and SNSDestination"
+        )));
+    }
+
+    if let Some(cloud_watch) = &destination.cloud_watch_destination {
+        // "A list of dimensions upon which to categorize your emails": a
+        // destination that categorizes them on nothing publishes no dimension,
+        // so the list the member requires carries at least one configuration.
+        // On the awsQuery wire an empty list carries no field at all, so such a
+        // request provides no destination and the rule above refuses it first.
+        if cloud_watch.dimension_configurations.is_empty() {
+            return Err(EventDestinationFault::CloudWatch(
+                "CloudWatchDestination.DimensionConfigurations must carry at least one dimension \
+                 configuration"
+                    .to_string(),
+            ));
+        }
+        for dimension in &cloud_watch.dimension_configurations {
+            if !is_dimension_name(&dimension.dimension_name) {
+                return Err(EventDestinationFault::CloudWatch(format!(
+                    "Invalid DimensionName {:?}: DimensionName must contain only ASCII letters \
+                     (a-z, A-Z), numbers (0-9), underscores (_), dashes (-), or colons (:), and \
+                     {MAX_DIMENSION_NAME} characters or fewer",
+                    dimension.dimension_name
+                )));
+            }
+            if !crate::ops::DIMENSION_VALUE_SOURCE_VALUES
+                .contains(&dimension.dimension_value_source.as_str())
+            {
+                return Err(EventDestinationFault::CloudWatch(format!(
+                    "Invalid DimensionValueSource {:?}: DimensionValueSource must be one of {}",
+                    dimension.dimension_value_source,
+                    crate::ops::DIMENSION_VALUE_SOURCE_VALUES.join(", ")
+                )));
+            }
+            if !is_default_dimension_value(&dimension.default_dimension_value) {
+                return Err(EventDestinationFault::CloudWatch(format!(
+                    "Invalid DefaultDimensionValue {:?}: DefaultDimensionValue must contain only \
+                     ASCII letters (a-z, A-Z), numbers (0-9), underscores (_), dashes (-), at \
+                     signs (@), or periods (.), and {MAX_DEFAULT_DIMENSION_VALUE} characters or \
+                     fewer",
+                    dimension.default_dimension_value
+                )));
+            }
+        }
+    }
+
+    if let Some(firehose) = &destination.kinesis_firehose_destination {
+        let stream = firehose.delivery_stream_arn.trim();
+        if !(names_a_resource_here(stream, FIREHOSE_DELIVERY_STREAM.vendor, region)
+            && FIREHOSE_DELIVERY_STREAM.admits(stream))
+        {
+            return Err(EventDestinationFault::Firehose(format!(
+                "Invalid DeliveryStreamARN {stream:?}: DeliveryStreamARN {} of account {} in \
+                 {region}",
+                FIREHOSE_DELIVERY_STREAM.phrase(),
+                ::engine::EMULATOR_ACCOUNT_ID
+            )));
+        }
+        // An IAM role is GLOBAL: IAM writes no Region into a role ARN, so the
+        // account is all a role ARN of this emulator's one account has to carry.
+        let role = firehose.iam_role_arn.trim();
+        let role_of_this_account = ::service_common::arn::IAM_ROLE.admits(role)
+            && ::service_common::arn::parse(role).is_some_and(|arn| {
+                arn.partition == ARN_PARTITION && arn.account == ::engine::EMULATOR_ACCOUNT_ID
+            });
+        if !role_of_this_account {
+            return Err(EventDestinationFault::Firehose(format!(
+                "Invalid IAMRoleARN {role:?}: IAMRoleARN {} of account {}",
+                ::service_common::arn::IAM_ROLE.phrase(),
+                ::engine::EMULATOR_ACCOUNT_ID
+            )));
+        }
+    }
+
+    if let Some(sns) = &destination.sns_destination {
+        // The same reading of a topic ARN every member of this service that
+        // names one makes.
+        if resolve_sns_topic(&sns.topic_arn, region).is_err() {
+            return Err(EventDestinationFault::Sns(format!(
+                "Invalid TopicARN {:?}: TopicARN must be the ARN of an Amazon SNS topic of \
+                 account {} in {region}",
+                sns.topic_arn.trim(),
+                ::engine::EMULATOR_ACCOUNT_ID
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// The identity-list key for an identity a request names, or the reason the
 /// value names no identity this emulator holds.
 ///
@@ -1989,8 +2268,30 @@ pub fn mail_from_domain_for(identity: &str, value: &str) -> Result<String, Strin
 /// "contain 64 characters or fewer" ([`MAX_CONFIGURATION_SET_NAME`]). A name
 /// built from no characters at all names nothing, so it is not one either.
 pub fn is_configuration_set_name(name: &str) -> bool {
+    is_letters_digits_name(name, MAX_CONFIGURATION_SET_NAME)
+}
+
+/// Whether `name` is an event destination name of the form the model documents.
+///
+/// `EventDestination$Name` states the same two halves as a configuration set's
+/// name does, over the same character set: the name must "contain only ASCII
+/// letters (a-z, A-Z), numbers (0-9), underscores (_), or dashes (-)" and
+/// "contain 64 characters or fewer" ([`MAX_EVENT_DESTINATION_NAME`]).
+pub fn is_event_destination_name(name: &str) -> bool {
+    is_letters_digits_name(name, MAX_EVENT_DESTINATION_NAME)
+}
+
+/// Whether `name` is built from ASCII letters, digits, underscores and dashes
+/// alone and is at most `max` characters long.
+///
+/// The ONE reading of that form in this service, because the models of the
+/// resources that carry a name — a configuration set
+/// ([`is_configuration_set_name`]), an event destination
+/// ([`is_event_destination_name`]) — document it in the same words. A name built
+/// from no characters at all names nothing, so it is not one either.
+fn is_letters_digits_name(name: &str, max: usize) -> bool {
     !name.is_empty()
-        && name.chars().count() <= MAX_CONFIGURATION_SET_NAME
+        && name.chars().count() <= max
         && name
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))

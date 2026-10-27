@@ -364,6 +364,12 @@ mod keyspaces_streams_routing;
 mod lambda_bundled_wire_operations;
 #[path = "all/lambda_signing_name_routing.rs"]
 mod lambda_signing_name_routing;
+// Declared in this span of the sorted list, beside the other `lambda…` suites, rather than
+// at the head of this file or in its appended tail: both of those are where concurrently
+// landing suites put their line, so a declaration there loses a squash merge to every one
+// of them, while these neighbouring lines are stable.
+#[path = "all/lambda_execution_role_trust.rs"]
+mod lambda_execution_role_trust;
 // Declared in this span of the sorted list, beside the other `l…` suites, rather than at
 // the head of this file or in its appended tail: both of those are where concurrently
 // landing suites put their line, so a declaration there loses a squash merge to every one

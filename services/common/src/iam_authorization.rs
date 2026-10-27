@@ -89,6 +89,30 @@
 //! knows every value of a key FAMILY publishes the family — `aws:PrincipalTag/`, a trailing
 //! `/` — which is what lets a statement conditioned on the absence of one principal tag be
 //! decided for a principal whose tags are all known.
+//!
+//! ## Policy variables
+//!
+//! A policy element may be written with a VARIABLE — `${aws:username}` and the rest of
+//! IAM's `${<condition key>}` grammar — which is a placeholder for the value the REQUEST
+//! carries for that condition key, substituted at evaluation time and not at write time
+//! ("IAM policy elements: variables and tags"). So the document is stored and reported
+//! verbatim, and one document decides differently for two callers.
+//!
+//! Substitution happens here, into a statement's `Resource`/`NotResource` values and into
+//! a `Condition` clause's values, out of the same [`Request::context`] the condition
+//! operators read — so a key a caller supplies a value for is the key a variable of that
+//! name expands to. The substituted text is TEXT: a `*` or `?` that arrives with a value
+//! is that character, while one the document itself wrote is still a wildcard, since the
+//! pattern is what the document states and not what a request puts into it. `${*}`,
+//! `${?}` and `${$}` are IAM's three escapes and stand for the single characters they
+//! name, which is what keeps a `$` that opens no variable matched literally.
+//!
+//! A variable the request carries no single value for cannot be substituted, and an
+//! element carrying it therefore matches nothing: the statement is read as UNDECIDED, the
+//! same fail-closed reading a condition over an unknown key gets — it grants nothing while
+//! a `Deny` carrying it still refuses. That is deliberately stricter than reading such an
+//! element as a plain non-match: a refusal is never weakened on a value this evaluation
+//! could not establish.
 
 /// The string condition operators this evaluator decides. Everything else — the numeric,
 /// date and IP operators — leaves the statement undecided (see the module
@@ -417,40 +441,107 @@ pub fn not_authorized_by_resource_policy(principal: &str, action: &str, resource
 /// and true for a resource ARN. The walk is the classic single-pass wildcard match with
 /// one backtrack point per `*`, so its cost is bounded by the product of the two lengths
 /// and it never recurses.
+///
+/// Every `*` and `?` of `pattern` is a wildcard here, which is what an element the
+/// document wrote with no policy variable in it means; an element that names one is
+/// matched through [`Expanded`], where the characters a variable's VALUE contributed are
+/// the characters themselves.
 pub fn wildcard_match(pattern: &str, value: &str, case_sensitive: bool) -> bool {
-    let fold = |text: &str| -> Vec<char> {
-        if case_sensitive {
-            text.chars().collect()
-        } else {
-            text.to_lowercase().chars().collect()
-        }
-    };
-    let pattern = fold(pattern);
-    let value = fold(value);
+    Expanded::literal(pattern).matches(value, case_sensitive)
+}
 
+/// How IAM opens a policy variable, closed by the next `}`.
+const VARIABLE_OPEN: &str = "${";
+
+/// IAM's three literal escapes, each standing for the one character it names rather than
+/// for a variable or a wildcard: "`${*}`, `${?}`, `${$}` … use these special characters in
+/// a policy variable to specify a literal `*`, `?` or `$` character".
+const VARIABLE_ESCAPES: [&str; 3] = ["*", "?", "$"];
+
+/// What a policy element's text means once its policy VARIABLES are substituted: the
+/// characters to match, each carrying whether it is still one of IAM's wildcards.
+///
+/// A `*` or `?` the DOCUMENT wrote is a wildcard; one that arrived as part of a
+/// substituted value is the character itself, because a variable's value is text the
+/// request supplied rather than a pattern the document stated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Expanded {
+    glyphs: Vec<(char, bool)>,
+}
+
+impl Expanded {
+    /// `text` read as a pattern in its own right: every `*` and `?` in it is a wildcard,
+    /// which is what an element carrying no policy variable states.
+    fn literal(text: &str) -> Self {
+        let mut glyphs = Vec::with_capacity(text.len());
+        push_pattern(&mut glyphs, text);
+        Self { glyphs }
+    }
+
+    /// Whether this element's characters ARE `actual`, which is what an equality
+    /// comparison asks: a wildcard is special only to a pattern match. Compared without
+    /// building the text, so a clause decided against many values allocates nothing per
+    /// comparison.
+    fn equals(&self, actual: &str, case_sensitive: bool) -> bool {
+        let mut glyphs = self.glyphs.iter().map(|(glyph, _)| *glyph);
+        let mut actual = actual.chars();
+        loop {
+            match (glyphs.next(), actual.next()) {
+                (None, None) => return true,
+                (Some(expected), Some(reached))
+                    if expected == reached
+                        || (!case_sensitive && expected.eq_ignore_ascii_case(&reached)) => {}
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether this element matches `value`, by [`wildcard_match`]'s walk over the
+    /// characters that are still wildcards.
+    fn matches(&self, value: &str, case_sensitive: bool) -> bool {
+        if case_sensitive {
+            return walk(&self.glyphs, &value.chars().collect::<Vec<char>>());
+        }
+        // IAM folds case on the comparisons that are case-insensitive, which is the one
+        // reason either side is rebuilt.
+        let pattern: Vec<(char, bool)> = self
+            .glyphs
+            .iter()
+            .flat_map(|(glyph, wildcard)| {
+                let wildcard = *wildcard;
+                glyph.to_lowercase().map(move |folded| (folded, wildcard))
+            })
+            .collect();
+        walk(&pattern, &value.to_lowercase().chars().collect::<Vec<char>>())
+    }
+}
+
+/// Whether `pattern` matches `value`: the single-pass wildcard walk, with one backtrack
+/// point per `*`, over the characters of `pattern` that are still wildcards.
+fn walk(pattern: &[(char, bool)], value: &[char]) -> bool {
     let mut pattern_at = 0;
     let mut value_at = 0;
-    // The last `*` seen, and how much of `value` it had consumed when it was seen: the one
-    // place the walk returns to when a literal comparison fails after it.
+    // The last `*` seen, and how much of `value` it had consumed when it was seen: the
+    // one place the walk returns to when a literal comparison fails after it.
     let mut star_at: Option<usize> = None;
     let mut star_consumed = 0;
     while value_at < value.len() {
         match pattern.get(pattern_at) {
-            Some('*') => {
+            Some(('*', true)) => {
                 star_at = Some(pattern_at);
                 star_consumed = value_at;
                 pattern_at += 1;
             }
-            Some('?') => {
+            Some(('?', true)) => {
                 pattern_at += 1;
                 value_at += 1;
             }
-            Some(literal) if *literal == value[value_at] => {
+            Some((literal, _)) if *literal == value[value_at] => {
                 pattern_at += 1;
                 value_at += 1;
             }
-            // Either the pattern ran out or it disagrees here: give the last `*` one more
-            // character and try again from just after it.
+            // Either the pattern ran out or it disagrees here: give the last `*` one
+            // more character and try again from just after it.
             _ => match star_at {
                 Some(star) => {
                     pattern_at = star + 1;
@@ -462,7 +553,82 @@ pub fn wildcard_match(pattern: &str, value: &str, case_sensitive: bool) -> bool 
         }
     }
     // Trailing `*`s match the empty remainder.
-    pattern[pattern_at..].iter().all(|glyph| *glyph == '*')
+    pattern[pattern_at..]
+        .iter()
+        .all(|(glyph, wildcard)| *glyph == '*' && *wildcard)
+}
+
+/// Push `text` onto `glyphs` as PATTERN text: the characters it spells, with its `*` and
+/// `?` marked as the wildcards they are.
+fn push_pattern(glyphs: &mut Vec<(char, bool)>, text: &str) {
+    glyphs.extend(
+        text.chars()
+            .map(|glyph| (glyph, glyph == '*' || glyph == '?')),
+    );
+}
+
+/// `value` with every policy variable it names substituted from the request's condition
+/// context, or `None` when one of them has no single value there — an element this
+/// evaluation cannot match at all (see the module docs).
+///
+/// The text around a variable keeps its wildcards; the text a variable contributes does
+/// not acquire any. A `${` that is never closed opens no variable, so what follows it is
+/// matched as the pattern text it is.
+fn expand(value: &str, request: &Request<'_>) -> Option<Expanded> {
+    if !value.contains(VARIABLE_OPEN) {
+        return Some(Expanded::literal(value));
+    }
+    let mut glyphs: Vec<(char, bool)> = Vec::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find(VARIABLE_OPEN) {
+        push_pattern(&mut glyphs, &rest[..at]);
+        let opened = &rest[at + VARIABLE_OPEN.len()..];
+        let Some(end) = opened.find('}') else {
+            push_pattern(&mut glyphs, &rest[at..]);
+            return Some(Expanded { glyphs });
+        };
+        let name = &opened[..end];
+        rest = &opened[end + 1..];
+        if VARIABLE_ESCAPES.contains(&name) {
+            // The one character the escape names, which is never a wildcard and never a
+            // variable opener.
+            glyphs.extend(name.chars().map(|glyph| (glyph, false)));
+            continue;
+        }
+        // The key's value as text: a `*` or `?` inside it is that character.
+        glyphs.extend(
+            single_value(request, name)?
+                .chars()
+                .map(|glyph| (glyph, false)),
+        );
+        // Substitution is the one thing that makes an element LONGER than the document it
+        // was read from, so the bound every document is already held to is taken over the
+        // expanded element too: one past it is read as matching nothing, exactly as a
+        // document past [`MAX_POLICY_BYTES`] is read as stating nothing. The matcher's
+        // cost is the product of the pattern's length and the value's, which is what this
+        // keeps bounded however many variables an element names.
+        if glyphs.len() > MAX_POLICY_BYTES {
+            return None;
+        }
+    }
+    push_pattern(&mut glyphs, rest);
+    Some(Expanded { glyphs })
+}
+
+/// The ONE value the request's context carries for `key`, compared the same
+/// case-insensitive way a condition clause's key is.
+///
+/// `None` for a key the context carries no value for — nothing to substitute — and for one
+/// it carries several, since a multi-valued key names no single text a variable could
+/// stand for.
+fn single_value<'a>(request: &Request<'a>, key: &str) -> Option<&'a str> {
+    let mut values = request
+        .context
+        .iter()
+        .filter(|(known, _)| known.eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.as_str());
+    let only = values.next()?;
+    values.next().is_none().then_some(only)
 }
 
 /// What one SET of documents decides about the request, and which of their statements
@@ -521,8 +687,14 @@ fn collect_applying(
             // Neither of the two effects the grammar admits: the statement says nothing.
             continue;
         }
-        if !covers(entry, request, flavor) {
-            continue;
+        // Whether the statement is about the request at all. An element naming a policy
+        // variable the request has no value for cannot be matched, which leaves this
+        // undecided — read fail-closed in both directions, exactly as an undecidable
+        // condition clause is below.
+        match covers(entry, request, flavor) {
+            Some(false) => continue,
+            None if allows => continue,
+            _ => {}
         }
         // The statement's condition, where this evaluator can decide it, is part of
         // whether the statement applies at all — to a `Deny` as much as to an `Allow`. A
@@ -546,10 +718,20 @@ fn collect_applying(
 }
 
 /// Whether one statement is ABOUT the request — whatever effect it then states.
-fn covers(statement: &::serde_json::Value, request: &Request<'_>, flavor: Flavor) -> bool {
-    names_action(statement, request.action)
-        && names_resource(statement, request.resource, flavor)
-        && names_principal(statement, request.principals, flavor)
+///
+/// `None` when that cannot be decided: a `Resource` element naming a policy variable the
+/// request carries no value for (see the module docs).
+fn covers(
+    statement: &::serde_json::Value,
+    request: &Request<'_>,
+    flavor: Flavor,
+) -> Option<bool> {
+    if !names_action(statement, request.action)
+        || !names_principal(statement, request.principals, flavor)
+    {
+        return Some(false);
+    }
+    names_resource(statement, request, flavor)
 }
 
 /// Whether the statement's `Action`/`NotAction` element covers the requested action.
@@ -567,18 +749,38 @@ fn names_action(statement: &::serde_json::Value, action: &str) -> bool {
 }
 
 /// Whether the statement's `Resource`/`NotResource` element covers the requested resource.
-fn names_resource(statement: &::serde_json::Value, resource: &str, flavor: Flavor) -> bool {
+///
+/// Each value is read with its policy variables substituted ([`expand`]), so one document
+/// scopes a grant per caller. `None` when a value names a variable the request carries no
+/// value for AND no other value settles the element: that element matches nothing this
+/// evaluation can establish, which is neither a match nor a miss.
+fn names_resource(
+    statement: &::serde_json::Value,
+    request: &Request<'_>,
+    flavor: Flavor,
+) -> Option<bool> {
     match element(statement, "Resource", "NotResource") {
         Some((values, negated)) => {
-            let hit = values
-                .iter()
-                .any(|pattern| wildcard_match(pattern, resource, true));
-            hit != negated
+            let mut hit = false;
+            let mut unexpanded = false;
+            for value in values {
+                match expand(value, request) {
+                    Some(pattern) => hit = hit || pattern.matches(request.resource, true),
+                    None => unexpanded = true,
+                }
+            }
+            // A value that DOES match settles the element whichever spelling it is: the
+            // resource is among the values (so `Resource` covers it and `NotResource` does
+            // not), whatever an unsubstitutable sibling value would have said.
+            if hit {
+                return Some(!negated);
+            }
+            (!unexpanded).then_some(negated)
         }
         // An identity-based statement must name the resources it covers. A
         // resource-based one is attached to the resource, so leaving the element out
         // covers exactly that resource.
-        None => flavor == Flavor::Resource,
+        None => Some(flavor == Flavor::Resource),
     }
 }
 
@@ -725,6 +927,14 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
                 held = held && (asserted_absent == actual.is_empty());
                 continue;
             }
+            // A clause's own VALUES may name policy variables, substituted from this same
+            // context the way a `Resource` element's are. A value naming a variable the
+            // request carries no value for cannot be compared at all, which leaves the
+            // statement undecided.
+            let expected: Vec<Expanded> = expected
+                .into_iter()
+                .map(|value| expand(value, request))
+                .collect::<Option<Vec<Expanded>>>()?;
             let decided = match qualifier {
                 // Unqualified: the key must carry exactly one value for the comparison
                 // to mean what IAM means by it.
@@ -821,23 +1031,15 @@ fn is_negated(operator: &str) -> bool {
     operator.contains("Not")
 }
 
-/// Whether one decided clause holds: `expected` are the clause's values, `actual` the value
-/// the request carries for its key.
-fn clause_holds(operator: &str, expected: &[&str], actual: &str) -> bool {
+/// Whether one decided clause holds: `expected` are the clause's values, with their policy
+/// variables already substituted, and `actual` the value the request carries for its key.
+fn clause_holds(operator: &str, expected: &[Expanded], actual: &str) -> bool {
     let any_equals = |case_sensitive: bool| {
-        expected.iter().any(|value| {
-            if case_sensitive {
-                *value == actual
-            } else {
-                value.eq_ignore_ascii_case(actual)
-            }
-        })
-    };
-    let any_like = || {
         expected
             .iter()
-            .any(|pattern| wildcard_match(pattern, actual, true))
+            .any(|value| value.equals(actual, case_sensitive))
     };
+    let any_like = || expected.iter().any(|pattern| pattern.matches(actual, true));
     match operator {
         "StringEquals" => any_equals(true),
         "StringNotEquals" => !any_equals(true),
@@ -1500,6 +1702,204 @@ mod tests {
                 "case {case:?}: expected {expected:?}, got {reached:?}"
             );
         }
+    }
+
+    /// The ARN of the IAM user the policy-variable rows below are decided about: the
+    /// principal that signed, which is also the resource it addresses.
+    const CALLER: &str = "arn:aws:iam::000000000000:user/writer";
+
+    /// The condition context a request signed by that user carries: the keys that
+    /// describe the signing principal, which is where a variable's value comes from. One
+    /// tag's value is a `*`, so a row can state what a value containing a wildcard
+    /// character means, and one key carries two values.
+    fn caller_context() -> Vec<(String, String)> {
+        vec![
+            ("aws:username".to_string(), "writer".to_string()),
+            ("aws:PrincipalTag/team".to_string(), "payments".to_string()),
+            ("aws:PrincipalTag/glob".to_string(), "*".to_string()),
+            ("aws:TagKeys".to_string(), "Project".to_string()),
+            ("aws:TagKeys".to_string(), "Owner".to_string()),
+        ]
+    }
+
+    /// A policy variable is a placeholder for the value the REQUEST carries for the
+    /// condition key it names, substituted before the element is matched — and the
+    /// substituted text is text, never a pattern.
+    #[test]
+    fn a_policy_variable_is_substituted_from_the_request_context() {
+        // The rows differ along what the rule generalises over: which key the variable
+        // names, the case it is spelled in, where it sits in the element, whether a
+        // wildcard belongs to the document, to an escape or to a value, and whether the
+        // request carries one value for the key, none, or several.
+        let rows: &[(&str, &str, Decision)] = &[
+            (
+                "the signing user's name, which is what the ARN carries",
+                "arn:aws:iam::000000000000:user/${aws:username}",
+                Decision::Allowed,
+            ),
+            (
+                "the same key spelled in another case",
+                "arn:aws:iam::000000000000:user/${AWS:UserName}",
+                Decision::Allowed,
+            ),
+            (
+                "a wildcard the document wrote after the variable",
+                "arn:aws:iam::000000000000:user/${aws:username}*",
+                Decision::Allowed,
+            ),
+            (
+                "a variable spanning the whole name part of another entity",
+                "arn:aws:iam::000000000000:role/${aws:username}",
+                Decision::NotStated,
+            ),
+            (
+                "a principal tag whose value is not the name",
+                "arn:aws:iam::000000000000:user/${aws:PrincipalTag/team}",
+                Decision::NotStated,
+            ),
+            (
+                "a value that is a star, which is that character and not every user",
+                "arn:aws:iam::000000000000:user/${aws:PrincipalTag/glob}",
+                Decision::NotStated,
+            ),
+            (
+                "a key the request carries no value for",
+                "arn:aws:iam::000000000000:user/${aws:PrincipalTag/absent}",
+                Decision::NotStated,
+            ),
+            (
+                "a key the request carries several values for",
+                "arn:aws:iam::000000000000:user/${aws:TagKeys}",
+                Decision::NotStated,
+            ),
+            (
+                "the dollar escape, after which nothing is a variable",
+                "arn:aws:iam::000000000000:user/${$}{aws:username}",
+                Decision::NotStated,
+            ),
+            (
+                "the star escape, which is the character and not a wildcard",
+                "arn:aws:iam::000000000000:user/writer${*}",
+                Decision::NotStated,
+            ),
+            (
+                "the question-mark escape, which is the character",
+                "arn:aws:iam::000000000000:user/writer${?}",
+                Decision::NotStated,
+            ),
+            (
+                "an opener the document never closes, which opens no variable",
+                "arn:aws:iam::000000000000:user/${aws:username",
+                Decision::NotStated,
+            ),
+            (
+                "no variable at all",
+                "arn:aws:iam::000000000000:user/*",
+                Decision::Allowed,
+            ),
+        ];
+        let held = principals();
+        let context = caller_context();
+        for (case, resource, expected) in rows {
+            let document = identity(&format!(
+                "{{\"Effect\":\"Allow\",\"Action\":\"iam:ListAccessKeys\",\
+                 \"Resource\":\"{resource}\"}}"
+            ));
+            let request = Request::new("iam:ListAccessKeys", CALLER, &held).with_context(&context);
+            let reached = identity_decision(&[document], &request);
+            assert_eq!(
+                reached, *expected,
+                "case {case:?}: expected {expected:?}, got {reached:?}"
+            );
+        }
+    }
+
+    /// A clause's own values carry variables too, and an element naming a variable the
+    /// request cannot supply is read fail-closed in both directions: it grants nothing,
+    /// and a `Deny` carrying it still refuses.
+    #[test]
+    fn a_variable_the_request_cannot_supply_grants_nothing_and_still_refuses() {
+        let held = principals();
+        let context = caller_context();
+        let decide = |statements: &str| {
+            let request = Request::new("iam:ListAccessKeys", CALLER, &held).with_context(&context);
+            identity_decision(
+                &[format!("{{\"Version\":\"2012-10-17\",\"Statement\":[{statements}]}}")],
+                &request,
+            )
+        };
+
+        // (case, the statements of one document, what it then states)
+        let rows: &[(&str, &str, Decision)] = &[
+            (
+                "a condition value that expands to the key's own value",
+                "{\"Effect\":\"Allow\",\"Action\":\"iam:ListAccessKeys\",\"Resource\":\"*\",\
+                 \"Condition\":{\"StringEquals\":{\"aws:PrincipalTag/team\":\
+                 \"${aws:PrincipalTag/team}\"}}}",
+                Decision::Allowed,
+            ),
+            (
+                "a condition value that expands to another key's value",
+                "{\"Effect\":\"Allow\",\"Action\":\"iam:ListAccessKeys\",\"Resource\":\"*\",\
+                 \"Condition\":{\"StringEquals\":{\"aws:PrincipalTag/team\":\
+                 \"${aws:username}\"}}}",
+                Decision::NotStated,
+            ),
+            (
+                "a condition value naming a key the request cannot supply",
+                "{\"Effect\":\"Allow\",\"Action\":\"iam:ListAccessKeys\",\"Resource\":\"*\",\
+                 \"Condition\":{\"StringEquals\":{\"aws:PrincipalTag/team\":\
+                 \"${aws:PrincipalTag/absent}\"}}}",
+                Decision::NotStated,
+            ),
+            (
+                "a Deny whose resource names a variable the request cannot supply, \
+                 beside a grant",
+                "{\"Effect\":\"Allow\",\"Action\":\"iam:ListAccessKeys\",\"Resource\":\"*\"},\
+                 {\"Effect\":\"Deny\",\"Action\":\"iam:ListAccessKeys\",\
+                 \"Resource\":\"arn:aws:iam::000000000000:user/${aws:PrincipalTag/absent}\"}",
+                Decision::Denied,
+            ),
+            (
+                "a resource element one of whose values does match",
+                "{\"Effect\":\"Allow\",\"Action\":\"iam:ListAccessKeys\",\"Resource\":\
+                 [\"arn:aws:iam::000000000000:user/${aws:PrincipalTag/absent}\",\
+                 \"arn:aws:iam::000000000000:user/${aws:username}\"]}",
+                Decision::Allowed,
+            ),
+        ];
+        for (case, statements, expected) in rows {
+            let reached = decide(statements);
+            assert_eq!(
+                reached, *expected,
+                "case {case:?}: expected {expected:?}, got {reached:?}"
+            );
+        }
+    }
+
+    /// Substituting a value longer than the bound every policy document is held to leaves
+    /// an element nothing matches, which is what keeps the matcher's work bounded.
+    #[test]
+    fn an_element_whose_variable_expands_past_the_document_bound_matches_nothing() {
+        let held = principals();
+        // One value longer on its own than the whole bound, so the expanded element could
+        // not have been a document this evaluator reads at all.
+        let context = [(
+            "aws:PrincipalTag/huge".to_string(),
+            "a".repeat(MAX_POLICY_BYTES + 1),
+        )];
+        let document = identity(
+            "{\"Effect\":\"Allow\",\"Action\":\"iam:ListAccessKeys\",\
+             \"Resource\":\"arn:aws:iam::000000000000:user/${aws:PrincipalTag/huge}\"}",
+        );
+        let request = Request::new("iam:ListAccessKeys", CALLER, &held).with_context(&context);
+        let reached = identity_decision(&[document], &request);
+        assert_eq!(
+            reached,
+            Decision::NotStated,
+            "case 'a value past the document bound': expected the element to match nothing, \
+             got {reached:?}"
+        );
     }
 
     #[test]

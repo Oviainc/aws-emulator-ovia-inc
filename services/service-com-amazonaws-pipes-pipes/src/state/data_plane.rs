@@ -46,6 +46,17 @@
 //! Every call this module makes goes to the emulator it is running inside, over the
 //! in-process callback ([`smithy_server_runtime::EmbeddedEmulator`]): the pipe reaches
 //! the sqs, lambda and states surfaces of this same emulator and nothing else.
+//!
+//! Every one of those calls is made AS THE PIPE'S EXECUTION ROLE, so each stage asks
+//! first whether the policies in force on that role let it make the call it is about to
+//! make ([`super::execution_role`]): a call the role may not make is that stage FAILING —
+//! the source records stay where they are and the pipe tries again — and never a call
+//! that happens anyway.
+//!
+//! What each pass came to is published as the pipe's OWN CloudWatch metrics
+//! ([`super::metrics`]), for every minute the pipe is running: that series is the only
+//! thing that tells a pipe whose stage was refused from a pipe that never ran, because
+//! both leave the target holding nothing.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -117,6 +128,16 @@ const STATES_NAMESPACE: &str = "states";
 /// The resource types the enrichment ARNs name within those namespaces.
 const FUNCTION_RESOURCE: &str = "function";
 const STATE_MACHINE_RESOURCE: &str = "stateMachine";
+
+/// The IAM action each stage's call is authorized under — the action name of the API call
+/// the stage makes, in the namespace of the service it makes it to, which is what the
+/// policies in force on the pipe's execution role are evaluated against
+/// ([`super::execution_role`]).
+const RECEIVE_MESSAGE_ACTION: &str = "sqs:ReceiveMessage";
+const DELETE_MESSAGE_ACTION: &str = "sqs:DeleteMessage";
+const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
+const INVOKE_FUNCTION_ACTION: &str = "lambda:InvokeFunction";
+const START_SYNC_EXECUTION_ACTION: &str = "states:StartSyncExecution";
 
 /// `ReceiveMessage`'s selector for every attribute: "All".
 const ALL_ATTRIBUTES: &str = "All";
@@ -204,13 +225,21 @@ pub fn drive_pipe<Eng: Send + Sync + 'static>(
         return;
     }
     let callback = ctx.callback().clone();
+    // The two OTHER stores of this same engine the stages read: the IAM records the
+    // pipe's execution role lives in, and the CloudWatch store the pipe publishes its own
+    // metrics to. Resolved once per poller, because neither handle changes.
+    let iam = super::execution_role::iam_state(&**engine);
+    let metrics = super::metrics::PipeMetrics::new(
+        pipe_name,
+        super::metrics::cloudwatch_state(&**engine),
+    );
     let claim = PollerClaim {
         state: ::engine::ServiceState::clone(&state),
         pipe: pipe_name.to_string(),
         held: true,
     };
     runtime.spawn(async move {
-        poll_pipe(&callback, claim).await;
+        poll_pipe(&callback, claim, iam, metrics).await;
     });
 }
 
@@ -273,6 +302,8 @@ enum Pass {
 async fn poll_pipe(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     mut claim: PollerClaim,
+    iam: Option<::engine::ServiceState<super::execution_role::IamState>>,
+    mut metrics: super::metrics::PipeMetrics,
 ) {
     let pipe_name = claim.pipe.clone();
     // A handle of its own, so the store can be locked while the claim is borrowed.
@@ -301,26 +332,48 @@ async fn poll_pipe(
                 claim.release(&mut store);
                 return;
             }
-            Pass::Run(run) => match move_one_batch(callback, &mut clients, &run).await {
-                Batch::Moved => failures = 0,
-                Batch::Idle => {
-                    failures = 0;
-                    ::tokio::time::sleep(POLL_INTERVAL).await;
-                }
-                Batch::Failed(detail) => {
-                    failures = failures.saturating_add(1);
-                    if failures == 1 || failures.is_multiple_of(FAILURE_LOG_INTERVAL) {
-                        ::tracing::warn!(
-                            pipe = %pipe_name,
-                            attempt = failures,
-                            detail = %detail,
-                            "a pipe could not move a batch from its source to its \
-                             target; the records stay on the source and it tries again"
-                        );
+            Pass::Run(run) => {
+                // A RUNNING pipe publishes for every minute it runs, so its counters
+                // exist and read 0 for a minute in which nothing of their kind happened.
+                metrics.open_window();
+                match move_one_batch(callback, &mut clients, iam.as_ref(), &run).await {
+                    Batch::Moved { events } => {
+                        metrics.count(super::metrics::EVENT_COUNT_METRIC, events);
+                        failures = 0;
                     }
-                    ::tokio::time::sleep(retry_backoff(failures)).await;
+                    Batch::Idle => {
+                        failures = 0;
+                        ::tokio::time::sleep(POLL_INTERVAL).await;
+                    }
+                    Batch::Failed {
+                        stage,
+                        events,
+                        detail,
+                    } => {
+                        // The events the failed execution took from its source still
+                        // entered the pipe, and the execution itself failed — at the stage
+                        // that failed it, which is the counter that tells a refused
+                        // delivery from a pipe that never ran.
+                        metrics.count(super::metrics::EVENT_COUNT_METRIC, events);
+                        metrics.count(super::metrics::EXECUTION_FAILED_METRIC, 1);
+                        if let Some(metric) = stage.failure_metric() {
+                            metrics.count(metric, 1);
+                        }
+                        failures = failures.saturating_add(1);
+                        if failures == 1 || failures.is_multiple_of(FAILURE_LOG_INTERVAL) {
+                            ::tracing::warn!(
+                                pipe = %pipe_name,
+                                attempt = failures,
+                                stage = %stage.name(),
+                                detail = %detail,
+                                "a pipe could not move a batch from its source to its \
+                                 target; the records stay on the source and it tries again"
+                            );
+                        }
+                        ::tokio::time::sleep(retry_backoff(failures)).await;
+                    }
                 }
-            },
+            }
         }
     }
 }
@@ -364,31 +417,95 @@ fn next_pass(store: &mut ComAmazonawsPipesPipesState, claim: &mut PollerClaim) -
     Pass::Stop
 }
 
+/// The stage of a pipe an execution reached: which of the three made the call that
+/// failed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// The source poll.
+    Source,
+    /// The enrichment the polled batch is handed to.
+    Enrichment,
+    /// The delivery of one event to the target.
+    Target,
+}
+
+impl Stage {
+    /// The metric a failure AT THIS STAGE is counted on, or `None` for a stage that has
+    /// no counter of its own — a failed poll is an execution that failed, and nothing
+    /// narrower is published about it.
+    fn failure_metric(self) -> Option<&'static str> {
+        match self {
+            Self::Source => None,
+            Self::Enrichment => Some(super::metrics::ENRICHMENT_STAGE_FAILED_METRIC),
+            Self::Target => Some(super::metrics::TARGET_STAGE_FAILED_METRIC),
+        }
+    }
+
+    /// This stage's own name, for the one log line a repeatedly failing pipe writes.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Enrichment => "enrichment",
+            Self::Target => "target",
+        }
+    }
+}
+
 /// What one pass of the poller came to.
 enum Batch {
-    /// A batch was polled and every event it produced was delivered.
-    Moved,
+    /// A batch was polled and every event it produced was delivered, carrying how many
+    /// events the execution took from its source.
+    Moved { events: usize },
     /// The source held nothing.
     Idle,
     /// A stage failed; the source records are left for the next pass (and reappear on
-    /// the queue when their visibility timeout lapses).
-    Failed(String),
+    /// the queue when their visibility timeout lapses). `events` is how many events the
+    /// failed execution had taken from its source, which entered the pipe whether or not
+    /// the execution finished.
+    Failed {
+        stage: Stage,
+        events: usize,
+        detail: String,
+    },
 }
 
 /// Move one batch: poll the source, hand it to the enrichment, deliver what came back to
 /// the target, and delete the source records that were delivered.
+///
+/// Every one of those calls is made AS THE PIPE'S EXECUTION ROLE, so each is preceded by
+/// the one question [`RoleGate`] answers: may that role make this call on this resource?
+/// A call it may not make is the stage FAILING rather than the call happening.
 async fn move_one_batch(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
+    iam: Option<&::engine::ServiceState<super::execution_role::IamState>>,
     run: &SqsSourcedPipe,
 ) -> Batch {
+    let gate = RoleGate {
+        iam,
+        role_arn: &run.role_arn,
+    };
+    if let Some(detail) = gate.refusal(RECEIVE_MESSAGE_ACTION, &run.source_arn) {
+        return Batch::Failed {
+            stage: Stage::Source,
+            events: 0,
+            detail,
+        };
+    }
     let polled = match collect_batch(callback, clients, run).await {
         Ok(polled) => polled,
-        Err(detail) => return Batch::Failed(detail),
+        Err(detail) => {
+            return Batch::Failed {
+                stage: Stage::Source,
+                events: 0,
+                detail,
+            }
+        }
     };
     if polled.is_empty() {
         return Batch::Idle;
     }
+    let taken = polled.len();
 
     // The WHOLE polled batch, as one JSON array of record envelopes.
     let batch: Vec<Value> = polled
@@ -405,14 +522,48 @@ async fn move_one_batch(
         Some(enrichment) => {
             let handed = match transformed(run.enrichment_template.as_deref(), batch) {
                 Ok(handed) => handed,
-                Err(detail) => return Batch::Failed(detail),
+                Err(detail) => {
+                    return Batch::Failed {
+                        stage: Stage::Enrichment,
+                        events: taken,
+                        detail,
+                    }
+                }
             };
+            if let Some(detail) =
+                gate.refusal(enrichment.invocation_action(), enrichment.arn())
+            {
+                return Batch::Failed {
+                    stage: Stage::Enrichment,
+                    events: taken,
+                    detail,
+                };
+            }
             match invoke_enrichment(callback, clients, enrichment, &handed).await {
                 Ok(events) => events,
-                Err(detail) => return Batch::Failed(detail),
+                Err(detail) => {
+                    return Batch::Failed {
+                        stage: Stage::Enrichment,
+                        events: taken,
+                        detail,
+                    }
+                }
             }
         }
     };
+
+    // The target stage makes one call per event, each the same call on the same resource,
+    // so the role is asked about it once for the batch — and only when there is an event
+    // to deliver, because a batch the enrichment emptied makes no target call at all.
+    if !events.is_empty() {
+        if let Some(detail) = gate.refusal(run.target.delivery_action(), &run.target_arn) {
+            return Batch::Failed {
+                stage: Stage::Target,
+                events: taken,
+                detail,
+            };
+        }
+    }
 
     // One target call per event, never one call holding the array. What the target
     // RECEIVES is the event rendered through the TARGET's input template, when the pipe
@@ -422,19 +573,38 @@ async fn move_one_batch(
             None => ::std::borrow::Cow::Borrowed(event),
             Some(template) => match render_template(template, event) {
                 Ok(payload) => ::std::borrow::Cow::Owned(payload),
-                Err(detail) => return Batch::Failed(detail),
+                Err(detail) => {
+                    return Batch::Failed {
+                        stage: Stage::Target,
+                        events: taken,
+                        detail,
+                    }
+                }
             },
         };
         if let Err(detail) =
             deliver_event(callback, clients, &run.target, payload.as_ref(), event).await
         {
-            return Batch::Failed(detail);
+            return Batch::Failed {
+                stage: Stage::Target,
+                events: taken,
+                detail,
+            };
         }
     }
 
-    // Delivered: the source records may go. A delete that fails only means the record
-    // reappears and is delivered again, which is the at-least-once the service promises.
+    // Delivered: the source records may go. A delete the role may not make, or that
+    // fails, only means the record reappears and is delivered again, which is the
+    // at-least-once the service promises.
     let queue = run.source_queue.clone();
+    if let Some(detail) = gate.refusal(DELETE_MESSAGE_ACTION, &run.source_arn) {
+        ::tracing::warn!(
+            queue = %queue,
+            detail = %detail,
+            "a delivered pipe source record could not be deleted"
+        );
+        return Batch::Moved { events: taken };
+    }
     for message in &polled {
         let Some(handle) = message.receipt_handle.as_deref() else {
             continue;
@@ -454,7 +624,28 @@ async fn move_one_batch(
             );
         }
     }
-    Batch::Moved
+    Batch::Moved { events: taken }
+}
+
+/// The one question each stage asks before it makes its call: may this pipe's execution
+/// role perform it?
+///
+/// The decision itself is [`super::execution_role::call_refusal`] — this holds only what
+/// it is asked about (the role the record carries now, and the IAM store of this engine)
+/// and takes the IAM guard for the length of that one decision, so no call leaves this
+/// process while it is held.
+struct RoleGate<'a> {
+    iam: Option<&'a ::engine::ServiceState<super::execution_role::IamState>>,
+    role_arn: &'a str,
+}
+
+impl RoleGate<'_> {
+    /// Why the role may not perform `action` on `resource`, or `None` when nothing of the
+    /// kind can be shown and the call goes ahead.
+    fn refusal(&self, action: &str, resource: &str) -> Option<String> {
+        let iam = self.iam?;
+        super::execution_role::call_refusal(self.role_arn, action, resource, &iam.lock())
+    }
 }
 
 /// Poll the source for up to `BatchSize` records, collecting for up to the batching
@@ -956,6 +1147,9 @@ struct SqsSourcedPipe {
     source_arn: String,
     /// The Region the source ARN names — the one its records are polled in and report.
     source_region: String,
+    /// `RoleArn`: the role every stage's call is made as, read off the record each pass so
+    /// a pipe whose role was switched is judged by the one it carries now.
+    role_arn: String,
     /// `BatchSize`: the most records one batch holds.
     batch_size: usize,
     /// `MaximumBatchingWindowInSeconds`, as a span.
@@ -969,6 +1163,8 @@ struct SqsSourcedPipe {
     /// rendered per event. Absent when the pipe configures none.
     target_template: Option<String>,
     target: Target,
+    /// The `Target` itself: the resource the delivery is authorized on.
+    target_arn: String,
 }
 
 /// The enrichment a batch is handed to, by the resource its ARN names.
@@ -979,6 +1175,24 @@ enum Enrichment {
     /// input: "You can only use Express workflows as an enrichment", and a synchronous
     /// run is what answers the enriched events.
     ExpressWorkflow { arn: String, region: String },
+}
+
+impl Enrichment {
+    /// The resource the enrichment stage's call is made on.
+    fn arn(&self) -> &str {
+        match self {
+            Self::LambdaFunction { arn, .. } | Self::ExpressWorkflow { arn, .. } => arn,
+        }
+    }
+
+    /// The IAM action the enrichment stage's call is authorized under: the API call this
+    /// kind of enrichment is invoked by.
+    fn invocation_action(&self) -> &'static str {
+        match self {
+            Self::LambdaFunction { .. } => INVOKE_FUNCTION_ACTION,
+            Self::ExpressWorkflow { .. } => START_SYNC_EXECUTION_ACTION,
+        }
+    }
 }
 
 /// The target an event is delivered to, by the resource its ARN names.
@@ -993,6 +1207,16 @@ enum Target {
         message_group_id: Option<String>,
         message_deduplication_id: Option<String>,
     },
+}
+
+impl Target {
+    /// The IAM action the target stage's call is authorized under: the API call this kind
+    /// of target takes one event by.
+    fn delivery_action(&self) -> &'static str {
+        match self {
+            Self::Queue { .. } => SEND_MESSAGE_ACTION,
+        }
+    }
 }
 
 /// What this record asks the stages to do, or why this data plane does not serve it.
@@ -1066,12 +1290,14 @@ fn resolve_run(pipe: &PipeRecord) -> Result<SqsSourcedPipe, String> {
         source_queue,
         source_arn: pipe.source.clone(),
         source_region,
+        role_arn: pipe.role_arn.clone(),
         batch_size,
         batching_window,
         enrichment,
         enrichment_template,
         target_template,
         target,
+        target_arn: pipe.target.clone(),
     })
 }
 

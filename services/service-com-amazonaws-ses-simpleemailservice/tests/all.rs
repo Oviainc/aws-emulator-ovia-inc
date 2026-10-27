@@ -29,6 +29,8 @@ mod ses_active_receipt_rule_set;
 mod ses_configuration_set_creation;
 #[path = "all/ses_configuration_set_delivery_options.rs"]
 mod ses_configuration_set_delivery_options;
+#[path = "all/ses_configuration_set_event_destinations.rs"]
+mod ses_configuration_set_event_destinations;
 #[path = "all/ses_configuration_set_listing.rs"]
 mod ses_configuration_set_listing;
 #[path = "all/ses_configuration_set_reputation_metrics.rs"]

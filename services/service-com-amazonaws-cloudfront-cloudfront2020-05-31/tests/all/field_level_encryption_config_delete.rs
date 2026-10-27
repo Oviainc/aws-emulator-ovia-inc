@@ -57,7 +57,7 @@ type Spelling = fn(&str) -> String;
 
 /// `DELETE /2020-05-31/field-level-encryption/{Id}` under the version token `if_match` — the
 /// route and the header the model binds this operation to (`IfMatch` travels in `If-Match`).
-async fn delete_config(
+pub(crate) async fn delete_config(
     router: &MultiServiceRouter,
     config_id: &str,
     if_match: Option<&str>,

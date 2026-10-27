@@ -2019,6 +2019,17 @@ impl ComAmazonawsGlueAwsglueState {
         self.glossaries.get_mut(id)
     }
 
+    /// Remove the glossary whose `Id` is `id`, reporting the record removed and `None` when
+    /// this account holds none under that id.
+    ///
+    /// The one place a glossary leaves the namespace, resolving the identifier the way
+    /// [`Self::glossary`] does — the `GlossaryId` is the whole address — so the delete and
+    /// the reads cannot disagree about which record an identifier names. A glossary's terms
+    /// are their own records in their own namespace, so this removes none of them.
+    pub fn remove_glossary(&mut self, id: &str) -> Option<GlossaryEntry> {
+        self.glossaries.remove(id)
+    }
+
     /// The stored glossary carrying this `Name`, or `None` when the name is free.
     ///
     /// A glossary's name is unique over this per-account namespace — that is what
@@ -5205,6 +5216,27 @@ pub fn ml_transform_update_names_a_change(input: &UpdateMLTransformInput) -> boo
 /// disagree about how the one miss is worded.
 pub fn form_type_not_found_message(identifier: &str) -> String {
     let sentence = format!("Metadata form type {identifier} not found.");
+    serde_json::json!({ "Message": sentence }).to_string()
+}
+
+/// The message the catalog's business glossary surface refuses an identifier it holds no
+/// glossary under with: the value of that refusal's `EntityNotFoundException$Message`.
+///
+/// Worded the way this surface words a miss, exactly as the form type one above does
+/// ([`form_type_not_found_message`]): the refusal text is itself a JSON document carrying
+/// the sentence under a `Message` key, so that text — braces and all — is what the modelled
+/// member carries, and the resource is named as the service names it, a business glossary.
+/// `serde_json` renders it, so an identifier carrying a quote or a backslash still yields a
+/// well-formed document.
+///
+/// `identifier` is the text's one variable part and is taken from the request.
+///
+/// One copy, shared by every operation that resolves a `GlossaryId`
+/// ([`ComAmazonawsGlueAwsglueState::glossary`]) — the glossary's own reader and the term
+/// create that puts a term inside one — so two of them cannot disagree about how the one
+/// miss is worded.
+pub fn glossary_not_found_message(identifier: &str) -> String {
+    let sentence = format!("Business glossary {identifier} not found.");
     serde_json::json!({ "Message": sentence }).to_string()
 }
 
