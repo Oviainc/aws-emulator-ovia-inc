@@ -4,10 +4,10 @@
 //! definition read its deployment targets from the same parameters.
 //!
 //! The rule under test: a configuration definition's deployment targets are the
-//! `TargetRegions` and `TargetAccounts` entries of its parameter map, so the operation
-//! that creates a definition and the operation that updates one deploy the same set for
-//! one parameter map and refuse the same parameter maps — the refusal differing only in
-//! the request member it names. Both drive the shared accessor in
+//! `TargetRegions`, `TargetAccounts` and `TargetOrganizationalUnits` entries of its
+//! parameter map, so the operation that creates a definition and the operation that
+//! updates one deploy the same set for one parameter map and refuse the same parameter
+//! maps, with the same statement of the rule. Both drive the shared accessor in
 //! `service_..._quicksetup::state`; every case below goes through the real wire path
 //! (the production `MultiServiceRouter`, restJson1 serialization, the
 //! modelled-constraint walk and the handlers), so what is asserted is what a signed AWS
@@ -291,9 +291,9 @@ type ParameterCase = (&'static str, Value, Expected);
 
 /// The table: parameter maps spanning what the rule generalises over — whether each
 /// target key is present at all, how many entries it names, how the comma-separated
-/// value is written (padding, empty entries, repeats), a parameter that names no
-/// target, a target set outside what may be deployed, and the deployment bound itself
-/// (at it and one past it).
+/// value is written (padding, empty entries, repeats), a parameter map that names no
+/// deployment target at all, a target set outside what may be deployed, and the
+/// deployment bound itself (at it and one past it).
 fn cases(local: &str) -> Vec<ParameterCase> {
     let other = "111122223333".to_string();
     let third = "444455556666".to_string();
@@ -308,11 +308,16 @@ fn cases(local: &str) -> Vec<ParameterCase> {
         (
             "neither target key",
             json!({}),
+            Expected::Refused,
+        ),
+        (
+            "only the organizational units, no Region",
+            json!({ "TargetOrganizationalUnits": "ou-1" }),
             Expected::Targets(vec![(local.to_string(), REGION.to_string())]),
         ),
         (
-            "one targeted Region, no account",
-            json!({ "TargetRegions": "eu-west-1" }),
+            "one targeted Region, the accounts left to the organizational units",
+            json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": "eu-west-1" }),
             Expected::Targets(vec![(local.to_string(), "eu-west-1".to_string())]),
         ),
         (
@@ -343,16 +348,16 @@ fn cases(local: &str) -> Vec<ParameterCase> {
             )),
         ),
         (
-            "both lists written empty",
-            json!({ "TargetAccounts": "", "TargetRegions": "" }),
-            Expected::Targets(vec![(local.to_string(), REGION.to_string())]),
+            "both target lists written empty",
+            json!({ "TargetAccounts": "", "TargetOrganizationalUnits": "", "TargetRegions": "" }),
+            Expected::Refused,
         ),
         (
-            // Only the two target keys name a deployment target; any other parameter is
-            // carried by the deployed configuration without moving it.
+            // Only the target keys name a deployment target, so a map of other
+            // parameters names nowhere to deploy to.
             "a parameter that names no target",
             json!({ "UpdateSSMAgent": "true" }),
-            Expected::Targets(vec![(local.to_string(), REGION.to_string())]),
+            Expected::Refused,
         ),
         (
             "an account that is not an account id",
@@ -381,14 +386,14 @@ fn cases(local: &str) -> Vec<ParameterCase> {
 /// A create and an update read one definition's deployment targets from the same
 /// parameters: for every parameter map in the table, both operations deploy the same
 /// account-and-Region set, and both refuse the same maps with a 400
-/// `ValidationException` whose message differs only in the request member it names.
+/// `ValidationException` stating the same rule.
 #[tokio::test]
 async fn a_create_and_an_update_read_the_same_targets_from_one_parameter_map() {
     let router = emulator();
     let local = local_account();
     // The parameters every update below starts from: one targeted Region in the local
     // account, so a refused update is visibly the one that wrote nothing.
-    let baseline = json!({ "TargetRegions": "us-east-1" });
+    let baseline = json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": "us-east-1" });
     let baseline_pairs: BTreeSet<(String, String)> =
         [(local.clone(), "us-east-1".to_string())].into_iter().collect();
 
@@ -453,16 +458,18 @@ async fn a_create_and_an_update_read_the_same_targets_from_one_parameter_map() {
                     "ValidationException",
                     "case {case}: expected ValidationException from the update, got {updated:?}"
                 );
-                // One rule, one message: the refusals differ only in the member each
-                // operation carries the parameters on.
+                // One rule, one message: a refusal stating one of this service's own
+                // bounds names the member the parameters arrived on, so the member is
+                // taken off before the two are compared; a refusal stating a rule of
+                // the API itself names no member and is compared as it stands.
                 let from_create = error_message(&created);
                 let from_update = error_message(&updated);
-                let create_tail = from_create.strip_prefix(CREATE_MEMBER).unwrap_or_else(|| {
-                    panic!("case {case}: expected a refusal naming {CREATE_MEMBER}, got {from_create:?}")
-                });
-                let update_tail = from_update.strip_prefix(UPDATE_MEMBER).unwrap_or_else(|| {
-                    panic!("case {case}: expected a refusal naming {UPDATE_MEMBER}, got {from_update:?}")
-                });
+                let create_tail = from_create
+                    .strip_prefix(CREATE_MEMBER)
+                    .unwrap_or(&from_create);
+                let update_tail = from_update
+                    .strip_prefix(UPDATE_MEMBER)
+                    .unwrap_or(&from_update);
                 assert_eq!(
                     create_tail, update_tail,
                     "case {case}: both refusals must state one rule, got {from_create:?} and {from_update:?}"

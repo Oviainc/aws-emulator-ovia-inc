@@ -168,6 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx);
         let mut state = state.lock();
         state.settle(std::time::SystemTime::now());
 
@@ -176,16 +177,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // something here. It is scoped to the region this request reached: an ARN of
         // another region, account or partition names a resource this endpoint does not
         // serve, which is as absent here as an identifier that was never minted.
-        let Some(tags) = state
-            .resource_tags(&resource, &crate::state::request_region(ctx))
-            .cloned()
-        else {
+        let Some(tags) = state.resource_tags(&resource, &region).cloned() else {
+            // The refusal names the resource that is MISSING by its own type and its
+            // own identifier, which for a nested stream ARN is the stream rather than
+            // the cluster segment the ARN read split at.
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
-                    &input.resource_arn,
-                    &resource.resource_id,
-                    &resource.resource_type,
-                ),
+                state
+                    .addressed_identity(&resource, &region)
+                    .not_found(&input.resource_arn),
             )
             .into());
         };

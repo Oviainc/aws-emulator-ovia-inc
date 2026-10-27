@@ -18,8 +18,8 @@
 //! Each test asserts that over a table spanning the axis the rule generalises over: how
 //! many language codes the request allowed identification to choose between (none, one,
 //! two, five) and which, including codes taken from the model's own `LanguageCode` enum,
-//! crossed with whether execution was deferred so the job reaches the same end through
-//! an extra status transition.
+//! crossed with whether the request deferred its execution, which the identification a
+//! finished job reports does not depend on.
 
 use std::time::Duration;
 
@@ -39,7 +39,7 @@ use crate::transcription_jobs::Transcribe;
 /// and `rt-multi-thread` features only, so `tokio::time::sleep` is not available here.
 const PAST_EVERY_TRANSITION: Duration = Duration::from_millis(1_300);
 
-/// The role a deferred job is queued with, so the row that defers execution satisfies
+/// The role a deferred job names, so the row that defers execution satisfies
 /// the co-requirements `JobExecutionSettings` documents on itself.
 const DEFERRED_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/transcribe-access";
 

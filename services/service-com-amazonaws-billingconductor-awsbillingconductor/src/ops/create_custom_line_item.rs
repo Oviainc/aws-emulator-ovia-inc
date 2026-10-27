@@ -283,14 +283,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exclusive, so the end has to be a LATER billing period than the start.
         let period_range = input.billing_period_range.clone();
         if let Some(range) = &period_range {
-            if !crate::state::billing_period_range_is_ordered(range) {
-                return Err(validation(
-                    "ILLEGAL_BILLING_PERIOD_RANGE",
-                    "BillingPeriodRange.ExclusiveEndBillingPeriod",
-                    "the exclusive end billing period must be later than the inclusive \
-                     start billing period"
-                        .to_string(),
-                ));
+            if let Err((reason, field, message)) =
+                crate::state::check_billing_period_range_is_ordered(range)
+            {
+                return Err(validation(reason, field, message));
             }
             // "Creates a custom line item … for the current or previous billing
             // period": the periods this operation may put an item into are bounded to

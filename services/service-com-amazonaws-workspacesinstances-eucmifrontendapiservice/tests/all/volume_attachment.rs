@@ -34,7 +34,11 @@ use crate::workspace_instance_lifecycle::{
 
 /// The `Message` member of an error envelope, which the JSON protocols render with the
 /// modelled casing and some clients read in lower case.
-fn message(payload: &Value) -> Option<&str> {
+///
+/// `pub(crate)` with [`attach_body`] below: the sibling `attachment_persistence` suite
+/// drives the same two operations and reads their envelopes through these helpers rather
+/// than through copies of them.
+pub(crate) fn message(payload: &Value) -> Option<&str> {
     payload["Message"]
         .as_str()
         .or_else(|| payload["message"].as_str())
@@ -48,7 +52,7 @@ async fn instance_and_volume(router: &MultiServiceRouter) -> (String, String) {
 }
 
 /// An `AssociateVolume` body.
-fn attach_body(instance: &str, volume: &str, device: &str) -> Value {
+pub(crate) fn attach_body(instance: &str, volume: &str, device: &str) -> Value {
     json!({ "WorkspaceInstanceId": instance, "VolumeId": volume, "Device": device })
 }
 

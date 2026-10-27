@@ -18,9 +18,12 @@
 //!   worth of jobs have all finished, a further start succeeds and the finished
 //!   records stay readable, which leaves the account holding MORE records than the
 //!   ceiling;
-//! * a start made while the ceiling's worth of jobs are still in flight IS refused,
-//!   with the modelled error and nothing stored under the refused name, and the very
-//!   same request succeeds once those jobs have finished.
+//! * a start made while the ceiling's worth of jobs are still in flight, by a request
+//!   that opted into no queue, IS refused, with the modelled error and nothing stored
+//!   under the refused name, and the very same request succeeds once those jobs have
+//!   finished (the queue a family that documents one opens AT the ceiling is
+//!   `crate::transcription_job_queueing`'s and `crate::call_analytics_job_queueing`'s
+//!   subject).
 //!
 //! Asserted over a table whose rows are the four job families — batch transcription,
 //! medical transcription, Call Analytics and Medical Scribe — each with its own
@@ -83,10 +86,14 @@ struct Family {
     request: fn(&str, usize) -> Value,
 }
 
-/// A batch transcription start. Every fifth job defers its execution, so the family's
-/// queued-then-processing path is counted against the quota too, and the rest start
-/// processing straight away.
-fn transcription_request(name: &str, index: usize) -> Value {
+/// A batch transcription start. Every fifth job defers its execution, so the member
+/// that opts into this family's queue is exercised in the fill too; below the ceiling
+/// there is nothing to wait for, so those jobs are processing like the rest (the queue
+/// that member opens AT the ceiling is `crate::transcription_job_queueing`'s subject).
+///
+/// `pub(crate)`, like [`call_analytics_request`] below: that queueing suite fills this
+/// family's ceiling with the very same jobs rather than inventing a second set.
+pub(crate) fn transcription_request(name: &str, index: usize) -> Value {
     let (uri, format) = MEDIA[index % MEDIA.len()];
     let mut request = json!({
         "TranscriptionJobName": name,
@@ -301,17 +308,20 @@ async fn a_finished_job_releases_its_concurrency_slot() {
     }
 }
 
-/// A start made while the ceiling's worth of jobs are IN FLIGHT is refused with the
-/// modelled `LimitExceededException`, stores nothing — and the identical request is
-/// served once those jobs have finished.
+/// A start made while the ceiling's worth of jobs are IN FLIGHT, by a request that
+/// opted into no queue, is refused with the modelled `LimitExceededException`, stores
+/// nothing — and the identical request is served once those jobs have finished.
 #[tokio::test]
 async fn a_start_at_the_concurrency_limit_is_refused_until_a_job_finishes() {
     for family in families() {
         let transcribe = Transcribe::new();
         family.fill_to_the_ceiling(&transcribe).await;
 
+        // Index 1, so the batch transcription row carries no `JobExecutionSettings`:
+        // the ceiling refuses a start that opted into no queue, and the start that DID
+        // opt in is `crate::transcription_job_queueing`'s subject.
         let case = format!("{}: one start past the concurrency limit", family.case);
-        let refused = family.start_job(&transcribe, "over-the-limit", 0).await;
+        let refused = family.start_job(&transcribe, "over-the-limit", 1).await;
         refused.refused(&case, 400, "LimitExceededException");
         let message = refused.error_message(&case);
         assert!(
@@ -332,7 +342,7 @@ async fn a_start_at_the_concurrency_limit_is_refused_until_a_job_finishes() {
 
         std::thread::sleep(PAST_EVERY_TRANSITION);
 
-        let served = family.start_job(&transcribe, "over-the-limit", 0).await;
+        let served = family.start_job(&transcribe, "over-the-limit", 1).await;
         served.ok_status(
             &format!("{}: the same start once the family is idle", family.case),
             200,

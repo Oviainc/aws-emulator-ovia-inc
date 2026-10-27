@@ -383,15 +383,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is bounded by its own depth rather than by the ceiling (see
         // [`crate::state::MAX_QUEUED_CALL_ANALYTICS_JOBS`]). A start that opted into
         // nothing, and one that would make the queue deeper than this emulator keeps,
-        // are refused in the ceiling's own words.
-        let at_the_ceiling =
-            crate::state::jobs_in_flight(&mut store.call_analytics_jobs, &region, now)
-                >= crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS;
-        let enters_the_queue = at_the_ceiling
-            && input.data_access_role_arn.is_some()
-            && crate::state::jobs_waiting_in_queue(&mut store.call_analytics_jobs, &region, now)
-                < crate::state::MAX_QUEUED_CALL_ANALYTICS_JOBS;
-        if at_the_ceiling && !enters_the_queue {
+        // are refused in the ceiling's own words. This is the rule the sibling family
+        // whose start documents a queue follows too, so both ask
+        // [`crate::state::admit_start`] for it.
+        let admission = crate::state::admit_start(
+            &mut store.call_analytics_jobs,
+            &region,
+            now,
+            crate::state::MAX_CONCURRENT_CALL_ANALYTICS_JOBS,
+            input
+                .data_access_role_arn
+                .is_some()
+                .then_some(crate::state::MAX_QUEUED_CALL_ANALYTICS_JOBS),
+        );
+        if admission == crate::state::StartAdmission::Refuse {
             return Err(StartCallAnalyticsJobErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(crate::state::concurrency_limit_message(
@@ -404,7 +409,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Only the ceiling puts a job in the queue: below it there is nothing to wait
         // for, so a start that named a role is processing like any other.
-        let queued = enters_the_queue;
+        let queued = admission == crate::state::StartAdmission::Queue;
 
         // The Region comes from the request's own (unauthenticated) credential scope, so
         // the concurrency quota above, the queue depth beside it and the retention bound
@@ -426,27 +431,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A job accepted into the documented queue is not processing yet: it has no
         // start time, and the clock owes it `QUEUED` -> `IN_PROGRESS` before the
         // completion every job gets — the same two spans a deferred batch
-        // transcription job waits out.
-        let (status, start_time, queued_until, completion_due) = if queued {
-            let starts_at = now + crate::state::JOB_TRANSITION_DELAY;
-            (
-                crate::state::STATUS_QUEUED.to_string(),
-                None,
-                Some(starts_at),
-                starts_at + crate::state::JOB_TRANSITION_DELAY,
-            )
-        } else {
-            (
-                crate::state::STATUS_IN_PROGRESS.to_string(),
-                Some(now),
-                None,
-                now + crate::state::JOB_TRANSITION_DELAY,
-            )
-        };
+        // transcription job waits out, so both families ask
+        // [`crate::state::start_lifecycle`] for them.
+        let lifecycle = crate::state::start_lifecycle(now, queued);
         let record = crate::state::CallAnalyticsJobRecord {
             name: input.call_analytics_job_name.clone(),
             sequence,
-            status,
+            status: lifecycle.status,
             media: input.media,
             output_location: input.output_location,
             output_encryption_kms_key_id: input.output_encryption_kms_key_id,
@@ -463,10 +454,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             transcript: None,
             failure_reason: None,
             creation_time: now,
-            start_time,
+            start_time: lifecycle.start_time,
             completion_time: None,
-            queued_until,
-            completion_due,
+            queued_until: lifecycle.queued_until,
+            completion_due: lifecycle.completion_due,
             tags: input.tags.unwrap_or_default(),
         };
 

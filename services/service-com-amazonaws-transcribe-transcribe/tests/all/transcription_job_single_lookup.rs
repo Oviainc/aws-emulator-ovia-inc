@@ -18,11 +18,10 @@
 //! reads back `COMPLETED` and is still refused deletion for a status it had left (or
 //! the reverse).
 //!
-//! Asserted over a table whose rows vary along what the rule generalises over: the
-//! clock path a job takes (`IN_PROGRESS -> COMPLETED` against the deferred
-//! `QUEUED -> IN_PROGRESS -> COMPLETED`), the Region the call is signed for, where
-//! the output goes and which transcripts the job was asked to produce — not along the
-//! job name alone.
+//! Asserted over a table whose rows vary along what the rule generalises over: what
+//! the request asked for (an explicit language against automatic identification, where
+//! the output goes, which transcripts the job was asked to produce, whether it deferred
+//! its execution) and the Region the call is signed for — not along the job name alone.
 
 use std::time::Duration;
 
@@ -43,8 +42,8 @@ const PAST_EVERY_TRANSITION: Duration = Duration::from_millis(1_300);
 const ROLE_ARN: &str = "arn:aws:iam::111122223333:role/TranscribeAccess";
 
 /// The statuses a transcription job passes through, in the order the clock moves it
-/// along them: `QUEUED` only for a job whose execution was deferred, then
-/// `IN_PROGRESS`, then the terminal `COMPLETED`
+/// along them: `QUEUED` only for a job that entered the queue its family's concurrency
+/// ceiling feeds, then `IN_PROGRESS`, then the terminal `COMPLETED`
 /// (`smithy_query(query="shape", shape="TranscriptionJobStatus")` lists
 /// `QUEUED`, `IN_PROGRESS`, `FAILED` and `COMPLETED`; `FAILED` is the other terminal
 /// one and no emulated job reaches it).
@@ -86,7 +85,7 @@ fn rows() -> Vec<Row> {
             first_status: "IN_PROGRESS",
         },
         Row {
-            case: "deferred execution, so the job is queued first",
+            case: "deferred execution, which queues nothing below the ceiling",
             name: "deferred.job-1",
             region: None,
             request: json!({
@@ -101,7 +100,10 @@ fn rows() -> Vec<Row> {
                     "DataAccessRoleArn": ROLE_ARN
                 }
             }),
-            first_status: "QUEUED",
+            // Nothing of this family is in flight here, so the deferral has no queue
+            // to enter: the job is processing already
+            // (`crate::transcription_job_queueing` drives the ceiling it queues at).
+            first_status: "IN_PROGRESS",
         },
         Row {
             case: "redacted and unredacted transcripts, signed for eu-west-1",
@@ -135,7 +137,8 @@ fn rows() -> Vec<Row> {
                     "DataAccessRoleArn": ROLE_ARN
                 }
             }),
-            first_status: "QUEUED",
+            // Deferred too, and in another Region, where this family is just as idle.
+            first_status: "IN_PROGRESS",
         },
     ]
 }

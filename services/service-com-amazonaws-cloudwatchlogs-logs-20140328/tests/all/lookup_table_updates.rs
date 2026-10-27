@@ -574,7 +574,7 @@ fn refusals() -> Vec<Refusal> {
                 "tableBody": "user\nalice\n",
             }),
             code: NOT_FOUND,
-            in_message: "does not exist".to_string(),
+            in_message: "Lookup table 'update_never_created' not found in account".to_string(),
         },
         Refusal {
             case: "this table's name in ANOTHER Region, which this account does not hold here",
@@ -584,7 +584,7 @@ fn refusals() -> Vec<Refusal> {
                 "tableBody": "user\nalice\n",
             }),
             code: NOT_FOUND,
-            in_message: "does not exist".to_string(),
+            in_message: "Lookup table 'update_refusals' not found in account".to_string(),
         },
         Refusal {
             case: "a log group's ARN, which names no lookup table",

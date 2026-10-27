@@ -931,9 +931,20 @@ impl ComAmazonawsDsqlDsqlState {
         resource: &'a ArnResource,
         endpoint_region: &str,
     ) -> Option<(&'a str, Option<&'a str>)> {
-        if !resource.is_scoped_to(endpoint_region) {
-            return None;
-        }
+        resource
+            .is_scoped_to(endpoint_region)
+            .then(|| Self::arn_path(resource))
+            .flatten()
+    }
+
+    /// The identifiers a tagging ARN's resource PATH names, whatever scope the ARN
+    /// carries: the cluster, and the stream nested under it when the path nests one.
+    ///
+    /// The scope is [`Self::addressed_resource`]'s business; this is the read of the
+    /// path alone, so a refusal can name the resource an out-of-scope ARN addresses
+    /// just as precisely as one this endpoint could have held
+    /// ([`Self::addressed_identity`]).
+    fn arn_path(resource: &ArnResource) -> Option<(&str, Option<&str>)> {
         if resource.resource_type != RESOURCE_TYPE_CLUSTER {
             return None;
         }
@@ -946,6 +957,68 @@ impl ComAmazonawsDsqlDsqlState {
                 (!cluster.is_empty() && !stream.is_empty()).then_some((cluster, Some(stream)))
             }
         }
+    }
+
+    /// The identity a modelled error reports for the resource a tagging ARN names:
+    /// that resource's OWN type segment and its OWN identifier.
+    ///
+    /// A resource is identified by the type segment it is stored under and the
+    /// identifier that segment carries, so a stream of a cluster is a
+    /// [`RESOURCE_TYPE_STREAM`] named by its own stream identifier — the identity
+    /// [`stream_not_found`] reports for that very stream — and never the leading
+    /// `cluster` segment [`parse_resource_arn`] split the resource field at, carrying
+    /// the rest of the path for an identifier.
+    ///
+    /// Which of a nested ARN's two resources is the one a REFUSAL names follows the
+    /// same rule the identifier-addressed readers follow: the resource the lookup
+    /// stopped at is the one that is missing, so a nested ARN whose cluster this store
+    /// does not hold — including one in a scope this endpoint serves none of — names
+    /// that cluster, and one whose cluster is held names the stream under it. An ARN
+    /// whose path names no resource of this service at all is reported exactly as it
+    /// was spelled, there being no resource of this service to name instead.
+    pub fn addressed_identity(
+        &self,
+        resource: &ArnResource,
+        endpoint_region: &str,
+    ) -> ResourceIdentity {
+        let Some((cluster_identifier, stream_identifier)) = Self::arn_path(resource) else {
+            return ResourceIdentity {
+                resource_type: resource.resource_type.clone(),
+                resource_id: resource.resource_id.clone(),
+            };
+        };
+        match stream_identifier {
+            Some(stream_identifier)
+                if self.holds_cluster(resource, endpoint_region, cluster_identifier) =>
+            {
+                ResourceIdentity {
+                    resource_type: RESOURCE_TYPE_STREAM.to_string(),
+                    resource_id: stream_identifier.to_string(),
+                }
+            }
+            _ => ResourceIdentity {
+                resource_type: RESOURCE_TYPE_CLUSTER.to_string(),
+                resource_id: cluster_identifier.to_string(),
+            },
+        }
+    }
+
+    /// Whether this store holds the cluster `cluster_identifier` names as the ARN
+    /// `resource` names it: in the scope the request reached, and minted with that
+    /// very scope — the same two conditions [`Self::resource_tags`] resolves a
+    /// cluster under, so the identity a refusal reports and the resolution that
+    /// refused never disagree.
+    fn holds_cluster(
+        &self,
+        resource: &ArnResource,
+        endpoint_region: &str,
+        cluster_identifier: &str,
+    ) -> bool {
+        resource.is_scoped_to(endpoint_region)
+            && self
+                .clusters
+                .get(cluster_identifier)
+                .is_some_and(|cluster| resource.is_arn_of(&cluster.arn))
     }
 
     /// The tags of the resource `resource` names, if this service holds it.
@@ -1483,6 +1556,30 @@ fn crockford_base32(value: u128) -> String {
             char::from(CROCKFORD_SYMBOLS[symbol])
         })
         .collect()
+}
+
+/// How one resource is identified in the modelled shapes that carry a resource's
+/// identity (`ResourceNotFoundException` and `ServiceQuotaExceededException`, both
+/// of which model a `@required` `resourceId` and `resourceType`): the type segment
+/// the resource is stored under, and that resource's own identifier.
+///
+/// Built from the store rather than per handler
+/// ([`ComAmazonawsDsqlDsqlState::addressed_identity`]), so every operation that
+/// reports a resource's identity reports the same two values for the same resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceIdentity {
+    /// The resource's own type segment, e.g. [`RESOURCE_TYPE_STREAM`] for a stream.
+    pub resource_type: String,
+    /// The resource's own identifier, carrying none of a parent's segments.
+    pub resource_id: String,
+}
+
+impl ResourceIdentity {
+    /// The modelled `ResourceNotFoundException` for a resource `arn` addressed and
+    /// this service does not hold: [`resource_not_found`] over this identity.
+    pub fn not_found(&self, arn: &str) -> ResourceNotFoundException {
+        resource_not_found(arn, &self.resource_id, &self.resource_type)
+    }
 }
 
 /// The modelled `ResourceNotFoundException` for a resource this service does not

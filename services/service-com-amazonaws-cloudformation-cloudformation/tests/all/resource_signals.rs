@@ -31,7 +31,9 @@ use crate::stack_lifecycle::{
     call, call_in, create_stack, describe_stack, member, router_with_engine, store,
     wait_for_the_transition, xml_blocks, xml_text, REGION,
 };
-use service_com_amazonaws_cloudformation_cloudformation::state::{status, STATUS_TRANSITION_DELAY};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    resource_failure_summary, status, STATUS_TRANSITION_DELAY,
+};
 
 /// The logical id of the resource every template here declares as the one a signal is
 /// about, so a row says what the declaration IS rather than what it is called.
@@ -609,15 +611,14 @@ async fn a_failure_signal_fails_the_operation_that_waits_for_it() {
             row.case, row.expected_status
         );
         let reason = xml_text(&described, "StackStatusReason").unwrap_or_default();
-        let expected_reason = format!(
-            "The following resource(s) failed to {}: [{GATE}]. {}",
-            row.expected_verb,
-            signal_reason("FAILURE", unique_id)
-        );
+        // The STACK's reason is the summary of which resource failed the operation; the
+        // signal that failed it is the RESOURCE's own diagnosis, asserted on its event
+        // below.
+        let expected_reason = resource_failure_summary(row.expected_verb, [GATE]);
         assert_eq!(
             reason, expected_reason,
-            "case {:?}: expected the reason to name the resource and the signal that failed \
-             it, got {reason:?}",
+            "case {:?}: expected the reason to summarise the resource that failed, got \
+             {reason:?}",
             row.case
         );
         // The event log carries the signal on the resource itself, with the status that

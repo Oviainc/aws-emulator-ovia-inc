@@ -28,3 +28,28 @@ Traces: batch__events__sqs.batch-job-state-change-event-delivered-to-matching-ru
 2. CreateQueue(qMatch) and CreateQueue(qOther); SetQueueAttributes on both with a policy admitting their rule ARNs.
 3. PutRule(Name=rMatch, EventPattern='{"source":["aws.batch"],"detail-type":["Batch Job State Change"],"detail":{"jobQueue":[<jq arn>]}}') + PutTargets to qMatch; PutRule(Name=rOther) with a non-matching jobQueue + PutTargets to qOther.
 4. SubmitJob(jobQueue=jq, jobDefinition=jd, jobName=n) -> ReceiveMessage(qMatch) never returns a message.
+
+## Resolution
+
+The cause above is served. Every job status transition is published onto the default
+EventBridge bus as `aws.batch` / "Batch Job State Change"
+(`services/service-com-amazonaws-batch-awsbatchv20160810/src/state.rs`:
+`publish_job_state_changes`, drained by SubmitJob, the readers, the cancel/terminate
+operations and the clock pump `drive_job_clock`), EventBridge routes the envelope to
+each rule whose pattern matches it, and the rule's SQS target receives it. The whole
+sequence in "Steps to Reproduce" — including the queue policy, the `detail.jobQueue`
+pattern and the second rule that must receive nothing — is driven over the wire,
+through the emulator's whole mounted service set, by
+`core/router/tests/all/batch_job_state_change_reaches_matching_rules.rs`: the matching
+rule's queue receives the `SUBMITTED` and `RUNNABLE` envelopes within about a second
+and with no further Batch call, and the other rule's queue stays empty.
+
+STILL OPEN on this trace: the recorded check itself continues to report
+"Check timed out after 60.0s", with no divergence reported on any call it makes. What
+it waits for past the delivery above is not observable from the replay output, so the
+unit is not passing even though the cause this report names is. Anyone picking this up
+should start from what is already ruled out: the publication, the routing, the
+delivery, the queue policy, the `VALID` compute environment and job queue, SubmitJob
+addressed by name or by ARN, an empty `ReceiveMessage` long poll returning when its
+wait is up, and an SDK-signed in-process callback verifying with request
+authentication on.
