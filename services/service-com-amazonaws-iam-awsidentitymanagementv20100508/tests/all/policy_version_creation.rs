@@ -134,14 +134,14 @@ fn padded_document(filler: &str) -> String {
 
 /// A policy document whose measured size is EXACTLY `characters`.
 ///
-/// The measure is the crate's own (`state::managed_policy_characters`), the one the
-/// managed policy size quota is taken against, so a row built here sits exactly on a
+/// The measure is the crate's own (`state::policy_document_characters`), the one every
+/// policy size quota is taken against, so a row built here sits exactly on a
 /// published bound rather than near it.
 fn document_of_size(characters: usize) -> String {
-    let base = state::managed_policy_characters(&padded_document(""));
+    let base = state::policy_document_characters(&padded_document(""));
     let document = padded_document(&"a".repeat(characters - base));
     assert_eq!(
-        state::managed_policy_characters(&document),
+        state::policy_document_characters(&document),
         characters,
         "the fixture document must measure exactly {characters} characters"
     );

@@ -236,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 131072-character ceiling, and the bound is the policy's, not the create's: a
         // version whose document is past the quota is refused rather than stored, exactly
         // as the document `CreatePolicy` was given would be.
-        let characters = crate::state::managed_policy_characters(&input.policy_document);
+        let characters = crate::state::policy_document_characters(&input.policy_document);
         if characters > crate::state::MAX_MANAGED_POLICY_CHARACTERS {
             return Err(CreatePolicyVersionErrorModeled::LimitExceededException(
                 LimitExceededException {

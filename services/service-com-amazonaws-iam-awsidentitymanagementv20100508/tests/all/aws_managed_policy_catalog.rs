@@ -333,12 +333,12 @@ fn catalog_entries_are_well_formed_and_distinct() {
             entry.document
         );
         assert!(
-            state::managed_policy_characters(entry.document)
+            state::policy_document_characters(entry.document)
                 <= state::MAX_MANAGED_POLICY_CHARACTERS,
             "case {case:?}: the document must fit the managed-policy quota of {} \
              characters, got {}",
             state::MAX_MANAGED_POLICY_CHARACTERS,
-            state::managed_policy_characters(entry.document)
+            state::policy_document_characters(entry.document)
         );
         assert!(
             state::is_aws_managed_policy_arn(&arn),
