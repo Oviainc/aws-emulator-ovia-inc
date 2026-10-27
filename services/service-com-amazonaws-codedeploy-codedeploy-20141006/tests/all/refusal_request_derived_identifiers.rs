@@ -31,7 +31,7 @@ use service_com_amazonaws_codedeploy_codedeploy_20141006::state::MAX_ALARM_NAME_
 
 use crate::codedeploy_lifecycle::{error_code, s3_revision, seeded_group, Emulator};
 use crate::deployment_targets::deployable;
-use crate::list_deployment_targets::{deploy, group_with, register};
+use crate::list_deployment_targets::{deploy, force_status, group_with, register};
 
 /// The account id every emulated ARN carries (`engine::emulator_account_id`).
 fn account() -> &'static str {
@@ -285,20 +285,19 @@ async fn a_target_refusal_identifies_the_target_by_its_arn() {
     );
 
     // The rule is about an identifier, not about the refusal: an id that DOES
-    // name a target of the deployment is still answered, so nothing above turned
-    // a readable target into a refusal.
+    // name a target of the deployment is answered once that target's record is
+    // readable, so nothing above turned a readable target into a refusal.
+    force_status(&emulator, &server, "InProgress", true);
     let answered = emulator
         .call(
             "GetDeploymentTarget",
             json!({"deploymentId": server, "targetId": "host-a"}),
         )
         .await;
-    assert!(
-        answered.0 == 200 || error_code(&answered.1) == "DeploymentNotStartedException",
-        "case \"a target the deployment holds\": expected the target to be readable (or the \
-         deployment not to have started yet), got {} {:?}",
-        answered.0,
-        answered.1
+    assert_eq!(
+        answered.0, 200,
+        "case \"a target the deployment holds\": expected the target to be readable, got {} {:?}",
+        answered.0, answered.1
     );
 }
 

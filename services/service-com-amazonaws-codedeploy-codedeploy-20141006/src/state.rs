@@ -705,43 +705,88 @@ pub const MAX_ALARMS_PER_DEPLOYMENT_GROUP: usize = 10;
 /// per-deployment quota here.
 pub const MAX_ALARMS_PER_DEPLOYMENT: usize = 50;
 
-/// Which resource's alarm quota an operation enforces: the deployment group's own
-/// `alarmConfiguration`, or one deployment's `overrideAlarmConfiguration`.
+/// How many alarms one deployment group's stored alarm configuration KEEPS.
 ///
-/// The two differ in the quota and in the sentence that states it, and in nothing
-/// else — every other rule about an alarm configuration is the same for both —
-/// so [`validate_alarm_configuration`] takes this rather than being written twice.
+/// A group's alarm list is caller-chosen, is replaced whole on every update,
+/// and is cloned into every read of the group, while the figure the model
+/// documents ([`MAX_ALARMS_PER_DEPLOYMENT_GROUP`]) is not what an update is
+/// admitted under ([`AlarmQuota`]). So — like [`MAX_REVISIONS_PER_APPLICATION`]
+/// — this bound is CHOSEN rather than published: it is set far above the
+/// documented figure, so every configuration the service admits is still
+/// admitted, and it is what keeps one group from retaining a list of any length
+/// and a read of it from answering one.
+pub const MAX_RETAINED_ALARMS_PER_DEPLOYMENT_GROUP: usize = 200;
+
+/// `AlarmsLimitExceededException` (HTTP 400) for a deployment group's own alarm
+/// configuration: the error's own sentence, stating the count that refused the
+/// request and the count the request named.
+fn group_alarms_exceeded(limit: usize, specified: usize) -> String {
+    format!(
+        "The maximum number of alarms for a deployment group ({limit}) was exceeded: \
+         {specified} alarms were specified"
+    )
+}
+
+/// Which alarm-count gate an operation taking an alarm configuration applies:
+/// the one a deployment group is SET UP under, the one an existing group is
+/// UPDATED under, or one deployment's `overrideAlarmConfiguration`.
+///
+/// The three differ in the count a configuration is admitted up to and in the
+/// sentence that states it, and in nothing else — every other rule about an
+/// alarm configuration is the same for all of them — so
+/// [`validate_alarm_configuration`] takes this rather than being written three
+/// times.
+///
+/// A documented quota and an admission gate are NOT the same thing: the figure
+/// the model documents bounds the resource, and whether a count past it is
+/// refused as the request arrives is per operation
+/// ([`AlarmQuota::too_many_alarms`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlarmQuota {
-    /// A deployment group's own alarm configuration
+    /// The alarm configuration a deployment group is created with
     /// ([`MAX_ALARMS_PER_DEPLOYMENT_GROUP`]).
     DeploymentGroup,
-    /// One deployment's override of it ([`MAX_ALARMS_PER_DEPLOYMENT`]).
+    /// The alarm configuration an EXISTING deployment group is updated to,
+    /// which is admitted past the documented figure and bounded only by what
+    /// the store KEEPS ([`MAX_RETAINED_ALARMS_PER_DEPLOYMENT_GROUP`]): see
+    /// [`AlarmQuota::too_many_alarms`].
+    DeploymentGroupUpdate,
+    /// One deployment's override of its group's configuration
+    /// ([`MAX_ALARMS_PER_DEPLOYMENT`]).
     Deployment,
 }
 
 impl AlarmQuota {
-    /// How many alarms this resource's alarm configuration may carry.
-    pub fn max_alarms(self) -> usize {
+    /// The `AlarmsLimitExceededException` sentence a configuration of
+    /// `specified` alarms is refused at admission with, or `None` where this
+    /// gate admits it.
+    ///
+    /// A sentence is built from the constant it states, so the figure a caller
+    /// reads back is the one that refused the request. A configuration an
+    /// existing deployment group is updated to is admitted past the documented
+    /// figure — that figure bounds the group's alarm monitoring rather than the
+    /// writes of its configuration, so the update stores every well-formed
+    /// entry it names instead of refusing the request and leaving the group on
+    /// its previous alarm set — up to what one group KEEPS
+    /// ([`MAX_RETAINED_ALARMS_PER_DEPLOYMENT_GROUP`]), which is the store's own
+    /// bound and is stated by the same sentence.
+    pub fn too_many_alarms(self, specified: usize) -> Option<String> {
         match self {
-            Self::DeploymentGroup => MAX_ALARMS_PER_DEPLOYMENT_GROUP,
-            Self::Deployment => MAX_ALARMS_PER_DEPLOYMENT,
-        }
-    }
-
-    /// The `AlarmsLimitExceededException` sentence for a configuration past this
-    /// quota, which states the quota the caller has to fit in — built from the
-    /// constant, so the figure a caller reads back is the one enforced.
-    pub fn too_many_alarms_message(self, specified: usize) -> String {
-        match self {
-            Self::DeploymentGroup => format!(
-                "The maximum number of alarms for a deployment group ({}) was exceeded: \
-                 {specified} alarms were specified",
-                MAX_ALARMS_PER_DEPLOYMENT_GROUP
+            Self::DeploymentGroup if specified > MAX_ALARMS_PER_DEPLOYMENT_GROUP => Some(
+                group_alarms_exceeded(MAX_ALARMS_PER_DEPLOYMENT_GROUP, specified),
             ),
-            Self::Deployment => format!(
+            Self::DeploymentGroupUpdate
+                if specified > MAX_RETAINED_ALARMS_PER_DEPLOYMENT_GROUP =>
+            {
+                Some(group_alarms_exceeded(
+                    MAX_RETAINED_ALARMS_PER_DEPLOYMENT_GROUP,
+                    specified,
+                ))
+            }
+            Self::Deployment if specified > MAX_ALARMS_PER_DEPLOYMENT => Some(format!(
                 "Deployments cannot contain more than {MAX_ALARMS_PER_DEPLOYMENT} alarms."
-            ),
+            )),
+            _ => None,
         }
     }
 }
@@ -761,8 +806,8 @@ pub const MAX_ALARM_NAME_LENGTH: usize = 255;
 /// operation's error enum.
 #[derive(Debug)]
 pub enum AlarmConfigurationRejection {
-    /// More alarms than the resource's [`AlarmQuota`] allows; carries the
-    /// sentence that states the quota the request has to fit in.
+    /// More alarms than the operation's [`AlarmQuota`] admits; carries the
+    /// sentence that states the count the request has to fit in.
     TooManyAlarms(String),
     /// Malformed in one of the ways `InvalidAlarmConfigException` documents; the
     /// string is the whole sentence, so the caller can fix the request from the
@@ -783,10 +828,10 @@ pub fn validate_alarm_configuration(
     quota: AlarmQuota,
 ) -> Result<(), AlarmConfigurationRejection> {
     let alarms = configuration.alarms.as_deref().unwrap_or_default();
-    if alarms.len() > quota.max_alarms() {
-        return Err(AlarmConfigurationRejection::TooManyAlarms(
-            quota.too_many_alarms_message(alarms.len()),
-        ));
+    // The COUNT is gated only where the operation gates it; the rules below are
+    // about the configuration's FORM and hold wherever one is accepted.
+    if let Some(message) = quota.too_many_alarms(alarms.len()) {
+        return Err(AlarmConfigurationRejection::TooManyAlarms(message));
     }
     if configuration.enabled && alarms.is_empty() {
         return Err(AlarmConfigurationRejection::Malformed(
@@ -2553,6 +2598,29 @@ pub fn find_deployment_target<'a>(
         .targets
         .iter()
         .find(|target| target.target_id.as_deref() == Some(target_id))
+}
+
+/// The target of `deployment` a reader of ONE target can answer under
+/// `target_id` right now, if there is one.
+///
+/// A deployment's per-target RECORDS come into existence as the deployment
+/// resolves its targets, which this service owes at the instant it starts
+/// ([`Deployment::is_started`]): until then the deployment holds no record a
+/// reader can answer under any id. So a read of one target is keyed on the
+/// record alone — either it is there to answer, or it is not — and an id the
+/// deployment's snapshot DOES hold a target under is simply unreadable for that
+/// window, answered exactly as an id no target of this deployment is reported
+/// under ([`deployment_target_not_found`]). That keeps one code for the whole
+/// not-yet-readable window, so a client polling a target retries on that one
+/// code and stops on the answer.
+pub fn readable_deployment_target<'a>(
+    deployment: &'a Deployment,
+    target_id: &str,
+) -> Option<&'a DeploymentTargetSnapshot> {
+    if !deployment.is_started() {
+        return None;
+    }
+    find_deployment_target(deployment, target_id)
 }
 
 /// The instant a target of `deployment` last changed state.

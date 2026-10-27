@@ -37,6 +37,8 @@ mod automation_rule_preview;
 mod automation_rule_preview_summaries;
 #[path = "all/automation_rule_validation.rs"]
 mod automation_rule_validation;
+#[path = "all/disassociated_member_initiation.rs"]
+mod disassociated_member_initiation;
 #[path = "all/enrollment_gate.rs"]
 mod enrollment_gate;
 #[path = "all/enrollment_rule_mode.rs"]
@@ -47,6 +49,8 @@ mod enum_parameter_rejection;
 mod error_payloads;
 #[path = "all/filter_name_refusals.rs"]
 mod filter_name_refusals;
+#[path = "all/member_account_association_gate.rs"]
+mod member_account_association_gate;
 #[path = "all/member_account_initiation_gate.rs"]
 mod member_account_initiation_gate;
 #[path = "all/not_found_wording.rs"]

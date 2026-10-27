@@ -250,6 +250,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(now);
 
+        // A workspace lives in ONE Region — "You can have one or more workspaces in each
+        // Region in your account" — so the store this call reads and writes is the one of
+        // the Region the request was signed for, and nothing it creates is reachable from
+        // another Region's endpoint. The Region comes from the caller's own credential
+        // scope, so this create — one of only two that may bring a Region's store into
+        // being — is refused once the store holds records for as many Regions as it may,
+        // and writes nothing. A Region the store already holds records in needs no room
+        // for a further one, so it is never refused here. `MAX_REGIONS` is a small finite
+        // figure and stays one: the assertion below fails to COMPILE otherwise.
+        const _: () = assert!(crate::state::MAX_REGIONS <= 64);
+        if !store.holds_records_in(&region)
+            && store.regions_holding_records() >= crate::state::MAX_REGIONS
+        {
+            return Err(CreateWorkspaceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: crate::state::region_ceiling_message(),
+                    // The bound is per account, so the account is the resource that
+                    // reached it.
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    service_code: ctx.identity().signing_name().to_string(),
+                    // `quotaCode` is `@required`, and the bound this refusal reports is
+                    // the EMULATOR's own (the message says so): the code names what it
+                    // bounds rather than claiming an identifier Service Quotas issues,
+                    // which this emulator does not model.
+                    quota_code: "EmulatorRegionsPerAccount".to_string(),
+                },
+            )
+            .into());
+        }
+        let held = &*store;
+        let records = held.region(&region);
+
         // `clientToken` carries `@idempotencyToken`: replaying a token that already
         // created a workspace answers with THAT workspace instead of a second one — as
         // long as the workspace is still the record that create left. One whose removal
@@ -259,8 +292,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = input
             .client_token
             .as_deref()
-            .and_then(|token| store.client_tokens.get(token))
-            .and_then(|workspace_id| store.workspaces.get(workspace_id))
+            .and_then(|token| records.client_tokens.get(token))
+            .and_then(|workspace_id| records.workspaces.get(workspace_id))
             .filter(|workspace| workspace.status_code != crate::state::STATUS_DELETING)
         {
             return Ok(response_for(existing));
@@ -268,17 +301,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store is BOUNDED: past its quota a create is refused rather than adding
         // another record. `ServiceQuotaExceededException` is the modelled refusal for
-        // exactly this, and `WORKSPACE_QUOTA` is what stops the workspace, ARN-index and
-        // client-token maps growing without end.
-        if store.workspaces.len() >= crate::state::WORKSPACE_QUOTA {
+        // exactly this, and `WORKSPACE_QUOTA` is what stops the workspace and
+        // client-token maps of ONE Region growing without end — the published quota is
+        // per account per Region, so a Region that is full says nothing about any other.
+        if records.workspaces.len() >= crate::state::WORKSPACE_QUOTA {
             return Err(CreateWorkspaceErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
-                        "this account already holds the maximum of {} workspaces",
+                        "this account already holds the maximum of {} workspaces in this Region",
                         crate::state::WORKSPACE_QUOTA
                     ),
-                    // The bound is per account, so the account is the resource that
-                    // reached it.
+                    // The bound is per account and Region, so the account is the resource
+                    // that reached it.
                     resource_id: ::engine::emulator_account_id().to_string(),
                     resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
                     service_code: ctx.identity().signing_name().to_string(),
@@ -291,7 +325,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let workspace_id = crate::state::mint_workspace_id(&mut store.next_id);
+        // Every refusal above is answered off the Region's store as it STANDS, read
+        // through a shared borrow, so none of them materialises a store for the Region a
+        // caller named: the inserting accessor is taken only here, where the record is
+        // about to be written.
+        let (store, next_id) = store.region_and_ids_mut_for_create(&region);
+
+        let workspace_id = crate::state::mint_workspace_id(next_id);
         let workspace = crate::state::Workspace {
             arn: crate::state::workspace_arn(&region, &workspace_id),
             prometheus_endpoint: crate::state::prometheus_endpoint(&region, &workspace_id),

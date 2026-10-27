@@ -197,6 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // Whatever the clock already owed the stored packages is materialised before the
+        // set is judged, so this create decides on the packages the account holds at
+        // `now`: a package whose deletion has fallen due is neither a name this create
+        // collides with nor a record counted against the bound below.
+        store.settle_packages(now);
+
         // `PackageName` is the "unique name for the package", so a second create of
         // the same name is the modelled already-exists refusal: the existing record
         // stays exactly as it is rather than becoming a second package a caller could
@@ -247,6 +253,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: None,
                 due: now + PROVISIONING,
             }),
+            // Nothing about a package a create has just minted is owed a removal: a
+            // delete is what asks for one.
+            removal_due: None,
             version: FIRST_PACKAGE_VERSION,
             versions: Vec::new(),
             engine_version: input.engine_version,

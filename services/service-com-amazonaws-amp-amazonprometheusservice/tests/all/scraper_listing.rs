@@ -70,13 +70,16 @@ fn scrape_configuration(yaml: &str) -> ScrapeConfiguration {
     ScrapeConfiguration::configurationBlob(yaml.as_bytes().to_vec())
 }
 
-/// Seed one scraper into the store the mounted service reads — the SAME record the
-/// handlers read, not a second copy of it. `pub(crate)` for the reason the builder above
-/// is: a seeded record pins the id, status and shape a suite needs, so every suite that
-/// needs a stored scraper seeds one, and they all seed it the one way.
-pub(crate) fn seed(amp: &Amp, record: &Scraper) {
+/// Seed one scraper into the store of `region` the mounted service reads — the SAME
+/// record the handlers serving that Region read, not a second copy of it. `pub(crate)` for
+/// the reason the builder above is: a seeded record pins the id, status and shape a suite
+/// needs, so every suite that needs a stored scraper seeds one, and they all seed it the
+/// one way. The Region is explicit because this service is regional: a scraper is reachable
+/// only from the endpoint of the Region whose store holds it.
+pub(crate) fn seed(amp: &Amp, region: &str, record: &Scraper) {
     amp.store()
         .lock()
+        .region_mut_for_create(region)
         .scrapers
         .insert(record.scraper_id.clone(), record.clone());
 }
@@ -186,6 +189,7 @@ async fn the_listing_reports_the_stored_record() {
     );
     amp.store()
         .lock()
+        .region_mut_for_create(region)
         .scrapers
         .insert(seeded.scraper_id.clone(), seeded.clone());
 
@@ -286,9 +290,9 @@ async fn the_listing_filters_the_way_the_model_documents() {
     {
         let store = amp.store();
         let mut guard = store.lock();
+        let held = guard.region_mut_for_create(region);
         for record in &seeded {
-            guard
-                .scrapers
+            held.scrapers
                 .insert(record.scraper_id.clone(), record.clone());
         }
     }
@@ -395,8 +399,9 @@ async fn the_pagination_members_are_bound_as_the_model_declares() {
     {
         let store = amp.store();
         let mut guard = store.lock();
+        let held = guard.region_mut_for_create(region);
         for id in ids {
-            guard.scrapers.insert(
+            held.scrapers.insert(
                 id.to_string(),
                 scraper(
                     id,
@@ -474,8 +479,9 @@ async fn the_listing_pages_by_max_results_and_next_token() {
     {
         let store = amp.store();
         let mut guard = store.lock();
+        let held = guard.region_mut_for_create(region);
         for id in &ids {
-            guard.scrapers.insert(
+            held.scrapers.insert(
                 id.clone(),
                 scraper(
                     id,

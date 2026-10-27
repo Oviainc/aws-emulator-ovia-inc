@@ -53,6 +53,11 @@ pub(crate) const KEY_ACCESS_ROLE_ARN: &str =
 /// (`^([FG][0-9]+)$|^(pkg-[a-f0-9]+)$`) that no create in these tests minted.
 pub(crate) const UNKNOWN_PACKAGE_ID: &str = "pkg-00000000000000000000000000000000";
 
+/// A `PackageID` of the OTHER form that pattern admits: the form that addresses a
+/// package the SERVICE itself publishes, which a create cannot mint, so this account
+/// holds none of them.
+pub(crate) const SERVICE_PACKAGE_ID: &str = "F123456789";
+
 /// `AssociatePackages`: `POST /2021-01-01/packages/associateMultiple`.
 async fn associate(emulator: &Emulator, body: Value) -> Answer {
     emulator

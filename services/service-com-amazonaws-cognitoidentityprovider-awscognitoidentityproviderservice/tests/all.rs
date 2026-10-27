@@ -41,6 +41,8 @@ mod clock_dependent_state;
 mod delete_group;
 #[path = "all/delete_identity_provider.rs"]
 mod delete_identity_provider;
+#[path = "all/delete_terms.rs"]
+mod delete_terms;
 #[path = "all/delete_user.rs"]
 mod delete_user;
 #[path = "all/delete_user_attributes.rs"]

@@ -243,6 +243,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.materialize_due(now);
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a workspace created in another Region is not
+        // reachable from this endpoint and is not found here. The id counter is the whole
+        // store's, so no two Regions mint the same detector id.
+        let (store, next_id) = match store.held_region_and_ids_mut(&region) {
+            Some(held) => held,
+            // A Region this account holds nothing in holds no workspace either, so it
+            // answers the same not-found the missing workspace does, below.
+            None => return Err(workspace_not_found(&input.workspace_id)),
+        };
 
         // A detector is created INSIDE a workspace: `workspaceId` is an `@httpLabel`
         // naming the PARENT resource, and a request this service cannot place in a
@@ -312,7 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let anomaly_detector_id = crate::state::mint_anomaly_detector_id(&mut store.next_id);
+        let anomaly_detector_id = crate::state::mint_anomaly_detector_id(next_id);
         let detector = crate::state::AnomalyDetector {
             arn: crate::state::anomaly_detector_arn(
                 &region,
