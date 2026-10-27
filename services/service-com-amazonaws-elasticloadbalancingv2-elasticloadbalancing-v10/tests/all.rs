@@ -45,6 +45,8 @@ mod shared_endpoint_routing;
 mod ssl_policies;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/subnet_vpc_membership.rs"]
+mod subnet_vpc_membership;
 #[path = "all/tag_not_found_wording.rs"]
 mod tag_not_found_wording;
 #[path = "all/tag_removal.rs"]
