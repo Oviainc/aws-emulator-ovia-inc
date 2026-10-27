@@ -15,19 +15,19 @@
 
 use serde_json::{json, Value};
 
-// The service's own refusal wordings and its configuration state values, so the
+// The service's own refusal wording and its configuration state values, so the
 // suite and the handlers cannot drift apart on what the service says.
 use service_com_amazonaws_kafka_kafka::state::{
-    CONFIGURATION_ARN_NOT_FOUND_MESSAGE, CONFIGURATION_IN_USE_MESSAGE,
-    CONFIGURATION_STATE_ACTIVE, CONFIGURATION_STATE_DELETING,
+    CONFIGURATION_IN_USE_MESSAGE, CONFIGURATION_STATE_ACTIVE, CONFIGURATION_STATE_DELETING,
 };
 
-// The router harness, the signing region, the account id and the URI encoder
-// every suite of this crate shares, so this one adds only its own rule and its
-// configuration-shaped requests.
+// The router harness, the signing region, the account id, the URI encoder and
+// the configuration family's shared refusal assertion every suite of this crate
+// shares, so this one adds only its own rule and its configuration-shaped
+// requests.
 use super::kafka_harness::{
-    configuration_rows, pct, sleep_past_activation, ClusterRequest, ConfigurationRequest, Emulator,
-    Reply, ACCOUNT, REGION,
+    assert_configuration_arn_resolves_to_nothing, configuration_rows, pct, sleep_past_activation,
+    ClusterRequest, ConfigurationRequest, Emulator, Reply, ACCOUNT, REGION,
 };
 
 /// The table the suites below walk: the crate's shared configuration table —
@@ -108,31 +108,6 @@ async fn is_listed(emulator: &Emulator, region: &str, arn: &str) -> bool {
         })
 }
 
-/// Assert `reply` is the refusal the service answers an `Arn` it resolves to no
-/// configuration with: HTTP 400 `BadRequestException`, naming `Arn` as the
-/// parameter at fault.
-fn assert_arn_resolves_to_nothing(reply: &Reply, case: &str) {
-    assert_eq!(
-        (reply.status, reply.error_code()),
-        (400, "BadRequestException"),
-        "case {case}: expected 400 BadRequestException, got {} {}",
-        reply.status,
-        reply.body
-    );
-    assert_eq!(
-        reply.error_message(),
-        CONFIGURATION_ARN_NOT_FOUND_MESSAGE,
-        "case {case}: expected the unresolved-ARN wording, got {}",
-        reply.body
-    );
-    assert_eq!(
-        reply.at("/invalidParameter").as_str(),
-        Some("Arn"),
-        "case {case}: the refusal must name Arn as the parameter at fault, got {}",
-        reply.body
-    );
-}
-
 /// RULE: deleting a configuration takes it out of the service's registry and
 /// reports it in the `DELETING` state under its own ARN, so no later reader
 /// resolves or lists it and the name it held can be taken again.
@@ -181,22 +156,26 @@ async fn a_deleted_configuration_is_gone_from_every_reader() {
         );
 
         // Gone from the single-resource reader, from the listing, and from the
-        // revision reader: one removal, every reader.
+        // revision reader: one removal, every reader. A reader that cannot
+        // resolve the ARN answers the configuration family's
+        // unresolvable-reference refusal, which is HTTP 400.
         let described = describe_in(&emulator, REGION, arn).await;
-        assert_eq!(
-            described.status, 404,
-            "case {row:?}: a deleted configuration must not resolve, got {} {}",
-            described.status, described.body
+        assert_configuration_arn_resolves_to_nothing(
+            &described,
+            &format!("{row:?} deleted-configuration-read"),
+            arn,
+            REGION,
         );
         assert!(
             !is_listed(&emulator, REGION, arn).await,
             "case {row:?}: {arn} must not be listed after its delete"
         );
         let revision = emulator.describe_configuration_revision(arn, 1).await;
-        assert_eq!(
-            revision.status, 404,
-            "case {row:?}: a deleted configuration holds no readable revision, got {} {}",
-            revision.status, revision.body
+        assert_configuration_arn_resolves_to_nothing(
+            &revision,
+            &format!("{row:?} deleted-configuration-revision-read"),
+            arn,
+            REGION,
         );
 
         // The name it held is free again: a create may take it, and the new
@@ -303,7 +282,7 @@ async fn an_arn_that_names_no_configuration_is_refused() {
 
     for (case, arn) in &refused {
         let reply = delete(&emulator, arn).await;
-        assert_arn_resolves_to_nothing(&reply, case);
+        assert_configuration_arn_resolves_to_nothing(&reply, case, arn, REGION);
     }
 
     // Nothing above deleted anything: the configuration this endpoint holds is

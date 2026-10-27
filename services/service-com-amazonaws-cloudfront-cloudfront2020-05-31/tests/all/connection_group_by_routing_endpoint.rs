@@ -51,7 +51,10 @@ use crate::response_headers_policy_lifecycle::text;
 ///
 /// The value is percent-encoded by the encoder [`crate::realtime_log_config_list`] already
 /// builds for a query-bound member, so a value of any shape reaches the handler as written.
-async fn get_by_routing_endpoint(router: &MultiServiceRouter, endpoint: &str) -> Answer {
+///
+/// `pub(crate)` so the sibling delete suite asks whether a deleted group's routing endpoint
+/// still resolves over this one wire path rather than growing a copy of it.
+pub(crate) async fn get_by_routing_endpoint(router: &MultiServiceRouter, endpoint: &str) -> Answer {
     call(
         router,
         "GET",

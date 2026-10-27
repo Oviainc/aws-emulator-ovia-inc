@@ -23,6 +23,8 @@ mod channel_lifecycle;
 mod data_records;
 #[path = "all/encrypted_records.rs"]
 mod encrypted_records;
+#[path = "all/enhanced_monitoring.rs"]
+mod enhanced_monitoring;
 #[path = "all/manual_resharding.rs"]
 mod manual_resharding;
 #[path = "all/max_record_size.rs"]

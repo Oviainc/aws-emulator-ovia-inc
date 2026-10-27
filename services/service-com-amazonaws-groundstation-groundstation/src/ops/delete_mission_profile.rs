@@ -140,19 +140,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The service's mission-profile literal, for either read of the store below: it
+        // does not disclose the id that was asked for.
+        let not_found = || {
+            DeleteMissionProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::MISSION_PROFILE_NOT_FOUND.to_string()),
+            })
+        };
+
         let mut guard = state.lock();
+        // Whether a contact still holds this profile is a question about statuses the
+        // clock moves on its own: a contact is confirmed, carried through its pass and
+        // its release completed at instants its own timestamps recorded. Each move was
+        // owed at this instant whether or not anybody called, so materialising them first
+        // is what makes this delete read the statuses that hold now.
+        guard.settle_due_contacts();
+
+        let mission_profile_arn = guard
+            .mission_profiles
+            .get(&input.mission_profile_id)
+            .map(|profile| profile.mission_profile_arn.clone())
+            .ok_or_else(not_found)?;
+
+        // A mission profile a contact still to be flown depends on is NOT deleted: a
+        // contact names its profile by ARN and reads the wiring of its pass back out of
+        // it, so dropping the profile out from under it would leave a live reservation
+        // pointing at a reference that no longer resolves. So the holding contacts are
+        // counted first and, when there are any, the delete is refused as a bad parameter
+        // naming them — the caller flies or releases those first and retries. Nothing is
+        // written on this path, so the profile and every contact are left exactly as they
+        // were.
+        let holding = guard.contacts_using_mission_profile(&mission_profile_arn);
+        if !holding.is_empty() {
+            return Err(DeleteMissionProfileErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::mission_profile_in_use_message(&holding)),
+                    parameter_name: None,
+                },
+            )
+            .into());
+        }
+
         // The removal drops the profile AND the ARN index entry that resolved to it, so
         // from here on a read of it, and any ARN-valued reference to it, answers as it
         // does for a profile that never existed.
+        // The profile's presence was read under this same lock, so the removal answers it;
+        // a store that nonetheless holds nothing under that id holds no profile to delete,
+        // which is the missing-resource refusal above rather than anything to unwind on.
         let removed = guard
             .remove_mission_profile(&input.mission_profile_id)
-            .ok_or_else(|| {
-                DeleteMissionProfileErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::MISSION_PROFILE_NOT_FOUND.to_string()),
-                    },
-                )
-            })?;
+            .ok_or_else(not_found)?;
 
         Ok(DeleteMissionProfileOutput {
             mission_profile_id: Some(removed.mission_profile_id),

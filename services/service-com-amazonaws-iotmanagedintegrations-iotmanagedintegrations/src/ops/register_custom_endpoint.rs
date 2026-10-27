@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterCustomEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterCustomEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterCustomEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers this account's dedicated custom endpoint in the region the request was signed
+//! for and answers its `EndpointAddress`.
+//!
+//! The request carries no identifier, so the endpoint is a per-account, per-region
+//! SINGLETON and this call is a get-or-create: the first call MINTS the address and stores
+//! it, and every later call answers the address already held — which is also what
+//! `GetCustomEndpoint` reports.
+//!
+//! The endpoint is keyed by that region, so the store keeps endpoints for at most
+//! [`crate::state::MAX_CONFIGURED_REGIONS`] regions and only under a key shaped like a
+//! region name ([`crate::state::is_region_name`]) — the same bound and guard this service's
+//! per-region puts apply to their own stores. A register for a further region past the
+//! bound is refused with the modelled `ThrottlingException`.
 //!
 //! ## Shape of an operation
 //!
@@ -145,21 +150,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        _input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterCustomEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterCustomEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The custom endpoint is a per-account, per-region singleton: the request carries
+        // no identifier, so the endpoint it was signed for decides which one is
+        // registered, as it does for every other resource of this service. The credential
+        // scope's access key id is read only to ATTRIBUTE the change ([`audit`]).
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            RegisterCustomEndpointErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the custom-endpoint store is unavailable".to_string()),
+            })
+        })?;
+
+        // The region becomes the KEY this endpoint is stored under, so its shape is checked
+        // before it reaches the store, exactly as this service's per-region puts check it.
+        // An EMULATOR-ONLY guard: the real service resolves an endpoint rather than reading
+        // the signing region out of the request, so it never refuses a call over the
+        // spelling of that region — this one refuses rather than keying its store by an
+        // arbitrary caller-supplied string.
+        if !crate::state::is_region_name(&region) {
+            audit(&akid, &region, "refused");
+            return Err(RegisterCustomEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "the request's credential scope must name a region of at most {} \
+                         lowercase letters, digits and hyphens",
+                        crate::state::MAX_REGION_NAME_LENGTH
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Get-or-create: the first register of a region mints its dedicated address and
+        // stores it; every later register answers that same stored address, so repeating
+        // the call registers nothing new.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterCustomEndpoint"))
+        // The store keeps endpoints for a bounded number of regions: past it, a register
+        // for a region it does not already hold is refused rather than grown into. The
+        // operation models no quota error, so the refusal is the modelled error closest to
+        // "this service will not take another one now" — the one this service's per-region
+        // puts answer at the same bound.
+        let endpoint_address = state
+            .lock()
+            .register_custom_endpoint(&region)
+            .ok_or_else(|| {
+                audit(&akid, &region, "refused");
+                RegisterCustomEndpointErrorModeled::ThrottlingException(ThrottlingException {
+                    message: Some(format!(
+                        "this service holds a custom endpoint for the maximum of {} regions; \
+                         it cannot take on another region",
+                        crate::state::MAX_CONFIGURED_REGIONS
+                    )),
+                })
+            })?;
+
+        audit(&akid, &region, "registered");
+        Ok(RegisterCustomEndpointOutput { endpoint_address })
     }
 }
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region whose endpoint it addressed, and how
+/// the call ended. Nothing the request did not send, and no credential material — the same
+/// audit record this service's other state-changing per-region calls write.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "RegisterCustomEndpoint",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+

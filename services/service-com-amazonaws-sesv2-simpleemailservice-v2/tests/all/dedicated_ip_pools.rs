@@ -20,14 +20,30 @@
 //!    (`BadRequestException`) rather than read as the start of the listing;
 //! 4. `PutAccountDedicatedIpWarmupAttributes` writes the account's auto warm-up switch,
 //!    which `GetAccount` then reports — in both directions, and idempotently.
+//! 5. the `Tags` a `CreateDedicatedIpPool` request carries are STORED on the pool, in the
+//!    order they were supplied, and the tag listing of the pool's own ARN reports exactly
+//!    them; a create carrying more tags than one resource may hold is refused
+//!    (`BadRequestException`) and stores no pool and no tag.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_sesv2_simpleemailservice_v2::state::MAX_DEDICATED_IP_POOLS;
+use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
+    MAX_DEDICATED_IP_POOLS, MAX_TAGS_PER_RESOURCE,
+};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+// `ListTagsForResource` binds `ResourceArn` to `@httpQuery`, and an ARN carries `:` and
+// `/` — characters a query string gives its own meaning to — so the value is escaped the
+// way an SDK escapes it, by the one escape this test binary shares.
+use crate::contact_lists::query_escaped;
+
+/// The account id every ARN this emulator mints carries, and the Region every call in
+/// this suite is signed for, so the two an ARN it resolves has to carry.
+const ACCOUNT_ID: &str = "000000000000";
+const HOME: &str = "us-east-1";
 
 /// Every `ScalingMode` the model declares, in the order it declares them
 /// (`smithy_query(query="shape",shape="ScalingMode")`).
@@ -164,6 +180,17 @@ impl Ses {
 
     async fn account(&self) -> Reply {
         self.call("GET", "/v2/email/account", None).await
+    }
+
+    /// `ListTagsForResource` for `resource_arn`, which the operation binds to
+    /// `@httpQuery`.
+    async fn list_tags(&self, resource_arn: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!("/v2/email/tags?ResourceArn={}", query_escaped(resource_arn)),
+            None,
+        )
+        .await
     }
 
     async fn put_auto_warmup(&self, enabled: bool) -> Reply {
@@ -492,6 +519,231 @@ async fn the_pool_ceiling_is_enforced_and_nothing_past_it_is_stored() {
         read.status, 404,
         "case one pool past the ceiling: nothing is stored, got {} {:?}",
         read.status, read.body
+    );
+}
+
+/// `arn:aws:ses:<region>:<account>:dedicated-ip-pool/<name>`, the form SES writes a
+/// dedicated IP pool of its own in.
+fn pool_arn(pool_name: &str) -> String {
+    format!("arn:aws:ses:{HOME}:{ACCOUNT_ID}:dedicated-ip-pool/{pool_name}")
+}
+
+/// A tag pair, as a row states one.
+fn tag(key: &str, value: &str) -> (String, String) {
+    (key.to_string(), value.to_string())
+}
+
+/// The `Tags` of a create body, from the pairs a row supplies.
+fn tag_values(tags: &[(String, String)]) -> Vec<Value> {
+    tags.iter()
+        .map(|(key, value)| json!({"Key": key, "Value": value}))
+        .collect()
+}
+
+/// The `Tags` a reply reported, as key/value pairs in the order reported.
+fn reported_tags(reply: &Reply) -> Vec<(String, String)> {
+    reply
+        .at(&["Tags"])
+        .as_array()
+        .map(|tags| {
+            tags.iter()
+                .map(|row| {
+                    (
+                        row.get("Key")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        row.get("Value")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One create whose `Tags` the pool has to carry afterwards.
+struct TagRow {
+    case: &'static str,
+    pool_name: &'static str,
+    tags: Vec<(String, String)>,
+}
+
+/// The tag table: the count stored (none, one, several, the documented maximum), the
+/// order supplied (which is not the sorted order), an empty value, and the characters a
+/// key and a value may carry.
+fn tag_rows() -> Vec<TagRow> {
+    vec![
+        TagRow {
+            case: "a pool carrying no tags at all",
+            pool_name: "untagged-pool",
+            tags: Vec::new(),
+        },
+        TagRow {
+            case: "a pool carrying one tag",
+            pool_name: "one-tag-pool",
+            tags: vec![tag("owner", "marketing")],
+        },
+        TagRow {
+            case: "a pool whose tags were not supplied in sorted order",
+            pool_name: "ordered-pool",
+            tags: vec![tag("zone", "c"), tag("alpha", "a"), tag("mid", "b")],
+        },
+        TagRow {
+            case: "a pool carrying one tag whose value is empty",
+            // `Tag$Value` documents "The minimum length is 0 characters", so a tag may
+            // carry a key and no value.
+            pool_name: "empty-value-pool",
+            tags: vec![tag("retired", "")],
+        },
+        TagRow {
+            case: "a pool whose tags use the documented symbol set",
+            // `Tag`'s documentation: "The characters can be Unicode letters, digits,
+            // white space, or one of the following symbols: _ . : / = + -".
+            pool_name: "symbol-pool",
+            tags: vec![
+                tag("cost_center.1:a/b", "x=y+z-1"),
+                tag("team name", "platform ops"),
+            ],
+        },
+        TagRow {
+            case: "a pool carrying the documented maximum number of tags",
+            pool_name: "fully-tagged-pool",
+            // Supplied in descending key order, so the reported order is the supplied one
+            // rather than the sorted one.
+            tags: (0..MAX_TAGS_PER_RESOURCE)
+                .rev()
+                .map(|index| tag(&format!("key-{index:02}"), &format!("value-{index:02}")))
+                .collect(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn tags_supplied_at_create_are_stored_on_the_pool_and_reported_by_the_tag_listing() {
+    let ses = Ses::new();
+    for row in tag_rows() {
+        let case = row.case;
+        let reply = ses
+            .create_pool(json!({
+                "PoolName": row.pool_name,
+                "Tags": tag_values(&row.tags),
+            }))
+            .await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (200, ""),
+            "case {case:?}: expected 200 from the create, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+
+        // The round trip: the pool is stored, and the tag listing of its own ARN reports
+        // exactly the tags the create supplied, in the order supplied.
+        let read = ses.get_pool(row.pool_name).await;
+        assert_eq!(
+            (
+                read.status,
+                read.text_at(&["DedicatedIpPool", "PoolName"]).as_str()
+            ),
+            (200, row.pool_name),
+            "case {case:?}: expected the stored pool {:?}, got {} {:?}",
+            row.pool_name,
+            read.status,
+            read.body
+        );
+        let listed = ses.list_tags(&pool_arn(row.pool_name)).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case:?}: expected 200 from the tag listing, got {} {:?}",
+            listed.status, listed.body
+        );
+        assert_eq!(
+            reported_tags(&listed),
+            row.tags,
+            "case {case:?}: expected the stored tags {:?} in the order supplied, got {:?}",
+            row.tags,
+            listed.body
+        );
+
+        // Reading the tags changes nothing a later caller sees.
+        let again = ses.list_tags(&pool_arn(row.pool_name)).await;
+        assert_eq!(
+            reported_tags(&again),
+            row.tags,
+            "case {case:?}: a second tag listing reported {:?}, expected the same {:?}",
+            reported_tags(&again),
+            row.tags
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_create_past_the_tag_ceiling_is_refused_and_stores_nothing() {
+    let ses = Ses::new();
+    // One tag past the documented maximum, and a long way past it: both are more tags
+    // than one resource may hold.
+    for over_by in [1usize, 25] {
+        let count = MAX_TAGS_PER_RESOURCE + over_by;
+        let case = format!("a create carrying {count} tags");
+        let pool_name = format!("over-tagged-{count}");
+        let tags: Vec<(String, String)> = (0..count)
+            .map(|index| tag(&format!("key-{index:02}"), &format!("value-{index:02}")))
+            .collect();
+        let reply = ses
+            .create_pool(json!({"PoolName": pool_name, "Tags": tag_values(&tags)}))
+            .await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, "BadRequestException"),
+            "case {case:?}: expected 400 BadRequestException, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+        let read = ses.get_pool(&pool_name).await;
+        assert_eq!(
+            (read.status, read.error_code().as_str()),
+            (404, "NotFoundException"),
+            "case {case:?}: a refused create must store no pool, got {} {:?}",
+            read.status,
+            read.body
+        );
+        let listed = ses.list_tags(&pool_arn(&pool_name)).await;
+        assert_eq!(
+            (listed.status, listed.error_code().as_str()),
+            (404, "NotFoundException"),
+            "case {case:?}: a refused create must store no tag, got {} {:?}",
+            listed.status,
+            listed.body
+        );
+    }
+
+    // Exactly the maximum is accepted, so the refusal is about the ceiling and not about
+    // the member.
+    let at_the_ceiling: Vec<(String, String)> = (0..MAX_TAGS_PER_RESOURCE)
+        .map(|index| tag(&format!("key-{index:02}"), &format!("value-{index:02}")))
+        .collect();
+    let reply = ses
+        .create_pool(json!({
+            "PoolName": "at-the-ceiling",
+            "Tags": tag_values(&at_the_ceiling),
+        }))
+        .await;
+    assert_eq!(
+        (reply.status, reply.error_code().as_str()),
+        (200, ""),
+        "case a create carrying exactly {MAX_TAGS_PER_RESOURCE} tags: expected 200, got {} {:?}",
+        reply.status,
+        reply.body
+    );
+    let listed = ses.list_tags(&pool_arn("at-the-ceiling")).await;
+    assert_eq!(
+        reported_tags(&listed),
+        at_the_ceiling,
+        "case a create carrying exactly {MAX_TAGS_PER_RESOURCE} tags: expected them stored, got {:?}",
+        listed.body
     );
 }
 

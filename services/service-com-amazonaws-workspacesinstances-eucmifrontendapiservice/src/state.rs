@@ -1286,6 +1286,40 @@ pub fn availability_zones_in_region(region: &str) -> Vec<String> {
         .collect()
 }
 
+/// Refuse a request that names an Availability Zone the Region it was signed for does
+/// not publish.
+///
+/// A resource of this service belongs to the Region its create call was signed for, so
+/// a zone the request names — the zone a volume is created in, or the zone an
+/// instance's placement asks for — has to be one of the zones THAT Region publishes
+/// ([`availability_zones_in_region`]). The modelled zone members admit any Region's
+/// zone name and any letter (`AvailabilityZone`'s
+/// `^[a-z]{2}-[a-z]+-\d(?:[a-z]|-[a-z]+-\d[a-z])$`,
+/// `smithy_query(query="shape",shape="AvailabilityZone")`), so no boundary validator
+/// can refuse a foreign zone and the operations that accept one enforce it here.
+///
+/// The ONE place that rule is applied, so both sides of it cannot drift apart: a zone
+/// accepted on one create and refused on another would leave a resource whose zone no
+/// other resource of its Region can ever match. `member` is the input member the zone
+/// arrived in, named in the refusal exactly as [`field_validation_failed`] names any
+/// other bad member, and the wording states the rule and none of what the caller sent.
+pub fn require_zone_in_region(
+    member: &str,
+    region: &str,
+    zone: &str,
+) -> Result<(), ValidationException> {
+    if availability_zones_in_region(region)
+        .iter()
+        .any(|published| published == zone)
+    {
+        return Ok(());
+    }
+    Err(field_validation_failed(
+        member,
+        format!("{member} must name an Availability Zone of the Region this request was signed for"),
+    ))
+}
+
 /// The volume type a `CreateVolume` that names none creates.
 ///
 /// "Default: gp2" (Amazon EBS `CreateVolume$VolumeType`). This service's own model

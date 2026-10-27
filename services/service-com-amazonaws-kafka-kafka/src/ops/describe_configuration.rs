@@ -6,10 +6,15 @@
 //! so the two readers cannot disagree about one configuration.
 //!
 //! A configuration ARN belongs to one region, so a regional endpoint resolves
-//! only its own: a value that is not an MSK configuration ARN is a
-//! `BadRequestException` (400), and a well-formed one this region holds no
-//! configuration for is a `NotFoundException` (404) — the distinction the real
-//! service draws between a request it cannot parse and a resource it cannot find.
+//! only its own. ONE condition, one refusal: an `Arn` this endpoint resolves to
+//! no configuration — not shaped like an MSK configuration ARN, absent, already
+//! deleted, or belonging to another region — is a `BadRequestException` (400)
+//! carrying [`crate::state::CONFIGURATION_ARN_NOT_FOUND_MESSAGE`], the one
+//! envelope every operation of the configuration family reports an unresolvable
+//! configuration reference with
+//! ([`crate::state::configuration_arn_not_found`]), and NOT the
+//! `NotFoundException` the other resource families answer. One lookup decides
+//! it, since only an ARN the registry minted can resolve at all.
 //!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
@@ -170,34 +175,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx.parts());
-        if !crate::state::is_configuration_arn(&input.arn) {
-            return Err(
-                DescribeConfigurationErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("Arn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK configuration ARN.",
-                        input.arn
-                    )),
-                })
-                .into(),
-            );
-        }
 
         // Reporting only: nothing here writes. A configuration is stored
         // `ACTIVE`, so the clock owes it no transition for this read to
         // materialise.
         let state = state.lock();
+        // ONE condition, one refusal: an `Arn` that resolves to no configuration
+        // of this endpoint's region is the configuration family's
+        // unresolvable-reference bad request, whether it is malformed, absent,
+        // already deleted, or another region's. Since only an ARN the registry
+        // minted can resolve at all, one lookup decides it.
         let Some(configuration) = state.configuration_in(&region, &input.arn) else {
-            return Err(
-                DescribeConfigurationErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("Arn".to_string()),
-                    message: Some(format!(
-                        "No configuration exists in {region} with the ARN {}",
-                        input.arn
-                    )),
-                })
-                .into(),
-            );
+            return Err(DescribeConfigurationErrorModeled::BadRequestException(
+                crate::state::configuration_arn_not_found(),
+            )
+            .into());
         };
         // Rendered through the ONE rendering of a stored configuration, so this
         // reader and `ListConfigurations` report the same configuration the same

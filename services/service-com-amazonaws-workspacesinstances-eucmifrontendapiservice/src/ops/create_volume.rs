@@ -128,10 +128,11 @@ impl From<CreateVolumeErrorModeled> for CreateVolumeError {
 ///
 /// * a volume is created IN an Availability Zone, so `AvailabilityZone` must name one
 ///   of the zones the Region this request was signed for PUBLISHES — each Region's own
-///   zone letters, which [`crate::state::availability_zones_in_region`] reads from the
-///   per-Region catalog, not a count of letters assumed alike for every Region — while
-///   the modelled `len 0..64` admits the empty string and any other text, none of
-///   which is a zone;
+///   of the zones the Region this request was signed for PUBLISHES, through the
+///   crate's one zone rule ([`crate::state::require_zone_in_region`], which reads the
+///   per-Region catalog rather than a count of letters assumed alike for every
+///   Region) — while the modelled `len 0..64` admits the empty string and any other
+///   text, none of which is a zone;
 /// * a volume needs a capacity source: "You must specify either a snapshot ID or a
 ///   volume size" (Amazon EBS `CreateVolume$Size`);
 /// * `SizeInGB`, `Iops` and `Throughput` must be ones the named volume type accepts,
@@ -151,7 +152,7 @@ fn validate_configuration(
     region: &str,
 ) -> Result<(), ValidationException> {
     use crate::state::{
-        availability_zones_in_region, field_validation_failed, reject_reserved_tag_keys,
+        field_validation_failed, reject_reserved_tag_keys, require_zone_in_region,
         specification_tag_keys, volume_type_spec, DEFAULT_VOLUME_TYPE,
     };
 
@@ -162,16 +163,7 @@ fn validate_configuration(
         specification_tag_keys(input.tag_specifications.iter().flatten()),
     )?;
 
-    if !availability_zones_in_region(region)
-        .iter()
-        .any(|zone| zone == &input.availability_zone)
-    {
-        return Err(field_validation_failed(
-            "AvailabilityZone",
-            "AvailabilityZone must name an Availability Zone of the Region this request \
-             was signed for",
-        ));
-    }
+    require_zone_in_region("AvailabilityZone", region, &input.availability_zone)?;
 
     // The type every other rule is read for: the one the request names, or the
     // backing service's documented default when it names none.

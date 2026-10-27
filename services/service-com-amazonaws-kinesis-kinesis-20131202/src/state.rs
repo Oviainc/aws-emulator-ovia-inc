@@ -22,7 +22,7 @@ use crate::ops::types::{
     ChannelStreamDescription, ChildShard, Consumer, ConsumerDescription, EnhancedMetrics,
     HashKeyRange, Record, S3DestinationDescription, S3TablesDestinationDescription,
     SequenceNumberRange, Shard, StreamDescription, StreamDescriptionSummary, StreamModeDetails,
-    StreamSummary, Tag, WarmThroughputObject,
+    StreamSummary, Tag, WarmThroughputObject, METRICS_NAME_VALUES,
 };
 
 /// The region a stream is created in when the request carries no SigV4 credential scope
@@ -1436,6 +1436,44 @@ impl Stream {
         }]
     }
 
+    /// Turn the shard-level metrics `requested` ON for this stream, answering the set that
+    /// was enhanced BEFORE the call.
+    ///
+    /// The stored set is a SET: the metrics the request names are added to the ones the
+    /// stream already reports, so naming a metric twice, or one that is already enhanced,
+    /// leaves the same set behind ([`requested_shard_level_metrics`] expands the catch-all
+    /// and settles the order).
+    pub fn enable_shard_level_metrics(&mut self, requested: &[String]) -> Vec<String> {
+        let before = self.shard_level_metrics.clone();
+        let added = requested_shard_level_metrics(requested);
+        self.shard_level_metrics = shard_level_metric_catalog()
+            .into_iter()
+            .filter(|metric| {
+                before.iter().any(|enhanced| enhanced == metric)
+                    || added.iter().any(|name| name == metric)
+            })
+            .map(str::to_string)
+            .collect();
+        before
+    }
+
+    /// Turn the shard-level metrics `requested` OFF for this stream, answering the set that
+    /// was enhanced BEFORE the call.
+    ///
+    /// The counterpart of [`Self::enable_shard_level_metrics`] over the same stored set:
+    /// every metric the request names stops being enhanced and every other one stays as it
+    /// was, so naming a metric nothing enhanced leaves the same set behind.
+    pub fn disable_shard_level_metrics(&mut self, requested: &[String]) -> Vec<String> {
+        let before = self.shard_level_metrics.clone();
+        let removed = requested_shard_level_metrics(requested);
+        self.shard_level_metrics = before
+            .iter()
+            .filter(|enhanced| !removed.iter().any(|name| name == *enhanced))
+            .cloned()
+            .collect();
+        before
+    }
+
     /// The warm throughput the stream reports: the target the create asked for, or the
     /// throughput its open shards provide ([`SHARD_WRITE_MI_BPS`] each). Both members
     /// carry the same value — the input member's doc calls it "the throughput capacity
@@ -2162,6 +2200,40 @@ pub fn tag_ceiling_exceeded_message(resulting: usize) -> String {
         "assigning these tags would leave the resource carrying {resulting} tags, past the \
          {MAX_STREAM_TAGS} tags one resource may carry"
     )
+}
+
+/// The `MetricsName` value that stands for the whole set of shard-level metrics rather
+/// than for one of them: "The value \"ALL\" enables every metric"
+/// (`EnableEnhancedMonitoringInput$ShardLevelMetrics`).
+pub const METRICS_NAME_ALL: &str = "ALL";
+
+/// Every shard-level metric enhanced monitoring reports, in the order the model's
+/// `MetricsName` enum lists them (`smithy_query(query="shape",shape="MetricsName")`, whose
+/// values this is filtered from), with [`METRICS_NAME_ALL`] left out: that value names the
+/// whole catalog rather than a metric of its own.
+///
+/// This is the order every report of the enhanced set is in, so two reads of one stream
+/// cannot disagree about it.
+pub fn shard_level_metric_catalog() -> Vec<&'static str> {
+    METRICS_NAME_VALUES
+        .iter()
+        .copied()
+        .filter(|metric| *metric != METRICS_NAME_ALL)
+        .collect()
+}
+
+/// The shard-level metrics a request's `ShardLevelMetrics` names, in the catalog's order
+/// and without a repeat: [`METRICS_NAME_ALL`] stands for every metric, so a request naming
+/// it names the whole catalog. The member targets the modelled `MetricsName` enum, whose
+/// constraint the framework's own walk refuses a request against before any handler runs,
+/// and a value outside the catalog names no metric here either.
+pub fn requested_shard_level_metrics(requested: &[String]) -> Vec<String> {
+    let names_every_metric = requested.iter().any(|metric| metric == METRICS_NAME_ALL);
+    shard_level_metric_catalog()
+        .into_iter()
+        .filter(|metric| names_every_metric || requested.iter().any(|named| named == metric))
+        .map(str::to_string)
+        .collect()
 }
 
 /// How a request that names no consumer is refused: the rule `DescribeStreamConsumer`

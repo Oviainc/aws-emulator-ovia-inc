@@ -67,6 +67,8 @@ mod key_specs;
 mod list_key_rotations_reads;
 #[path = "all/list_resource_tags_reads.rs"]
 mod list_resource_tags_reads;
+#[path = "all/message_authentication_codes.rs"]
+mod message_authentication_codes;
 #[path = "all/multi_region_primary.rs"]
 mod multi_region_primary;
 #[path = "all/public_key.rs"]
