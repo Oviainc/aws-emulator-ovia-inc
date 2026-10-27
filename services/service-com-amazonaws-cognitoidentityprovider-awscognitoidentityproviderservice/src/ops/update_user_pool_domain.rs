@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUserPoolDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUserPoolDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUserPoolDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -207,20 +198,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUserPoolDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUserPoolDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUserPoolDomain"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // This operation names pool AND domain (`UserPoolId` is **required**
+        // here), so the pool is resolved first: a request naming a pool that
+        // does not exist names no domain to update either.
+        let Some(pool) = guard.pool(&input.user_pool_id) else {
+            return Err(not_found(format!(
+                "User pool {} does not exist.",
+                input.user_pool_id
+            )));
+        };
+        let user_pool_tier = pool.user_pool_tier.clone();
+
+        // "This operation doesn't change the name of your user pool domain. To
+        // change your domain, delete it with DeleteUserPoolDomain and create a
+        // new domain with CreateUserPoolDomain": `Domain` identifies the
+        // EXISTING record to update, so a name the pool does not hold names no
+        // resource of this pool's — whichever of its two domain slots it would
+        // have lived in.
+        let Some(stored) = pool.domain_named(&input.domain) else {
+            return Err(not_found(format!(
+                "User pool {} has no domain {}.",
+                input.user_pool_id, input.domain
+            )));
+        };
+        let custom = stored.is_custom();
+
+        // "A value of `1` indicates hosted UI (classic) and a version of `2`
+        // indicates managed login" (`ManagedLoginVersion`): those are the only
+        // branding versions there are, so any other value names none.
+        if let Some(version) = input.managed_login_version {
+            if !crate::state::MANAGED_LOGIN_VERSIONS.contains(&version) {
+                return Err(invalid_parameter(format!(
+                    "ManagedLoginVersion must be one of {:?}, not {version}.",
+                    crate::state::MANAGED_LOGIN_VERSIONS
+                )));
+            }
+
+            // "Managed login requires that your user pool be configured for any
+            // feature plan other than `Lite`" (`ManagedLoginVersion`).
+            if version == crate::state::MANAGED_LOGIN_BRANDING
+                && user_pool_tier == crate::state::LITE_USER_POOL_TIER
+            {
+                return Err(feature_unavailable_in_tier(
+                    crate::state::feature_unavailable_in_tier_message(
+                        &user_pool_tier,
+                        &crate::state::managed_login_feature_name(
+                            crate::state::MANAGED_LOGIN_BRANDING,
+                        ),
+                    ),
+                ));
+            }
+        }
+
+        // `CustomDomainConfig` "specifies an SSL certificate for the managed
+        // login hosted webserver" and routing is a custom-domain configuration
+        // too (`CreateUserPoolDomain.Routing`: "currently only supported for
+        // custom domains"). Whether a domain is custom is fixed when it is
+        // created and this operation cannot change the domain's name, so
+        // neither member names anything on a stored prefix domain.
+        if !custom {
+            if input.custom_domain_config.is_some() {
+                return Err(invalid_parameter(format!(
+                    "CustomDomainConfig is supported only for a custom domain, and {} is an Amazon Cognito prefix domain.",
+                    input.domain
+                )));
+            }
+            if input.routing.is_some() {
+                return Err(invalid_parameter(format!(
+                    "Routing is supported only for a custom domain, and {} is an Amazon Cognito prefix domain.",
+                    input.domain
+                )));
+            }
+        }
+
+        // Every refusal is behind us, so the stored record can be borrowed
+        // mutably and written.
+        let Some(pool) = guard.pool_mut(&input.user_pool_id) else {
+            return Err(internal_error());
+        };
+        let Some(stored) = pool.domain_named_mut(&input.domain) else {
+            return Err(internal_error());
+        };
+
+        // Each member the request carries replaces the stored value; a member it
+        // leaves unset leaves what is stored in place, which is what lets a
+        // branding-version update keep serving the certificate the domain
+        // already has ("Typically, ACM certificates automatically renew and you
+        // user pool can continue to use the same ARN").
+        let mut changed = false;
+        if let Some(version) = input.managed_login_version {
+            // A branding version the domain already serves asks for nothing to
+            // be rolled out, so it leaves the domain `ACTIVE`.
+            changed |= stored.managed_login_version != version;
+            stored.managed_login_version = version;
+        }
+        // A submitted certificate, on the other hand, is distribution work the
+        // service performs whether or not the ARN is the one already stored
+        // ("After you submit your request, Amazon Cognito requires up to 1 hour
+        // to distribute your new certificate to your custom domain"), and the
+        // same holds for a resubmitted routing configuration, so either member's
+        // presence is a change to roll out.
+        if input.custom_domain_config.is_some() {
+            stored.custom_domain_config = input.custom_domain_config.clone();
+            changed = true;
+        }
+        if input.routing.is_some() {
+            stored.routing = input.routing.clone();
+            changed = true;
+        }
+        // The CloudFront endpoint is the domain's, not the certificate's: a new
+        // certificate ARN is distributed to the SAME distribution, so the FQDN
+        // the caller's alias record points at is left alone.
+        if changed {
+            stored.begin_update(now);
+        }
+
+        // Rendered from the STORED domain, so the response is what a later read
+        // of that domain sees.
+        let output = UpdateUserPoolDomainOutput {
+            managed_login_version: Some(stored.managed_login_version),
+            // "Amazon Cognito returns this value if you set a custom domain with
+            // CustomDomainConfig. If you set an Amazon Cognito prefix domain,
+            // this operation returns a blank response."
+            cloud_front_domain: stored.cloud_front_distribution.clone(),
+            routing: stored.routing.clone(),
+        };
+        if changed {
+            // The pool itself changed: the domain configuration it renders is
+            // not the one it rendered before.
+            pool.last_modified_date = now;
+        }
+        Ok(output)
     }
+}
+
+/// This operation's `ResourceNotFoundException`: "thrown when the Amazon Cognito
+/// service can't find the requested resource" (this service's model), which is
+/// what a request naming an absent pool, or a domain that pool does not hold,
+/// asks this operation to update.
+fn not_found(message: String) -> UpdateUserPoolDomainError {
+    UpdateUserPoolDomainErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, which names the member the
+/// request has to fix.
+fn invalid_parameter(message: String) -> UpdateUserPoolDomainError {
+    UpdateUserPoolDomainErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `ReasonCode` is an optional machine code AWS fills in for a few
+        // specific refusals only, so none is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `FeatureUnavailableInTierException` for a feature the pool's
+/// feature plan does not include.
+fn feature_unavailable_in_tier(message: String) -> UpdateUserPoolDomainError {
+    UpdateUserPoolDomainErrorModeled::FeatureUnavailableInTierException(
+        FeatureUnavailableInTierException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> UpdateUserPoolDomainError {
+    UpdateUserPoolDomainErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
