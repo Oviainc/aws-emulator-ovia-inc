@@ -294,14 +294,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             namespace.delete_token = input.client_token;
             // No update is in flight any more: the record is on its way out.
             namespace.update_token = None;
-        }
-        let namespace_arn = namespace.arn.clone();
-        drop(guard);
+            let namespace_arn = namespace.arn.clone();
+            drop(guard);
 
-        // The call changed stored state (or replayed the call that did), so it leaves an
-        // access record naming the operation, the resource and the key id the request
-        // presented — see `crate::state::record_state_change`.
-        crate::state::record_state_change(Self::NAME, &namespace_arn, ctx.parts());
+            // The call changed stored state, so it leaves an access record naming the
+            // operation, the resource and the key id the request presented — see
+            // `crate::state::record_state_change`. A replay of the pending deletion
+            // writes nothing, so it records nothing.
+            crate::state::record_state_change(Self::NAME, &namespace_arn, ctx.parts());
+        }
 
         Ok(DeleteRuleGroupsNamespaceOutput)
     }

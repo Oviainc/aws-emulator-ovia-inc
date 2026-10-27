@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTableVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTableVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTableVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Drops ONE version out of a table's version history, so a later read of that version
+//! answers `EntityNotFoundException` while every other version of the table, and the
+//! table itself, stay exactly as they were.
+//!
+//! A table's version history is its live definition — the version its `VersionId` names —
+//! beside the definitions earlier writes archived
+//! (`crate::state::TableEntry::archived_versions`). The LIVE one IS the table, so it is
+//! not deletable on its own: a request that addresses the table's newest version is
+//! refused as invalid input, and dropping it is `DeleteTable`'s job. Every earlier version
+//! is removable, and once removed it is gone — a second delete of it is the miss it has
+//! become.
+//!
+//! An absent database or table, and a `VersionId` the addressed table's history does not
+//! hold, are `EntityNotFoundException`; a `VersionId` that spells no integer is
+//! `InvalidInputException`, because that is not a version id at all ("A VersionID is a
+//! string representation of an integer").
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +85,10 @@
 //! * `InternalServiceException` (HTTP 500) — An internal service error occurred.
 //! * `InvalidInputException` (HTTP 400) — The input provided was not valid.
 //! * `OperationTimeoutException` (HTTP 400) — The operation timed out.
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   "Access to a resource was denied." A `CatalogId` naming another account's Data
+//!   Catalog is reachable only through that catalog's resource-based policy, so a caller
+//!   with no grant on it is refused here before any entity is looked up.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -90,9 +104,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-glue-awsglue.json");
 // here — hence the `DeleteTableVersionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.glue#DeleteTableVersion")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.glue#DeleteTableVersion",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum DeleteTableVersionErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     EntityNotFoundException(EntityNotFoundException),
     InternalServiceException(InternalServiceException),
     InvalidInputException(InvalidInputException),
@@ -150,18 +168,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTableVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTableVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTableVersion"))
+        // "A VersionID is a string representation of an integer. Each version is
+        // incremented by 1", so an id that spells no integer is not a version id at all:
+        // the request is refused as invalid input rather than answered as a miss, exactly
+        // as the version read reads it (`crate::ops::get_table_version`).
+        let Some(requested) = crate::state::parse_version_counter(&input.version_id) else {
+            return Err(DeleteTableVersionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::malformed_version_id(
+                        &input.version_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteTableVersionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // Whether the caller may address this catalog at all is decided BEFORE the entity
+        // lookup: a `CatalogId` of another account is reachable only through that
+        // catalog's own resource policy (see `crate::state::foreign_catalog_refusal`).
+        if let Some(message) = crate::state::foreign_catalog_refusal(
+            &catalog_id,
+            &crate::state::request_region(ctx.parts()),
+            Self::NAME,
+        ) {
+            return Err(DeleteTableVersionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        let folded_table = crate::state::fold_name(&input.table_name);
+
+        let mut store = state.lock();
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(DeleteTableVersionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // Read off the database before the table is borrowed out of it, so the log line
+        // below names the database this delete was served out of.
+        let database_name = database.name.clone();
+        let Some(entry) = database.tables.get_mut(&folded_table) else {
+            return Err(DeleteTableVersionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // The table's newest version IS its live definition, so this operation cannot
+        // drop it on its own: a table has a current version for as long as it exists, and
+        // removing that version means removing the table (`DeleteTable`). The request
+        // names a version that exists, so this is a bad parameter and not a miss.
+        if crate::state::parse_version_counter(&entry.version_id) == Some(requested) {
+            return Err(DeleteTableVersionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::TABLE_VERSION_IS_LATEST.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // Every other version of the table is one an earlier write archived, so the
+        // delete removes it from that history and leaves the live definition alone. A
+        // counter the history does not hold names no version of this table.
+        if entry.archived_versions.remove(&requested).is_none() {
+            return Err(DeleteTableVersionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::TABLE_VERSION_NOT_FOUND.to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        ::tracing::info!(
+            operation = "DeleteTableVersion",
+            catalog_id = %catalog_id,
+            database = %database_name,
+            table = %folded_table,
+            version_id = requested,
+            "deleted a Data Catalog table version"
+        );
+
+        Ok(DeleteTableVersionOutput {})
     }
 }

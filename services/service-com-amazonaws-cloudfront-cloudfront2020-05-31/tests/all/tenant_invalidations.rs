@@ -57,7 +57,10 @@ use crate::distribution_tenant_lifecycle::{
 
 /// `POST /2020-05-31/distribution-tenant/{Id}/invalidation`, from the operation's `http`
 /// binding.
-async fn create_invalidation_for_tenant(
+///
+/// `pub(crate)` so a sibling suite calls the tenant invalidation surface through these
+/// helpers rather than through a second copy of them.
+pub(crate) async fn create_invalidation_for_tenant(
     router: &MultiServiceRouter,
     tenant_id: &str,
     batch: &str,
@@ -73,7 +76,7 @@ async fn create_invalidation_for_tenant(
 }
 
 /// `GET /2020-05-31/distribution-tenant/{DistributionTenantId}/invalidation/{Id}`.
-async fn get_invalidation_for_tenant(
+pub(crate) async fn get_invalidation_for_tenant(
     router: &MultiServiceRouter,
     tenant_id: &str,
     invalidation_id: &str,
@@ -92,7 +95,7 @@ async fn get_invalidation_for_tenant(
 
 /// `GET /2020-05-31/distribution-tenant/{Id}/invalidation`, with `query` appended verbatim
 /// (`?MaxItems=2&Marker=I…`).
-async fn list_invalidations_for_tenant(
+pub(crate) async fn list_invalidations_for_tenant(
     router: &MultiServiceRouter,
     tenant_id: &str,
     query: &str,
@@ -140,7 +143,7 @@ async fn tenant(router: &MultiServiceRouter, distribution_id: &str, name: &str) 
 }
 
 /// One multi-tenant distribution with one tenant under it, reported as the tenant's id.
-async fn distribution_with_tenant(router: &MultiServiceRouter, case: &str) -> String {
+pub(crate) async fn distribution_with_tenant(router: &MultiServiceRouter, case: &str) -> String {
     let distribution = multi_tenant_distribution(router, &format!("ref-{case}")).await;
     tenant(router, &distribution, case).await
 }
@@ -177,7 +180,7 @@ async fn create_batches(
 }
 
 /// The `InvalidationSummary` elements of an `InvalidationList`.
-fn summaries(list: &Node) -> Vec<&Node> {
+pub(crate) fn summaries(list: &Node) -> Vec<&Node> {
     list.child("Items")
         .map(|items| items.children_named("InvalidationSummary"))
         .unwrap_or_default()
@@ -192,7 +195,7 @@ fn summary_ids(list: &Node) -> Vec<String> {
 }
 
 /// The paths an `Invalidation` payload reports its batch naming, in document order.
-fn batch_paths(invalidation: &Node) -> Vec<String> {
+pub(crate) fn batch_paths(invalidation: &Node) -> Vec<String> {
     invalidation
         .at("InvalidationBatch/Paths/Items")
         .map(|items| {

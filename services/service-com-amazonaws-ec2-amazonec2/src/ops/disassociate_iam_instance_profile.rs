@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateIamInstanceProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateIamInstanceProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateIamInstanceProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Disassociates an IAM instance profile from a running or stopped instance": this
+//! operation WRITES to the associations
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::iam_instance_profile_associations`]
+//! holds — the association the request names is recorded `disassociating`, which is what
+//! stops the instance running as the profile, and the clock owes the association's own
+//! removal a transition span later
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies
+//! both moves).
+//! An association id this account holds no association for is refused. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -132,18 +134,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateIamInstanceProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateIamInstanceProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only, and nothing an association reports is a fact
+        // of the Region (`IamInstanceProfileAssociation` carries no Region member), so this
+        // operation reads none of it. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The clock-owed moves this call must see before it resolves an id: an association
+        // whose own disassociation span has run out is GONE, whether or not anybody called,
+        // so it cannot be disassociated a second time.
+        store.materialize_due_transitions();
+
+        // "The ID of the IAM instance profile association"
+        // (`DisassociateIamInstanceProfileRequest$AssociationId`): the disassociation acts
+        // on the association that id names, and an id this account holds no association for
+        // is REFUSED rather than answered as a no-op, so a caller can tell a disassociation
+        // that happened from one that had nothing to act on.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateIamInstanceProfile"))
+        // "Disassociates an IAM instance profile from a running or stopped instance"
+        // (`DisassociateIamInstanceProfile`): the instance stops running as the profile
+        // here, and the association is reported in the non-terminal `disassociating` state
+        // the clock then takes away.
+        let association = store
+            .start_iam_instance_profile_disassociation(&input.association_id)
+            .ok_or_else(|| {
+                crate::state::invalid_iam_instance_profile_association_id(&input.association_id)
+            })?;
+
+        Ok(DisassociateIamInstanceProfileOutput {
+            iam_instance_profile_association: Some(association),
+        })
     }
 }

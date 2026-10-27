@@ -48,6 +48,8 @@ const SHARED_NAME: &str = "Shared";
 /// One HTTP answer, reduced to what these tests assert on.
 struct Answer {
     status: u16,
+    /// `x-amzn-errortype`, which is where restJson1 resolves an error shape from.
+    error_type_header: Option<String>,
     body: Vec<u8>,
 }
 
@@ -64,16 +66,46 @@ impl Answer {
         })
     }
 
-    /// The modelled error code, which restJson1 carries in `__type`.
+    /// The body as a JSON document when it is one, and `Value::Null` when it is not — the
+    /// refusals the environment data endpoint's front door answers carry the sentence as
+    /// plain text rather than a document.
+    fn document(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+    }
+
+    /// The modelled error code a restJson1 client resolves: the `x-amzn-errortype` header
+    /// first, then the body's own `__type` discriminator.
     fn error_code(&self) -> String {
-        self.json()
-            .get("__type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
+        let named = self.error_type_header.clone().unwrap_or_else(|| {
+            self.document()
+                .get("__type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        });
+        named
             .rsplit(['#', '/'])
             .next()
             .unwrap_or_default()
+            .split(':')
+            .next()
+            .unwrap_or_default()
             .to_string()
+    }
+
+    /// The sentence a client reads off a refusal, the way an SDK's JSON error parser reads
+    /// it: the `message` member of a document body, and the body itself when the body is
+    /// not a document.
+    fn refusal_message(&self) -> String {
+        match self.document() {
+            Value::Object(object) => object
+                .get("message")
+                .or_else(|| object.get("Message"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            _ => self.text(),
+        }
     }
 
     fn text(&self) -> String {
@@ -119,8 +151,14 @@ impl Harness {
             .body(bytes::Bytes::from(payload))
             .expect("a well-formed request");
         let response = self.router.dispatch(request).await;
+        let error_type_header = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         Answer {
             status: response.status().as_u16(),
+            error_type_header,
             body: response.into_body().to_vec(),
         }
     }
@@ -419,12 +457,7 @@ async fn a_name_addressed_operation_resolves_nothing_outside_the_environments_re
                     "case {case:?}: expected the modelled wire code, got {:?}",
                     answer.error_code()
                 );
-                let message = answer
-                    .json()
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                let message = answer.refusal_message();
                 assert_eq!(
                     message, expected_message,
                     "case {case:?}: expected the endpoint's own wording, got {message:?}"

@@ -175,6 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags.remove(key);
         }
 
+        // This call CHANGED this service's state — the stored tag map of the resource the
+        // ARN names — so it leaves the audit record every mutating handler of this crate
+        // leaves: the operation, the resource it changed and the access-key id the
+        // REQUEST presented, and none of the keys it carried (see
+        // [`crate::state::record_state_change`]).
+        crate::state::record_state_change(Self::NAME, &input.resource_arn, ctx.parts());
         Ok(UntagResourceOutput {})
     }
 }

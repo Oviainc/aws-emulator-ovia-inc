@@ -19,10 +19,9 @@
 //!   resource and a second call must not silently restart its documented hour;
 //! * that hour has run out — `startExpired`, with no URLs: "Use this action to
 //!   resume the session after it expires" is `StartGUISession`'s own
-//!   documentation, so resuming is not this call's business. Until that
-//!   operation is implemented (it is still a scaffold stub, with its own issue)
-//!   an expired session has no implemented path back: that is the honest answer
-//!   while nothing can resume it, not an empty success.
+//!   documentation, so resuming is not this call's business — a caller whose
+//!   session has expired resumes it there, and this call then reports the
+//!   session that start created.
 //! * the instance is still coming up — `settingUpInstance`, with
 //!   `percentageComplete` tracking the transition the clock owes it;
 //! * the instance is stopping or stopped — `notStarted`: no session is up and

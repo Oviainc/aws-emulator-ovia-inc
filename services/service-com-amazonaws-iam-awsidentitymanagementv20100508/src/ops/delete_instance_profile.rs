@@ -196,28 +196,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`DeleteInstanceProfile`), so a profile that still holds one "has attached
         // subordinate entities" (`DeleteConflictException`) and is NOT deleted. The
         // binding `AddRoleToInstanceProfile` wrote and `RemoveRoleFromInstanceProfile`
-        // clears is the one place that is read from, so the refusal names the roles the
-        // caller still has to remove.
-        let bound: Vec<String> = held
-            .role_keys
-            .iter()
-            .map(|role_key| {
-                store
-                    .roles
-                    .get(role_key)
-                    .map_or_else(|| role_key.clone(), |role| role.role_name.clone())
-            })
-            .collect();
-        if !bound.is_empty() {
+        // clears is the one place that is read from, and the refusal is the fixed text
+        // IAM words that class of blocking dependent with — the same sentence
+        // `DeleteRole` answers for a role still in a profile
+        // (`crate::state::DELETE_CONFLICT_REMOVE_ROLES_FROM_INSTANCE_PROFILE`), naming
+        // neither the profile nor the roles it holds.
+        if !held.role_keys.is_empty() {
             return Err(DeleteInstanceProfileErrorModeled::DeleteConflictException(
                 DeleteConflictException {
-                    message: Some(format!(
-                        "Cannot delete entity: the {} {} must be removed from instance profile \
-                         {} first.",
-                        if bound.len() == 1 { "role" } else { "roles" },
-                        bound.join(", "),
-                        input.instance_profile_name
-                    )),
+                    message: Some(
+                        crate::state::DELETE_CONFLICT_REMOVE_ROLES_FROM_INSTANCE_PROFILE
+                            .to_string(),
+                    ),
                 },
             )
             .into());
