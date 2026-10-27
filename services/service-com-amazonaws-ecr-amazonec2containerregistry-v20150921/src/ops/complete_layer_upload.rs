@@ -4,8 +4,8 @@
 //! Closes the layer upload `InitiateLayerUpload` opened and `UploadLayerPart` streamed
 //! into: the layer is the concatenation of the parts the upload accepted, the digest is
 //! the one computed over those bytes, and the blob joins the repository under it so a
-//! later `PutImage` can reference it and `BatchCheckLayerAvailability` reports it
-//! available.
+//! later `PutImage` can reference it, `BatchCheckLayerAvailability` reports it available
+//! and `GetDownloadUrlForLayer` serves its bytes.
 //!
 //! ## Shape of an operation
 //!
@@ -356,10 +356,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The blob joins the repository, addressed by the digest the registry computed,
         // and the upload it came from is closed: its id resolves to nothing afterwards.
         // The media type stays unset — a blob's media type is what a manifest
-        // referencing it declares, which this call carries nothing of. What the assembled
-        // bytes are a filesystem OF is read here, while they are in hand: the bytes are
-        // not retained, so a later basic scan of an image built on this layer examines
-        // this record of them.
+        // referencing it declares, which this call carries nothing of. The assembled
+        // BYTES are what the repository now holds the layer as, so a later
+        // `GetDownloadUrlForLayer` serves exactly them; what they are a filesystem OF is
+        // read here, once, while they are in hand, so a later basic image scan does not
+        // walk the archive again.
         let filesystem = crate::state::scan_layer_filesystem(&assembled);
         repo.layer_blobs.insert(
             digest.clone(),
@@ -368,6 +369,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 size: Some(layer_size),
                 media_type: None,
                 filesystem,
+                content: assembled,
             },
         );
         store.uploads.remove(&input.upload_id);
