@@ -266,6 +266,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = SystemTime::now();
         let fingerprint = request_fingerprint(&input);
+
+        // "Amazon Managed Workflows for Apache Airflow Serverless takes a snapshot of
+        // the definition at creation time": the definition file is read out of Amazon S3
+        // HERE, once, so the version this call creates freezes the content the object
+        // holds now and reports it however the object changes later. Read before the
+        // store is locked — the read is a call into another emulated service, and this
+        // service's store is not held across it.
+        let definition = crate::state::workflow_definition::snapshot_definition(
+            ctx,
+            &region,
+            &input.definition_s3_location,
+        )
+        .await;
+
         let mut store = state.lock();
 
         // Finish every workflow teardown the clock already made due, so a name held
@@ -361,6 +375,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // workflow unless you create a new version".
         let snapshot = crate::state::WorkflowSnapshot {
             definition_s3_location: input.definition_s3_location.clone(),
+            // The content read above, and the schedule that content declares: both
+            // belong to THIS version, so a later overwrite of the object cannot change
+            // what this version reports.
+            workflow_definition: definition
+                .as_ref()
+                .map(|snapshot| snapshot.content.clone()),
+            schedule_configuration: definition
+                .and_then(|snapshot| snapshot.schedule_configuration),
             code: input.code.clone(),
             role_arn: input.role_arn.clone(),
             description: input.description.clone(),
