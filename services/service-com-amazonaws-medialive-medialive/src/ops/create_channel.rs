@@ -187,21 +187,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `DryRun` carries no documented semantics in this model (its doc text is
-        // the generated placeholder), so what the real service validates — and
-        // what it answers — is not knowable from the contract. Refuse it with the
-        // operation's own modelled client error rather than silently creating a
-        // channel the caller asked NOT to create.
-        if input.dry_run == Some(true) {
-            return Err(CreateChannelErrorModeled::BadRequestException(BadRequestException {
-                message: Some(
-                    "dryRun is not implemented by this emulator; omit dryRun to create the channel"
-                        .to_string(),
-                ),
-            })
-            .into());
-        }
-
         // `InputAttachments` is a caller-chosen list, and every later read that
         // walks it (an input's `AttachedChannels`, a signal map's discovery)
         // costs work per entry, so its length is bounded here: a longer list is
@@ -243,17 +228,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
+        // `DryRun` asks for the request to be CHECKED, not performed: every
+        // refusal the real create would answer is answered below just the same,
+        // and only the writes are skipped. It is a member the operation defines,
+        // so it is never itself a reason to refuse the request.
+        let dry_run = input.dry_run == Some(true);
+
         let mut state = state.lock();
         state.settle(now);
 
         // A retried create (same `@idempotencyToken` `RequestId`) must return the
-        // channel the first one created, not a second channel.
-        if let Some(existing) = input
+        // channel the first one created, not a second channel. A validate-only
+        // request creates nothing and so records no token: it is never such a
+        // retry, and is answered by the dry-run arm below instead.
+        let retried = input
             .request_id
             .as_deref()
+            .filter(|_| !dry_run)
             .and_then(|token| state.channel_for_token(token))
-            .map(str::to_string)
-        {
+            .map(str::to_string);
+        if let Some(existing) = retried {
             let channel = state.channel_description(&existing).ok_or_else(unavailable)?;
             return Ok(CreateChannelOutput {
                 channel: Some(channel),
@@ -273,6 +267,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // Every refusal this create could earn has now been answered, so a
+        // validate-only request is done: it mints no id and stores nothing, and
+        // since no channel was created there is no channel to describe.
+        if dry_run {
+            return Ok(CreateChannelOutput { channel: None });
         }
 
         let id = state.mint_channel_id();

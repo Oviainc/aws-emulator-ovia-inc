@@ -212,17 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
 
-        // `DryRun` carries no documented semantics in this model (its doc text is
-        // the generated placeholder), so what the real service validates — and
-        // what it answers — is not knowable from the contract. Refused with this
-        // operation's own modelled client error rather than silently applying an
-        // update the caller asked NOT to apply, exactly as `CreateChannel`
-        // refuses the same member.
-        if input.dry_run == Some(true) {
-            return Err(bad_request(
-                "dryRun is not implemented by this emulator; omit dryRun to update the channel",
-            ));
-        }
+        // `DryRun` asks for the request to be CHECKED, not performed: every
+        // refusal the real update would answer is answered below just the same,
+        // and only the writes are skipped. It is a member the operation defines,
+        // so it is never itself a reason to refuse the request.
+        let dry_run = input.dry_run == Some(true);
 
         // The two caller-chosen lists this operation STORES carry the same
         // ceilings `CreateChannel` applies, because the per-request work every
@@ -277,6 +271,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
             .into());
+        }
+
+        // Every refusal this update could earn has now been answered, so a
+        // validate-only request is done: the channel keeps the configuration it
+        // already had and its state is not moved, so there is no updated channel
+        // to describe.
+        if dry_run {
+            return Ok(UpdateChannelOutput { channel: None });
         }
 
         // Each member the request named is stored; each one it omitted keeps the

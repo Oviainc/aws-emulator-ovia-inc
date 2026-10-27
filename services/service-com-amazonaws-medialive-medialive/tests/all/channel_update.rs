@@ -623,9 +623,8 @@ async fn updating_a_channel_that_cannot_be_resolved_is_a_bad_request() {
 
 /// Rule: a request this emulator cannot store is refused with the modelled
 /// `BadRequestException` (400) before anything is written — a caller-chosen list
-/// longer than the ceiling this emulator keeps on one channel, and the `DryRun`
-/// member whose semantics this model documents nothing for (its doc text is the
-/// generated placeholder), exactly as `CreateChannel` refuses both.
+/// longer than the ceiling this emulator keeps on one channel, exactly as
+/// `CreateChannel` refuses it.
 ///
 /// The list rows are each ceiling at its published bound and one entry past it.
 #[tokio::test]
@@ -691,36 +690,149 @@ async fn an_update_this_emulator_cannot_store_is_refused() {
             );
         }
     }
+}
 
-    // `DryRun` is refused whatever else the request names, and the request that
-    // omits it is the control that shows the refusal is about that member.
-    let dry_run_table: [(&str, Value, u16); 3] = [
-        ("dryRun true", json!({ "name": "dry", "dryRun": true }), 400),
-        ("dryRun false", json!({ "name": "wet", "dryRun": false }), 200),
-        ("dryRun omitted", json!({ "name": "plain" }), 200),
+/// Rule: a request carrying the modelled `dryRun` flag is VALIDATE-ONLY — the
+/// update is checked exactly as the same request without the flag is checked and
+/// earns the same status and error code, but none of its writes are performed,
+/// so the channel still reads back as it was and the response describes no
+/// updated channel.
+///
+/// The rows span the verdicts the check can reach — a patch that validates, one
+/// naming several members, and each class of refusal the patch itself earns —
+/// with the request that carries the flag false or not at all as the control
+/// that does apply. The refusals the TARGET earns (a channel that has not
+/// stopped, a channel id that names nothing) follow the table.
+#[tokio::test]
+async fn a_dry_run_update_validates_without_changing_the_channel() {
+    // (case, the patch, the verdict the update earns, its error code)
+    let dry_run_table: [(&str, Value, u16, &str); 4] = [
+        ("a patch that validates", json!({ "name": "dry" }), 200, ""),
+        (
+            "a patch naming several members",
+            json!({ "name": "dry", "logLevel": "DEBUG", "destinations": [{ "id": "dry" }] }),
+            200,
+            "",
+        ),
+        (
+            "attachments one past the ceiling",
+            json!({ "name": "dry", "inputAttachments": (0..=MAX_INPUT_ATTACHMENTS)
+                .map(|slot| json!({ "inputAttachmentName": format!("slot-{slot}"), "inputId": "1000000" }))
+                .collect::<Vec<Value>>() }),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "destinations one past the ceiling",
+            json!({ "name": "dry", "destinations": (0..=MAX_CHANNEL_DESTINATIONS)
+                .map(|slot| json!({ "id": format!("destination-{slot}") }))
+                .collect::<Vec<Value>>() }),
+            400,
+            "BadRequestException",
+        ),
     ];
-    for (case, patch, expected_status) in dry_run_table {
+    for (case, patch, verdict, code) in dry_run_table {
         let router = medialive();
         let id = idle_channel(&router, case, baseline_body()).await;
-        let (status, body) = update_channel(&router, &id, patch).await;
+
+        let mut asked = patch.clone();
+        asked["dryRun"] = json!(true);
+        let (status, body) = update_channel(&router, &id, asked).await;
         assert_eq!(
-            status, expected_status,
-            "case {case:?}: expected {expected_status}, got {status}: {body}"
+            status, verdict,
+            "case {case:?}: expected the dry run to answer {verdict}, got {status}: {body}"
         );
-        if expected_status == 400 {
+        if verdict == 200 {
+            assert!(
+                body["channel"].is_null(),
+                "case {case:?}: a dry run changes nothing, so it must describe no channel, got {:?}",
+                body["channel"]
+            );
+        } else {
             assert_eq!(
                 error_code(status, &body),
-                "BadRequestException",
-                "case {case:?}: expected BadRequestException, got {body}"
+                code,
+                "case {case:?}: expected {code}, got {body}"
+            );
+        }
+        wait_for_the_clock();
+        let (status, after) = describe(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeChannel: got {status}: {after}"
+        );
+        assert_eq!(
+            after["name"],
+            json!("baseline"),
+            "case {case:?}: expected the dry run to have written nothing, got {:?}",
+            after["name"]
+        );
+        assert_eq!(
+            after["state"],
+            json!("IDLE"),
+            "case {case:?}: expected the dry run to have left the channel IDLE, got {:?}",
+            after["state"]
+        );
+
+        // The same patch performed for real earns the same verdict, and when it
+        // succeeds it is the one that writes.
+        for flag in [Some(false), None] {
+            let router = medialive();
+            let id = idle_channel(&router, case, baseline_body()).await;
+            let mut performed = patch.clone();
+            if let Some(flag) = flag {
+                performed["dryRun"] = json!(flag);
+            }
+            let (status, body) = update_channel(&router, &id, performed).await;
+            assert_eq!(
+                status, verdict,
+                "case {case:?} with dryRun {flag:?}: expected {verdict}, got {status}: {body}"
             );
             wait_for_the_clock();
             let (_, after) = describe(&router, &id).await;
+            let expected_name = if verdict == 200 { "dry" } else { "baseline" };
             assert_eq!(
                 after["name"],
-                json!("baseline"),
-                "case {case:?}: expected the refused update to have written nothing, got {:?}",
+                json!(expected_name),
+                "case {case:?} with dryRun {flag:?}: expected the name {expected_name}, got {:?}",
                 after["name"]
             );
         }
     }
+
+    // The refusals a dry run reports are not only about the patch: a channel the
+    // update could not have changed is refused the same way with the flag set.
+    let router = medialive();
+    let running = idle_channel(&router, "running channel", baseline_body()).await;
+    let (status, started) = call(
+        &router,
+        "POST",
+        &format!("/prod/channels/{running}/start"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "StartChannel: got {status}: {started}");
+    let (status, body) = update_channel(&router, &running, json!({ "name": "dry", "dryRun": true }))
+        .await;
+    assert_eq!(
+        status, 409,
+        "expected a dry run on a channel that has not stopped to conflict, got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(status, &body),
+        "ConflictException",
+        "expected ConflictException, got {body}"
+    );
+
+    let (status, body) = update_channel(&router, "999999", json!({ "name": "dry", "dryRun": true }))
+        .await;
+    assert_eq!(
+        status, 400,
+        "expected a dry run naming no channel to be refused, got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(status, &body),
+        "BadRequestException",
+        "expected BadRequestException, got {body}"
+    );
 }
