@@ -107,12 +107,12 @@ fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str]) -> 
 /// is empty.
 const WIRE_PATH_SEGMENTS: &[&str] = &[emulator_server::ROOT_PATH_SEGMENT];
 
-/// The error code the query protocols name a refusal of a value outside a DECLARED BOUND
-/// with (`vendor/smithy-server-runtime/src/pre_dispatch.rs`), and the code the framework
-/// itself would have answered this refusal with. It is restated here because [`Refused`]
-/// replaces the code and the message TOGETHER and only the message changes below: a
-/// client branches on the code, so it must stay the one it would have seen.
-const BOUND_REFUSAL_CODE: &str = "ValidationError";
+/// The error code the query protocols name a refusal of an invalid request value with
+/// (`vendor/smithy-server-runtime/src/pre_dispatch.rs`), and the code the framework itself
+/// would have answered this refusal with. It is restated here because [`Refused`] replaces
+/// the code and the message TOGETHER and only the message changes below: a client branches
+/// on the code, so it must stay the one it would have seen.
+const VALUE_REFUSAL_CODE: &str = "ValidationError";
 
 /// Whether `violation` is a value outside a BOUND the model declares for its member — a
 /// number outside its `@range`, or a string or collection outside its `@length`.
@@ -130,56 +130,110 @@ fn is_declared_bound(violation: &Violation) -> bool {
     )
 }
 
-/// A boundary refusal restated so a value outside a DECLARED BOUND names the member and
-/// the bound it broke and nothing of the value itself, or `None` when the request broke no
-/// such bound and the framework's own wording stands.
+/// The admissible value sets this service states in an order of its OWN, each written in
+/// the order IAM publishes for that enum.
 ///
-/// This service states that class of refusal without echoing the rejected value — the
-/// clause reads `Value at '<member>' failed to satisfy constraint: Member must have
-/// {value,length} {greater,less} than or equal to <bound>` — while the other classes (a
-/// string outside its `@pattern`, a value outside an enumerated set, an absent required
-/// member) keep the framework's sentence, value and all. Only the `Value '<the value>' at`
-/// opening is lifted out: the envelope, the member path and the requirement are the
-/// framework's, built from the same two fields the renderer interpolated, so the two
-/// cannot drift and the replacement matches the echo whatever the value is. The ONE thing
-/// it couples to is the renderer's quoting of that opening
-/// (`vendor/smithy-schema-server/src/constraints.rs::Violation::message`, `Value
-/// '<shown>' at '<path>'`); the suite below asserts the whole message and that the value
-/// appears nowhere in it, so a renderer that quoted it differently would fail there rather
-/// than turn this into a silent no-op.
+/// A refusal of a value outside an enumerated set states the set, and the order it is
+/// stated in belongs to the service: for some of IAM's enums it is not the order the model
+/// happens to declare the values in. Where the two differ the published order is carried
+/// here and replaces the renderer's; a set this table does not name keeps the model's
+/// order, which is what the framework already states.
 ///
-/// The rule covers every member with a bound, not one member: the bound and the member
-/// path both come from the model, so a page size, a session duration, a description's
-/// length and a tag list's size are one class of refusal and are worded alike
-/// (`tests/all/range_refusal_wording.rs` reads them back, over both bound directions and
-/// over the scalar and collection forms of a length). Two of those rows go beyond what
-/// this service's recorded answers show — a role name over its `@length` maximum and a tag
-/// list over its own — and follow the class rather than an observation of their own; a
-/// later recording that echoes the value for one of them would narrow the class here, not
-/// contradict the seam.
+/// SOURCE, for adding an enum: the order AWS itself states the set in — the `Valid Values`
+/// listing for that member in the IAM API Reference, or the bracketed set in IAM's own
+/// refusal of a value outside it. That is AWS data about the enum, so an entry is added
+/// only when such a statement is in hand and it disagrees with the model's declaration
+/// order; an enum nobody has that for is simply absent from this table, which is why the
+/// table is short rather than one entry per enum.
+///
+/// An entry is matched by its MEMBERSHIP — the set of values, in any order — so it answers
+/// for the enum itself rather than for one member referencing it, and every member
+/// targeting that enum, in any operation, is stated the same way.
+const PUBLISHED_ENUM_ORDERS: &[&[&str]] = &[
+    // The scope of a managed-policy listing (`iam#policyScopeType`, declared by the model
+    // as `All, AWS, Local`).
+    &["All", "Local", "AWS"],
+];
+
+/// The order this service states the admissible set `allowed` in, or `None` when the
+/// model's own order stands.
+///
+/// The match is on membership and size, never on position, so a model that reordered its
+/// own declaration of the same enum would still be stated in the published order.
+fn published_enum_order(allowed: &[String]) -> Option<&'static [&'static str]> {
+    PUBLISHED_ENUM_ORDERS.iter().copied().find(|published| {
+        published.len() == allowed.len()
+            && published
+                .iter()
+                .all(|value| allowed.iter().any(|declared| declared == value))
+    })
+}
+
+/// A boundary refusal restated so a value this service refuses WITHOUT echoing it names
+/// the member and the requirement and nothing of the value, or `None` when the request
+/// broke no such requirement and the framework's own wording stands.
+///
+/// Two classes are restated, and both read `Value at '<member>' failed to satisfy
+/// constraint: <requirement>`:
+///
+/// - a value outside a BOUND its member declares ([`is_declared_bound`]), whose
+///   requirement is the bound itself;
+/// - a value outside an enumerated set, whose requirement states the admissible set —
+///   rendered in the order this service publishes for that enum
+///   ([`published_enum_order`]) rather than the model's declaration order.
+///
+/// The other classes (a string outside its `@pattern`, an absent required member) keep the
+/// framework's sentence, value and all. Only the `Value '<the value>' at` opening is
+/// lifted out, and only the bracketed set is reordered: the envelope, the member path and
+/// the requirement are the framework's, built from the same fields the renderer
+/// interpolated, so the two cannot drift and the replacement matches the echo whatever the
+/// value is. The ONE thing it couples to is the renderer's wording of that opening and of
+/// the set (`vendor/smithy-schema-server/src/constraints.rs::Violation::message`, `Value
+/// '<shown>' at '<path>'` and `Member must satisfy enum value set: [<values>]`); the
+/// suites assert the whole message and that the value appears nowhere in it, so a renderer
+/// that worded either differently would fail there rather than turn this into a silent
+/// no-op.
+///
+/// Each rule covers every member of its class, not one member: the bound, the set and the
+/// member path all come from the model, so a page size, a session duration, a
+/// description's length and a tag list's size are one class and are worded alike
+/// (`tests/all/range_refusal_wording.rs`), and a listing's scope, a usage filter, an
+/// access key's status and an entity filter are another
+/// (`tests/all/enum_refusal_wording.rs`), read back over the operations and members that
+/// carry them.
 ///
 /// A refusal carrying an ABSENT required member is declined whole: that one renders under
-/// a different code than a failed bound, and restating it under [`BOUND_REFUSAL_CODE`]
+/// a different code than a failed value, and restating it under [`VALUE_REFUSAL_CODE`]
 /// would change what a client branches on.
-fn without_bound_value_echo(violations: &[Violation]) -> Option<Refused> {
+fn without_refused_value_echo(violations: &[Violation]) -> Option<Refused> {
     let absent_member = violations
         .iter()
         .any(|violation| matches!(violation.kind, ViolationKind::MissingRequiredMember));
-    if absent_member || !violations.iter().any(is_declared_bound) {
+    let restated = |violation: &Violation| {
+        is_declared_bound(violation) || matches!(violation.kind, ViolationKind::EnumValue(_))
+    };
+    if absent_member || !violations.iter().any(restated) {
         return None;
     }
     let mut message = envelope(violations)?;
-    for violation in violations.iter().filter(|violation| is_declared_bound(violation)) {
-        let Some(value) = violation.value.as_deref() else {
-            continue;
-        };
-        message = message.replace(
-            &format!("Value '{value}' at '{}'", violation.path),
-            &format!("Value at '{}'", violation.path),
-        );
+    for violation in violations.iter().filter(|violation| restated(violation)) {
+        if let Some(value) = violation.value.as_deref() {
+            message = message.replace(
+                &format!("Value '{value}' at '{}'", violation.path),
+                &format!("Value at '{}'", violation.path),
+            );
+        }
+        if let ViolationKind::EnumValue(allowed) = &violation.kind {
+            if let Some(published) = published_enum_order(allowed) {
+                message = message.replace(
+                    &format!("enum value set: [{}]", allowed.join(", ")),
+                    &format!("enum value set: [{}]", published.join(", ")),
+                );
+            }
+        }
     }
     Some(Refused {
-        code: BOUND_REFUSAL_CODE.to_string(),
+        code: VALUE_REFUSAL_CODE.to_string(),
         message,
     })
 }
@@ -349,14 +403,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording; the one class this service words differently is a value outside
-        // a bound its member declares, which it states without echoing the value
-        // (see [`without_bound_value_echo`], which answers with the code the
-        // framework would have chosen).
+        // required member, or a value outside a declared bound or an enumerated
+        // set) to let this service reword it. Returning `None` keeps the
+        // framework's default wording; the classes this service words differently
+        // are a value outside a bound its member declares and a value outside an
+        // enumerated set, both of which it states without echoing the value (see
+        // [`without_refused_value_echo`], which answers with the code the framework
+        // would have chosen).
         match refusal {
-            Refusal::Invalid(violations) => without_bound_value_echo(violations),
+            Refusal::Invalid(violations) => without_refused_value_echo(violations),
             _ => None,
         }
     }

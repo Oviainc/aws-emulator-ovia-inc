@@ -204,10 +204,16 @@ async fn every_catalog_policy_is_readable_and_serves_its_default_version() {
             entry.path,
             "case {case:?}: the reported Path must be the catalog's: {body}"
         );
+        // SOURCE: the path AWS reserves for service-linked roles, written out here so the
+        // expectation comes from the published rule rather than from the function the
+        // service derives the flag with.
+        let attachable = !entry.path.starts_with("/aws-service-role/");
         assert_eq!(
             element(&body, "IsAttachable"),
-            "true",
-            "case {case:?}: an AWS-managed policy is published to be attached: {body}"
+            attachable.to_string(),
+            "case {case:?}: a policy AWS files under the path reserved for service-linked \
+             roles belongs to that role alone and is not attachable; every other one is: \
+             {body}"
         );
         assert_eq!(
             element(&body, "AttachmentCount"),
@@ -271,8 +277,11 @@ async fn every_catalog_policy_is_readable_and_serves_its_default_version() {
     }
 }
 
-/// Every catalog entry is a well-formed managed policy, distinct from the others:
-/// the table is the catalog itself, so an entry added later is checked too.
+/// Every catalog entry is a well-formed managed policy, distinct from the others, and the
+/// catalog offers both kinds of entry: the policies published to be attached and the ones
+/// AWS files under the path it reserves for service-linked roles, which report
+/// `IsAttachable` false. The table is the catalog itself, so an entry added later is
+/// checked too.
 ///
 /// The constraints are the modelled ones (`policyPathType`, `policyNameType`,
 /// `arnType`, `idType`, from `smithy_query(query="shape", shape="Policy")`) plus the
@@ -367,6 +376,21 @@ fn catalog_entries_are_well_formed_and_distinct() {
         policy_ids.push(entry.policy_id);
         arns.push(arn);
     }
+
+    // Both kinds of entry are present, so a client enumerating the catalog can find a
+    // policy it may attach and one it may not.
+    assert!(
+        state::AWS_MANAGED_POLICIES
+            .iter()
+            .any(|entry| entry.is_attachable()),
+        "the catalog must carry policies an identity can attach"
+    );
+    assert!(
+        state::AWS_MANAGED_POLICIES
+            .iter()
+            .any(|entry| !entry.is_attachable()),
+        "the catalog must carry at least one policy that is NOT attachable"
+    );
 }
 
 /// `AttachmentCount` is the number of entities attached to the policy NOW, for a

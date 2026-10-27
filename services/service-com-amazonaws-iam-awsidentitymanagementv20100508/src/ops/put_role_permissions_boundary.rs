@@ -276,17 +276,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Amazon Web Services service role policies can only be attached to the
-        // service-linked role for that service" (`PolicyNotAttachableException`): such
-        // a policy is one AWS files under the reserved service-linked role path, and
-        // the role being bounded here is not service-linked — that was refused above.
-        if crate::state::is_service_linked_role_path(&policy.path) {
+        // service-linked role for that service" (`PolicyNotAttachableException`): a
+        // policy that is published but NOT attachable is refused, and the flag a
+        // reader of that policy reports (`Policy$IsAttachable`) is the one decision
+        // behind it (`crate::state::policy_is_attachable`), so a client that
+        // pre-screens a boundary ARN on that flag and IAM agree. The boundary is left
+        // exactly as it was.
+        if !store.policy_is_attachable(&input.permissions_boundary) {
             return Err(
                 PutRolePermissionsBoundaryErrorModeled::PolicyNotAttachableException(
                     PolicyNotAttachableException {
-                        message: Some(format!(
-                            "Policy {} is not attachable: a service role policy can only be \
-                             attached to the service-linked role for that service",
-                            input.permissions_boundary
+                        message: Some(crate::state::policy_cannot_be_attached(
+                            &input.permissions_boundary,
                         )),
                     },
                 )
