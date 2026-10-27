@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeServiceDeployments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeServiceDeployments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeServiceDeployments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the STORED service deployments the request's ARNs name — each rollout's
+//! instants, the revisions it moves the service between with their task counts counted
+//! off the task map, and the state of the failure-detection mechanisms its own deployment
+//! configuration turned on — and a `MISSING` failure for every ARN that names no stored
+//! deployment, rather than refusing the batch. A REPORTING operation (`@readonly`):
+//! nothing here changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -160,20 +157,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeServiceDeployments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeServiceDeploymentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeServiceDeployments"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeServiceDeploymentsErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "You can specify a maximum of 20 ARNs."
+        if input.service_deployment_arns.len() > crate::state::MAX_DESCRIBE_SERVICE_DEPLOYMENTS {
+            return Err(
+                DescribeServiceDeploymentsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::at_most_items_message(
+                            "service deployments",
+                            crate::state::MAX_DESCRIBE_SERVICE_DEPLOYMENTS,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        let mut service_deployments = Vec::new();
+        let mut failures = Vec::new();
+        // A deployment is reported once however many times the request names it: the same
+        // ARN repeated names the same rollout, so it is one answer, not one per entry.
+        let mut seen = ::std::collections::HashSet::new();
+        for reference in &input.service_deployment_arns {
+            let reference = reference.trim();
+            if !seen.insert(reference.to_string()) {
+                continue;
+            }
+            match guard.service_deployments.get(reference) {
+                Some(record) => service_deployments.push(guard.service_deployment_view(record)),
+                // "Any failures associated with the call. If you decsribe a deployment
+                // with a service revision created before October 25, 2024, the call
+                // fails. The failure includes the service revision ARN and the reason set
+                // to MISSING": an entry that names no stored rollout is a failure of its
+                // own entry, naming the ARN the caller sent, rather than a refusal that
+                // would lose the deployments the request did resolve.
+                None => failures.push(crate::state::missing_failure(reference)),
+            }
+        }
+
+        Ok(DescribeServiceDeploymentsOutput {
+            service_deployments: Some(service_deployments),
+            failures: Some(failures),
+        })
     }
 }
