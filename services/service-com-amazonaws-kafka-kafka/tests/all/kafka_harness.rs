@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_kafka_kafka::state::{
-    CLUSTER_ACTIVATION_DELAY, CLUSTER_UPDATE_DELAY, VPC_CONNECTION_ACTIVATION_DELAY,
+    CLUSTER_ACTIVATION_DELAY, CLUSTER_UPDATE_DELAY, CONFIGURATION_ARN_NOT_FOUND_MESSAGE,
+    VPC_CONNECTION_ACTIVATION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -454,6 +455,48 @@ pub fn reported_server_properties(reply: &Reply, case: &str) -> Vec<u8> {
         .unwrap_or_else(|| panic!("case {case}: expected serverProperties, got {}", reply.body));
     ::aws_smithy_types::base64::decode(encoded)
         .unwrap_or_else(|error| panic!("case {case}: serverProperties is not base64: {error}"))
+}
+
+/// Assert `reply` is the refusal every operation of the MSK configuration family
+/// answers an `Arn` it resolves to no configuration of `region` with: HTTP 400
+/// `BadRequestException`, naming `Arn` as the parameter at fault, carrying the
+/// service's one fixed sentence for that condition — a sentence with no variable
+/// parts, so neither `arn` nor `region` nor the account id may appear in it.
+///
+/// Shared by every configuration suite, so none of them can drift from another
+/// about what that refusal is.
+pub fn assert_configuration_arn_resolves_to_nothing(
+    reply: &Reply,
+    case: &str,
+    arn: &str,
+    region: &str,
+) {
+    assert_eq!(
+        (reply.status, reply.error_code()),
+        (400, "BadRequestException"),
+        "case {case}: expected 400 BadRequestException, got {} {}",
+        reply.status,
+        reply.body
+    );
+    assert_eq!(
+        reply.error_message(),
+        CONFIGURATION_ARN_NOT_FOUND_MESSAGE,
+        "case {case}: expected the unresolved-ARN wording, got {:?}",
+        reply.error_message()
+    );
+    assert_eq!(
+        reply.at("/invalidParameter").as_str(),
+        Some("Arn"),
+        "case {case}: the refusal must name Arn as the parameter at fault, got {}",
+        reply.body
+    );
+    for (what, value) in [("the ARN", arn), ("the region", region), ("the account", ACCOUNT)] {
+        assert!(
+            !reply.error_message().contains(value),
+            "case {case}: the message must not interpolate {what} ({value:?}), got {:?}",
+            reply.error_message()
+        );
+    }
 }
 
 /// The resource URI of one MSK VPC connection, with the ARN percent-encoded into

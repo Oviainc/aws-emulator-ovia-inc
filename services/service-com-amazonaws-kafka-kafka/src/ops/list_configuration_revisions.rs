@@ -13,10 +13,11 @@
 //! service's `BadRequestException`), and `NextToken` is an opaque encoding of the
 //! configuration and the revision the page stopped at — absent from the last page.
 //!
-//! A configuration is addressed by ARN, so a value that is not an MSK
-//! configuration ARN is a bad request, while a well-formed one this endpoint's
-//! region holds no configuration for is not found: the same distinction
-//! `DescribeConfigurationRevision` draws.
+//! A configuration is addressed by ARN, so an `Arn` this endpoint resolves to no
+//! configuration — malformed, absent, already deleted, or another region's — is
+//! the configuration family's one unresolvable-reference bad request
+//! ([`crate::state::configuration_arn_not_found`]) rather than an empty page: the
+//! same refusal `DescribeConfigurationRevision` and the delete answer.
 //!
 //! A reporting operation: it only reads the registry. A configuration is created
 //! `ACTIVE` and a stored revision never changes, so the clock owes this read no
@@ -221,18 +222,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::request_region(ctx.parts());
 
-        if !crate::state::is_configuration_arn(&input.arn) {
-            return Err(
-                ListConfigurationRevisionsErrorModeled::BadRequestException(BadRequestException {
-                    invalid_parameter: Some("Arn".to_string()),
-                    message: Some(format!(
-                        "{} is not a valid Amazon MSK configuration ARN.",
-                        input.arn
-                    )),
-                })
-                .into(),
-            );
-        }
+        // Reporting only: nothing here writes.
+        let state = state.lock();
+
+        // The revisions are listed FROM a configuration, so an `Arn` this
+        // endpoint resolves to no configuration has no history to serve — the
+        // configuration family's unresolvable-reference refusal, not an empty
+        // page. Resolved before the token and the page size are judged, so a
+        // request naming no configuration is told that, whatever else it
+        // carries.
+        let Some(configuration) = state.configuration_in(&region, &input.arn) else {
+            return Err(ListConfigurationRevisionsErrorModeled::BadRequestException(
+                crate::state::configuration_arn_not_found(),
+            )
+            .into());
+        };
 
         // `MaxResults` outside the modelled 1..100 range never reaches here: the
         // boundary refuses it with this service's own `BadRequestException` (see
@@ -265,25 +269,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = usize::try_from(input.max_results.unwrap_or(MAX_RESULTS_LIMIT))
             .unwrap_or(MAX_RESULTS_LIMIT as usize)
             .clamp(1, MAX_RESULTS_LIMIT as usize);
-
-        // Reporting only: nothing here writes.
-        let state = state.lock();
-
-        // The revisions are listed FROM a configuration, so an endpoint that
-        // holds none for this ARN has no history to serve — a missing resource,
-        // not an empty page.
-        let Some(configuration) = state.configuration_in(&region, &input.arn) else {
-            return Err(
-                ListConfigurationRevisionsErrorModeled::NotFoundException(NotFoundException {
-                    invalid_parameter: Some("Arn".to_string()),
-                    message: Some(format!(
-                        "No configuration exists in {region} with the ARN {}",
-                        input.arn
-                    )),
-                })
-                .into(),
-            );
-        };
 
         // The history is stored in revision order and only ever appended to, so
         // the page walks it from its resume point and stops as soon as it is
