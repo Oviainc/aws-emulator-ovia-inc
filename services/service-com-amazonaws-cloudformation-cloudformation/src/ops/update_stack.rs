@@ -42,12 +42,18 @@
 //! force do not satisfy is not such a refusal — it fails the update, which likewise leaves
 //! the stack as it was.
 //!
-//! Members this slice stores but has nothing to act on, because it performs no resource
-//! updates: `StackPolicyBody` (replaces the stack's policy, which `GetStackPolicy`
-//! reports back) and `ResourceTypes`. `StackPolicyDuringUpdateBody` is a policy that
-//! applies to THIS update only, protecting resources from being changed by it; with no
-//! resource updates to govern it has nothing to override, so it is accepted and not
-//! stored. `DisableValidation` turns off pre-deployment validation this emulator does not
+//! The STACK POLICY in force governs every resource action this update plans
+//! ([`crate::state::stack_policy`]): the policy the stack carries, or the
+//! `StackPolicyDuringUpdateBody` the request overrides it with for this one update (which is
+//! never stored, so `GetStackPolicy` goes on reporting the stored document). An action the
+//! policy does not permit fails that resource with the policy's own verdict as its reason
+//! and rolls the stack back to `UPDATE_ROLLBACK_COMPLETE`, before anything about the stack
+//! or its resources is changed — so a denied update leaves the template, the parameters and
+//! every resource exactly as they were. `StackPolicyBody` replaces the stack's stored
+//! policy, which `GetStackPolicy` reports back.
+//!
+//! Members this slice stores but has nothing to act on: `ResourceTypes`.
+//! `DisableValidation` turns off pre-deployment validation this emulator does not
 //! perform either way. `StackPolicyURL` and `StackPolicyDuringUpdateURL` name a policy in
 //! Amazon S3 and are answered 501.
 //!
@@ -239,6 +245,17 @@ struct PreviousValues {
     role_arn: Option<String>,
     rollback_configuration: Option<StoredRollbackConfiguration>,
     deployment_config: Option<StoredDeploymentConfig>,
+    /// The stack policy in force when this update arrived: what governs the resource
+    /// actions it plans, unless the request overrides it for this one update.
+    stack_policy_body: Option<String>,
+    /// The identity the stack's own pseudo parameters resolve to, and the resources and
+    /// imports its deployed template is in force with: what the planned resource actions
+    /// are computed against ([`crate::state::change_plan`]).
+    region: String,
+    stack_name: String,
+    stack_id: String,
+    deployed: Vec<crate::state::DeployedResource>,
+    imports: ::std::collections::BTreeMap<String, String>,
 }
 
 impl PreviousValues {
@@ -253,8 +270,56 @@ impl PreviousValues {
             role_arn: stack.role_arn.clone(),
             rollback_configuration: stack.rollback_configuration.clone(),
             deployment_config: stack.deployment_config.clone(),
+            stack_policy_body: stack.stack_policy_body.clone(),
+            region: stack.region.clone(),
+            stack_name: stack.stack_name.clone(),
+            stack_id: stack.stack_id.clone(),
+            deployed: stack.resources.clone(),
+            imports: stack.imports.clone(),
         }
     }
+}
+
+/// The resource actions an update PLANS, as the stack policy in force is asked about them.
+///
+/// Computed from the resource-level plan [`crate::state::computed_changes`] answers for the
+/// two revisions — the one the stack is in force with and the one this update would deploy —
+/// which is the same comparison `CreateChangeSet` reviews an update through, so the policy
+/// is evaluated against the actions the deployment really performs.
+fn planned_actions(
+    previous: &PreviousValues,
+    submitted_body: &str,
+    submitted_stage: &crate::state::template::Processed,
+    parameters: &[StoredParameter],
+) -> Vec<crate::state::stack_policy::PlannedAction> {
+    let Some(submitted) = submitted_stage
+        .body(submitted_body)
+        .and_then(crate::state::declared_template)
+    else {
+        return Vec::new();
+    };
+    let current = previous
+        .template_body
+        .as_deref()
+        .and_then(|body| previous.processed_template.body(body))
+        .and_then(crate::state::declared_template)
+        .unwrap_or_default();
+    let changes = crate::state::computed_changes(
+        Some(crate::state::StackRevision {
+            stack: crate::state::template::StackScope {
+                region: &previous.region,
+                stack_name: &previous.stack_name,
+                stack_id: &previous.stack_id,
+            },
+            template: &current,
+            parameters: &previous.parameters,
+            deployed: &previous.deployed,
+            imports: &previous.imports,
+        }),
+        &submitted,
+        parameters,
+    );
+    crate::state::stack_policy::planned_actions(&changes)
 }
 
 // The request's `Parameters` are resolved against the stack's stored values by the shared
@@ -644,6 +709,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             _ => processed_template,
         };
+
+        // "Updates on the resources you specify are denied": the stack policy in force
+        // governs every resource action this update plans, so it is weighed BEFORE anything
+        // about the stack is written — a denied update deploys nothing, and so changes
+        // neither the stack's configuration nor its resources.
+        //
+        // Which policy is in force is what `StackPolicyDuringUpdateBody` decides: "a
+        // temporary overriding stack policy during this update. If you don't specify a stack
+        // policy, the current policy that is associated with the stack will be used." The
+        // override applies to THIS update alone and is never stored, so the stack goes on
+        // carrying the document `GetStackPolicy` reads back.
+        //
+        // A template whose processed stage this update could not compute has no plan to
+        // weigh: that failure is the one reported, below.
+        let governing_policy = input
+            .stack_policy_during_update_body
+            .clone()
+            .or_else(|| previous.stack_policy_body.clone());
+        let denial = match (&governing_policy, &transform_failure) {
+            (Some(policy), None) => crate::state::stack_policy::denied(
+                policy,
+                &planned_actions(&previous, &template_body, &processed_template, &parameters),
+            ),
+            _ => None,
+        };
+        if let Some(denial) = denial {
+            // The denied resource's update FAILS, and the stack rolls back: "if the stack
+            // update fails, CloudFormation rolls back the stack to the previous stack
+            // configuration" — which here is the configuration still in force, nothing
+            // having been deployed. A caller that asked for a failed update's state to be
+            // kept (`DisableRollback`) stops at `UPDATE_FAILED`, as on any other failure.
+            let mut store = state.lock();
+            let stack = store
+                .resolve_mut(&request_region, &input.stack_name)
+                .filter(|stack| stack.is_live())
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_does_not_exist(&input.stack_name),
+                    )
+                })?;
+            // The same preconditions the write block re-asserts, for the same reason: the
+            // read above released the lock, and only one operation may be in flight.
+            if let Some(message) = crate::state::reused_client_request_token(
+                stack,
+                input.client_request_token.as_deref(),
+            ) {
+                return Err(UpdateStackErrorModeled::TokenAlreadyExistsException(
+                    TokenAlreadyExistsException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            if stack.pending.is_some() || !crate::state::status_takes_an_update(&stack.status) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_cannot_be_updated(&stack.stack_id, &stack.status),
+                ));
+            }
+            let client_request_token = input
+                .client_request_token
+                .clone()
+                .unwrap_or_else(crate::state::new_client_request_token);
+            stack.client_request_token = Some(client_request_token.clone());
+            stack.begin_transition(
+                now,
+                status::UPDATE_IN_PROGRESS,
+                status::UPDATE_COMPLETE,
+                Some(operation_id.clone()),
+                Some(client_request_token),
+            );
+            // The resource's own events come before the stack's terminal one, exactly as a
+            // deployment's do: the denial is what the event stream reports about the
+            // protected resource.
+            stack.schedule_resource_events(&denial.transitions());
+            let failed_at = ::std::time::SystemTime::now();
+            // What the STACK reports it failed for is the policy's verdict itself, not the
+            // summary of which resources failed ([`crate::state::resource_failure_summary`],
+            // the sentence an update whose RESOURCES failed reports): nothing was asked of
+            // any resource here — CloudFormation denied the action by the policy in force —
+            // so the denial is the whole account of why the update did not happen, and it is
+            // what a client reading the stack has to act on.
+            let reason = denial.reason();
+            stack.fail_transition(failed_at, status::UPDATE_FAILED, reason.clone());
+            // "Preserve the state of previously provisioned resources when an operation
+            // fails": the request's own `DisableRollback` where it carries one, else the
+            // value in force on the stack — the same reading the deploying path gives that
+            // member, so a denied update and a failed one answer it alike.
+            if !input.disable_rollback.unwrap_or(stack.disable_rollback) {
+                stack.begin_update_rollback(failed_at, reason);
+            }
+            return Ok(UpdateStackOutput {
+                stack_id: Some(stack.stack_id.clone()),
+                operation_id: Some(operation_id),
+            });
+        }
+
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that create or delete the stack's resources run after it, and each of
         // those reaches another service's own handler, which takes that service's lock.

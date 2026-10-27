@@ -19,7 +19,11 @@
 //! * `savingsEstimationMode` = `AfterDiscounts` reports figures net of the
 //!   discounts member accounts' spend carries, so it is available only while
 //!   the organization has made those discounts visible
-//!   (`memberAccountDiscountVisibility` = `All`).
+//!   (`memberAccountDiscountVisibility` = `All`). The rule is about the STATE,
+//!   so it is judged on the record the merge would leave — a request that
+//!   carries only the visibility is refused just the same when the mode already
+//!   stored is the discount-adjusted one, because the pair it would leave is
+//!   the pair the rule forbids.
 //!
 //! Everything else the model declares is the caller's to set, so a request
 //! whose values are inside their modelled enums and that satisfies both rules
@@ -197,18 +201,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(discount_visibility_is_the_management_accounts());
             }
 
-            // Whether the organization's member-account discounts are visible
-            // once this request is applied: the value the request sets if it
-            // sets one (which, past the gate above, is the organization's own),
-            // otherwise the one already in effect.
+            // The discount rule is a property of the STATE, so it is judged on
+            // the pair this request would LEAVE, not on the members it happens
+            // to carry: each half is the value the request sets where it sets
+            // one, and the value already in effect where it does not. A request
+            // that leaves the discount-adjusted mode without visible discounts
+            // is refused whichever of the two members it carries, so the pair
+            // the handler refuses in one request cannot be reached in two.
             let discounts_visible = match input.member_account_discount_visibility.as_deref() {
                 Some(requested) => requested == crate::state::DISCOUNT_VISIBILITY_ALL,
                 None => store.member_account_discounts_visible(),
             };
-            if input.savings_estimation_mode.as_deref() == Some(crate::state::AFTER_DISCOUNTS)
-                && !discounts_visible
-            {
-                return Err(after_discounts_needs_visible_discounts());
+            let resulting_mode = match input.savings_estimation_mode.as_deref() {
+                Some(requested) => requested.to_string(),
+                None => store
+                    .preferences
+                    .get(&account_id)
+                    .map(|stored| stored.effective_savings_estimation_mode().to_string())
+                    .unwrap_or_else(|| {
+                        crate::state::DEFAULT_SAVINGS_ESTIMATION_MODE.to_string()
+                    }),
+            };
+            if resulting_mode == crate::state::AFTER_DISCOUNTS && !discounts_visible {
+                // Attribute the refusal to the member of THIS request that the
+                // rule stops: the mode where the request asks for it, and the
+                // visibility where the request is the one hiding the discounts
+                // the stored mode is net of.
+                return Err(if input.savings_estimation_mode.is_some() {
+                    after_discounts_needs_visible_discounts(
+                        SAVINGS_ESTIMATION_MODE_MEMBER,
+                        "the mode reports figures net of the organization's discounts, which \
+                         are not visible to member accounts",
+                    )
+                } else {
+                    after_discounts_needs_visible_discounts(
+                        DISCOUNT_VISIBILITY_MEMBER,
+                        "hiding the organization's discounts would leave the savings \
+                         estimation mode in effect reporting figures net of discounts the \
+                         member accounts are no longer shown",
+                    )
+                });
             }
 
             let preferences = store.preferences.entry(account_id.clone()).or_default();
@@ -258,7 +290,15 @@ fn discount_visibility_is_the_management_accounts() -> UpdatePreferencesError {
 /// shows them is set — in Cost Optimization Hub, or in the organization's cost
 /// management preferences, which is the other place the same permission is
 /// granted and which the sentence names as well.
-fn after_discounts_needs_visible_discounts() -> UpdatePreferencesError {
+///
+/// One sentence for the one rule, with `field_name` and `field_message` naming
+/// the member of the refused request the rule stops: the mode a request asks
+/// for, or the visibility a request withdraws from under a stored mode that
+/// needs it.
+fn after_discounts_needs_visible_discounts(
+    field_name: &str,
+    field_message: &str,
+) -> UpdatePreferencesError {
     UpdatePreferencesErrorModeled::ValidationException(
         crate::service::stated_validation_exception(
             "Invalid permission to update preferences. To use AfterDiscounts savings \
@@ -267,10 +307,8 @@ fn after_discounts_needs_visible_discounts() -> UpdatePreferencesError {
              discount visibility in Cost Management Preferences."
                 .to_string(),
             vec![ValidationExceptionDetail {
-                field_name: "savingsEstimationMode".to_string(),
-                message: "the mode reports figures net of the organization's discounts, which \
-                          are not visible to member accounts"
-                    .to_string(),
+                field_name: field_name.to_string(),
+                message: field_message.to_string(),
             }],
         ),
     )
@@ -279,3 +317,7 @@ fn after_discounts_needs_visible_discounts() -> UpdatePreferencesError {
 
 /// The input member both organization rules above are attributed to.
 const DISCOUNT_VISIBILITY_MEMBER: &str = "memberAccountDiscountVisibility";
+
+/// The input member the discount rule is attributed to where the request is the
+/// one asking for the discount-adjusted mode.
+const SAVINGS_ESTIMATION_MODE_MEMBER: &str = "savingsEstimationMode";

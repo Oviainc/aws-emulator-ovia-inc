@@ -21,6 +21,8 @@ mod batch_get_jobs;
 mod batch_get_partition;
 #[path = "all/batch_stop_job_run.rs"]
 mod batch_stop_job_run;
+#[path = "all/batch_update_partition.rs"]
+mod batch_update_partition;
 #[path = "all/catalog_encryption.rs"]
 mod catalog_encryption;
 #[path = "all/catalog_identity.rs"]

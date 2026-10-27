@@ -283,16 +283,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`smithy_query(query="shape",shape="ListAutomationEventSummariesRequest")`),
         // enforced by the generated request walk BEFORE this handler runs — so
         // the page size is only defaulted here, never bounded above, exactly as
-        // `ListAutomationEvents` defaults the page over the same events. The
-        // floor is against a zero page, which would return nothing while
-        // carrying a token whose offset never advances.
-        let page_size = usize::try_from(
-            input
-                .max_results
-                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
-        )
-        .unwrap_or(1)
-        .max(1);
+        // `ListAutomationEvents` defaults the page over the same events. One
+        // rule for every paginated listing here, including the floor against a
+        // non-advancing zero page: `crate::state::page_size`.
+        let page_size = crate::state::page_size(input.max_results);
 
         let now = ::std::time::SystemTime::now();
         // Only events created inside the retrieval window are reachable, so the

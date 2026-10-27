@@ -53,16 +53,16 @@ const S3_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=0000";
 
 /// The bucket every staged media object below lives in.
-const BUCKET: &str = "example-media";
+pub(crate) const BUCKET: &str = "example-media";
 
 /// A bucket name no `CreateBucket` below ever creates.
-const ABSENT_BUCKET: &str = "example-media-missing";
+pub(crate) const ABSENT_BUCKET: &str = "example-media-missing";
 
 /// The keys staged in [`BUCKET`]: one at the bucket root and one under a nested prefix,
 /// each named with one of the modelled `MediaFormat` extensions
 /// (`smithy_query(query="shape", shape="MediaFormat")`: amr | flac | m4a | mp3 | mp4 |
 /// ogg | wav | webm), which is what the format of a stored object is read from.
-const STAGED_KEYS: &[&str] = &["dictation.wav", "clinic/visits/consult.flac"];
+pub(crate) const STAGED_KEYS: &[&str] = &["dictation.wav", "clinic/visits/consult.flac"];
 
 /// The bytes every staged object holds. Nothing reads a media file's content — no audio
 /// is transcribed — so one short payload serves every row.
@@ -74,7 +74,7 @@ const MEDIA_BYTES: &[u8] = b"RIFF....WAVEfmt emulator media object";
 ///
 /// Waited out with `std::thread::sleep`: the workspace enables tokio's `macros`, `rt`
 /// and `rt-multi-thread` features only, so `tokio::time::sleep` is not available here.
-const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
+pub(crate) const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
 
 /// The `FailureReason` a job whose declared `MediaFormat` the stored media contradicts
 /// reports, verbatim as the model's own enumeration of that member spells it
@@ -88,7 +88,7 @@ const ROLE_ARN: &str = "arn:aws:iam::111122223333:role/HealthScribeAccess";
 /// One emulator: transcribe and Amazon S3 on a single shared engine behind the
 /// production router — what `build_router` assembles, narrowed to the services under
 /// test.
-fn emulator() -> Arc<MultiServiceRouter> {
+pub(crate) fn emulator() -> Arc<MultiServiceRouter> {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -102,7 +102,7 @@ fn emulator() -> Arc<MultiServiceRouter> {
 }
 
 /// An emulator with transcribe alone: no object store to ask about any media.
-fn emulator_without_the_object_store() -> Arc<MultiServiceRouter> {
+pub(crate) fn emulator_without_the_object_store() -> Arc<MultiServiceRouter> {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -114,7 +114,7 @@ fn emulator_without_the_object_store() -> Arc<MultiServiceRouter> {
 
 /// One transcribe call in the service's own wire envelope (awsJson1_1), signed for
 /// [`REGION`].
-async fn call(emulator: &MultiServiceRouter, operation: &str, input: Value) -> Reply {
+pub(crate) async fn call(emulator: &MultiServiceRouter, operation: &str, input: Value) -> Reply {
     dispatch(emulator, operation, input, Some(REGION)).await
 }
 
@@ -137,7 +137,7 @@ async fn s3(emulator: &MultiServiceRouter, method: &str, path: &str, body: &[u8]
 /// `PUT /<bucket>` — `CreateBucket` — then `PUT /<bucket>/<key>` — `PutObject` — for
 /// every key of [`STAGED_KEYS`], so the object store really holds the media the
 /// accepted rows below name.
-async fn given_staged_media(emulator: &MultiServiceRouter) {
+pub(crate) async fn given_staged_media(emulator: &MultiServiceRouter) {
     let (status, body) = s3(emulator, "PUT", &format!("/{BUCKET}"), &[]).await;
     assert_eq!(
         status,

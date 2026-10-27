@@ -452,7 +452,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing — simulating a call neither performs it nor records it. The lock is
         // held only for the collection, so nothing else waits on it while the
         // decisions below are made.
-        let (documents, sources): (Vec<String>, Vec<String>) = {
+        let (documents, sources, attached_boundary): (Vec<String>, Vec<String>, Option<String>) = {
             let store = state.lock();
             let Some(carried) = store.principal_sourced_policies(&input.policy_source_arn) else {
                 return Err(SimulatePrincipalPolicyErrorModeled::NoSuchEntityException(
@@ -492,7 +492,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ones. Each is collected BESIDE the identifier the response names it by, so
             // a decision reached from a document can be attributed to that document
             // ([`source_policy_id`]).
-            kept.into_iter()
+            // The ceiling the entity actually carries, read only when the request
+            // supplied none of its own (see below).
+            let attached_boundary = boundary
+                .is_empty()
+                .then(|| store.permissions_boundary_document(&input.policy_source_arn))
+                .flatten();
+            let (documents, sources) = kept
+                .into_iter()
                 .filter_map(|policy| {
                     let crate::state::SourcedPolicy { source, document } = policy;
                     document.map(|document| (document, source_policy_id(&source)))
@@ -500,7 +507,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .chain(supplied.into_iter().enumerate().map(|(at, document)| {
                     (document, format!("{SUPPLIED_POLICY_ID}.{}", at + 1))
                 }))
-                .unzip()
+                .unzip();
+            (documents, sources, attached_boundary)
+        };
+        // "An IAM entity can only have one permissions boundary in effect at a time …
+        // if a permissions boundary is attached to an entity and you pass in a different
+        // permissions boundary policy using this parameter, then the new permissions
+        // boundary policy is used for the simulation"
+        // (`SimulatePrincipalPolicy$PermissionsBoundaryPolicyInputList`): a request that
+        // supplies one simulates THAT boundary, and one that supplies none simulates the
+        // boundary in force on the entity, since that is the ceiling its permissions
+        // actually have. A boundary whose document is not held caps nothing, the same
+        // reading this service's authorizer takes of it.
+        let boundary = match attached_boundary {
+            Some(document) => vec![document],
+            None => boundary,
         };
 
         // "Whenever a context key is evaluated in one of the simulated IAM permissions
@@ -825,9 +846,10 @@ struct Simulated<'a> {
     /// How the response names each of those documents, one per entry of
     /// [`Self::documents`] ([`source_policy_id`]).
     sources: &'a [String],
-    /// The simulated permissions boundary's documents.
+    /// The simulated permissions boundary's documents: the one the request supplied, or
+    /// the one in force on the simulated entity when it supplied none.
     boundary: &'a [::service_common::iam_authorization::PreparedDocument],
-    /// Whether the request simulated no permissions boundary at all.
+    /// Whether no permissions boundary took part in the simulation at all.
     no_boundary: bool,
     /// The resource-based policy the request supplied, when it supplied one.
     resource_policy: Option<&'a ::service_common::iam_authorization::PreparedDocument>,
@@ -1020,9 +1042,9 @@ fn restrictiveness(decision: &str) -> u8 {
 ///
 /// Aggregated the way the decision beside it is: the boundary allowed the action only
 /// where it allowed it on EVERY resource the request asked about, since one resource the
-/// boundary withheld is a resource the entity may not act on. Absent when the request
-/// simulated no permissions boundary at all, which is when no resource carries the detail
-/// either.
+/// boundary withheld is a resource the entity may not act on. Absent when no permissions
+/// boundary took part in the simulation at all, which is when no resource carries the
+/// detail either.
 fn boundary_detail(
     per_resource: &[ResourceSpecificResult],
 ) -> Option<PermissionsBoundaryDecisionDetail> {

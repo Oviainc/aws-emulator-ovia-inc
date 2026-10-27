@@ -55,6 +55,8 @@ mod member_account_association_gate;
 mod member_account_initiation_gate;
 #[path = "all/not_found_wording.rs"]
 mod not_found_wording;
+#[path = "all/page_size_rule.rs"]
+mod page_size_rule;
 #[path = "all/page_token_refusals.rs"]
 mod page_token_refusals;
 #[path = "all/preview_selection_guard.rs"]

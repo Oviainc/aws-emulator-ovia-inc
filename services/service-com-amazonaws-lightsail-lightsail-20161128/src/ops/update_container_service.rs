@@ -311,7 +311,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // deployment back, so nothing here retires one.
                 let settles_into = if service.is_disabled {
                     crate::state::CONTAINER_SERVICE_DISABLED
-                } else if service.current_deployment.is_some() || service.next_deployment.is_some() {
+                } else if service.current_deployment().is_some()
+                    || service.next_deployment().is_some()
+                {
                     crate::state::CONTAINER_SERVICE_RUNNING
                 } else {
                     crate::state::CONTAINER_SERVICE_READY
@@ -330,7 +332,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // one as the service starts serving again; a service being
                     // disabled activates nothing.
                     activates_next_deployment: !service.is_disabled
-                        && service.next_deployment.is_some(),
+                        && service.next_deployment().is_some(),
                 });
             }
 

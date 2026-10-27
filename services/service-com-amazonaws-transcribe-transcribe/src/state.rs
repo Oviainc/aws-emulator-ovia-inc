@@ -3732,12 +3732,27 @@ fn media_object_address(uri: &str) -> Option<(&str, &str)> {
     (!bucket.is_empty() && !key.is_empty()).then_some((bucket, key))
 }
 
+/// Whether `uri` is of the Amazon S3 scheme and yet addresses NO object of it
+/// ([`media_object_address`]): `s3://` with no bucket, or a bucket with no key under it.
+///
+/// Such a URI needs no object store to judge: the media member is "The Amazon S3
+/// location of the media file you want to transcribe", and every example of it names a
+/// bucket AND a key (`s3://DOC-EXAMPLE-BUCKET/my-media-file.flac`), so an `s3://` URI
+/// carrying no key addresses a bucket rather than a media file and names no object the
+/// service could ever read — unlike the `http(s)://` form, which addresses a host this
+/// emulator cannot resolve and so leaves the media simply unknown.
+fn s3_uri_addresses_no_object(uri: &str) -> bool {
+    uri.trim().starts_with("s3://") && media_object_address(uri).is_none()
+}
+
 /// What asking this emulator's own Amazon S3 about the media a start request named
 /// established.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaVerdict {
-    /// Amazon S3 reports that an object the request named is not there: the start is
-    /// refused and nothing is stored.
+    /// No object of the object store answers for the media the request named — either
+    /// Amazon S3 reports that an object it named is not there, or the URI is of the S3
+    /// scheme and addresses no object of it at all
+    /// ([`s3_uri_addresses_no_object`]): the start is refused and nothing is stored.
     NoSuchObject,
     /// Every object the request addressed resolved, so the service has seen the stored
     /// media it is to process.
@@ -3807,7 +3822,9 @@ fn object_is_absent(
 /// The verdict is read from S3's own absent-object answer and never from an HTTP status
 /// alone ([`object_is_absent`]): with no S3 to ask (a router with only this service
 /// mounted, say) nothing is known about the media, so the start is accepted — a refusal
-/// has to be grounded in what the object store answered, never assumed.
+/// has to be grounded in what the object store answered, never assumed. The one refusal
+/// that needs no answer is a URI of the S3 scheme that addresses no object of it
+/// ([`s3_uri_addresses_no_object`]): it names no media file for any store to hold.
 ///
 /// The read is a `HeadObject`, "the same options as a GET operation on an object"
 /// without its body: what a start has to establish is that the media it was pointed at
@@ -3827,6 +3844,12 @@ pub async fn resolve_media_objects(
     let mut resolved = 0usize;
     for uri in uris {
         let Some((bucket, key)) = media_object_address(uri) else {
+            // A URI of the S3 scheme that addresses no object of it names no media file
+            // at all ([`s3_uri_addresses_no_object`]), so the start is refused without
+            // asking the store: there is no object for it to answer about.
+            if s3_uri_addresses_no_object(uri) {
+                return MediaVerdict::NoSuchObject;
+            }
             continue;
         };
         asked += 1;

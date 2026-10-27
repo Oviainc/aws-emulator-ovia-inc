@@ -3254,7 +3254,8 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::materialize_due_transitions`]. Nothing in this service's implemented surface
     /// puts a volume IN the bin: a deleted resource is retained only when a Recycle Bin
     /// retention rule covers it, retention rules are the `rbin` service's resources, and
-    /// `DeleteVolume` — still a scaffold — is the operation that will consult one.
+    /// `DeleteVolume` — which has no rule of its own to find, so it deletes permanently — is
+    /// the operation that will consult one.
     pub volumes_in_recycle_bin: BTreeMap<String, RecycledVolumeRecord>,
     /// Every AMI usage report the account holds, by `ReportId`, as the modelled
     /// [`ImageUsageReport`] shape the describe reports. `CreateImageUsageReport` is the

@@ -365,10 +365,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // A load balancer's network interfaces live in the subnets it is placed in, and
+        // each of them belongs to exactly one VPC: a placement spanning two VPCs is a
+        // configuration no load balancer can hold, so it is refused rather than created.
+        // The ONE reading of that rule, which `SetSubnets` applies to the subnets that
+        // REPLACE these, so one call cannot place a load balancer where the other would
+        // not.
+        if let Err(rule) = crate::state::check_subnet_vpcs(
+            // A load balancer being created is in no VPC yet, so the VPC the placement
+            // has to agree on is the one of the first subnet the request names.
+            None,
+            &requested_subnets,
+            resolved_subnets.as_deref(),
+        ) {
+            return Err(invalid_configuration(&rule));
+        }
         // "Every DescribeLoadBalancers entry carries the VpcId the load balancer's
         // subnets belong to": the VPC of the subnets it was created in, reported only
         // when the subnets agree on one — which is the only case AWS creates at all.
-        let vpc_id = load_balancer_vpc(resolved_subnets.as_deref());
+        let vpc_id = crate::state::subnets_vpc(resolved_subnets.as_deref());
         if let Some(vpc_id) = vpc_id.as_deref() {
             if let Some(refusal) = foreign_security_group(
                 ctx,
@@ -519,19 +534,6 @@ fn tag_map(
         }
     }
     Ok(map)
-}
-
-/// The VPC a load balancer in these subnets is in: the one every subnet EC2 reported
-/// belongs to.
-///
-/// A load balancer's subnets are all in one VPC — AWS creates no other kind — so subnets
-/// that do not agree on one, or that EC2 could not be asked about, resolve no VPC and the
-/// member is left unreported rather than guessed from the first of them.
-fn load_balancer_vpc(subnets: Option<&[crate::state::network::SubnetFacts]>) -> Option<String> {
-    let subnets = subnets?;
-    let mut vpcs = subnets.iter().filter_map(|subnet| subnet.vpc_id.as_deref());
-    let first = vpcs.next()?;
-    vpcs.all(|vpc| vpc == first).then(|| first.to_string())
 }
 
 /// The refusal a request whose security groups are not the VPC's earns, or `None` when

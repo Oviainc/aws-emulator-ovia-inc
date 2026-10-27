@@ -363,6 +363,27 @@ async fn an_omitted_name_lists_the_signing_users_keys() {
 
     for Case { stored_name, .. } in CASES {
         let minted = with_user_holding(&router, stored_name, MAX_ACCESS_KEYS_PER_USER).await;
+        // IAM authorizes its own API, so the signing user needs the grant AWS requires
+        // for this read before it can make it; what this suite is about is which user a
+        // nameless request resolves to, not the decision
+        // (`tests/all/identity_policy_enforcement.rs` owns that).
+        let (status, put) = call(
+            &router,
+            "PutUserPolicy",
+            &[
+                ("UserName", stored_name),
+                ("PolicyName", "allow-listaccesskeys"),
+                (
+                    "PolicyDocument",
+                    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:ListAccessKeys","Resource":"*"}]}"#,
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {stored_name:?}: the fixture PutUserPolicy must succeed, got {status}: {put}"
+        );
 
         // Every key the user holds is a credential the request may be signed by, and
         // each resolves to the same user and so to the same listing.

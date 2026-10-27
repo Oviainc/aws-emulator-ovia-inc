@@ -1809,7 +1809,11 @@ pub struct ParticipantRecord {
     pub recording_state: String,
     /// Whether the publisher reached the stage over redundant ingest.
     pub redundant_ingest: bool,
-    /// The ingest configuration the publisher broadcast with, when it used one.
+    /// The ingest configuration the join NAMED, when it named one. `None` leaves
+    /// [`participant_ingest_configuration`] to resolve the configuration whose ingest
+    /// credentials were minted for this participant, which is what the reported
+    /// `ingestConfigurationArn` ([`participant_ingest_configuration_arn`]) and `protocol`
+    /// ([`participant_protocol`]) are both read from.
     pub ingest_configuration_arn: Option<String>,
     /// What the stage's data plane observed about the joining client. No member of
     /// `ParticipantSummary` reports any of it; `Participant`'s client members do, which
@@ -2051,6 +2055,27 @@ pub fn participant_ingest_configuration<'a>(
         .min_by_key(|configuration| configuration.sequence)
 }
 
+/// The ARN `Participant$ingestConfigurationArn` reports for the participant `record` of
+/// `stage_arn` — "the participant's ingest configuration" — or `None` when it broadcasts
+/// with none.
+///
+/// Read off the configuration [`participant_ingest_configuration`] resolves, the one
+/// answer to "which configuration does this participant broadcast with", rather than off
+/// the join's own member: a publisher that reached the stage on a configuration's ingest
+/// credential named no ARN when it joined, yet broadcasts with that configuration — which
+/// is what the read in the other direction ([`ingest_configuration_publishers`]) reports
+/// of it. So the ARN a participant reports and the protocol it reports
+/// ([`participant_protocol`]) name ONE configuration, and neither contradicts what a read
+/// of that configuration says about its publishers.
+pub fn participant_ingest_configuration_arn(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    record: &ParticipantRecord,
+) -> Option<String> {
+    participant_ingest_configuration(state, stage_arn, record)
+        .map(|configuration| configuration.arn.clone())
+}
+
 /// The `ParticipantProtocol` the participant `record` of `stage_arn` broadcasts with.
 ///
 /// `Participant$protocol` is the "type of ingest protocol that the participant employs
@@ -2079,8 +2104,16 @@ impl ParticipantRecord {
     /// `replication` is what the replications this store holds say about this participant
     /// of this session ([`session_participant_replications`]): the four replication members are a
     /// fact about a replication, not about the join that recorded this participant, so
-    /// they are reported from the replication itself on every read.
-    pub fn to_summary(&self, replication: &ParticipantReplication) -> ParticipantSummary {
+    /// they are reported from the replication itself on every read. `ingestConfigurationArn`
+    /// is likewise a fact about the configurations `store` holds for `stage_arn`
+    /// ([`participant_ingest_configuration_arn`]), computed on every read exactly as the
+    /// full [`Self::to_participant`] computes it.
+    pub fn to_summary(
+        &self,
+        store: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+        stage_arn: &str,
+        replication: &ParticipantReplication,
+    ) -> ParticipantSummary {
         ParticipantSummary {
             participant_id: Some(self.participant_id.clone()),
             // Reported only when the token named one: the member is optional, and an
@@ -2096,7 +2129,9 @@ impl ParticipantRecord {
             source_stage_arn: replication.source_stage_arn.clone(),
             source_session_id: replication.source_session_id.clone(),
             redundant_ingest: self.redundant_ingest,
-            ingest_configuration_arn: self.ingest_configuration_arn.clone(),
+            ingest_configuration_arn: participant_ingest_configuration_arn(
+                store, stage_arn, self,
+            ),
         }
     }
 
@@ -2109,9 +2144,10 @@ impl ParticipantRecord {
     /// from the same record — the attributes the join supplied and what it observed about
     /// the client — except the two that are not stored values but facts about the stage
     /// right now: where the participant's media is being recorded
-    /// ([`participant_recording_location`]) and the protocol it broadcasts with
-    /// ([`participant_protocol`]), both computed on every read — and the four replication
-    /// members, read off the replications the store holds
+    /// ([`participant_recording_location`]), the ingest configuration it broadcasts with
+    /// ([`participant_ingest_configuration_arn`]) and the protocol that configuration
+    /// ingests ([`participant_protocol`]), each computed on every read — and the four
+    /// replication members, read off the replications the store holds
     /// ([`session_participant_replications`]) exactly as a summary's are.
     pub fn to_participant(
         &self,
@@ -2151,7 +2187,9 @@ impl ParticipantRecord {
             source_stage_arn: replication.source_stage_arn,
             source_session_id: replication.source_session_id,
             redundant_ingest: self.redundant_ingest,
-            ingest_configuration_arn: self.ingest_configuration_arn.clone(),
+            ingest_configuration_arn: participant_ingest_configuration_arn(
+                store, stage_arn, self,
+            ),
         }
     }
 }

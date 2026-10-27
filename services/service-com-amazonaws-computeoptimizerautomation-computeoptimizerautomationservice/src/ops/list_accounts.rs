@@ -188,17 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The model bounds this operation's `maxResults` at 1..=1000, so a
-        // caller that sends none gets `crate::state::DEFAULT_MAX_RESULTS`.
-        // Clamped to at least one here as well: a zero page would return nothing
-        // while still carrying a token whose offset never advances, so a walk
-        // would never terminate.
-        let page_size = usize::try_from(
-            input
-                .max_results
-                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
-        )
-        .unwrap_or(1)
-        .max(1);
+        // caller may ask for a page larger than the default this service serves
+        // a request that names none. One rule for every paginated listing here,
+        // including the floor against a non-advancing zero page:
+        // `crate::state::page_size`.
+        let page_size = crate::state::page_size(input.max_results);
 
         let at = crate::state::now();
         let guard = state.lock();
