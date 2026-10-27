@@ -1730,6 +1730,30 @@ pub fn tenant_already_authorized(app: &str) -> ValidationException {
     )
 }
 
+/// A modelled `ValidationException` refusing a call that would leave the
+/// ingestion ASSOCIATED with an app authorization — the one the bundle holds for
+/// that authorization's (application, tenant) pair, see
+/// [`AppBundleRecord::ingestion_for`] — without an app authorization at all.
+///
+/// The precondition is the one `DeleteAppAuthorization` documents ("You must
+/// delete the associated ingestion before you can delete an app authorization"),
+/// and it binds every call that would break the association rather than only the
+/// delete: an ingestion exists only for a pair whose authorization has completed
+/// the connect handshake, so a call that removes the authorization from the pair
+/// — by deleting it or by re-pointing it at another tenant — has to find the
+/// ingestion gone first. `action` is what the refused call would have done to the
+/// authorization, so the one precondition is worded once for every caller.
+pub fn associated_ingestion_still_held(
+    authorization_arn: &str,
+    ingestion_arn: &str,
+    action: &str,
+) -> ValidationException {
+    precondition_not_met(format!(
+        "App authorization {authorization_arn} is associated with ingestion {ingestion_arn}; \
+         you must delete the associated ingestion before you can {action} an app authorization."
+    ))
+}
+
 /// A modelled `ResourceNotFoundException` for a tagging call whose `resourceArn`
 /// names no resource this store holds.
 ///

@@ -130,7 +130,10 @@ async fn held_status(emulator: &Emulator, bundle: &str, authorization: &str, cas
 /// How an ingestion's app-authorization dependency stops holding AFTER the
 /// ingestion was created. Every row is reachable with modelled calls alone:
 /// `UpdateAppAuthorization` applies a change whenever it is given a `credential`
-/// or a `tenant`, and an applied update invalidates the connect handshake.
+/// or a `tenant`, and an applied update invalidates the connect handshake. What
+/// no modelled call reaches is the pair losing its authorization ALTOGETHER:
+/// while the bundle holds the ingestion, both the delete and a tenant move are
+/// refused by the precondition `DeleteAppAuthorization` documents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Broken {
     /// The credential is rotated, which re-pends the handshake.
@@ -138,9 +141,6 @@ enum Broken {
     /// Only the tenant's DISPLAY name changes — still an applied update, so the
     /// handshake is re-pended for the same (app, tenant) pair.
     TenantDisplayNameChanged,
-    /// The authorization moves to another tenant, so the ingestion's pair is
-    /// left with no authorization at all.
-    TenantMovedAway,
 }
 
 impl Broken {
@@ -154,17 +154,7 @@ impl Broken {
                 "tenantIdentifier": tenant,
                 "tenantDisplayName": format!("{tenant} renamed"),
             }}),
-            Self::TenantMovedAway => json!({"tenant": {
-                "tenantIdentifier": format!("{tenant}-moved"),
-                "tenantDisplayName": format!("{tenant} moved"),
-            }}),
         }
-    }
-
-    /// Whether the ingestion's own (app, tenant) pair still has an
-    /// authorization at all after the break.
-    fn pair_still_authorized(self) -> bool {
-        self != Self::TenantMovedAway
     }
 }
 
@@ -175,9 +165,9 @@ impl Broken {
 /// `ValidationException` (HTTP 400), and no second ingestion is ever written.
 ///
 /// The table spans every way an applied `UpdateAppAuthorization` can stop the
-/// dependency from holding (credential rotated, tenant display name changed,
-/// tenant moved away so the pair has no authorization at all), over applications
-/// and tenants the issue did not cite and over a body with and without `tags`.
+/// dependency from holding (credential rotated, tenant display name changed),
+/// over applications and tenants the issue did not cite and over a body with and
+/// without `tags`.
 #[tokio::test]
 async fn a_spent_token_replays_its_ingestion_after_the_dependency_stops_holding() {
     // (case, app, tenant, tags, how the dependency is broken)
@@ -204,18 +194,18 @@ async fn a_spent_token_replays_its_ingestion_after_the_dependency_stops_holding(
             Broken::TenantDisplayNameChanged,
         ),
         (
-            "tenant moved away, one tag",
+            "tenant display name changed, one tag",
             "CISCO",
             "tenant-cisco",
             json!([{"key": "only", "value": "one"}]),
-            Broken::TenantMovedAway,
+            Broken::TenantDisplayNameChanged,
         ),
         (
-            "tenant moved away, no tags",
+            "credential rotated, another application",
             "GOOGLE",
             "tenant-google",
             Value::Null,
-            Broken::TenantMovedAway,
+            Broken::CredentialRotated,
         ),
     ];
 
@@ -294,10 +284,9 @@ async fn a_spent_token_replays_its_ingestion_after_the_dependency_stops_holding(
         let refusal_message = member(&refused.body, "message");
         assert!(
             refusal_message.contains(app)
-                && (refusal_message.contains(APP_AUTHORIZATION_STATUS_PENDING_CONNECT)
-                    == broken.pair_still_authorized()),
-            "case {case:?}: the refusal must name the app and the held status only when the pair \
-             still has an authorization, got {refusal_message:?}"
+                && refusal_message.contains(APP_AUTHORIZATION_STATUS_PENDING_CONNECT),
+            "case {case:?}: the refusal must name the app and the status the pair's authorization \
+             now holds, got {refusal_message:?}"
         );
 
         // The retry, however often it comes, replays the ingestion the first
