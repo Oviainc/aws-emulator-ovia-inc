@@ -14,11 +14,11 @@
 //! `GetUserPolicy`): a URL-decoding client reads plain JSON unchanged, since RFC 3986
 //! only escapes characters an IAM policy document need not carry.
 //!
-//! An `arn:aws:iam::aws:policy/` ARN whose catalog entry this emulator does not carry
-//! answers 501 rather than `NoSuchEntityException`, for the reason `crate::ops::get_policy`
-//! states: the policy is AWS's, and the emulator carries a subset of AWS's catalog.
-//! `NoSuchEntityException` is reserved for a policy the account does not hold, and for a
-//! version the resolved policy does not carry.
+//! An ARN this service resolves no policy under — the account holds none under it, and
+//! AWS's catalog as this emulator carries it has no entry for it — is refused with
+//! `NoSuchEntityException`, the refusal this operation models, for the reason
+//! `crate::ops::get_policy` states. The same refusal answers a version the resolved
+//! policy does not carry.
 //!
 //! ## Shape of an operation
 //!
@@ -200,11 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policies are served from the catalog beside the account's.
         let store = state.lock();
         let Some(resolved) = store.resolve_policy(&input.policy_arn) else {
-            if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
-                return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                    crate::state::uncarried_aws_managed_policy(&input.policy_arn, "document"),
-                ));
-            }
+            // An ARN this service can resolve no policy under "referenced a resource
+            // entity that does not exist" — the refusal this operation models for a
+            // policy it cannot report, whichever namespace the ARN is in, since a code
+            // outside its modelled set is one no SDK has a branch for.
             return Err(GetPolicyVersionErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(crate::state::policy_not_found(&input.policy_arn)),

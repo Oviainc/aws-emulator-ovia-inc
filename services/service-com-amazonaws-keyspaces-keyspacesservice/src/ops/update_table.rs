@@ -575,14 +575,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `crate::state::validate_schema` enforces on a create. A name the table
                 // already has, or one this request repeats, is refused naming the member the
                 // caller has to fix — the alternative would be a schema with two columns of
-                // one name.
-                let mut declared: ::std::collections::BTreeSet<&str> = schema
+                // one name. Which column a name addresses is its identifier identity and not
+                // its spelling (`crate::state::identifier_identity`), so another casing of an
+                // unquoted name the schema already declares is that same column.
+                let mut declared: ::std::collections::BTreeSet<String> = schema
                     .all_columns
                     .iter()
-                    .map(|column| column.name.as_str())
+                    .map(|column| crate::state::identifier_identity(&column.name))
                     .collect();
                 for column in &added {
-                    if !declared.insert(column.name.as_str()) {
+                    if !declared.insert(crate::state::identifier_identity(&column.name)) {
                         return Err(invalid(format!(
                             "addColumns names column '{}', which the table's schema already declares",
                             column.name

@@ -409,10 +409,10 @@ async fn a_next_token_this_listing_did_not_mint_is_refused() {
     }
 }
 
-/// RULE: the configuration is named by ARN, so a value that is not an MSK
-/// configuration ARN is a bad request (400), and a well-formed one this
-/// endpoint's region holds no configuration for is not found (404) — never an
-/// empty page.
+/// RULE: the configuration is named by ARN, so an `Arn` that resolves to no
+/// configuration of this endpoint's region is refused HTTP 400
+/// `BadRequestException` — whether it is not an MSK configuration ARN at all or
+/// a well-formed one nothing holds — never an empty page.
 #[tokio::test]
 async fn an_unknown_or_malformed_arn_is_refused() {
     let emulator = Emulator::new();
@@ -440,8 +440,8 @@ async fn an_unknown_or_malformed_arn_is_refused() {
         ),
         (
             "arn:aws:kafka:us-west-2:000000000000:configuration/absent/0e7b1f9a-1",
-            404,
-            "NotFoundException",
+            400,
+            "BadRequestException",
         ),
     ];
     for (candidate, status, code) in &candidates {
@@ -460,7 +460,7 @@ async fn an_unknown_or_malformed_arn_is_refused() {
     let elsewhere = list_in(&emulator, "eu-central-1", &arn, "").await;
     assert_eq!(
         (elsewhere.status, elsewhere.error_code()),
-        (404, "NotFoundException"),
+        (400, "BadRequestException"),
         "case region=eu-central-1: another region's endpoint must not list its revisions, \
          got {} {}",
         elsewhere.status,

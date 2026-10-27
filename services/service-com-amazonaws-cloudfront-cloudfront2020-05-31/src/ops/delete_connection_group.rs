@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConnectionGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConnectionGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConnectionGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a stored connection group under its version token: the record a later read
+//! answered from is REMOVED, so neither the id, the name, the ARN nor the routing endpoint
+//! resolves to a group afterwards and the name is free for another create to claim. A group
+//! that is still enabled is refused with `ResourceNotDisabled`, and one a stored
+//! distribution tenant is still routed through with `CannotDeleteEntityWhileInUse`; each
+//! refusal leaves the group exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +69,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -169,18 +171,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConnectionGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConnectionGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConnectionGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this
+        // call reads it: the version token this delete matches against, and what the stored
+        // tenants route through, are read as they stand at this instant.
+        store.settle(SystemTime::now());
+
+        // "The ID of the connection group to delete": the id is the store's key, so an id
+        // no stored group carries names no entity to delete — and that refusal comes first,
+        // because a precondition can only be checked against a stored version.
+        let Some((current_etag, enabled)) = store
+            .connection_groups
+            .get(&input.id)
+            .map(|stored| (stored.etag.clone(), stored.enabled))
+        else {
+            return Err(DeleteConnectionGroupErrorModeled::EntityNotFound(
+                crate::state::connection_group_not_found(),
+            )
+            .into());
+        };
+
+        // "The value of the ETag header that you received when retrieving the connection
+        // group to delete": the precondition is evaluated first, the way HTTP evaluates
+        // one, so a caller holding a version that is no longer current is told that before
+        // anything about the group's own state. A token that is no version token at all is
+        // "missing or not valid", and a well-formed token that is not the current one is a
+        // failed precondition.
+        match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(DeleteConnectionGroupErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(DeleteConnectionGroupErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // A group that still carries `Enabled` is one "the specified CloudFront resource
+        // hasn't been disabled yet" is about: the caller turns it off with an update first,
+        // and until then the group stays readable exactly as it was.
+        if enabled {
+            return Err(DeleteConnectionGroupErrorModeled::ResourceNotDisabled(
+                crate::state::resource_not_disabled(),
+            )
+            .into());
+        }
+
+        // A group a distribution tenant is still routed through is in use, so the delete is
+        // refused and the group stays readable: the attachment names the group by the id its
+        // own create minted, so the question is answered against the stored tenants.
+        if store.connection_group_is_associated(&input.id) {
+            return Err(
+                DeleteConnectionGroupErrorModeled::CannotDeleteEntityWhileInUse(
+                    crate::state::entity_in_use(),
+                )
+                .into(),
+            );
+        }
+
+        // Gone means gone: the record every read answered from is removed — with the tags
+        // and the routing endpoint it carried, which were held on it — so neither the id,
+        // the ARN, the name nor the routing endpoint resolves to a group afterwards, and a
+        // later create may claim that name again.
+        store.connection_groups.remove(&input.id);
+
+        Ok(DeleteConnectionGroupOutput)
     }
 }
