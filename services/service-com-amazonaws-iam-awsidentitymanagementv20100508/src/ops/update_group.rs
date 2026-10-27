@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Renames and/or re-paths the stored group the request names: the SAME group keeps the
+//! id and create date its create minted, carries the name and path the request leaves it
+//! under, and takes the ARN those two spell — and every record this service keys by the
+//! group's name (its memberships, its embedded policies, its policy attachments) follows
+//! the rename with it.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +179,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateGroupErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A mutation: it "updates the name and/or the path of the specified IAM group",
+        // so the lock is held for write across the lookup, the uniqueness check and the
+        // re-keying.
+        let mut store = state.lock();
+
+        // IAM entity names "are not distinguished by case", so the group is found under
+        // the case-folded name whatever case the request spelled it in — the key
+        // `CreateGroup` stored it under.
+        let key = crate::state::name_key(&input.group_name);
+
+        // The group the request addresses, if the account holds one. The LOOKUP comes
+        // first but the answer to it is withheld until the call has been authorized,
+        // because IAM decides a call against the caller's policies before it reads the
+        // resource.
+        let held = store.groups.get(&key).cloned();
+
+        // "Only include this if changing the group's name" / "the group's path": an
+        // absent member leaves that half of the group's identity as the account HOLDS it,
+        // down to the case the stored name is spelled in — the request's own spelling of
+        // the addressed name identifies the group, it does not re-spell it — so a request
+        // naming neither member leaves the group exactly as it was.
+        let new_group_name: String = match (&input.new_group_name, &held) {
+            (Some(new_group_name), _) => new_group_name.clone(),
+            (None, Some(group)) => group.group_name.clone(),
+            (None, None) => input.group_name.clone(),
+        };
+        let new_path: String = match (&input.new_path, &held) {
+            (Some(new_path), _) => new_path.clone(),
+            (None, Some(group)) => group.path.clone(),
+            (None, None) => crate::state::DEFAULT_PATH.to_string(),
+        };
+
+        // IAM authorizes its own API, and this call is decided against BOTH names: the
+        // principal "must have permission to change the group with the old name and the
+        // new name", so a caller allowed to change only one of the two is refused —
+        // before the store changes and before the lookup's answer is given away. Each
+        // decision is made on the ARN the group carries under that name: the held group's
+        // own ARN, and the one the update would leave it under; for a name the account
+        // holds no group under, that is the ARN the name would carry at the default path,
+        // since there is no other path to attribute it to. A refusal names the group as
+        // the request named it (`group Admins`) rather than by ARN.
+        let addressed = held.as_ref().map_or_else(
+            || crate::state::group_arn(crate::state::DEFAULT_PATH, &input.group_name),
+            |group| group.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::UPDATE_GROUP,
+            &addressed,
+            &format!("group {}", input.group_name),
+        )?;
+        let requested = crate::state::group_arn(&new_path, &new_group_name);
+        if requested != addressed {
+            crate::state::authorization::authorize_named(
+                &store,
+                ctx,
+                crate::state::authorization::UPDATE_GROUP,
+                &requested,
+                &format!("group {new_group_name}"),
+            )?;
+        }
+
+        // Only a group the account holds can be updated: a name it holds none under
+        // names no group, which is the modelled client error this operation declares.
+        let Some(mut group) = held else {
+            return Err(UpdateGroupErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The group with name {} cannot be found.",
+                        input.group_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "IAM user, group, role, and policy names must be unique within the account"
+        // and "names are not distinguished by case", so the case-folded name is the
+        // identity a rename competes for: a new name ANOTHER group is already held under
+        // is refused rather than merging the two, while a new name that folds to this
+        // group's own key only re-spells the group's own name and is applied to it.
+        let new_key = crate::state::name_key(&new_group_name);
+        let renamed = new_key != key;
+        if renamed && store.groups.contains_key(&new_key) {
+            return Err(UpdateGroupErrorModeled::EntityAlreadyExistsException(
+                EntityAlreadyExistsException {
+                    message: Some(format!("Group with name {new_group_name} already exists.")),
+                },
+            )
+            .into());
+        }
+
+        // The same group under the name and path it now carries: the id and the create
+        // date are what identify the group over its lifetime and are NOT reminted, while
+        // the ARN is spelled from the path and the name the group carries from here on.
+        group.group_name = new_group_name;
+        group.path = new_path;
+        group.arn = requested;
+
+        if renamed {
+            // Everything this service keys by the group's name belongs to the GROUP, not
+            // to the name it used to carry, so it moves with the rename: the group's
+            // members stay its members, its embedded policies stay embedded in it and its
+            // attachments stay attached to it. Left behind, each would read as belonging
+            // to a group the account no longer holds — and would reappear under a later
+            // group created with the old name.
+            store.groups.remove(&key);
+            if let Some(members) = store.group_members.remove(&key) {
+                store.group_members.insert(new_key.clone(), members);
+            }
+            if let Some(policies) = store.group_inline_policies.remove(&key) {
+                store.group_inline_policies.insert(new_key.clone(), policies);
+            }
+            if let Some(attached) = store.group_attached_policies.remove(&key) {
+                store
+                    .group_attached_policies
+                    .insert(new_key.clone(), attached);
+            }
+        }
+        let group_name = group.group_name.clone();
+        store.groups.insert(new_key, group);
+
+        // Audit record for the change: the acting principal, the operation and the group
+        // it left behind, so a state-changing call leaves a local record.
+        ::tracing::info!(
+            audit = true,
+            operation = "UpdateGroup",
+            outcome = "updated",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            group_name = %group_name,
+            "a group was updated"
+        );
+        Ok(UpdateGroupOutput)
     }
 }

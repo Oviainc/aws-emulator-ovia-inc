@@ -11,6 +11,33 @@ Issue-Commit: 6d436f6d30cd83c53e890485fd5b45dc369d520d
 
 > _Note: this issue was identified against the code base at commit `6d436f6d30cd83c53e890485fd5b45dc369d520d`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+Cause 2 (the `PutCompositeAlarm` `AlarmRule` parse message) is FIXED: the refusal now carries
+CloudWatch's own parse diagnosis, with the offending token and its character offset read off
+the submitted rule. Its check
+(`cloudwatch.composite-alarm-rule-cycle-and-unknown-child-rejected`) replays green.
+
+Cause 1 (the forced transition's action dispatch and its `ActionsEnabled` gate) is DECLINED:
+the behaviour it asks for is implemented — `src/ops/set_alarm_state.rs` enqueues the
+notification a state change owes and settles it, and `src/state/alarm_actions.rs` selects the
+action list by the state moved to, withholds it while `ActionsEnabled` is false, decides the
+target topic's policy and publishes — and no defect was found anywhere in that chain. It is
+pinned instead by passing tests at three levels: the crate's
+`tests/all/forced_state_actions.rs` and `tests/all/alarm_action_dispatch.rs`, the new
+`tests/all/standing_alarm_suppression.rs` (the same differential over an alarm whose own
+evaluation clock has run between the legs), and the new
+`core/router/tests/all/cloudwatch_alarm_action_reaches_its_subscribed_queue.rs`, which drives
+the recorded wiring through the WHOLE mounted service set.
+
+Its check (`cloudwatch.alarm-actions-disabled-suppresses-state-triggered-action`) still
+reports `Check timed out after 60.0s` on replay, so the cause is recorded here as declined
+rather than fixed. What that timeout is NOT: this issue's other check replays green through
+the same harness, and the SNS→SQS delivery leg demonstrably reaches a subscribed queue in the
+booted emulator (see `20261025T064350Z-sns-9-behavioral-divergences-…`, whose check reads the
+delivered envelope and fails only on its missing signature members). A later attempt should
+start from that, not from the dispatch path.
+
 ## Operation
 SetAlarmState
 

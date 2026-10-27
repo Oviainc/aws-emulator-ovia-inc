@@ -37,6 +37,8 @@ mod alarm_m_of_n_directions;
 mod alarm_period_windows;
 #[path = "all/alarm_reason_datapoints.rs"]
 mod alarm_reason_datapoints;
+#[path = "all/alarm_rule_parse_diagnosis.rs"]
+mod alarm_rule_parse_diagnosis;
 #[path = "all/anomaly_band_alarms.rs"]
 mod anomaly_band_alarms;
 #[path = "all/anomaly_detectors.rs"]
@@ -107,6 +109,8 @@ mod resource_tags;
 mod sns_action_queue_policy;
 #[path = "all/sns_action_topic_policy.rs"]
 mod sns_action_topic_policy;
+#[path = "all/standing_alarm_suppression.rs"]
+mod standing_alarm_suppression;
 #[path = "all/start_metric_streams.rs"]
 mod start_metric_streams;
 #[path = "all/state_roundtrip.rs"]
