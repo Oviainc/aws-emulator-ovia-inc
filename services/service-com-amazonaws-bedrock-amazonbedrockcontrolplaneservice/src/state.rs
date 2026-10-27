@@ -1807,19 +1807,78 @@ pub const MODEL_INVOCATION_JOB_STOPPED_AFTER: Duration = Duration::from_millis(5
 
 /// How long after it was submitted a batch inference job is owed its move from
 /// [`MODEL_INVOCATION_JOB_STATUS_SUBMITTED`] to
-/// [`MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS`].
+/// [`MODEL_INVOCATION_JOB_STATUS_VALIDATING`].
 ///
 /// The emulator's own span, chosen like [`IMPORT_JOB_COMPLETE_AFTER`] rather than read off
-/// any published figure: the queueing and validation a real submission waits through is
-/// not something this emulator performs, and the span is non-zero so a caller reading the
-/// job straight after the create still sees the status the create answered with.
+/// any published figure: the queueing a real submission waits through is not something this
+/// emulator performs, and the span is non-zero so a caller reading the job straight after
+/// the create still sees the status the create answered with.
+pub const MODEL_INVOCATION_JOB_VALIDATES_AFTER: Duration = Duration::from_millis(500);
+
+/// How long after its validation began a batch inference job is owed its move from
+/// [`MODEL_INVOCATION_JOB_STATUS_VALIDATING`] to
+/// [`MODEL_INVOCATION_JOB_STATUS_SCHEDULED`]. Chosen, and non-zero, for the reason
+/// [`MODEL_INVOCATION_JOB_VALIDATES_AFTER`] is: every pre-start status the model documents
+/// is one a caller can read the job in rather than one it is carried past.
+pub const MODEL_INVOCATION_JOB_SCHEDULES_AFTER: Duration = Duration::from_millis(500);
+
+/// How long after it was queued for its turn a batch inference job is owed its move from
+/// [`MODEL_INVOCATION_JOB_STATUS_SCHEDULED`] to
+/// [`MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS`]. Chosen for the same reason
+/// [`MODEL_INVOCATION_JOB_VALIDATES_AFTER`] is.
 pub const MODEL_INVOCATION_JOB_BEGINS_AFTER: Duration = Duration::from_millis(500);
 
-/// How long after it began a batch inference job is owed its move from
-/// [`MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS`] to
-/// [`MODEL_INVOCATION_JOB_STATUS_COMPLETED`]. Chosen for the same reason
-/// [`MODEL_INVOCATION_JOB_BEGINS_AFTER`] is.
-pub const MODEL_INVOCATION_JOB_COMPLETE_AFTER: Duration = Duration::from_millis(500);
+/// How long a running batch inference job dwells in
+/// [`MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS`] before it is owed its move to
+/// [`MODEL_INVOCATION_JOB_STATUS_COMPLETED`].
+///
+/// Longer than the three spans before it, and longer than the interval a client polls a job
+/// at: the run is the half of the lifecycle callers act ON — watching a job's progress,
+/// stopping one that is still running, reacting to a running job in a scheduler — so the
+/// running status has to be one a caller polling at a human interval reads the job in,
+/// rather than one that falls between two polls. A real submission runs for as long as its
+/// records take; this emulator reads no input and runs no inference, so this span is its own
+/// rather than derived from an input.
+pub const MODEL_INVOCATION_JOB_COMPLETE_AFTER: Duration = Duration::from_secs(60);
+
+/// The instants a batch inference job submitted at a given moment is owed each of its
+/// status transitions at: the whole progression
+/// `Submitted -> Validating -> Scheduled -> InProgress -> Completed`, fixed by the
+/// submission.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelInvocationJobClock {
+    /// When [`MODEL_INVOCATION_JOB_STATUS_VALIDATING`] is owed.
+    pub validating_at: SystemTime,
+    /// When [`MODEL_INVOCATION_JOB_STATUS_SCHEDULED`] is owed.
+    pub scheduled_at: SystemTime,
+    /// When [`MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS`] is owed.
+    pub in_progress_at: SystemTime,
+    /// When [`MODEL_INVOCATION_JOB_STATUS_COMPLETED`] is owed.
+    pub completed_at: SystemTime,
+}
+
+impl ModelInvocationJobClock {
+    /// The clock of a job submitted at `submit_time`: each transition stands its own span
+    /// after the transition before it.
+    ///
+    /// Every instant is computed from the submission rather than from the call that
+    /// materialises a transition, which is what keeps the progression observable: the
+    /// instants are strictly increasing, so no transition a settle materialises leaves the
+    /// next one already due at the same moment.
+    #[must_use]
+    pub fn armed_at(submit_time: SystemTime) -> Self {
+        let validating_at = submit_time + MODEL_INVOCATION_JOB_VALIDATES_AFTER;
+        let scheduled_at = validating_at + MODEL_INVOCATION_JOB_SCHEDULES_AFTER;
+        let in_progress_at = scheduled_at + MODEL_INVOCATION_JOB_BEGINS_AFTER;
+        let completed_at = in_progress_at + MODEL_INVOCATION_JOB_COMPLETE_AFTER;
+        Self {
+            validating_at,
+            scheduled_at,
+            in_progress_at,
+            completed_at,
+        }
+    }
+}
 
 /// The seconds in the hour a `timeoutDurationInHours` counts, so the instant a job times
 /// out is computed on one scale wherever it is needed.
@@ -1887,14 +1946,23 @@ pub struct ModelInvocationJobRecord {
     /// `ModelInvocationJobStatus`.
     pub status: &'static str,
     /// When [`Self::status`] is owed its move to
-    /// [`MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS`], or `None` once the job has begun.
+    /// [`MODEL_INVOCATION_JOB_STATUS_VALIDATING`], or `None` once that move has been
+    /// materialised.
     ///
     /// The due INSTANT, not a timer, for the same reason
-    /// [`ModelImportJobRecord::completed_due_at`] is one.
+    /// [`ModelImportJobRecord::completed_due_at`] is one. It and the three below are the
+    /// job's whole clock, armed by the submission ([`ModelInvocationJobClock::armed_at`]).
+    pub validating_due_at: Option<SystemTime>,
+    /// When [`Self::status`] is owed its move to
+    /// [`MODEL_INVOCATION_JOB_STATUS_SCHEDULED`], or `None` once that move has been
+    /// materialised.
+    pub scheduled_due_at: Option<SystemTime>,
+    /// When [`Self::status`] is owed its move to
+    /// [`MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS`], or `None` once the job has begun.
     pub in_progress_due_at: Option<SystemTime>,
     /// When [`Self::status`] is owed its move to
-    /// [`MODEL_INVOCATION_JOB_STATUS_COMPLETED`], or `None` while the job has not begun yet
-    /// or has already reached a terminal status.
+    /// [`MODEL_INVOCATION_JOB_STATUS_COMPLETED`], or `None` once the job has reached a
+    /// terminal status.
     pub completed_due_at: Option<SystemTime>,
     /// When [`Self::status`] is owed its move to
     /// [`MODEL_INVOCATION_JOB_STATUS_STOPPED`], or `None` while no stop is in flight.
@@ -1920,10 +1988,13 @@ impl ModelInvocationJobRecord {
     /// is owed its move to [`MODEL_INVOCATION_JOB_STATUS_STOPPED`].
     ///
     /// The caller's own write, asked for by `StopModelInvocationJob` — not a clock
-    /// transition. The inference it was queued for or running is being wound down, so the
-    /// job is owed neither its start nor its completion any more.
+    /// transition. The inference it was queued for or running is being wound down, so none
+    /// of the transitions the submission armed ([`ModelInvocationJobClock::armed_at`]) is
+    /// owed any more.
     pub fn stop(&mut self, now: SystemTime) {
         self.status = MODEL_INVOCATION_JOB_STATUS_STOPPING;
+        self.validating_due_at = None;
+        self.scheduled_due_at = None;
         self.in_progress_due_at = None;
         self.completed_due_at = None;
         self.stopped_due_at = Some(now + MODEL_INVOCATION_JOB_STOPPED_AFTER);
@@ -1932,14 +2003,31 @@ impl ModelInvocationJobRecord {
 
     /// Materialise the status transitions the clock has already made due at `now`.
     ///
+    /// Each transition of the progression is owed at an instant the submission fixed
+    /// ([`ModelInvocationJobClock::armed_at`]), so what a caller reads is the status the
+    /// clock has reached and nothing a read armed for itself: each stage the model documents
+    /// dwells for its own span, so a caller polling the job observes it pre-start, then
+    /// running, then finished, rather than being carried across a stage that was armed and
+    /// spent inside one call. The stop a caller asked for is owed the same way, from the
+    /// instant [`Self::stop`] recorded.
+    ///
     /// Every move is owed at its due instant even if nobody called, which is why that
     /// instant — not `now` — is the one the job reports as its last modification and its
     /// end, and why settling twice at different instants reports the same instants.
     pub fn settle(&mut self, now: SystemTime) {
+        if let Some(due) = self.validating_due_at.filter(|due| now >= *due) {
+            self.status = MODEL_INVOCATION_JOB_STATUS_VALIDATING;
+            self.validating_due_at = None;
+            self.last_modified_at = due;
+        }
+        if let Some(due) = self.scheduled_due_at.filter(|due| now >= *due) {
+            self.status = MODEL_INVOCATION_JOB_STATUS_SCHEDULED;
+            self.scheduled_due_at = None;
+            self.last_modified_at = due;
+        }
         if let Some(due) = self.in_progress_due_at.filter(|due| now >= *due) {
             self.status = MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS;
             self.in_progress_due_at = None;
-            self.completed_due_at = Some(due + MODEL_INVOCATION_JOB_COMPLETE_AFTER);
             self.last_modified_at = due;
         }
         if let Some(due) = self.completed_due_at.filter(|due| now >= *due) {

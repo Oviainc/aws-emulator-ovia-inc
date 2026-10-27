@@ -301,14 +301,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Ok(()) => successful.push(ChangeMessageVisibilityBatchResultEntry {
                     id: entry.id.clone(),
                 }),
+                // A handle of another queue, or of an incarnation that is gone, is
+                // refused as what it NAMES — the latter names a queue that no longer
+                // exists — and for that entry alone.
                 Err(sqs::VisibilityRefusal::MalformedHandle)
                 | Err(sqs::VisibilityRefusal::NoSuchMessage) => {
+                    let (code, message) = sqs::unresolvable_receipt_handle_batch_failure(origin);
                     failed.push(BatchResultErrorEntry {
                         id: entry.id.clone(),
                         // The caller supplied the handle, so the fault is the sender's.
                         sender_fault: true,
-                        code: RECEIPT_HANDLE_IS_INVALID.to_string(),
-                        message: sqs::receipt_handle_is_invalid(origin).message,
+                        code: code.to_string(),
+                        message,
                     })
                 }
                 Err(sqs::VisibilityRefusal::NotInFlight) => {
@@ -333,12 +337,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ChangeMessageVisibilityBatchOutput { successful, failed })
     }
 }
-
-/// The per-entry error code for a receipt handle the queue does not hold: the name of the
-/// modelled error `ChangeMessageVisibility` answers for the same condition
-/// (`com.amazonaws.sqs#ReceiptHandleIsInvalid`), which is what AWS reports in a batch result
-/// entry's `Code`.
-const RECEIPT_HANDLE_IS_INVALID: &str = "ReceiptHandleIsInvalid";
 
 /// The per-entry error code for a message that is not in flight, named after the modelled
 /// error `ChangeMessageVisibility` answers for the same condition.

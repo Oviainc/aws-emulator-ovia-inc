@@ -9,7 +9,8 @@
 //! the headers that integration's own records render, the steps in an execution log, and
 //! the latency the simulation took — answering a call whose integration cannot be performed
 //! through the API's gateway response for it, and never with a backend answer it did not
-//! obtain.
+//! obtain. A method that carries NO integration is refused on the operation's own error
+//! channel instead, which the `test_invoke_method_no_integration` suite asserts.
 //!
 //! The rows differ along what that rule generalises over: the content type the simulated
 //! request declares (which selects the integration request template, and so the status),
@@ -23,7 +24,7 @@
 
 use serde_json::{json, Value};
 
-use crate::rest_api_lifecycle::{create_api, create_resource, string_member, Gateway};
+use crate::rest_api_lifecycle::{create_api, resource_under, Gateway};
 
 /// The region the integration ARNs of these cases name; one is enough, because no row
 /// turns on it.
@@ -127,12 +128,6 @@ async fn test_invoke(
         error: answer.error,
         body: answer.body,
     }
-}
-
-/// A child resource of the API's root, answering its resource id.
-async fn resource_under(gateway: &Gateway, api: &str, root: &str, path_part: &str) -> String {
-    let created = create_resource(gateway, api, root, path_part).await;
-    string_member(&created, "id", &format!("CreateResource({path_part})"))
 }
 
 /// `PutMethod` with open authorization on a resource.
@@ -435,8 +430,10 @@ struct Unservable {
     case: &'static str,
     /// The path part of the resource this row stands its method up on.
     path_part: &'static str,
-    /// The `PutIntegration` request, or `None` for a method left with no integration.
-    integration: Option<Value>,
+    /// The `PutIntegration` request this row's method carries. Every row has one: a
+    /// method with NO integration is not an unperformable configuration but a refused
+    /// call, which the `test_invoke_method_no_integration` suite asserts.
+    integration: Value,
     /// The `PutIntegrationResponse` request for status `200`, when the row needs one.
     integration_response: Option<Value>,
     /// The simulated request.
@@ -455,17 +452,16 @@ async fn an_integration_that_cannot_be_performed_is_reported_through_the_gateway
     let (api, root) = create_api(&gateway, "test-invoke-unservable").await;
 
     // Rows differ along the configuration that cannot be performed: each integration type
-    // that names a backend, a method with no integration at all, a MOCK whose only
-    // integration response is patterned (so no response is selected), a MOCK whose response
-    // template is Velocity rather than a literal body, and a MOCK that refuses an unmapped
-    // content type outright.
+    // that names a backend, a MOCK whose only integration response is patterned (so no
+    // response is selected), a MOCK whose response template is Velocity rather than a
+    // literal body, and a MOCK that refuses an unmapped content type outright.
     let cases: Vec<Unservable> = vec![
         Unservable {
             case: "a Lambda proxy integration",
             path_part: "proxy",
-            integration: Some(
-                json!({ "type": "AWS_PROXY", "httpMethod": "POST", "uri": lambda_uri() }),
-            ),
+            integration: json!({
+                "type": "AWS_PROXY", "httpMethod": "POST", "uri": lambda_uri()
+            }),
             integration_response: None,
             request: json!({}),
             status: 500,
@@ -475,11 +471,11 @@ async fn an_integration_that_cannot_be_performed_is_reported_through_the_gateway
         Unservable {
             case: "an AWS service action integration",
             path_part: "ddb",
-            integration: Some(json!({
+            integration: json!({
                 "type": "AWS",
                 "httpMethod": "POST",
                 "uri": format!("arn:aws:apigateway:{REGION}:dynamodb:action/PutItem")
-            })),
+            }),
             integration_response: None,
             request: json!({}),
             status: 500,
@@ -489,11 +485,11 @@ async fn an_integration_that_cannot_be_performed_is_reported_through_the_gateway
         Unservable {
             case: "an HTTP proxy integration",
             path_part: "upstream-proxy",
-            integration: Some(json!({
+            integration: json!({
                 "type": "HTTP_PROXY",
                 "httpMethod": "GET",
                 "uri": "https://example.com/upstream"
-            })),
+            }),
             integration_response: None,
             request: json!({}),
             status: 500,
@@ -503,21 +499,11 @@ async fn an_integration_that_cannot_be_performed_is_reported_through_the_gateway
         Unservable {
             case: "an HTTP integration",
             path_part: "upstream",
-            integration: Some(json!({
+            integration: json!({
                 "type": "HTTP",
                 "httpMethod": "GET",
                 "uri": "https://example.com/upstream"
-            })),
-            integration_response: None,
-            request: json!({}),
-            status: 500,
-            message: INTERNAL_SERVER_ERROR,
-            response_type: API_CONFIGURATION_ERROR,
-        },
-        Unservable {
-            case: "a method carrying no integration at all",
-            path_part: "bare",
-            integration: None,
+            }),
             integration_response: None,
             request: json!({}),
             status: 500,
@@ -527,7 +513,7 @@ async fn an_integration_that_cannot_be_performed_is_reported_through_the_gateway
         Unservable {
             case: "a MOCK whose only integration response is patterned",
             path_part: "patterned",
-            integration: Some(json!({ "type": "MOCK" })),
+            integration: json!({ "type": "MOCK" }),
             integration_response: Some(json!({ "selectionPattern": "4\\d\\d" })),
             request: json!({}),
             status: 500,
@@ -537,7 +523,7 @@ async fn an_integration_that_cannot_be_performed_is_reported_through_the_gateway
         Unservable {
             case: "a MOCK whose response template is a Velocity template",
             path_part: "velocity",
-            integration: Some(json!({ "type": "MOCK" })),
+            integration: json!({ "type": "MOCK" }),
             integration_response: Some(json!({
                 "responseTemplates": {
                     "application/json": "#set($root = $input.path('$'))\n{\"id\":\"$root.id\"}"
@@ -551,11 +537,11 @@ async fn an_integration_that_cannot_be_performed_is_reported_through_the_gateway
         Unservable {
             case: "a MOCK that passes no unmapped content type through",
             path_part: "strict",
-            integration: Some(json!({
+            integration: json!({
                 "type": "MOCK",
                 "passthroughBehavior": "NEVER",
                 "requestTemplates": { "application/json": "{\"statusCode\": 200}" }
-            })),
+            }),
             integration_response: Some(json!({})),
             request: json!({ "headers": { "Content-Type": "text/csv" } }),
             status: 415,
@@ -569,19 +555,17 @@ async fn an_integration_that_cannot_be_performed_is_reported_through_the_gateway
         let status = row.status;
         let resource = resource_under(&gateway, &api, &root, row.path_part).await;
         put_method(&gateway, &api, &resource, "GET").await;
-        if let Some(integration) = &row.integration {
-            put_integration(&gateway, &api, &resource, "GET", integration.clone()).await;
-            if let Some(integration_response) = &row.integration_response {
-                put_integration_response(
-                    &gateway,
-                    &api,
-                    &resource,
-                    "GET",
-                    "200",
-                    integration_response.clone(),
-                )
-                .await;
-            }
+        put_integration(&gateway, &api, &resource, "GET", row.integration.clone()).await;
+        if let Some(integration_response) = &row.integration_response {
+            put_integration_response(
+                &gateway,
+                &api,
+                &resource,
+                "GET",
+                "200",
+                integration_response.clone(),
+            )
+            .await;
         }
         let simulated = test_invoke(&gateway, &api, &resource, "GET", row.request.clone()).await;
         assert_eq!(
@@ -863,7 +847,7 @@ async fn a_simulated_invocation_changes_nothing_a_later_caller_sees() {
         )
         .await;
 
-    // The same simulation repeated, and one that cannot be performed in between: neither
+    // The same simulation repeated, and a call the operation REFUSES in between: neither
     // may move a record the next reader sees.
     let first = test_invoke(
         &gateway,
@@ -875,12 +859,11 @@ async fn a_simulated_invocation_changes_nothing_a_later_caller_sees() {
     .await;
     let bare = resource_under(&gateway, &api, &root, "bare").await;
     put_method(&gateway, &api, &bare, "GET").await;
-    let unservable = test_invoke(&gateway, &api, &bare, "GET", json!({})).await;
+    let refused = test_invoke(&gateway, &api, &bare, "GET", json!({})).await;
     assert_eq!(
-        unservable.status(),
-        500,
-        "case the unservable call: expected simulated status 500, got {:?}",
-        unservable.body
+        refused.http_status, 400,
+        "case the refused call: expected the operation to answer 400, got {} with {:?}",
+        refused.http_status, refused.body
     );
     let second = test_invoke(
         &gateway,

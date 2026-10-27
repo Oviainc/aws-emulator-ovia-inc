@@ -110,74 +110,99 @@ fn control_mapping(record: &crate::state::ControlMappingRecord) -> ControlMappin
     }
 }
 
-/// Does `record` satisfy every dimension the caller's filter sets?
+/// The caller's filter read as the identities the catalog knows its resources by.
 ///
-/// A dimension the filter omits constrains nothing; a dimension it sets admits only a
-/// mapping whose own stored value is among the values listed. A control ARN is
-/// resolved through the catalog first, so the Control Tower form of a control's ARN
-/// filters for the same control its `controlcatalog` form does.
-fn matches_filter(
-    record: &crate::state::ControlMappingRecord,
-    filter: Option<&ControlMappingFilter>,
-    state: &crate::state::ComAmazonawsControlcatalogControlcatalogState,
-) -> bool {
-    let Some(filter) = filter else {
-        return true;
-    };
-    if let Some(control_arns) = filter.control_arns.as_ref() {
-        let matched = control_arns.iter().any(|requested| {
-            state
-                .resolve_control(requested)
-                .is_some_and(|control| control.arn == record.control_arn)
-        });
-        if !matched {
-            return false;
-        }
-    }
-    if let Some(common_control_arns) = filter.common_control_arns.as_ref() {
-        let matched = match &record.mapping {
-            crate::state::MappingDetails::CommonControl { common_control_arn } => {
-                common_control_arns.contains(common_control_arn)
-            }
-            _ => false,
-        };
-        if !matched {
-            return false;
-        }
-    }
-    if let Some(mapping_types) = filter.mapping_types.as_ref() {
-        if !mapping_types.contains(&record.mapping_type) {
-            return false;
-        }
-    }
-    true
+/// Each ARN dimension is rewritten to the ARN the catalog stores for the resource that
+/// ARN names: neither the partition segment, nor the Region segment of the Control
+/// Tower form of a control ARN, is part of a catalog resource's identity, so the
+/// Control Tower form of a control's ARN and any partition's spelling of a catalog ARN
+/// filter for the same resource. An ARN that names nothing the catalog publishes is
+/// kept as sent, so it matches nothing. Both the match and the fingerprint a
+/// `NextToken` carries are taken from these identities, so the same filter written two
+/// ways narrows to one sequence.
+#[derive(Debug, Default)]
+struct CanonicalFilter {
+    control_arns: Option<Vec<String>>,
+    common_control_arns: Option<Vec<String>>,
+    mapping_types: Option<Vec<String>>,
 }
 
-/// The filter's dimensions, as the `(dimension, values)` pairs
-/// `state::filter_fingerprint` hashes: the model declares `ControlArns`,
-/// `CommonControlArns` and `MappingTypes`, and a dimension the caller omitted
-/// contributes no values.
-fn filter_dimensions(filter: Option<&ControlMappingFilter>) -> Vec<(&'static str, Vec<String>)> {
-    vec![
-        (
-            "controlArns",
-            filter
-                .and_then(|filter| filter.control_arns.clone())
-                .unwrap_or_default(),
-        ),
-        (
-            "commonControlArns",
-            filter
-                .and_then(|filter| filter.common_control_arns.clone())
-                .unwrap_or_default(),
-        ),
-        (
-            "mappingTypes",
-            filter
-                .and_then(|filter| filter.mapping_types.clone())
-                .unwrap_or_default(),
-        ),
-    ]
+impl CanonicalFilter {
+    /// Read the caller's filter, resolving every ARN it carries against the catalog.
+    fn read(
+        filter: Option<&ControlMappingFilter>,
+        state: &crate::state::ComAmazonawsControlcatalogControlcatalogState,
+    ) -> Self {
+        let Some(filter) = filter else {
+            return Self::default();
+        };
+        Self {
+            control_arns: filter.control_arns.as_ref().map(|arns| {
+                arns.iter()
+                    .map(|requested| {
+                        state
+                            .resolve_control(requested)
+                            .map_or_else(|| requested.clone(), |control| control.arn.clone())
+                    })
+                    .collect()
+            }),
+            common_control_arns: filter.common_control_arns.as_ref().map(|arns| {
+                arns.iter()
+                    .map(|requested| {
+                        crate::state::canonical_catalog_arn("common-control", requested)
+                    })
+                    .collect()
+            }),
+            mapping_types: filter.mapping_types.clone(),
+        }
+    }
+
+    /// Does `record` satisfy every dimension the caller's filter sets?
+    ///
+    /// A dimension the filter omits constrains nothing; a dimension it sets admits only
+    /// a mapping whose own stored value is among the identities listed.
+    fn matches(&self, record: &crate::state::ControlMappingRecord) -> bool {
+        if let Some(control_arns) = self.control_arns.as_ref() {
+            if !control_arns.contains(&record.control_arn) {
+                return false;
+            }
+        }
+        if let Some(common_control_arns) = self.common_control_arns.as_ref() {
+            let matched = match &record.mapping {
+                crate::state::MappingDetails::CommonControl { common_control_arn } => {
+                    common_control_arns.contains(common_control_arn)
+                }
+                _ => false,
+            };
+            if !matched {
+                return false;
+            }
+        }
+        if let Some(mapping_types) = self.mapping_types.as_ref() {
+            if !mapping_types.contains(&record.mapping_type) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The filter's dimensions, as the `(dimension, values)` pairs
+    /// `state::filter_fingerprint` hashes: the model declares `ControlArns`,
+    /// `CommonControlArns` and `MappingTypes`, and a dimension the caller omitted
+    /// contributes no values.
+    fn dimensions(&self) -> Vec<(&'static str, Vec<String>)> {
+        vec![
+            ("controlArns", self.control_arns.clone().unwrap_or_default()),
+            (
+                "commonControlArns",
+                self.common_control_arns.clone().unwrap_or_default(),
+            ),
+            (
+                "mappingTypes",
+                self.mapping_types.clone().unwrap_or_default(),
+            ),
+        ]
+    }
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -263,15 +288,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        let filter = input.filter.as_ref();
-        let fingerprint = crate::state::filter_fingerprint(&filter_dimensions(filter));
+        let filter = CanonicalFilter::read(input.filter.as_ref(), &state);
+        let fingerprint = crate::state::filter_fingerprint(&filter.dimensions());
         let page = crate::state::page(
             "control-mappings",
             &fingerprint,
             state
                 .control_mappings
                 .iter()
-                .filter(|(_, record)| matches_filter(record, filter, &state))
+                .filter(|(_, record)| filter.matches(record))
                 .map(|(key, record)| (key.clone(), control_mapping(record))),
             input.next_token.as_deref(),
             input.max_results,

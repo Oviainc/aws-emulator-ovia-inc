@@ -4362,6 +4362,27 @@ pub struct Bucket {
     /// Private, like `tags` and `metrics_configurations`, so the accessor pair below is the
     /// only way in or out.
     analytics_configurations: BTreeMap<String, crate::ops::types::AnalyticsConfiguration>,
+    /// The bucket's S3 Inventory configurations, by the inventory id each one is identified
+    /// by: a put "adds an S3 Inventory configuration (identified by the inventory ID) to the
+    /// bucket" (`PutBucketInventoryConfiguration`'s own documentation).
+    ///
+    /// A MAP rather than one value, for the reason [`Self::analytics_configurations`] is
+    /// one — "You can have up to 1,000 inventory configurations per bucket" (same
+    /// documentation, [`MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET`]) — each addressable on its
+    /// own by the id the request named it with, so a read, a replacement or a delete of one
+    /// configuration leaves every other one exactly as it was. A `BTreeMap`, so iterating it
+    /// IS ascending id order and a listing needs no sort step. Empty for a bucket no
+    /// inventory configuration has been put on, the state a bucket is created in.
+    ///
+    /// The MODELLED container is stored whole, the way [`Self::replication`] is: it is
+    /// exactly what the put carries as its payload and what
+    /// `GetBucketInventoryConfiguration` reports back, so a read answers the configuration
+    /// the bucket actually carries — the destination, the schedule, the optional fields it
+    /// asked for — rather than a re-derived copy of it.
+    ///
+    /// Private, like `tags` and `analytics_configurations`, so the accessor pair below is
+    /// the only way in or out.
+    inventory_configurations: BTreeMap<String, crate::ops::types::InventoryConfiguration>,
     /// The S3 Intelligent-Tiering configurations the bucket carries, by the id each one is
     /// identified by — empty while the bucket carries none, which is the state it is
     /// created in.
@@ -5163,6 +5184,43 @@ impl Bucket {
             id,
             configuration,
             MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET,
+        )
+    }
+
+    /// The S3 Inventory configuration the bucket carries under `id`, or `None` when it
+    /// carries none under that id — the state every bucket starts in, and what makes a read
+    /// answer [`NO_SUCH_CONFIGURATION_CODE`].
+    ///
+    /// The stored container itself, so what a reader reports is what the put recorded rather
+    /// than a re-derived copy — the reading [`Self::analytics_configuration`] gives.
+    pub fn inventory_configuration(
+        &self,
+        id: &str,
+    ) -> Option<&crate::ops::types::InventoryConfiguration> {
+        self.inventory_configurations.get(id)
+    }
+
+    /// Associate `configuration` with the bucket under `id`, and report what that did.
+    ///
+    /// Per-ID and a full replacement of that id alone: a put "adds an S3 Inventory
+    /// configuration (identified by the inventory ID) to the bucket"
+    /// (`PutBucketInventoryConfiguration`'s own documentation) and carries the whole
+    /// container, so the configuration stored under `id` becomes exactly the one this request
+    /// named and every other id the bucket carries is left as it was.
+    ///
+    /// The ceiling is checked HERE, where the bucket's configuration count is, so a put
+    /// cannot reach past [`MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET`]; replacing an id the
+    /// bucket already carries adds no configuration and so is never refused for it.
+    pub fn put_inventory_configuration(
+        &mut self,
+        id: String,
+        configuration: crate::ops::types::InventoryConfiguration,
+    ) -> BucketConfigurationWrite {
+        put_keyed_configuration(
+            &mut self.inventory_configurations,
+            id,
+            configuration,
+            MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET,
         )
     }
 
@@ -8702,13 +8760,14 @@ pub const METADATA_CONFIGURATION_ALREADY_EXISTS_MESSAGE: &str =
 /// (`BucketAlreadyExists` and `BucketAlreadyOwnedByYou` carry the same one).
 pub const METADATA_CONFIGURATION_ALREADY_EXISTS_STATUS: u16 = 409;
 
-/// What [`Bucket::put_metrics_configuration`] or [`Bucket::put_analytics_configuration`]
-/// did, so the caller answers each outcome without re-deriving it — and cannot reach the
-/// stored cases without having gone through the per-bucket ceiling.
+/// What [`Bucket::put_metrics_configuration`], [`Bucket::put_analytics_configuration`] or
+/// [`Bucket::put_inventory_configuration`] did, so the caller answers each outcome without
+/// re-deriving it — and cannot reach the stored cases without having gone through the
+/// per-bucket ceiling.
 ///
-/// ONE type for both families, because a put of either is the same transaction: a full
-/// replacement of the configuration of the id it names, bounded by how many of them one
-/// bucket may hold.
+/// ONE type for every one of those families, because a put of any of them is the same
+/// transaction: a full replacement of the configuration of the id it names, bounded by how
+/// many of them one bucket may hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketConfigurationWrite {
     /// The bucket carried no configuration under that id; this one was recorded.
@@ -8717,7 +8776,8 @@ pub enum BucketConfigurationWrite {
     Replaced,
     /// The bucket already holds as many configurations of that family as it may
     /// ([`MAX_METRICS_CONFIGURATIONS_PER_BUCKET`],
-    /// [`MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET`]) and this put would add one more;
+    /// [`MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET`],
+    /// [`MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET`]) and this put would add one more;
     /// NOTHING was written.
     QuotaReached,
 }
@@ -8725,10 +8785,11 @@ pub enum BucketConfigurationWrite {
 /// Record `configuration` under `id` in one of a bucket's per-id configuration maps,
 /// refusing a NEW id once the map holds `ceiling` of them.
 ///
-/// The one implementation behind [`Bucket::put_metrics_configuration`] and
-/// [`Bucket::put_analytics_configuration`]: both store the modelled container whole under
-/// the id the request identifies it by, so replacing an id already present overwrites that
-/// entry alone and counts against no ceiling.
+/// The one implementation behind [`Bucket::put_metrics_configuration`],
+/// [`Bucket::put_analytics_configuration`] and [`Bucket::put_inventory_configuration`]: each
+/// stores the modelled container whole under the id the request identifies it by, so
+/// replacing an id already present overwrites that entry alone and counts against no
+/// ceiling.
 fn put_keyed_configuration<T>(
     configurations: &mut BTreeMap<String, T>,
     id: String,
@@ -8774,6 +8835,31 @@ pub const MAX_ANALYTICS_ID_CHARS: usize = MAX_CONFIGURATION_ID_CHARS;
 /// configuration id by length ([`is_valid_configuration_id`], i.e. between one and
 /// [`MAX_ANALYTICS_ID_CHARS`] characters), which is all `AnalyticsId` constrains.
 pub fn is_valid_analytics_id(value: &str) -> bool {
+    is_valid_configuration_id(value)
+}
+
+/// How many S3 Inventory configurations one bucket may hold, and so how many entries one
+/// bucket's inventory record can ever carry.
+///
+/// AWS publishes the bound on the operation itself: "You can have up to 1,000 inventory
+/// configurations per bucket" (`PutBucketInventoryConfiguration`'s own documentation), which
+/// also names the refusal past it ([`TOO_MANY_CONFIGURATIONS_CODE`]). A put past it is
+/// refused rather than recorded, so a caller looping on fresh ids cannot grow one bucket's
+/// record without end.
+pub const MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET: usize = 1_000;
+
+/// The most characters an S3 Inventory configuration id may carry.
+///
+/// [`MAX_CONFIGURATION_ID_CHARS`], the bound every bucket configuration id shares: the model
+/// constrains `InventoryId` no further — `smithy_query(query="shape",shape="InventoryId")`
+/// reports a plain string with no `length` or `pattern` — so nothing refuses a longer id
+/// before a handler does, and an id is what one bucket's inventory map keys on.
+pub const MAX_INVENTORY_ID_CHARS: usize = MAX_CONFIGURATION_ID_CHARS;
+
+/// Whether `value` is an id an S3 Inventory configuration may be identified by: a
+/// configuration id by length ([`is_valid_configuration_id`], i.e. between one and
+/// [`MAX_INVENTORY_ID_CHARS`] characters), which is all `InventoryId` constrains.
+pub fn is_valid_inventory_id(value: &str) -> bool {
     is_valid_configuration_id(value)
 }
 

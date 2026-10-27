@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDashboards
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDashboards`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDashboards::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates every dashboard the store holds for the IoT SiteWise Monitor
+//! project the request names, each exactly once, in one stable order, cut into pages of
+//! at most `maxResults` entries, reporting for each the values `DescribeDashboard`
+//! reports for it. A read, so it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +148,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDashboards` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDashboardsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDashboards"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        let _ = ctx;
+
+        // A pure read: nothing below writes, so two callers listing one project's
+        // dashboards in either order see the same dashboards.
+        let store = state.lock();
+
+        // The listing is scoped to ONE project, so that project has to exist: an id
+        // this service holds no project for is a refusal rather than an empty page,
+        // which would report absence as success. This operation declares no
+        // `ResourceNotFoundException`, so the absence is stated on the client-input
+        // error it does declare, in the one wording every not-found refusal in this
+        // service carries — the same refusal `ListProjectAssets` gives for the same
+        // absence.
+        if !store.projects.contains_key(&input.project_id) {
+            return Err(invalid_request(crate::state::not_found_message(
+                crate::state::RESOURCE_PROJECT,
+                &input.project_id,
+            )));
+        }
+
+        // Every dashboard created in that project, and no other: a dashboard names the
+        // project it was created in on its own record, and nothing moves it, so the
+        // project is the only filter this enumeration applies.
+        let mut dashboards: Vec<&crate::state::DashboardRecord> = store
+            .dashboards
+            .values()
+            .filter(|dashboard| dashboard.project_id == input.project_id)
+            .collect();
+        // A stable total order is what makes `nextToken` resumable: oldest first, ties
+        // broken by id so two dashboards created in the same instant still order
+        // deterministically.
+        dashboards.sort_by(|left, right| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the id of the first dashboard
+        // of the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$` and stays opaque to the caller. A token whose resume point
+        // is not in this enumeration is refused rather than answered with an empty page,
+        // which would report absence as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                dashboards
+                    .iter()
+                    .position(|dashboard| dashboard.id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total. The default is the one this operation's `maxResults` documents.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(dashboards.len());
+
+        // "The token for the next set of results, or null if there are no additional
+        // results": issued only when a dashboard follows this page.
+        let next_token = dashboards
+            .get(end)
+            .map(|dashboard| ::hex::encode(dashboard.id.as_bytes()));
+        let dashboard_summaries = dashboards[start..end].iter().copied().map(summary).collect();
+
+        Ok(ListDashboardsOutput {
+            dashboard_summaries,
+            next_token,
+        })
     }
+}
+
+/// The page size this operation's `maxResults` documents when the caller sends none:
+/// "Default: 50".
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// One stored dashboard as the summary this operation reports, read straight off the
+/// record `CreateDashboard` persisted and `DescribeDashboard` reads back, so a listed
+/// dashboard and a described one never disagree.
+fn summary(record: &crate::state::DashboardRecord) -> DashboardSummary {
+    DashboardSummary {
+        id: record.id.clone(),
+        name: record.name.clone(),
+        description: record.description.clone(),
+        creation_date: Some(crate::state::to_date_time(record.creation_date)),
+        last_update_date: Some(crate::state::to_date_time(record.last_update_date)),
+    }
+}
+
+/// Decode a `nextToken` back into the dashboard id it resumes from.
+fn decode_token(token: &str) -> Result<String, ListDashboardsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 500 `InternalFailureException`: the store this operation needs is not there.
+fn internal_failure() -> ListDashboardsError {
+    ListDashboardsErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message` — the client-input error
+/// this operation declares.
+fn invalid_request(message: String) -> ListDashboardsError {
+    ListDashboardsErrorModeled::InvalidRequestException(InvalidRequestException { message }).into()
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListDashboardsError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
 }

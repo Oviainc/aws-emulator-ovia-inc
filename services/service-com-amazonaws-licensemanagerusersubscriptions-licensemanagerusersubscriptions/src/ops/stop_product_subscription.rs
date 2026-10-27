@@ -4,15 +4,18 @@
 //!
 //! Ends one user's product subscription: resolves the stored product user by
 //! `ProductUserArn` or by the `(Username, IdentityProvider, Product)` triple it was
-//! subscribed with, removes it from [`crate::state`], and returns the
-//! `ProductUserSummary` for the subscription it ended — `UNSUBSCRIBED`, with the
+//! subscribed with, records in [`crate::state`] that the subscription has ended, and
+//! returns the `ProductUserSummary` for it — `UNSUBSCRIBED`, with the
 //! `SubscriptionEndDate` of this call.
 //!
-//! Because the subscription is gone, `ListProductSubscriptions` no longer reports the
-//! user and a second stop of the same user is a `ResourceNotFoundException`. The record is
-//! REMOVED rather than retained in an `UNSUBSCRIBED` state, so that status is returned by
-//! this call but is never listable; a later slice that needs unsubscribed history has to
-//! keep the record instead of deleting it.
+//! Ending a subscription is a teardown the service REPORTS while it runs: the record is
+//! kept, so `ListProductSubscriptions` goes on reporting the user in that ended status —
+//! which is what makes the operation's documented `Status` filter able to select anything
+//! other than a live subscription — until the teardown the clock owes completes, and only
+//! then does it stop being reported. What the end takes away at once is what made the
+//! subscription LIVE: it is no longer taggable, and it resolves for no operation that acts
+//! on a subscription, so a second stop of the same user is a `ResourceNotFoundException`
+//! while its triple stays occupied against a re-subscribe.
 //!
 //! Two refusals this operation does not word itself, because they are the service's:
 //! a request naming neither `ProductUserArn` nor the full triple is refused by LISTING the
@@ -188,13 +191,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )))
             })?;
 
-        let mut ended = state.remove_product_user(&arn).ok_or_else(|| {
-            into_error(crate::state::StateError::NotFound(format!(
-                "product user {arn} has no subscription"
-            )))
-        })?;
-        ended.status = crate::state::STATUS_UNSUBSCRIBED.to_string();
-        ended.unsubscribed_at = Some(now);
+        // The teardown this call accepts: the subscription is ended NOW — that is the
+        // status and the end date the answer carries — and stops being reported when the
+        // clock owes it, so a client polling the list observes it ending.
+        let ended = state
+            .begin_product_user_unsubscription(&arn, now)
+            .ok_or_else(|| {
+                into_error(crate::state::StateError::NotFound(format!(
+                    "product user {arn} has no subscription"
+                )))
+            })?;
 
         Ok(StopProductSubscriptionOutput {
             product_user_summary: state.product_user_summary(&ended, &provider_union),

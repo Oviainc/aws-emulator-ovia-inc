@@ -17,8 +17,11 @@
 //!   listed and still tagged, and stops existing only once the clock has made that
 //!   operation due;
 //! * a mutating call against a resource an in-flight operation is already changing is
-//!   `ConflictException` (409) and persists nothing — for every such call, including the
-//!   `CreateLandingZone` whose account the decommissioning landing zone still occupies.
+//!   `ConflictException` (409) and persists nothing — for every such NON-`@idempotent`
+//!   call, including the `CreateLandingZone` whose account the decommissioning landing
+//!   zone still occupies. A repeat of the `@idempotent` `DeleteLandingZone` itself is the
+//!   same work rather than a collision, which the `delete_landing_zone_idempotence`
+//!   suite covers.
 //!
 //! The version rows come from this crate's landing zone version catalog and the enum
 //! values from
@@ -287,17 +290,14 @@ struct Collision {
     body: fn(&str) -> serde_json::Value,
 }
 
-/// RULE: a mutating call against a landing zone an in-flight operation is already
-/// changing is `ConflictException` (409) and persists nothing — including the create whose
-/// account that landing zone still occupies.
+/// RULE: a mutating call that is not `@idempotent` against a landing zone an in-flight
+/// operation is already changing is `ConflictException` (409) and persists nothing —
+/// including the create whose account that landing zone still occupies. The repeat of the
+/// `@idempotent` delete is NOT such a call: it reports the operation already in flight,
+/// which `delete_landing_zone_idempotence` asserts.
 #[tokio::test]
 async fn a_mutating_call_during_the_in_flight_delete_is_a_conflict() {
     let cases = vec![
-        Collision {
-            case: "a second delete",
-            path: "/delete-landingzone",
-            body: |arn| serde_json::json!({ "landingZoneIdentifier": arn }),
-        },
         Collision {
             case: "an update",
             path: "/update-landingzone",

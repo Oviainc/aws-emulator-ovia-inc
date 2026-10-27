@@ -43,6 +43,8 @@ mod list_rule_groups;
 mod logging_configuration;
 #[path = "all/managed_products.rs"]
 mod managed_products;
+#[path = "all/managed_products_by_vendor.rs"]
+mod managed_products_by_vendor;
 #[path = "all/managed_rule_group_description.rs"]
 mod managed_rule_group_description;
 #[path = "all/managed_rule_group_version_expiry.rs"]

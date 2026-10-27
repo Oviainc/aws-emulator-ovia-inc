@@ -3054,6 +3054,14 @@ pub const NO_SUCH_METHOD: &str = "Invalid Method identifier specified";
 /// The `NotFoundException` message for a method that carries no integration.
 pub const NO_SUCH_INTEGRATION: &str = "Invalid Integration identifier specified";
 
+/// The `BadRequestException` message for a SIMULATED invocation of a method that carries
+/// no integration: simulating an invocation invokes the method's integration, so a method
+/// with none leaves the call nothing to invoke and the call itself is refused.
+///
+/// A SENTENCE OF ITS OWN, like [`INVALID_REST_API_IDENTIFIER`]: nothing is interpolated
+/// from the request, so neither the API, the resource nor the verb is named.
+pub const NO_INTEGRATION_DEFINED: &str = "No integration defined for method";
+
 /// The `NotFoundException` message for a `statusCode` that names no response of the
 /// method at that code — the method response `GetMethodResponse` resolves, or the
 /// integration response `GetIntegrationResponse` resolves on the method's integration.

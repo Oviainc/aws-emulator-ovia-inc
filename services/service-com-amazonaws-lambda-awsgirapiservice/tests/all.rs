@@ -43,6 +43,8 @@ mod capacity_provider_update;
 mod capacity_providers;
 #[path = "all/code_signing_config_deletion.rs"]
 mod code_signing_config_deletion;
+#[path = "all/code_signing_config_listing.rs"]
+mod code_signing_config_listing;
 #[path = "all/code_signing_config_update.rs"]
 mod code_signing_config_update;
 #[path = "all/code_signing_configs.rs"]

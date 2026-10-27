@@ -55,6 +55,8 @@ mod delete_custom_line_item;
 mod disassociate_accounts;
 #[path = "all/disassociate_pricing_rules.rs"]
 mod disassociate_pricing_rules;
+#[path = "all/list_billing_group_cost_reports.rs"]
+mod list_billing_group_cost_reports;
 #[path = "all/list_custom_line_item_versions.rs"]
 mod list_custom_line_item_versions;
 #[path = "all/list_custom_line_items.rs"]

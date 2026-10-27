@@ -27,26 +27,16 @@ use serde_json::{json, Value};
 
 use crate::integration_response::{get_integration_response, put_integration_response};
 use crate::method_integration::{
-    aws_integration_uri, get_integration, get_method, put_integration, resource_with_a_method,
+    aws_integration_uri, delete_integration, get_integration, get_method, put_integration,
+    resource_with_a_method,
 };
 use crate::method_response::{get_method_response, put_method_response};
-use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
+use crate::rest_api_lifecycle::{assert_failure, create_api, Gateway};
 
 /// One row of the delete table: its case name, the path part of the resource to stand up,
 /// the verb of the method, the `PutIntegration` request, and the status codes of the
 /// integration responses to put on the integration.
 type DeleteCase<'a> = (&'a str, &'a str, &'a str, Value, Vec<&'a str>);
-
-/// `DeleteIntegration` for `verb` on `resource` of `api`.
-async fn delete_integration(gateway: &Gateway, api: &str, resource: &str, verb: &str) -> Answer {
-    gateway
-        .call(
-            "DELETE",
-            &format!("/restapis/{api}/resources/{resource}/methods/{verb}/integration"),
-            None,
-        )
-        .await
-}
 
 /// Stand the `verb` method of a fresh `path_part` resource up with `request` as its
 /// integration and one integration response per entry of `responses`, answering the

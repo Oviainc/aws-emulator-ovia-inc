@@ -160,13 +160,25 @@ async fn every_response_announces_one_media_type() {
         ),
         (
             // Still a scaffold, so the 501 media type stays covered by a row the census
-            // can confirm: `src/ops/describe_scraper_logging_configuration.rs` carries
-            // the `//! SCAFFOLDED, NOT IMPLEMENTED:` marker.
-            "DescribeScraperLoggingConfiguration, a scaffolded operation",
-            "GET",
+            // can confirm: `src/ops/update_scraper_logging_configuration.rs` carries
+            // the `//! SCAFFOLDED, NOT IMPLEMENTED:` marker. The body satisfies every
+            // modelled constraint, since a request that does not is refused at the
+            // boundary with a 400 before the scaffold is reached.
+            "UpdateScraperLoggingConfiguration, a scaffolded operation",
+            "PUT",
             "/scrapers/s-00000000-0000-0000-0000-000000000000/logging-configuration"
                 .to_string(),
-            String::new(),
+            serde_json::json!({
+                "loggingDestination": {
+                    "cloudWatchLogs": {
+                        "logGroupArn": format!(
+                            "arn:aws:logs:{region}:{}:log-group:/aws/prometheus/media-type:*",
+                            engine::emulator_account_id()
+                        )
+                    }
+                }
+            })
+            .to_string(),
             501,
         ),
     ];

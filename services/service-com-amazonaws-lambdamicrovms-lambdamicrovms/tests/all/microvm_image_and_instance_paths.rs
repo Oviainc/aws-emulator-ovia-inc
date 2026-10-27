@@ -82,8 +82,10 @@ async fn running_microvm(router: &MultiServiceRouter, image: &str) -> String {
 /// RULE: `DeleteMicrovmImage` deletes the image for good — the call records it
 /// `DELETING` and the removal the clock then owes takes the record and every version
 /// it holds, so every later lookup of it misses and its name is free again — and,
-/// being documented idempotent, a repeat (and a delete of an image this account no
-/// longer holds) still succeeds.
+/// being documented idempotent, a repeat WHILE the record still exists with that
+/// deletion in flight still succeeds and reports the same state. (What a delete
+/// addressed at a record that is already GONE answers is the refusal
+/// `gone_image_delete_refusal` owns.)
 #[tokio::test]
 async fn deleting_an_image_is_durable_and_idempotent() {
     let router = emulator();
@@ -205,19 +207,6 @@ async fn deleting_an_image_is_durable_and_idempotent() {
             "case {case:?}: expected an empty page, got {listed}"
         );
 
-        // "deleting an image that has already been deleted succeeds without error".
-        let (status, gone) = delete_image(&router, identifier).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: deleting an already-deleted image must succeed, got {status} {gone}"
-        );
-        assert_eq!(
-            gone["state"].as_str(),
-            Some("DELETED"),
-            "case {case:?}: an image this account no longer holds is DELETED, got {:?}",
-            gone["state"]
-        );
-
         // The name is free again, which is what "a subsequent create reusing the name"
         // needs: nothing of the deleted image is left to collide with.
         let (status, recreated) = call(
@@ -233,22 +222,6 @@ async fn deleting_an_image_is_durable_and_idempotent() {
         );
     }
 
-    // An identifier this account never held is the same success — in either form.
-    for (case, identifier) in [
-        ("a name that was never created", "never-existed".to_string()),
-        ("an ARN that was never minted", expected_image_arn("never-minted")),
-    ] {
-        let (status, body) = delete_image(&router, &identifier).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: an idempotent delete must succeed, got {status} {body}"
-        );
-        assert_eq!(
-            body["state"].as_str(),
-            Some("DELETED"),
-            "case {case:?}: expected DELETED, got {body}"
-        );
-    }
 }
 
 /// RULE: a lookup on these paths that resolves nothing answers 404

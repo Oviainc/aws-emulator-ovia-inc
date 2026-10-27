@@ -37,6 +37,8 @@ mod license_servers_behind_an_endpoint;
 mod list_instances;
 #[path = "all/optional_settings_registration.rs"]
 mod optional_settings_registration;
+#[path = "all/product_subscription_teardown.rs"]
+mod product_subscription_teardown;
 #[path = "all/refusals.rs"]
 mod refusals;
 #[path = "all/registration_pair_resolution_is_shared.rs"]

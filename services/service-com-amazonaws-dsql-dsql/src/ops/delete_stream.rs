@@ -293,13 +293,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.tokens(crate::state::TokenScope::DeleteStream).record(
                 token,
                 fingerprint,
-                crate::state::RecordedCall::new(&deleted.stream_identifier)
-                    .answering(crate::state::STATUS_MEMBER, &deleted.status)
-                    .answering(crate::state::ARN_MEMBER, &deleted.arn)
-                    .answering(
-                        crate::state::CREATION_TIME_MEMBER,
-                        &crate::state::encode_instant(creation_time),
-                    ),
+                crate::state::RecordedDelete {
+                    resource: deleted.stream_identifier.clone(),
+                    arn: deleted.arn.clone(),
+                    status: deleted.status.clone(),
+                    creation_time,
+                }
+                .into_record(),
             );
         }
         Ok(deleted)
@@ -324,23 +324,24 @@ fn delete_stream_output(
 
 /// The answer a recorded `DeleteStream` call gave, rendered for its retry.
 ///
-/// The stream's own members come from the record rather than from the store: the
-/// stream the recorded call deleted is, by the time a retry arrives, either on
-/// its way out or gone, and neither its current status nor its absence is what
-/// that request answered. The cluster is the one the retry addresses, which the
-/// fingerprint binds to the recorded call's own. `None` is a record missing a
-/// member it should hold — never an answer to serve.
+/// The stream's own members come from the record rather than from the store,
+/// through the one codec both deletes of this service share
+/// ([`crate::state::RecordedDelete`]): the stream the recorded call deleted is,
+/// by the time a retry arrives, either on its way out or gone, and neither its
+/// current status nor its absence is what that request answered. The cluster is
+/// the one the retry addresses, which the fingerprint binds to the recorded
+/// call's own. `None` is a record missing a member it should hold — never an
+/// answer to serve.
 fn recorded_delete_output(
     cluster_identifier: &str,
     recorded: &crate::state::RecordedCall,
 ) -> Option<DeleteStreamOutput> {
+    let answered = crate::state::RecordedDelete::from_record(recorded)?;
     Some(DeleteStreamOutput {
         cluster_identifier: cluster_identifier.to_string(),
-        stream_identifier: recorded.resource.clone(),
-        arn: recorded.answered(crate::state::ARN_MEMBER)?.to_string(),
-        status: recorded.answered(crate::state::STATUS_MEMBER)?.to_string(),
-        creation_time: ::aws_smithy_types::DateTime::from(crate::state::decode_instant(
-            recorded.answered(crate::state::CREATION_TIME_MEMBER)?,
-        )?),
+        stream_identifier: answered.resource,
+        arn: answered.arn,
+        status: answered.status,
+        creation_time: ::aws_smithy_types::DateTime::from(answered.creation_time),
     })
 }

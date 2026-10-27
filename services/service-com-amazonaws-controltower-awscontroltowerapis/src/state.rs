@@ -730,6 +730,32 @@ pub struct EnabledControl {
     ///
     /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
     pub pending_update: Option<PendingEnabledControlUpdate>,
+    /// The teardown a `DISABLE_CONTROL` still in flight will complete, or `None` while no
+    /// disable is running. [`settle`] removes the enablement once the clock makes it due,
+    /// so the resource stops existing when the asynchronous teardown completes and not
+    /// when the call that asked for it returned.
+    ///
+    /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+    pub pending_deletion: Option<PendingEnabledControlDeletion>,
+}
+
+/// A control teardown a `DISABLE_CONTROL` has started and the clock has not yet made due.
+///
+/// `DisableControl` "starts an asynchronous operation that deletes Amazon Web Services
+/// resources on the specified organizational unit and the accounts it contains", so the
+/// enablement does not disappear when that call returns: it stays a reportable resource,
+/// `UNDER_CHANGE`, until [`settle`] removes it at `due_at` — the same instant the
+/// `DISABLE_CONTROL` record reaches its terminal status.
+///
+/// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
+#[derive(Debug, Clone)]
+pub struct PendingEnabledControlDeletion {
+    /// The `DISABLE_CONTROL` operation whose completion removes the enablement.
+    pub operation_identifier: String,
+    /// The instant the clock owes this removal — the same instant that operation becomes
+    /// due, held here so applying it never depends on the operation's record still being
+    /// in the (bounded) log. Stored, never slept on.
+    pub due_at: SystemTime,
 }
 
 /// A configuration `UpdateEnabledControl` accepted and the clock has yet to apply.
@@ -1153,6 +1179,38 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             };
         }
 
+        // A DISABLE_CONTROL the clock has made due has finished tearing its
+        // `EnabledControl` down, so the resource is gone whether or not anybody called;
+        // its operation record stays, and still resolves. The due instant is the pending
+        // teardown's OWN, not read back off the operation log, for the same reason a
+        // landing zone's decommissioning carries its own: `enforce_log_bound` evicts the
+        // oldest in-flight record when every record is in flight, and a missing record
+        // must not be read as "due" and remove a resource the clock does not owe yet. A
+        // teardown whose own record FAILED removed nothing, so the enablement stays —
+        // the same reading the pending update below gives a failed operation.
+        let operations = &self.control_operations;
+        let torn_down: Vec<String> = self
+            .enabled_controls
+            .iter()
+            .filter(|(_, control)| {
+                control.pending_deletion.as_ref().is_some_and(|pending| {
+                    now >= pending.due_at
+                        && !operations
+                            .get(&pending.operation_identifier)
+                            .is_some_and(|operation| {
+                                operation.status == ControlOperationStatus::Failed
+                            })
+                })
+            })
+            .map(|(arn, _)| arn.clone())
+            .collect();
+        for arn in torn_down {
+            self.enabled_controls.remove(&arn);
+            // A tag entry never outlives the resource it tags, which is what keeps the tag
+            // map bounded by the resource stores.
+            self.tags.remove(&arn);
+        }
+
         // An UPDATE_ENABLED_CONTROL the clock has made due has finished applying the
         // configuration it carried, so those parameters are the control's whether or not
         // anybody called. The due instant is the pending change's OWN, not read back off
@@ -1414,6 +1472,23 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             .map(|pending| pending.operation_identifier.clone())
     }
 
+    /// The `operationIdentifier` of the `DELETE` still decommissioning the landing zone
+    /// `arn` names, or `None` when that landing zone is not being decommissioned. Call
+    /// [`settle`] first.
+    ///
+    /// Read off the parked removal rather than the operation log, for the same reason
+    /// `settle` derives the status from it: `enforce_log_bound` can evict the `DELETE`
+    /// record while the removal the clock owes is still parked, and the identifier a
+    /// repeated delete reports must be the one that removal carries.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn deletion_in_flight_on(&self, arn: &str) -> Option<String> {
+        self.landing_zones
+            .get(arn)
+            .and_then(|landing_zone| landing_zone.pending_deletion.as_ref())
+            .map(|pending| pending.operation_identifier.clone())
+    }
+
     /// Start a `DELETE` against the landing zone `arn` names, parking its removal for
     /// [`settle`] to apply once the clock makes it due, and return the operation's
     /// `operationIdentifier`.
@@ -1563,6 +1638,49 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         control.drift_status = DriftStatus::Unknown;
         control.inheritance_drift_status = DriftStatus::Unknown;
         control.resource_drift_status = DriftStatus::Unknown;
+        Some(operation_identifier)
+    }
+
+    /// Start a `DISABLE_CONTROL` against the control `arn` names, parking its removal for
+    /// [`settle`] to apply once the clock makes it due, and return the operation's
+    /// `operationIdentifier`.
+    ///
+    /// The enablement stays in the store, `UNDER_CHANGE`, until that instant: the teardown
+    /// is asynchronous, so while it runs the control is still a resource a reporting call
+    /// reports and a second mutating call collides with. It deploys no configuration, so
+    /// unlike an update or a reset it parks no parameters — what it parks is the removal.
+    ///
+    /// `None` when `arn` names no stored control, so a handler answers the modelled
+    /// `ResourceNotFoundException` and NOTHING is written.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn record_enabled_control_disable(&mut self, arn: &str, now: SystemTime) -> Option<String> {
+        let (control_identifier, target_identifier) = self.enabled_controls.get(arn).map(|control| {
+            (
+                control.control_identifier.clone(),
+                control.target_identifier.clone(),
+            )
+        })?;
+
+        let operation_identifier = self.record_control_operation(
+            ControlOperationType::DisableControl,
+            &control_identifier,
+            &target_identifier,
+            arn,
+            now,
+        );
+        let control = self.enabled_controls.get_mut(arn)?;
+        // ONE instant, held in both places that need it: the status the control reports
+        // while the teardown runs is owed at the same moment as the removal itself, so the
+        // two cannot drift apart.
+        let due_at = now + OPERATION_SETTLE_AFTER;
+        control.status = EnablementStatus::UnderChange;
+        control.last_operation_identifier = operation_identifier.clone();
+        control.due_at = due_at;
+        control.pending_deletion = Some(PendingEnabledControlDeletion {
+            operation_identifier: operation_identifier.clone(),
+            due_at,
+        });
         Some(operation_identifier)
     }
 

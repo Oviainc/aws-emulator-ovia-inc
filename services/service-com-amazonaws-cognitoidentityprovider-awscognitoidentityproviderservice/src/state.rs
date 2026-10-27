@@ -1319,22 +1319,6 @@ impl RiskConfiguration {
     }
 }
 
-/// The configuration a level that nothing has ever configured reports: the level
-/// itself, with no setting and no modification instant — nothing was modified
-/// there, so there is no "date and time when the item was modified" to report.
-/// `RiskConfiguration` is a modelled required member of both responses that carry
-/// it, so the level is named even where it holds nothing.
-pub fn unconfigured_risk_configuration_type(
-    user_pool_id: &str,
-    client_id: Option<&str>,
-) -> RiskConfigurationType {
-    RiskConfigurationType {
-        user_pool_id: Some(user_pool_id.to_string()),
-        client_id: client_id.map(str::to_string),
-        ..RiskConfigurationType::default()
-    }
-}
-
 impl UserPool {
     /// The token issuer for this pool: the regional user-pool endpoint.
     pub fn issuer(&self) -> String {

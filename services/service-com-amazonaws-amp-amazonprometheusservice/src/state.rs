@@ -1864,6 +1864,19 @@ pub fn query_logging_metadata(
     }
 }
 
+/// The `ScraperLoggingConfigurationStatus` a stored scraper logging configuration
+/// reports — the one derivation every reader and writer of that configuration answers
+/// with, exactly as [`query_logging_status`] is for a workspace's query logging
+/// configuration.
+pub fn scraper_logging_status(
+    configuration: &ScraperLoggingConfiguration,
+) -> crate::ops::types::ScraperLoggingConfigurationStatus {
+    crate::ops::types::ScraperLoggingConfigurationStatus {
+        status_code: configuration.status_code.clone(),
+        status_reason: configuration.status_reason.clone(),
+    }
+}
+
 // =============================================================================
 // The media type this service answers in
 // =============================================================================

@@ -170,6 +170,11 @@ async fn a_start_naming_a_custom_resource_this_account_lacks_is_refused() {
             .call(row.create, (row.create_request)(&name))
             .await
             .ok(&format!("{case}: {}", row.create));
+        // A held custom vocabulary is applicable only once its build has finished:
+        // READY is what makes one usable.
+        if row.create == "CreateVocabulary" {
+            transcribe.vocabulary_ready(&name, None).await;
+        }
         let held = format!("held-job-{index}");
         transcribe
             .call("StartCallAnalyticsJob", start_request(&held, &settings))
@@ -247,11 +252,13 @@ async fn a_name_held_only_in_another_family_does_not_satisfy_a_start() {
             .refused(case, 400, "BadRequestException");
     }
 
-    // Recorded in the family the member reads, the same name is accepted.
+    // Recorded in the family the member reads, the same name is accepted — once its
+    // build has finished, which is what makes a custom vocabulary usable.
     transcribe
         .call("CreateVocabulary", vocabulary_create(name))
         .await
         .ok("CreateVocabulary shared-name");
+    transcribe.vocabulary_ready(name, None).await;
     transcribe
         .call(
             "StartCallAnalyticsJob",

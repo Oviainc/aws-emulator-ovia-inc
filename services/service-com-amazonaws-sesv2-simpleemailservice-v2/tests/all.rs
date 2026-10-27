@@ -23,6 +23,8 @@ mod account_suppression_attributes;
 mod configuration_set_event_destinations;
 #[path = "all/configuration_set_event_publication_surface.rs"]
 mod configuration_set_event_publication_surface;
+#[path = "all/configuration_set_sns_event_destinations.rs"]
+mod configuration_set_sns_event_destinations;
 #[path = "all/configuration_sets.rs"]
 mod configuration_sets;
 #[path = "all/contact_lists.rs"]
