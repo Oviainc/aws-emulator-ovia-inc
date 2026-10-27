@@ -127,6 +127,11 @@ async fn publish_placed(router: &MultiServiceRouter, name: &str, row: &Row) {
                 "MetricName": METRIC,
                 "Dimensions": [{"Name": "Case", "Value": name}],
                 "Value": datum.value,
+                // A high-resolution series: a sub-minute period reads only data stored at that
+                // resolution ("Data points with a period of 10 seconds are available only for
+                // custom metrics defined with a StorageResolution of 1"), because regular
+                // resolution stores a datapoint at 1-minute granularity.
+                "StorageResolution": 1,
                 "Timestamp": start + period / 2.0,
             })
         })
