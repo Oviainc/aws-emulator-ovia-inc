@@ -960,31 +960,38 @@ impl Invoice {
 /// The scope a `ListAgreementInvoiceLineItems` page token belongs to: the whole
 /// query, so a token cannot resume a different listing.
 ///
-/// Every part is length-prefixed by [`query_scope`], so no value a caller
-/// supplies can imitate the delimiters and make two different listings hash
-/// alike.
+/// Every part is length-prefixed by [`query_scope`], and the minting operation
+/// is a part too ([`listing_scope`]), so no value a caller supplies can imitate
+/// the delimiters and make two different listings hash alike.
+///
+/// `issued` is the ONE window the request's two issued-time bounds name, as the
+/// handler reads them: after, then before.
 pub fn invoice_line_item_scope(
+    operation: &str,
     agreement_id: &str,
     group_by: &str,
     invoice_id: Option<&str>,
     invoice_type: Option<&str>,
     billing_period: Option<&InvoiceBillingPeriod>,
-    issued_after: Option<f64>,
-    issued_before: Option<f64>,
+    issued: (Option<f64>, Option<f64>),
 ) -> String {
     let instant = |bound: Option<f64>| bound.map(|secs| format!("{secs:?}")).unwrap_or_default();
     let period = billing_period
         .map(|period| format!("{}/{}", period.month, period.year))
         .unwrap_or_default();
-    query_scope(&[
-        agreement_id,
-        group_by,
-        invoice_id.unwrap_or_default(),
-        invoice_type.unwrap_or_default(),
-        &period,
-        &instant(issued_after),
-        &instant(issued_before),
-    ])
+    let (issued_after, issued_before) = issued;
+    listing_scope(
+        operation,
+        &[
+            agreement_id,
+            group_by,
+            invoice_id.unwrap_or_default(),
+            invoice_type.unwrap_or_default(),
+            &period,
+            &instant(issued_after),
+            &instant(issued_before),
+        ],
+    )
 }
 
 /// `Timing`'s values (`TIMING_VALUES` in `types`), with the meaning
@@ -2949,10 +2956,11 @@ impl BillingAdjustmentRequest {
 /// The scope a `ListBillingAdjustmentRequests` page token belongs to: the whole
 /// query, so a token cannot resume a different listing.
 ///
-/// Every part is length-prefixed by [`query_scope`], so no value a caller
-/// supplies can imitate the delimiters and make two different listings hash
-/// alike.
+/// Every part is length-prefixed by [`query_scope`], and the minting operation
+/// is a part too ([`listing_scope`]), so no value a caller supplies can imitate
+/// the delimiters and make two different listings hash alike.
 pub fn billing_adjustment_scope(
+    operation: &str,
     agreement_id: Option<&str>,
     status: Option<&str>,
     catalog: Option<&str>,
@@ -2961,14 +2969,17 @@ pub fn billing_adjustment_scope(
     created_before: Option<f64>,
 ) -> String {
     let instant = |bound: Option<f64>| bound.map(|secs| format!("{secs:?}")).unwrap_or_default();
-    query_scope(&[
-        agreement_id.unwrap_or_default(),
-        status.unwrap_or_default(),
-        catalog.unwrap_or_default(),
-        agreement_type.unwrap_or_default(),
-        &instant(created_after),
-        &instant(created_before),
-    ])
+    listing_scope(
+        operation,
+        &[
+            agreement_id.unwrap_or_default(),
+            status.unwrap_or_default(),
+            catalog.unwrap_or_default(),
+            agreement_type.unwrap_or_default(),
+            &instant(created_after),
+            &instant(created_before),
+        ],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3268,22 +3279,41 @@ pub fn matches_filters(agreement: &Agreement, filters: &[Filter]) -> bool {
     })
 }
 
-/// The scope a page token belongs to: every part of the query that selects what
-/// the page indexes into, each part length-prefixed by [`counted`] so no value a
-/// caller supplies can imitate the delimiters and make two different queries
+/// The concatenation of `parts`, each length-prefixed by [`counted`] so no value
+/// a caller supplies can imitate the delimiters and make two different queries
 /// hash alike.
 ///
-/// The one spelling of that rule: every page-token scope in this module —
-/// [`search_scope`], [`payment_request_scope`], [`charge_scope`],
-/// [`billing_adjustment_scope`] and [`invoice_line_item_scope`] — builds its
-/// scope from it.
+/// The one spelling of that rule: every page-token scope in this module is built
+/// from it, through [`listing_scope`].
 pub fn query_scope(parts: &[&str]) -> String {
     parts.iter().copied().map(counted).collect()
+}
+
+/// The scope a page token belongs to: the OPERATION that minted it, then every
+/// parameter of the call that selects what the page indexes into.
+///
+/// `operation` is the minting operation's name (`Self::NAME` in a handler). It
+/// is part of the scope because two operations paginate two different sequences
+/// even when they take the same selectors: without it, two listings whose
+/// selector parts coincide would hash alike, and a token minted by one would be
+/// accepted by the other as a raw offset into a sequence it never indexed.
+///
+/// The one spelling of that rule: every page-token scope in this module —
+/// [`search_scope`], [`submitted_request_scope`], [`charge_scope`],
+/// [`billing_adjustment_scope`], [`invoice_line_item_scope`] and the
+/// agreement-keyed scopes of `GetAgreementTerms` and `GetAgreementEntitlements` —
+/// is built from it.
+pub fn listing_scope(operation: &str, selectors: &[&str]) -> String {
+    let mut parts = Vec::with_capacity(selectors.len() + 1);
+    parts.push(operation);
+    parts.extend_from_slice(selectors);
+    query_scope(&parts)
 }
 
 /// The scope a `SearchAgreements` page token belongs to: the whole query, so a
 /// token cannot resume a different search.
 pub fn search_scope(
+    operation: &str,
     catalog: Option<&str>,
     filters: &[Filter],
     sort_by: &str,
@@ -3304,54 +3334,70 @@ pub fn search_scope(
         })
         .collect();
     pairs.sort();
-    query_scope(&[
-        catalog.unwrap_or_default(),
-        sort_by,
-        sort_order,
-        &pairs.join(""),
-    ])
+    listing_scope(
+        operation,
+        &[
+            catalog.unwrap_or_default(),
+            sort_by,
+            sort_order,
+            &pairs.join(""),
+        ],
+    )
 }
 
-/// The scope a `ListAgreementPaymentRequests` page token belongs to: every
-/// parameter that selects which payment requests the list reports, so a token
-/// minted for one list cannot resume another.
+/// The scope a page token of a listing over seller-submitted requests belongs
+/// to — `ListAgreementPaymentRequests` and `ListAgreementCancellationRequests`,
+/// which take the same five selectors over the same two kinds of request
+/// ([`submitted_request_party_matches`] decides the party for both).
 ///
-/// Built from [`query_scope`] like every other scope in this module, so no value
-/// a caller supplies can imitate the delimiters and make two different listings
-/// hash alike.
-pub fn payment_request_scope(
+/// Every parameter that selects which requests the list reports is a part, so a
+/// token minted for one query cannot resume another, and `operation` is a part
+/// too, so the two listings never hash alike however their selectors line up.
+///
+/// Built from [`listing_scope`] like every other scope in this module, so no
+/// value a caller supplies can imitate the delimiters and make two different
+/// listings hash alike.
+pub fn submitted_request_scope(
+    operation: &str,
     party_type: &str,
     agreement_id: Option<&str>,
     agreement_type: Option<&str>,
     catalog: Option<&str>,
     status: Option<&str>,
 ) -> String {
-    query_scope(&[
-        party_type,
-        agreement_id.unwrap_or_default(),
-        agreement_type.unwrap_or_default(),
-        catalog.unwrap_or_default(),
-        status.unwrap_or_default(),
-    ])
+    listing_scope(
+        operation,
+        &[
+            party_type,
+            agreement_id.unwrap_or_default(),
+            agreement_type.unwrap_or_default(),
+            catalog.unwrap_or_default(),
+            status.unwrap_or_default(),
+        ],
+    )
 }
 
 /// The scope a `ListAgreementCharges` page token belongs to: every parameter
 /// that selects which charges the list reports, so a token minted for one list
 /// cannot resume another.
 ///
-/// Built from [`query_scope`] like every other scope in this module, so no value
-/// a caller supplies can imitate the delimiters and make two different listings
-/// hash alike.
+/// Built from [`listing_scope`] like every other scope in this module, so no
+/// value a caller supplies can imitate the delimiters and make two different
+/// listings hash alike.
 pub fn charge_scope(
+    operation: &str,
     agreement_id: Option<&str>,
     agreement_type: Option<&str>,
     catalog: Option<&str>,
 ) -> String {
-    query_scope(&[
-        agreement_id.unwrap_or_default(),
-        agreement_type.unwrap_or_default(),
-        catalog.unwrap_or_default(),
-    ])
+    listing_scope(
+        operation,
+        &[
+            agreement_id.unwrap_or_default(),
+            agreement_type.unwrap_or_default(),
+            catalog.unwrap_or_default(),
+        ],
+    )
 }
 
 // ---------------------------------------------------------------------------
