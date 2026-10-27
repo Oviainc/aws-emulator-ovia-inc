@@ -298,6 +298,9 @@ fn token_rejected(
     match rejection {
         crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
         crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::MissingRequiredScopes => {
+            not_authorized(crate::state::MISSING_REQUIRED_SCOPES_MESSAGE)
+        }
         crate::state::TokenRejection::PoolGone => {
             GetUserAttributeVerificationCodeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

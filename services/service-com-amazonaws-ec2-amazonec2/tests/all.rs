@@ -23,6 +23,12 @@ mod prefix_lists;
 // neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/address_attribute_reset.rs"]
 mod address_attribute_reset;
+// What `AllocateHosts` writes: how many hosts one call mints, the configuration each of them
+// carries, and that an earlier call's hosts are left as stored. Declared here rather than in
+// sorted position, for the reason the note above gives — the sorted neighbourhood is the
+// contended region of this file.
+#[path = "all/allocate_hosts.rs"]
+mod allocate_hosts;
 // What a delete does to the state behind it: the dependency refusals and the reads of a
 // resource that is gone. Declared here rather than in sorted position, for the reason the
 // note above gives — the sorted neighbourhood is the contended region of this file.

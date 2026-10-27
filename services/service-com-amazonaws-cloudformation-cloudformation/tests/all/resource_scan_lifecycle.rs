@@ -559,6 +559,11 @@ async fn the_refusals_around_a_resource_scan() {
         "ResourceScanNotFound",
         "case {case:?}: expected the modelled not-found refusal, got {body}"
     );
+    assert_eq!(
+        xml_text(&body, "Message").as_deref(),
+        Some(scans::NOT_FOUND),
+        "case {case:?}: expected the sentence that refusal carries, got {body}"
+    );
 
     // A filter may carry the wildcard "at only the end of the string"; one that places it
     // anywhere else is refused, and leaves no scan behind — which the calls after it show, by

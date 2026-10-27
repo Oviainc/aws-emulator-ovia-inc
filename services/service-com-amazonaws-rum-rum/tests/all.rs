@@ -25,6 +25,8 @@ mod batch_create_metric_definitions_targeting;
 mod batch_delete_metric_definitions;
 #[path = "all/batch_get_metric_definitions_reads.rs"]
 mod batch_get_metric_definitions_reads;
+#[path = "all/constraint_refusals.rs"]
+mod constraint_refusals;
 #[path = "all/create_app_monitor_tags.rs"]
 mod create_app_monitor_tags;
 #[path = "all/cw_log_delivery.rs"]

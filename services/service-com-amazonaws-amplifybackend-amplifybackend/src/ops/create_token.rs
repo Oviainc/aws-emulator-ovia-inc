@@ -182,11 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::mint_challenge_token(ctx.credential_store())
         else {
             return Err(CreateTokenErrorModeled::GatewayTimeoutException(
-                GatewayTimeoutException {
-                    message: Some(
-                        "the emulator minted no challenge code for this request".to_string(),
-                    ),
-                },
+                crate::state::gateway_timeout(crate::state::CHALLENGE_CODE_UNAVAILABLE_SENTENCE),
             )
             .into());
         };

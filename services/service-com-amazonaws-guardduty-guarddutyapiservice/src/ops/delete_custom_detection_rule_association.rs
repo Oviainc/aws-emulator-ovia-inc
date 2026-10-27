@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCustomDetectionRuleAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCustomDetectionRuleAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCustomDetectionRuleAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the custom detection rule association the two URI labels
+//! identify — "disables a custom detection rule by deleting its association"
+//! (`smithy_query(query="doc",shape="DeleteCustomDetectionRuleAssociation")`) — so a
+//! later `GetCustomDetectionRuleAssociation` answers the modelled
+//! `ResourceNotFoundException`, the list no longer reports it and the `(RuleId, Mode)`
+//! pair it held is free to associate again. An `(AssociationId, RuleId)` pair this
+//! account holds no association for is refused with that same modelled 404, the class
+//! the read and the update bound at this URI answer for the same absence.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +140,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCustomDetectionRuleAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCustomDetectionRuleAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteCustomDetectionRuleAssociationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        let mut state = state.lock();
+
+        // The association is selected by the two URI labels, `RuleId` and
+        // `AssociationId`, exactly the binding the read and the update bound at this
+        // same URI use
+        // (`smithy_query(operation="DeleteCustomDetectionRuleAssociation,GetCustomDetectionRuleAssociation")`).
+        // Both carry their own length and pattern constraints, refused at the request
+        // boundary, so reaching here means only the association's EXISTENCE is open.
+        // The store keys an association by `(region, RuleId, Mode)`, so the mode the
+        // record carries is what names the entry to take out.
+        let Some(mode) = state
+            .detection_rule_association_by_id(&region, &input.rule_id, &input.association_id)
+            .map(|record| record.mode.clone())
+        else {
+            // The pair resolves to nothing, so there is nothing to disable: the
+            // modelled 404, the same class and message a read of that pair answers,
+            // so "never associated", "associated through another Region's endpoint"
+            // and "already deleted" are one refusal and no caller can tell them
+            // apart. This is what `@idempotent` on this DELETE
+            // (`smithy_query(operation="DeleteCustomDetectionRuleAssociation")`)
+            // means observably — a replay removes nothing more and leaves the same
+            // store — and never a hollow success for a resource the account does not
+            // hold, which the modelled `ResourceNotFoundException` is there to
+            // report.
+            return Err(not_found());
+        };
+
+        // Dropping the one entry that key names is the whole delete: an association
+        // owns nothing else, its tags and the `ClientToken` the create carried live ON
+        // the record, so removing it retires that idempotency mapping with it and no
+        // token is left resolving to an association the store no longer holds. The
+        // account's ORGANIZATION configuration for the same `(RuleId, Mode)` pair is a
+        // different resource in a store of its own, so it is untouched, and the
+        // published rule itself is GuardDuty's catalogue entry rather than this
+        // account's, so it stands too.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCustomDetectionRuleAssociation"))
+        // The `else` is DEFENSIVE and not a refusal path a caller can reach: the
+        // lookup above already resolved the record, and every record is held under the
+        // key its own `(region, rule_id, mode)` fields give.
+        if state
+            .custom_detection_rule_associations
+            .remove(&(region, input.rule_id, mode))
+            .is_none()
+        {
+            debug_assert!(
+                false,
+                "an association resolved by id must be held under its own (region, rule, mode) key"
+            );
+            return Err(not_found());
+        }
+
+        // `DeleteCustomDetectionRuleAssociationResponse` declares no members
+        // (`smithy_query(operation="DeleteCustomDetectionRuleAssociation")`): the
+        // removal is observed through `GetCustomDetectionRuleAssociation` and
+        // `ListCustomDetectionRuleAssociations`.
+        Ok(DeleteCustomDetectionRuleAssociationOutput {})
     }
+}
+
+/// The error CLASS a delete of an association this account does not hold is named by
+/// on the wire — the modelled 404
+/// (`smithy_query(operation="DeleteCustomDetectionRuleAssociation")`), so it is
+/// answered as the modelled shape rather than under the `BadRequestException`
+/// envelope this service's 400s use.
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// Refuse an `(AssociationId, RuleId)` pair this account holds no association for
+/// with the modelled 404, carrying the message a read of the same absence answers
+/// with: the two name the same missing resource, so they cannot describe it
+/// differently.
+fn not_found() -> DeleteCustomDetectionRuleAssociationError {
+    DeleteCustomDetectionRuleAssociationErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(crate::state::detection_rule_association_not_found_message()),
+            // "The error type" (`smithy_query(shape="ResourceNotFoundException")`):
+            // the class, the same value the body's `__type` carries.
+            r#type: Some(RESOURCE_NOT_FOUND_EXCEPTION.to_string()),
+        },
+    )
+    .into()
 }
