@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateIamInstanceProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateIamInstanceProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateIamInstanceProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Associates an IAM instance profile with a running or stopped instance": this operation
+//! WRITES one association into
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::iam_instance_profile_associations`] — the
+//! instance the request names, the profile it names, and the `associating` state the clock
+//! then moves to `associated` — so the instance runs as that profile until something takes
+//! it away. "You cannot associate more than one IAM instance profile with an instance", so
+//! an instance that already holds one is refused, as is an instance id this account holds no
+//! instance for and a profile reference naming neither an ARN nor a name. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -133,18 +134,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateIamInstanceProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateIamInstanceProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateIamInstanceProfile"))
+        // `ctx` carries request metadata only, and nothing an association reports is a fact
+        // of the Region (`IamInstanceProfileAssociation` carries no Region member), so this
+        // operation reads none of it. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        // "The IAM instance profile" (`AssociateIamInstanceProfileRequest$IamInstanceProfile`)
+        // is read BEFORE the store is touched, so a request that names no profile this
+        // service can act on is refused without the store being locked.
+        let iam_instance_profile =
+            crate::state::resolve_iam_instance_profile(&input.iam_instance_profile)?;
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // The clock-owed moves this call must see before it decides: an instance whose own
+        // launch or stop has fallen due is in the state that move left it in, and an
+        // association whose disassociation span has run out is GONE — so the instance it was
+        // over can be given a profile again.
+        store.materialize_due_transitions();
+
+        // "The ID of the instance" (`AssociateIamInstanceProfileRequest$InstanceId`): an id
+        // this account holds no instance for is refused the way every operation of this
+        // crate that resolves ONE instance refuses it.
+        crate::state::require_known_instance(&store, &input.instance_id)?;
+
+        // "You cannot associate more than one IAM instance profile with an instance"
+        // (`AssociateIamInstanceProfile`), so an instance that already holds an association
+        // is refused rather than given a second one.
+        if let Some(existing) = store.iam_instance_profile_association_over(&input.instance_id) {
+            if existing.state.as_deref()
+                != Some(crate::state::IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_DISASSOCIATING)
+            {
+                return Err(crate::state::existing_iam_instance_profile_association(
+                    &input.instance_id,
+                ));
+            }
+        }
+
+        // The association is recorded in the non-terminal `associating` state the clock then
+        // moves to `associated`, so a caller that reads straight after this call still sees
+        // the transient state.
+        let association = store
+            .insert_iam_instance_profile_association(
+                crate::state::IamInstanceProfileAssociationSpec {
+                    instance_id: input.instance_id.clone(),
+                    iam_instance_profile,
+                },
+            )
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::request_limit_exceeded(format!(
+                    "This emulator holds {} IAM instance profile associations, which is as \
+                     many as it stores",
+                    crate::state::MAX_IAM_INSTANCE_PROFILE_ASSOCIATIONS
+                ))
+            })?;
+
+        Ok(AssociateIamInstanceProfileOutput {
+            iam_instance_profile_association: Some(association),
+        })
     }
 }

@@ -158,6 +158,10 @@ pub mod paths {
         "/configuration/cognitoUserPoolConfiguration/userPoolArn";
     /// An authorization request's `principal`.
     pub const PRINCIPAL: &str = "/principal";
+    /// The access token an authorization call takes its principal from.
+    pub const ACCESS_TOKEN: &str = "/accessToken";
+    /// The identity token an authorization call takes its principal from.
+    pub const IDENTITY_TOKEN: &str = "/identityToken";
     /// An authorization request's `action`.
     pub const ACTION: &str = "/action";
     /// An authorization request's `resource`.

@@ -23,8 +23,17 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # `json_document::minified`: the ONE minification of a JSON document a service takes
 # as an opaque string member and reports back, which this service's stored Cedar
-# schema document is.
+# schema document is. `jwt::read` / `jwt::verify`: the ONE reading of a compact JWS and
+# the ONE check of its signature against the key set its issuer published, which
+# `IsAuthorizedWithToken` takes its principal out of.
 service-common = { path = "../common" }
+# The Amazon Cognito user pools an identity source references live in that service's
+# own state in this same shared engine, and a user pool PUBLISHES the key set its
+# tokens are verified against (`<issuer>/.well-known/jwks.json`). An authorization call
+# that takes its principal from such a token has to check the token's signature against
+# that key set, so it is read from the service that owns it — this emulator fetches
+# nothing from outside itself. Only the pool's PUBLIC key parameters are read.
+service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice = { workspace = true }
 # Hex codec for the opaque ListPolicies pagination cursor.
 hex = { workspace = true }
 # The Cedar policy language itself: parses the Cedar policy text this service

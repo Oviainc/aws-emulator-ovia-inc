@@ -217,18 +217,22 @@ enum ControlArnRef<'a> {
 
 impl<'a> ControlArnRef<'a> {
     /// Read an ARN as the control it names, or `None` when it names none.
+    ///
+    /// The global catalog form is read by [`catalog_identifier`] — the one helper every
+    /// caller of a catalog ARN goes through, [`canonical_catalog_arn`] included — so what
+    /// a global `controlcatalog` ARN names is decided in a single place for this
+    /// resolution and for every list filter alike. What is left here is the namespace
+    /// this type genuinely owns: `controltower`, whose ARNs do carry the Region the
+    /// control was enabled in.
     fn parse(arn: &'a str) -> Option<Self> {
+        if let Some(identifier) = catalog_identifier("control", arn) {
+            return Some(Self::Catalog(identifier));
+        }
         let parsed = AccountlessArn::parse(arn)?;
-        let identifier = parsed.resource.strip_prefix("control/")?;
-        if identifier.is_empty() {
+        if parsed.service != "controltower" {
             return None;
         }
-        match parsed.service {
-            // The global catalog form carries no Region segment.
-            "controlcatalog" if parsed.region.is_empty() => Some(Self::Catalog(identifier)),
-            "controltower" => Some(Self::ControlTower(identifier)),
-            _ => None,
-        }
+        kind_identifier("control", parsed.resource).map(Self::ControlTower)
     }
 }
 
@@ -337,8 +341,18 @@ fn catalog_identifier<'a>(kind: &str, arn: &'a str) -> Option<&'a str> {
     if parsed.service != "controlcatalog" || !parsed.region.is_empty() {
         return None;
     }
-    let identifier = parsed
-        .resource
+    kind_identifier(kind, parsed.resource)
+}
+
+/// The identifier an ARN's resource segment carries for `kind` — what follows `{kind}/`
+/// — or `None` when the segment names no resource of that kind, an empty identifier
+/// included.
+///
+/// The resource segment is read the same way in either namespace an accepted ARN can
+/// select, so both [`catalog_identifier`] and [`ControlArnRef::parse`]'s `controltower`
+/// branch read it through here.
+fn kind_identifier<'a>(kind: &str, resource: &'a str) -> Option<&'a str> {
+    let identifier = resource
         .strip_prefix(kind)
         .and_then(|rest| rest.strip_prefix('/'))?;
     (!identifier.is_empty()).then_some(identifier)

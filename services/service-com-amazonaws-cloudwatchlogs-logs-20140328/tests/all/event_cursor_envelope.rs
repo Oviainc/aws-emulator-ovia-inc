@@ -76,8 +76,14 @@ fn cursors(case: &str, page: &Value) -> ((String, bool), (String, bool)) {
     )
 }
 
-/// A group with one stream holding `count` events one second apart, named `event-<i>`.
-async fn stream_of(logs: &Logs, group: &str, count: usize) -> Vec<String> {
+/// A group with one stream holding `count` events one second apart, named `event-<i>`,
+/// returned with the base timestamp the first of them was stamped at.
+///
+/// A window a case means to place relative to those events is derived from THIS base: a
+/// second clock reading is a different instant, so a bound taken from one would sit a few
+/// milliseconds away from where the case means it, and `GetLogEvents` selects on the
+/// stored timestamps.
+async fn stream_of(logs: &Logs, group: &str, count: usize) -> (i64, Vec<String>) {
     group_with_stream(logs, group, "stream", None).await;
     let base = base_ms();
     let events: Vec<(i64, String)> = (0..count)
@@ -103,7 +109,10 @@ async fn stream_of(logs: &Logs, group: &str, count: usize) -> Vec<String> {
         )
         .await;
     }
-    events.into_iter().map(|(_, message)| message).collect()
+    (
+        base,
+        events.into_iter().map(|(_, message)| message).collect(),
+    )
 }
 
 /// Both cursors of every page carry their own direction prefix, the sentinel appears
@@ -116,7 +125,7 @@ async fn get_log_events_cursors_carry_their_direction_and_end_of_stream_envelope
         for limit in 1_usize..=3 {
             for from_head in [true, false] {
                 let logs = Logs::new();
-                let expected = stream_of(&logs, "envelope", count).await;
+                let (_, expected) = stream_of(&logs, "envelope", count).await;
                 let case = format!("{count} events, limit {limit}, startFromHead {from_head}");
 
                 // Where the first page starts: the head, or the last `limit` events.
@@ -201,7 +210,7 @@ async fn the_backward_cursor_walks_towards_older_events() {
     for count in 1_usize..=4 {
         for limit in 1_usize..=3 {
             let logs = Logs::new();
-            let expected = stream_of(&logs, "backward", count).await;
+            let (_, expected) = stream_of(&logs, "backward", count).await;
             let case = format!("{count} events, limit {limit}");
 
             let mut walked: Vec<String> = Vec::new();
@@ -337,9 +346,8 @@ async fn a_token_outside_the_envelope_is_refused() {
 #[tokio::test]
 async fn a_window_with_no_events_reports_the_zero_position() {
     let logs = Logs::new();
-    let expected = stream_of(&logs, "empty", 2).await;
+    let (base, expected) = stream_of(&logs, "empty", 2).await;
     group_with_stream(&logs, "empty-stream", "stream", None).await;
-    let base = base_ms();
 
     // An empty stream, and a window that excludes every event this stream holds.
     let cases: Vec<(&str, Value)> = vec![

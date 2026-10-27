@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The IAM instance profile an instance runs as: what the associate records, what the two
+// describes report of it, and what the disassociate takes away. Declared beside
+// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail
+// of this file are where every new ec2 suite inserts its lines.
+#[path = "all/iam_instance_profile_associations.rs"]
+mod iam_instance_profile_associations;
 // What `DeleteVolume` removes, what it refuses, and what a dry run of it performs. Declared
 // beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood is where
 // every new ec2 suite inserts its two lines.

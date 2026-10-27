@@ -277,19 +277,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A fresh id per creation, re-minted on the (vanishingly unlikely) chance the
         // digest already names a live configuration, so one ARN never denotes two of
-        // them — the uniqueness rule `CreateStage` applies to a minted stage ARN.
-        let sequence = store.next_sequence();
-        let mut arn = crate::state::ingest_configuration_arn(
-            &region,
-            &crate::state::mint_id(sequence, crate::state::INGEST_CONFIGURATION_ID_LEN),
+        // them — minted through the one place `crate::state` applies that rule.
+        let crate::state::MintedResource { sequence, arn, .. } = crate::state::mint_unique_arn(
+            &mut store,
+            crate::state::INGEST_CONFIGURATION_ID_LEN,
+            |configuration_id| crate::state::ingest_configuration_arn(&region, configuration_id),
+            |store, candidate| store.ingest_configurations.contains_key(candidate),
         );
-        while store.ingest_configurations.contains_key(&arn) {
-            let retry = store.next_sequence();
-            arn = crate::state::ingest_configuration_arn(
-                &region,
-                &crate::state::mint_id(retry, crate::state::INGEST_CONFIGURATION_ID_LEN),
-            );
-        }
 
         // The configuration's own participant id and ingest key, and — only when the
         // request asked for redundant ingest — the backup credentials beside them. Each

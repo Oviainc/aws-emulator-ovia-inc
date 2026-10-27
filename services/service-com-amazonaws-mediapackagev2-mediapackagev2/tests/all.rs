@@ -90,3 +90,5 @@ mod harvest_job_idempotency;
 mod multiview_channel_ingest;
 #[path = "all/quota_refusal_form.rs"]
 mod quota_refusal_form;
+#[path = "all/no_op_write_commits_nothing.rs"]
+mod no_op_write_commits_nothing;

@@ -65,6 +65,32 @@ pub(crate) fn element(body: &str, name: &str) -> String {
     opt_element(body, name).unwrap_or_else(|| panic!("no <{name}> element in {body}"))
 }
 
+/// The inner text of the first `<name …>…</name>` element, whose own tag MAY carry
+/// attributes.
+///
+/// [`opt_element`] matches the closing bracket as part of the tag, so it finds NOTHING for an
+/// element the serializer wrote with an attribute (`<Metadata xmlns="…">…`, which is how the
+/// awsQuery serializer writes a structure member). This reads from the tag's OWN closing
+/// bracket instead — the technique [`members_of`] uses for a list member — so a suite
+/// reading such an element scopes the read to it rather than falling back on "the first
+/// `<Name>` in the whole document". The tag matches only where the NAME ends, so
+/// `<MetadataEntry>` is not this element.
+pub(crate) fn block_of<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    let (open, close) = (format!("<{name}"), format!("</{name}>"));
+    let mut rest = body;
+    while let Some(at) = rest.find(&open) {
+        let after = &rest[at + open.len()..];
+        match after.chars().next() {
+            Some(next) if next == '>' || next == '/' || next.is_whitespace() => {
+                let (_, inner) = after.split_once('>')?;
+                return inner.split_once(close.as_str()).map(|(text, _)| text);
+            }
+            _ => rest = after,
+        }
+    }
+    None
+}
+
 /// The text of EVERY `<name>…</name>` element of an XML answer, in document order, with
 /// the five entities this emulator's XML serializer escapes decoded back — so a value that
 /// is itself a document (an attribute carrying JSON, a policy) compares as the service
@@ -161,6 +187,54 @@ mod tests {
             assert_eq!(
                 encoded, expected,
                 "case {case:?}: expected {expected:?}, got {encoded:?}"
+            );
+        }
+    }
+
+    /// The attribute-tolerant reader scopes the read to the element it names, over the tag
+    /// forms this emulator's awsQuery serializer writes: a bare tag, one carrying the
+    /// service's namespace attribute, and a tag whose name is a PREFIX of another's.
+    #[test]
+    fn the_block_reader_finds_an_element_whose_tag_carries_attributes() {
+        // (case, the answer, the tag read, its inner text)
+        let rows: [(&str, &str, &str, Option<&str>); 5] = [
+            (
+                "a bare tag",
+                "<R><M><Name>a</Name></M></R>",
+                "M",
+                Some("<Name>a</Name>"),
+            ),
+            (
+                "a tag carrying the service's namespace",
+                "<R><M xmlns=\"http://x/doc/\"><Name>a</Name></M></R>",
+                "M",
+                Some("<Name>a</Name>"),
+            ),
+            (
+                "a tag whose name is a prefix of the one asked for",
+                "<R><MEntry><Name>b</Name></MEntry><M><Name>a</Name></M></R>",
+                "M",
+                Some("<Name>a</Name>"),
+            ),
+            (
+                "the first of two of a tag",
+                "<R><M>first</M><M>second</M></R>",
+                "M",
+                Some("first"),
+            ),
+            (
+                "a tag the answer does not carry",
+                "<R><M>a</M></R>",
+                "Other",
+                None,
+            ),
+        ];
+
+        for (case, body, tag, expected) in rows {
+            let read = block_of(body, tag);
+            assert_eq!(
+                read, expected,
+                "case {case:?}: expected {expected:?}, got {read:?}"
             );
         }
     }
