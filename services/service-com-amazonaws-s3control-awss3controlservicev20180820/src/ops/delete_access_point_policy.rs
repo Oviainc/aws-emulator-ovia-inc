@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAccessPointPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAccessPointPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAccessPointPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the policy document stored on the access point under (account id,
+//! name), so a later `GetAccessPointPolicy` or `GetAccessPointPolicyStatus`
+//! answers `NoSuchAccessPointPolicy`, or answers `NoSuchAccessPoint` when the
+//! account owns no access point of that name. Deleting a policy is idempotent:
+//! an access point that carries none is already in the state the call asks for.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +164,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAccessPointPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAccessPointPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAccessPointPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let key = (input.account_id.clone(), input.name.clone());
+        let mut store = state.lock();
+        // The document lives on the access point record, so the access point
+        // has to exist for there to be a policy to remove at all.
+        let Some(record) = store.access_points.get_mut(&key) else {
+            return Err(crate::state::no_such_access_point(&input.name));
+        };
+        // Clearing the document returns the access point to the state it was
+        // created in — carrying no policy — which is also the state a repeat of
+        // this call asks for, so the second one succeeds as well as the first.
+        record.policy = None;
+        Ok(DeleteAccessPointPolicyOutput)
     }
 }
