@@ -37,7 +37,7 @@ use crate::cluster_lifecycle::REGION;
 use crate::wire::{call, emulator, encode_label, error_code, Answer};
 
 /// `GET /addons/supported-versions`, with an optional query string.
-async fn describe_addon_versions(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn describe_addon_versions(router: &MultiServiceRouter, query: &str) -> Answer {
     let uri = if query.is_empty() {
         "/addons/supported-versions".to_string()
     } else {
@@ -47,7 +47,7 @@ async fn describe_addon_versions(router: &MultiServiceRouter, query: &str) -> An
 }
 
 /// `GET /addons/configuration-schemas`, for one `(addonName, addonVersion)` pair.
-async fn describe_addon_configuration(
+pub(crate) async fn describe_addon_configuration(
     router: &MultiServiceRouter,
     addon_name: &str,
     addon_version: &str,
@@ -61,7 +61,7 @@ async fn describe_addon_configuration(
 }
 
 /// The `addons` array of a successful answer.
-fn addons(answer: &Answer) -> Vec<serde_json::Value> {
+pub(crate) fn addons(answer: &Answer) -> Vec<serde_json::Value> {
     answer.body["addons"]
         .as_array()
         .unwrap_or_else(|| panic!("expected an addons list, got {:?}", answer.body))
@@ -69,7 +69,7 @@ fn addons(answer: &Answer) -> Vec<serde_json::Value> {
 }
 
 /// The `addonName` of every entry of an answer, in the order reported.
-fn addon_names(answer: &Answer) -> Vec<String> {
+pub(crate) fn addon_names(answer: &Answer) -> Vec<String> {
     addons(answer)
         .iter()
         .map(|addon| string_member(addon, "addonName"))
@@ -78,7 +78,7 @@ fn addon_names(answer: &Answer) -> Vec<String> {
 
 /// A string member of a reported object, which every entry the catalog publishes
 /// carries.
-fn string_member(value: &serde_json::Value, member: &str) -> String {
+pub(crate) fn string_member(value: &serde_json::Value, member: &str) -> String {
     value[member]
         .as_str()
         .unwrap_or_else(|| panic!("expected a {member} string, got {value:?}"))
@@ -86,7 +86,7 @@ fn string_member(value: &serde_json::Value, member: &str) -> String {
 }
 
 /// The `addonVersions` array of one reported add-on.
-fn versions_of(addon: &serde_json::Value) -> Vec<serde_json::Value> {
+pub(crate) fn versions_of(addon: &serde_json::Value) -> Vec<serde_json::Value> {
     addon["addonVersions"]
         .as_array()
         .unwrap_or_else(|| panic!("expected an addonVersions list, got {addon:?}"))
@@ -94,7 +94,7 @@ fn versions_of(addon: &serde_json::Value) -> Vec<serde_json::Value> {
 }
 
 /// The `compatibilities` array of one reported build.
-fn compatibilities_of(version: &serde_json::Value) -> Vec<serde_json::Value> {
+pub(crate) fn compatibilities_of(version: &serde_json::Value) -> Vec<serde_json::Value> {
     version["compatibilities"]
         .as_array()
         .unwrap_or_else(|| panic!("expected a compatibilities list, got {version:?}"))
@@ -150,7 +150,7 @@ async fn calendar_cluster_versions(router: &MultiServiceRouter, include_all: boo
 }
 
 /// The whole catalog, in one page.
-async fn whole_catalog(router: &MultiServiceRouter) -> Answer {
+pub(crate) async fn whole_catalog(router: &MultiServiceRouter) -> Answer {
     let answer = describe_addon_versions(router, "maxResults=100").await;
     assert_eq!(
         answer.status, 200,
@@ -171,7 +171,7 @@ fn cluster_request(name: &str, version: &str) -> serde_json::Value {
 
 /// One cluster on `version`, waited into `ACTIVE` so the add-on layer that
 /// requires an active cluster is past.
-async fn active_cluster(router: &MultiServiceRouter, name: &str, version: &str) {
+pub(crate) async fn active_cluster(router: &MultiServiceRouter, name: &str, version: &str) {
     let answer = call(
         router,
         REGION,

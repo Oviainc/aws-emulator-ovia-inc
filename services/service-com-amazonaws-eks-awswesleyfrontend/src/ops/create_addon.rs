@@ -304,6 +304,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let default_addon_version = guard
             .default_addon_version(&input.addon_name, &cluster_version, now)
             .unwrap_or_else(|| state::derive_default_addon_version(&cluster_version));
+        // The build this install runs: the caller's version when it named one,
+        // else the default version resolved just above. It is the build whose
+        // configuration schema the document below is validated against, and the
+        // version the stored record reports.
+        let addon_version = input
+            .addon_version
+            .clone()
+            .filter(|version| !version.trim().is_empty())
+            .unwrap_or(default_addon_version);
 
         // LAYER 4 — the body's own members. Each is a rule the model cannot express,
         // so the boundary validator passed the request and this is where it is caught.
@@ -326,22 +335,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "The set of configuration values for the add-on that's created. The values
         // that you provide are validated against the schema returned by
-        // DescribeAddonConfiguration" — and the schema that operation publishes for a
-        // build of an Amazon EKS-managed add-on requires no property and restricts
-        // none (`crate::state::AddonCatalogRecord::configuration_schema`), so every
-        // well-formed document satisfies it. What IS checked is that a document which
-        // opens like JSON is well-formed JSON: an add-on configuration is JSON or
-        // YAML, and a JSON document that does not parse can never satisfy any schema.
+        // DescribeAddonConfiguration" — so a JSON document is held to exactly that
+        // schema, the one the catalog publishes for the build being installed
+        // (`crate::state::AddonCatalogRecord::configuration_violation`): a key the
+        // add-on's schema does not declare, a declared key of the wrong JSON type and
+        // a missing required property are each refused, naming the path at fault.
+        // Before any of that, a document which opens like JSON must BE JSON: an add-on
+        // configuration is JSON or YAML, and a JSON document that does not parse can
+        // never satisfy any schema. A YAML document is not validated here — the schema
+        // is a JSON Schema — and neither is a build this catalog does not publish,
+        // which publishes no schema to validate against.
         if let Some(values) = input
             .configuration_values
             .as_deref()
             .map(str::trim)
             .filter(|values| values.starts_with('{') || values.starts_with('['))
         {
-            if let Err(error) = serde_json::from_str::<serde_json::Value>(values) {
-                return Err(invalid_parameter(format!(
-                    "configurationValues opens like JSON but is not valid JSON: {error}"
-                )));
+            match serde_json::from_str::<serde_json::Value>(values) {
+                Err(error) => {
+                    return Err(invalid_parameter(format!(
+                        "configurationValues opens like JSON but is not valid JSON: {error}"
+                    )));
+                }
+                Ok(document) => {
+                    if let Some(violation) = guard
+                        .published_addon_build(&input.addon_name, &addon_version, now)
+                        .and_then(|(addon, build)| {
+                            addon.configuration_violation(build, &document)
+                        })
+                    {
+                        return Err(invalid_parameter(format!(
+                            "ConfigurationValue provided in request is not supported: Json \
+                             schema validation failed with error: [{violation}]"
+                        )));
+                    }
+                }
             }
         }
         // `podIdentityAssociations` maps a Kubernetes service account to an IAM role,
@@ -625,12 +653,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = AddonRecord {
             arn: addon_arn,
             // The caller's version if it named one, else the default version for the
-            // cluster's Kubernetes version.
-            addon_version: input
-                .addon_version
-                .clone()
-                .filter(|version| !version.trim().is_empty())
-                .unwrap_or(default_addon_version),
+            // cluster's Kubernetes version (resolved above).
+            addon_version,
             status: ADDON_STATUS_CREATING.to_string(),
             created_at: now,
             modified_at: now,

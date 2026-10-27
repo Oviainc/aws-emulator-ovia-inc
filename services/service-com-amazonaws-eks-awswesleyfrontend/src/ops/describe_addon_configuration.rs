@@ -17,12 +17,15 @@
 //! one sentence this service states an unresolvable resource in
 //! (`crate::state::RESOURCE_NOT_FOUND_MESSAGE`).
 //!
-//! The schema is derived from the catalog entry, so what it declares is what
-//! this service acts on, and its `required` list is the build's own required
-//! configuration — the same thing that makes
+//! The schema is the one the catalog holds for that build: the add-on's OWN
+//! configurable keys, each with the JSON type it takes, beside the namespace the
+//! add-on is installed into and the service account it runs as, and nothing else
+//! is allowed in a configuration document. Its `required` list is the build's own
+//! required configuration — the same thing that makes
 //! `AddonVersionInfo$requiresConfiguration` true for that build, so the flag
 //! `DescribeAddonVersions` publishes and the schema this operation publishes
-//! cannot disagree.
+//! cannot disagree — and it is the same document `CreateAddon` validates
+//! `configurationValues` against.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
