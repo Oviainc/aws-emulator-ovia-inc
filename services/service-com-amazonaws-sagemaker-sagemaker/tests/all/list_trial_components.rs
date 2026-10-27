@@ -146,19 +146,16 @@ fn names_of(seeded: &[Seeded], cases: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Record that the component `component` is part of the trial `trial`, on the ONE shared
-/// store the handler reads through `state::service_state`.
-///
-/// `AssociateTrialComponent` — the only call that attaches a component to a trial — is a
-/// scaffolded stub, so the membership is seeded here, under exactly the folded keys the
-/// stores are keyed by (`state::entity_key`), the way `inference_deployment_lifecycle`
-/// seeds a lineage group for the create SageMaker models none of.
-fn attach_to_trial(emulator: &Emulator, trial: &str, component: &str) {
-    let state = emulator.engine.state::<ComAmazonawsSagemakerSagemakerState>();
-    state
-        .lock()
-        .trial_component_trials
-        .insert((entity_key(trial), entity_key(component)));
+/// Record that the component `component` is part of the trial `trial`, through
+/// `AssociateTrialComponent` — the one call that attaches a component to a trial — so this
+/// listing reads the memberships the API writes rather than state planted beside it.
+async fn attach_to_trial(emulator: &Emulator, trial: &str, component: &str) {
+    emulator
+        .ok(
+            "AssociateTrialComponent",
+            &json!({ "TrialName": trial, "TrialComponentName": component }),
+        )
+        .await;
 }
 
 /// RULE: `ListTrialComponents` returns the account's stored trial components ordered by
@@ -564,11 +561,11 @@ async fn list_trial_components_selects_the_components_of_the_named_trial_or_expe
     }
     // `tc-delta` is part of BOTH trials of `exp-one`, so the experiment filter has to
     // report it once rather than once per trial; `tc-beta` is part of no trial at all.
-    attach_to_trial(&emulator, "trial-a", "tc-gamma");
-    attach_to_trial(&emulator, "trial-a", "tc-delta");
-    attach_to_trial(&emulator, "trial-b", "tc-delta");
-    attach_to_trial(&emulator, "trial-b", "tc-alpha");
-    attach_to_trial(&emulator, "trial-c", "tc-beta");
+    attach_to_trial(&emulator, "trial-a", "tc-gamma").await;
+    attach_to_trial(&emulator, "trial-a", "tc-delta").await;
+    attach_to_trial(&emulator, "trial-b", "tc-delta").await;
+    attach_to_trial(&emulator, "trial-b", "tc-alpha").await;
+    attach_to_trial(&emulator, "trial-c", "tc-beta").await;
 
     // Rows differ along which entity filter is sent, how many components it admits, the
     // case the name is written in, whether the named entity exists, and whether the filter

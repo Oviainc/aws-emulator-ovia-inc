@@ -2745,11 +2745,14 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// its two ends. A component may be part of several trials, and a trial holds many
     /// components, so the membership is an edge rather than a member of either record.
     ///
-    /// Read by `ListTrialComponents`, whose `TrialName` and `ExperimentName` filters are
-    /// exactly "the components part of this trial" and "part of any trial of this
-    /// experiment". `AssociateTrialComponent` — the only call that attaches a component to
-    /// a trial — is a scaffolded stub today, so the index lives here, beside both stores it
-    /// relates, rather than in the listing that reads it.
+    /// Written by `AssociateTrialComponent` — the call that attaches a component to a
+    /// trial — and read by `ListTrialComponents`, whose `TrialName` and `ExperimentName`
+    /// filters are exactly "the components part of this trial" and "part of any trial of
+    /// this experiment". The index lives here, beside both stores it relates, rather than
+    /// in either of them: a component may be part of several trials and a trial holds many
+    /// components, so neither record owns the membership.
+    ///
+    /// Bounded by [`TRIAL_COMPONENT_TRIAL_QUOTA`].
     pub trial_component_trials: BTreeSet<(String, String)>,
     /// Keyed by `ProcessingJobName`.
     pub processing_jobs: BTreeMap<String, ProcessingJob>,
@@ -5747,6 +5750,13 @@ pub const TRIAL_COMPONENT_KIND: &str = "experiment-trial-component";
 /// `CreateTrialComponent` answers `ResourceLimitExceeded` past.
 pub const TRIAL_COMPONENT_QUOTA: usize = 1_000;
 
+/// See [`ASSOCIATION_QUOTA`], which bounds the lineage-edge store for the same reason and
+/// at the same figure: a trial-component membership is an EDGE too — the index grows with
+/// the PAIRS of trial and component a caller attaches, not with either resource — so it is
+/// higher than the per-resource bounds, and it is what `AssociateTrialComponent` answers
+/// `ResourceLimitExceeded` past.
+pub const TRIAL_COMPONENT_TRIAL_QUOTA: usize = 10_000;
+
 /// A trial component created by `CreateTrialComponent`, as `DescribeTrialComponent`
 /// replays it.
 ///
@@ -5832,6 +5842,13 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// types rather than in the one above.
     pub fn trial_components_below_quota(&self) -> bool {
         self.trial_components.len() < TRIAL_COMPONENT_QUOTA
+    }
+
+    /// Whether another trial-component membership fits, i.e. [`Self::trial_component_trials`]
+    /// is below [`TRIAL_COMPONENT_TRIAL_QUOTA`]. What `AssociateTrialComponent` admits a
+    /// NEW membership by.
+    pub fn trial_component_trials_below_quota(&self) -> bool {
+        self.trial_component_trials.len() < TRIAL_COMPONENT_TRIAL_QUOTA
     }
 
     /// The [`entity_key`]s of the trial components that are part of the trial `trial_name`

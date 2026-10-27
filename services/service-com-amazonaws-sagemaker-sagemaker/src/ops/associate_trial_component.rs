@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateTrialComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateTrialComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateTrialComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the trial and the trial component the request names in
+//! `crate::state`, refuses either one the account does not hold with the modelled
+//! `ResourceNotFound`, and otherwise records the membership in
+//! [`crate::state::ComAmazonawsSagemakerSagemakerState::trial_component_trials`] — the
+//! index `ListTrialComponents`' `TrialName` and `ExperimentName` filters read — then
+//! answers both resolved ARNs. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +146,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateTrialComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateTrialComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateTrialComponent"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        // A membership relates two STORED entities, so both ends must exist: a trial or a
+        // component this account holds none of gets the not-found failure this operation
+        // models, never a 200 recording a membership of nothing. Both lookups fold case
+        // the way `ExperimentEntityName` is documented to ("is not case-sensitive"),
+        // through the owning slices' own keys, and each refusal reuses the sentence that
+        // slice's own reader words, so one fact is not stated two ways.
+        let Some(trial) = store.trial(&input.trial_name) else {
+            // `TrialArn`'s modelled pattern fixes the resource kind a trial's ARN carries
+            // (`…:[0-9]{12}:experiment-trial/`) — the one `CreateTrial` mints and
+            // `DescribeTrial` names a missing trial by.
+            let trial_arn =
+                crate::state::resource_arn(&region, "experiment-trial", &input.trial_name);
+            return Err(AssociateTrialComponentErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Trial {trial_arn} does not exist.")),
+            })
+            .into());
+        };
+        // The trial as the STORED record spells it, so the membership is filed under the
+        // one key every reader resolves by whatever casing this request carried.
+        let trial_arn = trial.arn.clone();
+        let trial_key = crate::state::entity_key(&trial.name);
+
+        let component_key = crate::state::entity_key(&input.trial_component_name);
+        let Some(component) = store.trial_components.get(&component_key) else {
+            return Err(AssociateTrialComponentErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Could not find trial component \"{}\".",
+                    crate::state::resource_arn(
+                        &region,
+                        crate::state::TRIAL_COMPONENT_KIND,
+                        &input.trial_component_name,
+                    )
+                )),
+            })
+            .into());
+        };
+        let component_arn = component.arn.clone();
+
+        // "A trial component can be associated with multiple trials", and a trial holds
+        // many components, so a membership IS the `(trial, component)` pair and nothing
+        // else: associating a pair already recorded files no second entry and still
+        // answers both ARNs, the way `AddAssociation` treats its own pair as the edge's
+        // whole identity.
+        let membership = (trial_key, component_key);
+        let attached = !store.trial_component_trials.contains(&membership);
+        if attached {
+            // The index is bounded, so a caller pairing names cannot grow it without end;
+            // an associate past the bound answers the limit failure this operation models.
+            // Checked only for a NEW membership, since re-recording one adds no entry.
+            if !store.trial_component_trials_below_quota() {
+                return Err(AssociateTrialComponentErrorModeled::ResourceLimitExceeded(
+                    ResourceLimitExceeded {
+                        message: Some(format!(
+                            "The account-level service limit for trial component \
+                             associations is {}, with current utilization of {} and a \
+                             request delta of 1.",
+                            crate::state::TRIAL_COMPONENT_TRIAL_QUOTA,
+                            store.trial_component_trials.len()
+                        )),
+                    },
+                )
+                .into());
+            }
+            store.trial_component_trials.insert(membership);
+        }
+        drop(store);
+
+        // The component is the end this call attached, so it is the resource whose state
+        // changed — recorded only where the membership is new, since a repeated associate
+        // leaves the state exactly as it was.
+        if attached {
+            crate::state::record_state_change(Self::NAME, &component_arn, ctx);
+        }
+        Ok(AssociateTrialComponentOutput {
+            trial_arn: Some(trial_arn),
+            trial_component_arn: Some(component_arn),
+        })
     }
 }
