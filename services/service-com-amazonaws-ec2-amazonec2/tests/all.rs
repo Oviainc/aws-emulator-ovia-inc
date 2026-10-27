@@ -161,6 +161,10 @@ mod byoip_cidr_lifecycle;
 mod byoip_cidrs;
 #[path = "all/capacity_block_offerings.rs"]
 mod capacity_block_offerings;
+// The availability of the capacity of the account's Capacity Blocks, summed over the
+// Capacity Reservations each block holds its capacity as.
+#[path = "all/capacity_block_status.rs"]
+mod capacity_block_status;
 #[path = "all/capacity_blocks.rs"]
 mod capacity_blocks;
 // The account's EC2 Capacity Manager settings: what `EnableCapacityManager` records and
