@@ -36,7 +36,11 @@ const PROFILE_NOT_FOUND: &str =
 
 /// The enum clause this service states for `path` and `allowed`: the member and
 /// the permitted set, with no echo of the rejected value.
-fn enum_envelope(path: &str, allowed: &[&str]) -> String {
+///
+/// `pub(crate)` so the sibling suites in `tests/all/` assert that one clause
+/// (`tests/all/source_format_enum_refusal.rs` asserts it for `SourceFormat`)
+/// rather than each writing its own copy of the sentence.
+pub(crate) fn enum_envelope(path: &str, allowed: &[&str]) -> String {
     format!(
         "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
          Member must satisfy enum value set: [{}]",

@@ -79,6 +79,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The validation path of this operation's `SourceFormat` member, as the envelope
+/// spells a member name (lowerCamel; see
+/// `smithy_query(query="operation", operation="ListDataTransformationProfiles")`
+/// for the modelled name).
+const SOURCE_FORMAT_PATH: &str = "sourceFormat";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,12 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `SourceFormat` is a modelled enum, so the boundary validator has already
         // refused anything else; this re-states the rule for the reason the create
         // and the publish re-state it, because a format this service cannot convert
-        // from describes no profile and so can never select one.
+        // from describes no profile and so can never select one. It answers in the
+        // SAME words as the validator — member and permitted set, no echo of the
+        // rejected value.
         if !SOURCE_FORMAT_VALUES.contains(&input.source_format.as_str()) {
-            return Err(validation(format!(
-                "SourceFormat must be one of {}, got '{}'",
-                SOURCE_FORMAT_VALUES.join(", "),
-                input.source_format
+            return Err(validation(crate::service::enum_violation_message(
+                SOURCE_FORMAT_PATH,
+                SOURCE_FORMAT_VALUES,
             )));
         }
 
