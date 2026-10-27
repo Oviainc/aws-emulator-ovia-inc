@@ -345,13 +345,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read needs nothing from the request beyond its deserialized input.
         let _ = ctx;
 
-        // What this slice cannot answer faithfully: a partial read—`Range` and
-        // `PartNumber` are answered with HTTP 206 and a `Content-Range`, and a
-        // conditional read with 304 or 412, none of which an operation whose success
-        // status is 200 can render—plus the customer-key encryption nothing here
-        // performs. A 501 says so instead of answering 200 with the whole object as if
-        // the request had asked for it. `VersionId` IS served: it names one stored
-        // version of the key.
+        // What this read cannot answer faithfully: `If-None-Match` and `If-Modified-Since`
+        // are answered with HTTP 304 and no body when the condition fails, which an
+        // operation rendering one success status cannot express. Everything else is served:
+        // `Range` and `PartNumber` select a span of the object (answered 206 with a
+        // `Content-Range`), `If-Match` and `If-Unmodified-Since` are judged against the
+        // version the read resolves, and `VersionId` names one stored version of the key.
+        // The customer-key encryption nothing here performs is refused as `PutObject`
+        // refuses it.
         if let Some(unserved) = unserved_feature(&input) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "HeadObject with {unserved}"
@@ -453,6 +454,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::unmodeled(code, 404, message));
         };
 
+        let now = ::std::time::SystemTime::now();
+
+        // The preconditions this read is subject to, judged against the version it
+        // resolved, through the one rule `GetObject` judges its own by
+        // ([`crate::state::read_precondition_fails`]) — so a GET and a HEAD of the same
+        // object cannot disagree about whether they hold.
+        if crate::state::read_precondition_fails(
+            &object.etag,
+            object.last_modified,
+            input.if_match.as_deref(),
+            input
+                .if_unmodified_since
+                .as_ref()
+                .and_then(crate::state::instant_of),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::PRECONDITION_FAILED_CODE,
+                crate::state::PRECONDITION_FAILED_STATUS,
+                crate::state::PRECONDITION_FAILED_MESSAGE,
+            ));
+        }
+
+        // WHICH SPAN of the object this HEAD describes: "a HEAD request has the same options
+        // as a GET operation on an object" (`HeadObject`'s own documentation), so a
+        // `PartNumber` or a `Range` is answered with the same span, the same `Content-Range`
+        // and the same two refusals `GetObject` answers — with the length of that span as
+        // `Content-Length`, since a HEAD reports what a GET of the same request would
+        // return without carrying the bytes.
+        let total = object.body.len();
+        let span = match (input.part_number, input.range.as_deref()) {
+            (Some(part_number), _) => match object.part_span(part_number) {
+                Some(span) => Some(span),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_PART_NUMBER_CODE,
+                        crate::state::INVALID_PART_NUMBER_STATUS,
+                        crate::state::INVALID_PART_NUMBER_MESSAGE,
+                    ))
+                }
+            },
+            (None, Some(header)) => match crate::state::requested_range(header, total) {
+                crate::state::RangeRequest::Span(span) => Some(span),
+                crate::state::RangeRequest::Unsatisfiable => {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_RANGE_CODE,
+                        crate::state::INVALID_RANGE_STATUS,
+                        crate::state::INVALID_RANGE_MESSAGE,
+                    ))
+                }
+                crate::state::RangeRequest::Ignored => None,
+            },
+            (None, None) => None,
+        };
+
         // "To retrieve the checksum, this parameter must be enabled"
         // (`HeadObjectRequest$ChecksumMode`): the checksum the write stored with the object
         // is reported only to a read that asked for it, and an object stored under no
@@ -466,7 +521,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(HeadObjectOutput {
             e_tag: Some(object.etag.clone()),
-            content_length: Some(i64::try_from(object.body.len()).unwrap_or(i64::MAX)),
+            // "The size of the body in bytes" (`HeadObjectOutput$ContentLength`) — of the
+            // body a GET of this same request would return, so a part- or range-scoped HEAD
+            // reports the span's length rather than the object's.
+            content_length: Some(
+                i64::try_from(span.map_or(total, |span| span.len())).unwrap_or(i64::MAX),
+            ),
+            // "The portion of the object returned in the response"
+            // (`HeadObjectOutput$ContentRange`), for a read that asked for a portion.
+            content_range: span.map(|span| span.content_range(total)),
+            // "This value is only returned if you specify `partNumber` in your request and
+            // the object was uploaded as a multipart upload"
+            // (`HeadObjectOutput$PartsCount`) — both conditions, or no count.
+            parts_count: input.part_number.and(object.parts_count()),
             last_modified: Some(::aws_smithy_types::DateTime::from(object.last_modified)),
             content_type: object.content_type.clone(),
             cache_control: object.cache_control.clone(),
@@ -485,7 +552,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             storage_class: Some(object.storage_class.clone()),
             // "Indicates that a range of bytes was specified" — S3 reports that an
             // object read supports range requests whether or not one was made.
-            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            accept_ranges: Some(crate::state::ACCEPT_RANGES_BYTES.to_string()),
             // "The number of tags, if any, on the object" (`HeadObjectOutput$TagCount`) —
             // the count of the tag set the object holds, whether the write that stored it
             // carried the set in `x-amz-tagging` or a later `PutObjectTagging` associated
@@ -520,14 +587,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             restore: object
                 .restore
                 .as_ref()
-                .and_then(|restore| restore.header_value(::std::time::SystemTime::now())),
+                .and_then(|restore| restore.header_value(now)),
             // Every remaining member is documented as reported only when something this
             // slice does not serve is true of the object: it is a delete marker
             // (`DeleteMarker`, which a delete records none of), it is in an
             // S3 Intelligent-Tiering archive tier (`ArchiveStatus`, which no stored object
             // here is: a restore is asked for on a storage CLASS), metadata could not be
-            // decoded (`MissingMeta`), the read was
-            // partial (`ContentRange`, `PartsCount`), a customer-provided key encrypted it
+            // decoded (`MissingMeta`), a customer-provided key encrypted it
             // (`SSECustomer*`, which `PutObject` refuses), it is replicated
             // (`ReplicationStatus`), it is locked (`ObjectLock*`) or the bucket is
             // Requester Pays (`RequestCharged`).
@@ -547,19 +613,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The value `accept-ranges` carries for an object S3 can serve byte ranges of.
-const ACCEPT_RANGES_BYTES: &str = "bytes";
-
 /// The feature `input` asks for that this slice does not serve, if any — named for the
 /// 501 that refuses it.
 fn unserved_feature(input: &HeadObjectInput) -> Option<&'static str> {
     [
-        (input.range.is_some(), "Range"),
-        (input.part_number.is_some(), "PartNumber"),
-        (input.if_match.is_some(), "IfMatch"),
         (input.if_none_match.is_some(), "IfNoneMatch"),
         (input.if_modified_since.is_some(), "IfModifiedSince"),
-        (input.if_unmodified_since.is_some(), "IfUnmodifiedSince"),
         (
             input.sse_customer_algorithm.is_some(),
             "SSECustomerAlgorithm",

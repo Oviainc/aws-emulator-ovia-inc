@@ -39,7 +39,34 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The layer download plane
+//!
+//! `GetDownloadUrlForLayer` hands out a pre-signed download URL, and such a URL is a
+//! promise that whoever holds it can FETCH the layer: it names the endpoint the CALLER
+//! reached this emulator on (`crate::state::layer_download_url_host`), under the path
+//! space `crate::state::LAYER_DOWNLOAD_PATH_PREFIX` owns, which names no modelled
+//! operation — every operation of this service is `POST /` on awsJson1_1. Two seams
+//! carry it, the same pair any emulated data plane uses:
+//!
+//! - [`Service::can_handle`] also claims a request to that path space, so a fetch that
+//!   carries neither a credential nor a host naming a service — which is every fetch of
+//!   a URL this service handed out — is not answered `UnknownService`;
+//! - [`Service::override_routing_error`] serves it. A download names no modelled
+//!   operation by construction, so the router reaches exactly this seam for it, and
+//!   reaches it BEFORE authentication — which is what lets a pre-signed URL be followed
+//!   without a signature, as a pre-signed URL is.
+//!
+//! What it serves is the blob the repository HOLDS (`crate::state::LayerBlob::content`),
+//! read at the moment of the fetch: a download is a pure read, so following one URL
+//! twice answers the same bytes and changes nothing a later caller sees. The capability
+//! is the grant the control plane minted (`crate::state::LayerDownloadGrant`), addressed
+//! by the token the URL carries: a path a client assembled itself resolves to no grant,
+//! a grant whose window has closed is refused as an expired request, and a grant whose
+//! layer or repository this registry no longer holds has nothing to serve.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
@@ -52,6 +79,13 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the layer download plane is served from
+    /// [`Service::override_routing_error`], which is not an operation and so has no
+    /// `self.engine` of its own; it must read the one store the operations write, not a
+    /// second copy.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +94,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
     }
 }
@@ -358,10 +393,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        if smithy_server_runtime::resolve_route_key(parts)
+            .is_some_and(|key| key == self.entry.identity().signing_name())
+        {
+            return true;
         }
+        // A layer download carries no credential and no `X-Amz-Target`, and when a client
+        // addresses the emulator directly rather than by endpoint host its host names no
+        // service either, so the path this registry publishes downloads at is the only
+        // thing left to identify it. Without this the router answers `UnknownService` for
+        // a URL this service announced. Every method is claimed, not only the two that
+        // are served: a `POST` to a path this service publishes is this service's to
+        // refuse as a method. See the module docs.
+        crate::state::parse_layer_download_path(parts.uri.path()).is_some()
     }
 
     fn override_operation(
@@ -432,10 +476,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // A request to a layer download URL this registry handed out is exactly that
+        // case by construction — the path is not in the model — so this is where such a
+        // URL is served. Anything else keeps the framework's default.
+        let target =
+            crate::state::parse_layer_download_path(::service_common::request_path(req.uri()))?;
+        Some(self.serve_layer_download(req, &target))
     }
 
     fn override_framework_error(
@@ -451,4 +499,127 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
+    /// Serve one request to a published layer download URL.
+    ///
+    /// A download is a pure READ: it answers the bytes the repository holds for the layer
+    /// the grant names and writes nothing, so following one URL twice answers the same
+    /// layer and changes nothing a later caller sees.
+    ///
+    /// The grant the URL's token addresses is what decides it, in this order: a token
+    /// this registry never handed out (or one whose grant has since been reclaimed) names
+    /// no download at all; a grant whose window has closed is an expired request, which
+    /// is a different answer from one that never existed; a path whose digest is not the
+    /// one the grant serves names no download either, so a URL cannot be rewritten onto
+    /// another layer; and finally the repository's own record of the blob is read, so a
+    /// repository or a layer this registry no longer holds has nothing to serve.
+    fn serve_layer_download(
+        &self,
+        req: &RtRequest,
+        target: &crate::state::LayerDownloadTarget,
+    ) -> RtResponse {
+        if !matches!(req.method(), "GET" | "HEAD") {
+            return method_not_allowed();
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return download_error(
+                500,
+                "InternalError",
+                "the ecr repository store is unavailable",
+            );
+        };
+        let store = state.lock();
+
+        let Some(grant) = store.layer_download_grant(&target.token) else {
+            return download_error(404, "NoSuchKey", DOWNLOAD_NOT_FOUND_MESSAGE);
+        };
+        if grant.has_expired(::std::time::SystemTime::now()) {
+            return download_error(403, "AccessDenied", DOWNLOAD_EXPIRED_MESSAGE);
+        }
+        if grant.layer_digest != target.layer_digest {
+            return download_error(404, "NoSuchKey", DOWNLOAD_NOT_FOUND_MESSAGE);
+        }
+        let held = store
+            .repositories
+            .get(&grant.repository_name)
+            .and_then(|repo| repo.layer_blobs.get(&grant.layer_digest));
+        let Some(blob) = held else {
+            return download_error(404, "NoSuchKey", DOWNLOAD_NOT_FOUND_MESSAGE);
+        };
+
+        // A `GET` carries the layer's bytes and a `HEAD` reports its length without them.
+        layer_response(&blob.content, req.method() == "GET")
+    }
+}
+
+/// The body of a download refusal that found no layer: one sentence carrying nothing from
+/// the request, so a caller cannot probe for layers it was not handed a URL for.
+const DOWNLOAD_NOT_FOUND_MESSAGE: &str = "The specified key does not exist.";
+
+/// The body of a download refusal whose URL is past its validity window.
+const DOWNLOAD_EXPIRED_MESSAGE: &str = "Request has expired";
+
+/// The read methods the layer download plane serves: `GET` carries the bytes and `HEAD`
+/// reports the metadata without them.
+const DOWNLOAD_READ_METHODS: &str = "GET, HEAD";
+
+/// The refusal the download plane answers a method it does not serve with. RFC 9110
+/// requires a `405` to state which methods the target does support, so the refusal names
+/// them in the `Allow` header as well as in its message.
+fn method_not_allowed() -> RtResponse {
+    let mut response = download_error(
+        405,
+        "MethodNotAllowed",
+        "A layer download is served by GET or HEAD",
+    );
+    response
+        .headers_mut()
+        .insert("allow", DOWNLOAD_READ_METHODS);
+    response
+}
+
+/// One layer download: the blob's own bytes, under the generic binary media type and its
+/// own length.
+///
+/// `with_body` is false for a `HEAD`, which reports the layer's length without its bytes.
+fn layer_response(content: &[u8], with_body: bool) -> RtResponse {
+    let body = if with_body {
+        SdkBody::from(content.to_vec())
+    } else {
+        SdkBody::empty()
+    };
+    let mut response = RtResponse::new(status(200), body);
+    response
+        .headers_mut()
+        .insert("content-type", crate::state::LAYER_DOWNLOAD_CONTENT_TYPE);
+    response
+        .headers_mut()
+        .insert("content-length", content.len().to_string());
+    response
+}
+
+/// One download-plane error response: the status, the code in `x-amzn-errortype`, and a
+/// JSON body carrying the reason.
+///
+/// The download plane is plain HTTPS rather than a modelled operation, so it answers in
+/// its own small envelope instead of this service's awsJson1_1 one. The message is built
+/// from constants, never from the request.
+fn download_error(status_code: u16, code: &str, message: &str) -> RtResponse {
+    let body = ::serde_json::json!({ "message": message, "code": code }).to_string();
+    let mut response = RtResponse::new(status(status_code), SdkBody::from(body));
+    response
+        .headers_mut()
+        .insert("content-type", "application/json");
+    response
+        .headers_mut()
+        .insert("x-amzn-errortype", code.to_string());
+    response
+}
+
+/// A status this plane answers with. Every call site passes a constant of this module, so
+/// the conversion cannot fail.
+fn status(code: u16) -> StatusCode {
+    StatusCode::try_from(code).expect("the download plane's statuses are valid constants")
 }

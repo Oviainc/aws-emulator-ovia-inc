@@ -18,11 +18,12 @@
 //! * the call is reporting only: two identical calls answer identically and the store is
 //!   unchanged by a read.
 //!
-//! An instance is not created by an API of this service (it enters the store through the
-//! user-association plane, whose `AssociateUser` handler is still a scaffold stub — see
-//! `issues/.../license-manager-user-subscriptions-7-operations-answer-http.md`, cause 1),
-//! so these tests seed `state::instances` through the shared engine the handlers read,
-//! exactly as that writer will, and then exercise `ListInstances` over the wire.
+//! An instance is not created by an API of this service: it enters the store through the
+//! user-association plane, whose `AssociateUser` is what writes the instance view (the
+//! plane's own suites drive that end to end). These tests are about what `ListInstances`
+//! REPORTS, over instance records a single writer puts there, so they seed
+//! `state::instances` through the shared engine the handlers read — exactly as that writer
+//! does — and then exercise `ListInstances` over the wire.
 
 use std::time::{Duration, SystemTime};
 

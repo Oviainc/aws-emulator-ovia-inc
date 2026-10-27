@@ -45,13 +45,13 @@ use crate::resource_tags::{
 
 /// `TagKey`'s modelled minimum length. Source: `smithy_query(query="shape",
 /// shape="TagKey")` — `@length` min 1, max 128.
-const TAG_KEY_MIN_LEN: usize = 1;
+pub(crate) const TAG_KEY_MIN_LEN: usize = 1;
 
 /// The fixed text AppSync answers for an API that is absent.
-const API_NOT_FOUND: &str = "API not found.";
+pub(crate) const API_NOT_FOUND: &str = "API not found.";
 
 /// `POST /v1/tags/{resourceArn}` carrying `tags`, as a client issues it.
-async fn tag_resource(router: &MultiServiceRouter, arn: &str, tags: Value) -> Answer {
+pub(crate) async fn tag_resource(router: &MultiServiceRouter, arn: &str, tags: Value) -> Answer {
     call(
         router,
         "POST",
@@ -62,12 +62,12 @@ async fn tag_resource(router: &MultiServiceRouter, arn: &str, tags: Value) -> An
 }
 
 /// `GET /v1/tags/{resourceArn}`, the read this suite proves a write through.
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Answer {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Answer {
     call(router, "GET", &format!("/v1/tags/{}", encode_label(arn)), None).await
 }
 
 /// `pairs` as the modelled `TagMap` JSON object.
-fn tag_map(pairs: &[(String, String)]) -> Value {
+pub(crate) fn tag_map(pairs: &[(String, String)]) -> Value {
     let mut map = Map::new();
     for (key, value) in pairs {
         map.insert(key.clone(), Value::String(value.clone()));
@@ -76,7 +76,7 @@ fn tag_map(pairs: &[(String, String)]) -> Value {
 }
 
 /// A borrowed pair table as an owned one.
-fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
     entries
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -84,7 +84,7 @@ fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 /// `count` distinct pairs, numbered from `first` so two runs can be disjoint.
-fn numbered_pairs(first: usize, count: usize) -> Vec<(String, String)> {
+pub(crate) fn numbered_pairs(first: usize, count: usize) -> Vec<(String, String)> {
     (first..first + count)
         .map(|index| (format!("key-{index:02}"), format!("value-{index:02}")))
         .collect()

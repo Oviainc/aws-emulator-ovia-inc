@@ -111,7 +111,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 ///   ([`dimension_cap_refusal`]);
 /// * a value inside a LIST that is outside the enumerated type the list's member names — a
 ///   percentile passed in `Statistics`, whose place is `ExtendedStatistics` — named as the
-///   value and the request member path it arrived on.
+///   request member path it arrived on and the value set the type declares.
 ///
 /// Every other violation keeps the framework's code and wording: a scalar outside its own
 /// bound or enum is what this service is recorded answering `ValidationException` for, and a
@@ -161,24 +161,24 @@ fn dimension_cap_refusal(violation: &aws_smithy_schema_server::Violation) -> Opt
 /// The refusal of an element of a LIST holding a value outside the enumerated type the list's
 /// member names, or `None` when `violation` is not one.
 ///
-/// Stated in the wording this service refuses an unusable input value in
-/// ([`crate::state::value_is_invalid_message`], the sentence its handlers already answer an
-/// unusable value with): the value, and the request member path it arrived on as a
-/// query-protocol refusal names it (`Statistics.member.1`), which is what locates the element
-/// a client has to change.
+/// Stated the way CloudWatch states a value outside the set a member accepts
+/// ([`crate::state::value_in_set_message`]): the request member path the element arrived on as
+/// a query-protocol refusal names it, down to the list's own target shape
+/// (`Statistics.member.1.<list element>`), and the whole value set the enumerated type
+/// declares — which is what lets a client repair the request. The submitted value is NOT
+/// echoed; the set it had to come from is what locates the repair.
 fn list_element_enum_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<Refused> {
-    if !matches!(
-        violation.kind,
-        aws_smithy_schema_server::ViolationKind::EnumValue(_)
-    ) || !is_list_element(&violation.path)
-    {
+    let aws_smithy_schema_server::ViolationKind::EnumValue(ref allowed) = violation.kind else {
+        return None;
+    };
+    if !is_list_element(&violation.path) {
         return None;
     }
     Some(Refused {
         code: INVALID_PARAMETER_VALUE.to_string(),
-        message: crate::state::value_is_invalid_message(
-            violation.value.as_deref()?,
-            &crate::state::query_parameter_path(&violation.path),
+        message: crate::state::value_in_set_message(
+            &crate::state::list_target_path(&crate::state::query_parameter_path(&violation.path)),
+            allowed,
         ),
     })
 }

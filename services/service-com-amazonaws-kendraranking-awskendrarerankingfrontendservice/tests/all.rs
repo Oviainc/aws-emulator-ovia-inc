@@ -19,6 +19,8 @@ mod arn_resolution_single_source;
 mod control_plane_fidelity;
 #[path = "all/create_plan_tag_charset.rs"]
 mod create_plan_tag_charset;
+#[path = "all/error_message_bound.rs"]
+mod error_message_bound;
 #[path = "all/handler_list_ceiling_report.rs"]
 mod handler_list_ceiling_report;
 #[path = "all/harness.rs"]

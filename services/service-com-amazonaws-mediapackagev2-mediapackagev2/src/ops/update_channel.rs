@@ -31,6 +31,11 @@
 //! An absent `ETag` is an unconditional update, which is what the model's optional
 //! member means.
 //!
+//! A commit is what rotates the tag, and only a write that CHANGED the channel commits:
+//! an update that stored exactly the content the channel already held leaves `ModifiedAt`
+//! and the ETag alone, so the tag the caller just read stays usable as the precondition of
+//! its next update.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -168,6 +173,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The write-only-commits-a-change rule lives on the state module's `VersionedRecord`,
+// which every `Update*` handler in this crate decides its commit through.
+use crate::state::VersionedRecord;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -360,6 +368,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // What the channel was before this request wrote anything, so the commit below
+        // can tell a real change from an update that stored what was already there.
+        let before = channel.configuration_fingerprint();
         channel.description = input.description;
         channel.input_switch_configuration =
             crate::state::materialized_input_switch_configuration(input.input_switch_configuration);
@@ -374,7 +385,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(requested) = input.multiview_configuration {
             channel.multiview_configuration = Some(requested);
         }
-        channel.commit(crate::state::now());
+        // A write that CHANGED the channel commits a new version of it, and the ETag is a
+        // function of that version as well as of the channel's content: the tag this
+        // update answers with then differs from the one the caller held — which is what
+        // makes `x-amzn-update-if-match` detect a lost update — and a following
+        // `GetChannel` reports exactly this tag. An update that stored what was already
+        // there changed nothing, so it commits nothing: neither the tag nor `ModifiedAt`
+        // moves, and the tag the caller holds stays usable as the precondition of the
+        // update it is entitled to make.
+        channel.commit_if_changed(&before, crate::state::now());
 
         // Answer from what was stored, so the response can only carry what a later
         // `GetChannel` will read.

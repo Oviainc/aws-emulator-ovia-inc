@@ -158,3 +158,5 @@ mod aggregate_conformance_pack_compliance_summary;
 mod conformance_pack_in_use_message;
 #[path = "all/aggregate_compliance_by_conformance_packs.rs"]
 mod aggregate_compliance_by_conformance_packs;
+#[path = "all/get_resource_config_history.rs"]
+mod get_resource_config_history;

@@ -27,6 +27,8 @@ mod evaluation_errors;
 mod harness;
 #[path = "all/identity_sources.rs"]
 mod identity_sources;
+#[path = "all/is_authorized_with_token.rs"]
+mod is_authorized_with_token;
 #[path = "all/list_identity_sources.rs"]
 mod list_identity_sources;
 #[path = "all/list_policy_store_aliases.rs"]

@@ -220,6 +220,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let table_arn = |table: &crate::state::MetadataTable| {
             crate::state::metadata_table_arn(&region, &table.name)
         };
+        // "If the `CREATING` status is `FAILED`, the reason that the journal table couldn't
+        // be created" (`JournalTableConfigurationResult$Error`): the `ErrorDetails` the
+        // table's own record carries, reported for a table that could not be created and for
+        // no other.
+        let table_error = |table: &crate::state::MetadataTable| {
+            table.failure.as_ref().map(|failure| ErrorDetails {
+                error_code: Some(failure.code.to_string()),
+                error_message: Some(failure.message.to_string()),
+            })
+        };
 
         Ok(GetBucketMetadataConfigurationOutput {
             get_bucket_metadata_configuration_result: Some(GetBucketMetadataConfigurationResult {
@@ -241,10 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // create — so this container is always reported.
                     journal_table_configuration_result: Some(JournalTableConfigurationResult {
                         table_status: configuration.journal.status_at(now).to_string(),
-                        // `ErrorDetails` reports "If the `CREATING` status is `FAILED`, the
-                        // reason that the journal table couldn't be created": no table here
-                        // fails to be created, so there is no error to report.
-                        error: None,
+                        error: table_error(&configuration.journal),
                         table_name: configuration.journal.name.clone(),
                         table_arn: Some(table_arn(&configuration.journal)),
                         record_expiration: configuration.journal_record_expiration.clone(),
@@ -263,7 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 .table
                                 .as_ref()
                                 .map(|table| table.status_at(now).to_string()),
-                            error: None,
+                            error: inventory.table.as_ref().and_then(table_error),
                             table_name: inventory
                                 .table
                                 .as_ref()
@@ -279,7 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 .table
                                 .as_ref()
                                 .map(|table| table.status_at(now).to_string()),
-                            error: None,
+                            error: annotation.table.as_ref().and_then(table_error),
                             table_name: annotation
                                 .table
                                 .as_ref()

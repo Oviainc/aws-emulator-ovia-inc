@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDownloadUrlForLayer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDownloadUrlForLayer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the download URL for one layer the named repository holds: a capability this
+//! registry mints, valid for a bounded window, that serves the blob's own bytes from the
+//! endpoint the caller reached this emulator on (`crate::state::LAYER_DOWNLOAD_PATH_PREFIX`,
+//! served by `crate::service`). Nothing about the URL is derived from the request: the
+//! token addresses a grant this registry stored, and the bytes behind it are the ones
+//! `CompleteLayerUpload` registered.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDownloadUrlForLayer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Two of the modelled refusals are deliberately unreachable here, and neither is a
+//! layer this registry could serve but declines to. `LayerInaccessibleException` is "the
+//! specified layer is not available because it is not associated with an image.
+//! Unassociated image layers may be cleaned up at any time" — a layer whose content the
+//! registry's own clean-up has taken away — and this registry cleans up no blob it
+//! registered, so every layer it holds is still available, whether or not an image
+//! references it. `UnableToGetUpstreamLayerException` reports a failure fetching a layer
+//! through a pull through cache rule, and this emulator reaches no upstream registry: it
+//! serves only what was pushed to it.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +136,44 @@ impl From<GetDownloadUrlForLayerErrorModeled> for GetDownloadUrlForLayerError {
     }
 }
 
+/// Map a shared-state failure onto this operation's own modelled errors.
+fn fault_error(fault: crate::state::Fault) -> GetDownloadUrlForLayerErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            GetDownloadUrlForLayerErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        // No other fault is reachable here: this handler resolves a repository and a
+        // layer digest, and names no image, tag or policy.
+        _ => GetDownloadUrlForLayerErrorModeled::InvalidParameterException(
+            InvalidParameterException { message },
+        ),
+    }
+}
+
+/// Refuse the request: the audit record for a call that handed out no URL, and the
+/// modelled error it answers with. `reason` is this handler's own wording, never the
+/// request's values, so the record carries no caller-supplied text.
+fn refusal(
+    reason: &'static str,
+    caller_akid: &str,
+    error: GetDownloadUrlForLayerErrorModeled,
+) -> GetDownloadUrlForLayerErrorModeled {
+    ::tracing::info!(
+        target: "emulator::audit",
+        audit = true,
+        operation = "GetDownloadUrlForLayer",
+        outcome = "refused",
+        reason,
+        caller_akid = %caller_akid,
+        registry_id = %crate::state::registry_id(),
+        "layer download url refused"
+    );
+    error
+}
+
 /// The `GetDownloadUrlForLayer` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -165,18 +210,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDownloadUrlForLayer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDownloadUrlForLayerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDownloadUrlForLayer"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDownloadUrlForLayerErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // "If you do not specify a registry, the default registry is assumed" — and the
+        // only registry served here is this emulator's own.
+        crate::state::check_registry(input.registry_id.as_ref())
+            .map_err(|fault| refusal("another registry", &caller_akid, fault_error(fault)))?;
+
+        // The URL names the endpoint the CALLER reached this emulator on, because this
+        // emulator is what serves the download; read off the request before the store is
+        // locked, since it is request metadata rather than state.
+        let host = crate::state::layer_download_url_host(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // A layer belongs to a repository, so there has to be one.
+        let repo = store
+            .repository(&input.repository_name)
+            .map_err(|fault| refusal("no such repository", &caller_akid, fault_error(fault)))?;
+
+        // A download is of content this repository HOLDS: blobs are per-repository, so a
+        // digest this one holds no blob under "could not be found, or … is not valid for
+        // this repository" — which covers a digest nothing ever uploaded and one
+        // uploaded to another repository alike.
+        if !repo.layer_blobs.contains_key(&input.layer_digest) {
+            return Err(refusal(
+                "no such layer in the repository",
+                &caller_akid,
+                GetDownloadUrlForLayerErrorModeled::LayersNotFoundException(
+                    LayersNotFoundException {
+                        message: Some(crate::state::layer_not_found_message(
+                            &input.layer_digest,
+                            &input.repository_name,
+                        )),
+                    },
+                ),
+            )
+            .into());
+        }
+
+        // The URL is a capability this registry mints and holds: one per call, exactly as
+        // each pre-signed URL AWS answers with is its own, valid for the window the grant
+        // records. It is the ONE thing this reporting call writes, and it is what the
+        // operation is for — "retrieves the pre-signed Amazon S3 download URL" — so no
+        // repository, image or layer a later caller reads is touched.
+        let Some((token, grant)) = store.issue_layer_download_grant(
+            &input.repository_name,
+            &input.layer_digest,
+            now,
+        ) else {
+            return Err(refusal(
+                "layer download grant ceiling reached",
+                &caller_akid,
+                GetDownloadUrlForLayerErrorModeled::ServerException(ServerException {
+                    message: Some(format!(
+                        "the registry with id '{}' already holds the maximum of {} \
+                         unexpired layer download URLs",
+                        crate::state::registry_id(),
+                        crate::state::MAX_LAYER_DOWNLOAD_GRANTS
+                    )),
+                }),
+            )
+            .into());
+        };
+
+        // Audit record for the one write this call makes: who asked, what was granted,
+        // how it ended. Only wire metadata and server-held values — the token itself is
+        // the capability, so it is not logged.
+        ::tracing::info!(
+            target: "emulator::audit",
+            audit = true,
+            operation = "GetDownloadUrlForLayer",
+            outcome = "granted",
+            caller_akid = %caller_akid,
+            registry_id = %crate::state::registry_id(),
+            repository_name = %grant.repository_name,
+            layer_digest = %grant.layer_digest,
+            validity_seconds = grant.validity_seconds(),
+            "layer download url granted"
+        );
+
+        // Both members come from the grant this registry stored, so the answer reports
+        // what a fetch of the URL will resolve against rather than echoing the request.
+        Ok(GetDownloadUrlForLayerOutput {
+            download_url: Some(crate::state::layer_download_url(&host, &token, &grant)),
+            layer_digest: Some(grant.layer_digest.clone()),
+        })
     }
 }

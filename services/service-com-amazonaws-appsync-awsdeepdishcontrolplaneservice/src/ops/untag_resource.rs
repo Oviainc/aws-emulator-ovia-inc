@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes from the resource the request names exactly the tag keys the request lists,
+//! in this service's store: a key the resource carries is dropped together with its
+//! value, a key it does not carry is simply not there afterwards, and a key the request
+//! does not list is left exactly as it was — so this call REMOVES the named keys rather
+//! than replacing the map, it is idempotent, and `ListTagsForResource` (and the
+//! resource's own `tags` member) answers what is left afterwards.
+//!
+//! Dropping a key is not the same as writing an empty value over it: `TagValue` admits
+//! the empty string, so a key removed here stops being reported at all, while a key
+//! whose value is empty keeps being reported with that value.
+//!
+//! `ResourceArn` admits one ARN shape (`^arn:aws:appsync:…:apis/…$`), under which an
+//! API of either resource family is published, so the resource is resolved from the
+//! whole ARN through the store's `tags_of_mut` — the same lookup the tag write and the
+//! tag listing go through. An ARN this account holds no resource for is a 404
+//! `NotFoundException` and a key outside `TagKey`'s rule a 400 `BadRequestException`.
+//! Every refusal is decided before anything is removed, so a refused call leaves the
+//! stored map exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +158,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // Which resource is untagged, and which keys go, comes from the ARN and the
+        // request's own query parameters alone, so nothing here reads the request's
+        // metadata.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A key's LENGTH is refused by the request boundary against `TagKey`'s modelled
+        // bounds before this handler runs, but its alphabet and its reserved prefix are
+        // stated by a pattern with a negative lookahead, which the boundary's regex
+        // engine cannot compile and therefore treats as satisfied — so the key's own
+        // rule is enforced here, through the same predicate the tag write uses. Checked
+        // before anything is removed, so a refused call leaves the stored tags as they
+        // were.
+        for key in &input.tag_keys {
+            if !crate::state::is_tag_key(key) {
+                return Err(UntagResourceErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::invalid_tag_key_message(key)),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut guard = state.lock();
+
+        let Some(tags) = guard.tags_of_mut(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        // Removing a key the resource does not carry leaves the map as it is rather
+        // than failing: what the call states is that the named keys are gone
+        // afterwards, so repeating it answers the same way.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+
+        // `UntagResourceResponse` models no members: what is left of the stored map is
+        // what the tag listing answers, and this call reports only that the removal
+        // happened.
+        Ok(UntagResourceOutput {})
     }
 }

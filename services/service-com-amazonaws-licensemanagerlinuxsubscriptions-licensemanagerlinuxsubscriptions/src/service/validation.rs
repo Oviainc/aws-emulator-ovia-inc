@@ -15,11 +15,14 @@
 //!    (`/tags/{resourceArn}`) address their resource with the `resourceArn` label, and
 //!    a value outside that label's modelled grammar is refused with
 //!    `BadRequestException` — not the generic `ValidationException`, which
-//!    `UntagResource` does not even model. A tag set past its modelled size limit is
-//!    refused with `BadRequestException` too, wherever that tag map appears
-//!    (`RegisterSubscriptionProvider`'s `Tags` as much as `TagResource`'s `tags`). Both
-//!    are the refusals `crate::scaffolded` states, so the EXISTENCE stage a handler
-//!    answers (`NotFoundException`) sits behind the same taxonomy.
+//!    `UntagResource` does not even model. A tag SELECTION past its modelled size limit
+//!    is refused with `BadRequestException` too, wherever that selection appears —
+//!    whether it travels as the tag MAP of a write (`RegisterSubscriptionProvider`'s
+//!    `Tags` as much as `TagResource`'s `tags`) or as the tag-KEY LIST of a removal
+//!    (`UntagResource`'s `tagKeys`), since both select from the one tag set whose size
+//!    the limit is about. Both are the refusals `crate::scaffolded` states, so the
+//!    EXISTENCE stage a handler answers (`NotFoundException`) sits behind the same
+//!    taxonomy.
 //! 2. **Every other refusal is the AWS constraint envelope** under this service's
 //!    modelled `ValidationException`: `N validation error(s) detected: ` over one
 //!    clause per violation, each naming the member path, the value it held and the
@@ -77,10 +80,13 @@ pub(crate) const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// `ListTagsForResource`, as `smithy_query(query="operation")` reports them.
 const RESOURCE_ARN_MEMBER: &str = "resourceArn";
 
-/// The member a tag SET travels in: the `Tags` map of `RegisterSubscriptionProvider` and
-/// the `tags` map of `TagResource`, both `@length 0..50`. Both spell the same lowerCamel
-/// path, so one name covers them.
-const TAG_SET_MEMBER: &str = "tags";
+/// The members a tag SELECTION travels in, each `@length 0..50`
+/// (`smithy_query(query="operation")`): the `Tags` map of `RegisterSubscriptionProvider`
+/// and the `tags` map of `TagResource` — both spell the same lowerCamel path, so one name
+/// covers them — and the `tagKeys` list of `UntagResource`. A map names the tags a write
+/// leaves and a list names the tags a removal takes away, but each is a selection out of
+/// the one tag set a resource may carry, and it is that set's size the limit bounds.
+const TAG_SELECTION_MEMBERS: &[&str] = &["tags", "tagKeys"];
 
 /// The suffix the framework's validation path carries for the step from a collection
 /// into one of its elements: `path::element` spells an element as its 1-based position
@@ -363,20 +369,20 @@ fn tag_api_refusal(violations: &[Violation]) -> Option<&'static UnmodeledRefusal
     let first = violations.first()?;
     let (path, depth) = collapsed(&first.path);
     // Both refusals are about the MEMBER itself — the label's own grammar, and the SIZE
-    // of the tag map — so a violation reached THROUGH a collection step is not one of
-    // them, whatever member it sits under. That is also what keeps a numeric tag KEY
+    // of the tag selection — so a violation reached THROUGH a collection step is not one
+    // of them, whatever member it sits under. That is also what keeps a numeric tag KEY
     // from being read as a tag-count violation: the framework spells a map entry
     // `<key>.member`, exactly as it spells a list element, so a key of digits only is
-    // indistinguishable from an index by the path alone — but a per-key or per-value
-    // `@length` on such an entry is not the map's own `@length`, and this check is what
-    // separates them.
+    // indistinguishable from an index by the path alone — but a per-key, per-value or
+    // per-element `@length` on such an entry is not the collection's own `@length`, and
+    // this check is what separates them.
     if depth != 0 {
         return None;
     }
     if path == RESOURCE_ARN_MEMBER {
         return Some(&INVALID_ARN);
     }
-    if path == TAG_SET_MEMBER && matches!(first.kind, ViolationKind::MaxLength(_)) {
+    if TAG_SELECTION_MEMBERS.contains(&path) && matches!(first.kind, ViolationKind::MaxLength(_)) {
         return Some(&TAG_LIMIT);
     }
     None
@@ -484,19 +490,23 @@ mod tests {
         );
     }
 
-    /// The tag APIs' own refusals are about the MEMBER — the label's grammar and the tag
-    /// map's size — so a violation reached through a collection step never takes them,
-    /// which is what keeps a per-entry `@length` on a numeric tag key from being
+    /// The tag APIs' own refusals are about the MEMBER — the label's grammar and the size
+    /// of a tag selection — so a violation reached through a collection step never takes
+    /// them, which is what keeps a per-entry `@length` on a numeric tag key from being
     /// answered as the tag-COUNT refusal.
     #[test]
     fn only_a_violation_on_the_member_itself_takes_a_tag_api_refusal() {
         let cases = [
             // The tag map's own `@length`: the tag-count refusal.
             ("tags", true),
+            // The tag-key list's own `@length`: the same refusal, same taxonomy.
+            ("tagKeys", true),
             // A per-entry `@length` on an entry whose key happens to be digits only.
             ("tags.2024.member", false),
             // A per-entry `@length` on an ordinary key.
             ("tags.owner.member", false),
+            // A per-ELEMENT constraint on one tag key, which is not the list's size.
+            ("tagKeys.1.member", false),
         ];
         for (path, expects_tag_limit) in cases {
             let violation = Violation {

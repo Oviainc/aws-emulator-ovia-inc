@@ -357,10 +357,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // report, and answering 200 anyway would claim behaviour nothing performed, so
         // the request is refused rather than quietly stripped of its meaning:
         //
-        // * `If-Match` / `If-None-Match` make the write conditional, and the documented
-        //   answers when the condition fails are HTTP 412 `PreconditionFailed` and 409
-        //   `ConditionalRequestConflict` — neither is a shape in this model, and an
-        //   operation renders one success status, so the condition has no faithful answer.
         // * the SSE-C members carry a customer-provided KEY. S3 "doesn't store the
         //   encryption key you provide", and every later read of the object has to carry
         //   it again for S3 to decrypt — so serving them would mean either keeping a key
@@ -369,6 +365,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //   by one.
         // * the Object Lock members decide whether a later delete is allowed; no
         //   retention or hold is emulated.
+        //
+        // `If-Match` and `If-None-Match` are NOT in this list: they make the write
+        // conditional on what the key holds, which is judged below against the object the
+        // store really holds and refused with the documented 412 when it does not hold.
         //
         // `x-amz-tagging` is NOT in this list: it carries a tag set this emulator stores
         // on the object it writes (see below), exactly as `PutObjectTagging` would.
@@ -384,8 +384,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one of them carries is the client's own for the same bytes, which is neither
         // verified nor echoed.
         for (member, present) in [
-            ("If-Match", input.if_match.is_some()),
-            ("If-None-Match", input.if_none_match.is_some()),
             (
                 "x-amz-server-side-encryption-customer-algorithm",
                 input.sse_customer_algorithm.is_some(),
@@ -649,6 +647,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 ));
             }
+        }
+
+        // The conditional members, judged against what the key holds NOW — the write is what
+        // they make conditional, so they are judged here, immediately before it, through the
+        // one rule every conditional write in this service is judged by
+        // ([`crate::state::write_precondition_fails`]). A refused write stores nothing, so
+        // the object the key holds is left exactly as it was and the caller can read its tag
+        // and retry.
+        if crate::state::write_precondition_fails(
+            bucket_record
+                .object(&input.key)
+                .map(|object| object.etag.as_str()),
+            input.if_match.as_deref(),
+            input.if_none_match.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::PRECONDITION_FAILED_CODE,
+                crate::state::PRECONDITION_FAILED_STATUS,
+                crate::state::PRECONDITION_FAILED_MESSAGE,
+            ));
         }
 
         let etag = crate::state::object_etag(&body);

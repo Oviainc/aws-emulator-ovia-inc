@@ -294,9 +294,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetResourceConfigHistoryErrorModeled::ResourceNotDiscoveredException(
                     ResourceNotDiscoveredException {
-                        message: Some(format!(
-                            "Resource of type {} with id {} has not been discovered",
-                            input.resource_type, input.resource_id,
+                        message: Some(not_discovered_message(
+                            &input.resource_id,
+                            &input.resource_type,
                         )),
                     },
                 )
@@ -366,3 +366,19 @@ const MAX_PAGE_SIZE: i32 = 100;
 /// (`com.amazonaws.configservice#ChronologicalOrder`, whose values are `Reverse` and
 /// `Forward`); `Reverse` is the default and needs no name here.
 const CHRONOLOGICAL_ORDER_FORWARD: &str = "Forward";
+
+/// How Config words `ResourceNotDiscoveredException` — "You have specified a resource
+/// that is either unknown or has not been discovered" — for a well-formed resource key
+/// the recorder never captured a configuration item for.
+///
+/// The fixed text is everything around the two variable parts, and both variable parts
+/// are taken from the request: the resource id first, then the resource type, which is
+/// the order Config words them in. A caller branching on this refusal reads back the
+/// pair it asked about, so it can tell which half of the key was the one Config knows
+/// nothing about.
+fn not_discovered_message(resource_id: &str, resource_type: &str) -> String {
+    format!(
+        "Resource {resource_id} of resourceType:{resource_type} is unknown or has not \
+         been discovered"
+    )
+}

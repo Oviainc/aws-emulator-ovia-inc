@@ -451,15 +451,30 @@ pub struct LayerBlob {
     pub size: Option<i64>,
     pub media_type: Option<String>,
     /// What a basic image scan identifies inside this blob's bytes, read ONCE when
-    /// `CompleteLayerUpload` assembled and registered them ([`scan_layer_filesystem`]).
-    /// The bytes themselves are not retained, so what a later scan of an image built on
-    /// this layer examines is this record of them.
+    /// `CompleteLayerUpload` assembled and registered them ([`scan_layer_filesystem`]),
+    /// so a later scan of an image built on this layer reads this record rather than
+    /// walking the archive again.
     ///
     /// Empty ([`LayerFilesystem::default`]) for a blob whose bytes carry no filesystem
     /// this scan could read, and for a DESCRIPTOR read out of a manifest document: a
     /// descriptor states a digest, a size and a media type, and carries none of the
     /// blob's content.
     pub filesystem: LayerFilesystem,
+    /// The blob's own bytes, exactly as `CompleteLayerUpload` assembled them from the
+    /// parts the upload accepted: what a download of this layer serves, byte for byte,
+    /// and what [`Self::digest`] addresses it by.
+    ///
+    /// A layer is content-addressed, so the bytes ARE the layer: a registry that reports
+    /// a layer available and hands out a download URL for it has to still hold them.
+    /// They count against [`MAX_REGISTRY_CALLER_BYTES`]
+    /// ([`caller_bytes_held`](ComAmazonawsEcrAmazonec2containerregistryV20150921State::caller_bytes_held)),
+    /// where they are the same bytes the completed upload held, so closing an upload
+    /// moves a layer's bytes between two records rather than freeing the budget they sit
+    /// under.
+    ///
+    /// Empty for a DESCRIPTOR read out of a manifest document, which carries a digest, a
+    /// size and a media type and none of the content they describe.
+    pub content: Vec<u8>,
 }
 
 /// What a basic image scan identifies in ONE layer's filesystem: the operating system the
@@ -1309,7 +1324,8 @@ pub const MAX_LAYER_UPLOADS: usize = 1_000;
 pub const ABANDONED_UPLOAD_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// The registry-wide ceiling on the caller-supplied BYTES this store retains at once:
-/// every in-flight upload's received bytes plus every stored image manifest.
+/// every in-flight upload's received bytes, every registered layer blob's bytes, and
+/// every stored image manifest.
 ///
 /// The per-record caps above each bound ONE dimension and their product is far larger
 /// than any host — [`MAX_LAYER_UPLOADS`] uploads of [`MAX_LAYER_UPLOAD_BYTES`] alone
@@ -1441,6 +1457,100 @@ impl LayerUpload {
         }
         self.received_bytes.extend_from_slice(blob);
         Ok(self.last_byte_received().unwrap_or(part_last_byte))
+    }
+}
+
+/// How long a layer download URL `GetDownloadUrlForLayer` hands out stays valid.
+///
+/// AWS publishes no validity window for the pre-signed URL that operation answers with,
+/// so this span is the EMULATOR's own choice rather than a claim about the service. It is
+/// long enough that a client which asked for a URL per layer of an image can pull every
+/// one of them, and far inside the longest validity a pre-signed URL may carry at all
+/// (seven days), which is the only published bound on one.
+pub const LAYER_DOWNLOAD_URL_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// The path space this registry publishes layer downloads under, beneath the endpoint the
+/// caller reached this emulator on.
+///
+/// `GetDownloadUrlForLayer`'s `downloadUrl` is a promise that whoever holds it can FETCH
+/// the layer, so the URL has to name a host this emulator serves: a literal Amazon S3
+/// hostname would send the next client out of the emulator entirely. The prefix names
+/// this service and this resource, so it cannot collide with another service's URI space,
+/// and no modelled operation of this service is bound to a path at all — every one of
+/// them is `POST /` on awsJson1_1 — so claiming a read beneath it cannot take a request
+/// any operation would have served.
+pub const LAYER_DOWNLOAD_PATH_PREFIX: &str = "/ecr-layer-download";
+
+/// The media type a layer download is served under.
+///
+/// A layer is opaque content to the registry: what it IS is stated by the descriptor of
+/// whichever manifest references it, not by the blob, so a download carries the generic
+/// binary type — as the pre-signed object store a real download is served from does.
+pub const LAYER_DOWNLOAD_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// See [`MAX_REPOSITORIES`]. This one bounds `layer_download_grants`, which grows by one
+/// entry per `GetDownloadUrlForLayer` call: each call hands out its own URL, exactly as
+/// each pre-signed URL AWS answers with is its own, so the only thing that shrinks the
+/// table is a grant's window closing
+/// ([`reclaim_expired_layer_download_grants`](ComAmazonawsEcrAmazonec2containerregistryV20150921State::reclaim_expired_layer_download_grants)).
+/// Past the ceiling, with nothing expired to reclaim, the call is refused with the
+/// `ServerException` that operation models: reaching it is this registry's own capacity,
+/// not a fault in the request. A grant is a few hundred bytes and holds no layer content,
+/// so the number is set well above the URLs any ordinary pull sequence asks for.
+pub const MAX_LAYER_DOWNLOAD_GRANTS: usize = 10_000;
+
+/// One layer download URL this registry handed out: which layer of which repository it
+/// serves, and the window it serves it in.
+///
+/// A pre-signed URL is a CAPABILITY, so what makes a fetch resolve is a grant this
+/// registry minted and still holds — addressed by the opaque token the URL carries — and
+/// never the repository or digest spelled in the URL's path: a path a client assembled
+/// for itself names no grant and serves nothing.
+///
+/// The layer's bytes are NOT copied here. A download reads the repository's own record of
+/// the blob ([`LayerBlob::content`]) when it is fetched, so a grant for a layer this
+/// registry no longer holds has nothing to serve, and two grants for one layer are two
+/// capabilities over one copy of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerDownloadGrant {
+    /// The repository whose blob this grant serves. A blob is per-repository, so the
+    /// grant names the repository as well as the digest.
+    pub repository_name: String,
+    /// The digest of the layer this grant serves.
+    pub layer_digest: String,
+    /// When `GetDownloadUrlForLayer` minted it.
+    pub issued_at: SystemTime,
+    /// When its window closes: [`LAYER_DOWNLOAD_URL_TTL`] after it was minted. Stored as
+    /// the instant rather than recomputed per fetch, so a grant's window is decided once,
+    /// by the call that handed the URL out.
+    pub expires_at: SystemTime,
+}
+
+impl LayerDownloadGrant {
+    /// The grant for one layer of one repository, minted at `now` and valid from then for
+    /// [`LAYER_DOWNLOAD_URL_TTL`].
+    pub fn issued(repository_name: &str, layer_digest: &str, now: SystemTime) -> Self {
+        Self {
+            repository_name: repository_name.to_string(),
+            layer_digest: layer_digest.to_string(),
+            issued_at: now,
+            expires_at: now + LAYER_DOWNLOAD_URL_TTL,
+        }
+    }
+
+    /// Whether this grant's window has closed as of `now`, which is what makes a fetch of
+    /// its URL an expired request.
+    pub fn has_expired(&self, now: SystemTime) -> bool {
+        self.expires_at <= now
+    }
+
+    /// How long the URL stays valid from the instant it was issued, in whole seconds:
+    /// the validity the URL states to whoever holds it.
+    pub fn validity_seconds(&self) -> u64 {
+        self.expires_at
+            .duration_since(self.issued_at)
+            .unwrap_or_default()
+            .as_secs()
     }
 }
 
@@ -2428,7 +2538,7 @@ impl Repo {
         })
     }
 
-    /// Every blob this repository holds, by digest.
+    /// Every blob this repository holds, by digest, WITHOUT the blobs' bytes.
     ///
     /// A blob is in a repository because a layer upload against that repository was
     /// COMPLETED — `CompleteLayerUpload` is what registers one, under the digest the
@@ -2440,8 +2550,29 @@ impl Repo {
     /// whichever stored manifest knows it. Blobs are per-repository: a layer uploaded to
     /// one repository is not a layer of another, which is why this is a method on the
     /// repository.
+    ///
+    /// [`LayerBlob::content`] is left EMPTY in the copies this answers with: every reader
+    /// of it reports ON a layer — its digest, its size, its media type, its availability
+    /// — rather than serving it, and one layer runs to [`MAX_LAYER_UPLOAD_BYTES`], so
+    /// copying the content per read would let one small request allocate every byte the
+    /// repository holds. The download plane reads [`Self::layer_blobs`] itself.
     pub fn layers(&self) -> BTreeMap<String, LayerBlob> {
-        let mut layers = self.layer_blobs.clone();
+        let mut layers: BTreeMap<String, LayerBlob> = self
+            .layer_blobs
+            .iter()
+            .map(|(digest, blob)| {
+                (
+                    digest.clone(),
+                    LayerBlob {
+                        digest: blob.digest.clone(),
+                        size: blob.size,
+                        media_type: blob.media_type.clone(),
+                        filesystem: blob.filesystem.clone(),
+                        content: Vec::new(),
+                    },
+                )
+            })
+            .collect();
         for image in self.images.values() {
             for blob in manifest_blobs(&image.manifest) {
                 // A descriptor for a blob the repository does not hold describes
@@ -2861,6 +2992,12 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// reached. An upload opened against a repository later deleted is therefore inert,
     /// but still counts against [`MAX_LAYER_UPLOADS`] until the process ends.
     pub uploads: BTreeMap<String, LayerUpload>,
+    /// The layer download URLs this registry has handed out, by the opaque token each
+    /// URL carries. Registry-wide, because a token is what a fetch addresses a grant by;
+    /// each record names the repository and the layer it serves. A `BTreeMap` for the
+    /// same deterministic order as the maps above, and bounded by
+    /// [`MAX_LAYER_DOWNLOAD_GRANTS`].
+    pub layer_download_grants: BTreeMap<String, LayerDownloadGrant>,
     /// The registry's scanning configuration, exactly as the last
     /// `PutRegistryScanningConfiguration` stored it. `None` until one is stored, which is
     /// the state the documented default describes — see
@@ -2898,6 +3035,49 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
             .filter(|upload| upload.repository_name == repository_name)
     }
 
+    /// Drop every layer download grant whose window has closed as of `now`.
+    ///
+    /// Expiry is the clock's, not a caller's: a grant past [`LAYER_DOWNLOAD_URL_TTL`]
+    /// serves nothing whether or not anything has looked at it, so dropping it changes
+    /// nothing a later caller can observe and keeps the table from growing for the life
+    /// of the process. Called by `GetDownloadUrlForLayer` before it mints another.
+    pub fn reclaim_expired_layer_download_grants(&mut self, now: SystemTime) {
+        self.layer_download_grants
+            .retain(|_, grant| !grant.has_expired(now));
+    }
+
+    /// Mint one layer download grant for `layer_digest` of `repository_name` at `now`,
+    /// keep it, and answer the token addressing it with the grant itself.
+    ///
+    /// `None` when the registry already holds [`MAX_LAYER_DOWNLOAD_GRANTS`] live grants
+    /// and none has expired, which is the one case the caller refuses rather than
+    /// answering a URL. Expired grants are reclaimed first, so a client that keeps
+    /// pulling is bounded by how many URLs it asks for within one window rather than by
+    /// how many it has ever asked for.
+    pub fn issue_layer_download_grant(
+        &mut self,
+        repository_name: &str,
+        layer_digest: &str,
+        now: SystemTime,
+    ) -> Option<(String, LayerDownloadGrant)> {
+        self.reclaim_expired_layer_download_grants(now);
+        if self.layer_download_grants.len() >= MAX_LAYER_DOWNLOAD_GRANTS {
+            return None;
+        }
+        let grant = LayerDownloadGrant::issued(repository_name, layer_digest, now);
+        let token = mint_hex(LAYER_DOWNLOAD_TOKEN_BYTES);
+        self.layer_download_grants
+            .insert(token.clone(), grant.clone());
+        Some((token, grant))
+    }
+
+    /// The grant `token` addresses, whether or not its window is still open: whether it
+    /// has expired is the FETCH's question, because an expired URL and a URL this
+    /// registry never handed out are not the same answer.
+    pub fn layer_download_grant(&self, token: &str) -> Option<&LayerDownloadGrant> {
+        self.layer_download_grants.get(token)
+    }
+
     /// The rule registered for `prefix`, whichever way its trailing slash is written, or
     /// `None` when the registry holds no rule for it.
     pub fn pull_through_cache_rule(&self, prefix: &str) -> Option<&PullThroughCacheRule> {
@@ -2906,13 +3086,19 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     }
 
     /// The caller-supplied BYTES this registry currently holds: every in-flight upload's
-    /// received bytes plus every stored image manifest.
+    /// received bytes, every registered layer blob's bytes, and every stored image
+    /// manifest.
     ///
     /// The one accounting behind [`MAX_REGISTRY_CALLER_BYTES`], so the two paths that
     /// grow the store — `UploadLayerPart` and `PutImage` — are held to one aggregate
-    /// rather than to their own per-record caps alone. Summed on demand: both maps are
-    /// bounded by their entry caps, so this is a walk of at most a few thousand lengths
-    /// and no second copy of the figure can drift from the bytes actually held.
+    /// rather than to their own per-record caps alone. A registered blob's bytes are
+    /// counted here as well as an in-flight upload's ([`LayerBlob::content`]): closing an
+    /// upload moves the same bytes from one record to the other, so a client cannot free
+    /// the aggregate by completing uploads and keep streaming new ones.
+    ///
+    /// Summed on demand: every map is bounded by its entry cap, so this is a walk of at
+    /// most a few thousand lengths and no second copy of the figure can drift from the
+    /// bytes actually held.
     pub fn caller_bytes_held(&self) -> usize {
         let upload_bytes = self
             .uploads
@@ -2921,7 +3107,10 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
                 held.saturating_add(upload.received_bytes.len())
             });
         self.repositories.values().fold(upload_bytes, |held, repo| {
-            repo.images.values().fold(held, |held, image| {
+            let with_blobs = repo.layer_blobs.values().fold(held, |held, blob| {
+                held.saturating_add(blob.content.len())
+            });
+            repo.images.values().fold(with_blobs, |held, image| {
                 held.saturating_add(image.manifest.len())
             })
         })
@@ -3421,6 +3610,19 @@ pub fn upload_not_found_message(upload_id: &str, repository_name: &str) -> Strin
     )
 }
 
+/// The wording ECR uses when a repository holds no layer of the digest a request named
+/// — the state `LayersNotFoundException` documents: "the specified layers could not be
+/// found, or the specified layer is not valid for this repository". Worded in the shape
+/// this service states every other missing resource in, naming the three things the
+/// request gave: the digest, the repository and the registry.
+pub fn layer_not_found_message(layer_digest: &str, repository_name: &str) -> String {
+    format!(
+        "The layer with digest '{layer_digest}' does not exist in the repository with \
+         name '{repository_name}' in the registry with id '{}'",
+        registry_id()
+    )
+}
+
 /// The wording ECR uses when a repository carries no policy: the error's own
 /// documentation is "the specified repository and registry combination does not have an
 /// associated repository policy".
@@ -3483,6 +3685,160 @@ pub fn repository_uri(region: &str, name: &str) -> String {
 /// format is `https://aws_account_id.dkr.ecr.region.amazonaws.com`."
 pub fn registry_proxy_endpoint(region: &str) -> String {
     format!("https://{}", registry_host(region))
+}
+
+/// How many bytes of a minted id a layer download token carries: 32, the full width of
+/// the digest [`mint_hex`] takes it from, so the token a URL carries is as hard to guess
+/// as the mint allows.
+const LAYER_DOWNLOAD_TOKEN_BYTES: usize = 32;
+
+/// The host a layer download URL is announced under when the request carried no endpoint
+/// this emulator could read: a loopback literal, because this emulator is what serves the
+/// download.
+const LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// The endpoint the request reached this emulator on, as the layer download URL this
+/// registry announces names it: the request's own `Host`, else the authority its URI
+/// carries, else [`LOOPBACK_HOST`].
+///
+/// Read from the request rather than built from this registry's own
+/// `<account>.dkr.ecr.<region>.amazonaws.com` host ([`registry_host`]), because the URL
+/// has to resolve for whoever was handed it: that host is AWS's, and a URL naming it
+/// would send the next client out of the emulator entirely, while a client addressing
+/// the emulator by socket is handed that socket.
+///
+/// The value is the CALLER's and it is interpolated into a URL this service announces, so
+/// only a BARE AUTHORITY is honoured: anything else is not an endpoint, and the loopback
+/// literal is announced instead of reflecting it.
+///
+/// The same rule, with the same two sources and the same filter, as
+/// `service-com-amazonaws-artifact-artifact`'s `document_url_host` and
+/// `service-com-amazonaws-iotdeviceadvisor-iotsenateservice`'s `report_url_host`: each
+/// service resolves the caller's own endpoint for a URL it announces, and this note is
+/// here so the three cannot drift apart unnoticed if any of them changes.
+pub fn layer_download_url_host(parts: &::http::request::Parts) -> String {
+    parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        // The URI's AUTHORITY, not its host: a request that carries its endpoint on the
+        // URI carries the PORT there too, and a URL announced without the port would not
+        // resolve back to the socket the caller reached.
+        .or_else(|| parts.uri.authority().map(::http::uri::Authority::as_str))
+        .filter(|candidate| is_bare_authority(candidate))
+        .unwrap_or(LOOPBACK_HOST)
+        .to_string()
+}
+
+/// True when `value` is a bare authority: a host with an optional port and nothing else.
+///
+/// A path, query, fragment, userinfo or space makes it something other than an endpoint —
+/// a URL built around it would not resolve back to this emulator — so the parse is
+/// `::http::uri::Authority`'s, with those separators refused first because an authority
+/// accepts userinfo.
+fn is_bare_authority(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains(['/', '?', '#', '@', '\\', ' ', '\t'])
+        && value.parse::<::http::uri::Authority>().is_ok()
+}
+
+/// The URL one layer download grant is served at, addressed to `host` (the endpoint the
+/// caller reached this emulator on — see [`layer_download_url_host`]).
+///
+/// The path carries the grant's token, which is the capability a fetch resolves through,
+/// and then the digest the grant serves, so the URL names the content it leads to the way
+/// an object URL does. The query states the window the grant was minted with — when it
+/// was issued and how many seconds it is valid for — so a client holding the URL can see
+/// what it has; it is NOT what a fetch is judged against, which is the stored grant, so a
+/// rewritten query extends nothing. No signature is attached: this emulator signs
+/// nothing, and a fabricated one would claim a computation nothing performed.
+pub fn layer_download_url(host: &str, token: &str, grant: &LayerDownloadGrant) -> String {
+    format!(
+        "https://{host}{LAYER_DOWNLOAD_PATH_PREFIX}/{token}/{}?X-Amz-Date={}&X-Amz-Expires={}",
+        grant.layer_digest,
+        basic_timestamp(grant.issued_at),
+        grant.validity_seconds()
+    )
+}
+
+/// One instant in the compact form a pre-signed URL states its date in
+/// (`yyyymmddThhmmssZ`): the RFC 3339 rendering of the whole second, with the separators
+/// that form leaves out removed.
+///
+/// Rendered through `aws_smithy_types::DateTime` — the same timestamp type every modelled
+/// member of this service is serialized through — rather than by date arithmetic of this
+/// module's own.
+fn basic_timestamp(at: SystemTime) -> String {
+    let at = ::aws_smithy_types::DateTime::from(at);
+    ::aws_smithy_types::DateTime::from_secs(at.secs())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| !matches!(character, '-' | ':'))
+        .collect()
+}
+
+/// What a request to a published layer download URL addresses: the grant token the URL
+/// carries, and the digest its path names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerDownloadTarget {
+    /// The token the URL carries, which addresses the grant in
+    /// [`ComAmazonawsEcrAmazonec2containerregistryV20150921State::layer_download_grants`].
+    pub token: String,
+    /// The layer digest the URL's path names, which has to be the one the grant serves.
+    pub layer_digest: String,
+}
+
+/// The layer download a request path addresses, or `None` when the path is not one
+/// [`layer_download_url`] publishes.
+///
+/// Both segments are percent-decoded, so a client that encoded the digest's `:` resolves
+/// the same URL as one that sent it literally (a `:` is legal in a path segment, so this
+/// service announces it unencoded).
+pub fn parse_layer_download_path(path: &str) -> Option<LayerDownloadTarget> {
+    let rest = path
+        .strip_prefix(LAYER_DOWNLOAD_PATH_PREFIX)?
+        .strip_prefix('/')?;
+    let (token, digest) = rest.split_once('/')?;
+    (!token.is_empty() && !digest.is_empty() && !digest.contains('/')).then(|| {
+        LayerDownloadTarget {
+            token: ::smithy_server_runtime::percent_decode(token),
+            layer_digest: ::smithy_server_runtime::percent_decode(digest),
+        }
+    })
+}
+
+/// A freshly minted hex id of `bytes` unguessable bytes, at most the 32 a SHA-256 is
+/// wide; a wider request is served the whole digest.
+///
+/// The bytes are the leading ones of a SHA-256 — the crate's existing `sha2` dependency,
+/// the same one that digests a manifest — over three inputs: a per-process random seed
+/// from the standard library's `RandomState` (the OS-seeded randomness `HashMap` uses), a
+/// monotonically increasing counter, and the clock. The seed keeps two processes apart,
+/// and the counter keeps two ids of one process apart even if the clock does not advance,
+/// so no two ids minted here collide. Nothing in an id is derived from the request.
+///
+/// The one mint in this service: an `InitiateLayerUpload` upload id and a layer download
+/// token are both ids a later call addresses a record by, so neither has its own recipe.
+pub fn mint_hex(bytes: usize) -> String {
+    use ::sha2::Digest as _;
+    use ::std::hash::{BuildHasher as _, Hasher as _};
+
+    static MINTED: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
+
+    let counter = MINTED.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    let mut seeder = ::std::collections::hash_map::RandomState::new().build_hasher();
+    seeder.write_u64(counter);
+    let nanos = SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_nanos());
+
+    let mut digest = ::sha2::Sha256::new();
+    digest.update(seeder.finish().to_be_bytes());
+    digest.update(counter.to_be_bytes());
+    digest.update(nanos.to_be_bytes());
+    let minted = digest.finalize();
+    ::hex::encode(&minted[..bytes.min(minted.len())])
 }
 
 /// Refuse a request that names a registry other than this emulator's: there is exactly
@@ -4354,6 +4710,7 @@ pub fn manifest_layer_descriptors(manifest: &str) -> Vec<LayerBlob> {
                 size: None,
                 media_type: None,
                 filesystem: LayerFilesystem::default(),
+                content: Vec::new(),
             })
         }));
     }
@@ -4369,9 +4726,10 @@ fn blob_descriptor(descriptor: &serde_json::Value) -> Option<LayerBlob> {
             .get("mediaType")
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string),
-        // A descriptor carries no blob content: what reading the registered bytes
-        // identified lives on the repository's own record of the blob.
+        // A descriptor carries no blob content: the bytes, and what reading them
+        // identified, live on the repository's own record of the blob.
         filesystem: LayerFilesystem::default(),
+        content: Vec::new(),
     })
 }
 

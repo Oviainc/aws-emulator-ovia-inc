@@ -539,29 +539,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The conditional members, judged against what the key holds NOW — the write is what
         // they make conditional, so they are judged here, immediately before it, rather than
-        // on anything the parts were uploaded against:
-        //
-        // * "Uploads the object only if the object key name does not already exist in the
-        //   bucket specified. Otherwise, Amazon S3 returns a 412 Precondition Failed error"
-        //   (`CompleteMultipartUploadRequest$IfNoneMatch`).
-        // * "Uploads the object only if the ETag (entity tag) value provided during the
-        //   WRITE operation matches the ETag of the object in S3. If the ETag values do not
-        //   match, the operation returns a 412 Precondition Failed error"
-        //   (`CompleteMultipartUploadRequest$IfMatch`) — so a key holding nothing at all
-        //   matches no tag either.
+        // on anything the parts were uploaded against, and through the one rule every
+        // conditional write in this service is judged by
+        // ([`crate::state::write_precondition_fails`], which carries each member's own
+        // documentation of the condition and of the 412 it answers).
         //
         // A refused completion leaves the upload in progress with every part it held, so the
         // caller can read the object's tag and retry.
         let held_etag = bucket_record
             .object(&input.key)
             .map(|object| object.etag.clone());
-        let condition_fails = (input.if_none_match.is_some() && held_etag.is_some())
-            || input.if_match.as_deref().is_some_and(|expected| {
-                held_etag
-                    .as_deref()
-                    .is_none_or(|held| crate::state::etag_value(held) != crate::state::etag_value(expected))
-            });
-        if condition_fails {
+        if crate::state::write_precondition_fails(
+            held_etag.as_deref(),
+            input.if_match.as_deref(),
+            input.if_none_match.as_deref(),
+        ) {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::PRECONDITION_FAILED_CODE,
                 crate::state::PRECONDITION_FAILED_STATUS,
@@ -712,7 +704,7 @@ const INVALID_PART_STATUS: u16 = 400;
 /// whichever way the named part failed to match.
 const INVALID_PART_MESSAGE: &str =
     "One or more of the specified parts could not be found. The part may not have been \
-     uploaded, or the specified entity tag may not have matched the part's entity tag.";
+     uploaded, or the specified entity tag may not match the part's entity tag.";
 
 /// The code S3 answers a completion whose parts list is not in ascending part-number order:
 /// `InvalidPartOrder`, HTTP 400 — also unmodelled in this service's model, from the same
@@ -722,8 +714,7 @@ const INVALID_PART_ORDER_CODE: &str = "InvalidPartOrder";
 const INVALID_PART_ORDER_STATUS: u16 = 400;
 /// The `<Message>` that code's entry in the same list publishes.
 const INVALID_PART_ORDER_MESSAGE: &str =
-    "The list of parts was not in ascending order. The parts list must be specified in \
-     order by part number.";
+    "The list of parts was not in ascending order. Parts must be ordered by part number.";
 
 /// The code S3 answers a completion naming a part smaller than the published minimum part
 /// size: `EntityTooSmall`, HTTP 400 — also unmodelled in this service's model, from the same
