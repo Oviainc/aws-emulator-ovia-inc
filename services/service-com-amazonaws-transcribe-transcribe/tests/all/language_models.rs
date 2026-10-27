@@ -11,13 +11,14 @@
 //! suite's harness (`crate::transcription_jobs`), reused rather than stood up a
 //! second time.
 //!
-//! WHAT A CUSTOM LANGUAGE MODEL IS HERE: its training and tuning data can only come
-//! from the Amazon S3 location at `InputDataConfig$S3Uri`, which `CreateLanguageModel`
-//! models `@required` with no inline alternative, and this emulator reads no object
-//! store. So the RECORD is real — name, language, base model, input data config,
-//! status, timestamps and tags — while the training it cannot run ends in the
-//! service's own modelled `FAILED` state with a `FailureReason`. These tests assert
-//! exactly that, and never a `COMPLETED` model.
+//! WHAT A CUSTOM LANGUAGE MODEL IS HERE: the RECORD — name, language, base model,
+//! input data config, status, timestamps and tags — plus the one thing its training
+//! run establishes about the data it is given, namely whether the object store holds
+//! it. No S3 is mounted beside Transcribe in this suite, so nothing is known about the
+//! locations these rows name and nothing is failed on an assumption: every model here
+//! settles `COMPLETED`, with no `FailureReason`. The suite that stages data and asserts
+//! both outcomes against the object store's own answer is
+//! `crate::language_model_training_data`.
 //!
 //! THE RULE THIS SUITE IS ABOUT (`DeleteLanguageModel`): a delete removes the named
 //! record and nothing else, and refuses both a record the service has not finished
@@ -31,7 +32,7 @@ use serde_json::{json, Value};
 
 use crate::transcription_jobs::{Reply, Transcribe};
 
-/// Long enough for the `IN_PROGRESS -> FAILED` transition of a model created during
+/// Long enough for the `IN_PROGRESS` -> terminal transition of a model created during
 /// the test to have fallen due: one span of `crate::state::MODEL_TRANSITION_DELAY`
 /// (500 ms), with room for a slow machine.
 ///
@@ -247,10 +248,11 @@ pub(crate) async fn create(transcribe: &Transcribe, case: &str, request: &Value)
 }
 
 /// A created language model is stored, reported back as `IN_PROGRESS`, readable
-/// through `DescribeLanguageModel`, and ends `FAILED` with a reason naming the Amazon
-/// S3 location this emulator does not read once the clock makes that transition due.
+/// through `DescribeLanguageModel`, and settles `COMPLETED` once the clock makes that
+/// transition due — no object store answered for the locations these rows name, so
+/// nothing grounds a failure.
 #[tokio::test]
-async fn a_created_language_model_is_in_progress_then_fails_and_describes_back() {
+async fn a_created_language_model_is_in_progress_then_settles_and_describes_back() {
     let transcribe = Transcribe::new();
     let rows = language_model_rows();
     let mut created_at: Vec<(&str, String, String, f64)> = Vec::new();
@@ -316,9 +318,9 @@ async fn a_created_language_model_is_in_progress_then_fails_and_describes_back()
         created_at.push((case, name, s3_uri_of(request), create_time));
     }
 
-    // The transition the clock owes every one of these records: the training that
-    // would have had to READ the Amazon S3 location ends in the modelled failure
-    // state.
+    // The transition the clock owes every one of these records: the training ends, and
+    // with nothing known about the locations they name it ends in the status that makes
+    // a model usable.
     std::thread::sleep(PAST_THE_TRANSITION);
 
     for (case, name, s3_uri, create_time) in &created_at {
@@ -330,15 +332,14 @@ async fn a_created_language_model_is_in_progress_then_fails_and_describes_back()
         );
         assert_eq!(
             model["ModelStatus"],
-            json!("FAILED"),
-            "case {case:?}: a model whose training data is never read must end FAILED, \
-             got {model:?}"
+            json!("COMPLETED"),
+            "case {case:?}: with nothing known about the data at {s3_uri} the training \
+             must settle COMPLETED, got {model:?}"
         );
-        let reason = model["FailureReason"].as_str().unwrap_or_default();
         assert!(
-            reason.contains(s3_uri),
-            "case {case:?}: the failure reason must name the location that was not read \
-             ({s3_uri}), got {reason:?}"
+            is_absent(&model, "FailureReason"),
+            "case {case:?}: a model that finished training carries no FailureReason, \
+             got {model:?}"
         );
         let last_modified = model["LastModifiedTime"].as_f64().unwrap_or_default();
         assert!(

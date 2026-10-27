@@ -330,9 +330,16 @@ fn describe(record: &crate::state::LoadBalancer) -> LoadBalancerDescription {
             unhealthy_threshold: record.health_check.unhealthy_threshold,
             healthy_threshold: record.health_check.healthy_threshold,
         }),
-        // Elastic Load Balancing reports the source security group it created for the
-        // load balancer; no operation of this emulator creates one yet.
-        source_security_group: None,
+        // "Information about a source security group": the group the load balancer's
+        // traffic comes from, reported under the name and owner EC2 holds for it — read
+        // off the record that resolved them when the groups were associated, and left
+        // unreported for a load balancer carrying no group this emulator could resolve.
+        source_security_group: record.source_security_group.as_ref().map(|group| {
+            SourceSecurityGroup {
+                owner_alias: group.owner_alias.clone(),
+                group_name: group.group_name.clone(),
+            }
+        }),
         security_groups: Some(record.security_groups.clone()),
         created_time: Some(::aws_smithy_types::DateTime::from(record.created_time)),
         scheme: Some(record.scheme.clone()),

@@ -16,6 +16,11 @@
 //! that shape and of the member targeting it, not of this one
 //! (`crate::state::TagConstraints`).
 //!
+//! Resolving the label is the sequence every operation that addresses a deployment
+//! parameter by a caller-supplied `resourceArn` runs, written once as
+//! `crate::state::with_tagged_parameter`; what follows is what that sequence decides,
+//! and this handler adds only the merge onto the resolved record.
+//!
 //! The label is judged as an INPUT first (`crate::state::validate_resource_arn`): a
 //! value that is not a resource ARN of this service's vendor names nothing this API
 //! can address, so it is refused as a bad request (HTTP 400, error code
@@ -171,74 +176,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // Input before lookup: a value that is not a resource ARN this API addresses is
-        // a bad request, not a missing resource.
-        crate::state::validate_resource_arn(&input.resource_arn)?;
-        // The TAGS next, still before any state is touched: the whole part of the tag
-        // judgement that reads only the request is made here, so the answer to a bad
-        // tag set does not depend on whether the store holds the ARN. A key in the
-        // namespace AWS reserves for its own generated tags, a key outside the length
-        // bound a tag key may hold, and a value longer than a tag value may be are
-        // each bad requests — the modelled `ValidationException` (HTTP 400) —
-        // whether the target exists or not, and nothing is stored either way. Only
-        // the per-resource cap, which is a property of the RESULTING stored set
-        // rather than of the request, is left to the merge below.
+        // ONE sequence, stated once in `crate::state`: judge the `resourceArn` as an
+        // input, judge the rest of the request on its own content, take the store,
+        // materialise the expiry the clock has already made due, then resolve the
+        // record or answer the service's not-found failure. The merge below is
+        // everything this operation adds to it.
+        //
+        // The ARN check comes first: a value that is not a resource ARN this API
+        // addresses is a bad request, not a missing resource. The TAGS are next,
+        // still before any state is touched: the whole part of the tag judgement
+        // that reads only the request is made there, so the answer to a bad tag set
+        // does not depend on whether the store holds the ARN. A key in the namespace
+        // AWS reserves for its own generated tags, a key outside the length bound a
+        // tag key may hold, and a value longer than a tag value may be are each bad
+        // requests — the modelled `ValidationException` (HTTP 400) — whether the
+        // target exists or not, and nothing is stored either way. Only the
+        // per-resource cap, which is a property of the RESULTING stored set rather
+        // than of the request, is left to the merge below.
         //
         // `TagConstraints::Unconstrained` because this operation's `tags` member
         // targets the map the model leaves unconstrained; the character class the
-        // model states belongs to the constrained map another member targets.
-        if let Some(tags) = input.tags.as_ref() {
-            if let Err(why) = crate::state::validate_tags_member(
-                tags,
-                crate::state::TagConstraints::Unconstrained,
-            ) {
-                return Err(TagResourceErrorModeled::ValidationException(why).into());
-            }
-        }
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(TagResourceErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: "the deployment-parameter store is unavailable".to_string(),
-                },
-            )
-            .into());
-        };
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-
-        // Materialise the expiry the clock has already made due before resolving the
-        // ARN: a parameter past its `expirationDate` is scheduled for deletion, so a
-        // tag write against it is a write to a resource that no longer exists. ONE
-        // clock sample decides it.
-        store.purge_expired(now);
-
-        let Some(record) = store.parameters.get_mut(&input.resource_arn) else {
-            // The not-found CODE this service emits is `NotFoundException`, not the
-            // modelled `ResourceNotFoundException` shape name; see
-            // `crate::state::parameter_not_found`.
-            return Err(crate::state::parameter_not_found());
-        };
-
-        // The merge is computed before anything is stored, so a refused request
-        // leaves the record untouched.
-        //
-        // This operation's `tags` member targets the map the model leaves
-        // UNCONSTRAINED, so the set is held to AWS's own tagging limits alone and any
-        // other UTF-8 key and value is stored as sent: the key/value character class
-        // the model states belongs to the constrained map another member targets, and
-        // applying it here would refuse ordinary AWS tags.
-        let merged = match crate::state::merge_tags(
-            &record.tags,
-            &input.tags.unwrap_or_default(),
-            crate::state::TagConstraints::Unconstrained,
-        ) {
-            Ok(merged) => merged,
-            Err(why) => {
-                return Err(TagResourceErrorModeled::ValidationException(why).into());
-            }
-        };
-        record.tags = merged;
-
-        Ok(TagResourceOutput {})
+        // model states belongs to the constrained map another member targets. An
+        // absent `tags` member carries no entries to judge, which is what the empty
+        // map it reads as says.
+        let incoming = input.tags.unwrap_or_default();
+        crate::state::with_tagged_parameter(
+            &*self.engine,
+            &input.resource_arn,
+            TagResourceErrorModeled::InternalServerException,
+            || {
+                crate::state::validate_tags_member(
+                    &incoming,
+                    crate::state::TagConstraints::Unconstrained,
+                )
+                .map_err(TagResourceErrorModeled::ValidationException)
+            },
+            |record| {
+                // The merge is computed before anything is stored, so a refused
+                // request leaves the record untouched.
+                //
+                // This operation's `tags` member targets the map the model leaves
+                // UNCONSTRAINED, so the set is held to AWS's own tagging limits
+                // alone and any other UTF-8 key and value is stored as sent: the
+                // key/value character class the model states belongs to the
+                // constrained map another member targets, and applying it here would
+                // refuse ordinary AWS tags.
+                let merged = crate::state::merge_tags(
+                    &record.tags,
+                    &incoming,
+                    crate::state::TagConstraints::Unconstrained,
+                )
+                .map_err(TagResourceErrorModeled::ValidationException)?;
+                record.tags = merged;
+                Ok(TagResourceOutput {})
+            },
+        )
     }
 }

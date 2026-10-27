@@ -97,7 +97,11 @@ const BASELINES: [(&str, &[Command], &str); 3] = [
 
 /// `UpdateInputDevice` as a client calls it: `PUT /prod/inputDevices/{id}`,
 /// asserting the update was accepted.
-async fn update(router: &MultiServiceRouter, case: &str, id: &str, body: Value) {
+///
+/// `pub(crate)` so the suite that holds the device's PENDING TRANSFER against the
+/// same writers ([`crate::input_device_transfer_independence`]) updates a device
+/// through this one helper rather than keeping a second copy of it.
+pub(crate) async fn update(router: &MultiServiceRouter, case: &str, id: &str, body: Value) {
     let (status, updated) = call(
         router,
         "PUT",
@@ -114,7 +118,9 @@ async fn update(router: &MultiServiceRouter, case: &str, id: &str, body: Value) 
 /// The settings member that configures THIS device, read from the type the store
 /// resolved for it: "The settings that you want to apply to the HD input device"
 /// / "... to the UHD input device".
-async fn settings_member(router: &MultiServiceRouter, case: &str, id: &str) -> &'static str {
+///
+/// `pub(crate)` for the same reason [`update`] is.
+pub(crate) async fn settings_member(router: &MultiServiceRouter, case: &str, id: &str) -> &'static str {
     // The model's own value list (`smithy_query(query="shape",
     // shape="InputDeviceType")`: HD | UHD).
     match device(router, case, id).await["type"].as_str() {

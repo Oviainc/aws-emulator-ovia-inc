@@ -223,6 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
             let now = ::std::time::SystemTime::now();
+            // The overrides this start states: each carries the `revisionType` that says
+            // what its value pins, so they are kept as given and consulted by the action
+            // whose source they override.
+            let source_overrides = input.source_revisions.unwrap_or_default();
             let execution_mode = crate::state::resolved_execution_mode(&pipeline.declaration);
             let stages = crate::state::plan_stages(&pipeline.declaration, now);
             let pipeline_version = pipeline.version;
@@ -279,21 +283,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .collect(),
                 variables,
-                source_revisions: input
-                    .source_revisions
-                    .unwrap_or_default()
-                    .into_iter()
+                source_revisions: source_overrides
+                    .iter()
                     // `SourceRevisionOverride` carries a `revisionType` naming what kind
                     // of revision the value is (a commit id, an object version); the
                     // `SourceRevision` the listing reports models only the revision
                     // itself, so the override's value becomes the recorded revision id.
+                    // What the value PINS is decided by that type, which is why the
+                    // overrides themselves are kept below.
                     .map(|source_override| SourceRevision {
-                        action_name: source_override.action_name,
-                        revision_id: Some(source_override.revision_value),
+                        action_name: source_override.action_name.clone(),
+                        revision_id: Some(source_override.revision_value.clone()),
                         revision_summary: None,
                         revision_url: None,
                     })
                     .collect(),
+                source_overrides,
                 stages,
                 artifact_bucket,
                 artifact_encryption_key,

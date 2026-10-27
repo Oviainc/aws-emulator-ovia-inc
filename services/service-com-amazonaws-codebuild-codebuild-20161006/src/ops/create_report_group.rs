@@ -153,18 +153,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::report_group_arn(&region, &input.name);
 
-        // An `S3` export has to name the bucket the raw data is exported to. The model
-        // leaves `s3Destination` and its `bucket` optional because the same structure
-        // also describes a `NO_EXPORT` config, so this combination passes the boundary
-        // validator and is refused here with the operation's own input error.
-        if input.export_config.export_config_type.as_deref() == Some("S3")
-            && input
-                .export_config
-                .s3_destination
-                .as_ref()
-                .and_then(|destination| destination.bucket.as_deref())
-                .is_none_or(str::is_empty)
-        {
+        // An `S3` export has to name the bucket the raw data is exported to, the one
+        // rule `crate::state` states for an export configuration — asked here about the
+        // configuration the report group would be minted with, the way
+        // `UpdateReportGroup` asks it about the merge onto a stored one.
+        if let Some(message) = crate::state::report_export_config_violation(&input.export_config) {
             crate::state::audit(
                 Self::NAME,
                 ctx.parts(),
@@ -173,11 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(CreateReportGroupErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(
-                        "exportConfig.s3Destination.bucket must be set when \
-                         exportConfig.exportConfigType is S3"
-                            .to_string(),
-                    ),
+                    message: Some(message),
                 },
             )
             .into());

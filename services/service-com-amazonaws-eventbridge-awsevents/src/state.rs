@@ -2,9 +2,10 @@
 
 //! Engine state for the com-amazonaws-eventbridge-awsevents service.
 //!
-//! EventBridge's control plane is two nested resources: an event bus (named,
-//! always holding at least the account's `default` bus) and the rules bound to
-//! it. A rule owns an ordered list of targets. `PutRule` creates or replaces a
+//! EventBridge's control plane is two nested resources: an event bus (named
+//! within one Region — an event bus is a regional resource, so the bus store is
+//! keyed by [`BusKey`] and every Region holds the account's `default` bus) and
+//! the rules bound to it. A rule owns an ordered list of targets. `PutRule` creates or replaces a
 //! rule, `PutTargets`/`RemoveTargets` upsert and remove its targets by `Id`,
 //! `DescribeRule`/`ListRules`/`ListTargetsByRule` report them, and `DeleteRule`
 //! removes one. A bus also carries its own mutable configuration, which
@@ -70,12 +71,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     ApiDestination as ApiDestinationSummary, Archive as ArchiveSummary, Connection,
-    ConnectionAuthResponseParameters, DeadLetterConfig, DescribeApiDestinationOutput,
-    DescribeArchiveOutput, DescribeConnectionOutput, DescribeEndpointOutput, DescribeReplayOutput,
-    Endpoint as EndpointSummary, EndpointEventBus, LogConfig, PartnerEventSourceAccount,
-    Replay as ReplaySummary, ReplayDestination, ReplicationConfig, RoutingConfig,
-    Rule as RuleSummary, Tag, Target, UpdateEndpointOutput, INCLUDE_DETAIL_VALUES, LEVEL_VALUES,
-    RULE_STATE_VALUES,
+    ConnectionAuthResponseParameters, ConnectionBodyParameter, ConnectionHeaderParameter,
+    ConnectionHttpParameters, ConnectionOAuthResponseParameters, ConnectionQueryStringParameter,
+    DeadLetterConfig,
+    DescribeApiDestinationOutput, DescribeArchiveOutput, DescribeConnectionOutput,
+    DescribeEndpointOutput, DescribeReplayOutput, Endpoint as EndpointSummary, EndpointEventBus,
+    LogConfig, PartnerEventSourceAccount, Replay as ReplaySummary, ReplayDestination,
+    ReplicationConfig, RoutingConfig, Rule as RuleSummary, Tag, Target, UpdateEndpointOutput,
+    INCLUDE_DETAIL_VALUES, LEVEL_VALUES, RULE_STATE_VALUES,
 };
 
 /// The event bus a request lands on when it names none.
@@ -127,14 +130,27 @@ pub const NO_SUCH_POLICY_STATEMENT: &str = "Statement with the provided id does 
 /// call can never serialize more than this many records.
 pub const MAX_LIST_PAGE: usize = 100;
 
-/// Largest number of event buses one account holds, the account's `default` bus
-/// included.
+/// Largest number of event buses one account holds IN ONE REGION, that Region's
+/// `default` bus included.
 ///
-/// The EventBridge service quota "Event buses per account" (default 100). It is
-/// also what bounds the store: a `CreateEventBus` that would ADD a bus past it
-/// answers the modelled `LimitExceededException` instead of growing memory
-/// without limit.
+/// The EventBridge service quota "Event buses per account" (default 100), which
+/// like every EventBridge quota is per account and Region — and an event bus is
+/// a regional resource ([`BusKey`]). It is also what bounds the store: a
+/// `CreateEventBus` that would ADD a bus past it answers the modelled
+/// `LimitExceededException` instead of growing memory without limit.
 pub const MAX_EVENT_BUSES: usize = 100;
+
+/// Largest number of REGIONS this store holds event buses in.
+///
+/// This emulator's OWN bound, not a quota AWS publishes: the Region half of a
+/// bus's identity ([`BusKey`]) is read off the caller's own credential scope
+/// ([`request_region`]), so the per-Region quotas above bound each Region's
+/// buses and rules but say nothing about how many Regions a caller may open —
+/// and this store holds them all in memory. It is far above the number of
+/// Regions AWS has, so no client addressing real Regions reaches it, and a
+/// `CreateEventBus` past it answers the modelled `LimitExceededException`
+/// ([`ComAmazonawsEventbridgeAwseventsState::may_hold_bus_in`]).
+pub const MAX_BUS_REGIONS: usize = 64;
 
 /// Largest number of rules one event bus holds.
 ///
@@ -364,11 +380,39 @@ pub struct PolicyStatement {
     pub body: String,
 }
 
+/// What identifies one event bus in this store: the Region it lives in, and its
+/// name within that Region.
+///
+/// An event bus is a REGIONAL resource — its ARN carries the Region
+/// ([`event_bus_arn`]) and a global endpoint is built from "a primary and
+/// secondary Region with event buses in each Region" whose names "must be
+/// identical in each Region" ([`endpoint_event_bus_violation`]) — so the same
+/// name in two Regions is two separate buses and a name is unique only WITHIN a
+/// Region. The Region comes first in the ordering, so the buses of one Region
+/// enumerate in name order and a list operation's page token stays a position in
+/// that order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BusKey {
+    pub region: String,
+    pub name: String,
+}
+
+impl BusKey {
+    /// The key of the bus `name` names in `region`.
+    pub fn new(region: &str, name: &str) -> Self {
+        Self {
+            region: region.to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
 /// An event bus and the rules bound to it.
 ///
 /// The bus's ARN is NOT stored: an ARN's region segment comes from the request
-/// that is being answered ([`request_region`]), and the account's `default` bus
-/// exists before any request is made, so a reader derives it with
+/// that is being answered ([`request_region`]), which is also the Region half of
+/// the bus's identity ([`BusKey`]), and the account's `default` bus exists in
+/// every Region before any request is made, so a reader derives it with
 /// [`event_bus_arn`] rather than reading a region frozen at startup.
 #[derive(Debug, Clone)]
 pub struct EventBus {
@@ -611,14 +655,17 @@ fn json_text(value: &str) -> String {
 /// `PutPermission` grants `action` on the bus `resource` names to `principal`,
 /// so the statement is that grant written in the IAM policy language: the
 /// request's `StatementId` as the `Sid`, [`POLICY_EFFECT_ALLOW`], the principal
-/// under `Principal.AWS`, the action and the bus ARN as the `Resource`, in that
+/// under `Principal`, the action and the bus ARN as the `Resource`, in that
 /// member order. The principal is written AS THE REQUEST GAVE IT — "the
 /// 12-digit Amazon Web Services account ID that you are permitting to put events
 /// to your default event bus. Specify "*" to permit any account" — so an account
 /// id stays an account id (the policy language also admits that account's
 /// root-user ARN, but EventBridge installs what it was given) and `*` stays the
-/// wildcard. `condition` is `Condition`'s `Type`, `Key` and `Value`, which "must
-/// contain Type, Key, and Value fields" and render as the IAM condition block
+/// wildcard. The WILDCARD is rendered the way the policy language writes "every
+/// principal", the bare string `"*"` ([`wildcard_principal`]); a named account is
+/// an Amazon Web Services principal and is rendered under `AWS`. `condition` is
+/// `Condition`'s `Type`, `Key` and `Value`, which "must contain Type, Key, and
+/// Value fields" and render as the IAM condition block
 /// `{<Type>: {<Key>: <Value>}}`.
 pub fn permission_statement(
     sid: &str,
@@ -628,10 +675,10 @@ pub fn permission_statement(
     condition: Option<(&str, &str, &str)>,
 ) -> PolicyStatement {
     let mut body = format!(
-        "{{\"Sid\":{},\"Effect\":{},\"Principal\":{{\"AWS\":{}}},\"Action\":{},\"Resource\":{}",
+        "{{\"Sid\":{},\"Effect\":{},\"Principal\":{},\"Action\":{},\"Resource\":{}",
         json_text(sid),
         json_text(POLICY_EFFECT_ALLOW),
-        json_text(principal),
+        rendered_principal(principal),
         json_text(action),
         json_text(resource),
     );
@@ -648,6 +695,28 @@ pub fn permission_statement(
         sid: Some(sid.to_string()),
         body,
     }
+}
+
+/// The principal `*` names every principal there is.
+///
+/// `PutPermission$Principal` is "the 12-digit Amazon Web Services account ID
+/// that you are permitting ... Specify "*" to permit any account to put events",
+/// and its modelled pattern `^(\d{12}|\*)$` admits exactly those two forms.
+pub const WILDCARD_PRINCIPAL: &str = "*";
+
+/// `principal` as a policy statement's `Principal` member.
+///
+/// The policy language writes "every principal" as the bare string `"*"` and a
+/// NAMED principal as an object keyed by the kind of principal it is, so an
+/// account id is an Amazon Web Services principal under `AWS`
+/// (`{"AWS":"<account>"}`) while the wildcard is the string itself. A document a
+/// client reads back is therefore the one the policy language defines, which is
+/// what lets policy diffing compare it with the document the client submitted.
+fn rendered_principal(principal: &str) -> String {
+    if principal == WILDCARD_PRINCIPAL {
+        return json_text(principal);
+    }
+    format!("{{\"AWS\":{}}}", json_text(principal))
 }
 
 /// The policy a caller supplied as one whole document, or why it is not a
@@ -826,6 +895,223 @@ pub const CONNECTION_STATE_UPDATING: &str = "UPDATING";
 /// being removed.
 pub const CONNECTION_STATE_DELETING: &str = "DELETING";
 
+/// The `ConnectionState` a connection is in while EventBridge is obtaining the
+/// token it needs before it can authorize anything.
+pub const CONNECTION_STATE_AUTHORIZING: &str = "AUTHORIZING";
+
+/// The `ConnectionAuthorizationType` whose credentials are not the
+/// authorization: EventBridge exchanges them for a token at the connection's
+/// authorization endpoint ("OAUTH tokens are refreshed when a 401 or 407
+/// response is returned", `CreateConnection$AuthorizationType`).
+pub const OAUTH_CLIENT_CREDENTIALS_AUTHORIZATION: &str = "OAUTH_CLIENT_CREDENTIALS";
+
+/// Whether a connection of `authorization_type` has to obtain a token before it
+/// can authorize an invocation.
+///
+/// `API_KEY` and `BASIC` credentials ARE the authorization — EventBridge sends
+/// them with the invocation — so a connection holding them is authorized as soon
+/// as it is written. `OAUTH_CLIENT_CREDENTIALS` credentials are exchanged for a
+/// token at the connection's own authorization endpoint first, so such a
+/// connection is not authorized until that exchange has happened
+/// ([`CONNECTION_STATE_AUTHORIZING`] is the state it is in until then).
+pub fn needs_authorization_exchange(authorization_type: &str) -> bool {
+    authorization_type == OAUTH_CLIENT_CREDENTIALS_AUTHORIZATION
+}
+
+/// How long ONE authorization exchange may wait on a connection's authorization
+/// endpoint.
+///
+/// This emulator's OWN bound, not a duration AWS publishes: the exchange is made
+/// through the in-process transport, and a request that never answers must not
+/// hold the call that started it open.
+pub const AUTHORIZATION_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The HTTP method an authorization exchange uses when the connection names
+/// none: a token request posts its client credentials.
+pub const AUTHORIZATION_EXCHANGE_METHOD: &str = "POST";
+
+/// What a connection reports as its `StateReason` when it holds no
+/// authorization endpoint to obtain a token from at all — which is what a
+/// connection `DeauthorizeConnection` stripped is left with.
+pub const NO_AUTHORIZATION_ENDPOINT: &str =
+    "The connection names no authorization endpoint to obtain a token from.";
+
+/// Obtain the token an OAuth connection needs, answering `Ok(())` when the
+/// authorization endpoint issued one and `Err(reason)` \u2014 the `StateReason` the
+/// connection then reports \u2014 when it did not.
+///
+/// The rule AWS follows: an `OAUTH_CLIENT_CREDENTIALS` connection's client
+/// credentials are exchanged for a token at its `AuthorizationEndpoint` with its
+/// `HttpMethod`, and the connection can authorize an invocation only once that
+/// exchange has succeeded; an endpoint that answers anything else, or nothing at
+/// all, leaves the connection DEAUTHORIZED, which in turn leaves every API
+/// destination invoking through it INACTIVE
+/// ([`ComAmazonawsEventbridgeAwseventsState::api_destination_state`]).
+///
+/// The request goes through the IN-PROCESS emulator transport and nothing else,
+/// like every other request this service makes on the account's behalf: no
+/// socket is opened and no name is resolved, so an authorization endpoint this
+/// emulator serves nothing at answers the transport's own refusal, which is an
+/// exchange that reached no endpoint.
+pub async fn authorization_exchange(
+    transport: &::aws_smithy_runtime_api::client::http::SharedHttpConnector,
+    parameters: &ConnectionOAuthResponseParameters,
+) -> Result<(), String> {
+    use ::aws_smithy_runtime_api::client::http::HttpConnector;
+
+    let Some(endpoint) = parameters.authorization_endpoint.as_deref() else {
+        return Err(NO_AUTHORIZATION_ENDPOINT.to_string());
+    };
+    let named_method = parameters
+        .http_method
+        .as_deref()
+        .unwrap_or(AUTHORIZATION_EXCHANGE_METHOD);
+    let Ok(method) = ::http::Method::from_bytes(named_method.as_bytes()) else {
+        return Err(format!(
+            "The connection's authorization HttpMethod {named_method:?} is not an HTTP method."
+        ));
+    };
+    // Every value here comes from the stored parameters, so an endpoint that is
+    // not a URI fails HERE rather than panicking.
+    let request = ::http::Request::builder()
+        .method(method)
+        .uri(endpoint)
+        .body(::aws_smithy_types::body::SdkBody::empty())
+        .map_err(|error| error.to_string())
+        .and_then(|request| {
+            ::aws_smithy_runtime_api::http::Request::try_from(request)
+                .map_err(|error| error.to_string())
+        });
+    let request = match request {
+        Ok(request) => request,
+        Err(_) => return Err(ENDPOINT_NOT_REACHED.to_string()),
+    };
+    match ::tokio::time::timeout(AUTHORIZATION_EXCHANGE_TIMEOUT, transport.call(request)).await {
+        // Nothing answered inside the timeout, or the endpoint could not be
+        // reached at all, or this emulator serves nothing at it — one condition
+        // as the connection reports it: the endpoint was not reached.
+        Err(_) | Ok(Err(_)) => Err(ENDPOINT_NOT_REACHED.to_string()),
+        Ok(Ok(response))
+            if response
+                .body()
+                .bytes()
+                .is_some_and(is_transport_refusal) =>
+        {
+            Err(ENDPOINT_NOT_REACHED.to_string())
+        }
+        Ok(Ok(response)) if (200..=299).contains(&response.status().as_u16()) => Ok(()),
+        Ok(Ok(response)) => Err(format!(
+            "The authorization endpoint answered HTTP {} instead of issuing a token.",
+            response.status().as_u16()
+        )),
+    }
+}
+
+/// What a connection reports as its `StateReason` when EventBridge could not
+/// reach the endpoint it had to call: "Could not connect to the specified
+/// endpoint."
+///
+/// The wording EventBridge states for an endpoint nothing answered at, whatever
+/// the endpoint was.
+pub const ENDPOINT_NOT_REACHED: &str = "Could not connect to the specified endpoint.";
+
+/// The error types that are the TRANSPORT's own refusal rather than an answer
+/// from an endpoint: this emulator serves nothing at that URL, or more than one
+/// of its services claims it. Either way the request reached no endpoint.
+const TRANSPORT_REFUSALS: [&str; 2] = ["UnknownService", "AmbiguousService"];
+
+/// How much of a non-2xx answer is read to tell the transport's own refusal from
+/// an endpoint's answer. The envelope is two short fields; anything larger is an
+/// answer from something that served the request, so it is not read at all.
+const MAX_REFUSAL_ENVELOPE_BYTES: usize = 4 * 1024;
+
+/// Whether `body` is the in-process transport's OWN refusal of the request —
+/// this emulator serves nothing at the endpoint that was called — rather than an
+/// answer from an endpoint that served it.
+///
+/// The refusal is told by the error type its envelope carries
+/// ([`TRANSPORT_REFUSALS`]); the bridge the request crosses keeps the body but
+/// not the headers, so the envelope is where that type can be read at all.
+/// Written once, so every request this service makes on the account's behalf —
+/// an API destination invocation, a connection's authorization exchange — tells
+/// "nothing answered" from "an endpoint answered" the same way.
+pub fn is_transport_refusal(body: &[u8]) -> bool {
+    if body.len() > MAX_REFUSAL_ENVELOPE_BYTES {
+        return false;
+    }
+    let Ok(envelope) = ::serde_json::from_slice::<::serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(error_type) = envelope.get("__type").and_then(::serde_json::Value::as_str) else {
+        return false;
+    };
+    // The type may carry a shape namespace; the code is its last segment.
+    let code = error_type.rsplit('#').next().unwrap_or(error_type);
+    TRANSPORT_REFUSALS.contains(&code)
+}
+
+/// The scheme an authorization endpoint carries: `AuthorizationEndpoint` is an
+/// `HttpsEndpoint`, so the exchange is made over TLS.
+const HTTPS_SCHEME: &str = "https://";
+
+/// Why `endpoint` is not an authorization endpoint EventBridge accepts, or
+/// `None` when it is.
+///
+/// The member is modelled as an `HttpsEndpoint` ("the URL to the authorization
+/// endpoint when OAuth is specified as the authorization type"), and its
+/// modelled pattern admits any URL characters, so the scheme is checked here: a
+/// value that is not an `https` URL is refused rather than stored as an endpoint
+/// no token request could be made to.
+pub fn authorization_endpoint_violation(endpoint: &str) -> Option<String> {
+    let scheme_matches = endpoint
+        .get(..HTTPS_SCHEME.len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(HTTPS_SCHEME));
+    (!scheme_matches).then(|| {
+        parameter_violation(
+            "AuthParameters",
+            &format!("AuthorizationEndpoint {endpoint:?} is not an https endpoint."),
+        )
+    })
+}
+
+/// Record what a connection's authorization exchange came to: the state the
+/// clock owes the connection `name` is what that exchange answered.
+///
+/// The second half of the write a connection of an authorization type that needs
+/// a token makes ([`authorization_exchange`]). It is applied after the exchange
+/// so no store lock is held across it: while the exchange is outstanding the
+/// connection is owed the state of one that obtained no token, and this replaces
+/// that with the outcome — keeping the instant the transition was already due,
+/// or falling due at once when the clock has already moved the connection on.
+/// A connection that is gone, or on its way out, is left alone: a delete already
+/// decided its last state.
+pub fn record_authorization(
+    state: &::engine::ServiceState<ComAmazonawsEventbridgeAwseventsState>,
+    name: &str,
+    authorized: Result<(), String>,
+) {
+    let transition = match authorized {
+        Ok(()) => ConnectionTransition::to(CONNECTION_STATE_AUTHORIZED),
+        Err(reason) => ConnectionTransition::to_because(CONNECTION_STATE_DEAUTHORIZED, reason),
+    };
+    let mut store = state.lock();
+    let Some(connection) = store.connection_mut(name) else {
+        return;
+    };
+    if connection.is_being_removed() {
+        return;
+    }
+    match connection.pending.as_mut() {
+        Some(pending) => pending.to = transition,
+        None => {
+            connection.pending = Some(PendingTransition {
+                due: SystemTime::now(),
+                to: transition,
+            })
+        }
+    }
+}
+
 /// How long after the call that starts it a connection's next state becomes due.
 ///
 /// A connection AWS answers in a non-terminal state (`CREATING`, `DEAUTHORIZING`,
@@ -846,10 +1132,33 @@ pub const MAX_CONNECTIONS: usize = 1_000;
 /// The next state a connection's clock owes it.
 #[derive(Debug, Clone)]
 pub enum ConnectionTransition {
-    /// The connection moves to this `ConnectionState`.
-    To(String),
+    /// The connection moves to this `ConnectionState`, carrying the
+    /// `StateReason` that state has — `None` for a state that needs none, which
+    /// clears whatever reason the connection reported before.
+    To {
+        state: String,
+        reason: Option<String>,
+    },
     /// The connection is removed from the store.
     Removed,
+}
+
+impl ConnectionTransition {
+    /// A move to `state` with no reason to report.
+    pub fn to(state: &str) -> Self {
+        Self::To {
+            state: state.to_string(),
+            reason: None,
+        }
+    }
+
+    /// A move to `state` the connection reports `reason` for.
+    pub fn to_because(state: &str, reason: String) -> Self {
+        Self::To {
+            state: state.to_string(),
+            reason: Some(reason),
+        }
+    }
 }
 
 /// The transition a connection's clock owes, and when it falls due.
@@ -960,6 +1269,60 @@ impl ConnectionRecord {
             last_modified_time: Some(to_wire_timestamp(self.last_modified)),
             last_authorized_time: self.last_authorized.map(to_wire_timestamp),
         }
+    }
+}
+
+/// `parameters` as a READ reports them: every value the write flagged SECRET is
+/// withheld.
+///
+/// "Specifies whether the value is a secret" (`IsValueSecret`, a member of each
+/// of the header, query-string and body parameters a connection sends with every
+/// invocation). A value declared secret lives in the connection's secret, which
+/// `SecretArn` names and no operation of this service reads back, so it is not
+/// part of what a read may report — exactly as the response authorization shapes
+/// carry a user name, an API key NAME and a client id and no password, key value
+/// or client secret. The key and the flag ARE reported: they say which parameter
+/// the connection sends and that its value is held in that secret. A value the
+/// write did NOT flag secret is reported as it was given.
+///
+/// Written once and applied by every write of a connection, so no secret the
+/// request carried is ever stored on the record a read serializes.
+pub fn reported_http_parameters(parameters: &ConnectionHttpParameters) -> ConnectionHttpParameters {
+    let withheld = |value: &Option<String>, secret: bool| -> Option<String> {
+        if secret {
+            None
+        } else {
+            value.clone()
+        }
+    };
+    ConnectionHttpParameters {
+        header_parameters: parameters.header_parameters.as_ref().map(|list| {
+            list.iter()
+                .map(|parameter| ConnectionHeaderParameter {
+                    key: parameter.key.clone(),
+                    value: withheld(&parameter.value, parameter.is_value_secret),
+                    is_value_secret: parameter.is_value_secret,
+                })
+                .collect()
+        }),
+        query_string_parameters: parameters.query_string_parameters.as_ref().map(|list| {
+            list.iter()
+                .map(|parameter| ConnectionQueryStringParameter {
+                    key: parameter.key.clone(),
+                    value: withheld(&parameter.value, parameter.is_value_secret),
+                    is_value_secret: parameter.is_value_secret,
+                })
+                .collect()
+        }),
+        body_parameters: parameters.body_parameters.as_ref().map(|list| {
+            list.iter()
+                .map(|parameter| ConnectionBodyParameter {
+                    key: parameter.key.clone(),
+                    value: withheld(&parameter.value, parameter.is_value_secret),
+                    is_value_secret: parameter.is_value_secret,
+                })
+                .collect()
+        }),
     }
 }
 
@@ -2058,8 +2421,18 @@ impl EndpointRecord {
 /// Per-service state for com-amazonaws-eventbridge-awsevents. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsEventbridgeAwseventsState {
-    /// Every event bus, by name. The account's `default` bus is always present.
-    pub buses: BTreeMap<String, EventBus>,
+    /// Every event bus, by Region and name ([`BusKey`]): a bus name is unique
+    /// within one Region, and the same name in another Region is another bus.
+    /// A Region's `default` bus is recorded here the first time something
+    /// WRITES a bus of that Region; until then it is the implicit one below, so
+    /// no read has to write.
+    pub buses: BTreeMap<BusKey, EventBus>,
+    /// The `default` bus of a Region nothing has written a bus in yet: the bus
+    /// the account has in every Region before any call is made, holding no
+    /// creation instant, no configuration and no rule. One canonical record,
+    /// never handed out mutably — see
+    /// [`ComAmazonawsEventbridgeAwseventsState::implicit_default_bus_in`].
+    implicit_default_bus: EventBus,
     /// Every connection, by name — the resource `CreateConnection` writes and
     /// `DescribeConnection` reports.
     pub connections: BTreeMap<String, ConnectionRecord>,
@@ -2112,22 +2485,21 @@ pub struct ComAmazonawsEventbridgeAwseventsState {
     event_seq: u64,
 }
 
-/// The store comes up holding the account's `default` event bus: that bus
-/// exists before any call is made, so the whole rule slice works without
-/// `CreateEventBus`.
+/// The store comes up holding no bus RECORD at all: the account's `default` bus
+/// exists in every Region before any call is made, and which Regions those are
+/// is not known until a request names one, so a Region's default bus is the
+/// implicit one until something writes a bus of that Region — the whole rule
+/// slice therefore works without `CreateEventBus`, in every Region, and no read
+/// writes anything to make that so.
 ///
-/// No call created it, so it holds no creation instant ([`EventBus::created`]):
-/// the moment this store was built is not a creation anybody performed and is
-/// never reported as one.
+/// No call creates it, so it holds no creation instant ([`EventBus::created`]):
+/// the moment this store was built, or the moment a Region was first addressed,
+/// is not a creation anybody performed and is never reported as one.
 impl Default for ComAmazonawsEventbridgeAwseventsState {
     fn default() -> Self {
-        let mut buses = BTreeMap::new();
-        buses.insert(
-            DEFAULT_EVENT_BUS_NAME.to_string(),
-            EventBus::new(DEFAULT_EVENT_BUS_NAME, None),
-        );
         Self {
-            buses,
+            buses: BTreeMap::new(),
+            implicit_default_bus: EventBus::new(DEFAULT_EVENT_BUS_NAME, None),
             connections: BTreeMap::new(),
             archives: BTreeMap::new(),
             replays: BTreeMap::new(),
@@ -2144,26 +2516,149 @@ impl Default for ComAmazonawsEventbridgeAwseventsState {
 }
 
 impl ComAmazonawsEventbridgeAwseventsState {
-    /// The bus `name` names, for a REPORTING operation: nothing is created, so
-    /// a read leaves the store exactly as it found it.
-    pub fn bus(&self, name: &str) -> Option<&EventBus> {
-        self.buses.get(name)
+    /// How many REGIONS this store holds a bus record in.
+    ///
+    /// The keys are ordered by Region first ([`BusKey`]), so the Regions are the
+    /// runs of equal Region in one walk of them.
+    fn bus_region_count(&self) -> usize {
+        let mut regions = 0usize;
+        let mut last: Option<&str> = None;
+        for key in self.buses.keys() {
+            if last != Some(key.region.as_str()) {
+                regions += 1;
+                last = Some(key.region.as_str());
+            }
+        }
+        regions
     }
 
-    /// The bus `name` names, mutably. Still creates nothing: a bus comes into
-    /// existence through `CreateEventBus`, never through a rule write.
-    pub fn bus_mut(&mut self, name: &str) -> Option<&mut EventBus> {
-        self.buses.get_mut(name)
+    /// Whether this store may hold a bus in `region`.
+    ///
+    /// A Region it already holds one in always may; a NEW Region only while the
+    /// store is below [`MAX_BUS_REGIONS`]. This is what bounds the store as a
+    /// whole: the Region half of a bus's identity comes from the caller's own
+    /// credential scope ([`request_region`]), so the per-Region bus and rule
+    /// quotas bound each Region but not how many Regions a caller can open.
+    pub fn may_hold_bus_in(&self, region: &str) -> bool {
+        self.buses
+            .keys()
+            .any(|key| key.region == region)
+            || self.bus_region_count() < MAX_BUS_REGIONS
     }
 
-    /// The rule `name` on bus `bus_name`, if both exist.
-    pub fn rule(&self, bus_name: &str, name: &str) -> Option<&RuleRecord> {
-        self.buses.get(bus_name)?.rules.get(name)
+    /// Materialise the `default` event bus of `region`, if this store does not
+    /// hold a record of it yet and [`Self::may_hold_bus_in`] admits the Region.
+    ///
+    /// Called only where a bus of `region` is WRITTEN
+    /// ([`Self::bus_mut`], [`Self::insert_bus`]): a read resolves the Region's
+    /// implicit default bus without writing anything
+    /// ([`Self::implicit_default_bus_in`]), so no reporting operation of this
+    /// service changes what a later caller sees.
+    fn ensure_default_bus(&mut self, region: &str) {
+        if !self.may_hold_bus_in(region) {
+            return;
+        }
+        self.buses
+            .entry(BusKey::new(region, DEFAULT_EVENT_BUS_NAME))
+            .or_insert_with(|| EventBus::new(DEFAULT_EVENT_BUS_NAME, None));
     }
 
-    /// The rule `name` on bus `bus_name`, mutably, if both exist.
-    pub fn rule_mut(&mut self, bus_name: &str, name: &str) -> Option<&mut RuleRecord> {
-        self.buses.get_mut(bus_name)?.rules.get_mut(name)
+    /// The `default` bus of a Region this store holds no record of one for.
+    ///
+    /// The account's default bus is created with the account ("Events generated
+    /// by Amazon Web Services services go to your account's default event
+    /// bus"), in every Region, so it exists before any call is made and no call
+    /// creates it — which Regions a run addresses, though, is only known once a
+    /// request names one. A Region nothing has written yet therefore has a
+    /// default bus carrying no creation instant ([`EventBus::created`]), no
+    /// configuration and no rule, which is what this answers: one canonical
+    /// record, so a READ of such a Region needs to write nothing at all.
+    fn implicit_default_bus_in(&self, region: &str, name: &str) -> Option<&EventBus> {
+        (name == DEFAULT_EVENT_BUS_NAME
+            && !self
+                .buses
+                .contains_key(&BusKey::new(region, DEFAULT_EVENT_BUS_NAME)))
+        .then_some(&self.implicit_default_bus)
+    }
+
+    /// The bus `name` names IN `region`, for a REPORTING operation: nothing is
+    /// created, so a read leaves the store exactly as it found it — a Region
+    /// whose `default` bus nothing has written yet answers the implicit one
+    /// ([`Self::implicit_default_bus_in`]).
+    pub fn bus(&self, region: &str, name: &str) -> Option<&EventBus> {
+        self.buses
+            .get(&BusKey::new(region, name))
+            .or_else(|| self.implicit_default_bus_in(region, name))
+    }
+
+    /// The bus `name` names in `region`, mutably. Still creates no CUSTOM bus: a
+    /// bus comes into existence through `CreateEventBus`, never through a rule
+    /// write — only the Region's implicit `default` bus is materialised, because
+    /// a write has to have a record to write to.
+    pub fn bus_mut(&mut self, region: &str, name: &str) -> Option<&mut EventBus> {
+        self.ensure_default_bus(region);
+        self.buses.get_mut(&BusKey::new(region, name))
+    }
+
+    /// Every bus of `region`, in name order — which is what lets
+    /// `ListEventBuses` resume from a page token. The Region's implicit
+    /// `default` bus is among them, in its place in that order, whether or not
+    /// anything has written a record of it.
+    pub fn buses_in(&self, region: &str) -> Vec<&EventBus> {
+        let mut buses: Vec<&EventBus> = self
+            .buses
+            .iter()
+            .filter(|(key, _)| key.region == region)
+            .map(|(_, bus)| bus)
+            .chain(self.implicit_default_bus_in(region, DEFAULT_EVENT_BUS_NAME))
+            .collect();
+        buses.sort_by(|left, right| left.name.cmp(&right.name));
+        buses
+    }
+
+    /// How many buses `region` holds, which is what the per-Region bus quota is
+    /// charged against — the Region's `default` bus included, since it is one of
+    /// the buses the account holds there.
+    pub fn bus_count_in(&self, region: &str) -> usize {
+        self.buses_in(region).len()
+    }
+
+    /// Write `bus` into `region` under its own name, beside the record of that
+    /// Region's `default` bus — a Region this store holds a bus in holds the
+    /// default bus it has as well.
+    ///
+    /// Stores nothing for a Region [`Self::may_hold_bus_in`] does not admit,
+    /// which is the bound on the store as a whole; `CreateEventBus` charges that
+    /// bound before it gets here, and reads the record back afterwards, so a
+    /// refused create never answers as if it had stored one.
+    pub fn insert_bus(&mut self, region: &str, bus: EventBus) {
+        if !self.may_hold_bus_in(region) {
+            return;
+        }
+        self.ensure_default_bus(region);
+        let key = BusKey::new(region, &bus.name);
+        self.buses.insert(key, bus);
+    }
+
+    /// Remove the bus `name` names in `region`, answering the record that was
+    /// removed — and `None` when that Region held none under that name.
+    pub fn remove_bus(&mut self, region: &str, name: &str) -> Option<EventBus> {
+        self.buses.remove(&BusKey::new(region, name))
+    }
+
+    /// The rule `name` on bus `bus_name` in `region`, if both exist.
+    pub fn rule(&self, region: &str, bus_name: &str, name: &str) -> Option<&RuleRecord> {
+        self.bus(region, bus_name)?.rules.get(name)
+    }
+
+    /// The rule `name` on bus `bus_name` in `region`, mutably, if both exist.
+    pub fn rule_mut(
+        &mut self,
+        region: &str,
+        bus_name: &str,
+        name: &str,
+    ) -> Option<&mut RuleRecord> {
+        self.bus_mut(region, bus_name)?.rules.get_mut(name)
     }
 
     /// The tag set of the resource an ARN named ([`parse_tagged_resource`]), for
@@ -2172,11 +2667,16 @@ impl ComAmazonawsEventbridgeAwseventsState {
     /// than with an empty tag set.
     pub fn tags_of(&self, resource: &TaggedResource) -> Option<&Vec<Tag>> {
         match resource {
-            TaggedResource::EventBus(name) => self.bus(name).map(|bus| &bus.tags),
+            TaggedResource::EventBus { region, name } => {
+                self.bus(region, name).map(|bus| &bus.tags)
+            }
             TaggedResource::Rule {
+                region,
                 event_bus_name,
                 name,
-            } => self.rule(event_bus_name, name).map(|rule| &rule.tags),
+            } => self
+                .rule(region, event_bus_name, name)
+                .map(|rule| &rule.tags),
         }
     }
 
@@ -2186,12 +2686,15 @@ impl ComAmazonawsEventbridgeAwseventsState {
     /// operation, never through a tag write.
     pub fn tags_of_mut(&mut self, resource: &TaggedResource) -> Option<&mut Vec<Tag>> {
         match resource {
-            TaggedResource::EventBus(name) => self.bus_mut(name).map(|bus| &mut bus.tags),
+            TaggedResource::EventBus { region, name } => {
+                self.bus_mut(region, name).map(|bus| &mut bus.tags)
+            }
             TaggedResource::Rule {
+                region,
                 event_bus_name,
                 name,
             } => self
-                .rule_mut(event_bus_name, name)
+                .rule_mut(region, event_bus_name, name)
                 .map(|rule| &mut rule.tags),
         }
     }
@@ -2286,13 +2789,14 @@ impl ComAmazonawsEventbridgeAwseventsState {
     /// make lives here rather than in each of them.
     pub fn managed_rule_of(&self, resource: &TaggedResource) -> Option<String> {
         let TaggedResource::Rule {
+            region,
             event_bus_name,
             name,
         } = resource
         else {
             return None;
         };
-        self.rule(event_bus_name, name)
+        self.rule(region, event_bus_name, name)
             .filter(|rule| rule.managed_by.is_some())
             .map(|rule| rule.name.clone())
     }
@@ -2612,9 +3116,14 @@ impl ComAmazonawsEventbridgeAwseventsState {
     /// buses, the name must exactly match the name of the partner event source
     /// that this event bus is matched to" (`CreateEventBus$Name`), so the match
     /// is on the bus's own `event_source_name`.
+    ///
+    /// A partner event source is not a Region-keyed resource of this store (it
+    /// is offered to an ACCOUNT), so the bus it is matched with is sought
+    /// wherever that account created it rather than in one Region.
     pub fn matching_bus(&self, name: &str) -> Option<&EventBus> {
-        self.bus(name)
-            .filter(|bus| bus.event_source_name.as_deref() == Some(name))
+        self.buses
+            .values()
+            .find(|bus| bus.name == name && bus.event_source_name.as_deref() == Some(name))
     }
 
     /// The accounts a partner event source was offered to, as
@@ -2688,7 +3197,7 @@ impl ComAmazonawsEventbridgeAwseventsState {
                 ConnectionTransition::Removed => {
                     self.connections.remove(name);
                 }
-                ConnectionTransition::To(state) => {
+                ConnectionTransition::To { state, reason } => {
                     // The stamps move to the instant the transition fell DUE,
                     // not to the instant it was noticed, so two reads of a
                     // settled connection report the same timestamps.
@@ -2697,6 +3206,9 @@ impl ComAmazonawsEventbridgeAwseventsState {
                     }
                     connection.last_modified = pending.due;
                     connection.state = state;
+                    // The reason belongs to the state the connection reaches, so
+                    // a state that needs none reports none.
+                    connection.state_reason = reason;
                 }
             }
         }
@@ -3103,9 +3615,10 @@ pub fn is_rule_state(value: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaggedResource {
     /// `arn:aws:events:<region>:<account>:event-bus/<name>`.
-    EventBus(String),
+    EventBus { region: String, name: String },
     /// `arn:aws:events:<region>:<account>:rule/<bus-if-not-default>/<name>`.
     Rule {
+        region: String,
         event_bus_name: String,
         name: String,
     },
@@ -3127,17 +3640,19 @@ pub enum TaggedResource {
 /// passes any text: a value that is not an ARN, or names another service, or
 /// names a resource kind this service does not tag, is a bad request — not a
 /// missing resource. Whether the named resource EXISTS is a separate question,
-/// answered by [`ComAmazonawsEventbridgeAwseventsState::tags_of`]; the ARN's
-/// region and account segments are not part of the identity this store keys on,
-/// which is the resource name, exactly as every other reader of this service
-/// resolves a bus or a rule.
-pub fn parse_tagged_resource(arn: &str) -> Result<TaggedResource, String> {
+/// answered by [`ComAmazonawsEventbridgeAwseventsState::tags_of`]; the Region
+/// the ARN carries IS part of the identity this store keys a bus and a rule on
+/// ([`BusKey`]), so it is read off the ARN here — and an ARN whose region
+/// segment is empty (the modelled pattern admits one) names a resource in
+/// `request_region`, the Region the call itself was signed for.
+pub fn parse_tagged_resource(arn: &str, request_region: &str) -> Result<TaggedResource, String> {
     let invalid = || {
         format!("Parameter ResourceARN is not valid. Reason: {arn:?} is not the ARN of an EventBridge rule or event bus.")
     };
     if !is_arn(arn) {
         return Err(invalid());
     }
+    let region = arn_region(arn).unwrap_or(request_region).to_string();
     let mut fields = arn.splitn(6, ':');
     let service = fields.nth(2).unwrap_or_default();
     let resource = fields.nth(2).unwrap_or_default();
@@ -3148,7 +3663,10 @@ pub fn parse_tagged_resource(arn: &str) -> Result<TaggedResource, String> {
         if name.is_empty() {
             return Err(invalid());
         }
-        return Ok(TaggedResource::EventBus(name.to_string()));
+        return Ok(TaggedResource::EventBus {
+            region,
+            name: name.to_string(),
+        });
     }
     if let Some(path) = resource.strip_prefix("rule/") {
         let (event_bus_name, name) = match path.rsplit_once('/') {
@@ -3159,6 +3677,7 @@ pub fn parse_tagged_resource(arn: &str) -> Result<TaggedResource, String> {
             return Err(invalid());
         }
         return Ok(TaggedResource::Rule {
+            region,
             event_bus_name: event_bus_name.to_string(),
             name: name.to_string(),
         });
@@ -3519,27 +4038,39 @@ pub fn replay_not_cancellable(replay_name: &str) -> String {
 /// resolves an `events` ARN here.
 pub fn no_such_tagged_resource(resource: &TaggedResource) -> String {
     match resource {
-        TaggedResource::EventBus(name) => no_such_event_bus(name),
+        TaggedResource::EventBus { name, .. } => no_such_event_bus(name),
         TaggedResource::Rule {
             event_bus_name,
             name,
+            ..
         } => no_such_rule(event_bus_name, name),
     }
 }
 
 /// Why a `LogConfig` is not one EventBridge accepts, or `None` when it is.
 ///
-/// `LogConfig`'s two members are modelled enums — `IncludeDetail`
+/// A submitted log configuration has to name BOTH of `LogConfig`'s members:
+/// `Level` is "the level of logging detail to include ... applies to all log
+/// destinations for the event bus" and `IncludeDetail` is "whether EventBridge
+/// include detailed event information in the records it generates", so a
+/// configuration leaving either out states nothing about that half of it and is
+/// refused naming the missing member rather than stored as a configuration half
+/// of which nothing decided.
+///
+/// Each member is also a modelled enum — `IncludeDetail`
 /// (`INCLUDE_DETAIL_VALUES`) and `Level` (`LEVEL_VALUES`) — and the boundary
 /// validator does not narrow an enum-typed string to its values, so a value the
 /// enum does not admit is refused here rather than stored and later reported
-/// back as if EventBridge had accepted it. Written once, so `CreateEventBus` and
-/// `UpdateEventBus` refuse the same values.
+/// back as if EventBridge had accepted it. A value that was SUPPLIED is judged
+/// first, so a caller that sent one the enum does not admit reads that about the
+/// member it sent. Written once, so `CreateEventBus` and `UpdateEventBus` accept
+/// exactly the same configurations.
 pub fn log_config_violation(config: &LogConfig) -> Option<String> {
-    for (member, value, admitted) in [
+    let members = [
         ("IncludeDetail", config.include_detail.as_deref(), INCLUDE_DETAIL_VALUES),
         ("Level", config.level.as_deref(), LEVEL_VALUES),
-    ] {
+    ];
+    for (member, value, admitted) in members {
         if let Some(value) = value {
             if !admitted.contains(&value) {
                 return Some(format!(
@@ -3549,7 +4080,10 @@ pub fn log_config_violation(config: &LogConfig) -> Option<String> {
             }
         }
     }
-    None
+    members
+        .iter()
+        .find(|(_, value, _)| value.is_none())
+        .map(|(member, _, _)| required_member_violation(&format!("LogConfig.{member}")))
 }
 
 /// Why a `ScheduleExpression` is not one EventBridge accepts, or `None` when it

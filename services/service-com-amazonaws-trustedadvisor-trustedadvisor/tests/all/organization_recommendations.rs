@@ -9,14 +9,17 @@
 //!   filters keep, in organization-recommendation-ARN order** — an absent
 //!   filter keeps every one of them, and each filter is an equality or a
 //!   membership test except `afterLastUpdatedAt`/`beforeLastUpdatedAt`, which
-//!   are inclusive bounds on `lastUpdatedAt`;
+//!   are inclusive bounds on `lastUpdatedAt`. The store holds an organization
+//!   recommendation only for a prioritized recommendation, a rule pinned on its
+//!   own in `tests/all/organization_prioritized_only.rs`;
 //! * every ARN the list reports resolves in `GetOrganizationRecommendation` and
 //!   both reads report the same members: the two are one store read twice;
 //! * **`resourcesAggregates` is AGGREGATED on every read over the member
 //!   accounts' recommendations** — never stored — so it equals what those
-//!   accounts' `ListRecommendations` reports and it follows an exclusion made
-//!   through `BatchUpdateRecommendationResourceExclusion` or a change in a
-//!   member resource's status;
+//!   accounts' `ListRecommendations` reports and it follows a change in a
+//!   member resource's status or exclusion state, while an exclusion attempted
+//!   through `BatchUpdateRecommendationResourceExclusion` is refused per entry
+//!   for such a resource and moves nothing;
 //! * `nextToken` walks every entry exactly once at any page size, and a token
 //!   this read did not issue is refused with 400 `ValidationException`.
 //!
@@ -40,23 +43,16 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::organization_recommendation_lifecycle::{organization_recommendation_arn, read};
 use crate::recommendation_loop::{
     call, check_arn, emulator_on_plan, error_code, field_of_each, label, recommendation_arn,
-    resource_arn, timestamp_secs,
+    resource_arn, timestamp_secs, PRIORITIZED_CHECK_IDS,
 };
 
-/// Every seeded check, in the order the store keys its organization
-/// recommendation (check id order, since every such ARN shares one prefix).
-/// Source: the `SEED` table in `src/state.rs`.
-const CHECK_IDS: &[&str] = &[
-    "amazon-ebs-snapshots",
-    "iam-access-key-rotation",
-    "low-utilization-ec2-instances",
-    "rds-idle-db-instances",
-];
-
-/// The checks whose recommendation is `priority`, and those whose is
-/// `standard` — the two halves the `type` filter cuts the store into.
-const PRIORITY_CHECKS: &[&str] = &["low-utilization-ec2-instances", "rds-idle-db-instances"];
-const STANDARD_CHECKS: &[&str] = &["amazon-ebs-snapshots", "iam-access-key-rotation"];
+/// Every check with an organization recommendation, in the order the store
+/// keys it (check id order, since every such ARN shares one prefix): the
+/// PRIORITIZED checks, because every organization operation supports only
+/// prioritized recommendations — the rule itself is pinned in
+/// `tests/all/organization_prioritized_only.rs`. Source: the `SEED` table in
+/// `src/state.rs`.
+const CHECK_IDS: &[&str] = PRIORITIZED_CHECK_IDS;
 
 /// The ARN prefix `OrganizationRecommendationArn` declares
 /// (`^arn:[\w-]+:trustedadvisor:::organization-recommendation\/[\w-]+$`): an
@@ -156,33 +152,26 @@ async fn the_organization_list_reports_the_store_and_honours_every_filter() {
     // `lastUpdatedAt` values come from the `SEED` table in `src/state.rs` (one
     // day apart in SEED order, which is not check-id order):
     //   low-utilization-ec2-instances  2024-01-02T00:00:00Z
-    //   amazon-ebs-snapshots           2024-01-03T00:00:00Z
-    //   iam-access-key-rotation        2024-01-04T00:00:00Z
     //   rds-idle-db-instances          2024-01-05T00:00:00Z
     let cases: &[(&str, &[&str])] = &[
         ("", CHECK_IDS),
-        ("?type=priority", PRIORITY_CHECKS),
-        ("?type=standard", STANDARD_CHECKS),
-        ("?status=error", &["amazon-ebs-snapshots"]),
-        ("?status=ok", &["iam-access-key-rotation"]),
-        ("?status=warning", PRIORITY_CHECKS),
-        ("?pillar=cost_optimizing", PRIORITY_CHECKS),
-        ("?pillar=fault_tolerance", &["amazon-ebs-snapshots"]),
+        ("?type=priority", CHECK_IDS),
+        // No organization recommendation is standard, so that half of
+        // `RecommendationType` selects none of them.
+        ("?type=standard", &[]),
+        ("?status=error", &[]),
+        ("?status=ok", &[]),
+        ("?status=warning", CHECK_IDS),
+        ("?pillar=cost_optimizing", CHECK_IDS),
+        ("?pillar=fault_tolerance", &[]),
         // `performance` is the second pillar of one row: the filter is
         // membership, not equality.
         ("?pillar=performance", &["rds-idle-db-instances"]),
         ("?pillar=service_limits", &[]),
-        ("?awsService=ebs", &["amazon-ebs-snapshots"]),
         ("?awsService=ec2", &["low-utilization-ec2-instances"]),
+        ("?awsService=rds", &["rds-idle-db-instances"]),
         ("?awsService=lambda", &[]),
-        (
-            "?source=ta_check",
-            &[
-                "amazon-ebs-snapshots",
-                "iam-access-key-rotation",
-                "low-utilization-ec2-instances",
-            ],
-        ),
+        ("?source=ta_check", &["low-utilization-ec2-instances"]),
         ("?source=rds", &["rds-idle-db-instances"]),
         ("?source=well_architected", &[]),
         (
@@ -190,18 +179,18 @@ async fn the_organization_list_reports_the_store_and_honours_every_filter() {
             &["rds-idle-db-instances"],
         ),
         // Two filters that cannot hold together select nothing.
-        ("?type=standard&source=rds", &[]),
+        ("?type=priority&source=well_architected", &[]),
         (
             "?afterLastUpdatedAt=2024-01-04T00:00:00Z",
-            &["iam-access-key-rotation", "rds-idle-db-instances"],
+            &["rds-idle-db-instances"],
         ),
         (
             "?beforeLastUpdatedAt=2024-01-03T12:00:00Z",
-            &["amazon-ebs-snapshots", "low-utilization-ec2-instances"],
+            &["low-utilization-ec2-instances"],
         ),
         (
-            "?afterLastUpdatedAt=2024-01-03T12:00:00Z&beforeLastUpdatedAt=2024-01-04T12:00:00Z",
-            &["iam-access-key-rotation"],
+            "?afterLastUpdatedAt=2024-01-01T12:00:00Z&beforeLastUpdatedAt=2024-01-04T12:00:00Z",
+            &["low-utilization-ec2-instances"],
         ),
         // Both bounds are inclusive, so the seeded instants themselves match.
         (
@@ -284,7 +273,7 @@ async fn every_listed_summary_is_the_store_and_resolves_in_get() {
     assert_eq!(
         summaries.len(),
         CHECK_IDS.len(),
-        "expected one organization recommendation per seeded check, got {body}"
+        "expected one organization recommendation per prioritized seeded check, got {body}"
     );
 
     for (check_id, summary) in CHECK_IDS.iter().zip(&summaries) {
@@ -391,56 +380,69 @@ async fn organization_aggregates_add_up_the_member_accounts_counts() {
     // so its counts are the member accounts' counts added up — which, for the
     // one account this emulator presents, is that account's recommendation.
     //
-    // Rows differ along WHAT changes a member's resources and how: an exclusion
-    // made through the public API, several in one call, and a status change
-    // made by the part of Trusted Advisor that produces check results. Each
-    // expectation is [okCount, warningCount, errorCount, excludedCount].
+    // Rows differ along WHAT changes a member's resources and how: a status
+    // change and an exclusion change made by the part of Trusted Advisor that
+    // produces check results, and an exclusion ATTEMPTED through the public
+    // API, which refuses a prioritized recommendation's resource and so moves
+    // nothing. Each expectation is
+    // [okCount, warningCount, errorCount, excludedCount].
     //
-    // The seeded resources of `amazon-ebs-snapshots` (src/state.rs):
-    //   res-ebs-0001 error, included;  res-ebs-0002 ok, excluded
-    let check_id = "amazon-ebs-snapshots";
-    let first = resource_arn(check_id, "res-ebs-0001");
-    let second = resource_arn(check_id, "res-ebs-0002");
+    // The seeded resources of `low-utilization-ec2-instances` (src/state.rs):
+    //   res-ec2-0001 warning, included;  res-ec2-0002 ok, included;
+    //   res-ec2-0003 warning, included
+    let check_id = "low-utilization-ec2-instances";
+    let first = resource_arn(check_id, "res-ec2-0001");
 
     enum Change {
-        /// `BatchUpdateRecommendationResourceExclusion` entries, over the wire.
-        Exclusions(Vec<(String, bool)>),
+        /// An exclusion over the wire, which
+        /// `BatchUpdateRecommendationResourceExclusion` refuses per entry for a
+        /// resource of a prioritized recommendation ("This API currently
+        /// doesn't support prioritized recommendation resources") — and an
+        /// organization recommendation only ever aggregates prioritized ones.
+        RefusedExclusion(String),
+        /// A member resource's `ExclusionStatus`, written in process because no
+        /// request can move it for such a resource.
+        Exclusion(&'static str, &'static str),
         /// A member resource's `ResourceStatus`, written in process.
         Status(&'static str, &'static str),
         None,
     }
     let rows: Vec<(&str, Change, [i64; 4])> = vec![
-        ("the seeded store", Change::None, [1, 0, 1, 1]),
+        ("the seeded store", Change::None, [1, 2, 0, 0]),
         (
-            "an exclusion made through the API",
-            Change::Exclusions(vec![(first.clone(), true)]),
-            [1, 0, 1, 2],
+            "an exclusion the API refuses for a prioritized resource",
+            Change::RefusedExclusion(first.clone()),
+            [1, 2, 0, 0],
         ),
         (
-            "both resources included in one call",
-            Change::Exclusions(vec![(first.clone(), false), (second.clone(), false)]),
-            [1, 0, 1, 0],
+            "a member resource is excluded",
+            Change::Exclusion("res-ec2-0001", "excluded"),
+            [1, 2, 0, 1],
+        ),
+        (
+            "that resource is included again",
+            Change::Exclusion("res-ec2-0001", "included"),
+            [1, 2, 0, 0],
         ),
         (
             "a member resource moves from ok to warning",
-            Change::Status("res-ebs-0002", "warning"),
-            [0, 1, 1, 0],
+            Change::Status("res-ec2-0002", "warning"),
+            [0, 3, 0, 0],
         ),
         (
-            "and that resource is excluded too",
-            Change::Exclusions(vec![(second.clone(), true)]),
-            [0, 1, 1, 1],
+            "another member resource moves to error",
+            Change::Status("res-ec2-0003", "error"),
+            [0, 2, 1, 0],
         ),
     ];
 
     for (case, change, expected) in rows {
         match change {
-            Change::Exclusions(entries) => {
+            Change::RefusedExclusion(arn) => {
                 let payload = json!({
-                    "recommendationResourceExclusions": entries
-                        .iter()
-                        .map(|(arn, is_excluded)| json!({"arn": arn, "isExcluded": is_excluded}))
-                        .collect::<Vec<Value>>(),
+                    "recommendationResourceExclusions": [
+                        { "arn": arn, "isExcluded": true },
+                    ],
                 });
                 let (status, body) = call(
                     &router,
@@ -453,6 +455,36 @@ async fn organization_aggregates_add_up_the_member_accounts_counts() {
                     status, 200,
                     "case {case}: expected 200 from the exclusion batch, got {status} with {body}"
                 );
+                let errors = body["batchUpdateRecommendationResourceExclusionErrors"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("case {case}: no per-entry error list in {body}"));
+                assert_eq!(
+                    errors.len(),
+                    1,
+                    "case {case}: expected one per-entry error, got {errors:?}"
+                );
+                assert_eq!(
+                    errors[0]["arn"].as_str(),
+                    Some(arn.as_str()),
+                    "case {case}: expected the error to name {arn}, got {:?}",
+                    errors[0]
+                );
+                assert_eq!(
+                    errors[0]["errorCode"].as_str(),
+                    Some("ConflictException"),
+                    "case {case}: expected a ConflictException entry, got {:?}",
+                    errors[0]
+                );
+            }
+            Change::Exclusion(resource_id, exclusion_status) => {
+                let state = service_state(&*engine).expect("this service's state");
+                let mut state = state.lock();
+                let resource = state
+                    .recommendation_resources
+                    .values_mut()
+                    .find(|resource| resource.id == resource_id)
+                    .unwrap_or_else(|| panic!("case {case}: no seeded resource {resource_id}"));
+                resource.exclusion_status = exclusion_status.to_string();
             }
             Change::Status(resource_id, status) => {
                 let state = service_state(&*engine).expect("this service's state");
@@ -506,9 +538,9 @@ async fn paginating_the_organization_list_walks_every_entry_exactly_once() {
         .map(|check| organization_recommendation_arn(check))
         .collect();
 
-    // Rows differ along the page size: one entry per page, two, exactly the
-    // stored set, and a page larger than it.
-    for page_size in [1usize, 2, 4, 200] {
+    // Rows differ along the page size: one entry per page, exactly the stored
+    // set, and pages larger than it.
+    for page_size in [1usize, 2, 3, 200] {
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
         // One extra round beyond the number of pages the size implies, so a

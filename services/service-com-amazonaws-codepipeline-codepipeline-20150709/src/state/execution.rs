@@ -34,7 +34,10 @@
 //! * `Source`/`Deploy` actions whose provider is `S3` move real bytes: the source
 //!   action reads the object and writes the artifact into the artifact store, and the
 //!   deploy action reads the artifact and writes the delivered object — both through
-//!   in-process S3 calls over the framework's callback.
+//!   in-process S3 calls over the framework's callback. Which object the source action
+//!   reads is the declaration's, under the key and at the version the start's
+//!   `SourceRevisionOverride`s pin for it ([`s3_source_pin`]), and at the object's
+//!   current version when nothing pinned one.
 //! * every other provider (CodeBuild, CloudFormation, Lambda, a custom job worker …)
 //!   is work this emulator cannot perform, so its action FAILS with a reason saying so
 //!   and the execution reaches `Failed`. Nothing is ever reported as having run when
@@ -153,6 +156,55 @@ pub const FAILURE_JOB_FAILED: &str = "JobFailed";
 
 /// The `FailureType` reported for a declaration this emulator cannot execute at all.
 pub const FAILURE_CONFIGURATION_ERROR: &str = "ConfigurationError";
+
+/// The `SourceRevisionType` whose value is the S3 object VERSION a source action reads.
+pub const SOURCE_REVISION_TYPE_S3_OBJECT_VERSION_ID: &str = "S3_OBJECT_VERSION_ID";
+
+/// The `SourceRevisionType` whose value is the S3 object KEY a source action reads.
+pub const SOURCE_REVISION_TYPE_S3_OBJECT_KEY: &str = "S3_OBJECT_KEY";
+
+/// What an execution's source-revision overrides pin for ONE S3 source action.
+///
+/// Each override carries the `revisionType` that says what kind of revision its value
+/// is, so only the two S3 types name anything about an S3 object; "either of the types
+/// can be used independently, or they can be used together to override the source with
+/// a specific ObjectKey and VersionID".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct S3SourcePin {
+    /// The object key an `S3_OBJECT_KEY` override names, when one does.
+    pub key: Option<String>,
+    /// The object version an `S3_OBJECT_VERSION_ID` override names, when one does.
+    pub version_id: Option<String>,
+}
+
+/// What `overrides` pin for the S3 source action named `action_name`.
+///
+/// Only an override of an S3 revision type pins an S3 object: an override naming a
+/// commit id or an image digest describes another provider's revision, and a revision
+/// merely REPORTED for an action (`PutActionRevision`) is not an override at all, so
+/// neither selects an object or a version. An action nothing pins reads the object its
+/// configuration declares, at that object's current version.
+pub fn s3_source_pin(
+    overrides: &[crate::ops::types::SourceRevisionOverride],
+    action_name: &str,
+) -> S3SourcePin {
+    let mut pin = S3SourcePin::default();
+    for source_override in overrides
+        .iter()
+        .filter(|source_override| source_override.action_name == action_name)
+    {
+        match source_override.revision_type.as_str() {
+            SOURCE_REVISION_TYPE_S3_OBJECT_KEY => {
+                pin.key = Some(source_override.revision_value.clone());
+            }
+            SOURCE_REVISION_TYPE_S3_OBJECT_VERSION_ID => {
+                pin.version_id = Some(source_override.revision_value.clone());
+            }
+            _ => {}
+        }
+    }
+    pin
+}
 
 /// Where an artifact's bytes live: one object in the pipeline's artifact store.
 #[derive(Debug, Clone, PartialEq, Eq)]

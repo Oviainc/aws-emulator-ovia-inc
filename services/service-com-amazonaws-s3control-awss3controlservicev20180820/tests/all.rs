@@ -15,6 +15,10 @@
 mod access_grants_data_plane;
 #[path = "all/access_grants_instance.rs"]
 mod access_grants_instance;
+#[path = "all/access_grants_instance_resource_policy.rs"]
+mod access_grants_instance_resource_policy;
+#[path = "all/access_grants_location_delete.rs"]
+mod access_grants_location_delete;
 #[path = "all/access_grants_location_register.rs"]
 mod access_grants_location_register;
 #[path = "all/access_grants_location_update.rs"]

@@ -673,13 +673,23 @@ async fn list_connections_reports_the_stored_connections_under_one_filter() {
     }
 }
 
+/// One row of the update table: the case, the update, the authorization type the
+/// connection then has, the `ConnectionState` the clock then owes it, the member
+/// path a read must report, and the value it must report there.
+type UpdateRow = (
+    &'static str,
+    Value,
+    &'static str,
+    &'static str,
+    Vec<&'static str>,
+    Value,
+);
+
 /// `UpdateConnection` writes what the request carries, leaves the rest, and
 /// reports no credential back.
 #[tokio::test]
 async fn update_connection_writes_the_members_it_is_given() {
-    // (case, the update, the authorization type the connection then has, the
-    //  member path a read must report, the value it must report there)
-    let rows: Vec<(&str, Value, &str, Vec<&str>, Value)> = vec![
+    let rows: Vec<UpdateRow> = vec![
         (
             "a change of authorization type, with the new type's credentials",
             json!({
@@ -689,10 +699,15 @@ async fn update_connection_writes_the_members_it_is_given() {
                 },
             }),
             "BASIC",
+            state::CONNECTION_STATE_AUTHORIZED,
             vec!["BasicAuthParameters", "Username"],
             json!("new-user"),
         ),
         (
+            // OAuth client credentials are not themselves the authorization:
+            // they are exchanged for a token at the connection's authorization
+            // endpoint, and nothing answers at the endpoint this row names, so
+            // the update leaves the connection DEAUTHORIZED.
             "a change to OAuth, with the client parameters",
             json!({
                 "AuthorizationType": "OAUTH_CLIENT_CREDENTIALS",
@@ -708,6 +723,7 @@ async fn update_connection_writes_the_members_it_is_given() {
                 },
             }),
             "OAUTH_CLIENT_CREDENTIALS",
+            state::CONNECTION_STATE_DEAUTHORIZED,
             vec!["OAuthParameters", "ClientParameters", "ClientID"],
             json!("new-client"),
         ),
@@ -719,6 +735,7 @@ async fn update_connection_writes_the_members_it_is_given() {
                 },
             }),
             "API_KEY",
+            state::CONNECTION_STATE_AUTHORIZED,
             vec!["ApiKeyAuthParameters", "ApiKeyName"],
             json!("x-other-key"),
         ),
@@ -726,12 +743,13 @@ async fn update_connection_writes_the_members_it_is_given() {
             "a description alone, which leaves the credentials alone",
             json!({ "Description": "the updated connection" }),
             "API_KEY",
+            state::CONNECTION_STATE_AUTHORIZED,
             vec!["ApiKeyAuthParameters", "ApiKeyName"],
             json!("x-api-key"),
         ),
     ];
 
-    for (case, update, expected_type, path, expected_value) in rows {
+    for (case, update, expected_type, expected_state, path, expected_value) in rows {
         let router = emulator();
         let name = "the-connection";
         given_connection(&router, name).await;
@@ -776,9 +794,8 @@ async fn update_connection_writes_the_members_it_is_given() {
         );
         assert_eq!(
             settled["ConnectionState"],
-            json!(state::CONNECTION_STATE_AUTHORIZED),
-            "case {case:?}: the clock owes the updated connection {}, got {settled}",
-            state::CONNECTION_STATE_AUTHORIZED
+            json!(expected_state),
+            "case {case:?}: the clock owes the updated connection {expected_state}, got {settled}"
         );
         assert_eq!(
             settled["AuthorizationType"],

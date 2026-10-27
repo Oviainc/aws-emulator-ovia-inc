@@ -191,6 +191,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx.parts());
+        let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
+        let mut store = state.lock();
+
+        // A rule is bound to an event bus, so a bus that does not exist is a
+        // missing resource — never a bus this call brings into being. The bus is
+        // resolved BEFORE the request's own members are judged: a caller naming a
+        // bus that is gone has to read that it is gone, not a verdict on its
+        // request body, because the two call for different remedies.
+        if store.bus(&region, &bus_name).is_none() {
+            return Err(PutRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::no_such_event_bus(&bus_name)),
+                },
+            )
+            .into());
+        }
+
         // "A rule must contain at least an EventPattern or ScheduleExpression"
         // (this operation's own documentation). The model cannot express a
         // requirement spanning two optional members, so it is refused here.
@@ -240,12 +258,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let region = crate::state::request_region(ctx.parts());
-        let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
-        // The request's own tag count is charged BEFORE the store lock is taken, for
-        // the reason `crate::state::bound_tag_count` records: `TagList` carries no
-        // modelled `@length`, so the work a request can ask for inside the critical
-        // section has to be bounded by the per-resource quota up front.
+        // The request's own tag count is charged before anything caller-sized is
+        // built, for the reason `crate::state::bound_tag_count` records:
+        // `TagList` carries no modelled `@length`, so the work a request can ask
+        // for has to be bounded by the per-resource quota up front.
         if let Some(reason) = input
             .tags
             .as_ref()
@@ -254,11 +270,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::validation(reason));
         }
-        let mut store = state.lock();
 
-        // A rule is bound to an event bus, so a bus that does not exist is a
-        // missing resource — never a bus this call brings into being.
-        let Some(bus) = store.bus_mut(&bus_name) else {
+        let Some(bus) = store.bus_mut(&region, &bus_name) else {
             return Err(PutRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_event_bus(&bus_name)),

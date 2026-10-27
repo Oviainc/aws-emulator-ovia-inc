@@ -183,6 +183,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // "The load balancer balances the traffic among the remaining routable subnets":
+        // there has to BE a remaining one. A load balancer placed in subnets serves traffic
+        // from those subnets alone, so a detach that would leave it attached to none is a
+        // configuration change this service cannot apply, and none of the named subnets is
+        // detached. The set is judged before anything is removed, so a refusal leaves the
+        // placement exactly as it found it.
+        let remaining = record
+            .subnets
+            .iter()
+            .filter(|held| !input.subnets.iter().any(|named| named == *held))
+            .count();
+        if remaining == 0 && !record.subnets.is_empty() {
+            return Err(
+                DetachLoadBalancerFromSubnetsErrorModeled::InvalidConfigurationRequestException(
+                    InvalidConfigurationRequestException {
+                        message: Some(crate::state::detached_every_subnet_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // Each named subnet leaves the placement, taking the zone it put the load balancer
         // in with it — "the load balancer balances the traffic among the remaining routable
         // subnets". A subnet the load balancer is not attached to removes nothing: the set

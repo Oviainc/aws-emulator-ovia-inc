@@ -34,8 +34,14 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::organization_recommendation_lifecycle::read;
 use crate::recommendation_loop::{
-    call, emulator_on_plan, label, recommendation_arn, CHECK_IDS,
+    call, emulator_on_plan, label, recommendation_arn, PRIORITIZED_CHECK_IDS,
 };
+
+/// Every check with an organization recommendation to read: the PRIORITIZED
+/// ones, since every organization operation supports only prioritized
+/// recommendations (that rule is pinned in
+/// `tests/all/organization_prioritized_only.rs`).
+const CHECK_IDS: &[&str] = PRIORITIZED_CHECK_IDS;
 
 /// An emulator whose account is entitled to the API.
 fn emulator() -> MultiServiceRouter {

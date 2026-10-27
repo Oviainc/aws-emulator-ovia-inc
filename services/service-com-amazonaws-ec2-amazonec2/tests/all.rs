@@ -163,6 +163,11 @@ mod byoip_cidrs;
 mod capacity_block_offerings;
 #[path = "all/capacity_blocks.rs"]
 mod capacity_blocks;
+// The account's EC2 Capacity Manager settings: what `EnableCapacityManager` records and
+// what `GetCapacityManagerAttributes` reports back, including the ingestion the enable
+// starts.
+#[path = "all/capacity_manager.rs"]
+mod capacity_manager;
 #[path = "all/capacity_reservation_billing_requests.rs"]
 mod capacity_reservation_billing_requests;
 #[path = "all/capacity_reservation_fleets.rs"]

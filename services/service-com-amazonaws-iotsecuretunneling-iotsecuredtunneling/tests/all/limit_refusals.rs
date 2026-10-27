@@ -2,9 +2,9 @@
 
 //! How this service reports an exhausted limit, at every entry point that has one.
 //!
-//! RULE: when a request would take the service past a count it caps — the tunnel
-//! records this account holds (`state::MAX_TUNNELS`) or the distinct tag keys one
-//! tunnel carries (`state::MAX_TAGS_PER_TUNNEL`) — it is refused with the error
+//! RULE: when a request would take the service past a count it caps — the tunnels
+//! this account holds OPEN in one Region (`state::MAX_CONCURRENT_TUNNELS`) or the
+//! distinct tag keys one tunnel carries (`state::MAX_TAGS_PER_TUNNEL`) — it is refused with the error
 //! this service models for an exhausted limit, `LimitExceededException` at HTTP
 //! 403, whose message names the limit and the count the request would reach; the
 //! refusal stores nothing and mints nothing. The error code is the modelled
@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iotsecuretunneling_iotsecuredtunneling::state::{
-    StoredTunnel, MAX_TAGS_PER_TUNNEL, MAX_TUNNELS,
+    StoredTunnel, MAX_CONCURRENT_TUNNELS, MAX_TAGS_PER_TUNNEL,
 };
 use service_com_amazonaws_iotsecuretunneling_iotsecuredtunneling::{
     ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState as TunnelState, EmulatedService,
@@ -191,12 +191,12 @@ async fn the_tag_limit_is_refused_with_the_modelled_limit_error_at_both_entry_po
 }
 
 #[tokio::test]
-async fn the_tunnel_count_limit_is_refused_with_the_same_modelled_limit_error() {
+async fn the_open_tunnel_quota_is_refused_with_the_same_modelled_limit_error() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = mount(&engine);
 
-    // One real tunnel, then the store filled to its record cap with copies of it,
-    // so the refusal below is about the record count and nothing else.
+    // One real tunnel, then the account filled to its concurrency quota with OPEN
+    // copies of it, so the refusal below is about the open count and nothing else.
     let (status, opened) = open_with_tags(&router, tags_of(1, "k")).await;
     assert_eq!(status, 200, "OpenTunnel answered {status} {opened:?}");
     let seed_id = opened["tunnelId"].as_str().unwrap_or_default().to_string();
@@ -208,7 +208,7 @@ async fn the_tunnel_count_limit_is_refused_with_the_same_modelled_limit_error() 
             .cloned()
             .expect("the opened tunnel was not persisted");
         let mut filler = 0_usize;
-        while store.tunnels.len() < MAX_TUNNELS {
+        while store.open_tunnel_count(REGION) < MAX_CONCURRENT_TUNNELS {
             let tunnel_id = format!("filler-{filler}");
             let tunnel_arn = format!("arn:aws:iot:{REGION}:000000000000:tunnel/{tunnel_id}");
             let mut tunnel = seed.clone();
@@ -219,25 +219,19 @@ async fn the_tunnel_count_limit_is_refused_with_the_same_modelled_limit_error() 
         }
     }
 
-    let case = "a store holding its cap of tunnel records";
+    let case = "an account holding its quota of open tunnels";
+    let stored_before = engine.state::<TunnelState>().lock().tunnels.len();
     let (status, body) = open_with_tags(&router, tags_of(1, "k")).await;
-    assert_eq!(
-        status, LIMIT_STATUS,
-        "case {case:?}: expected the modelled limit refusal, answered {status} {body:?}"
-    );
-    assert_eq!(
-        body["__type"].as_str(),
-        Some(LIMIT_CODE),
-        "case {case:?}: expected the modelled limit error code, answered {body:?}"
-    );
-    let message = body["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains(&MAX_TUNNELS.to_string()),
-        "case {case:?}: the message must name the limit {MAX_TUNNELS}, got {message:?}"
+    assert_limit_refusal(
+        case,
+        status,
+        &body,
+        MAX_CONCURRENT_TUNNELS,
+        MAX_CONCURRENT_TUNNELS,
     );
     assert_eq!(
         engine.state::<TunnelState>().lock().tunnels.len(),
-        MAX_TUNNELS,
+        stored_before,
         "case {case:?}: a refused open must store no record"
     );
 }

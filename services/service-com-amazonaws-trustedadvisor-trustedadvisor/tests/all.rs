@@ -19,6 +19,8 @@ mod cost_optimizing_aggregates;
 mod localized_text;
 #[path = "all/organization_member_set.rs"]
 mod organization_member_set;
+#[path = "all/organization_prioritized_only.rs"]
+mod organization_prioritized_only;
 #[path = "all/organization_recommendation_accounts.rs"]
 mod organization_recommendation_accounts;
 #[path = "all/organization_recommendation_lifecycle.rs"]

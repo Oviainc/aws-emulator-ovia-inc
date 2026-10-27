@@ -146,12 +146,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // outside one. The RELATION between two of them is documented rather than
         // modelled — `HealthCheck$Timeout`: "This value must be less than the Interval
         // value" — so it is refused here, under the code this service answers a value it
-        // cannot accept with, naming both values the caller sent.
+        // cannot accept with, stating the relation the request broke.
         if requested.timeout >= requested.interval {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "HealthCheck.Timeout ({}) must be less than HealthCheck.Interval ({})",
-                requested.timeout, requested.interval
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                HEALTH_CHECK_TIMEOUT_RELATION,
+            ));
         }
         if let Err(why) = target_rejection(&requested.target) {
             return Err(crate::scaffolded::Scaffolded::validation_error(why));
@@ -203,8 +202,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The protocols a health-check target may name, from `HealthCheck$Target`: "The protocol
-/// is either TCP, HTTP, HTTPS, or SSL."
-const TARGET_PROTOCOLS: &[&str] = &["TCP", "SSL", "HTTP", "HTTPS"];
+/// is either TCP, HTTP, HTTPS, or SSL." Listed in the order this service's own refusal
+/// names them, which is what [`target_protocol_refusal`] states.
+const TARGET_PROTOCOLS: &[&str] = &["HTTP", "TCP", "HTTPS", "SSL"];
+
+/// The refusal a target that does not begin with one of [`TARGET_PROTOCOLS`] earns: a
+/// target is "a protocol:port pair", so a value that names no protocol at all and one that
+/// names something else both break the same rule, and the sentence states that rule with
+/// the protocols a target may begin with.
+fn target_protocol_refusal() -> String {
+    format!(
+        "HealthCheck Target must begin with one of {}",
+        TARGET_PROTOCOLS.join(", ")
+    )
+}
+
+/// The refusal a health check whose timeout is not below its interval earns, stated over
+/// the RELATION the two members have to each other rather than over the two values the
+/// request carried: the rule is what the caller has to satisfy, and it is the same rule
+/// whichever pair of values broke it.
+const HEALTH_CHECK_TIMEOUT_RELATION: &str = "HealthCheck timeout must be less than interval.";
 
 /// The ports a health-check target may name, from the same paragraph: "The range of valid
 /// ports is one (1) through 65535."
@@ -224,18 +241,11 @@ const MAX_HTTP_TARGET_CHARS: usize = 1024;
 /// and the rule it broke, which is what a caller fixes the request from.
 fn target_rejection(target: &str) -> Result<(), String> {
     let Some((protocol, rest)) = target.split_once(':') else {
-        return Err(format!(
-            "HealthCheck.Target must be '<protocol>:<port>' for TCP and SSL or \
-             '<protocol>:<port>/<path>' for HTTP and HTTPS, with the protocol one of \
-             {TARGET_PROTOCOLS:?}; got '{target}'"
-        ));
+        return Err(target_protocol_refusal());
     };
     let protocol = protocol.to_ascii_uppercase();
     if !TARGET_PROTOCOLS.contains(&protocol.as_str()) {
-        return Err(format!(
-            "HealthCheck.Target protocol must be one of {TARGET_PROTOCOLS:?}; got \
-             '{protocol}'"
-        ));
+        return Err(target_protocol_refusal());
     }
 
     // An HTTP or HTTPS target carries a ping path after the port; a TCP or SSL target is

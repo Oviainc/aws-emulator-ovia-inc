@@ -141,7 +141,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(RemovePermissionErrorModeled::InternalException(InternalException {
@@ -166,13 +166,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        let region = crate::state::request_region(ctx.parts());
         // "The name of the event bus to revoke permissions for. If you omit
         // this, the default event bus is used."
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
         let modified = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        let Some(bus) = store.bus_mut(&bus_name) else {
+        let Some(bus) = store.bus_mut(&region, &bus_name) else {
             return Err(RemovePermissionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_event_bus(&bus_name)),
