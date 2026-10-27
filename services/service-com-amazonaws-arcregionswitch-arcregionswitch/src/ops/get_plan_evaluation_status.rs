@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPlanEvaluationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPlanEvaluationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPlanEvaluationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! The evaluation of the plan the request names, derived from the stored plan record:
+//! [`crate::state::StoredPlan::evaluation_warnings`] raises one active warning for every
+//! workflow step whose execution block leaves one of the plan's two Regions unconfigured,
+//! or configures a resource in a Region the plan does not cover, and
+//! [`crate::state::evaluation_state`] turns the whole warning set into the reported
+//! `EvaluationStatus`. The evaluation is of the stored configuration, so the version it
+//! reports is the plan's current version and the time it reports is when that version was
+//! written.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +165,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPlanEvaluationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPlanEvaluationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPlanEvaluationStatus"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so a store that is not there is a
+            // refusal rather than a fabricated evaluation.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Region switch plan store is unavailable",
+            ));
+        };
+
+        // The token is a position in the plan's warning list; the only ones this service
+        // hands out are positions strictly inside it. This operation models no
+        // client-input error, so a token it never issued is the 400 the wrapper carries.
+        let offset = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => match token.parse::<usize>() {
+                Ok(offset) => offset,
+                Err(_) => {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "nextToken is not a pagination token this service issued: {token}"
+                    )))
+                }
+            },
+        };
+        // `maxResults` is constrained `@range(1..100)`; an absent one asks for as many as
+        // that range allows.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // `@readonly`: the only write is `settle`, which materialises the state changes the
+        // clock already made due — owed at the same instant whether or not anybody called.
+        // Every handler settles, so no two readers disagree about the current state.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(record) = store.plans.get(&input.plan_arn) else {
+            return Err(
+                GetPlanEvaluationStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::plan_not_found_message(&input.plan_arn),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The WHOLE warning set decides the evaluation state; the page decides only what
+        // this response carries, so a caller reading the second page is told the same
+        // state as one reading the first.
+        let warnings = record.evaluation_warnings();
+        let evaluation_state = crate::state::evaluation_state(&warnings);
+        let total = warnings.len();
+        if offset >= total.max(1) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "nextToken is not a pagination token this service issued: it resumes at \
+                 {offset}, at or past the last of the {total} evaluation warnings of plan {}",
+                input.plan_arn
+            )));
+        }
+        let end = offset.saturating_add(page_size).min(total);
+        let page: Vec<ResourceWarning> =
+            warnings.into_iter().skip(offset).take(page_size).collect();
+
+        Ok(GetPlanEvaluationStatusOutput {
+            plan_arn: record.plan.arn.clone(),
+            // The evaluation is of the configuration as stored, so the version evaluated
+            // is the plan's current version, and the instant that version was written is
+            // when the configuration this evaluation reports on last changed.
+            last_evaluated_version: Some(record.version()),
+            last_evaluation_time: record.plan.updated_at,
+            // Region switch is a regional API: the evaluation reported is the one held by
+            // the Region the request reached.
+            region: Some(crate::state::request_region(ctx)),
+            evaluation_state: Some(evaluation_state),
+            warnings: Some(page),
+            // A token only when a further page exists, so a caller paginating until the
+            // token is null terminates.
+            next_token: (end < total).then(|| end.to_string()),
+        })
     }
 }

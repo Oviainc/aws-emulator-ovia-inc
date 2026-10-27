@@ -297,11 +297,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // A welcome message needs an address to go to: "specify EMAIL if email will
+        // be used to send the welcome message. Specify SMS if the phone number will
+        // be used" (`AdminCreateUser.DesiredDeliveryMediums`), so each medium the
+        // request asks for names the attribute whose value addresses it, and a medium
+        // no submitted or stored attribute addresses asks for a message that can
+        // never be delivered. Checked BEFORE anything is written, so a refused
+        // request creates and changes no user — and so an unaddressable medium is
+        // reported ahead of the username check, the request being refused for what it
+        // carries rather than for what the pool already holds.
+        //
+        // It is the SUBMITTED list that is validated. The member's documented default
+        // says which medium carries the message when the request names none; it is
+        // not a request for one, so a create that asks for no medium is not refused
+        // for the address it does not carry.
+        let key = pool.user_key(&input.username);
+        if let Some(mediums) = input.desired_delivery_mediums.as_deref() {
+            let stored = pool.users.get(&key);
+            // Which attributes hold an address is decided ONCE, per addressing
+            // attribute — there are two of them, whatever the request's size — so the
+            // submitted attribute list is walked a fixed number of times and each
+            // requested medium then costs a constant-time test, rather than one scan
+            // of that list per medium.
+            let addressed: ::std::collections::BTreeSet<&'static str> =
+                crate::state::DELIVERY_MEDIUM_ATTRIBUTES
+                    .iter()
+                    .map(|(_, attribute)| *attribute)
+                    .filter(|attribute| {
+                        requested_attributes.iter().any(|submitted| {
+                            submitted.name == *attribute
+                                && submitted
+                                    .value
+                                    .as_deref()
+                                    .is_some_and(|value| !value.is_empty())
+                        }) || stored.is_some_and(|user| user.destination_of(attribute).is_some())
+                    })
+                    .collect();
+            let undeliverable =
+                crate::state::undeliverable_medium(mediums, |attribute| {
+                    addressed.contains(attribute)
+                });
+            if let Some((medium, attribute)) = undeliverable {
+                return Err(invalid_parameter(
+                    crate::state::undeliverable_medium_message(medium, attribute),
+                ));
+            }
+        }
+
         // "Set to RESEND to resend the invitation message to a user that already
         // exists, and to reset the temporary-password duration with a new
         // temporary password" (`AdminCreateUser.MessageAction`).
         let resend = input.message_action.as_deref() == Some("RESEND");
-        let key = pool.user_key(&input.username);
         if let Some(existing) = pool.users.get_mut(&key) {
             if !resend {
                 return Err(username_exists());

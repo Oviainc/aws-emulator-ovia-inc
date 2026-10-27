@@ -1335,6 +1335,30 @@ pub fn decode_cursor(tag: &str, token: &str) -> Option<String> {
     decoded.strip_prefix(tag).map(ToString::to_string)
 }
 
+/// The refusal every read of this service reports for a `NextToken` it did not issue.
+///
+/// ONE wording for ONE failure, whichever read resolved the cursor — the token is opaque to
+/// the caller ([`encode_cursor`]), so "this service did not issue it" is the whole
+/// requirement a client can act on, and a client comparing the message gets the same text
+/// from a read whose cursor is a store key and from one whose cursor is an offset
+/// ([`page_of`]).
+///
+/// It names the member and the requirement and NOTHING of the rejected token, the rule
+/// [`constraint_clause`] states for every constraint violation this service words: the
+/// token is caller input, and a refusal that rendered it would copy it into every client log
+/// recording the failure.
+pub const UNISSUED_NEXT_TOKEN: &str = "NextToken is not a token this service issued";
+
+/// [`UNISSUED_NEXT_TOKEN`] narrowed to the SCOPE a read resolves its cursor within, for a
+/// read whose token is only a cursor within the one scope that issued it: same member, same
+/// requirement, plus the scope the token had to have been issued for.
+///
+/// `scope` names the request members that pick that scope out — never their values, so the
+/// narrowing adds no echo of caller input either.
+pub fn unissued_next_token_in(scope: &str) -> String {
+    format!("{UNISSUED_NEXT_TOKEN} for {scope}")
+}
+
 /// The page size a list read serves for the `MaxResults` a request states, or the refusal
 /// for a bound outside the range that member admits: at least [`MIN_PAGE_BOUND`] and at
 /// most `maximum`.
@@ -1374,7 +1398,9 @@ pub fn page_bound(member_path: &str, max_results: i32, maximum: i32) -> Result<u
 /// is an offset into their deterministic order, not a key of a stored record. Each read
 /// passes its own [`SERVICE_OPERATIONS_TOKEN_TAG`]-style tag, so a token is only ever
 /// resolved against the projection that issued it; `Err` carries the refusal message for a
-/// token that is not one this service issued under that tag. A read whose projection is ONE
+/// token that is not one this service issued under that tag — the service's ONE wording for
+/// that failure ([`UNISSUED_NEXT_TOKEN`]), so a cursor refused here reads exactly like the
+/// same cursor refused by a read whose cursor is a stored key. A read whose projection is ONE
 /// subject's set passes that tag with the subject bound into it ([`subject_token_tag`]),
 /// since the operation alone does not name the projection there.
 pub fn page_of<T>(
@@ -1394,7 +1420,7 @@ pub fn page_of<T>(
         None => 0,
         Some(token) => decode_cursor(tag, token)
             .and_then(|cursor| cursor.parse::<usize>().ok())
-            .ok_or_else(|| format!("NextToken `{token}` is not a token this service issued"))?,
+            .ok_or_else(|| UNISSUED_NEXT_TOKEN.to_string())?,
     };
     let mut page: Vec<T> = items.into_iter().skip(offset).collect();
     let next_token = if page.len() > page_size {

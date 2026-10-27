@@ -5,8 +5,14 @@
 //! against the resources the request lists: one
 //! [`crate::state::RemediationExecutionEntry`] per resource key, which
 //! `DescribeRemediationExecutionStatus` then reports as it moves from `QUEUED` through
-//! `IN_PROGRESS` to `SUCCEEDED` — the execution is asynchronous, so this call records
-//! the invocation and the instants those moves are due at, and answers.
+//! `IN_PROGRESS` to `SUCCEEDED`.
+//!
+//! What an execution RUNS is the action of the automation runbook the configuration
+//! names, against the resource the key names and with that configuration's parameters
+//! resolved for it ([`crate::state::remediation`]): this emulator performs it through the
+//! owning service's own API, so the resource is changed and the execution reports its run
+//! as finished as soon as that call is. An execution whose runbook names an action this
+//! emulator does not perform changes nothing, and reports the moves the clock makes due.
 //!
 //! A rule with no remediation configuration attached — including a rule this account
 //! does not hold — is refused with `NoSuchRemediationConfigurationException` ("You
@@ -169,9 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; the execution is recorded in this
-        // service's own state.
-        let _ = ctx;
+        // `ctx` carries the request's Region and the in-process callback the remediation
+        // acts over; the execution itself is recorded in this service's own state.
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
@@ -200,86 +206,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
+        // Everything this call decides from the store is decided inside this block, so
+        // its guard is released before the runs below — no lock is held across an await.
+        let (failed, failure_message, actions) = {
+            let mut store = state.lock();
 
-        // The remediation configuration is what there is to run: a rule without one —
-        // and a rule this account does not hold has none — is exactly the precondition
-        // `NoSuchRemediationConfigurationException` documents ("You specified an Config
-        // rule without a remediation configuration").
-        let Some(remediation) = store
-            .remediation_configurations
-            .get(&input.config_rule_name)
-        else {
-            return Err(
-                StartRemediationExecutionErrorModeled::NoSuchRemediationConfigurationException(
-                    NoSuchRemediationConfigurationException {
-                        message: Some(no_remediation_configuration_message(
-                            &input.config_rule_name,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        };
-        // The step an execution runs is the remediation target the configuration names.
-        let target = remediation.target_id.clone();
-
-        // Which of the rule's own verdicts already place a resource as compliant: a
-        // resource that complies has nothing to remediate. Read before the executions
-        // are written, so the decision is about the state this call arrived at.
-        let compliant: ::std::collections::BTreeSet<(String, String)> = store
-            .config_rules
-            .get(&input.config_rule_name)
-            .map(|rule| {
-                rule.evaluation_results
-                    .values()
-                    .filter(|result| {
-                        result.compliance_type == crate::state::COMPLIANCE_TYPE_COMPLIANT
-                    })
-                    .map(|result| (result.resource_type.clone(), result.resource_id.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let mut failed = Vec::new();
-        let mut failure_message = None;
-        for key in input.resource_keys {
-            let identity = (key.resource_type.clone(), key.resource_id.clone());
-            // An execution the clock has not finished yet is the precondition this
-            // operation states for a repeat call, so the resource is reported back
-            // rather than started a second time.
-            let running = store
-                .remediation_executions
-                .get(&(
-                    input.config_rule_name.clone(),
-                    identity.0.clone(),
-                    identity.1.clone(),
-                ))
-                .is_some_and(|execution| {
-                    execution.state_at(now) != crate::state::REMEDIATION_EXECUTION_STATE_SUCCEEDED
-                });
-            let reason = if compliant.contains(&identity) {
-                Some(already_compliant_message(&input.config_rule_name))
-            } else if running {
-                Some(EXECUTION_IN_FLIGHT.to_string())
-            } else {
-                None
+            // The remediation configuration is what there is to run: a rule without one
+            // — and a rule this account does not hold has none — is exactly the
+            // precondition `NoSuchRemediationConfigurationException` documents ("You
+            // specified an Config rule without a remediation configuration").
+            let Some(remediation) = store.remediation_configurations.get(&input.config_rule_name)
+            else {
+                return Err(
+                    StartRemediationExecutionErrorModeled::NoSuchRemediationConfigurationException(
+                        NoSuchRemediationConfigurationException {
+                            message: Some(no_remediation_configuration_message(
+                                &input.config_rule_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
             };
-            if let Some(reason) = reason {
-                failure_message = failure_message.or(Some(reason));
-                failed.push(key);
-                continue;
+            // The step an execution runs is the remediation target the configuration
+            // names, and the inputs it runs with are that configuration's parameters — so
+            // the configuration is read out before the executions are written.
+            let remediation = remediation.clone();
+            let target = remediation.target_id.clone();
+
+            // Which of the rule's own verdicts already place a resource as compliant: a
+            // resource that complies has nothing to remediate. Read before the executions
+            // are written, so the decision is about the state this call arrived at.
+            let compliant: ::std::collections::BTreeSet<(String, String)> = store
+                .config_rules
+                .get(&input.config_rule_name)
+                .map(|rule| {
+                    rule.evaluation_results
+                        .values()
+                        .filter(|result| {
+                            result.compliance_type == crate::state::COMPLIANCE_TYPE_COMPLIANT
+                        })
+                        .map(|result| (result.resource_type.clone(), result.resource_id.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut failed = Vec::new();
+            let mut failure_message = None;
+            let mut actions: Vec<crate::state::RemediationAction> = Vec::new();
+            for key in input.resource_keys {
+                let identity = (key.resource_type.clone(), key.resource_id.clone());
+                // An execution that has not finished yet is the precondition this
+                // operation states for a repeat call, so the resource is reported back
+                // rather than started a second time.
+                let running = store
+                    .remediation_executions
+                    .get(&(
+                        input.config_rule_name.clone(),
+                        identity.0.clone(),
+                        identity.1.clone(),
+                    ))
+                    .is_some_and(|execution| {
+                        execution.state_at(now)
+                            != crate::state::REMEDIATION_EXECUTION_STATE_SUCCEEDED
+                    });
+                let reason = if compliant.contains(&identity) {
+                    Some(already_compliant_message(&input.config_rule_name))
+                } else if running {
+                    Some(EXECUTION_IN_FLIGHT.to_string())
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    failure_message = failure_message.or(Some(reason));
+                    failed.push(key);
+                    continue;
+                }
+                store.record_remediation_execution(
+                    &input.config_rule_name,
+                    crate::state::RemediationExecutionEntry::invoked(
+                        &key.resource_type,
+                        &key.resource_id,
+                        &target,
+                        now,
+                    ),
+                );
+                // What this execution RUNS: the action of the runbook the configuration
+                // names, with that configuration's parameters resolved for this resource.
+                // The run happens below, once the store's lock is released.
+                actions.push(crate::state::RemediationAction {
+                    config_rule_name: input.config_rule_name.clone(),
+                    resource_type: key.resource_type.clone(),
+                    resource_id: key.resource_id.clone(),
+                    target_id: target.clone(),
+                    inputs: crate::state::resolved_remediation_inputs(
+                        &remediation,
+                        &key.resource_id,
+                    ),
+                });
             }
-            store.record_remediation_execution(
-                &input.config_rule_name,
-                crate::state::RemediationExecutionEntry::invoked(
-                    &key.resource_type,
-                    &key.resource_id,
-                    &target,
-                    now,
-                ),
-            );
-        }
+            (failed, failure_message, actions)
+        };
+
+        // The runs happen with the store's lock RELEASED, so no action runs while this
+        // call still holds it. Each one acts on its resource through the owning service's
+        // own API, which is an in-process call, so the execution reports its run as
+        // finished as soon as it is.
+        crate::state::run_remediation_actions(ctx.callback(), &*self.engine, &region, &actions)
+            .await;
 
         // "For resources that have failed to start execution, the API returns a resource
         // key object": the member reports the per-resource outcome of an accepted

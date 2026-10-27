@@ -302,13 +302,18 @@ impl AppBundleRecord {
 
     /// The same authorization, but only once it has completed the connect
     /// handshake — the state an ingestion of that (app, tenant) pair requires.
+    ///
+    /// The handshake rule itself lives in
+    /// [`AppAuthorizationRecord::is_connected`], which this composes with the
+    /// lookup above, so every caller that needs "a usable authorization for
+    /// this pair" asks one question.
     pub fn connected_authorization(
         &self,
         app: &str,
         tenant: &str,
     ) -> Option<&AppAuthorizationRecord> {
         self.authorization_for(app, tenant)
-            .filter(|authorization| authorization.status == APP_AUTHORIZATION_STATUS_CONNECTED)
+            .filter(|authorization| authorization.is_connected())
     }
 
     /// This bundle's ingestion for one (application, tenant) pair, if it holds
@@ -397,6 +402,17 @@ pub struct AppAuthorizationRecord {
 }
 
 impl AppAuthorizationRecord {
+    /// Whether this authorization has completed the connect handshake — the ONE
+    /// place that rule is spelled out.
+    ///
+    /// AppFabric reaches an application only through an authorization in the
+    /// state the model's `AppAuthorizationStatus` documents as ready to be used
+    /// ([`APP_AUTHORIZATION_STATUS_CONNECTED`]), so both the ingestion
+    /// dependency check and the user-access fan-out decide with this.
+    pub fn is_connected(&self) -> bool {
+        self.status == APP_AUTHORIZATION_STATUS_CONNECTED
+    }
+
     /// The modelled `Tenant` this authorization was created for.
     pub fn to_tenant(&self) -> Tenant {
         Tenant {

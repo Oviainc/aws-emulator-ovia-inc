@@ -215,6 +215,8 @@ mod relational_database_master_user_password;
 mod relational_database_parameter_updates;
 #[path = "all/relational_database_parameters.rs"]
 mod relational_database_parameters;
+#[path = "all/relational_database_pre_stop_snapshot.rs"]
+mod relational_database_pre_stop_snapshot;
 #[path = "all/relational_database_reboot.rs"]
 mod relational_database_reboot;
 #[path = "all/relational_database_restore_from_snapshot.rs"]

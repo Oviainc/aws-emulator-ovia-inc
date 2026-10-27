@@ -1312,7 +1312,8 @@ fn the_client_token_index_never_grows_past_its_ceiling() {
         store.remember_client_token(
             "CreateAssistant",
             "",
-            &format!("token-{index}"),
+            Some(&format!("token-{index}")),
+            &format!("fingerprint-{index}"),
             &format!("resource-{index}"),
         );
         assert!(
@@ -1336,21 +1337,22 @@ fn the_client_token_index_never_grows_past_its_ceiling() {
     // still replays its own resource.
     for index in 0..overflow {
         let token = format!("token-{index}");
-        assert!(
-            store
-                .replayed_resource_id("CreateAssistant", "", &token)
-                .is_none(),
+        let fingerprint = format!("fingerprint-{index}");
+        assert_eq!(
+            store.replayed_create("CreateAssistant", "", Some(&token), &fingerprint),
+            state::Replay::Fresh,
             "case {token:?}: the oldest tokens must be the evicted ones, but it is still remembered"
         );
     }
     for index in overflow..state::MAX_REMEMBERED_CLIENT_TOKENS + overflow {
         let token = format!("token-{index}");
+        let fingerprint = format!("fingerprint-{index}");
         let expected = format!("resource-{index}");
+        let replayed = store.replayed_create("CreateAssistant", "", Some(&token), &fingerprint);
         assert_eq!(
-            store.replayed_resource_id("CreateAssistant", "", &token),
-            Some(&expected),
-            "case {token:?}: expected {expected:?}, got {:?}",
-            store.replayed_resource_id("CreateAssistant", "", &token)
+            replayed,
+            state::Replay::Retry(expected.clone()),
+            "case {token:?}: expected a retry of {expected:?}, got {replayed:?}"
         );
     }
 }

@@ -4,6 +4,23 @@
 //! Mutates the stored plan in place: the members the request carries replace what is
 //! stored, the ones it omits are left intact.
 //!
+//! `ScalingInstructions` the request carries are MERGED with the ones in force rather
+//! than written straight over them: an update does not re-point a target tracking
+//! policy a resource already has, so the target value in force for a metric the
+//! resource already tracks is kept while the rest of the instruction — including the
+//! rest of that metric's configuration — is applied.
+//! `crate::state::merge_scaling_instructions` owns that rule.
+//!
+//! That rule rests on the recorded behaviour of this operation, which is the only
+//! evidence there is: the model states no replacement semantics for
+//! `ScalingInstructions`. One alternative reading would put the kept target value down
+//! to a read taken before the new one had propagated, and would instead let the new
+//! value take effect when the owed transition completes; it is NOT what this emulator
+//! does, because the recorded read reports the plan `Active` with the applied status
+//! narrative and still carries the earlier target value. A recording that shows a
+//! settled plan reporting an updated target value overturns the rule here, in one
+//! place.
+//!
 //! An `ApplicationSource` the request carries is held to the same rule a create is:
 //! "You can create one scaling plan per application source", so a source another
 //! stored plan already claims is refused with `ValidationException` and the stored
@@ -210,12 +227,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // Replace only what the request carries; everything else stays as stored.
+        // Replace only what the request carries; everything else stays as stored. The
+        // instructions it carries are MERGED with those in force, so an update does not
+        // re-point a target tracking policy a resource already has (see
+        // `crate::state::merge_scaling_instructions`).
         if let Some(source) = input.application_source {
             plan.application_source = source;
         }
         if let Some(instructions) = input.scaling_instructions {
-            plan.scaling_instructions = instructions;
+            plan.scaling_instructions =
+                crate::state::merge_scaling_instructions(&plan.scaling_instructions, instructions);
         }
         plan.begin(
             crate::state::STATUS_UPDATE_IN_PROGRESS,

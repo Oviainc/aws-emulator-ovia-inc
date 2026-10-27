@@ -37,6 +37,8 @@ mod directory_networking_and_settings;
 mod directory_unsharing;
 #[path = "all/error_envelopes.rs"]
 mod error_envelopes;
+#[path = "all/event_topic_deregistration.rs"]
+mod event_topic_deregistration;
 #[path = "all/event_topics.rs"]
 mod event_topics;
 #[path = "all/harness.rs"]
@@ -47,6 +49,8 @@ mod ip_route_removal;
 mod log_subscriptions;
 #[path = "all/microsoft_ad.rs"]
 mod microsoft_ad;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/request_id_header.rs"]
 mod request_id_header;
 #[path = "all/schema_extensions.rs"]

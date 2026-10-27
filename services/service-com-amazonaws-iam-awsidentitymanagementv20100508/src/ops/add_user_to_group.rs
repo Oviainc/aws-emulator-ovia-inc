@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddUserToGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddUserToGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddUserToGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Makes the user a member of the group: the membership `crate::state::group_members`
+//! holds, which `GetGroup` reports as the group's users and which puts the group's own
+//! policies in force on the user. Adding a member the group already holds is the
+//! membership it already has, so the add is idempotent and consumes no second slot of
+//! the user's groups-per-user quota.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddUserToGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddUserToGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddUserToGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AddUserToGroupErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // Both entities are addressed by friendly name, and IAM entity names "are not
+        // distinguished by case" (`CreateGroup$GroupName`), so the case-folded name is
+        // the identity each store keys on — the key the create wrote the entity under.
+        // A name the account holds no such entity under "referenced a resource entity
+        // that does not exist", which is the modelled client error this operation
+        // declares, and the refusal names the entity as the request spelled it.
+        let group_key = crate::state::name_key(&input.group_name);
+        if !store.groups.contains_key(&group_key) {
+            return Err(AddUserToGroupErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The group with name {} cannot be found.",
+                        input.group_name
+                    )),
+                },
+            )
+            .into());
+        }
+        let user_key = crate::state::name_key(&input.user_name);
+        if !store.users.contains_key(&user_key) {
+            return Err(AddUserToGroupErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A user either belongs to a group or it does not, so adding one the group
+        // already holds leaves the account exactly as it is — and in particular does
+        // not consume a second slot of the user's quota.
+        let already_a_member = store
+            .group_members
+            .get(&group_key)
+            .is_some_and(|members| members.contains(&user_key));
+        if !already_a_member {
+            // A user belongs to a bounded number of groups, so a caller cannot grow
+            // one user's memberships — and with them the policies in force on it —
+            // without limit.
+            if store.group_keys_held_by(&user_key).count() >= crate::state::MAX_GROUPS_PER_USER {
+                return Err(AddUserToGroupErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        // "The error message describes the limit exceeded": the limit
+                        // is the one on the groups ONE user may belong to, so the
+                        // message names the user the request asked to add.
+                        message: Some(format!(
+                            "The maximum number of groups per user is exceeded for user: {}.",
+                            input.user_name
+                        )),
+                    },
+                )
+                .into());
+            }
+            store
+                .group_members
+                .entry(group_key)
+                .or_default()
+                .insert(user_key);
+        }
+
+        // Audit record for the change: the acting principal, the operation and what it
+        // changed, so a state-changing call leaves a local record.
+        ::tracing::info!(
+            audit = true,
+            operation = "AddUserToGroup",
+            outcome = "added",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            group_name = %input.group_name,
+            user_name = %input.user_name,
+            "a user was added to a group"
+        );
+        Ok(AddUserToGroupOutput)
     }
 }

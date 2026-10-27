@@ -39,7 +39,7 @@ const API_NOT_FOUND: &str = "API not found.";
 
 /// `AuthenticationType`'s whole value set, in the order the model declares it.
 /// Source: `smithy_query(query="shape", shape="AuthenticationType")`.
-const AUTHENTICATION_TYPES: &[&str] = &[
+pub(crate) const AUTHENTICATION_TYPES: &[&str] = &[
     "API_KEY",
     "AWS_IAM",
     "AMAZON_COGNITO_USER_POOLS",
@@ -121,7 +121,7 @@ impl CreateRow {
 
 /// An `eventConfig` whose providers set up `auth_types` and whose three auth-mode
 /// lists name `connection`, `publish` and `subscribe` respectively.
-fn event_config(
+pub(crate) fn event_config(
     auth_types: &[&str],
     connection: &[&str],
     publish: &[&str],
@@ -228,7 +228,7 @@ fn create_rows() -> Vec<CreateRow> {
 }
 
 /// Create one Event API and return the answer.
-async fn create_event_api(
+pub(crate) async fn create_event_api(
     router: &smithy_server_runtime::MultiServiceRouter,
     body: Value,
 ) -> Answer {

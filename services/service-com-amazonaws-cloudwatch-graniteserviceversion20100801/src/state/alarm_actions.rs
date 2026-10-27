@@ -30,10 +30,13 @@
 //!
 //! Asynchronous also means NOBODY NEED CALL AGAIN: a client that publishes a datapoint or
 //! writes an alarm looks for the notification on the action's target, not at CloudWatch, so the
-//! transitions the clock makes due after that write are materialised — and the actions they
-//! fire executed — by [`drive_alarm_clock`], the one bounded in-process task a write starts.
-//! Every handler still settles what is due when it runs ([`settle_alarms`]); the clock is what
-//! makes the path observable to a client that makes no further call.
+//! transitions the clock makes due after that call are materialised — and the actions they
+//! fire executed — by [`drive_alarm_clock`], the one bounded in-process task every call that
+//! touches alarms leaves running. Every handler still settles what is due when it runs
+//! ([`settle_alarms`]); the clock is what makes the path observable to a client that makes no
+//! further call. The two go together on every such handler, read or write: what a call settles
+//! was already due, and what is due NEXT is exactly what the client is no longer here to ask
+//! for.
 //!
 //! Only an SNS topic ARN is delivered to here. Every other action kind an alarm may carry (a
 //! Lambda function, an Auto Scaling policy, an SSM OpsItem, an EC2 instance action) needs its
@@ -507,7 +510,8 @@ impl Decided {
 /// that instant still sees the state the write left behind. The task waits for the clock so
 /// that no request ever has to.
 ///
-/// At most one clock runs per store (the store carries the claim), it is bounded by
+/// At most one clock runs per store (the store carries the claim, which a clock whose task has
+/// ended without releasing it does not keep — [`claim_alarm_clock`]), it is bounded by
 /// [`MAX_ALARM_WAKE_UPS`] wake-ups, and with no async runtime to spawn onto there is no clock
 /// — the evaluations are then materialised by the next operation instead, as they always were.
 pub fn drive_alarm_clock<Eng: Send + Sync + 'static>(
@@ -566,17 +570,40 @@ const MAX_ALARM_WAIT: ::std::time::Duration = ::std::time::Duration::from_millis
 /// How many times one alarm clock wakes up before it stands down.
 ///
 /// A backstop, not a schedule: it bounds the work one request can start, and whatever the
-/// clock has not reached when it is spent is materialised by the next clock (every write
-/// starts one if none is running) or by the next call that settles.
+/// clock has not reached when it is spent is materialised by the next clock (every call that
+/// settles starts one if none is running) or by the next call that settles.
 const MAX_ALARM_WAKE_UPS: usize = 2_000;
 
 /// Claim the single alarm clock for this store: the claim's GENERATION when the caller may
-/// start one, `None` when one already runs.
+/// start one, `None` when one is really running.
+///
+/// The claim is taken over from a clock whose TASK HAS ALREADY ENDED while still holding it.
+/// A clock releases its claim itself on the two ends it can see coming — nothing left to wait
+/// for, and the wake-up cap — so a claim still held by a task that is over belongs to a clock
+/// that ended on neither: one wake-up's work panicked, or the task was cancelled. Without the
+/// take-over that claim is held for as long as this store lives, and because the claim is what
+/// stops a second clock from starting, no later call could ever start one again: every
+/// transition the clock owes would wait for a caller to materialise it, and nothing at all
+/// would reach an action's target for a client that makes no further call to this service —
+/// which is the one thing the clock exists for. A clock that is still RUNNING keeps its claim,
+/// so this never doubles the running clocks for long: a take-over bumps the generation, and
+/// the losing starter's own task is aborted when it finds the generation moved on
+/// ([`set_alarm_clock`]).
 fn claim_alarm_clock(
     store: &mut super::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
 ) -> Option<u64> {
-    if store.alarm_clock_running {
+    let ended = store
+        .alarm_clock
+        .as_ref()
+        .is_some_and(::tokio::task::JoinHandle::is_finished);
+    if store.alarm_clock_running && !ended {
         return None;
+    }
+    if ended {
+        ::tracing::warn!(
+            "the alarm clock this store holds the claim for has ended without releasing it; \
+             the claim is taken over so the transitions it owes are still delivered"
+        );
     }
     store.alarm_clock_running = true;
     store.alarm_clock_generation = store.alarm_clock_generation.wrapping_add(1);
@@ -1004,4 +1031,62 @@ fn bounded(summary: String) -> String {
         .take_while(|(index, character)| index + character.len_utf8() <= MAX_HISTORY_SUMMARY_LEN)
         .map(|(_, character)| character)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{claim_alarm_clock, release_alarm_clock, set_alarm_clock};
+    use crate::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State as State;
+
+    /// A task that has already ended, so a claim it still holds belongs to a clock that is
+    /// over.
+    async fn ended_task() -> ::tokio::task::JoinHandle<()> {
+        let handle = ::tokio::task::spawn(async {});
+        while !handle.is_finished() {
+            ::tokio::task::yield_now().await;
+        }
+        handle
+    }
+
+    #[tokio::test]
+    async fn the_claim_is_granted_once_while_a_clock_runs_and_again_once_it_has_ended() {
+        let mut store = State::default();
+        // Nothing runs: the first caller starts the clock and installs its task.
+        let first = claim_alarm_clock(&mut store).expect("the first caller may start a clock");
+        let running = ::tokio::task::spawn(async {
+            ::std::future::pending::<()>().await;
+        });
+        set_alarm_clock(&mut store, first, running);
+        assert!(
+            claim_alarm_clock(&mut store).is_none(),
+            "a second clock must not start while the first one is still running"
+        );
+
+        // The running clock's task ends without releasing the claim — what a panicked or
+        // cancelled wake-up leaves behind. The next caller takes the claim over.
+        store
+            .alarm_clock
+            .replace(ended_task().await)
+            .expect("the running clock installed a task")
+            .abort();
+        let second = claim_alarm_clock(&mut store)
+            .expect("a claim held by a clock whose task has ended must be taken over");
+        assert_ne!(
+            second, first,
+            "a take-over must be its own claim, so the clock it replaces releases nothing"
+        );
+
+        // And the claim the clock that ended used to hold releases nothing now.
+        release_alarm_clock(&mut store, first);
+        assert!(
+            store.alarm_clock_running,
+            "only the current claim's holder may release it, got the clock released by \
+             generation {first}"
+        );
+        release_alarm_clock(&mut store, second);
+        assert!(
+            !store.alarm_clock_running,
+            "the current claim's holder must be able to release it"
+        );
+    }
 }

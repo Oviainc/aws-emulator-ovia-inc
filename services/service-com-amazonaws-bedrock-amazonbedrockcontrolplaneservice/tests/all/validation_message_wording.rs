@@ -20,7 +20,9 @@
 //!    alone**: `Value at '<path>' failed to satisfy constraint: Member must satisfy enum
 //!    value set: [ … ]`, with the value the member held NOT echoed, unlike every other
 //!    constraint class. The rows span enum-constrained members of three operations, in the
-//!    body and in the query string, over enums of two and five values.
+//!    body and in the query string, over enums of two, three and five values, and assert
+//!    the WHOLE clause — the set's membership AND the order the service lists it in, which
+//!    `tests/all/enum_value_set_listing.rs` is the rule for.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation")` / `query="shape"`), never from a recorded response
@@ -291,11 +293,10 @@ async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
 ///
 /// The rows differ along what the rule generalises over: which operation and member carry
 /// the enum, whether the value travels in the BODY or in the QUERY string, and how many
-/// values the enum publishes (two, three and five). Each row's admitted set is the model's
-/// (`smithy_query(query="shape",shape=...)`), asserted member by member rather than as one
-/// ordered list: this suite's rule is that the VALUE is not echoed, and the ORDER the set is
-/// listed in is pinned clause-by-clause, over a superset of these enums, by
-/// `tests/all/enum_value_set_order.rs`.
+/// values the enum publishes (two, three and five). Each row asserts the WHOLE clause: the
+/// membership is the model's (`smithy_query(query="shape",shape=...)`) and the order is the
+/// one this service lists that enum's values in, which `tests/all/enum_value_set_listing.rs`
+/// and `tests/all/enum_value_set_order.rs` are the rule for over a superset of these enums.
 #[tokio::test]
 async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
     /// One enum-constrained member driven outside its set.
@@ -311,7 +312,9 @@ async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
         member: &'static str,
         /// The value the request carries, which the clause must NOT echo.
         value: &'static str,
-        /// The values the model admits for that member.
+        /// The values the model admits for that member, in the order this service lists
+        /// that enum's values — its own listing for `DataRetentionMode`, the model's
+        /// declaration order for an enum it publishes no listing for.
         admitted: &'static [&'static str],
     }
 
@@ -326,11 +329,11 @@ async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
             member: "mode",
             value: "retain-everything",
             admitted: &[
-                "aws_review",
                 "default",
-                "inherit",
-                "none",
                 "provider_data_share",
+                "none",
+                "aws_review",
+                "inherit",
             ],
         },
         EnumRow {
@@ -341,7 +344,7 @@ async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
             body: None,
             member: "byOutputModality",
             value: "AUDIO",
-            admitted: &["EMBEDDING", "IMAGE", "TEXT"],
+            admitted: &["TEXT", "IMAGE", "EMBEDDING"],
         },
         EnumRow {
             // `InferenceType`, two values.
@@ -375,29 +378,17 @@ async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
             reply.status,
             reply.message
         );
-        let expected_open = format!(
+        let expected = format!(
             "1 validation error detected: Value at '{}' failed to satisfy constraint: \
-             Member must satisfy enum value set: [",
-            row.member
+             Member must satisfy enum value set: [{}]",
+            row.member,
+            row.admitted.join(", ")
         );
-        assert!(
-            reply.message.starts_with(&expected_open),
-            "case {case}: expected the clause to open {expected_open:?}, got {:?}",
+        assert_eq!(
+            reply.message, expected,
+            "case {case}: expected {expected:?}, got {:?}",
             reply.message
         );
-        assert!(
-            reply.message.ends_with(']'),
-            "case {case}: the clause closes the value set, got {:?}",
-            reply.message
-        );
-        for admitted_value in row.admitted {
-            assert!(
-                reply.message.contains(admitted_value),
-                "case {case}: the set must state the modelled value {admitted_value:?}, \
-                 got {:?}",
-                reply.message
-            );
-        }
         assert!(
             !reply.message.contains(row.value),
             "case {case}: an enum clause states the admitted set, never the value the \
