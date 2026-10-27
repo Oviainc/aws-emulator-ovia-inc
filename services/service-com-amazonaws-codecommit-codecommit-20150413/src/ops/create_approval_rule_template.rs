@@ -290,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.approval_rule_template_name,
             input.approval_rule_template_content.clone(),
             input.approval_rule_template_description.clone(),
-            crate::state::caller_identity_arn(ctx.parts()),
+            crate::state::caller_identity_arn(&*self.engine, ctx),
             std::time::SystemTime::now(),
         );
         let modeled = template.to_modeled();

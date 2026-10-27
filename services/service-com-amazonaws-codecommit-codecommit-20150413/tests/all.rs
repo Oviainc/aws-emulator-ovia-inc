@@ -47,6 +47,8 @@ mod branch_delete;
 mod branch_listing;
 #[path = "all/branch_listing_writes.rs"]
 mod branch_listing_writes;
+#[path = "all/caller_credential_identity.rs"]
+mod caller_credential_identity;
 #[path = "all/client_error_messages.rs"]
 mod client_error_messages;
 #[path = "all/client_request_token_validation.rs"]

@@ -88,6 +88,9 @@ mod resource_tags;
 #[path = "all/restore_table_from_backup.rs"]
 mod restore_table_from_backup;
 
+#[path = "all/scan_filter_value_types_and_segments.rs"]
+mod scan_filter_value_types_and_segments;
+
 #[path = "all/result_filter_expressions.rs"]
 mod result_filter_expressions;
 

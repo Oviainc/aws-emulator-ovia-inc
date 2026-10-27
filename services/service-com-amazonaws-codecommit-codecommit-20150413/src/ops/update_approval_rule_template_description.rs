@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::normalized_template_description`).
         template.set_description(
             Some(input.approval_rule_template_description.clone()),
-            crate::state::caller_identity_arn(ctx.parts()),
+            crate::state::caller_identity_arn(&*self.engine, ctx),
             std::time::SystemTime::now(),
         );
 

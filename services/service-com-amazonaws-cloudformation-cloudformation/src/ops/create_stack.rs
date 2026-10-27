@@ -775,10 +775,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match materialised.failure {
                 None => None,
                 Some(failure) => {
-                    // A resource an owning service refused to create: the stack never
-                    // reaches CREATE_COMPLETE, and it reports the summary of what failed
-                    // ([`crate::state::resource_failure_summary`]) — that service's own
-                    // refusal is on the failing resource's event.
+                    // The deployment could not be carried out: the stack never reaches
+                    // CREATE_COMPLETE, and it reports what failed
+                    // ([`crate::state::provisioning::Materialised::failure`]) — the
+                    // summary of the resources an owning service refused to create, whose
+                    // own refusals are on those resources' events, or CloudFormation's own
+                    // diagnostic where it refused the deployment before asking anybody (a
+                    // dynamic reference it could not resolve), which no resource's event
+                    // could carry because no resource was ever asked for.
                     let failed_at = ::std::time::SystemTime::now();
                     stack.fail_transition(failed_at, status::CREATE_FAILED, failure.clone());
                     // "ROLLBACK — Roll back the stack creation. This is the default": the

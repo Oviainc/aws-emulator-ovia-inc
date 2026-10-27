@@ -115,6 +115,8 @@ mod object_acl;
 mod object_and_policy;
 #[path = "all/object_and_tagging_roundtrip.rs"]
 mod object_and_tagging_roundtrip;
+#[path = "all/object_annotation_listing.rs"]
+mod object_annotation_listing;
 #[path = "all/object_annotation_removal.rs"]
 mod object_annotation_removal;
 #[path = "all/object_annotations.rs"]

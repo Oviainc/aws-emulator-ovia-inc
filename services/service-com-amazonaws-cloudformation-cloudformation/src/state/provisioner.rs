@@ -190,6 +190,17 @@
 //!   stack reports for the resource, and the delete and the drift read address the cluster
 //!   by it.
 //!
+//! * `AWS::AmazonMQ::Broker`'s properties ARE `CreateBroker`'s own members with the initial
+//!   letter lower-cased, all the way down (a `Users` entry's `Username`/`Password`, a
+//!   `Logs`' `General`, a `MaintenanceWindowStartTime`'s `DayOfWeek`), so its arm carries
+//!   the evaluated document through with the broker's name — the one value CloudFormation
+//!   decides — set on the way out and the declared `[{Key, Value}]` tag list sent as the tag
+//!   MAP that create takes. Its identity is Amazon MQ's own ("Ref returns the Amazon MQ
+//!   broker ID"): `CreateBroker` takes no identifier and answers the `brokerId` it minted
+//!   beside the `brokerArn` it built around that id, so the stack reports that id for the
+//!   resource and that ARN as its `Arn`, and the delete and the drift read address the
+//!   broker by the id.
+//!
 //! * the three `AWS::Route53Resolver::*` types' properties ARE their creates' own members,
 //!   spelled identically on both sides all the way down, so each arm carries the evaluated
 //!   document through ([`resolver_request`]) with the one member CloudFormation decides
@@ -304,7 +315,7 @@ use super::template::{
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
     ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, KMS_KEY,
-    MSK_CLUSTER,
+    MQ_BROKER, MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER, ROUTE53RESOLVER_ENDPOINT, ROUTE53RESOLVER_RULE,
     ROUTE53RESOLVER_RULE_ASSOCIATION,
     S3VECTORS_BUCKET_SEGMENT, S3VECTORS_INDEX,
@@ -397,6 +408,7 @@ pub(super) enum Provisioner {
     KmsKey,
     MskCluster,
     MskServerlessCluster,
+    MqBroker,
     RdsDbInstance,
     RdsDbSubnetGroup,
     RdsDbParameterGroup,
@@ -462,6 +474,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         KMS_KEY => Some(Provisioner::KmsKey),
         MSK_CLUSTER => Some(Provisioner::MskCluster),
         MSK_SERVERLESS_CLUSTER => Some(Provisioner::MskServerlessCluster),
+        MQ_BROKER => Some(Provisioner::MqBroker),
         RDS_DB_INSTANCE => Some(Provisioner::RdsDbInstance),
         RDS_DB_SUBNET_GROUP => Some(Provisioner::RdsDbSubnetGroup),
         RDS_DB_PARAMETER_GROUP => Some(Provisioner::RdsDbParameterGroup),
@@ -607,6 +620,7 @@ impl Provisioner {
             Self::MskServerlessCluster => {
                 create_msk_serverless_cluster(ctx, region, resource, propagated).await
             }
+            Self::MqBroker => create_mq_broker(ctx, region, resource, propagated).await,
             Self::RdsDbInstance => {
                 create_db_instance(ctx, region, resource, propagated).await
             }
@@ -1014,6 +1028,7 @@ impl Provisioner {
             Self::MskCluster | Self::MskServerlessCluster => {
                 delete_msk_cluster(ctx, region, physical_resource_id).await
             }
+            Self::MqBroker => delete_mq_broker(ctx, region, physical_resource_id).await,
             // The delete carries one member off the resource's own declaration
             // (`DeleteAutomatedBackups`), so it takes the record rather than the id.
             Self::RdsDbInstance => delete_db_instance(ctx, region, resource).await,
@@ -1207,6 +1222,7 @@ impl Provisioner {
             Self::MskCluster | Self::MskServerlessCluster => {
                 describe_msk_cluster(ctx, region, physical_resource_id).await
             }
+            Self::MqBroker => describe_mq_broker(ctx, region, physical_resource_id).await,
             Self::RdsDbInstance => {
                 describe_db_instance(ctx, region, physical_resource_id).await
             }
@@ -7011,6 +7027,182 @@ fn msk_cluster_name(resource: &StoredResource) -> Result<String, Refusal> {
 fn msk_members(value: &Value) -> Result<Value, Refusal> {
     renamed_members(value, 0, MSK_RENAMED_MEMBERS)
 }
+
+// ---------------------------------------------------------------------------
+// Amazon MQ: AWS::AmazonMQ::Broker
+// ---------------------------------------------------------------------------
+
+/// Amazon MQ's signing name, from its model (`sigv4Name: mq`). That service speaks
+/// `restJson1`, so its operations are bound to a METHOD and a URI rather than to an
+/// `X-Amz-Target` header: `CreateBroker` is `POST /v1/brokers`, `DeleteBroker` is
+/// `DELETE /v1/brokers/{BrokerId}` and `DescribeBroker` is `GET /v1/brokers/{BrokerId}`
+/// (`smithy_query(query="operation", operation="CreateBroker,DeleteBroker,DescribeBroker")`
+/// on that service's model).
+const MQ_SIGNING_NAME: &str = "mq";
+
+/// The URI `CreateBroker` is bound to, and the collection the per-broker URIs hang off.
+const MQ_BROKERS_URI: &str = "/v1/brokers";
+
+/// The error code Amazon MQ answers for a broker id it holds no broker for
+/// (`NotFoundException`, the modelled 404 of `DescribeBroker` and `DeleteBroker`).
+const MQ_NOT_FOUND: &str = "NotFoundException";
+
+/// Create the broker an `AWS::AmazonMQ::Broker` declares, so a client that deployed the
+/// stack and then calls `mq DescribeBroker` with the id the stack publishes reads the broker
+/// back rather than a `NotFoundException` for a broker nothing created.
+///
+/// Every published property of the type IS a `CreateBroker` member under the same name with
+/// its initial letter lower-cased, all the way down — `AuthenticationStrategy`,
+/// `AutoMinorVersionUpgrade`, `Configuration` (`Id`/`Revision`), `DataReplicationMode`,
+/// `DataReplicationPrimaryBrokerArn`, `DeploymentMode`, `EncryptionOptions`
+/// (`KmsKeyId`/`UseAwsOwnedKey`), `EngineType`, `EngineVersion`, `HostInstanceType`,
+/// `LdapServerMetadata`, `Logs` (`Audit`/`General`), `MaintenanceWindowStartTime`
+/// (`DayOfWeek`/`TimeOfDay`/`TimeZone`), `PubliclyAccessible`, `SecurityGroups`,
+/// `StorageType`, `SubnetIds` and `Users` (`Username`/`Password`/`ConsoleAccess`/`Groups`/
+/// `ReplicationUser`), each one a `jsonName` of
+/// `smithy_query(query="closure", operation="CreateBroker")` — so the evaluated property
+/// document is the request once its member names are re-cased ([`lower_camel_members`]).
+/// `Tags` is the exception, the type publishing the `[{Key, Value}]` list where the create
+/// takes a tag MAP ([`tags_as_map`]): it is lifted out before the walk so it carries the
+/// tags CloudFormation gives the resource beside the declared ones ([`tags_of`]).
+///
+/// The broker's NAME is the one value CloudFormation decides ([`declared_name`]), so it is
+/// set on the way out; its identity is not CloudFormation's at all ("Ref returns the Amazon
+/// MQ broker ID", a value only that service mints), so the `brokerId` the create answers
+/// with is reported as the resource's physical id and the `brokerArn` it built around that
+/// id as the resource's ARN.
+async fn create_mq_broker(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = Map::new();
+    if let Some(properties) = resource.properties.as_object() {
+        for (property, value) in properties {
+            if property == "Tags" {
+                continue;
+            }
+            request.insert(lower_initial(property), lower_camel_members(value, 0)?);
+        }
+    }
+    request.insert(
+        "brokerName".to_string(),
+        Value::String(declared_name(resource)),
+    );
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let answered = call_rest_json(
+        ctx,
+        MQ_SIGNING_NAME,
+        region,
+        "POST",
+        MQ_BROKERS_URI,
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let (Some(broker_id), Some(broker_arn)) = (
+        answered
+            .get("brokerId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty()),
+        answered
+            .get("brokerArn")
+            .and_then(Value::as_str)
+            .filter(|arn| !arn.is_empty()),
+    ) else {
+        // The create answered 2xx without the two values its output models. Nothing
+        // addresses a broker without that id, so this is reported as a failure rather than
+        // recorded as a resource with a physical id nothing minted.
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "Amazon MQ answered CreateBroker without a brokerId and brokerArn"
+                .to_string(),
+        });
+    };
+    Ok(Created {
+        physical_resource_id: Some(broker_id.to_string()),
+        attributes: super::template::arn_attributes(&resource.resource_type, broker_arn)
+            .into_iter()
+            .collect(),
+    })
+}
+
+/// Delete the broker a stack created, addressed by the `BrokerId` Amazon MQ minted for it —
+/// this resource's physical id, which is what `Ref` returns for the type. A broker that
+/// service no longer holds (`NotFoundException`, judged on the CODE and never on a message
+/// that carries the request's own identifier) is already in the state the delete asks for.
+async fn delete_mq_broker(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let uri = mq_broker_uri(physical_resource_id);
+    match call_rest_json(ctx, MQ_SIGNING_NAME, region, "DELETE", &uri, None).await {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == MQ_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The broker's configuration as Amazon MQ reports it, for drift detection:
+/// `DescribeBroker`'s own record, read by the id that service minted. One it no longer holds
+/// (`NotFoundException`) was deleted.
+///
+/// Every member that read reports under a name this type publishes as a property is
+/// compared; `Tags` is left out for the reason it is everywhere here (the tags a resource
+/// carries change independently of its declaration), and a property the read does not report
+/// is not evidence of anything ([`super::drift`]).
+///
+/// Four properties the read DOES report are deliberately not compared, because what it
+/// reports for them is not the declaration's own shape: `Logs` comes back as a `LogsSummary`
+/// (the switches plus the log groups Amazon MQ derived), `Users` as a `UserSummary` list
+/// (usernames, without the passwords and groups a declaration carries), `Configuration` as
+/// the `Configurations` record of current and pending revisions, and `LdapServerMetadata` as
+/// the output shape that omits the service-account password. Comparing any of them against
+/// the declared structure would report drift on every broker rather than on a changed one.
+async fn describe_mq_broker(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let uri = mq_broker_uri(physical_resource_id);
+    match call_rest_json(ctx, MQ_SIGNING_NAME, region, "GET", &uri, None).await {
+        Ok(answer) => Ok(Some(reported_as_properties(
+            &answer,
+            MQ_BROKER_REPORTED_PROPERTIES,
+        ))),
+        Err(refusal) if refusal.code == MQ_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The URI that addresses ONE broker: the `BrokerId` `@httpLabel` every operation on a
+/// broker binds, percent-encoded as a non-greedy label is sent.
+fn mq_broker_uri(broker_id: &str) -> String {
+    format!("{MQ_BROKERS_URI}/{}", percent_encoded(broker_id))
+}
+
+/// The members `DescribeBroker` reports under this type's own property names, as
+/// `(property, member)` pairs.
+const MQ_BROKER_REPORTED_PROPERTIES: &[(&str, &str)] = &[
+    ("AuthenticationStrategy", "authenticationStrategy"),
+    ("AutoMinorVersionUpgrade", "autoMinorVersionUpgrade"),
+    ("BrokerName", "brokerName"),
+    ("DataReplicationMode", "dataReplicationMode"),
+    ("DeploymentMode", "deploymentMode"),
+    ("EncryptionOptions", "encryptionOptions"),
+    ("EngineType", "engineType"),
+    ("EngineVersion", "engineVersion"),
+    ("HostInstanceType", "hostInstanceType"),
+    ("MaintenanceWindowStartTime", "maintenanceWindowStartTime"),
+    ("PubliclyAccessible", "publiclyAccessible"),
+    ("SecurityGroups", "securityGroups"),
+    ("StorageType", "storageType"),
+    ("SubnetIds", "subnetIds"),
+];
 
 // ---------------------------------------------------------------------------
 // Amazon Managed Grafana: AWS::Grafana::Workspace

@@ -121,6 +121,8 @@ mod partitions;
 mod registries;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/schema_registry.rs"]
 mod schema_registry;
 #[path = "all/search_tables.rs"]

@@ -528,7 +528,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The Amazon Resource Name (ARN) of the user who merged the branches": the
         // caller this request was signed by, read the one way this crate reads a
         // caller's identity.
-        let merged_by = crate::state::caller_identity_arn(ctx.parts());
+        let merged_by = crate::state::caller_identity_arn(&*self.engine, ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // An unreachable store is an internal mounting fault, not a modelled

@@ -28,6 +28,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_state;
+
 use crate::ops::types::{
     Approval, ApprovalRule, ApprovalRuleEventMetadata, ApprovalRuleOverriddenEventMetadata,
     ApprovalRuleTemplate, ApprovalStateChangedEventMetadata, Comment, Location, MergeMetadata,
@@ -3849,17 +3851,90 @@ pub fn region_of(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The identity that made this request, as an ARN: what an operation reports as
-/// the author of something the caller created.
+/// The session registry in the SAME shared engine: where the identity a temporary
+/// credential was minted for is held.
 ///
-/// Derived from the request's own SigV4 access key id, so a comment names the
-/// caller it actually had rather than a fabricated one. The access key id is
-/// caller-controlled text, so it is first reduced to the characters an access key
-/// id can hold. Every request this emulator serves is signed with a caller's own
-/// access key, so the identity is always an IAM identity of the emulator's
-/// account.
-pub fn caller_identity_arn(parts: &::http::request::Parts) -> String {
-    let filtered: String = ::engine::extract_akid(&parts.headers)
+/// The STS service's OWN accessor is called rather than copied, so this service
+/// resolves a caller from the very records `sts:AssumeRole` writes and
+/// `sts:GetCallerIdentity` reads. `None` means the engine carries no such store — a
+/// router that mounts this service without STS, where no session can exist at all.
+fn session_registry<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<sts_state::StsState>> {
+    sts_state::service_state(engine)
+}
+
+/// The identity that made this request, as an ARN: what an operation reports as
+/// the author of something the caller created, and the reviewer an approval is
+/// recorded for.
+///
+/// A request speaks for the principal its CREDENTIAL was minted for, so who that is
+/// is asked of the session registry ([`session_registry`]) through STS's own
+/// resolution of a request's caller rather than a second reading of it: a request
+/// signed with the temporary credentials of an assumed role speaks for that role
+/// SESSION, so the identity is the `assumed-role` ARN STS recorded for it — which is
+/// the spelling an approval rule's `ApprovalPoolMembers` entry names and a later
+/// reader reports — rather than an identity invented from the key's text.
+///
+/// A key that names no session is a LONG-TERM key, and the identity such a key
+/// speaks for is the IAM user the account holds it for
+/// ([`long_term_caller_identity`]) — the same resolution STS reports for it. A
+/// session whose expiry the clock has passed resolves there too: STS refuses such a
+/// credential, and the same call materialises the expiry, deleting the credential
+/// from the store so the next request presenting it does not verify at all.
+pub fn caller_identity_arn<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
+    let long_term = long_term_caller_identity(engine, &access_key_id);
+    let Some(registry) = session_registry(engine) else {
+        return long_term.arn;
+    };
+    let resolved = sts_state::resolve_request_caller(
+        &mut registry.lock(),
+        &access_key_id,
+        SystemTime::now(),
+        ctx.credential_store(),
+        long_term.clone(),
+    )
+    .map(|caller| caller.identity);
+    resolved.unwrap_or(long_term).arn
+}
+
+/// The identity a LONG-TERM access key speaks for: the IAM user this account holds
+/// the key for, read through STS's own resolution of such a key, so a caller signing
+/// with it is the user `sts:GetCallerIdentity` answers for the same credential.
+///
+/// STS answers its own ambient caller for a key the account holds no user for,
+/// because the key IT publishes is the one it expects to see. This emulator instead
+/// serves every well-formed access key id, so that answer would make every such
+/// caller ONE identity: a key no IAM record names keeps [`stand_in_identity`],
+/// which keeps two callers signing with different keys two identities.
+fn long_term_caller_identity<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    access_key_id: &str,
+) -> sts_state::Identity {
+    let stand_in = stand_in_identity(access_key_id);
+    let Some(iam) = sts_state::iam_state(engine) else {
+        return stand_in;
+    };
+    let held = sts_state::long_term_identity(Some(&iam.lock()), access_key_id);
+    if held.arn == sts_state::ambient_identity().arn {
+        stand_in
+    } else {
+        held
+    }
+}
+
+/// The identity this service stands in with for an access key id neither store
+/// names an identity for: an IAM user of the emulator's account named by the key id,
+/// with the user id STS derives from an identity's ARN.
+///
+/// The access key id is caller-controlled text, so it is first reduced to the
+/// characters an access key id can hold.
+fn stand_in_identity(access_key_id: &str) -> sts_state::Identity {
+    let filtered: String = access_key_id
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .take(128)
@@ -3869,7 +3944,12 @@ pub fn caller_identity_arn(parts: &::http::request::Parts) -> String {
     } else {
         filtered.as_str()
     };
-    ::engine::emulator_arn("iam", "", &format!("user/{akid}"))
+    let arn = ::engine::emulator_arn("iam", "", &format!("user/{akid}"));
+    sts_state::Identity {
+        user_id: sts_state::unique_id("AIDA", &arn),
+        account: ::engine::emulator_account_id().to_string(),
+        arn,
+    }
 }
 
 /// A `SystemTime` as the modeled timestamp type.

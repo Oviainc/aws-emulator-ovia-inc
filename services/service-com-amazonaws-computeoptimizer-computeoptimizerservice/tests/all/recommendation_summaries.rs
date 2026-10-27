@@ -16,7 +16,10 @@
 //! counted no more often than the finding it explains, and the aggregated saving is the
 //! rightsizing saving plus the idle one.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
+use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::ANALYSIS_DELAY;
 
 use crate::harness::{call, emulator, error_code, opt_in};
 
@@ -84,6 +87,17 @@ const INFERRED_WORKLOAD_TYPES: &[&str] = &[
     "SQLServer",
 ];
 
+/// An emulator whose account is opted in and whose analysis is due: a summary covers the
+/// account's analysed resources, and the service holds that analysis only once the analysis
+/// the enrollment started is due ([`ANALYSIS_DELAY`]); the extra margin covers scheduler
+/// jitter.
+async fn analysed_emulator() -> smithy_server_runtime::MultiServiceRouter {
+    let router = emulator();
+    opt_in(&router).await;
+    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    router
+}
+
 /// Read one page of summaries, asserting the call succeeded.
 async fn get_summaries(router: &smithy_server_runtime::MultiServiceRouter, request: Value) -> Value {
     let (status, body) = call(router, "GetRecommendationSummaries", request.clone()).await;
@@ -111,7 +125,9 @@ fn number(value: &Value, case: &str) -> f64 {
 
 /// Before the account opts in there are no findings to summarise at all, and the service
 /// says so with the modelled `OptInRequiredException` (HTTP 403) rather than an empty
-/// answer; once it opts in, every summary it reports is the caller's own account's.
+/// answer; an account that has just opted in is summarised over no rows, because the
+/// analysis its enrollment started is not due yet; once it is, every summary reported is the
+/// caller's own account's.
 #[tokio::test]
 async fn summaries_need_the_account_to_be_opted_in_and_report_the_caller_account() {
     let router = emulator();
@@ -128,12 +144,21 @@ async fn summaries_need_the_account_to_be_opted_in_and_report_the_caller_account
     );
 
     opt_in(&router).await;
+    let fresh = get_summaries(&router, json!({})).await;
+    assert_eq!(
+        summaries_of(&fresh),
+        Vec::<Value>::new(),
+        "just opted in: the analysis is not due yet, so there is nothing to summarise, got \
+         {fresh}"
+    );
 
+    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
     let body = get_summaries(&router, json!({})).await;
     let summaries = summaries_of(&body);
     assert!(
         !summaries.is_empty(),
-        "after opting in: the account's analysed resources must be summarised, got {body}"
+        "once the analysis is due: the account's analysed resources must be summarised, got \
+         {body}"
     );
     for summary in &summaries {
         let case = summary["recommendationResourceType"].to_string();
@@ -182,8 +207,7 @@ async fn summaries_need_the_account_to_be_opted_in_and_report_the_caller_account
 /// 0..=100 and zero exactly when the saving is zero.
 #[tokio::test]
 async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
-    let router = emulator();
-    opt_in(&router).await;
+    let router = analysed_emulator().await;
 
     let body = get_summaries(&router, json!({})).await;
     let summaries = summaries_of(&body);
@@ -263,10 +287,10 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
              ratings must total the {resources} resources counted by finding, got {ratings}"
         );
 
-        // An idle resource is a record of its own — what `GetIdleRecommendations` reports
-        // — and nothing has written one, so no summary counts an idle resource and the
-        // aggregated saving is the rightsizing one. The two readers must agree, which the
-        // assertion after this loop pins.
+        // An idle resource is a record of its own — what `GetIdleRecommendations` reports.
+        // This reader aggregates the findings CATALOG, and summarising that record is its
+        // own work, which the handler's header states it does not do yet, so neither idle
+        // member is reported and the aggregated saving is the rightsizing one.
         assert!(
             summary["idleSummaries"].is_null(),
             "case {case:?}: idleSummaries is reported only where resources were found idle, \
@@ -282,8 +306,8 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
         let aggregated = savings_value(summary, "aggregatedSavingsOpportunity", &case);
         assert_eq!(
             aggregated, rightsizing,
-            "case {case:?}: with nothing found idle the aggregated saving is the rightsizing \
-             saving {rightsizing}, got {aggregated}"
+            "case {case:?}: with no idle count reported the aggregated saving is the \
+             rightsizing saving {rightsizing}, got {aggregated}"
         );
 
         if let Some(inferred) = summary["inferredWorkloadSavings"].as_array() {
@@ -326,21 +350,6 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
             }
         }
     }
-
-    // The agreement the summaries' absent idle members rest on: the idle record this
-    // emulator reports from holds nothing, so there is no idle resource for a summary to
-    // count.
-    let (status, idle) = call(&router, "GetIdleRecommendations", json!({})).await;
-    assert_eq!(
-        status, 200,
-        "reading the idle record: expected 200, got {status}: {idle}"
-    );
-    assert_eq!(
-        idle["idleRecommendations"],
-        json!([]),
-        "no summary counts an idle resource, so the idle record must hold none either, got \
-         {idle}"
-    );
 }
 
 /// One savings opportunity of a summary, asserting the invariants every one of them holds:
@@ -382,8 +391,7 @@ fn savings_value(summary: &Value, member: &str, case: &str) -> f64 {
 /// specified per request."
 #[tokio::test]
 async fn account_ids_selects_one_account_and_refuses_more_than_one() {
-    let router = emulator();
-    opt_in(&router).await;
+    let router = analysed_emulator().await;
 
     let own = caller_account();
     let unpaged = summaries_of(&get_summaries(&router, json!({})).await);
@@ -455,8 +463,7 @@ async fn account_ids_selects_one_account_and_refuses_more_than_one() {
 /// but the last and none on it. A forged token is refused.
 #[tokio::test]
 async fn paging_walks_the_same_summaries_in_the_same_order() {
-    let router = emulator();
-    opt_in(&router).await;
+    let router = analysed_emulator().await;
 
     let unpaged = summaries_of(&get_summaries(&router, json!({})).await);
     assert!(
@@ -555,8 +562,7 @@ async fn paging_walks_the_same_summaries_in_the_same_order() {
 /// and not about what the store holds.
 #[tokio::test]
 async fn account_ids_refuses_a_value_that_is_not_a_12_digit_account_id() {
-    let router = emulator();
-    opt_in(&router).await;
+    let router = analysed_emulator().await;
 
     // Rows: the class of values that are not a 12-digit account id, each missing the shape
     // in a different direction — nothing at all, too short, too long, letters, one non-digit
@@ -649,8 +655,7 @@ async fn account_ids_refuses_a_value_that_is_not_a_12_digit_account_id() {
 /// summaries moves neither the enrollment record nor the stored preferences.
 #[tokio::test]
 async fn reading_summaries_changes_nothing_a_later_caller_sees() {
-    let router = emulator();
-    opt_in(&router).await;
+    let router = analysed_emulator().await;
 
     let before = call(&router, "GetEnrollmentStatus", json!({})).await.1;
     let first = get_summaries(&router, json!({})).await;
