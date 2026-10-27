@@ -195,13 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(
                 GetQueryStatusMonitorTopContributorsErrorModeled::ValidationException(
-                    crate::state::field_validation(
-                        "queryId",
-                        format!(
-                            "query {} was not found for monitor {}",
-                            input.query_id, input.monitor_name
-                        ),
-                    ),
+                    crate::state::unknown_query(&input.query_id),
                 )
                 .into(),
             );

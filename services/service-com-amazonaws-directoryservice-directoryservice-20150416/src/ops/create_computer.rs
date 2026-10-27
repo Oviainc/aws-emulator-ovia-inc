@@ -189,15 +189,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Creating a computer object writes into the directory itself, so it needs a
         // directory that is in service: one still being built by the transition its create
-        // owes is unavailable, which is the modelled refusal for exactly that.
+        // owes is unavailable, which is the modelled refusal for exactly that. The
+        // diagnostic is this service's shared one for a directory a call cannot reach
+        // ([`crate::state::directory_unavailable`]) — the requested id and nothing about
+        // the stage it is in.
         if directory.stage != crate::state::STAGE_ACTIVE {
             return Err(
                 CreateComputerErrorModeled::DirectoryUnavailableException(
-                    crate::state::refusal(format!(
-                        "Directory {id} is in stage {stage} and is not available for \
-                         computer account changes",
-                        id = directory.directory_id,
-                        stage = directory.stage
+                    crate::state::refusal(crate::state::directory_unavailable(
+                        &input.directory_id,
                     )),
                 )
                 .into(),

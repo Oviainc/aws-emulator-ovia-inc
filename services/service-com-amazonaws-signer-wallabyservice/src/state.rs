@@ -296,6 +296,42 @@ impl SigningProfileRecord {
         });
     }
 
+    /// This profile's ARN for `version` — the `profileVersionArn` a read of that
+    /// version reports, which is the profile's own ARN with the version after it
+    /// (see [`Self::profile_version_arn`], the same form for the current one).
+    pub fn version_arn(&self, version: &str) -> String {
+        format!("{}/{version}", self.arn)
+    }
+
+    /// Whether this profile's revocation leaves a signature that `version`
+    /// produced at `signature_timestamp` untrusted.
+    ///
+    /// `RevokeSigningProfile` revokes the PROFILE — it moves the profile itself
+    /// to `Revoked` and records ONE revocation record on it — so the revocation
+    /// covers every version the profile has had, from the
+    /// `revocationEffectiveFrom` instant the caller named: "the time when
+    /// revocation becomes effective", so a signature made at or after it is no
+    /// longer trusted while one made before it keeps its validity. A version this
+    /// profile has never had names nothing that record covers.
+    pub fn version_revoked_at(
+        &self,
+        version: &str,
+        signature_timestamp: &::aws_smithy_types::DateTime,
+    ) -> bool {
+        if !self.versions.iter().any(|held| held == version) {
+            return false;
+        }
+        let Some(record) = self.revocation_record.as_ref() else {
+            return false;
+        };
+        // A record naming no effective instant names no instant trust ended AT,
+        // so what it revokes is revoked whenever it was signed.
+        record
+            .revocation_effective_from
+            .as_ref()
+            .is_none_or(|effective_from| at_or_after(signature_timestamp, effective_from))
+    }
+
     /// The stored signing parameters, as the wire map — absent when there are none.
     pub fn signing_parameter_map(&self) -> Option<HashMap<String, String>> {
         non_empty_map(&self.signing_parameters)
@@ -404,6 +440,12 @@ impl SigningJobRecord {
     /// Whether the signature this job produced has been revoked.
     pub fn is_revoked(&self) -> bool {
         self.revocation_record.is_some()
+    }
+
+    /// This job's ARN — the form a request that names a signing job by ARN
+    /// carries it in (see [`job_arn`]).
+    pub fn arn(&self) -> String {
+        job_arn(&self.job_id, &self.region)
     }
 
     /// The stored signing parameters, as the wire map — absent when there are none.
@@ -568,6 +610,16 @@ impl ComAmazonawsSignerWallabyserviceState {
         self.profile_permissions
             .entry(profile_key(region, profile_name))
             .or_default()
+    }
+
+    /// The job `job_id` names in `region`, exactly as it is stored.
+    ///
+    /// For a REPORTING read whose answer does not depend on the job's status: it
+    /// changes nothing, so what a later caller sees is untouched by the asking. A
+    /// read that reports the status takes [`Self::settled_job_mut`] instead,
+    /// which first materialises the completion the clock already owes the job.
+    pub fn job(&self, region: &str, job_id: &str) -> Option<&SigningJobRecord> {
+        self.jobs.get(job_id).filter(|job| job.region == region)
     }
 
     /// The job `job_id` names in `region`, with any completion the clock owes it
@@ -742,6 +794,78 @@ pub fn profile_name_in_arn(arn: &str) -> Option<&str> {
 /// [`is_profile_name`]'s alphabet. It is a judgement on the STRING alone, so it
 /// says nothing about whether such a profile exists.
 pub fn profile_region_and_name_in_arn(arn: &str) -> Option<(&str, &str)> {
+    let (region, resource) = signer_region_and_resource(arn)?;
+    let name = resource.strip_prefix(PROFILE_ARN_RESOURCE_PREFIX)?;
+    is_profile_name(name).then_some((region, name))
+}
+
+/// The region, profile name and profile version inside `arn`, when `arn` is a
+/// well-formed signing-profile VERSION ARN — a profile ARN with the version
+/// after it, `arn:<partition>:signer:<region>:<account>:/signing-profiles/<name>/<version>`,
+/// which is the form [`SigningProfileRecord::version_arn`] builds and
+/// `PutSigningProfile` reports as `profileVersionArn`.
+///
+/// `None` for anything else: an ARN of another service or another resource, one
+/// carrying no version after the name, a name outside [`is_profile_name`]'s
+/// alphabet or a version outside [`is_profile_version`]'s. Like
+/// [`profile_region_and_name_in_arn`] it is a judgement on the STRING alone, so
+/// it says nothing about whether such a version exists.
+pub fn profile_version_in_arn(arn: &str) -> Option<(&str, &str, &str)> {
+    let (region, resource) = signer_region_and_resource(arn)?;
+    let (name, version) = resource
+        .strip_prefix(PROFILE_ARN_RESOURCE_PREFIX)?
+        .split_once('/')?;
+    (is_profile_name(name) && is_profile_version(version)).then_some((region, name, version))
+}
+
+/// The resource portion every signing-job ARN carries before the job id — see
+/// [`job_arn`] for the whole form.
+const JOB_ARN_RESOURCE_PREFIX: &str = "/signing-jobs/";
+
+/// The ARN of the signing job `job_id` names, as served by `region`.
+///
+/// Signer's job ARNs carry the leading `/` in the resource portion its profile
+/// ARNs carry ([`profile_arn`]):
+/// `arn:aws:signer:<region>:<account>:/signing-jobs/<jobId>`. Every modelled
+/// read of a job names it by `jobId`, so this is what a `jobArn` a request
+/// carries is resolved against.
+pub fn job_arn(job_id: &str, region: &str) -> String {
+    ::engine::emulator_arn(
+        "signer",
+        region,
+        &format!("{JOB_ARN_RESOURCE_PREFIX}{job_id}"),
+    )
+}
+
+/// The region and the job id inside `arn`, when `arn` is a well-formed
+/// signing-job ARN — the form [`job_arn`] builds. `None` for anything else: an
+/// ARN of another service, one whose resource is not a signing job, and one
+/// carrying no id or a further `/`-separated part after it.
+pub fn job_region_and_id_in_arn(arn: &str) -> Option<(&str, &str)> {
+    let (region, resource) = signer_region_and_resource(arn)?;
+    let job_id = resource.strip_prefix(JOB_ARN_RESOURCE_PREFIX)?;
+    (!job_id.is_empty() && !job_id.contains('/')).then_some((region, job_id))
+}
+
+/// Whether `arn` is a well-formed AWS Signer ARN at all — whatever resource it
+/// names, and whether or not such a resource exists.
+///
+/// For a member a request carries an ARN in: a value that is not one is a value
+/// this service cannot resolve to any resource of its own, while a Signer ARN
+/// naming nothing stored is a resource that merely does not exist here.
+pub fn is_signer_arn(arn: &str) -> bool {
+    signer_region_and_resource(arn).is_some()
+}
+
+/// The region and the resource portion of `arn`, when `arn` is a well-formed AWS
+/// Signer ARN: `arn:<partition>:signer:<region>:<account>:<resource>`.
+///
+/// The ONE place this service takes an ARN apart, so every resource an ARN can
+/// name — a signing profile, one of its versions, a signing job — is read out of
+/// the same fields: a non-empty partition, the `signer` service, the region the
+/// resource lives in (Signer is regional, see [`ProfileKey`]) and a non-empty
+/// account. The resource is whatever follows, for the caller to judge.
+fn signer_region_and_resource(arn: &str) -> Option<(&str, &str)> {
     // `arn : partition : service : region : account : resource`, and the resource
     // is the remainder because it carries `:` of its own in other ARN forms.
     let mut fields = arn.splitn(6, ':');
@@ -754,14 +878,13 @@ pub fn profile_region_and_name_in_arn(arn: &str) -> Option<(&str, &str)> {
     if fields.next()? != "signer" {
         return None;
     }
-    // Region and account: present, and non-empty for a profile ARN (Signer is a
-    // regional service and a profile belongs to one account).
+    // Region and account: present, and non-empty (Signer is a regional service
+    // and its resources belong to one account).
     let region = fields.next()?;
     if region.is_empty() || fields.next()?.is_empty() {
         return None;
     }
-    let name = fields.next()?.strip_prefix(PROFILE_ARN_RESOURCE_PREFIX)?;
-    is_profile_name(name).then_some((region, name))
+    Some((region, fields.next()?))
 }
 
 /// Why a tagging call could not reach a signing profile through its
@@ -1315,6 +1438,29 @@ pub fn is_profile_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// True when `value` satisfies `ProfileVersion`'s `@length(10, 10)` and
+/// `^[a-zA-Z0-9]{10}$` — the form
+/// [`ComAmazonawsSignerWallabyserviceState::mint_profile_version`] mints.
+///
+/// For a version read out of a value the model does not constrain: the one a
+/// signing-profile VERSION ARN carries.
+pub fn is_profile_version(value: &str) -> bool {
+    value.len() == 10 && value.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Whether `signature_timestamp` falls at or after `effective_from`.
+///
+/// A modelled `Timestamp` is whole epoch seconds (signed) plus a non-negative
+/// sub-second part, so two of them compare as that pair — correct on both sides
+/// of the epoch, where arithmetic over an unsigned duration would saturate.
+fn at_or_after(
+    signature_timestamp: &::aws_smithy_types::DateTime,
+    effective_from: &::aws_smithy_types::DateTime,
+) -> bool {
+    (signature_timestamp.secs(), signature_timestamp.subsec_nanos())
+        >= (effective_from.secs(), effective_from.subsec_nanos())
 }
 
 /// Which signing profiles one profile listing enumerates: the region whose

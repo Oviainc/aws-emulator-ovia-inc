@@ -38,6 +38,9 @@ mod region_scoping;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
+#[path = "all/revocation_status.rs"]
+mod revocation_status;
+
 #[path = "all/signature_revocation.rs"]
 mod signature_revocation;
 

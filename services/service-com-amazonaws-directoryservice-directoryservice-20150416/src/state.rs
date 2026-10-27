@@ -2481,6 +2481,19 @@ pub fn no_such_directory(directory_id: &str) -> String {
     format!("Directory: '{directory_id}' does not exist.")
 }
 
+/// The `DirectoryUnavailableException` message for a directory that is stored but is not
+/// in service yet. Shared so every operation that needs a directory in service says the
+/// same thing about the same failure.
+///
+/// Directory Service states this refusal with the SAME sentence it states for an id that
+/// resolves to no directory at all ([`no_such_directory`]): the quoted id the request
+/// asked for, then "does not exist." It reports nothing about where in its build the
+/// directory is, so the diagnostic discloses no internal provisioning state and a caller
+/// cannot read one out of the message. [`refusal`] appends the request id, once.
+pub fn directory_unavailable(directory_id: &str) -> String {
+    no_such_directory(directory_id)
+}
+
 /// The `DirectoryNotSharedException` message for a directory that is not shared with the
 /// consumer account the request named.
 ///

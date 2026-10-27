@@ -187,6 +187,19 @@ pub async fn receive_until(
     delivered
 }
 
+/// The attribute map a FIFO queue is created with: `FifoQueue` plus `extra`.
+///
+/// Every suite here that creates a FIFO queue shares it rather than re-deriving the one
+/// attribute that makes a queue a FIFO queue. A FIFO queue's NAME always carries the
+/// `.fifo` suffix, which is the caller's to supply.
+pub fn fifo_attributes(extra: &[(&str, &str)]) -> Value {
+    let mut attributes = json!({ "FifoQueue": "true" });
+    for (name, value) in extra {
+        attributes[*name] = json!(value);
+    }
+    attributes
+}
+
 /// Create a queue and return the raw reply.
 pub async fn create(router: &MultiServiceRouter, name: &str, attributes: &Value) -> (u16, Value) {
     let mut body = json!({"QueueName": name});

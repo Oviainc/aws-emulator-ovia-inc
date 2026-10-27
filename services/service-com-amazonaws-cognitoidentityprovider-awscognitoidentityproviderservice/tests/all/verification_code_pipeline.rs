@@ -7,9 +7,10 @@
 //! one, records it as the single code outstanding for that user and purpose — so a
 //! later send supersedes the earlier code — and reports the destination it went to
 //! masked, with the medium that destination is reached over; an operation documented
-//! as consuming a code accepts ONLY the outstanding code, refuses anything else with
-//! `CodeMismatchException` and an outstanding code past its validity window with
-//! `ExpiredCodeException`, and spends the code it accepts so it cannot be used twice.
+//! as consuming a code accepts ONLY the outstanding code, refuses any other value
+//! presented against a live code with `CodeMismatchException` and every check made
+//! where no live code is outstanding with `ExpiredCodeException`, and spends the code
+//! it accepts so it cannot be used twice.
 //!
 //! The code itself is delivered out of band, so no response carries it: a test learns
 //! the delivered code the way a mailbox would — from the emulator's own state.
@@ -669,7 +670,8 @@ async fn a_password_reset_code_is_single_use_and_a_reissue_supersedes_it() {
         );
 
         if accepted {
-            // The code is spent, so the same code cannot reset the password again.
+            // The code is spent, so no live code is left to compare against: the
+            // refusal is the one that asks for a code to be requested.
             let (replay_status, replay) = dispatch(
                 &emulator,
                 Addressing::Anonymous,
@@ -684,7 +686,7 @@ async fn a_password_reset_code_is_single_use_and_a_reissue_supersedes_it() {
             .await;
             assert_eq!(
                 error_code(&replay),
-                "CodeMismatchException",
+                "ExpiredCodeException",
                 "case {case:?}: a spent code is refused, got {replay_status} with {replay}"
             );
         }
@@ -777,12 +779,14 @@ async fn an_attribute_code_confirms_only_the_attribute_it_was_sent_for() {
             "",
         ),
         (
+            // No code is live for the attribute it is presented FOR, so there is
+            // nothing to compare it against.
             "the email code, presented for phone_number",
             "email",
             "phone_number",
             true,
             400,
-            "CodeMismatchException",
+            "ExpiredCodeException",
         ),
         (
             "a value the service never sent, presented for email",
@@ -857,7 +861,8 @@ async fn an_attribute_code_confirms_only_the_attribute_it_was_sent_for() {
             "case {case:?}: {flag} follows the outcome, got {attributes:?}"
         );
         if accepted {
-            // The code is spent, so the same code cannot verify the attribute again.
+            // The code is spent, so no live code is left to compare against: the
+            // refusal is the one that asks for a code to be requested.
             let (_, replay) = dispatch(
                 &emulator,
                 Addressing::Anonymous,
@@ -867,7 +872,7 @@ async fn an_attribute_code_confirms_only_the_attribute_it_was_sent_for() {
             .await;
             assert_eq!(
                 error_code(&replay),
-                "CodeMismatchException",
+                "ExpiredCodeException",
                 "case {case:?}: a spent code is refused, got {replay}"
             );
         }

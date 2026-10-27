@@ -137,6 +137,23 @@ fn validation(message: String) -> UpdateRewardError {
 /// in the recorded `UpdateReward` call that sent `Rewards: []`.
 const EMPTY_REWARDS_MESSAGE: &str = "Rewards list cannot be empty";
 
+/// How this service refuses a `Rewards` list that carries a different number of
+/// scores than the trajectory captured turns.
+///
+/// `Rewards` is documented as "The list of reward values to assign to this
+/// trajectory. Provide one reward value per turn in the trajectory", so the
+/// cardinality of the submission is part of the operation's contract: a score
+/// list of any other length cannot be attributed to the turns, and `DoubleList`
+/// carries no `@length` for the framework to check it with. The sentence names
+/// the trajectory from the request and both counts from the request and the
+/// store, so it says which submission was refused and against what.
+fn reward_count_message(trajectory_id: &str, turns: usize, rewards: usize) -> String {
+    format!(
+        "Rewards list must contain one reward value per turn in the trajectory; trajectory \
+         {trajectory_id} has {turns} turn(s) but {rewards} reward value(s) were provided"
+    )
+}
+
 /// Whether two reward lists are the same submission.
 ///
 /// Compared on the bit pattern of each score so the comparison is total: two
@@ -226,6 +243,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  rewards.",
                 input.trajectory_id,
                 completion_status.as_str()
+            )));
+        }
+
+        // "Provide one reward value per turn in the trajectory": the submission
+        // carries one score per captured turn or it cannot be attributed to the
+        // turns at all. The trajectory is sealed by this point, so the turn count
+        // it is checked against is final.
+        if input.rewards.len() != trajectory.turns.len() {
+            return Err(validation(reward_count_message(
+                &input.trajectory_id,
+                trajectory.turns.len(),
+                input.rewards.len(),
             )));
         }
 
