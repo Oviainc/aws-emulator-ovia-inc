@@ -226,10 +226,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DescribeIdentity<
         };
 
         // The same metadata a listing of the pool's identities reports for it, read from
-        // the one stored record both answer from.
+        // the one stored record both answer from — including the login projection, which
+        // carries the disabled sentinel for an identity an unlink left linked to nothing.
         Ok(DescribeIdentityOutput {
             identity_id: Some(identity.identity_id.clone()),
-            logins: Some(identity.logins.clone()),
+            logins: Some(identity.projected_logins()),
             creation_date: Some(::aws_smithy_types::DateTime::from(identity.creation_date)),
             last_modified_date: Some(::aws_smithy_types::DateTime::from(
                 identity.last_modified_date,

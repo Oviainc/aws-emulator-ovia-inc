@@ -103,7 +103,95 @@ impl IdentityPool {
                 .filter_map(|provider| provider.provider_name.as_deref())
                 .any(|name| name == provider_name)
     }
+
+    /// Whether a `Logins` entry made in the name of `provider_name` carries an OpenID
+    /// Connect IDENTITY TOKEN, so the value presented for it is decidable from the token
+    /// itself.
+    ///
+    /// Two of this pool's configured provider kinds issue one: an Amazon Cognito user pool
+    /// of its `CognitoIdentityProviders`, whose login is the user pool's id token, and an
+    /// OpenID Connect issuer of its `OpenIdConnectProviderARNs` ("A list of OpendID Connect
+    /// provider ARNs", this service's model), whose login is that issuer's id token. A login
+    /// of any other kind carries a provider-specific credential — an OAuth access token for
+    /// a public provider, a developer user identifier for the pool's own developer provider
+    /// — which is no JSON Web Token and is decided by the provider that issued it.
+    pub fn issues_open_id_connect_tokens(&self, provider_name: &str) -> bool {
+        (names_cognito_user_pool(provider_name) && self.accepts_login_provider(provider_name))
+            || self.names_open_id_connect_provider(provider_name)
+    }
+
+    /// Whether `provider_name` is the issuer of one of this pool's
+    /// `OpenIdConnectProviderARNs`: an IAM OpenID Connect provider is named
+    /// `arn:aws:iam::<account>:oidc-provider/<url without its scheme>`, and that url is the
+    /// name a `Logins` entry of that issuer is made under.
+    fn names_open_id_connect_provider(&self, provider_name: &str) -> bool {
+        self.open_id_connect_provider_arns
+            .iter()
+            .flatten()
+            .filter_map(|arn| arn.split_once(OIDC_PROVIDER_ARN_RESOURCE_PREFIX))
+            .any(|(_, issuer)| issuer == provider_name)
+    }
+
+    /// Whether `provider_name` is this pool's own developer provider — "the 'domain' by
+    /// which Cognito will refer to your users" — rather than a PUBLIC provider. A pool that
+    /// names no developer provider has no such entry at all.
+    pub fn names_developer_provider(&self, provider_name: &str) -> bool {
+        self.developer_provider_name.as_deref() == Some(provider_name)
+    }
+
+    /// Whether `logins` carries at least one entry made in the name of a PUBLIC provider —
+    /// any provider that is not this pool's own developer one.
+    pub fn logins_name_a_public_provider(&self, logins: &HashMap<String, String>) -> bool {
+        logins
+            .keys()
+            .any(|provider| !self.names_developer_provider(provider))
+    }
+
+    /// Whether `logins` presents, for a provider of this pool that issues OpenID Connect
+    /// identity tokens ([`IdentityPool::issues_open_id_connect_tokens`]), a value that is
+    /// not such a token at all.
+    ///
+    /// The reading is [`::service_common::jwt::read`], the tree's one bounded reading of a
+    /// compact JWS, through the reader a service presented ANOTHER party's token calls: a
+    /// value that is no JSON Web Token, or one nothing signed, is no identity token however
+    /// the provider would have decided it. The signature itself is not verified — that needs
+    /// the issuer's published verification key, which this emulator makes no outbound
+    /// connection to fetch — so what is decided here is decided from the presented value
+    /// alone, and only ever to REFUSE it.
+    pub fn presents_unreadable_identity_token(&self, logins: &HashMap<String, String>) -> bool {
+        logins.iter().any(|(provider, token)| {
+            self.issues_open_id_connect_tokens(provider)
+                && ::service_common::jwt::read(token).is_err()
+        })
+    }
 }
+
+/// The part of an IAM OpenID Connect provider ARN that precedes the issuer url it names
+/// (`arn:aws:iam::<account>:oidc-provider/<url without its scheme>`).
+const OIDC_PROVIDER_ARN_RESOURCE_PREFIX: &str = ":oidc-provider/";
+
+/// How AWS words the refusal of a login whose provider issues OpenID Connect identity
+/// tokens and whose presented value is not one.
+///
+/// Fixed text with no request- or state-derived part: the caller of an unsigned,
+/// token-authorized call holds no credential of this service, so the refusal says that the
+/// value presented is no identity token and nothing about the identity, the pool or the
+/// providers it is configured with.
+pub const INVALID_OPEN_ID_CONNECT_TOKEN_MESSAGE: &str =
+    "Invalid login token. Not a valid OpenId Connect identity token.";
+
+/// How AWS words the refusal of a `Logins` map that names no PUBLIC provider at all — one
+/// carrying only the pool's own developer provider, or nothing. Public providers are what
+/// the public-provider unlink operates on; a developer login is detached through
+/// `UnlinkDeveloperIdentity` instead.
+pub const NO_PUBLIC_PROVIDER_MESSAGE: &str = "Please provide a valid public provider";
+
+/// How AWS words the refusal of a request naming a developer provider that is not the one
+/// its identity pool is configured with: a bad input parameter, which is what the caller
+/// has to fix, rather than an access decision. Fixed text, naming neither the provider the
+/// request carried nor the pool's own.
+pub const UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE: &str =
+    "This identity pool does not support the specified developer provider.";
 
 /// Why a pool does not serve the basic (classic) authentication flow, whose entry point is
 /// `GetOpenIdToken`.
@@ -392,9 +480,52 @@ pub struct Identity {
     pub identity_id: String,
     pub identity_pool_id: String,
     pub logins: Vec<String>,
+    /// Whether an unlink has already taken every login provider off this identity, which is
+    /// what makes it a DISABLED one: the record survives, reachable through no login at all
+    /// ("removing the last linked login will make this identity inaccessible"), and that is
+    /// a different state from an identity that never carried a login — see
+    /// [`Identity::is_disabled`].
+    pub disabled: bool,
     pub creation_date: SystemTime,
     pub last_modified_date: SystemTime,
 }
+
+impl Identity {
+    /// Whether this identity is a DISABLED one: an unlink took its logins off it and none
+    /// has been linked since, so nothing resolves to it.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled && self.logins.is_empty()
+    }
+
+    /// The `Logins` list every read of this identity reports — `DescribeIdentity` and the
+    /// descriptions `ListIdentities` pages — which is the provider names it is linked to,
+    /// and for a DISABLED one the single [`DISABLED_LOGIN_PROJECTION`] sentinel standing in
+    /// place of the providers the unlink removed.
+    pub fn projected_logins(&self) -> Vec<String> {
+        if self.is_disabled() {
+            return vec![DISABLED_LOGIN_PROJECTION.to_string()];
+        }
+        self.logins.clone()
+    }
+}
+
+/// The one element the `Logins` list of a DISABLED identity carries: a fixed sentinel,
+/// not a provider name, which is how a read tells an identity an unlink orphaned from one
+/// that was never linked to anything (whose list is empty). It is the same value whatever
+/// providers were removed, so nothing of the request or of the stored record goes into it.
+pub const DISABLED_LOGIN_PROJECTION: &str = "DISABLED";
+
+/// How AWS words the refusal of a call that has to be authorized by a LOGIN of the identity
+/// it names when none of the logins it presents is one of that identity's — which is every
+/// such call for an identity an unlink left linked to nothing, since no login resolves to it
+/// any more ("removing the last linked login will make this identity inaccessible",
+/// `UnlinkIdentity`, this service's model).
+///
+/// Entirely fixed text, with no request- or state-derived part: the caller of these
+/// unsigned, login-authorized operations holds no credential of this service, so the refusal
+/// states what it has to send and nothing about the identity or what the pool holds for it.
+pub const UNMATCHED_LOGINS_MESSAGE: &str = "Logins don't match. Please include at least one \
+                                            valid login for this identity or identity pool.";
 
 /// The most OpenID Connect tokens this emulator holds outstanding at once. Not an AWS
 /// quota: THIS emulator's own ceiling on a store that grows by one record per successful
@@ -873,6 +1004,29 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             .iter()
             .filter(|(provider, _)| provider.as_str() == COGNITO_IDENTITY_LOGIN_PROVIDER)
             .find_map(|(_, token)| self.resolve_login_token(token, now).err())
+    }
+
+    /// Whether `logins` presents at least one login OF `identity_id`: a `(provider, login)`
+    /// this pool has indexed against that identity, or a token this service minted naming it
+    /// ([`Self::resolve_login_token`], the entry made under this service's own provider
+    /// name). A login of any other kind names some other identity, or none at all, so it is
+    /// not one of this identity's.
+    pub fn logins_name_identity(
+        &self,
+        identity_pool_id: &str,
+        identity_id: &str,
+        logins: &HashMap<String, String>,
+        now: SystemTime,
+    ) -> bool {
+        logins.iter().any(|(provider, login)| {
+            if provider.as_str() == COGNITO_IDENTITY_LOGIN_PROVIDER {
+                self.resolve_login_token(login, now)
+                    .is_ok_and(|issued| issued.identity_id == identity_id)
+            } else {
+                self.linked_identity(identity_pool_id, provider, login)
+                    .is_some_and(|linked| linked == identity_id)
+            }
+        })
     }
 
     /// The authentication methods an exchange presenting `logins` is made under: the values

@@ -25,6 +25,8 @@ mod describe_identity;
 mod developer_credentials_authorization;
 #[path = "all/developer_identity_tokens.rs"]
 mod developer_identity_tokens;
+#[path = "all/identity_link_lifecycle.rs"]
+mod identity_link_lifecycle;
 #[path = "all/identity_pool_flow.rs"]
 mod identity_pool_flow;
 #[path = "all/identity_pool_roles.rs"]
