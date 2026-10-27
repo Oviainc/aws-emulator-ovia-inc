@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(UnsubscribeErrorModeled::InternalErrorException(
@@ -200,6 +200,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(format!(
                         "Invalid parameter: SubscriptionArn Reason: {reason}"
                     )),
+                },
+            )
+            .into());
+        }
+
+        // A subscription belongs to the region of the topic it extends, which its own
+        // ARN carries: one naming another region names nothing this endpoint serves, so
+        // the delete is refused rather than silently answered as the idempotent one.
+        let region = state::request_region(ctx.parts());
+        if let Some(message) =
+            state::foreign_region_refusal("SubscriptionArn", &input.subscription_arn, &region)
+        {
+            return Err(UnsubscribeErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
                 },
             )
             .into());

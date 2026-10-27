@@ -286,6 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 due: now + PROVISIONING,
             }),
             data_sources: input.data_sources.unwrap_or_default(),
+            // A create attaches no data source: an attachment is the record
+            // `AttachDataSource` mints, so a new application holds none.
+            attachments: ::std::collections::BTreeMap::new(),
             app_configs: input.app_configs.unwrap_or_default(),
             iam_identity_center_options: input
                 .iam_identity_center_options

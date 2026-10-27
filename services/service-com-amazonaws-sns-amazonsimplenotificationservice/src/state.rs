@@ -3687,10 +3687,10 @@ pub const TAG_QUOTA_EXCEEDED_REFUSAL: &str =
 /// `None` when the value is a topic ARN.
 ///
 /// Two rules, in order, and both are ARGUMENT validation rather than a lookup — a
-/// value that could not name a topic in ANY account is bad input, so it is judged
+/// value that could not name a topic this endpoint serves is bad input, so it is judged
 /// before the store is consulted:
 ///
-/// 1. it has to be an ARN at all ([`arn_refusal`]);
+/// 1. it has to be an ARN of this endpoint's own region ([`regional_arn_refusal`]);
 /// 2. it has to be an ARN of an Amazon SNS TOPIC. Every tag operation documents its
 ///    `ResourceArn` as "The ARN of the topic …", and SNS holds tags on topics alone,
 ///    so an ARN of another service, or an SNS ARN whose resource part is not a topic
@@ -3699,8 +3699,8 @@ pub const TAG_QUOTA_EXCEEDED_REFUSAL: &str =
 ///
 /// Neither clause reproduces the value the caller sent: both name the member and the
 /// constraint it failed, as every other refusal of this service does.
-pub fn tagged_topic_arn_refusal(member: &str, value: &str) -> Option<String> {
-    if let Some(message) = arn_refusal(member, value) {
+pub fn tagged_topic_arn_refusal(member: &str, value: &str, region: &str) -> Option<String> {
+    if let Some(message) = regional_arn_refusal(member, value, region) {
         return Some(message);
     }
     topic_name_from_arn(value).is_none().then(|| {
@@ -3962,6 +3962,35 @@ pub fn arn_region(arn: &str) -> Option<&str> {
 /// so the same request answered by two regional endpoints reports two disjoint sets.
 pub fn belongs_to_region(arn: &str, region: &str) -> bool {
     arn_region(arn) == Some(region)
+}
+
+/// The message an ARN-typed `member` naming a resource of ANOTHER region is refused
+/// with, or `None` when `value` names a resource of `region` — or is not an ARN at all,
+/// which is a fault of its own that each operation already judges.
+///
+/// A regional endpoint serves the resources of its own region only, so an ARN naming
+/// another region names nothing this endpoint can read or act on — and that is a fault
+/// in the VALUE the caller sent, judged before any record is looked up, rather than a
+/// resource that is merely absent here. The sentence is this service's bare parameter
+/// refusal: the member whose value was not accepted, with neither the region nor the
+/// ARN echoed back.
+///
+/// Shared by every operation that resolves an ARN of this service, so the rule does not
+/// depend on which call carried the ARN.
+pub fn foreign_region_refusal(member: &str, value: &str, region: &str) -> Option<String> {
+    arn_region(value)
+        .is_some_and(|named| named != region)
+        .then(|| format!("Invalid parameter: {member}"))
+}
+
+/// The whole refusal an ARN-typed `member` of a REGIONAL lookup is held to, or `None`
+/// when `value` is an ARN of `region`: it has to be an ARN at all ([`arn_refusal`]), and
+/// it has to name this endpoint's own region ([`foreign_region_refusal`]).
+///
+/// Both clauses are argument validation — neither consults the store — so an operation
+/// judges them before it looks anything up.
+pub fn regional_arn_refusal(member: &str, value: &str, region: &str) -> Option<String> {
+    arn_refusal(member, value).or_else(|| foreign_region_refusal(member, value, region))
 }
 
 /// One page of `items` starting at `token`, plus the token of the page after it.

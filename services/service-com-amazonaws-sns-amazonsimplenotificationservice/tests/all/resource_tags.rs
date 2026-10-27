@@ -360,10 +360,13 @@ async fn a_tag_read_refuses_an_arn_that_cannot_name_a_topic() {
             code: "ResourceNotFound",
         },
         RefusalCase {
+            // A regional endpoint serves the topics of its own region only, so an ARN
+            // naming another region is a value this endpoint cannot act on at all rather
+            // than a topic that is merely absent here.
             case: "a topic ARN of another region",
             resource_arn: format!("arn:aws:sns:eu-west-1:{account}:tags-refusals"),
-            status: 404,
-            code: "ResourceNotFound",
+            status: 400,
+            code: "InvalidParameter",
         },
         RefusalCase {
             case: "the ARN of a topic that was deleted",

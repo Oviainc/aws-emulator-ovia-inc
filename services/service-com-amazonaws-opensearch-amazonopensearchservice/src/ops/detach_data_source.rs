@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes a data source from an OpenSearch application. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The attachment record is what this operation deletes, so a data source the
+//! application holds no record for is the modelled missing-resource refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +88,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    application_not_active, application_not_found, attachment_not_found, attachment_pending,
+    service_state, state_unavailable, APPLICATION_STATUS_ACTIVE, ATTACHMENT_STATUS_PENDING,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -165,18 +166,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachDataSource"))
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Whatever the clock already owed the records this call reads is materialised
+        // first, so the decisions below are made on the state at `now`: an application
+        // whose provisioning has landed is active, and a pending attachment that has
+        // fallen due is no longer pending.
+        store.settle_for_attachments(now);
+
+        // The attachment belongs to the application, so an id naming none holds no
+        // data source to detach.
+        let application = store.applications.get_mut(&input.id).ok_or_else(|| {
+            DetachDataSourceErrorModeled::ResourceNotFoundException(application_not_found(
+                &input.id,
+            ))
+        })?;
+
+        // "The application must be in the ACTIVE state": one that is still being
+        // provisioned has no data source saved object to remove yet, so the call is
+        // refused rather than served against a record the provisioning is still
+        // writing.
+        if application.status != APPLICATION_STATUS_ACTIVE {
+            return Err(DetachDataSourceErrorModeled::ConflictException(
+                application_not_active(&input.id, &application.status),
+            )
+            .into());
+        }
+
+        // "Throws a ConflictException if the specified data source has a PENDING
+        // attachment": an attachment still being made is in use by the call that is
+        // making it, so it is not one this call removes.
+        let attachment = application
+            .attachment(&input.data_source_arn)
+            .ok_or_else(|| {
+                DetachDataSourceErrorModeled::ResourceNotFoundException(attachment_not_found(
+                    &input.id,
+                    &input.data_source_arn,
+                ))
+            })?;
+        if attachment.status == ATTACHMENT_STATUS_PENDING {
+            return Err(DetachDataSourceErrorModeled::ConflictException(attachment_pending(
+                &input.id,
+                &input.data_source_arn,
+            ))
+            .into());
+        }
+
+        // "This operation removes the data source saved object from the application and
+        // deletes the attachment record", so the record is gone from the store and a
+        // later read of it is the missing-resource refusal.
+        application.attachments.remove(&input.data_source_arn);
+
+        Ok(DetachDataSourceOutput {
+            id: Some(application.id.clone()),
+            arn: Some(application.arn.clone()),
+            data_source_arn: Some(input.data_source_arn),
+        })
     }
 }
