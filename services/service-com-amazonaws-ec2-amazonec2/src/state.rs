@@ -37585,6 +37585,19 @@ pub const DEFAULT_FLOW_LOG_FORMAT: &str = "${version} ${account-id} ${interface-
 /// later move.
 pub const FLOW_LOG_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// The delivery outcome a stored flow log reports: "The status of the logs delivery
+/// (`SUCCESS` | `FAILED`)" (`FlowLog$DeliverLogsStatus`).
+///
+/// The outcome a flow log this store holds is in, for every destination type: a create is
+/// served only once the destination it asks for resolves and carries the delivery role that
+/// destination requires, so the flow log it stored is delivering — the same basis on which
+/// the record reports [`FLOW_LOG_STATUS_ACTIVE`]. `FAILED` is the
+/// other value the member documents, and belongs to a flow log whose delivery this store
+/// knows to be unusable; nothing here stores one, so no flow log carries a
+/// `DeliverLogsErrorMessage` either ("Information about the error that occurred" —
+/// `FlowLog$DeliverLogsErrorMessage`, which exists only for a delivery that failed).
+pub const DELIVER_LOGS_STATUS_SUCCESS: &str = "SUCCESS";
+
 /// The destination type a `CreateFlowLogs` that names none gets: "Default:
 /// `cloud-watch-logs`" (`CreateFlowLogsRequest$LogDestinationType`). One of the
 /// `LogDestinationType` enum's members
@@ -37954,21 +37967,27 @@ impl ComAmazonawsEc2Amazonec2State {
     /// Insert one flow log, and answer the `FlowLogId` it was given.
     ///
     /// Everything the service itself owns is derived here rather than taken from the caller
-    /// — the id, the creation time, the status and the record format a request that named
-    /// none gets ([`DEFAULT_FLOW_LOG_FORMAT`]) — so no writer can store a flow log a
-    /// describe would have to invent a member for. Like [`Self::insert_carrier_gateway`],
-    /// the caller-chosen bytes the record retains ([`flow_log_payload_bytes`]) are charged
-    /// against the store's byte budget here, so a writer cannot store them uncharged.
+    /// — the id, the creation time, the flow log status, the delivery status and the record
+    /// format a request that named none gets ([`DEFAULT_FLOW_LOG_FORMAT`]) — so no writer
+    /// can store a flow log a describe would have to invent a member for. Like
+    /// [`Self::insert_carrier_gateway`], the caller-chosen bytes the record retains
+    /// ([`flow_log_payload_bytes`]) are charged against the store's byte budget here, so a
+    /// writer cannot store them uncharged.
     pub fn insert_flow_log(&mut self, spec: FlowLogSpec) -> String {
         let payload_bytes = flow_log_payload_bytes(&spec);
         let flow_log_id = self.next_id(FLOW_LOG_ID_PREFIX);
         let view = FlowLog {
             creation_time: Some(system_time_to_date_time(spec.created_at)),
-            // Nothing in this emulator delivers a flow log record, so there is no delivery
-            // to report a status or an error for: `DeliverLogsStatus` and
-            // `DeliverLogsErrorMessage` stay absent rather than claiming an outcome.
+            // "The status of the logs delivery (SUCCESS | FAILED)"
+            // (`FlowLog$DeliverLogsStatus`) — reported for every flow log this store holds,
+            // on the same basis as the `ACTIVE` flow log status below: the create resolved
+            // the destination and the delivery role that destination requires before it got
+            // here, so this flow log's delivery is the one the member calls
+            // `DELIVER_LOGS_STATUS_SUCCESS`. "Information about the error that occurred"
+            // (`$DeliverLogsErrorMessage`) describes a delivery that failed, so a successful
+            // one carries no message.
             deliver_logs_error_message: None,
-            deliver_logs_status: None,
+            deliver_logs_status: Some(DELIVER_LOGS_STATUS_SUCCESS.to_string()),
             deliver_logs_permission_arn: spec.deliver_logs_permission_arn,
             deliver_cross_account_role: spec.deliver_cross_account_role,
             flow_log_id: Some(flow_log_id.clone()),
