@@ -406,6 +406,12 @@ mod s3files_create_file_system_bucket;
 mod scheduler_execution_role;
 #[path = "all/servicecatalog_signing_name_routing.rs"]
 mod servicecatalog_signing_name_routing;
+// Declared HERE, in sorted position in this quiet span, rather than beside the sibling SES
+// suites at the head of this file or in its appended tail: both of those are where every
+// concurrently landing suite puts its line, so a declaration there loses the squash merge
+// to all of them, while these neighbouring lines are stable.
+#[path = "all/ses_family_pre_dispatch_refusals.rs"]
+mod ses_family_pre_dispatch_refusals;
 #[path = "all/shared_signing_name_routing.rs"]
 mod shared_signing_name_routing;
 #[path = "all/ssm_contacts_replication_set.rs"]
