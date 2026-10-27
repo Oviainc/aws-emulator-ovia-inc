@@ -15,6 +15,8 @@
 mod async_invoke_model_contract;
 #[path = "all/bedrock_cloudwatch_request_metrics.rs"]
 mod bedrock_cloudwatch_request_metrics;
+#[path = "all/bedrock_cloudwatch_token_metric_dimensioning.rs"]
+mod bedrock_cloudwatch_token_metric_dimensioning;
 #[path = "all/bedrock_cloudwatch_token_metrics.rs"]
 mod bedrock_cloudwatch_token_metrics;
 #[path = "all/bedrock_runtime_inference.rs"]
