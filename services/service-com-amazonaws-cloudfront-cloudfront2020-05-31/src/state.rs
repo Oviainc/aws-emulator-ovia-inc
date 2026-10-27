@@ -8799,25 +8799,41 @@ pub fn comment_too_long(length: usize) -> crate::ops::types::InvalidArgument {
     }
 }
 
-/// The modelled `NoSuchResponseHeadersPolicy` (HTTP 404) for `id`, which neither source of
+/// The modelled `NoSuchResponseHeadersPolicy` (HTTP 404) for an id neither source of
 /// response headers policies holds one for.
 ///
-/// ONE code (and one status) covers two conditions, and the MESSAGE is what tells them
-/// apart: the service checks the SHAPE of the identifier before it looks anything up, so an
+/// This is the refusal of the STORE: it states that no policy answers to the id submitted,
+/// and it says nothing about the id's shape. It is what an operation that resolves such an
+/// id as a lookup KEY — one whose own resource is something else, so it never addresses a
+/// policy by that id — answers for every id no readable policy exists for, whatever shape
+/// the id takes; the sibling policy families answer their own one sentence the same way
+/// ([`no_such_cache_policy`], [`no_such_origin_request_policy`]). The shape of the
+/// identifier is examined only where an operation ADDRESSES the policy resource itself by
+/// it, which is [`unresolved_response_headers_policy_id`].
+pub fn no_such_response_headers_policy() -> NoSuchResponseHeadersPolicy {
+    NoSuchResponseHeadersPolicy {
+        message: Some(NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled `NoSuchResponseHeadersPolicy` (HTTP 404) an operation that ADDRESSES the
+/// policy resource by `id` answers when no readable policy answers to it.
+///
+/// Such an operation checks the SHAPE of the identifier before it looks anything up, and ONE
+/// code (and one status) covers both outcomes, so the MESSAGE is what tells them apart: an
 /// `id` outside the shape every response headers policy id takes ([`is_minted_uuid`]) is
 /// refused as an unusable identifier ([`RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE`]), while
 /// a well-formed id that names no policy — neither one this account created nor one AWS
-/// published — is the absent-policy sentence
-/// ([`NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE`]). Both are fixed text: each states a
-/// property of the identifier or of the store rather than echoing the value submitted, so
-/// nothing from the request reaches the wire.
-pub fn no_such_response_headers_policy(id: &str) -> NoSuchResponseHeadersPolicy {
-    NoSuchResponseHeadersPolicy {
-        message: Some(if is_minted_uuid(id) {
-            NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE.to_string()
-        } else {
-            RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE.to_string()
-        }),
+/// published — is the absent-policy sentence ([`no_such_response_headers_policy`]). Both are
+/// fixed text: each states a property of the identifier or of the store rather than echoing
+/// the value submitted, so nothing from the request reaches the wire.
+pub fn unresolved_response_headers_policy_id(id: &str) -> NoSuchResponseHeadersPolicy {
+    if is_minted_uuid(id) {
+        no_such_response_headers_policy()
+    } else {
+        NoSuchResponseHeadersPolicy {
+            message: Some(RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE.to_string()),
+        }
     }
 }
 
@@ -8829,6 +8845,10 @@ pub fn no_such_response_headers_policy(id: &str) -> NoSuchResponseHeadersPolicy 
 /// policy ([`NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE`]) — the two share the code and the
 /// status, so the message is all a caller has to tell them apart. Fixed text; it interpolates
 /// nothing, and in particular never echoes the id back.
+///
+/// Only an operation that ADDRESSES the policy resource by the identifier serves it, through
+/// [`unresolved_response_headers_policy_id`]: the precheck belongs to that operation, not to
+/// the error code.
 pub const RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE: &str = "Id format is invalid";
 
 /// The modelled `InvalidArgument` (HTTP 400) for a `ListResponseHeadersPolicies` `Marker`
@@ -8914,14 +8934,17 @@ pub fn no_such_monitoring_subscription() -> NoSuchMonitoringSubscription {
 pub const NO_SUCH_MONITORING_SUBSCRIPTION_MESSAGE: &str =
     "The monitoring subscription does not exist.";
 
-/// The message `NoSuchResponseHeadersPolicy` carries for a WELL-FORMED id that names no
-/// policy, on the wire.
+/// The message `NoSuchResponseHeadersPolicy` carries for an id no readable policy answers
+/// to, on the wire.
 ///
-/// The WIRE text CloudFront answers this code with for a response headers policy id in the
-/// shape the service mints that no policy holds, in the form this service states that
-/// condition in for every other named resource ([`NO_SUCH_CACHE_POLICY_MESSAGE`],
-/// [`NO_SUCH_DISTRIBUTION_MESSAGE`], [`NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE`]): "The
-/// specified <resource> does not exist."
+/// The WIRE text CloudFront answers this code with when the store holds no policy for the id
+/// submitted, in the form this service states that condition in for every other named
+/// resource ([`NO_SUCH_CACHE_POLICY_MESSAGE`], [`NO_SUCH_DISTRIBUTION_MESSAGE`],
+/// [`NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE`]): "The specified <resource> does not exist."
+/// An operation that addresses the policy resource by the identifier serves it for a
+/// well-formed id only, since it prechecks the shape
+/// ([`unresolved_response_headers_policy_id`]); one that resolves the id as a lookup key
+/// serves it for every unknown id ([`no_such_response_headers_policy`]).
 /// It differs from the sentence the MODEL's documentation of the error shape uses for the
 /// same rule ("The response headers policy does not exist."), which documents the condition
 /// rather than stating what is served, so do not "correct" this constant to it.
