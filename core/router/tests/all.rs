@@ -294,6 +294,8 @@ mod fis_execution_role_permissions;
 mod fis_execution_role_trust;
 #[path = "all/forecast_signing_name_routing.rs"]
 mod forecast_signing_name_routing;
+#[path = "all/glue_jobs_are_regional_while_their_role_is_global.rs"]
+mod glue_jobs_are_regional_while_their_role_is_global;
 // Declared HERE, in the sorted list at its own name, rather than at the head or the tail
 // of this file: both of those are where every concurrently landing suite puts its line, so
 // a declaration there conflicts with all of them, while these neighbouring lines are

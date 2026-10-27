@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(job) = store.job_mut(&region, &input.job_name) else {
             return Err(GetJobRunsErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::JOB_RUNS_JOB_NOT_FOUND.to_string()),
+                    message: Some(crate::state::messages::JOB_NOT_FOUND.to_string()),
                     from_federation_source: None,
                 },
             )

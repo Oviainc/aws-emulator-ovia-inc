@@ -1713,7 +1713,10 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// `CreateDataTransformationProfile` idempotency: `ClientToken` -> what the
     /// first call with that token minted. Bounded by
     /// [`MAX_PROFILE_CLIENT_TOKENS`]; write it through
-    /// [`Self::record_profile_client_token`], never directly.
+    /// [`Self::record_profile_client_token`], never directly. Every entry names
+    /// a profile this store still holds: a profile leaves through
+    /// [`Self::remove_profile`], which drops the tokens that minted it, so a
+    /// token cannot resolve to a record that is gone.
     pub profile_client_tokens: BTreeMap<String, ProfileClientTokenRecord>,
     /// The order [`Self::profile_client_tokens`] was written in, so the cap
     /// evicts the oldest token rather than an arbitrary one.
@@ -2140,6 +2143,33 @@ impl ComAmazonawsHealthlakeHealthlakeState {
         {
             self.profile_client_token_order.push_back(token);
         }
+    }
+
+    /// Drop every idempotency token that minted `profile_id`, so a token never
+    /// outlives the profile it names — the inverse of
+    /// [`Self::record_profile_client_token`], and the profile-side counterpart of
+    /// [`Self::forget_client_tokens_for`]. The order queue is pruned with the
+    /// map, so a dropped token stops consuming one of the
+    /// [`MAX_PROFILE_CLIENT_TOKENS`] slots as well.
+    fn forget_profile_client_tokens_for(&mut self, profile_id: &str) {
+        self.profile_client_tokens
+            .retain(|_, record| record.profile_id != profile_id);
+        let live = &self.profile_client_tokens;
+        self.profile_client_token_order
+            .retain(|token| live.contains_key(token));
+    }
+
+    /// Remove the profile `profile_id` and everything held for it, handing back
+    /// the record that went (or `None` when no record holds that id).
+    ///
+    /// The ONE way a profile leaves the store, so a removal cannot drop the
+    /// record and forget its idempotency tokens — the shape the data-store
+    /// reapers take, which remove the record and call
+    /// [`Self::forget_client_tokens_for`] together.
+    pub fn remove_profile(&mut self, profile_id: &str) -> Option<DataTransformationProfile> {
+        let profile = self.profiles.remove(profile_id)?;
+        self.forget_profile_client_tokens_for(profile_id);
+        Some(profile)
     }
 
     /// Mint an unused `ProfileId`: 32 lowercase hex characters, which is

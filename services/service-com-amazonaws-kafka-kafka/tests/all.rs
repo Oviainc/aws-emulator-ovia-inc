@@ -29,6 +29,8 @@ mod cluster_operation_v2;
 mod cluster_policy;
 #[path = "all/compatible_kafka_versions.rs"]
 mod compatible_kafka_versions;
+#[path = "all/configuration_arn_refusal.rs"]
+mod configuration_arn_refusal;
 #[path = "all/configuration_deletion.rs"]
 mod configuration_deletion;
 #[path = "all/configuration_lifecycle.rs"]

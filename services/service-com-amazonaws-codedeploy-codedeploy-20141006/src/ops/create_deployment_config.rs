@@ -467,7 +467,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 zonal_config: input.zonal_config,
                 compute_platform,
                 create_time_ms: crate::state::now_ms(),
-                tags: Vec::new(),
             });
             Ok(deployment_config_id)
         })

@@ -37,6 +37,8 @@ mod call_analytics_jobs;
 mod call_analytics_rule_time_ranges;
 #[path = "all/client_error_wire_status.rs"]
 mod client_error_wire_status;
+#[path = "all/clock_owed_record_access.rs"]
+mod clock_owed_record_access;
 #[path = "all/delete_requires_the_entity.rs"]
 mod delete_requires_the_entity;
 #[path = "all/describe_language_model.rs"]

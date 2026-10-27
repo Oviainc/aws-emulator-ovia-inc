@@ -2264,10 +2264,17 @@ pub fn cdc_specification_summary(stream: &CdcStreamEntry) -> CdcSpecificationSum
 /// partition, leaving a static column nothing to share and no storage distinct from an
 /// ordinary column: the CQL storage model this service implements has no such table, so
 /// such a schema is an invalid definition rather than a table with a redundant column.
+///
+/// A column name is an identifier, so WHICH column a name addresses is decided by
+/// [`identifier_identity`] and not by the spelling: an unquoted name is case-folded, a
+/// double-quoted one stands for itself. Two spellings of one identifier are therefore one
+/// column wherever this check compares names — a second `allColumns` entry for it is the
+/// same name declared twice, and a key or static column spelled in another casing names
+/// the column `allColumns` declares rather than one it does not.
 pub fn validate_schema(schema: &SchemaDefinition) -> Result<(), String> {
-    let mut declared: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+    let mut declared: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
     for column in &schema.all_columns {
-        if !declared.insert(column.name.as_str()) {
+        if !declared.insert(identifier_identity(&column.name)) {
             return Err(format!(
                 "schemaDefinition.allColumns declares column '{}' more than once",
                 column.name
@@ -2292,14 +2299,15 @@ pub fn validate_schema(schema: &SchemaDefinition) -> Result<(), String> {
                 .flatten()
                 .map(|column| ("staticColumns", column.name.as_str())),
         );
-    let mut assigned: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+    let mut assigned: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
     for (member, name) in roles {
-        if !declared.contains(name) {
+        let identity = identifier_identity(name);
+        if !declared.contains(&identity) {
             return Err(format!(
                 "schemaDefinition.{member} names column '{name}', which schemaDefinition.allColumns does not declare"
             ));
         }
-        if !assigned.insert(name) {
+        if !assigned.insert(identity) {
             return Err(format!(
                 "schemaDefinition.{member} names column '{name}', which the schema already gives another role"
             ));
