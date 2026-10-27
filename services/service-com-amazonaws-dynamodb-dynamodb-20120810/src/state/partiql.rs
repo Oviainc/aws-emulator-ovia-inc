@@ -1634,19 +1634,36 @@ fn equality(
     }
 }
 
-/// The `NextToken` a truncated page reports: the primary key the page stopped on,
-/// encoded so the next request resumes strictly after it.
+/// The `NextToken` a truncated page reports: the statement the page belongs to and the
+/// primary key it stopped on, encoded so the next request resumes strictly after it.
 ///
-/// Each component is its type tag and its bytes in hex — the key's own stored form
-/// (a number's canonical text, a string's UTF-8, a blob's bytes) — so the token
-/// carries nothing but the key and decodes back to exactly it.
-pub fn encode_cursor(key: &ItemKey) -> String {
-    let mut token = encode_key_component(&key.partition);
+/// Each key component is its type tag and its bytes in hex — the key's own stored form
+/// (a number's canonical text, a string's UTF-8, a blob's bytes) — so the token carries
+/// nothing but the key and decodes back to exactly it. It is prefixed by a digest of
+/// the STATEMENT, because a `NextToken` continues one statement's result set and means
+/// nothing to another: a token presented to a different statement would otherwise
+/// resume a result set that was never computed for it.
+pub fn encode_cursor(statement: &str, key: &ItemKey) -> String {
+    let mut token = statement_fingerprint(statement);
+    token.push(':');
+    token.push_str(&encode_key_component(&key.partition));
     if let Some(sort) = key.sort.as_ref() {
         token.push('.');
         token.push_str(&encode_key_component(sort));
     }
     token
+}
+
+/// How much of the statement's digest the token carries. A prefix of a SHA-256 digest:
+/// long enough that two different statements do not share one, short enough that the
+/// token stays a token.
+const FINGERPRINT_HEX_CHARS: usize = 16;
+
+/// The digest that binds a token to its statement.
+fn statement_fingerprint(statement: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(statement.as_bytes());
+    hex::encode(digest)[..FINGERPRINT_HEX_CHARS].to_string()
 }
 
 fn encode_key_component(component: &AttributeValueKey) -> String {
@@ -1660,9 +1677,14 @@ fn encode_key_component(component: &AttributeValueKey) -> String {
 }
 
 /// The key a `NextToken` stands for, or the refusal for a token this service did not
-/// mint.
-pub fn decode_cursor(token: &str) -> Result<ItemKey, RequestError> {
-    let mut components = token.split('.');
+/// mint FOR THIS STATEMENT — a token of another statement names a position in a result
+/// set this statement never computed, so it is as invalid here as one nothing minted.
+pub fn decode_cursor(statement: &str, token: &str) -> Result<ItemKey, RequestError> {
+    let (fingerprint, key) = token.split_once(':').ok_or_else(invalid_next_token)?;
+    if fingerprint != statement_fingerprint(statement) {
+        return Err(invalid_next_token());
+    }
+    let mut components = key.split('.');
     let partition = components
         .next()
         .ok_or_else(invalid_next_token)
@@ -1695,9 +1717,15 @@ fn decode_key_component(component: &str) -> Result<AttributeValueKey, RequestErr
     }
 }
 
-/// How a `NextToken` that is not one of this service's is refused.
+/// How a `NextToken` that does not continue THIS request is refused — one this service
+/// never minted, and one it minted for another statement, are the same mistake: the
+/// token names a position in a result set this request did not ask for.
+///
+/// The sentence is the one the service states for that refusal, which says what is
+/// wrong with the token rather than that it is unreadable: a client resuming a page
+/// reads from it that the token belongs to another request.
 fn invalid_next_token() -> RequestError {
-    RequestError::Validation("Invalid NextToken".to_string())
+    RequestError::Validation("NextToken does not match request".to_string())
 }
 
 // ===========================================================================
@@ -1749,6 +1777,18 @@ fn index_shape<'t>(
 /// Whether `index` is one this table declares.
 pub fn declares_index(table: &Table, index: &str) -> bool {
     index_shape(table, index).is_some()
+}
+
+/// Whether `index` is one of the table's GLOBAL secondary indexes.
+///
+/// The two kinds differ in what a read of them can ask for: a global index has its own
+/// partitions and is replicated to, so it serves eventually consistent reads only,
+/// while a local one shares the table's partitions and can be read consistently.
+pub fn is_global_index(table: &Table, index: &str) -> bool {
+    table
+        .global_secondary_indexes
+        .iter()
+        .any(|candidate| candidate.name == index)
 }
 
 /// Whether an item is projected into `index`: an index holds only the items that

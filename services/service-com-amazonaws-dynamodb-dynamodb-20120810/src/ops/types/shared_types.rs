@@ -11,7 +11,28 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-dynamodb-dynamodb-20120810.json");
 
-#[smithy_macros::smithy(union_for = "com.amazonaws.dynamodb#AttributeValue")]
+/// "Represents the data for an attribute. Each attribute value is described as a
+/// name-value pair. The name is the data type, and the value is the data itself"
+/// (`AttributeValue`'s own documentation) — a union of exactly one of the ten datatypes
+/// `smithy_query(query="shape", shape="com.amazonaws.dynamodb#AttributeValue")` lists:
+/// `S N B SS NS BS M L NULL BOOL`.
+///
+/// Written out rather than carrying `#[smithy_macros::smithy(union_for = ...)]` for ONE
+/// reason: the wording of the refusal a value that sets NO datatype, or more than one,
+/// gets. The generated codec refuses those with `union '<Shape>' had no member set` /
+/// `... had more than one member set`, which names the wire-layer term and the
+/// implementation's own idea of a member instead of the API concept the caller has to
+/// fix. Everything else below — the member schemas, their indices, the write and read
+/// arms — mirrors what that macro emits for this union, member for member; only
+/// [`EMPTY_ATTRIBUTE_VALUE_MESSAGE`] and [`AMBIGUOUS_ATTRIBUTE_VALUE_MESSAGE`] replace
+/// its two `SerdeError::custom` texts.
+///
+/// The cost of the copy: this declaration no longer tracks the model automatically, so
+/// a model change to `AttributeValue` (a renamed, added or `@jsonName`d member) has to
+/// be carried here by hand. The seam that would avoid it is in the vendored codegen
+/// (`vendor/smithy-macros`), which is read-only here, and the service's own
+/// `override_refusal` seam cannot reach this failure either: a codec
+/// `SerdeError::custom` is not one `refusal_of` describes structurally.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum AttributeValue {
@@ -25,6 +46,297 @@ pub enum AttributeValue {
     L(Vec<AttributeValue>),
     Null(bool),
     Bool(bool),
+}
+
+/// Why an `AttributeValue` carrying NO datatype at all is refused: AWS's fixed text for
+/// this constraint, which names the API concept (the value, and the datatypes it may
+/// carry) rather than the wire encoding.
+pub const EMPTY_ATTRIBUTE_VALUE_MESSAGE: &str =
+    "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes";
+
+/// Why an `AttributeValue` carrying MORE than one datatype is refused: the same
+/// constraint, stated for the other way to break it.
+pub const AMBIGUOUS_ATTRIBUTE_VALUE_MESSAGE: &str = "Supplied AttributeValue has more than one \
+     datatypes set, must contain exactly one of the supported datatypes";
+
+#[allow(non_upper_case_globals)]
+impl AttributeValue {
+    const M_S: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#AttributeValue$S",
+            "com.amazonaws.dynamodb",
+            "S",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "S",
+        0,
+    );
+
+    const M_N: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#AttributeValue$N",
+            "com.amazonaws.dynamodb",
+            "N",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "N",
+        1,
+    );
+
+    const M_B: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#AttributeValue$B",
+            "com.amazonaws.dynamodb",
+            "B",
+        ),
+        ::aws_smithy_schema::ShapeType::Blob,
+        "B",
+        2,
+    );
+
+    const M_SS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#AttributeValue$SS",
+            "com.amazonaws.dynamodb",
+            "SS",
+        ),
+        ::aws_smithy_schema::ShapeType::List,
+        "SS",
+        3,
+    );
+
+    const M_NS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#AttributeValue$NS",
+            "com.amazonaws.dynamodb",
+            "NS",
+        ),
+        ::aws_smithy_schema::ShapeType::List,
+        "NS",
+        4,
+    );
+
+    const M_BS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#AttributeValue$BS",
+            "com.amazonaws.dynamodb",
+            "BS",
+        ),
+        ::aws_smithy_schema::ShapeType::List,
+        "BS",
+        5,
+    );
+
+    const M_M: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#AttributeValue$M",
+            "com.amazonaws.dynamodb",
+            "M",
+        ),
+        ::aws_smithy_schema::ShapeType::Map,
+        "M",
+        6,
+    );
+
+    const M_L: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#AttributeValue$L",
+            "com.amazonaws.dynamodb",
+            "L",
+        ),
+        ::aws_smithy_schema::ShapeType::List,
+        "L",
+        7,
+    );
+
+    const M_NULL: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#AttributeValue$NULL",
+            "com.amazonaws.dynamodb",
+            "NULL",
+        ),
+        ::aws_smithy_schema::ShapeType::Boolean,
+        "NULL",
+        8,
+    );
+
+    const M_BOOL: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#AttributeValue$BOOL",
+            "com.amazonaws.dynamodb",
+            "BOOL",
+        ),
+        ::aws_smithy_schema::ShapeType::Boolean,
+        "BOOL",
+        9,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#AttributeValue",
+            "com.amazonaws.dynamodb",
+            "AttributeValue",
+        ),
+        ::aws_smithy_schema::ShapeType::Union,
+        &[
+            &Self::M_S,
+            &Self::M_N,
+            &Self::M_B,
+            &Self::M_SS,
+            &Self::M_NS,
+            &Self::M_BS,
+            &Self::M_M,
+            &Self::M_L,
+            &Self::M_NULL,
+            &Self::M_BOOL,
+        ],
+    );
+}
+
+pub static ATTRIBUTE_VALUE_SCHEMA: &::aws_smithy_schema::Schema = &AttributeValue::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for AttributeValue {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match self {
+            Self::S(value) => serializer.write_string(&Self::M_S, value.as_str())?,
+            Self::N(value) => serializer.write_string(&Self::M_N, value.as_str())?,
+            Self::B(value) => serializer.write_blob(&Self::M_B, value.as_slice())?,
+            Self::Ss(values) => serializer.write_list(&Self::M_SS, &|list| {
+                for value in values.iter() {
+                    list.write_string(&Self::M_SS, value.as_str())?;
+                }
+                Ok(())
+            })?,
+            Self::Ns(values) => serializer.write_list(&Self::M_NS, &|list| {
+                for value in values.iter() {
+                    list.write_string(&Self::M_NS, value.as_str())?;
+                }
+                Ok(())
+            })?,
+            Self::Bs(values) => serializer.write_list(&Self::M_BS, &|list| {
+                for value in values.iter() {
+                    list.write_blob(&Self::M_BS, value.as_slice())?;
+                }
+                Ok(())
+            })?,
+            Self::M(entries) => serializer.write_map(&Self::M_M, &|map| {
+                for (name, value) in entries.iter() {
+                    map.write_string(&Self::M_M, name.as_str())?;
+                    map.write_struct(&Self::M_M, value)?;
+                }
+                Ok(())
+            })?,
+            Self::L(values) => serializer.write_list(&Self::M_L, &|list| {
+                for value in values.iter() {
+                    list.write_struct(&Self::SCHEMA, value)?;
+                }
+                Ok(())
+            })?,
+            Self::Null(value) => serializer.write_boolean(&Self::M_NULL, *value)?,
+            Self::Bool(value) => serializer.write_boolean(&Self::M_BOOL, *value)?,
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for AttributeValue {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out: ::std::option::Option<Self> = ::std::option::Option::None;
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, deserializer| {
+            match member.member_index() {
+                // A union carries EXACTLY one member, so a second datatype on the wire
+                // is ambiguous and is refused rather than overwritten: overwriting
+                // would answer 200 for a value the caller did not send.
+                ::std::option::Option::Some(0..=9) if out.is_some() => {
+                    return ::std::result::Result::Err(
+                        ::aws_smithy_schema::serde::SerdeError::custom(
+                            AMBIGUOUS_ATTRIBUTE_VALUE_MESSAGE,
+                        ),
+                    );
+                }
+                ::std::option::Option::Some(0) => {
+                    out = Some(Self::S(deserializer.read_string(&Self::M_S)?));
+                }
+                ::std::option::Option::Some(1) => {
+                    out = Some(Self::N(deserializer.read_string(&Self::M_N)?));
+                }
+                ::std::option::Option::Some(2) => {
+                    out = Some(Self::B(deserializer.read_blob(&Self::M_B)?.into_inner()));
+                }
+                ::std::option::Option::Some(3) => {
+                    let mut members: Vec<String> = Vec::new();
+                    deserializer.read_list(&Self::M_SS, &mut |element| {
+                        members.push(element.read_string(&Self::M_SS)?);
+                        Ok(())
+                    })?;
+                    out = Some(Self::Ss(members));
+                }
+                ::std::option::Option::Some(4) => {
+                    let mut members: Vec<String> = Vec::new();
+                    deserializer.read_list(&Self::M_NS, &mut |element| {
+                        members.push(element.read_string(&Self::M_NS)?);
+                        Ok(())
+                    })?;
+                    out = Some(Self::Ns(members));
+                }
+                ::std::option::Option::Some(5) => {
+                    let mut members: Vec<Vec<u8>> = Vec::new();
+                    deserializer.read_list(&Self::M_BS, &mut |element| {
+                        members.push(element.read_blob(&Self::M_BS)?.into_inner());
+                        Ok(())
+                    })?;
+                    out = Some(Self::Bs(members));
+                }
+                ::std::option::Option::Some(6) => {
+                    let mut entries: std::collections::HashMap<String, AttributeValue> =
+                        ::std::default::Default::default();
+                    deserializer.read_map(&Self::M_M, &mut |name, entry| {
+                        let value = <Self as ::aws_smithy_schema_server::DeserializableStruct>
+                            ::deserialize(entry)
+                            .map_err(|error| {
+                                ::aws_smithy_schema_server::within_map_entry(error, &name)
+                            })?;
+                        entries.insert(name, value);
+                        Ok(())
+                    })?;
+                    out = Some(Self::M(entries));
+                }
+                ::std::option::Option::Some(7) => {
+                    let mut members: Vec<AttributeValue> = Vec::new();
+                    let mut position = 0usize;
+                    deserializer
+                        .read_list(&Self::M_L, &mut |element| {
+                            position += 1;
+                            members.push(
+                                <Self as ::aws_smithy_schema_server::DeserializableStruct>
+                                    ::deserialize(element)?,
+                            );
+                            Ok(())
+                        })
+                        .map_err(|error| {
+                            ::aws_smithy_schema_server::within_list_element(error, position)
+                        })?;
+                    out = Some(Self::L(members));
+                }
+                ::std::option::Option::Some(8) => {
+                    out = Some(Self::Null(deserializer.read_boolean(&Self::M_NULL)?));
+                }
+                ::std::option::Option::Some(9) => {
+                    out = Some(Self::Bool(deserializer.read_boolean(&Self::M_BOOL)?));
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        out.ok_or_else(|| {
+            ::aws_smithy_schema::serde::SerdeError::custom(EMPTY_ATTRIBUTE_VALUE_MESSAGE)
+        })
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.dynamodb#ConsumedCapacity")]

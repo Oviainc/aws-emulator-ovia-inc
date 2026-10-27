@@ -36,17 +36,31 @@ const _: () = assert!(
     "a table must reach ACTIVE no later than its stream reports ENABLED"
 );
 
+/// AWS's sentence for a request that declares a stream ON a new table and names no
+/// view type to capture in: the member is required as soon as the stream is enabled.
+pub const STREAM_VIEW_TYPE_REQUIRED: &str =
+    "One or more parameter values were invalid: StreamViewType is required when StreamEnabled \
+     is true";
+
+/// The same requirement where an EXISTING table's stream is being turned on, which is
+/// how AWS words it for a request that changes a table rather than creating one.
+pub const STREAM_VIEW_TYPE_REQUIRED_ON_ENABLE: &str =
+    "One or more parameter values were invalid: If stream is being enabled then UpdateViewType \
+     is required";
+
 /// The `StreamViewType` the specification asks for, refused when the pair cannot
 /// hold together.
 ///
 /// `StreamViewType` "determines what information is written to the stream for this
 /// table" (`StreamSpecification$StreamViewType`), so a specification that turns the
 /// stream ON without naming one asks for a stream whose contents are undefined and
-/// is refused; a specification that turns it OFF names nothing to capture, so the
-/// member is not read at all.
-pub fn stream_view_type(
-    specification: &StreamSpecification,
-) -> Result<Option<&str>, RequestError> {
+/// is refused with `missing_view_type` — one of the two sentences above, whichever the
+/// calling operation states; a specification that turns it OFF names nothing to
+/// capture, so the member is not read at all.
+pub fn stream_view_type<'s>(
+    specification: &'s StreamSpecification,
+    missing_view_type: &str,
+) -> Result<Option<&'s str>, RequestError> {
     use ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810 as streams;
 
     if !specification.stream_enabled {
@@ -67,11 +81,7 @@ pub fn stream_view_type(
             // the member's declared enum cannot drift.
             crate::ops::types::STREAM_VIEW_TYPE_VALUES.join(", ")
         ))),
-        None => Err(RequestError::Validation(
-            "One or more parameter values were invalid: StreamViewType is required when \
-             StreamEnabled is true"
-                .to_string(),
-        )),
+        None => Err(RequestError::Validation(missing_view_type.to_string())),
     }
 }
 
