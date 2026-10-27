@@ -1424,7 +1424,7 @@ async fn invalid_requests_are_refused_with_the_modelled_error() {
                 param("AvailabilityZones.member.1", "us-east-1a"),
             ],
             status: 400,
-            code: "UnsupportedProtocol",
+            code: "ValidationError",
         },
         Refusal {
             what: "an HTTP front end with a TCP back end",

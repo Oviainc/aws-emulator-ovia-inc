@@ -237,16 +237,6 @@ fn a_classic_load_balancers_zones_follow_the_subnets_it_is_attached_to() {
                     vec![first],
                     true,
                 ),
-                (
-                    // The zone of a subnet nothing holds is not something this emulator
-                    // knows, so the load balancer is reported in no zone rather than in
-                    // one nobody created.
-                    "an id EC2 holds no subnet for",
-                    vec![("Subnets.member.1", ABSENT_SUBNET)],
-                    vec![],
-                    vec![ABSENT_SUBNET],
-                    false,
-                ),
             ];
 
             for (index, (case, placement, zones, placed_in, in_vpc)) in
@@ -276,6 +266,34 @@ fn a_classic_load_balancers_zones_follow_the_subnets_it_is_attached_to() {
                     "case {case:?}: expected {expected:?}, got {reported:?}"
                 );
             }
+
+            // A subnet is EC2's resource, so an id EC2 holds no subnet for names no
+            // placement at all: the create is refused with the error the model declares for
+            // it, and no record is left behind for the name it asked for.
+            let refused = {
+                let mut params = vec![("LoadBalancerName", "classic-absent-subnet")];
+                params.extend(listener());
+                params.push(("Subnets.member.1", ABSENT_SUBNET));
+                classic(&router, &runtime, "CreateLoadBalancer", &params)
+            };
+            assert_eq!(
+                (refused.status, refused.code().as_str()),
+                (400, "SubnetNotFound"),
+                "case \"an id EC2 holds no subnet for\": the create must be refused, got \
+                 {refused:?}"
+            );
+            let described = classic(
+                &router,
+                &runtime,
+                "DescribeLoadBalancers",
+                &[("LoadBalancerNames.member.1", "classic-absent-subnet")],
+            );
+            assert_eq!(
+                (described.status, described.code().as_str()),
+                (400, "LoadBalancerNotFound"),
+                "case \"an id EC2 holds no subnet for\": the refused create must leave no \
+                 record, got {described:?}"
+            );
 
             // -----------------------------------------------------------------
             // …and the zone set follows every later attach and detach.
@@ -354,12 +372,15 @@ fn a_classic_load_balancers_zones_follow_the_subnets_it_is_attached_to() {
                     vec![third_zone],
                 ),
                 (
-                    "and then in none at all",
+                    // A load balancer placed in subnets serves traffic from those subnets
+                    // alone, so the detach that would leave it with none is refused and the
+                    // last subnet stays attached.
+                    "detaching the last subnet is refused",
                     Step::Detach,
                     third,
-                    None,
-                    vec![],
-                    vec![],
+                    Some("InvalidConfigurationRequest"),
+                    vec![third],
+                    vec![third_zone],
                 ),
             ];
 

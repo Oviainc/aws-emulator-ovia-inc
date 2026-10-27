@@ -338,6 +338,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 variables: target.variables,
                 variables_map: target.variables_map,
                 source_revisions: target.source_revisions,
+                // Re-running the stage reads the same sources the target execution read,
+                // so it carries the target's overrides too.
+                source_overrides: target.source_overrides,
                 stages: vec![plan],
                 artifact_bucket: target.artifact_bucket,
                 artifact_encryption_key: target.artifact_encryption_key,

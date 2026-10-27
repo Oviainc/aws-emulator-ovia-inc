@@ -170,14 +170,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Which Availability Zone — and which VPC — a subnet is in is EC2's to say, so the
-        // subnets are resolved against EC2 before the store is locked; nothing is held
-        // across that call.
-        let placement = crate::state::resolve_subnet_placement(ctx, &region, &input.subnets).await;
+        // The load balancer is resolved BEFORE the EC2 read, so a request naming one this
+        // region does not hold is refused for THAT whatever EC2 would have said about the
+        // subnets — the refusal a caller gets does not depend on which of the two answers
+        // came back first. The lock is released again for the read.
+        let held = {
+            let guard = state.lock();
+            guard
+                .load_balancers_in(&region)
+                .is_some_and(|records| records.contains_key(&input.load_balancer_name))
+        };
+        if !held {
+            return Err(
+                AttachLoadBalancerToSubnetsErrorModeled::AccessPointNotFoundException(
+                    AccessPointNotFoundException {
+                        message: Some(format!(
+                            "There is no ACTIVE Load Balancer named '{}'",
+                            input.load_balancer_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Which Availability Zone — and which VPC — a subnet is in is EC2's to say, and so is
+        // whether it exists at all, so the subnets are resolved against EC2 before the store
+        // is locked; nothing is held across that call. A subnet the account does not hold is
+        // an attachment EC2 itself refuses, so the modelled `SubnetNotFound` carries the code
+        // EC2 answered rather than a sentence restating it — the same refusal
+        // `CreateLoadBalancer` answers for a placement naming such a subnet.
+        let placement =
+            match crate::state::resolve_subnet_placement(ctx, &region, &input.subnets).await {
+                Ok(placement) => placement,
+                Err(_) => {
+                    // The sentence the model itself gives `SubnetNotFoundException`:
+                    // "One or more of the specified subnets do not exist."
+                    // (`smithy_query(query="shape", shape="SubnetNotFoundException")`).
+                    return Err(
+                        AttachLoadBalancerToSubnetsErrorModeled::SubnetNotFoundException(
+                            SubnetNotFoundException {
+                                message: Some(
+                                    "One or more of the specified subnets do not exist."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            };
 
         let mut guard = state.lock();
-        // A load balancer is a regional resource, so the name is resolved in the region
-        // this request is signed for.
+        // Looked up again because the lock was released for the EC2 read: the load balancer
+        // may have been deleted while it ran.
         let Some(record) = guard
             .load_balancers_in_mut(&region)
             .and_then(|records| records.get_mut(&input.load_balancer_name))

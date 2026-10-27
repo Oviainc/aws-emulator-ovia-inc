@@ -262,21 +262,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// This operation's wording for a listener the model's own rules rule out, in the errors
-/// it declares: `UnsupportedProtocolException` (400) for the protocol set and
-/// `InvalidConfigurationRequestException` (409) for the front-end/back-end pairing.
+/// This operation's wording for a listener the model's own rules rule out: a protocol
+/// member outside the documented set is a VALUE this service cannot accept, so it answers
+/// under the code every such value answers under, while the front-end/back-end pairing is
+/// the `InvalidConfigurationRequestException` (409) this operation declares.
 fn rejected(rejection: crate::state::ListenerRejection) -> CreateLoadBalancerListenersError {
     match rejection {
-        crate::state::ListenerRejection::UnsupportedProtocol { protocol } => {
-            CreateLoadBalancerListenersErrorModeled::UnsupportedProtocolException(
-                UnsupportedProtocolException {
-                    message: Some(format!(
-                        "Protocol must be one of {:?}; got '{protocol}'",
-                        crate::state::LISTENER_PROTOCOLS
-                    )),
-                },
+        crate::state::ListenerRejection::UnsupportedProtocol { member } => {
+            crate::scaffolded::Scaffolded::validation_error(
+                crate::state::listener_protocol_message(member),
             )
-            .into()
         }
         crate::state::ListenerRejection::IncompatibleProtocols {
             protocol,

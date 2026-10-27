@@ -29,7 +29,10 @@
 //!   keyed by organization-recommendation ARN, which is what
 //!   `GetOrganizationRecommendation` and
 //!   `UpdateOrganizationRecommendationLifecycle` take as their `@httpLabel`,
-//!   and what `ListOrganizationRecommendations` reports in that key order.
+//!   and what `ListOrganizationRecommendations` reports in that key order. It
+//!   holds only PRIORITIZED recommendations ([`RECOMMENDATION_TYPE_PRIORITY`]),
+//!   because every organization operation of this service is documented as
+//!   supporting only prioritized recommendations.
 //!
 //! A recommendation does NOT keep a list of its resource ARNs: a resource
 //! carries its owning `recommendation_arn`, so
@@ -203,8 +206,13 @@ pub const EXCLUSION_EXCLUDED: &str = "excluded";
 
 /// The `RecommendationType` whose lifecycle `UpdateRecommendationLifecycle` can
 /// move: its model doc says "This API only supports prioritized
-/// recommendations". `UpdateOrganizationRecommendationLifecycle` carries the
-/// same sentence, so the two share this value.
+/// recommendations". Every ORGANIZATION operation —
+/// `ListOrganizationRecommendations`, `GetOrganizationRecommendation`,
+/// `ListOrganizationRecommendationAccounts`,
+/// `ListOrganizationRecommendationResources` and
+/// `UpdateOrganizationRecommendationLifecycle` — carries that same sentence, so
+/// they all share this value: an organization recommendation exists only for a
+/// recommendation of this type.
 pub const RECOMMENDATION_TYPE_PRIORITY: &str = "priority";
 
 /// The one `UpdateRecommendationLifecycleStage` value that RESOLVES a
@@ -493,6 +501,11 @@ pub struct RecommendationEntry {
 /// Its lifecycle stage, update reason and resolution instant are its OWN: an
 /// organization recommendation is a separate resource from the member accounts'
 /// recommendations, so moving one does not move the other.
+///
+/// Only a PRIORITIZED recommendation ([`RECOMMENDATION_TYPE_PRIORITY`]) has
+/// one: every operation that reports, resolves or moves an organization
+/// recommendation supports only prioritized recommendations, so `type` is that
+/// value on every stored entry.
 ///
 /// The organization-level view of one check's findings, so it carries the same
 /// classification members as the account-level [`RecommendationEntry`] and
@@ -1580,36 +1593,44 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
                 },
             );
 
-            // The organization-level view of the same check: one organization
-            // recommendation per row, aggregating the member accounts'
-            // recommendations for that check (here the emulator's one
-            // account). Its classification members are the check's, so the two
-            // views of one finding cannot disagree.
-            let organization_recommendation_id =
-                format!("{}-organization-recommendation", row.check_id);
-            let organization_arn =
-                organization_recommendation_arn(&organization_recommendation_id);
-            state.organization_recommendations.insert(
-                organization_arn.clone(),
-                OrganizationRecommendationEntry {
-                    id: organization_recommendation_id,
-                    arn: organization_arn,
-                    text,
-                    check_arn: Some(check_arn),
-                    r#type: row.recommendation_type.to_string(),
-                    status: row.recommendation_status.to_string(),
-                    lifecycle_stage: row.lifecycle_stage.map(str::to_string),
-                    pillars: owned(row.pillars),
-                    source: row.source.to_string(),
-                    aws_services: owned(row.aws_services),
-                    member_recommendation_arns: vec![recommendation_arn.clone()],
-                    created_at_millis: SEED_CREATED_AT_MILLIS,
-                    last_updated_at_millis,
-                    resolved_at_millis: None,
-                    update_reason: None,
-                    update_reason_code: None,
-                },
-            );
+            // The organization-level view of the same check, aggregating the
+            // member accounts' recommendations for that check (here the
+            // emulator's one account). Its classification members are the
+            // check's, so the two views of one finding cannot disagree.
+            //
+            // Only a PRIORITIZED recommendation has one: every organization
+            // operation of this service supports only prioritized
+            // recommendations, so a check whose recommendation was produced
+            // automatically contributes nothing the organization surface can
+            // report, resolve or aggregate — and the organization recommendation
+            // it would have had is not a resource of this API.
+            if row.recommendation_type == RECOMMENDATION_TYPE_PRIORITY {
+                let organization_recommendation_id =
+                    format!("{}-organization-recommendation", row.check_id);
+                let organization_arn =
+                    organization_recommendation_arn(&organization_recommendation_id);
+                state.organization_recommendations.insert(
+                    organization_arn.clone(),
+                    OrganizationRecommendationEntry {
+                        id: organization_recommendation_id,
+                        arn: organization_arn,
+                        text,
+                        check_arn: Some(check_arn),
+                        r#type: row.recommendation_type.to_string(),
+                        status: row.recommendation_status.to_string(),
+                        lifecycle_stage: row.lifecycle_stage.map(str::to_string),
+                        pillars: owned(row.pillars),
+                        source: row.source.to_string(),
+                        aws_services: owned(row.aws_services),
+                        member_recommendation_arns: vec![recommendation_arn.clone()],
+                        created_at_millis: SEED_CREATED_AT_MILLIS,
+                        last_updated_at_millis,
+                        resolved_at_millis: None,
+                        update_reason: None,
+                        update_reason_code: None,
+                    },
+                );
+            }
 
             for resource in row.resources {
                 let arn = recommendation_resource_arn(&recommendation_id, resource.id);
