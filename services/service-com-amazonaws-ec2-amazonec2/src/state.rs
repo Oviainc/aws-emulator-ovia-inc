@@ -34194,6 +34194,11 @@ pub const INVALID_PLACEMENT_GROUP_DUPLICATE: &str = "InvalidPlacementGroup.Dupli
 /// `InvalidPlacementGroup.Unknown` error-code entry).
 pub const INVALID_PLACEMENT_GROUP_UNKNOWN: &str = "InvalidPlacementGroup.Unknown";
 
+/// The code EC2 answers for a placement group that cannot be deleted while something
+/// still depends on it: "the specified placement group is in use" (AWS's
+/// `InvalidPlacementGroup.InUse` error-code entry).
+pub const INVALID_PLACEMENT_GROUP_IN_USE: &str = "InvalidPlacementGroup.InUse";
+
 /// The code a create past [`MAX_PLACEMENT_GROUPS`] answers with: "you've reached the limit
 /// on the number of placement groups you can have" (AWS's `PlacementGroupLimitExceeded`
 /// error-code entry).
@@ -34217,7 +34222,21 @@ pub fn invalid_placement_group_unknown<E>(group: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_PLACEMENT_GROUP_UNKNOWN,
         400,
-        format!("The placement group '{group}' does not exist"),
+        format!("The Placement Group '{group}' is unknown."),
+    )
+}
+
+/// Refuse a delete of a placement group something still depends on: HTTP 400
+/// [`INVALID_PLACEMENT_GROUP_IN_USE`].
+///
+/// The text is AWS's for this error class — "the specified placement group is in use" (its
+/// `InvalidPlacementGroup.InUse` error-code entry) — with the group the request named in
+/// place of "the specified", which is the only variable part of it.
+pub fn invalid_placement_group_in_use<E>(group_name: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PLACEMENT_GROUP_IN_USE,
+        400,
+        format!("The placement group '{group_name}' is in use."),
     )
 }
 
@@ -34243,10 +34262,37 @@ pub fn placement_group_limit_exceeded<E>() -> Scaffolded<E> {
 /// a create checks cannot drift from what the insert takes, and a group with no tags is not
 /// free against [`MAX_STORED_BYTES`].
 pub fn placement_group_spec_bytes(spec: &PlacementGroupSpec) -> usize {
+    placement_group_stored_bytes(
+        &spec.group_name,
+        &spec.tags,
+        spec.parent_group_id.as_deref(),
+    )
+}
+
+/// The same charge, read off a group AS IT IS STORED, so a delete gives back exactly what
+/// the insert took: [`ComAmazonawsEc2Amazonec2State::remove_placement_group`] releases
+/// this and [`placement_group_spec_bytes`] reserves it, both through
+/// [`placement_group_stored_bytes`].
+pub fn placement_group_record_bytes(group: &PlacementGroup) -> usize {
+    placement_group_stored_bytes(
+        group.group_name.as_deref().unwrap_or_default(),
+        group.tags.as_deref().unwrap_or_default(),
+        group.parent_group_id.as_deref(),
+    )
+}
+
+/// The ONE formula behind [`placement_group_spec_bytes`] and
+/// [`placement_group_record_bytes`]: the caller-chosen members of a stored placement group,
+/// on top of [`STORED_RECORD_OVERHEAD_BYTES`].
+fn placement_group_stored_bytes(
+    group_name: &str,
+    tags: &[Tag],
+    parent_group_id: Option<&str>,
+) -> usize {
     STORED_RECORD_OVERHEAD_BYTES
-        .saturating_add(spec.group_name.len())
-        .saturating_add(tag_list_bytes(&spec.tags))
-        .saturating_add(spec.parent_group_id.as_ref().map_or(0, String::len))
+        .saturating_add(group_name.len())
+        .saturating_add(tag_list_bytes(tags))
+        .saturating_add(parent_group_id.map_or(0, str::len))
 }
 
 /// What a writer must say to store a placement group; everything else about the record —
@@ -34379,6 +34425,32 @@ impl ComAmazonawsEc2Amazonec2State {
         let stored = group.clone();
         self.placement_groups.insert(group_id, group);
         Some(stored)
+    }
+
+    /// Whether any placement group names `group_id` as its parent.
+    ///
+    /// "You cannot delete a placement group that is a parent of a cluster placement group.
+    /// Delete the cluster placement groups first" (`DeletePlacementGroup`), so this is the
+    /// dependency a delete asks about before removing anything — a question, so it answers
+    /// one as soon as a child is found rather than collecting every child's id.
+    pub fn has_placement_group_children(&self, group_id: &str) -> bool {
+        self.placement_groups
+            .values()
+            .any(|group| group.parent_group_id.as_deref() == Some(group_id))
+    }
+
+    /// Take the placement group `group_id` names out of the store and answer it as it was
+    /// stored, or `None` when the account holds no group under that id.
+    ///
+    /// The one way a placement group STOPS being stored, the counterpart of
+    /// [`Self::insert_placement_group`]: it gives the record's caller-chosen bytes back to
+    /// the store's budget ([`placement_group_record_bytes`]), so a create-delete-create
+    /// cycle cannot leak budget, and a later `DescribePlacementGroups` resolves neither the
+    /// id nor the name any more.
+    pub fn remove_placement_group(&mut self, group_id: &str) -> Option<PlacementGroup> {
+        let group = self.placement_groups.remove(group_id)?;
+        self.release_stored_bytes(placement_group_record_bytes(&group));
+        Some(group)
     }
 }
 
