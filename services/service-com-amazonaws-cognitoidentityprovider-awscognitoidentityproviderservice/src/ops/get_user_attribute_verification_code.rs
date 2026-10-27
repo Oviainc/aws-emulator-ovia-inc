@@ -243,18 +243,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // medium the message travels over (`crate::state::delivery_medium`, the same
         // rule `UpdateUserAttributes` reports a pending value's delivery by).
         let attribute_name = input.attribute_name.clone();
-        if crate::state::delivery_medium(&attribute_name).is_none() {
+        let Some(medium) = crate::state::delivery_medium(&attribute_name) else {
             return Err(invalid_parameter(format!(
                 "Invalid AttributeName: {attribute_name} is not an attribute a verification \
                  code can be sent for"
             )));
-        }
+        };
         // The destination is the attribute's STORED value, so a user holding no value
-        // for it has nowhere for a code to be sent.
+        // for it has nowhere for a code to be sent — the same refusal, in the one
+        // wording of `crate::state::undeliverable_medium_message`, that every request
+        // asking for a delivery it holds no address for earns.
         let Some(destination) = user.destination_of(&attribute_name) else {
-            return Err(invalid_parameter(format!(
-                "Invalid AttributeName: the user has no {attribute_name} to send a code to"
-            )));
+            return Err(invalid_parameter(
+                crate::state::undeliverable_medium_message(medium, &attribute_name),
+            ));
         };
 
         // `ClientMetadata` is "input for any custom workflows that this action

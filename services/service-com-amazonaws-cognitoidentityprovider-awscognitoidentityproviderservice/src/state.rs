@@ -2949,23 +2949,30 @@ impl User {
     ///
     /// A PURE read: accepting a code is what spends it ([`User::consume_code`]),
     /// so a refused attempt leaves the outstanding code exactly as it was and a
-    /// caller can present the right one afterwards. Nothing outstanding, a value
-    /// that is not the outstanding code, and a code a later one superseded are
-    /// all the same answer: this is not the code the service is expecting.
+    /// caller can present the right one afterwards.
+    ///
+    /// A presented value is compared only against a LIVE code. Where none is
+    /// live for `purpose` — none was ever issued, the one that was has been
+    /// spent, or its validity window has closed — there is nothing to compare
+    /// against at all, so the answer is [`CodeRejection::Expired`]: the
+    /// remediation is to ask for a code. Only a value that differs from a code
+    /// that IS live, a code a later one superseded among them, is the
+    /// [`CodeRejection::Mismatch`] whose remediation is to present the right
+    /// code.
     pub fn check_code(
         &self,
         purpose: &CodePurpose,
         presented: &str,
         now: SystemTime,
     ) -> Result<&VerificationCode, CodeRejection> {
-        let outstanding = self
-            .outstanding_code(purpose)
-            .ok_or(CodeRejection::Mismatch)?;
-        if outstanding.code != presented {
-            return Err(CodeRejection::Mismatch);
-        }
+        let Some(outstanding) = self.outstanding_code(purpose) else {
+            return Err(CodeRejection::Expired);
+        };
         if outstanding.expired(now) {
             return Err(CodeRejection::Expired);
+        }
+        if outstanding.code != presented {
+            return Err(CodeRejection::Mismatch);
         }
         Ok(outstanding)
     }
@@ -3231,11 +3238,12 @@ impl VerificationCode {
 /// operation that was given it answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeRejection {
-    /// The presented code is not the outstanding one — including the case where
-    /// nothing is outstanding at all, and the case where a later code for the
-    /// same purpose superseded the presented one.
+    /// A code IS live for the purpose and the presented value is not it —
+    /// including the case where a later code for the same purpose superseded
+    /// the presented one.
     Mismatch,
-    /// The presented code IS the outstanding one, but its validity window has
+    /// No live code is there to compare against: none was ever issued for the
+    /// purpose, the one that was has been spent, or its validity window has
     /// closed.
     Expired,
 }
@@ -3245,10 +3253,14 @@ pub enum CodeRejection {
 /// Developer Guide, "Signing up and confirming user accounts").
 pub const VERIFICATION_CODE_VALIDITY: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// The message a code that is not the outstanding one is refused with.
+/// The message a value that is not the live code is refused with
+/// ([`CodeRejection::Mismatch`]): it asks for the code to be presented again,
+/// because one is there to present.
 pub const CODE_MISMATCH_MESSAGE: &str = "Invalid verification code provided, please try again.";
 
-/// The message a code past its validity window is refused with.
+/// The message a check against no live code is refused with
+/// ([`CodeRejection::Expired`]): it asks for a code to be REQUESTED, because
+/// there is none to present.
 pub const EXPIRED_CODE_MESSAGE: &str = "Invalid code provided, please request a code again.";
 
 /// One device of a user: the device a sign-in minted a `DeviceKey` for, as the
@@ -4505,15 +4517,87 @@ pub const FLAG_CONFIRMED: &str = "true";
 /// confirmed.
 pub const FLAG_UNCONFIRMED: &str = "false";
 
+/// Each `DeliveryMediumType` value beside the user attribute whose stored value
+/// addresses a message sent over it: an email address is mailed and a phone
+/// number is texted, so `EMAIL` and `SMS` — the values
+/// [`crate::ops::types::DELIVERY_MEDIUM_TYPE_VALUES`] carries — name the two
+/// attributes a message is ever addressed to.
+///
+/// The ONE place the two value sets are mapped to each other, so the medium a
+/// delivery REPORTS and the attribute a delivery NEEDS cannot disagree.
+pub const DELIVERY_MEDIUM_ATTRIBUTES: [(&str, &str); 2] =
+    [("EMAIL", "email"), ("SMS", "phone_number")];
+
 /// The `DeliveryMediumType` a verification message for `attribute` travels by —
 /// an email address is mailed and a phone number is texted — or `None` for an
 /// attribute no message is sent for.
 pub fn delivery_medium(attribute: &str) -> Option<&'static str> {
-    match attribute {
-        "email" => Some("EMAIL"),
-        "phone_number" => Some("SMS"),
-        _ => None,
-    }
+    DELIVERY_MEDIUM_ATTRIBUTES
+        .iter()
+        .find(|(_, addressed_by)| *addressed_by == attribute)
+        .map(|(medium, _)| *medium)
+}
+
+/// The user attribute whose stored value addresses a message delivered over
+/// `medium` — the inverse of [`delivery_medium`] — or `None` for a value no
+/// `DeliveryMediumType` names.
+pub fn medium_destination_attribute(medium: &str) -> Option<&'static str> {
+    DELIVERY_MEDIUM_ATTRIBUTES
+        .iter()
+        .find(|(named, _)| *named == medium)
+        .map(|(_, addressed_by)| *addressed_by)
+}
+
+/// The first medium among `requested` that no address is held for, beside the
+/// attribute that would have addressed it, or `None` when every requested
+/// medium can be delivered over.
+///
+/// A message needs an address to go to, and the medium it travels over is what
+/// names the attribute holding one ([`DELIVERY_MEDIUM_ATTRIBUTES`]): a request
+/// that asks for delivery over a medium the recipient holds no value for asks
+/// for a message that can never be addressed, which is a bad parameter rather
+/// than a delivery that was attempted. `holds_destination` answers whether a
+/// value for the attribute it is given is held.
+///
+/// A PURE function of the request and the lookup it is given — it reads and
+/// writes no stored state itself — so a request refused by it leaves the store
+/// exactly as it was. Each requested medium costs ONE call of
+/// `holds_destination` and nothing is stored per entry, so a caller that
+/// decides the addressing attributes once, ahead of this walk, keeps the whole
+/// check linear in the request's size: the submitted medium list bounds nothing
+/// that is stored and nothing that is re-scanned. A medium no
+/// `DeliveryMediumType` names addresses no attribute and is passed over here:
+/// the request walk has already refused a value outside the modelled set.
+pub fn undeliverable_medium<F>(
+    requested: &[String],
+    holds_destination: F,
+) -> Option<(&str, &'static str)>
+where
+    F: Fn(&str) -> bool,
+{
+    requested.iter().find_map(|medium| {
+        let attribute = medium_destination_attribute(medium)?;
+        (!holds_destination(attribute)).then_some((medium.as_str(), attribute))
+    })
+}
+
+/// The message an `InvalidParameterException` carries for a request that asks
+/// for delivery over `medium` where no `attribute` addresses it
+/// ([`undeliverable_medium`]).
+///
+/// The refusal reports the medium the request asked for and the attribute that
+/// medium needs — both of them values the caller submitted or the model names —
+/// so it says what to send instead and discloses nothing stored.
+///
+/// Amazon Cognito states this condition as two clauses, the message it could not
+/// send and the registration it has no record of, and closes neither with a
+/// period: a resend with nothing to send to answers "Cannot resend codes. No
+/// registered/verified email or phone_number" (the sentence
+/// `ResendConfirmationCode` already carries in this crate). This is that
+/// sentence for ONE medium and the ONE attribute addressing it, so a caller
+/// matching the family matches both.
+pub fn undeliverable_medium_message(medium: &str, attribute: &str) -> String {
+    format!("Cannot send the message by {medium}. No registered {attribute}")
 }
 
 /// What one submitted attribute does to a stored user

@@ -2220,6 +2220,18 @@ pub struct RemediationExecutionEntry {
     /// When the execution is due to have finished; see
     /// [`REMEDIATION_EXECUTION_COMPLETES_AFTER`].
     pub completes_at: SystemTime,
+    /// When this execution's own RUN of its action began and ended, where this emulator
+    /// performed that action (`crate::state::remediation`).
+    ///
+    /// The run is what the execution reports the progress of, so where it happened these
+    /// are the instants the reported state moves at — an action performed in process
+    /// takes the time that call takes rather than the spans above. Both stay absent for
+    /// an execution whose runbook names an action this emulator does not perform, and for
+    /// one running where no pump could run it, and the reported state then follows the
+    /// clock's own spans.
+    pub ran_from: Option<SystemTime>,
+    /// See [`Self::ran_from`].
+    pub ran_to: Option<SystemTime>,
 }
 
 impl RemediationExecutionEntry {
@@ -2238,6 +2250,8 @@ impl RemediationExecutionEntry {
             invoked_at: at,
             starts_at: at + REMEDIATION_EXECUTION_STARTS_AFTER,
             completes_at: at + REMEDIATION_EXECUTION_COMPLETES_AFTER,
+            ran_from: None,
+            ran_to: None,
         }
     }
 
@@ -2250,10 +2264,21 @@ impl RemediationExecutionEntry {
         )
     }
 
-    /// The `RemediationExecutionState` this execution is in at `now`: queued until the
-    /// instant it is due to start, running until the instant it is due to have
-    /// finished, and succeeded from then on.
+    /// The `RemediationExecutionState` this execution is in at `now`.
+    ///
+    /// Where this emulator RAN the execution's action ([`Self::ran_from`]), the run is
+    /// what the state reports: running from the instant the action began, succeeded from
+    /// the instant it was performed — so a client that reads the status after the action
+    /// has changed the resource is not told the execution is still queued. Everything
+    /// else follows the clock: queued until the instant it is due to start, running until
+    /// the instant it is due to have finished, and succeeded from then on.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if self.ran_to.is_some_and(|ran_to| now >= ran_to) {
+            return REMEDIATION_EXECUTION_STATE_SUCCEEDED;
+        }
+        if self.ran_from.is_some_and(|ran_from| now >= ran_from) {
+            return REMEDIATION_EXECUTION_STATE_IN_PROGRESS;
+        }
         if now < self.starts_at {
             REMEDIATION_EXECUTION_STATE_QUEUED
         } else if now < self.completes_at {
@@ -2264,13 +2289,16 @@ impl RemediationExecutionEntry {
     }
 
     /// When this execution last moved (`RemediationExecutionStatus$LastUpdatedTime`):
-    /// the instant of the most recent transition the clock has made due, which is the
-    /// invocation itself while the execution is still queued.
+    /// the instant of the most recent transition — the instant its own run moved it where
+    /// this emulator ran it, and the instant the clock made the move due otherwise, which
+    /// is the invocation itself while the execution is still queued.
     pub fn last_updated_at(&self, now: SystemTime) -> SystemTime {
         match self.state_at(now) {
             REMEDIATION_EXECUTION_STATE_QUEUED => self.invoked_at,
-            REMEDIATION_EXECUTION_STATE_IN_PROGRESS => self.starts_at,
-            _ => self.completes_at,
+            REMEDIATION_EXECUTION_STATE_IN_PROGRESS => {
+                self.ran_from.unwrap_or(self.starts_at)
+            }
+            _ => self.ran_to.unwrap_or(self.completes_at),
         }
     }
 
@@ -2302,9 +2330,9 @@ impl RemediationExecutionEntry {
                 // A step that has not started has no start instant to report, and one
                 // that has not finished no stop instant.
                 start_time: (state != REMEDIATION_EXECUTION_STATE_QUEUED)
-                    .then(|| timestamp(self.starts_at)),
+                    .then(|| timestamp(self.ran_from.unwrap_or(self.starts_at))),
                 stop_time: (state == REMEDIATION_EXECUTION_STATE_SUCCEEDED)
-                    .then(|| timestamp(self.completes_at)),
+                    .then(|| timestamp(self.ran_to.unwrap_or(self.completes_at))),
             }]),
             invocation_time: Some(timestamp(self.invoked_at)),
             last_updated_time: Some(timestamp(self.last_updated_at(now))),
@@ -3805,6 +3833,12 @@ pub use recording::*;
 // here like the modules above so a handler reaches its names as `crate::state::<name>`.
 pub mod resource_arn;
 pub use resource_arn::*;
+
+// What a started remediation execution DOES to the resource it names — the action of the
+// runbook its configuration names — lives in `state/remediation.rs`, re-exported here
+// like the modules above so a handler reaches its names as `crate::state::<name>`.
+pub mod remediation;
+pub use remediation::*;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
