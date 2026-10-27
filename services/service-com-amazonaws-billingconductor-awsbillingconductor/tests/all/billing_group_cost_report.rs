@@ -631,12 +631,17 @@ async fn a_report_grouped_by_billing_period_reports_each_period_of_the_range() {
     let em = Emulator::new();
     let group = em.billing_group("periods").await;
 
-    // Three items differing in where their own half-open range falls: every period, one
-    // period only, and from a period on with no end at all.
+    // Three items differing in where their own half-open range falls: every period of
+    // the report, one period only, and from a period on with no end at all. An item is
+    // in effect no earlier than the period it was created in, so the one that spans the
+    // whole report names the first of them as its inclusive start.
     em.custom_line_item(
         &group,
-        "always",
-        json!({ "ChargeDetails": { "Type": "FEE", "Flat": { "ChargeValue": 1.0 } } }),
+        "fromprevious",
+        json!({
+            "ChargeDetails": { "Type": "FEE", "Flat": { "ChargeValue": 1.0 } },
+            "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(-1) },
+        }),
     )
     .await;
     em.custom_line_item(
@@ -728,13 +733,17 @@ async fn a_report_grouped_by_product_name_reports_each_presented_product() {
     let group = em.billing_group("products").await;
 
     // Items differing in the product they present under: two under one service, one under
-    // another, one under none at all, and one of them bounded to the second period.
+    // another, one under none at all, and one of them bounded to the second period. Each
+    // item that is meant to be in effect over the whole report names the first period of
+    // it as its inclusive start, since an item is in effect no earlier than the period it
+    // was created in.
     em.custom_line_item(
         &group,
         "storage",
         json!({
             "ChargeDetails": { "Type": "FEE", "Flat": { "ChargeValue": 10.0 } },
             "PresentationDetails": { "Service": "S3" },
+            "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(-1) },
         }),
     )
     .await;
@@ -757,13 +766,17 @@ async fn a_report_grouped_by_product_name_reports_each_presented_product() {
         json!({
             "ChargeDetails": { "Type": "CREDIT", "Flat": { "ChargeValue": 3.0 } },
             "PresentationDetails": { "Service": "EC2" },
+            "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(-1) },
         }),
     )
     .await;
     em.custom_line_item(
         &group,
         "unpresented",
-        json!({ "ChargeDetails": { "Type": "FEE", "Flat": { "ChargeValue": 7.0 } } }),
+        json!({
+            "ChargeDetails": { "Type": "FEE", "Flat": { "ChargeValue": 7.0 } },
+            "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(-1) },
+        }),
     )
     .await;
 
