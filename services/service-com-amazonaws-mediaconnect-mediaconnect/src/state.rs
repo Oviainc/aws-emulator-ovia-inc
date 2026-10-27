@@ -3873,10 +3873,16 @@ impl StoredRouterInput {
 
     /// Enter `DELETING` now and owe the record's removal once [`TRANSITION_SPAN`] has
     /// passed — the deletion counterpart of [`Self::begin_transition`], which owes a STATE
-    /// instead.
+    /// instead. The delete supersedes whatever state change was owed before it: an input on
+    /// its way out does not settle into `ACTIVE` on the way, so the state the accepted delete
+    /// reported is the state every later read answers until the record stops existing. The
+    /// accepted delete is a change to the record, so it moves `updated_at` as every other
+    /// mutation does.
     pub fn begin_deletion(&mut self, now: SystemTime) {
         self.state = ROUTER_INPUT_STATE_DELETING.to_string();
+        self.pending = None;
         self.removal_due_at = Some(now + TRANSITION_SPAN);
+        self.updated_at = now;
     }
 
     /// `RouterInput$Messages`: "messages with information about the router input".
@@ -4402,6 +4408,21 @@ impl StoredRouterOutput {
     /// [`ComAmazonawsMediaconnectMediaconnectState::settle_due_transitions`].
     pub fn is_removal_due(&self, now: SystemTime) -> bool {
         self.removal_due_at.is_some_and(|due_at| now >= due_at)
+    }
+
+    /// Enter `DELETING` now and owe the record's removal once [`TRANSITION_SPAN`] has
+    /// passed — the deletion counterpart of [`Self::begin_transition`], which owes a STATE
+    /// instead, and the router output spelling of [`StoredRouterInput::begin_deletion`] and
+    /// [`StoredRouterNetworkInterface::begin_deletion`]. The delete supersedes whatever state
+    /// change was owed before it: a router output on its way out does not settle into
+    /// `STANDBY` on the way, so the state the accepted delete reported is the state every
+    /// later read answers until the record stops existing. The accepted delete is a change to
+    /// the record, so it moves `updated_at` as every other mutation does.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.state = ROUTER_OUTPUT_STATE_DELETING.to_string();
+        self.pending = None;
+        self.removal_due_at = Some(now + TRANSITION_SPAN);
+        self.updated_at = now;
     }
 
     /// `RouterOutput$OutputType`, the variant of the output's configuration union —

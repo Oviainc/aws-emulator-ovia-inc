@@ -173,3 +173,5 @@ mod get_router_output;
 mod router_input_source_metadata;
 #[path = "all/router_input_thumbnail.rs"]
 mod router_input_thumbnail;
+#[path = "all/router_deletion_supersedes_owed_transitions.rs"]
+mod router_deletion_supersedes_owed_transitions;
