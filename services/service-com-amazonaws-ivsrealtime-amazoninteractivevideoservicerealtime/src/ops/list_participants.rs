@@ -291,6 +291,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .take(page_size)
             .map(|record| {
                 record.to_summary(
+                    &store,
+                    &input.stage_arn,
                     replications
                         .get(&record.participant_id)
                         .unwrap_or(&no_replication),
