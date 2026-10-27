@@ -18,10 +18,11 @@
 //! members, so `DescribeJobs` reports exactly what was submitted.
 //!
 //! The job is returned in the non-terminal `SUBMITTED` status; the clock owns every move
-//! out of it (see [`crate::state`]). Entering `SUBMITTED` is a job state change like any
-//! other, so this call also publishes a `Batch Job State Change` event for it onto the
-//! account's default EventBridge bus, together with any transition the clock had already
-//! made due (`state::publish_job_state_changes`).
+//! out of it (see [`crate::state`]). A job state change event reports a job MOVING, so no
+//! `Batch Job State Change` event is published for the status this call stores: the job's
+//! event stream begins at its first move out of it. This call still drains and publishes
+//! any transition the clock had already made due
+//! (`state::publish_job_state_changes`).
 //!
 //! Parts of the surface this slice does NOT implement answer 501 rather than accept a
 //! request they would then answer wrongly: `arrayProperties` and `nodeOverrides` (an
