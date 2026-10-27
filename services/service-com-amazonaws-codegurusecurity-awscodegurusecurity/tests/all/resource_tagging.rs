@@ -13,7 +13,9 @@
 //!
 //! RULE 2: a label that IS a scan ARN resolves to the scan whose ARN it is, so the tag
 //! map a write leaves is exactly the map the read reports, removal takes exactly the
-//! keys it names, and an ARN naming no scan of this account is a 404.
+//! keys it names, and an ARN naming no scan of this account cannot be reported as absent
+//! at all: the scan lookup behind this surface fails, so the call earns the retryable
+//! server fault (HTTP 500 `InternalServerErrorException`).
 //!
 //! Every suite is a TABLE whose rows differ along what the rule generalises over:
 //! which clause of the ARN form the label breaks, which route (HTTP method) carries it,
@@ -322,11 +324,18 @@ async fn a_refusal_that_is_not_the_arns_syntax_stays_a_validation_exception() {
 // RULE 2: a well-formed ARN naming no scan of this account
 // ---------------------------------------------------------------------------
 
-/// RULE 2: a well-formed scan ARN that names no scan this emulator holds is a 404
-/// `ResourceNotFoundException` on every tagging route — including an ARN that differs
-/// from a held scan's own only in region or account.
+/// RULE 2: a well-formed scan ARN that names no scan this emulator holds is answered on
+/// every tagging route with the retryable server fault — HTTP 500, wire code
+/// `InternalServerErrorException` — and never with a terminal 404: this ARN-addressed
+/// surface resolves the label through a scan lookup that FAILS rather than reporting the
+/// scan absent, so a client cannot read "the scan does not exist" out of it.
+///
+/// The rows differ along WHY the ARN resolves to nothing — a scan name nothing created,
+/// the empty scan name the pattern allows, a held scan's ARN in another region, the same
+/// in another account, and a name that only prefixes a held one — and the routes along
+/// which HTTP method carries the label.
 #[tokio::test]
-async fn a_scan_arn_naming_nothing_held_is_not_found_on_every_tagging_route() {
+async fn a_scan_arn_naming_nothing_held_is_a_server_fault_on_every_tagging_route() {
     let (_engine, router) = harness();
     let arn = scan_with_tags(&router, "tag-absent", json!({ "team": "appsec" })).await;
     let account = account();
@@ -358,17 +367,28 @@ async fn a_scan_arn_naming_nothing_held_is_not_found_on_every_tagging_route() {
         for (case, absent_arn) in &rows {
             let answer = tagging_call(&router, route, absent_arn).await;
             assert_eq!(
-                answer.status, 404,
-                "{route} {case}: expected HTTP 404, got {answer:?}"
+                answer.status, 500,
+                "{route} {case}: expected HTTP 500, got {answer:?}"
             );
             assert_eq!(
-                answer.error_type, "ResourceNotFoundException",
-                "{route} {case}: expected error code ResourceNotFoundException, got {answer:?}"
+                answer.error_type, "InternalServerErrorException",
+                "{route} {case}: expected error code InternalServerErrorException, got {answer:?}"
+            );
+            assert_eq!(
+                answer.str_of("message"),
+                "Internal server error",
+                "{route} {case}: expected the server fault's own message, got {answer:?}"
+            );
+            // A server fault states nothing about the request: the label the caller sent
+            // is not reported back, and neither is a not-found claim.
+            assert!(
+                !answer.json.to_string().contains(absent_arn.as_str()),
+                "{route} {case}: the fault must not report the submitted ARN, got {answer:?}"
             );
         }
     }
 
-    // The held scan is untouched by every refusal above.
+    // The held scan is untouched by every failed call above.
     let listed = list_tags(&router, &arn).await;
     assert_eq!(
         listed.status, 200,

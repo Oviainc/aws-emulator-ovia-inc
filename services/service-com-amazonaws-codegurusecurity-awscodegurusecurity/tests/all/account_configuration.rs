@@ -426,6 +426,12 @@ async fn the_configured_key_drives_the_required_upload_headers() {
     }
 }
 
+/// The expression a refused `kmsKeyArn` is told to satisfy: the modelled
+/// `EncryptionConfig$kmsKeyArn` `@pattern` cited at the top of this file, quoted the way
+/// AWS quotes it — without the whole-value `^`/`$` the model wraps the service's own
+/// expression in (`service_common::validation::unanchored`).
+const KMS_KEY_ARN_PATTERN_AS_STATED: &str = r"arn:aws:kms:[\S]+:[\d]{12}:key\/(([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})|(mrk-[0-9a-zA-Z]{32}))";
+
 #[tokio::test]
 async fn a_kms_key_arn_outside_the_modelled_pattern_is_refused_and_changes_nothing() {
     let (engine, router) = harness();
@@ -490,6 +496,26 @@ async fn a_kms_key_arn_outside_the_modelled_pattern_is_refused_and_changes_nothi
             answer.error_type,
             answer.json
         );
+        // The refusal states which member failed, the value it carried and the
+        // expression that value had to satisfy, so the caller can fix the request from
+        // the message alone. The empty string also breaks the member's `@length`
+        // minimum, so it is stated with one clause more.
+        let message = answer.str_of("message");
+        let clause = format!(
+            "Value '{value}' at 'encryptionConfig.kmsKeyArn' failed to satisfy constraint: \
+             Member must satisfy regular expression pattern: {KMS_KEY_ARN_PATTERN_AS_STATED}"
+        );
+        assert!(
+            message.contains(&clause),
+            "case {case:?}: expected the clause {clause:?}, got {message:?}"
+        );
+        if !value.is_empty() {
+            assert_eq!(
+                message,
+                format!("1 validation error detected: {clause}"),
+                "case {case:?}: expected the one-violation envelope, got {message:?}"
+            );
+        }
 
         let stored = store_of(&engine).lock().encryption_kms_key_arn();
         assert_eq!(
