@@ -31,7 +31,9 @@
 //! needs a grant: an `Allow` about it in the caller's identity-based policies, or one in
 //! the queue's policy that names the CALLER, and (where the principal carries one) a
 //! permissions boundary that also allows it. With neither grant the request is refused —
-//! IAM's implicit deny — and the operation has no effect.
+//! IAM's implicit deny, naming the document that withheld the grant: the boundary where the
+//! identity-based policies did allow the call, and those policies where nothing allowed it
+//! at all — and the operation has no effect.
 //!
 //! A statement that names the ACCOUNT rather than the caller (the account's root ARN, or
 //! the bare account id that stands for it) delegates to the account rather than granting:
@@ -188,7 +190,8 @@ pub struct Caller {
     /// The identity-based policy documents in force on the principal.
     pub documents: Vec<String>,
     /// The permissions boundary document in force on the principal, when it carries one
-    /// this emulator can read.
+    /// this emulator can read, as the IAM store resolves it
+    /// ([`iam_store::ComAmazonawsIamAwsidentitymanagementv20100508State::permissions_boundary_document`]).
     pub boundary: Option<String>,
     /// The condition keys this call can answer for: the `aws:PrincipalTag/<key>` of every
     /// tag the calling principal carries, and the keys that name the principal itself (see
@@ -227,6 +230,13 @@ fn reported_action(action: &str) -> String {
 /// missing is its own, so what the refusal names is the action no policy allows it.
 fn implicit_deny(named_action: &str) -> String {
     format!("because no identity-based policy allows the {named_action} action")
+}
+
+/// The reason an implicit deny states when the identity-based policies DID allow the
+/// call and the permissions boundary withheld it: the document that refused it is the
+/// boundary, so that is the one the refusal names.
+fn boundary_implicit_deny(named_action: &str) -> String {
+    format!("because no permissions boundary allows the {named_action} action")
 }
 
 /// Whether the policies in force let this request perform its operation on `resource`.
@@ -299,12 +309,13 @@ pub fn authorize<Eng: Send + Sync + 'static>(
         match iam::identity_decision(::std::slice::from_ref(boundary), &granting) {
             Decision::Allowed => {}
             // An explicit deny is a fact about the boundary document, so the refusal names
-            // it; a boundary that merely states nothing withheld no grant of its own, and
-            // the request is refused for the same reason an ungranted one is.
+            // it; a boundary that merely states nothing withheld the grant the
+            // identity-based policies gave, so the refusal names the boundary as the
+            // document that allows nothing here.
             Decision::Denied => {
                 return Err(refusal("with an explicit deny in a permissions boundary"))
             }
-            Decision::NotStated => return Err(refusal(&implicit_deny(&named_action))),
+            Decision::NotStated => return Err(refusal(&boundary_implicit_deny(&named_action))),
         }
     }
     Ok(())
@@ -423,7 +434,7 @@ pub fn caller<Eng: Send + Sync + 'static>(
         &entity_tags(&store, &identity_arn),
         &session_tags,
     );
-    caller.boundary = boundary_document(&store, &identity_arn);
+    caller.boundary = store.permissions_boundary_document(&identity_arn);
     caller
 }
 
@@ -507,35 +518,6 @@ fn role_arn_of_session(
         .roles
         .get(&iam_store::name_key(name))
         .map(|role| role.arn.clone())
-}
-
-/// The permissions boundary document in force on the identity `arn` names, or `None` when
-/// it carries none — or carries one whose document this account does not hold, which is a
-/// cap this emulator cannot read and so cannot apply.
-fn boundary_document(
-    store: &iam_store::ComAmazonawsIamAwsidentitymanagementv20100508State,
-    arn: &str,
-) -> Option<String> {
-    let entity = iam_store::parse_entity_arn(arn)?;
-    let key = iam_store::name_key(&entity.name);
-    let boundary = match entity.kind {
-        iam_store::EntityKind::Role => store
-            .roles
-            .get(&key)
-            .and_then(|role| iam_store::permissions_boundary_arn(role.permissions_boundary.as_ref())),
-        iam_store::EntityKind::User => store
-            .users
-            .get(&key)
-            .and_then(|user| iam_store::permissions_boundary_arn(user.permissions_boundary.as_ref())),
-        iam_store::EntityKind::Group => None,
-    }?
-    .to_string();
-    let policy = store.resolve_policy(&boundary)?;
-    let default = policy.policy.default_version_id.clone()?;
-    policy
-        .versions
-        .get(&default)
-        .and_then(|version| version.document.clone())
 }
 
 /// Why a `Policy` attribute value cannot be stored, or `None` when it is one Amazon SQS

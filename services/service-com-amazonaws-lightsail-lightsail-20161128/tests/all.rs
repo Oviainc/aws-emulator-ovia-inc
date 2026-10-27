@@ -75,6 +75,8 @@ mod container_image_registry_login;
 mod container_service_delete;
 #[path = "all/container_service_deployment.rs"]
 mod container_service_deployment;
+#[path = "all/container_service_deployment_history.rs"]
+mod container_service_deployment_history;
 #[path = "all/container_service_lifecycle.rs"]
 mod container_service_lifecycle;
 #[path = "all/container_service_log.rs"]

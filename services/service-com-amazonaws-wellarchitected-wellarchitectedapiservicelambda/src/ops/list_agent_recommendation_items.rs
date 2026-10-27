@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAgentRecommendationItems
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAgentRecommendationItems`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAgentRecommendationItems::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Lists recommendation items for a specific recommendation": one page of the
+//! `AgentRecommendationItemSummary` projections of the things the recommendation the ARN
+//! names AFFECTS, in item-id order, narrowed by the `type` filter the request carries and
+//! resumed from the opaque `nextToken` a previous page issued.
+//!
+//! An item represents "an Amazon Web Services resource or recommendation affected by the
+//! optimization recommendation", and its `metadata` is "a snapshot of the resource or
+//! recommendation at the time of generation"
+//! (`smithy_query(query="doc", shape="AgentRecommendationItemSummary")`), so the items of
+//! one recommendation are DERIVED from the finding it reports and from what its generation
+//! produced beside it, rather than held in a map of their own:
+//!
+//! * one `AWS_RESOURCE` item per Amazon Web Services service the finding applies to
+//!   (`$awsServices`). This emulator analyses no customer resources — which is why a
+//!   recommendation reports no `numberOfResources`
+//!   ([`crate::state::AgentRecommendationRecord::to_summary`]) — so the AWS side of a
+//!   finding is the service it is about, and the item's metadata names that service rather
+//!   than an invented resource id.
+//! * one `RECOMMENDATION` item per OTHER recommendation of the same generation whose pillar
+//!   this finding's `$crossPillarBenefits` or `$tradeOffs` name: those members are what the
+//!   finding says about another pillar, so a recommendation the same analysis produced for
+//!   that pillar is a recommendation this one affects. A relation to a pillar the
+//!   generation did not scope names no recommendation, and a recommendation a LATER
+//!   generation produced did not exist when this one was generated, so neither is an item
+//!   here — which is what keeps a snapshot taken at generation stable across later reads.
+//!
+//! A reporting operation — modelled `@readonly`, so it answers from the store and writes
+//! nothing a caller asked for. The one write it makes is the one the CLOCK already made
+//! due: a generation whose analysis has finished has produced its recommendations, and
+//! nothing runs between requests, so they are recorded on the way past
+//! ([`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::materialise_due_agent_recommendations`]).
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +178,324 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAgentRecommendationItems` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAgentRecommendationItemsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAgentRecommendationItemsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Well-Architected Tool agent profile store is unavailable"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        // `maxResults` is modelled `@default(100)`, so it arrives as a value rather than
+        // an option; the clamp restates the member's `@range(min: 1, max: 1000)`.
+        let page_size = crate::state::agent_list_page_size(input.max_results);
+
+        // Defence in depth for a caller that builds the input in process (a test or
+        // another service's handler): over HTTP the boundary walk in `crate::service`
+        // already refuses a `RecommendationItemType` outside the enum's published set with
+        // this same 400 before this handler runs. It is kept so an unpublished filter
+        // value can never be read as "no filter" and answered with every item.
+        if let Some(filter) = input.r#type.as_deref() {
+            if !RECOMMENDATION_ITEM_TYPE_VALUES.contains(&filter) {
+                return Err(ListAgentRecommendationItemsErrorModeled::ValidationException(
+                    crate::state::member_constraint_exception(
+                        ITEM_TYPE_MEMBER,
+                        &format!(
+                            "Member must satisfy enum value set: [{}], got {filter}",
+                            RECOMMENDATION_ITEM_TYPE_VALUES.join(", ")
+                        ),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // An opaque token this service did not issue is a bad request, not an empty page:
+        // a token is this service's own cursor rather than a value a caller composes, so it
+        // cannot be corrected, only obtained again, which is what `CANNOT_PARSE` says.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                match crate::state::decode_agent_recommendation_item_next_token(token) {
+                    Some(cursor) => Some(cursor),
+                    None => {
+                        return Err(
+                            ListAgentRecommendationItemsErrorModeled::ValidationException(
+                                crate::state::cannot_parse_exception(
+                                    crate::state::NEXT_TOKEN_MEMBER,
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                                ),
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            }
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The recommendations of a generation whose analysis the clock has finished exist
+        // from that instant, so they are recorded before this ARN is resolved: a caller may
+        // list the items of one as soon as the generation that produced it completed,
+        // whether or not anybody polled that generation in between.
+        store.materialise_due_agent_recommendations(now);
+
+        // "The Amazon Resource Name (ARN) of the recommendation to list items for": an ARN
+        // that names no recommendation this account holds has no items to report, which is
+        // the 404 this operation models.
+        let Some(record) = store.agent_recommendation(&input.recommendation_arn) else {
+            return Err(
+                ListAgentRecommendationItemsErrorModeled::ResourceNotFoundException(
+                    crate::state::agent_recommendation_not_found(&input.recommendation_arn),
+                )
+                .into(),
+            );
+        };
+
+        // An item id names one item of this recommendation for its whole life, so the id
+        // order the projection is built in IS this service's list order and a cursor is a
+        // single id. It is start-EXCLUSIVE: the page resumes just past the last id already
+        // returned, so every item is enumerated exactly once across the pages — and the
+        // `type` filter is applied BEFORE the page is cut, so a filtered enumeration pages
+        // over the selected items rather than over gaps in the unfiltered one.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAgentRecommendationItems"))
+        // One item past the page is taken rather than the whole tail: that one item is
+        // exactly the evidence that a further page exists.
+        let mut page: Vec<AgentRecommendationItemSummary> = item_summaries(&store, record)
+            .into_iter()
+            .filter(|item| cursor.as_deref().is_none_or(|last| item.id.as_str() > last))
+            .filter(|item| {
+                input
+                    .r#type
+                    .as_deref()
+                    .is_none_or(|wanted| wanted == item.r#type)
+            })
+            .take(page_size + 1)
+            .collect();
+
+        // The extra item, if the walk reached one, is not part of this page: it only says a
+        // further page exists, and the page's last id is the cursor that resumes the
+        // enumeration just past it.
+        let has_more = page.len() > page_size;
+        page.truncate(page_size);
+        let next_token = match page.last() {
+            Some(last) if has_more => Some(
+                crate::state::encode_agent_recommendation_item_next_token(&last.id),
+            ),
+            _ => None,
+        };
+
+        Ok(ListAgentRecommendationItemsOutput {
+            items: page,
+            next_token,
+        })
     }
+}
+
+/// The modelled input member an item-type finding names
+/// (`ListAgentRecommendationItemsRequest$type`), as `ValidationExceptionField$Name` reports
+/// it.
+const ITEM_TYPE_MEMBER: &str = "type";
+
+/// `RecommendationItemType$AWS_RESOURCE`: the item is an Amazon Web Services resource the
+/// recommendation affects (`smithy_query(query="shape", shape="RecommendationItemType")`).
+const ITEM_TYPE_AWS_RESOURCE: &str = "AWS_RESOURCE";
+
+/// `RecommendationItemType$RECOMMENDATION`: the item is another recommendation the
+/// recommendation affects.
+const ITEM_TYPE_RECOMMENDATION: &str = "RECOMMENDATION";
+
+/// What the id of an `AWS_RESOURCE` item starts with, so one enumeration orders the items
+/// of a recommendation by kind and then by name, and no id of one kind can collide with an
+/// id of the other.
+const AWS_RESOURCE_ID_PREFIX: &str = "aws-resource/";
+
+/// What the id of a `RECOMMENDATION` item starts with, for the reason
+/// [`AWS_RESOURCE_ID_PREFIX`] gives.
+const RECOMMENDATION_ID_PREFIX: &str = "recommendation/";
+
+/// The metadata key naming the Amazon Web Services service an `AWS_RESOURCE` item is about,
+/// as the finding publishes it (`$awsServices`).
+const SERVICE_KEY: &str = "service";
+
+/// The metadata key naming the `Pillar` the item is read under.
+const PILLAR_KEY: &str = "pillar";
+
+/// The metadata key naming the `RecommendationArn` of the recommendation a `RECOMMENDATION`
+/// item is.
+const RECOMMENDATION_ARN_KEY: &str = "recommendationArn";
+
+/// The metadata key naming that recommendation's title.
+const TITLE_KEY: &str = "title";
+
+/// The metadata key naming the members of THIS finding that relate it to the recommendation
+/// the item is: `crossPillarBenefits`, `tradeOffs`, or both.
+const RELATED_THROUGH_KEY: &str = "relatedThrough";
+
+/// The finding member that says what acting on it also buys under another pillar
+/// (`GetAgentRecommendationResponse$crossPillarBenefits`), as `relatedThrough` names it.
+const CROSS_PILLAR_BENEFITS_MEMBER: &str = "crossPillarBenefits";
+
+/// The finding member that says what acting on it costs under another pillar
+/// (`GetAgentRecommendationResponse$tradeOffs`), as `relatedThrough` names it.
+const TRADE_OFFS_MEMBER: &str = "tradeOffs";
+
+/// Every item of one recommendation, in id order.
+///
+/// The module docs give the two kinds and why they are derived rather than stored. Both
+/// carry the identity and instant of the RECOMMENDATION: an item is a snapshot taken when
+/// the recommendation was generated, so nothing modifies one afterwards and the modelled
+/// `lastModifiedBy` / `lastModifiedAt` stay absent.
+fn item_summaries(
+    store: &crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState,
+    record: &crate::state::AgentRecommendationRecord,
+) -> Vec<AgentRecommendationItemSummary> {
+    let created_at = ::aws_smithy_types::DateTime::from(record.created_at);
+    let mut items: Vec<AgentRecommendationItemSummary> = record
+        .content
+        .aws_services
+        .iter()
+        .map(|service| AgentRecommendationItemSummary {
+            id: format!("{AWS_RESOURCE_ID_PREFIX}{}", id_part(service)),
+            recommendation_arn: record.arn.clone(),
+            r#type: ITEM_TYPE_AWS_RESOURCE.to_string(),
+            metadata: metadata(vec![
+                (
+                    SERVICE_KEY,
+                    ::aws_smithy_types::Document::String((*service).to_string()),
+                ),
+                (
+                    PILLAR_KEY,
+                    ::aws_smithy_types::Document::String(record.content.pillar.to_string()),
+                ),
+            ]),
+            created_by: record.created_by.clone(),
+            created_at,
+            last_modified_by: None,
+            last_modified_at: None,
+        })
+        .collect();
+
+    // The recommendations the SAME generation produced beside this one: a recommendation of
+    // another profile is not one this analysis produced, and one of a later generation of
+    // this profile did not exist when this recommendation was generated.
+    let siblings = store
+        .agent_recommendations
+        .get(&record.profile_arn)
+        .into_iter()
+        .flat_map(|recommendations| recommendations.values())
+        .filter(|sibling| {
+            sibling.generation_id == record.generation_id && sibling.arn != record.arn
+        });
+
+    for sibling in siblings {
+        // What this finding says about the sibling's pillar. A sibling no member of this
+        // finding relates to is a recommendation of the same analysis that this one does
+        // not affect, so it is no item of it.
+        let related: Vec<&'static str> = [
+            (
+                CROSS_PILLAR_BENEFITS_MEMBER,
+                record
+                    .content
+                    .cross_pillar_benefits
+                    .iter()
+                    .any(|benefit| benefit.pillar == sibling.content.pillar),
+            ),
+            (
+                TRADE_OFFS_MEMBER,
+                record
+                    .content
+                    .trade_offs
+                    .iter()
+                    .any(|trade_off| trade_off.pillar == sibling.content.pillar),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(member, relates)| relates.then_some(member))
+        .collect();
+        if related.is_empty() {
+            continue;
+        }
+
+        items.push(AgentRecommendationItemSummary {
+            // One generation produces one recommendation per pillar it scoped, so the
+            // sibling's pillar names it among the items of this recommendation.
+            id: format!(
+                "{RECOMMENDATION_ID_PREFIX}{}",
+                id_part(sibling.content.pillar)
+            ),
+            recommendation_arn: record.arn.clone(),
+            r#type: ITEM_TYPE_RECOMMENDATION.to_string(),
+            metadata: metadata(vec![
+                (
+                    RECOMMENDATION_ARN_KEY,
+                    ::aws_smithy_types::Document::String(sibling.arn.clone()),
+                ),
+                (
+                    PILLAR_KEY,
+                    ::aws_smithy_types::Document::String(sibling.content.pillar.to_string()),
+                ),
+                (
+                    TITLE_KEY,
+                    ::aws_smithy_types::Document::String(sibling.content.title.to_string()),
+                ),
+                (
+                    RELATED_THROUGH_KEY,
+                    ::aws_smithy_types::Document::Array(
+                        related
+                            .iter()
+                            .map(|member| {
+                                ::aws_smithy_types::Document::String((*member).to_string())
+                            })
+                            .collect(),
+                    ),
+                ),
+            ]),
+            created_by: record.created_by.clone(),
+            created_at,
+            last_modified_by: None,
+            last_modified_at: None,
+        });
+    }
+
+    // The listing's order, and the order its start-exclusive cursor walks: the ids are
+    // distinct, so the sort is total and a page can neither repeat nor skip an item.
+    items.sort_by(|left, right| left.id.cmp(&right.id));
+    items
+}
+
+/// One item's `metadata`: "a snapshot of the resource or recommendation at the time of
+/// generation", as the untyped `Document` member carries it.
+fn metadata(members: Vec<(&str, ::aws_smithy_types::Document)>) -> ::aws_smithy_types::Document {
+    ::aws_smithy_types::Document::Object(
+        members
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect(),
+    )
+}
+
+/// The id-safe form of one published name — the service a finding applies to, or the pillar
+/// a related recommendation is for.
+///
+/// `id` is "the unique identifier of the recommendation item" and the model publishes no
+/// form for it, so it is this emulator's own stable slug of the name the item is about,
+/// exactly as the Trusted Advisor check ids already are: lower-cased, with every run of
+/// characters an id does not carry collapsed to one `-`. Stable, so the id of an item does
+/// not move between two readings of the same recommendation.
+fn id_part(name: &str) -> String {
+    let mut id = String::with_capacity(name.len());
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            id.extend(character.to_lowercase());
+        } else if !id.is_empty() && !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    id.trim_end_matches('-').to_string()
 }

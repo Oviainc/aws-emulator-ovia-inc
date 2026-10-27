@@ -336,9 +336,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ecr_image_puller_role_active,
                 // The deployment the request named is the one WAITING to become
                 // active: nothing is running on a service that is still being
-                // created.
-                current_deployment: None,
-                next_deployment: deployment.clone(),
+                // created, and the service's history holds just that one.
+                deployments: deployment.clone().into_iter().collect(),
                 next_deployment_version: if deployment.is_some() { 2 } else { 1 },
                 // Nothing is registered to a service this call just created: an
                 // image is registered only after a push puts it in the service's

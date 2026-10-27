@@ -21,13 +21,18 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. THIS service uses it: every modelled operation is served through it
+//!   wrapped in `StatedPerOperation`, which is what puts the request's own lists in
+//!   hand when a constraint broken by a list's ELEMENT has to be stated at the list
+//!   member (see the inline note on that wrapper). The operation served is the one the
+//!   generated table's own protocol resolves, so nothing is re-routed.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. THIS service uses it: it keeps the framework's
-//!   `ValidationException` envelope, clause and echoed value, and reports a
+//!   `ValidationException` envelope, clause and echoed value, reports a
 //!   `@pattern` requirement as the expression without the model's outer `^`/`$`
-//!   anchors (see the inline note on that method).
+//!   anchors, and attributes a constraint broken by an element of a list to the list
+//!   member with that element's requirement nested (see the inline notes on those
+//!   methods).
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -42,9 +47,14 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema_server::ProtocolError;
+use service_common::validation::list_of_element;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
+    Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// The error code this service answers an input-constraint violation with: the
@@ -121,37 +131,135 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
     })
 }
 
-/// One violation's clause: the submitted value, the input position that carries it
-/// and the requirement it failed.
+/// What a clause states AROUND the requirement an ELEMENT of a list failed: the element's
+/// own requirement nested inside this, so the member reported is the list and the rule
+/// reported is the one its elements have to satisfy.
+const ELEMENT_CONSTRAINT_OPEN: &str = "Member must satisfy constraint: [";
+
+/// The deepest collection nesting one clause walks out of.
 ///
-/// The value is echoed as the framework recorded it — this message is the only place
-/// the server reports the offending input back, and a caller comparing the echo
-/// against what it sent must see its own bytes. An ABSENT member has no submitted
-/// value, so it is stated as the `null` it was.
-fn constraint_clause(violation: &Violation) -> Option<String> {
-    let requirement = requirement(&violation.kind)?;
-    Some(match &violation.value {
-        Some(submitted) => format!(
-            "Value '{submitted}' at '{}' failed to satisfy constraint: {requirement}",
-            violation.path
-        ),
-        None => format!(
-            "Value null at '{}' failed to satisfy constraint: {requirement}",
-            violation.path
-        ),
-    })
+/// A step out of a collection is spelled `<position>.member`, and the step a MAP entry
+/// carries is the key the CALLER chose, so a key spelled `<digits>.member` is
+/// indistinguishable from a list position by the path alone: without a ceiling, the nesting
+/// a request could ask for would grow with the length of such a key. Every list this
+/// service's inputs declare holds SCALARS (`ConfigurationCheckTypeList`, `TagKeyList`,
+/// `InstanceList`), so one step is all they can produce; the ceiling is one past that,
+/// enough to state a list of lists were the model to grow one.
+const MAX_ELEMENT_DEPTH: usize = 2;
+
+/// The member path a clause names, and how many collection steps it walked out of to get
+/// there: `instances.1.member` is stated at `instances`, one step out.
+///
+/// Bounded by [`MAX_ELEMENT_DEPTH`], so a path that keeps looking like an element step
+/// cannot nest a requirement without end. The element spelling itself is
+/// `service_common::validation::list_of_element`'s, the one place in the tree that mirrors
+/// the validating walk's path bookkeeping.
+fn collapsed(path: &str) -> (&str, usize) {
+    let mut at = path;
+    let mut depth = 0;
+    while depth < MAX_ELEMENT_DEPTH {
+        match list_of_element(at) {
+            Some(collection) => {
+                at = collection;
+                depth += 1;
+            }
+            None => break,
+        }
+    }
+    (at, depth)
+}
+
+/// What the list at `path` HELD, as a clause states it.
+///
+/// The request's own list when it is in hand (`service_common::validation::submitted_lists`
+/// renders every element the caller sent, in position order); otherwise the elements of
+/// that list the walk REFUSED, which is as much of the member's value as the violations
+/// themselves know. The fallback understates a list of which only some elements were
+/// refused, and is only reached on the path that is handed the violations alone
+/// ([`Service::override_refusal`]).
+fn list_value(
+    violations: &[Violation],
+    path: &str,
+    lists: &HashMap<String, String>,
+) -> Option<String> {
+    if let Some(rendered) = lists.get(path) {
+        return Some(rendered.clone());
+    }
+    let mut elements: Vec<&str> = Vec::new();
+    for violation in violations {
+        let (list, depth) = collapsed(&violation.path);
+        if depth == 0 || list != path {
+            continue;
+        }
+        if let Some(value) = violation.value.as_deref() {
+            if !elements.contains(&value) {
+                elements.push(value);
+            }
+        }
+    }
+    (!elements.is_empty()).then(|| format!("[{}]", elements.join(", ")))
 }
 
 /// The `ValidationException` message for a refusal: the AWS envelope
-/// (`N validation error(s) detected: `) over one clause per violation, joined with
-/// `; `.
+/// (`N validation error(s) detected: `) over one clause per failing (member, requirement),
+/// joined with `; `.
 ///
-/// `None` declines the whole refusal — see [`constraint_clause`].
-fn constraint_envelope(violations: &[Violation]) -> Option<String> {
-    let clauses: Vec<String> = violations
-        .iter()
-        .map(constraint_clause)
-        .collect::<Option<Vec<_>>>()?;
+/// A clause states the submitted value, the input position that carries it and the
+/// requirement it failed. The value is echoed as it was SUBMITTED — this message is the
+/// only place the server reports the offending input back, and a caller comparing the echo
+/// against what it sent must see its own bytes — and an ABSENT member, which has no
+/// submitted value, is stated as the `null` it was.
+///
+/// A constraint broken by an ELEMENT of a list is stated at the LIST member, with no
+/// position and no `member` step: the value echoed is the whole list the member held
+/// ([`list_value`]) and the element's requirement is nested inside
+/// [`ELEMENT_CONSTRAINT_OPEN`]. Two elements of one list that broke the same rule are
+/// therefore ONE clause, while a member that broke two rules still states both. A
+/// constraint broken by the list ITSELF (its own `@length`) is not nested, and neither is
+/// one broken by a member INSIDE a structure element, which keeps its own full path.
+///
+/// `None` declines the whole refusal, which keeps the framework's own wording: a violation
+/// class this service has no requirement sentence for would otherwise be stated as a clause
+/// with no requirement at all.
+fn constraint_message(
+    violations: &[Violation],
+    lists: &HashMap<String, String>,
+) -> Option<String> {
+    let mut stated: HashSet<(String, String)> = HashSet::new();
+    let mut clauses: Vec<String> = Vec::new();
+    for violation in violations {
+        let (path, depth) = collapsed(&violation.path);
+        let mut requirement = requirement(&violation.kind)?;
+        for _ in 0..depth {
+            requirement = format!("{ELEMENT_CONSTRAINT_OPEN}{requirement}]");
+        }
+        if !stated.insert((path.to_string(), requirement.clone())) {
+            continue;
+        }
+        let held = (depth > 0)
+            .then(|| list_value(violations, path, lists))
+            .flatten();
+        clauses.push(match (&violation.value, held) {
+            (None, _) => {
+                format!("Value null at '{path}' failed to satisfy constraint: {requirement}")
+            }
+            (Some(submitted), held) => {
+                let shown = held.as_deref().unwrap_or(submitted.as_str());
+                format!("Value '{shown}' at '{path}' failed to satisfy constraint: {requirement}")
+            }
+        });
+    }
+    envelope(&clauses)
+}
+
+/// AWS's envelope over the clauses of one refusal: `1 validation error detected: <clause>`
+/// for one, `<N> validation errors detected: <clause>; <clause>` for several.
+///
+/// The wording is the framework's own (`aws_smithy_schema_server::constraints::envelope`),
+/// which cannot be CALLED here because it renders each clause from a [`Violation`] and a
+/// nested element requirement is not a [`ViolationKind`] any violation carries. The two are
+/// pinned against each other in [`tests`].
+fn envelope(clauses: &[String]) -> Option<String> {
     match clauses.len() {
         0 => None,
         1 => Some(format!("1 validation error detected: {}", clauses[0])),
@@ -162,6 +270,12 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     }
 }
 
+/// [`constraint_message`] for the path that is handed the violations ALONE, with no
+/// request's lists to read ([`Service::override_refusal`]).
+fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    constraint_message(violations, &HashMap::new())
+}
+
 /// The `com-amazonaws-ssmsap-ssmsap` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -169,6 +283,28 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`StatedPerOperation`] so a refused request is worded the way this service words it,
+    /// with the request's own lists in hand. Keyed by the routing key the protocol resolves
+    /// — the key the generated table uses — and built from the SAME shared engine, so a
+    /// wrapped operation reads and writes the one store.
+    stated: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`StatedPerOperation`] and keyed by its operation shape name — the routing key
+/// `ServerProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! stated_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(StatedPerOperation::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -176,9 +312,134 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut stated = OperationRoutingTable::new();
+        // EVERY modelled operation (27 of them, one per file in `src/ops/`), because the
+        // rule is the SERVICE's and not one operation's: an operation whose input declares
+        // no constrained list simply never has such a violation to state, which the wrapper
+        // reads off that operation's own input schema. An operation added later is added
+        // here as well, or it answers a refusal without the request's lists in hand; the
+        // test below fails when one is missing.
+        stated_operations!(
+            stated,
+            engine,
+            delete_resource_permission::DeleteResourcePermission,
+            deregister_application::DeregisterApplication,
+            get_application::GetApplication,
+            get_component::GetComponent,
+            get_configuration_check_operation::GetConfigurationCheckOperation,
+            get_database::GetDatabase,
+            get_operation::GetOperation,
+            get_resource_permission::GetResourcePermission,
+            list_applications::ListApplications,
+            list_components::ListComponents,
+            list_configuration_check_definitions::ListConfigurationCheckDefinitions,
+            list_configuration_check_operations::ListConfigurationCheckOperations,
+            list_databases::ListDatabases,
+            list_operation_events::ListOperationEvents,
+            list_operations::ListOperations,
+            list_sub_check_results::ListSubCheckResults,
+            list_sub_check_rule_results::ListSubCheckRuleResults,
+            list_tags_for_resource::ListTagsForResource,
+            put_resource_permission::PutResourcePermission,
+            register_application::RegisterApplication,
+            start_application::StartApplication,
+            start_application_refresh::StartApplicationRefresh,
+            start_configuration_checks::StartConfigurationChecks,
+            stop_application::StopApplication,
+            tag_resource::TagResource,
+            untag_resource::UntagResource,
+            update_application_settings::UpdateApplicationSettings,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            stated,
         }
+    }
+}
+
+/// One modelled operation, served so that a refused request is stated the way this service
+/// states it — in particular with the value a clause quotes at a LIST member, which is the
+/// whole list the caller sent and which no [`Violation`] carries.
+///
+/// Nothing else is re-implemented. A request this wrapper does not refuse is handed to the
+/// generated [`ErasedOperation::run`], which owns deserialize -> validate -> handle ->
+/// serialize, telemetry and every modelled error. The violations come from the framework's
+/// own machinery ([`stated_refusal`]), so this cannot refuse a request the framework's own
+/// walk would accept, nor accept one it would refuse. The cost is that a request this
+/// wrapper does not refuse is read twice, once here and once in the operation's own
+/// sequence, because the framework hands no already-built input to an operation. The
+/// structurally right place for the collecting half is the frozen crate — handing a handler,
+/// or `override_refusal`, the input it already built — which
+/// `services/common/src/validation.rs` records as the core seam this re-read exists only
+/// until.
+struct StatedPerOperation<O> {
+    operation: O,
+}
+
+impl<O> StatedPerOperation<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+/// This service's answer to every modelled constraint `req` breaks, for the operation `O`:
+/// the violations the framework's own walk finds and the wording this file gives them.
+/// `None` when the request breaks none — and for a failure that is NOT a refusal (a body
+/// the codec cannot read at all, a member of the wrong type), which the framework's own
+/// walk answers in its own envelope.
+///
+/// The collecting half is the tree's shared one,
+/// `service_common::validation::refusing_violations_with_lists`: one read of the request
+/// yields the framework's own violations (the protocol's deserializer for an absent
+/// `@required` member, `constraints::validate` over the built input) with each value echo
+/// restored to the bytes the caller sent, plus the request's own lists — the value a clause
+/// states at a LIST member. Nothing is re-checked here, and no second copy of that walk
+/// lives in this crate: both halves are bounded where those bounds are stated.
+fn stated_refusal<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<(Vec<Violation>, Refused)> {
+    let (violations, lists) =
+        service_common::validation::refusing_violations_with_lists::<O>(protocol, req);
+    if violations.is_empty() {
+        return None;
+    }
+    let stated = Refused {
+        code: VALIDATION_EXCEPTION.to_string(),
+        message: constraint_message(&violations, &lists)?,
+    };
+    Some((violations, stated))
+}
+
+impl<O> ErasedOperation for StatedPerOperation<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The definition is read, used and dropped inside each statement:
+            // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the await
+            // below would make this future non-`Send`.
+            let refused = stated_refusal::<O>(svc.definition().protocol(), req);
+            if let Some((violations, stated)) = refused {
+                return svc
+                    .definition()
+                    .refusal_response(ProtocolError::Invalid(violations), Some(stated));
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
     }
 }
 
@@ -204,25 +465,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol resolves,
+        // and the operation it names is the one served — wrapped in [`StatedPerOperation`]
+        // so a refused request is worded with the request's own lists in hand. A key the
+        // model does not name resolves to `None` here exactly as it does in the generated
+        // table, so the router's routing-error path is unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.stated.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it.
+        // service reword it. It is handed the violations ALONE — no request — so a
+        // clause stated at a LIST member has only the REFUSED elements of that list to
+        // quote; `StatedPerOperation` answers a modelled operation's refusals before this
+        // walk is reached, with the list the caller sent in hand. A refusal that gets here
+        // anyway is still stated by the SAME wording, so the two paths cannot differ on
+        // anything but how much of a list's value is known.
         //
-        // The ONE difference from the framework's own wording is the requirement a
-        // `@pattern` violation states: the expression without the model's outer
-        // anchors (see [`unanchored`]). The count, the clause, the echoed value and
-        // the envelope stay the framework's, and the code stays the modelled
-        // `ValidationException` (HTTP 400) the framework would have answered — so
-        // only the regex a caller reads out of the message changes.
+        // The differences from the framework's own wording are the requirement a
+        // `@pattern` violation states — the expression without the model's outer
+        // anchors (see [`unanchored`]) — and the member a constraint broken by a
+        // list's ELEMENT is attributed to (see [`constraint_message`]). The count, the
+        // clause form, the echoed value and the envelope stay the framework's, and the
+        // code stays the modelled `ValidationException` (HTTP 400) the framework would
+        // have answered.
         //
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure.
@@ -390,5 +658,248 @@ mod tests {
             constraint_envelope(&[]).is_none(),
             "case \"no violations\": there is nothing to state"
         );
+    }
+
+    /// A violation of `kind` at `path` holding `value`.
+    fn violation(path: &str, kind: ViolationKind, value: Option<&str>) -> Violation {
+        Violation {
+            path: path.to_string(),
+            kind,
+            value: value.map(str::to_string),
+        }
+    }
+
+    /// The count and the join are the framework's, for every clause count a refusal can
+    /// carry — pinned against the framework's own renderer, which [`envelope`] cannot call
+    /// because a nested element requirement is no [`ViolationKind`].
+    #[test]
+    fn the_envelope_counts_and_joins_clauses_the_way_the_framework_does() {
+        for count in 0_usize..4 {
+            let violations: Vec<Violation> = (0..count)
+                .map(|index| {
+                    violation(
+                        &format!("member{index}"),
+                        ViolationKind::MaxLength(8),
+                        Some("too long a value"),
+                    )
+                })
+                .collect();
+            let framework = aws_smithy_schema_server::constraints::envelope(&violations);
+            let clauses: Vec<String> = violations.iter().map(Violation::message).collect();
+            let mine = envelope(&clauses);
+            assert_eq!(
+                mine, framework,
+                "case {count} clause(s): expected the framework's envelope {framework:?}, \
+                 got {mine:?}"
+            );
+        }
+    }
+
+    /// A constraint broken by an ELEMENT of a list is stated at the LIST member, whatever
+    /// the constraint class — and a failure that is NOT on an element keeps its own path.
+    #[test]
+    fn an_elements_failure_is_stated_at_its_list_with_the_requirement_nested() {
+        // (case, violation, the whole expected message)
+        let rows = [
+            (
+                "an element outside its enum value set",
+                violation(
+                    "configurationCheckIds.1.member",
+                    ViolationKind::EnumValue(vec![
+                        "SAP_CHECK_01".to_string(),
+                        "SAP_CHECK_02".to_string(),
+                        "SAP_CHECK_03".to_string(),
+                    ]),
+                    Some("SAP_CHECK_NOT_A_REAL_ID"),
+                ),
+                "1 validation error detected: Value '[SAP_CHECK_NOT_A_REAL_ID]' at \
+                 'configurationCheckIds' failed to satisfy constraint: Member must satisfy \
+                 constraint: [Member must satisfy enum value set: [SAP_CHECK_01, \
+                 SAP_CHECK_02, SAP_CHECK_03]]",
+            ),
+            (
+                "an element outside its pattern, at a position past the first",
+                violation(
+                    "instances.3.member",
+                    ViolationKind::Pattern(r"^i-[\w\d]{8}$|^i-[\w\d]{17}$".to_string()),
+                    Some("not-an-instance"),
+                ),
+                "1 validation error detected: Value '[not-an-instance]' at 'instances' \
+                 failed to satisfy constraint: Member must satisfy constraint: [Member must \
+                 satisfy regular expression pattern: i-[\\w\\d]{8}$|^i-[\\w\\d]{17}]",
+            ),
+            (
+                "an element shorter than its minimum",
+                violation("tagKeys.1.member", ViolationKind::MinLength(1), Some("")),
+                "1 validation error detected: Value '[]' at 'tagKeys' failed to satisfy \
+                 constraint: Member must satisfy constraint: [Member must have length \
+                 greater than or equal to 1]",
+            ),
+            (
+                // The LIST's own constraint, not an element's: stated at the same path and
+                // NOT nested.
+                "the list's own length",
+                violation("instances", ViolationKind::MaxLength(1), Some("2 items")),
+                "1 validation error detected: Value '2 items' at 'instances' failed to \
+                 satisfy constraint: Member must have length less than or equal to 1",
+            ),
+            (
+                // A member INSIDE a structure element keeps its own full path.
+                "a member of a structure element",
+                violation("filters.1.member.name", ViolationKind::MinLength(1), Some("")),
+                "1 validation error detected: Value '' at 'filters.1.member.name' failed to \
+                 satisfy constraint: Member must have length greater than or equal to 1",
+            ),
+            (
+                // A map entry's step carries the caller's key, not a position.
+                "a map entry value",
+                violation(
+                    "tags.someKey.member",
+                    ViolationKind::MaxLength(256),
+                    Some("over long"),
+                ),
+                "1 validation error detected: Value 'over long' at 'tags.someKey.member' \
+                 failed to satisfy constraint: Member must have length less than or equal \
+                 to 256",
+            ),
+            (
+                "an absent required member",
+                violation("applicationId", ViolationKind::MissingRequiredMember, None),
+                "1 validation error detected: Value null at 'applicationId' failed to \
+                 satisfy constraint: Member must not be null",
+            ),
+        ];
+
+        for (case, violation, expected) in rows {
+            let stated = constraint_envelope(std::slice::from_ref(&violation))
+                .unwrap_or_else(|| panic!("case {case:?}: a constraint refusal is stated"));
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected {expected:?}, got {stated:?}"
+            );
+        }
+    }
+
+    /// The value a clause states at a list member is the WHOLE list when the request's
+    /// lists are in hand, and the refused elements when only the violations are — and two
+    /// elements breaking ONE rule are one clause, not two.
+    #[test]
+    fn a_list_clause_states_the_whole_list_when_it_is_in_hand() {
+        let allowed = ViolationKind::EnumValue(vec!["SAP_CHECK_01".to_string()]);
+        let violations = vec![
+            violation(
+                "configurationCheckIds.2.member",
+                allowed.clone(),
+                Some("NOPE_ONE"),
+            ),
+            violation(
+                "configurationCheckIds.3.member",
+                allowed,
+                Some("NOPE_TWO"),
+            ),
+        ];
+        let lists: HashMap<String, String> = [(
+            "configurationCheckIds".to_string(),
+            "[SAP_CHECK_01, NOPE_ONE, NOPE_TWO]".to_string(),
+        )]
+        .into_iter()
+        .collect();
+
+        let with_lists =
+            constraint_message(&violations, &lists).expect("a constraint refusal is stated");
+        assert_eq!(
+            with_lists,
+            "1 validation error detected: Value '[SAP_CHECK_01, NOPE_ONE, NOPE_TWO]' at \
+             'configurationCheckIds' failed to satisfy constraint: Member must satisfy \
+             constraint: [Member must satisfy enum value set: [SAP_CHECK_01]]",
+            "case \"the request's lists in hand\": got {with_lists:?}"
+        );
+
+        let without = constraint_envelope(&violations).expect("a constraint refusal is stated");
+        assert_eq!(
+            without,
+            "1 validation error detected: Value '[NOPE_ONE, NOPE_TWO]' at \
+             'configurationCheckIds' failed to satisfy constraint: Member must satisfy \
+             constraint: [Member must satisfy enum value set: [SAP_CHECK_01]]",
+            "case \"the violations alone\": got {without:?}"
+        );
+    }
+
+    /// A path that keeps looking like an element step nests at most [`MAX_ELEMENT_DEPTH`]
+    /// times, so the nesting a request can ask for is bounded.
+    #[test]
+    fn the_element_nesting_is_bounded() {
+        let deep = format!("outer{}", ".1.member".repeat(8));
+        let (path, depth) = collapsed(&deep);
+        assert_eq!(
+            depth, MAX_ELEMENT_DEPTH,
+            "case {deep:?}: expected at most {MAX_ELEMENT_DEPTH} steps out, got {depth}"
+        );
+        assert!(
+            path.starts_with("outer"),
+            "case {deep:?}: expected the remaining path to start at the outermost member, \
+             got {path:?}"
+        );
+        let stated = constraint_envelope(&[violation(
+            &deep,
+            ViolationKind::MinLength(1),
+            Some(""),
+        )])
+        .expect("a constraint refusal is stated");
+        assert_eq!(
+            stated.matches(ELEMENT_CONSTRAINT_OPEN).count(),
+            MAX_ELEMENT_DEPTH,
+            "case {deep:?}: expected {MAX_ELEMENT_DEPTH} nested requirements, got {stated:?}"
+        );
+    }
+
+    /// This service's Smithy model, as it ships beside this crate. Read at test time rather
+    /// than embedded: it is JSON no non-test build needs.
+    const MODEL_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-ssmsap-ssmsap.json"
+    );
+
+    /// The whole surface: every operation the model declares is served behind
+    /// [`StatedPerOperation`], under the same key the generated routing table is keyed by.
+    ///
+    /// The names come from the MODEL rather than from a second hand list, so an operation
+    /// added to the model and not to `stated_operations!` fails here instead of silently
+    /// answering a list-element refusal without the request's lists in hand.
+    #[test]
+    fn every_modelled_operation_is_served_with_this_services_refusal_wording() {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: serde_json::Value =
+            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let shapes = model["shapes"]
+            .as_object()
+            .expect("a Smithy model declares shapes");
+        let operations: Vec<&str> = shapes
+            .iter()
+            .filter(|(_, shape)| shape["type"] == "operation")
+            .filter_map(|(id, _)| id.rsplit('#').next())
+            .collect();
+        assert_eq!(
+            operations.len(),
+            27,
+            "case \"the model's surface\": expected this service's 27 operations, got \
+             {operations:?}"
+        );
+
+        let service = EmulatedService::new(Arc::new(engine::InMemoryEngine::new()));
+        for operation in operations {
+            assert!(
+                service.entry.routing_table().get(operation).is_some(),
+                "case {operation}: the generated table keys an operation by its shape name; \
+                 this one resolved to nothing, so the wrapper's key spelling is wrong"
+            );
+            assert!(
+                service.stated.get(operation).is_some(),
+                "case {operation}: every modelled operation is served behind \
+                 StatedPerOperation; this one is missing from stated_operations!, so a \
+                 list-element refusal of it quotes only the refused elements"
+            );
+        }
     }
 }

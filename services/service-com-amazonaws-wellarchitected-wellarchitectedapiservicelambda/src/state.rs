@@ -65,7 +65,10 @@
 //! and carrying the finding's content by reference into the catalog in
 //! [`recommendation_catalog`], so a recommendation's text is the same in every reading of
 //! it and only its status and the feedback submitted on it are a caller's to move
-//! (`UpdateAgentRecommendationStatus`, `PutAgentRecommendationFeedback`). The record types
+//! (`UpdateAgentRecommendationStatus`, `PutAgentRecommendationFeedback`). The items of one
+//! recommendation (`ListAgentRecommendationItems`) are DERIVED from that same finding and
+//! from the recommendations its generation produced beside it, so nothing has to be
+//! recorded when one is produced and no read has to write. The record types
 //! and
 //! their projections live here rather than in a handler because several operations reach
 //! them.
@@ -8158,6 +8161,21 @@ pub fn encode_agent_recommendation_next_token(recommendation_arn: &str) -> Strin
 /// `None` when the token is not one this service issued.
 pub fn decode_agent_recommendation_next_token(token: &str) -> Option<String> {
     Some(decode_cursor(token)?.get("a")?.as_str()?.to_string())
+}
+
+/// Encode a `ListAgentRecommendationItems` cursor: the item id last served, in the same
+/// opaque scheme as [`encode_next_token`]. The items of one recommendation are enumerated
+/// in id order and an id names one item of that recommendation for its whole life, so that
+/// id is the whole cursor. Its own key, so a cursor issued by another paginated operation
+/// is not a cursor here.
+pub fn encode_agent_recommendation_item_next_token(item_id: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "ri": item_id }))
+}
+
+/// The item id a `ListAgentRecommendationItems` `NextToken` points just past, or `None`
+/// when the token is not one this service issued.
+pub fn decode_agent_recommendation_item_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("ri")?.as_str()?.to_string())
 }
 
 /// What a `NextToken` this service did not issue is answered with. The token is this

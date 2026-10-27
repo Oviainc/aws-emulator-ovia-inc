@@ -8281,6 +8281,17 @@ pub const MAX_PUBLIC_DOMAIN_NAMES: usize = 4;
 /// this is where the bound on a caller-sized map lives.
 pub const MAX_CONTAINERS_PER_DEPLOYMENT: usize = 10;
 
+/// How many deployments of one container service the store keeps.
+///
+/// A service accumulates one deployment per create, so the history a caller can
+/// drive has to be bounded — and the service itself bounds it: the
+/// `GetContainerServiceDeployments` documentation states that "a set number of
+/// deployments are kept before the oldest one is replaced with the newest one",
+/// and points at the service's published quotas for the number. The number is
+/// not in the model, so the figure here is the emulator's; what it implements is
+/// the documented rule that the OLDEST deployment is the one dropped.
+pub const MAX_DEPLOYMENTS_PER_SERVICE: usize = 50;
+
 /// The hardware and price one container service power provides.
 ///
 /// The figures are the published Lightsail container service plans the modelled
@@ -9378,8 +9389,14 @@ pub struct StoredContainerService {
     /// order.
     pub public_domain_names: BTreeMap<String, Vec<String>>,
     pub ecr_image_puller_role_active: bool,
-    pub current_deployment: Option<StoredDeployment>,
-    pub next_deployment: Option<StoredDeployment>,
+    /// Every deployment this service has been given, NEWEST VERSION FIRST.
+    ///
+    /// The ONE place a deployment of this service lives: the record that is
+    /// `ACTIVE` is what `ContainerService$currentDeployment` reports and the one
+    /// that is `ACTIVATING` is its `nextDeployment`, so a deployment is never
+    /// held twice and the history, the current and the waiting deployment can
+    /// never disagree. Bounded by [`MAX_DEPLOYMENTS_PER_SERVICE`].
+    pub deployments: VecDeque<StoredDeployment>,
     /// The version the NEXT deployment of this service will carry.
     pub next_deployment_version: i32,
     /// The container images registered to this service, in registration order —
@@ -9475,8 +9492,8 @@ impl StoredContainerService {
             state: Some(self.state.to_string()),
             state_detail: self.state_detail(),
             scale: Some(self.scale),
-            current_deployment: self.current_deployment.as_ref().map(StoredDeployment::view),
-            next_deployment: self.next_deployment.as_ref().map(StoredDeployment::view),
+            current_deployment: self.current_deployment().map(StoredDeployment::view),
+            next_deployment: self.next_deployment().map(StoredDeployment::view),
             is_disabled: Some(self.is_disabled),
             principal_arn: Some(self.principal_arn.clone()),
             private_domain_name: Some(container_service_private_domain_name(&self.name)),
@@ -9523,7 +9540,7 @@ impl StoredContainerService {
         if self.state != CONTAINER_SERVICE_DEPLOYING {
             return None;
         }
-        let version = self.next_deployment.as_ref().map(|next| next.version);
+        let version = self.next_deployment().map(|next| next.version);
         Some(ContainerServiceStateDetail {
             code: Some(STATE_DETAIL_CREATING_DEPLOYMENT.to_string()),
             message: Some(match version {
@@ -9547,15 +9564,82 @@ impl StoredContainerService {
             if !phase.activates_next_deployment {
                 continue;
             }
-            if let Some(mut next) = self.next_deployment.take() {
-                next.state = DEPLOYMENT_STATE_ACTIVE;
-                // "The container service can have only one deployment in an
-                // active state at a time": whatever was running steps down.
-                if let Some(mut previous) = self.current_deployment.replace(next) {
-                    previous.state = DEPLOYMENT_STATE_INACTIVE;
+            let Some(activating) = self
+                .deployments
+                .iter()
+                .position(|deployment| deployment.state == DEPLOYMENT_STATE_ACTIVATING)
+            else {
+                continue;
+            };
+            // "The container service can have only one deployment in an active
+            // state at a time": whatever was running steps down to the state of
+            // a deployment that ran before, and stays in the history.
+            for deployment in self.deployments.iter_mut() {
+                if deployment.state == DEPLOYMENT_STATE_ACTIVE {
+                    deployment.state = DEPLOYMENT_STATE_INACTIVE;
                 }
             }
+            self.deployments[activating].state = DEPLOYMENT_STATE_ACTIVE;
         }
+    }
+
+    /// The deployment currently running on this service, if any — the one in
+    /// `ACTIVE`, of which the model admits at most one.
+    pub fn current_deployment(&self) -> Option<&StoredDeployment> {
+        self.deployments
+            .iter()
+            .find(|deployment| deployment.state == DEPLOYMENT_STATE_ACTIVE)
+    }
+
+    /// The deployment waiting to become the running one, if any — the one in
+    /// `ACTIVATING`, of which a service has at most one (see
+    /// [`Self::record_deployment`]).
+    pub fn next_deployment(&self) -> Option<&StoredDeployment> {
+        self.deployments
+            .iter()
+            .find(|deployment| deployment.state == DEPLOYMENT_STATE_ACTIVATING)
+    }
+
+    /// Add `deployment` to this service's history as the deployment WAITING to
+    /// become the running one.
+    ///
+    /// A service launches one deployment at a time, so a deployment that was
+    /// still `ACTIVATING` is superseded by this one: it was created, and it is
+    /// not running, which is what `INACTIVE` reports. The history is kept
+    /// newest-version-first and bounded by [`MAX_DEPLOYMENTS_PER_SERVICE`],
+    /// past which the OLDEST deployment is the one dropped.
+    pub fn record_deployment(&mut self, deployment: StoredDeployment) {
+        for superseded in self.deployments.iter_mut() {
+            if superseded.state == DEPLOYMENT_STATE_ACTIVATING {
+                superseded.state = DEPLOYMENT_STATE_INACTIVE;
+            }
+        }
+        self.deployments.push_front(deployment);
+        while self.deployments.len() > MAX_DEPLOYMENTS_PER_SERVICE {
+            if let Some(evicted) = self.deployments.pop_back() {
+                // A deployment the store had to forget stops being reported
+                // before anything replaced it, so the eviction is traceable
+                // rather than a silent surprise.
+                ::tracing::warn!(
+                    service = %self.name,
+                    version = evicted.version,
+                    limit = MAX_DEPLOYMENTS_PER_SERVICE,
+                    "the oldest deployment was dropped to keep this container service within \
+                     the store's bound"
+                );
+            }
+        }
+    }
+
+    /// This service's deployments as the modelled `ContainerServiceDeploymentList`.
+    ///
+    /// Newest version first: the operation's own documentation says "the newest
+    /// version is listed at the top of the response".
+    pub fn deployments_view(&self) -> Vec<ContainerServiceDeployment> {
+        self.deployments
+            .iter()
+            .map(StoredDeployment::view)
+            .collect()
     }
 }
 
@@ -12920,8 +13004,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     ///
     /// Everything a container service carries lives ON this record — its power
     /// and scale, its tags, the groups of public domain names it served, the
-    /// access its image puller role held, the deployments (current and next) and
-    /// the container images registered to it — so removing the record is what
+    /// access its image puller role held, its deployment history and the
+    /// container images registered to it — so removing the record is what
     /// removes them all, and no later read can report a deployment or a
     /// registered image of a service this account no longer holds. The name is
     /// free again for a service that inherits nothing from this one, exactly as
@@ -15851,8 +15935,7 @@ mod tests {
             principal_arn: String::new(),
             public_domain_names: BTreeMap::new(),
             ecr_image_puller_role_active: false,
-            current_deployment: None,
-            next_deployment: None,
+            deployments: VecDeque::new(),
             next_deployment_version: 1,
             images: Vec::new(),
             owed: VecDeque::new(),

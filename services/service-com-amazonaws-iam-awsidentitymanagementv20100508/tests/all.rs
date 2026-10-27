@@ -95,6 +95,8 @@ mod open_id_connect_provider_listing;
 mod open_id_connect_provider_tag_updates;
 #[path = "all/open_id_connect_providers.rs"]
 mod open_id_connect_providers;
+#[path = "all/permissions_boundary_ceiling.rs"]
+mod permissions_boundary_ceiling;
 #[path = "all/policies_granting_service_access.rs"]
 mod policies_granting_service_access;
 #[path = "all/policy_default_version.rs"]

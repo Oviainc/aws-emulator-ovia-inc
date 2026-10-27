@@ -240,18 +240,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model bounds `maxResults` at 1..=100, so a caller that sends none
         // gets the largest page it could have asked for, and the protocol
-        // boundary has already refused anything outside that range. Clamped into
-        // the range here as well: a zero page would return nothing while still
-        // carrying a token whose offset never advances, so a walk would never
-        // terminate.
-        let max_page_size = usize::try_from(crate::state::DEFAULT_MAX_RESULTS).unwrap_or(1);
-        let page_size = usize::try_from(
-            input
-                .max_results
-                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
-        )
-        .unwrap_or(1)
-        .clamp(1, max_page_size);
+        // boundary has already refused anything outside that range. One rule for
+        // every paginated listing here, including the floor against a
+        // non-advancing zero page: `crate::state::page_size`.
+        let page_size = crate::state::page_size(input.max_results);
 
         let scope = crate::state::preview_account_scope(
             &input.rule_type,

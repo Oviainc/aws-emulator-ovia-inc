@@ -256,6 +256,10 @@ pub mod template_url;
 /// change set submits, and the resource-level change list that comparison answers.
 pub mod change_plan;
 
+/// The stack policy in force on a stack: which of an update's planned resource actions it
+/// permits, and how a denied one is reported.
+pub mod stack_policy;
+
 /// The `{{resolve:...}}` dynamic references a resource's properties carry: the store each
 /// one is resolved against as the resource is deployed, and the resource failure a
 /// reference that store cannot satisfy is.
