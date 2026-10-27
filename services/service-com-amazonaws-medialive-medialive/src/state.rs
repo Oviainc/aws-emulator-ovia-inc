@@ -547,6 +547,11 @@ pub fn pipeline_index(id: &str) -> Option<i32> {
 pub mod signal_map_status {
     pub const CREATE_IN_PROGRESS: &str = "CREATE_IN_PROGRESS";
     pub const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
+    /// Where `StartUpdateSignalMap` leaves a signal map: the update "is
+    /// initiated" and answers 202, so the change runs asynchronously and the
+    /// clock settles it into [`UPDATE_COMPLETE`].
+    pub const UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
+    pub const UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
 }
 
 /// The `SignalMapMonitorDeploymentStatus` values this slice uses, spelled
@@ -764,7 +769,8 @@ const IP_POOL_LEN: u32 = 1 << 17;
 /// CHOSEN, not documented by AWS: the real service takes minutes, and no doc
 /// sentence pins a number, so this is the emulator's own span. It is deliberately
 /// non-zero so a caller that acts immediately after `CreateChannel` /
-/// `StartChannel` / `CreateSignalMap` still observes the transient state and the
+/// `StartChannel` / `CreateSignalMap` / `StartUpdateSignalMap` still observes
+/// the transient state and the
 /// `ConflictException` it produces, exactly as it would against the real service.
 pub const TRANSIENT_STATE_SPAN: Duration = Duration::from_millis(500);
 
@@ -2029,6 +2035,61 @@ pub enum SignalMapDeleteRefusal {
     /// in-flight deployment `StartMonitorDeployment` and
     /// `StartDeleteMonitorDeployment` refuse a second one over.
     DeploymentRunning { id: String, status: String },
+}
+
+/// Why [`ComAmazonawsMedialiveMedialiveState::start_signal_map_update`] changed
+/// nothing. Each variant is one modelled refusal of `StartUpdateSignalMap`, and
+/// each of them leaves the store exactly as it was.
+#[derive(Debug)]
+pub enum SignalMapUpdateRefusal {
+    /// No signal map answers to the identifier, by either form `Identifier`
+    /// documents (its id or its current name).
+    NotFound,
+    /// A lifecycle action of the signal map itself is still running, so the
+    /// signal map is not in a state a further update may take it out of.
+    /// Carries the id and the status it is in.
+    LifecycleRunning { id: String, status: String },
+    /// Another signal map already carries the name asked for, which `Name` is
+    /// documented to make unique within the resource type in a region.
+    NameTaken,
+    /// The `DiscoveryEntryPointArn` the request supplied is not an AWS resource
+    /// ARN at all, so it names no resource to discover a graph from. Carries the
+    /// value the request supplied.
+    EntryPointMalformed { arn: String },
+    /// The entry point a rediscovery would walk from names no resource this
+    /// store holds, so there is no workflow to map. Carries the ARN that
+    /// resolved to nothing.
+    EntryPointNotFound { arn: String },
+    /// A `CloudWatchAlarmTemplateGroupIdentifiers` entry names no stored alarm
+    /// template group, so there is no group to associate the signal map with.
+    /// Carries the identifier that resolved to nothing.
+    AlarmGroupNotFound { identifier: String },
+    /// An `EventBridgeRuleTemplateGroupIdentifiers` entry names no stored rule
+    /// template group, on the same terms as [`Self::AlarmGroupNotFound`].
+    RuleGroupNotFound,
+}
+
+/// What one `StartUpdateSignalMap` request asks the store to change: a member
+/// the request carried is `Some` and replaces the stored one, a member it
+/// omitted is `None` and leaves that setting as it was.
+#[derive(Debug, Clone, Default)]
+pub struct SignalMapChanges {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// The entry point to discover the signal map's graph from. A CHANGED one
+    /// makes the update rediscover the graph, which is what
+    /// `StartUpdateSignalMap` documents ("Will discover a new signal map if a
+    /// changed discoveryEntryPointArn is provided").
+    pub discovery_entry_point_arn: Option<String>,
+    /// `ForceRediscovery`: "If true, will force a rediscovery of a signal map if
+    /// an unchanged discoveryEntryPointArn is provided."
+    pub force_rediscovery: bool,
+    /// The identifiers of the alarm template groups to associate the signal map
+    /// with, each resolved to a group id before anything is written.
+    pub cloud_watch_alarm_template_group_identifiers: Option<Vec<String>>,
+    /// The identifiers of the eventbridge rule template groups to associate the
+    /// signal map with, resolved on the same terms.
+    pub event_bridge_rule_template_group_identifiers: Option<Vec<String>>,
 }
 
 /// Per-service state for com-amazonaws-medialive-medialive. A handler reaches it through [`service_state`].
@@ -3659,6 +3720,141 @@ impl ComAmazonawsMedialiveMedialiveState {
         Ok(removed)
     }
 
+    /// Apply `changes` to the signal map `identifier` names and put it into the
+    /// `UPDATE_IN_PROGRESS` status the clock settles, answering its id — or
+    /// refuse.
+    ///
+    /// `StartUpdateSignalMap` "initiates an update for the specified signal map.
+    /// Will discover a new signal map if a changed discoveryEntryPointArn is
+    /// provided", and `ForceRediscovery` forces that rediscovery for an
+    /// unchanged one — so a rediscovery walks the store exactly as the create's
+    /// discovery does, and the graph it finds replaces the stored one when the
+    /// update completes. Every other member is a partial update: one the request
+    /// carried replaces what is stored, one it omitted leaves it alone.
+    ///
+    /// The resolution, the preconditions, the rediscovery and the write live
+    /// together here, so a handler cannot check one of them and write past
+    /// another; the handler's job is only to turn a [`SignalMapUpdateRefusal`]
+    /// into the operation's own modelled error.
+    pub fn start_signal_map_update(
+        &mut self,
+        region: &str,
+        identifier: &str,
+        changes: SignalMapChanges,
+        now: SystemTime,
+    ) -> Result<String, SignalMapUpdateRefusal> {
+        let id = self
+            .signal_map_id_for_identifier(identifier)
+            .ok_or(SignalMapUpdateRefusal::NotFound)?
+            .to_string();
+        let map = self
+            .signal_maps
+            .get(&id)
+            .ok_or(SignalMapUpdateRefusal::NotFound)?;
+
+        // A lifecycle action of the signal map is asynchronous, so one still in
+        // flight is already changing the resource this call would change.
+        if map.lifecycle_in_progress() {
+            return Err(SignalMapUpdateRefusal::LifecycleRunning {
+                id,
+                status: map.status().to_string(),
+            });
+        }
+        let stored_entry_point = map.discovery_entry_point_arn.clone();
+
+        // `Name` is unique "within the scope of a resource type in a specific
+        // region", so a rename cannot take a name another signal map holds —
+        // while renaming a signal map to the name it already has changes
+        // nothing and is not a collision with itself.
+        if let Some(name) = changes.name.as_deref() {
+            if self.signal_map_named(name).is_some_and(|held| held != id) {
+                return Err(SignalMapUpdateRefusal::NameTaken);
+            }
+        }
+
+        // Request SYNTAX first: a `DiscoveryEntryPointArn` that is not an ARN at
+        // all cannot name a resource, whichever operation supplied it.
+        let requested_entry_point = changes.discovery_entry_point_arn.as_deref();
+        if let Some(arn) = requested_entry_point {
+            if !is_resource_arn(arn) {
+                return Err(SignalMapUpdateRefusal::EntryPointMalformed {
+                    arn: arn.to_string(),
+                });
+            }
+        }
+
+        // Then rediscovery: a changed entry point discovers a new graph, and an
+        // unchanged one only when the request forces it. The graph is resolved
+        // against the resources that exist now, so an entry point naming none is
+        // refused and nothing is written.
+        let entry_point = requested_entry_point
+            .unwrap_or(stored_entry_point.as_str())
+            .to_string();
+        let rediscover = requested_entry_point.is_some_and(|arn| arn != stored_entry_point)
+            || changes.force_rediscovery;
+        let discovered = if rediscover {
+            Some(self.discover_media_resource_map(&entry_point).ok_or(
+                SignalMapUpdateRefusal::EntryPointNotFound { arn: entry_point },
+            )?)
+        } else {
+            None
+        };
+
+        // A group identifier names a group that must already exist, and the
+        // signal map records the ID of the group it resolved — never the
+        // identifier it was given — exactly as the create resolves them.
+        let mut alarm_group_ids = None;
+        if let Some(identifiers) = changes.cloud_watch_alarm_template_group_identifiers.as_ref() {
+            let mut resolved = Vec::with_capacity(identifiers.len());
+            for identifier in identifiers {
+                let group = self.alarm_template_group(region, identifier).ok_or_else(|| {
+                    SignalMapUpdateRefusal::AlarmGroupNotFound {
+                        identifier: identifier.clone(),
+                    }
+                })?;
+                resolved.push(group.id.clone());
+            }
+            alarm_group_ids = Some(resolved);
+        }
+        let mut rule_group_ids = None;
+        if let Some(identifiers) = changes
+            .event_bridge_rule_template_group_identifiers
+            .as_ref()
+        {
+            let mut resolved = Vec::with_capacity(identifiers.len());
+            for identifier in identifiers {
+                let group = self
+                    .event_bridge_rule_template_group(region, identifier)
+                    .ok_or(SignalMapUpdateRefusal::RuleGroupNotFound)?;
+                resolved.push(group.id.clone());
+            }
+            rule_group_ids = Some(resolved);
+        }
+
+        // Every precondition is met, so the change is written in one step.
+        let map = self
+            .signal_maps
+            .get_mut(&id)
+            .ok_or(SignalMapUpdateRefusal::NotFound)?;
+        if let Some(name) = changes.name {
+            map.name = name;
+        }
+        if let Some(description) = changes.description {
+            map.description = Some(description);
+        }
+        if let Some(arn) = changes.discovery_entry_point_arn {
+            map.discovery_entry_point_arn = arn;
+        }
+        if let Some(ids) = alarm_group_ids {
+            map.cloud_watch_alarm_template_group_ids = ids;
+        }
+        if let Some(ids) = rule_group_ids {
+            map.event_bridge_rule_template_group_ids = ids;
+        }
+        map.begin_update(discovered, now);
+        Ok(id)
+    }
+
     /// The input whose ARN is exactly `arn`, if this store holds one — the same
     /// global-identity reading of an ARN as [`Self::channel_by_arn`].
     fn input_by_arn(&self, arn: &str) -> Option<&InputRecord> {
@@ -3794,10 +3990,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// declare (a follower channel's primary, the followers that name it, and
     /// the inputs a channel's `InputAttachments` name), so the graph is read out
     /// of persisted state. It is the SNAPSHOT of that state at the instant
-    /// discovery runs: the real service rediscovers a signal map's graph only
-    /// when a discovery is asked for (`StartUpdateSignalMap`, still a scaffold
-    /// here), so a resource created or deleted afterwards does not change a
-    /// stored signal map's `MediaResourceMap`.
+    /// discovery runs: the real
+    /// service rediscovers a signal map's graph only when a discovery is asked
+    /// for (`StartUpdateSignalMap`, with a changed entry point or
+    /// `ForceRediscovery`), so a resource created or deleted afterwards does not
+    /// change a stored signal map's `MediaResourceMap`.
     pub fn discover_media_resource_map(
         &self,
         entry_point: &str,
@@ -3834,7 +4031,11 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// map has that id.
     pub fn signal_map_description(&self, id: &str) -> Option<SignalMapDescription> {
         let map = self.signal_maps.get(id)?;
-        let discovered = map.status == signal_map_status::CREATE_COMPLETE;
+        // A discovered graph is reported once a discovery of this signal map has
+        // COMPLETED — which is also what stamps `LastDiscoveredAt` — so a later
+        // lifecycle action (an update) does not blank out the graph the signal
+        // map still maps while that action runs.
+        let discovered = map.last_discovered_at.is_some();
         Some(SignalMapDescription {
             arn: Some(map.arn.clone()),
             // The ids of the cloudwatch alarm template groups the create
@@ -4407,6 +4608,15 @@ pub struct SignalMapRecord {
     /// The instant discovery becomes due, so `CREATE_IN_PROGRESS` settles into
     /// `CREATE_COMPLETE`. Stored, never slept on.
     discovery_due: SystemTime,
+    /// The instant an update started by `StartUpdateSignalMap` becomes due, so
+    /// `UPDATE_IN_PROGRESS` settles into `UPDATE_COMPLETE`, or `None` while no
+    /// update is running. Stored, never slept on, on the same terms as
+    /// [`Self::discovery_due`].
+    update_due: Option<SystemTime>,
+    /// The graph a running update's rediscovery found, held until that update
+    /// comes due: until then the signal map still reports the graph its last
+    /// completed discovery produced, because that is the one it currently maps.
+    pending_media_resource_map: Option<BTreeMap<String, MediaResource>>,
     last_discovered_at: Option<SystemTime>,
     /// The latest monitor deployment `StartMonitorDeployment` started for this
     /// signal map, or `None` while none ever was — which is the `NOT_DEPLOYED`
@@ -4429,6 +4639,22 @@ impl SignalMapRecord {
             self.status = signal_map_status::CREATE_COMPLETE.to_string();
             self.last_discovered_at = Some(self.discovery_due);
             self.modified_at = self.discovery_due;
+        }
+        // The update an earlier call started, owed at its own due instant: the
+        // signal map reaches `UPDATE_COMPLETE` and, when that update asked for a
+        // rediscovery, the graph it found becomes the graph the signal map maps,
+        // discovered at the instant the update completed.
+        if let Some(due) = self
+            .update_due
+            .filter(|due| self.status == signal_map_status::UPDATE_IN_PROGRESS && now >= *due)
+        {
+            self.update_due = None;
+            self.status = signal_map_status::UPDATE_COMPLETE.to_string();
+            if let Some(discovered) = self.pending_media_resource_map.take() {
+                self.media_resource_map = discovered;
+                self.last_discovered_at = Some(due);
+            }
+            self.modified_at = due;
         }
         // Completed on THIS call: the due instant to stamp as the signal map's
         // `ModifiedAt`, and what that completion does to the latest successful
@@ -4473,9 +4699,10 @@ impl SignalMapRecord {
     /// Whether this signal map has a monitor to deploy at all: deploying "the
     /// latest monitor of the specified signal map" needs the media resource map
     /// its discovery found, so a signal map whose discovery has not completed
-    /// has nothing to deploy yet.
+    /// has nothing to deploy yet — and neither has one whose own lifecycle
+    /// action is still in flight, which is the graph being rebuilt underneath.
     pub fn discovery_complete(&self) -> bool {
-        self.status == signal_map_status::CREATE_COMPLETE
+        self.last_discovered_at.is_some() && !self.lifecycle_in_progress()
     }
 
     /// Whether a lifecycle action of the signal map ITSELF is still running, so
@@ -4534,6 +4761,25 @@ impl SignalMapRecord {
     /// IN_PROGRESS status and comes due [`TRANSIENT_STATE_SPAN`] later.
     pub fn begin_delete_monitor_deployment(&mut self, now: SystemTime) {
         self.begin_deployment(MonitorDeploymentKind::Delete, now);
+    }
+
+    /// Start an update of this signal map: `StartUpdateSignalMap` "initiates an
+    /// update for the specified signal map" and answers 202, so the signal map
+    /// enters `UPDATE_IN_PROGRESS` and comes due [`TRANSIENT_STATE_SPAN`] later,
+    /// where [`Self::settle`] finishes it — a caller that reads straight after
+    /// the call still observes the update running.
+    ///
+    /// `discovered` is the graph a rediscovery found, held pending until the
+    /// update completes, and `None` for an update that asked for none.
+    pub fn begin_update(
+        &mut self,
+        discovered: Option<BTreeMap<String, MediaResource>>,
+        now: SystemTime,
+    ) {
+        self.status = signal_map_status::UPDATE_IN_PROGRESS.to_string();
+        self.update_due = Some(now + TRANSIENT_STATE_SPAN);
+        self.pending_media_resource_map = discovered;
+        self.modified_at = now;
     }
 
     /// Record `kind` as this signal map's latest monitor deployment, running and
@@ -4669,6 +4915,11 @@ pub fn new_signal_map(
         media_resource_map,
         status: signal_map_status::CREATE_IN_PROGRESS.to_string(),
         discovery_due: now + TRANSIENT_STATE_SPAN,
+        // Nothing has updated a signal map nobody has updated yet, and nothing
+        // is pending rediscovery for it: `StartUpdateSignalMap` is what starts
+        // the first update.
+        update_due: None,
+        pending_media_resource_map: None,
         last_discovered_at: None,
         // No monitor has been deployed for a signal map nobody has deployed one
         // for: `StartMonitorDeployment` is what starts the first one.
