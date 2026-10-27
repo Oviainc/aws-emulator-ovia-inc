@@ -196,18 +196,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             page_size,
         )
         .ok_or_else(|| -> ListMonitoredResourcesError {
-            ListMonitoredResourcesErrorModeled::ValidationException(ValidationException {
-                message:
-                    "NextToken does not name a page of the monitored resources these filters select"
-                        .to_string(),
-                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                fields: Some(vec![ValidationExceptionField {
-                    name: "NextToken".to_string(),
-                    message:
-                        "must be a token returned by an earlier ListMonitoredResources for the same Filters"
-                            .to_string(),
-                }]),
-            })
+            ListMonitoredResourcesErrorModeled::ValidationException(
+                crate::state::FilterRejection::stale_cursor(
+                    "ListMonitoredResources",
+                    "the monitored resources these filters select",
+                    "Filters",
+                )
+                .validation_exception(),
+            )
             .into()
         })?;
 

@@ -180,16 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let collection_type = input.resource_collection_type.clone();
         let scope = format!("GetResourceCollection/{collection_type}");
         let invalid_next_token = || -> GetResourceCollectionError {
-            GetResourceCollectionErrorModeled::ValidationException(ValidationException {
-                message: "NextToken does not name a page of this resource collection"
-                    .to_string(),
-                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                fields: Some(vec![ValidationExceptionField {
-                    name: "NextToken".to_string(),
-                    message: "must be a token returned by an earlier GetResourceCollection for the same ResourceCollectionType"
-                        .to_string(),
-                }]),
-            })
+            GetResourceCollectionErrorModeled::ValidationException(
+                crate::state::FilterRejection::stale_cursor(
+                    "GetResourceCollection",
+                    "this resource collection",
+                    "ResourceCollectionType",
+                )
+                .validation_exception(),
+            )
             .into()
         };
         let token = input.next_token.as_deref();

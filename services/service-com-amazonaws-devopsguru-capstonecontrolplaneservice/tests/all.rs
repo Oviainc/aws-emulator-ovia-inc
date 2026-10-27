@@ -27,6 +27,8 @@ mod configuration_lifecycle;
 mod cost_estimation;
 #[path = "all/cost_estimation_scope.rs"]
 mod cost_estimation_scope;
+#[path = "all/cursor_refusal.rs"]
+mod cursor_refusal;
 #[path = "all/event_sources_config.rs"]
 mod event_sources_config;
 #[path = "all/events.rs"]
