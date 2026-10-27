@@ -33335,12 +33335,11 @@ impl ComAmazonawsEc2Amazonec2State {
 
     /// Drop the account's data feed, giving its bytes back, and answer whether it had one.
     ///
-    /// What `DeleteSpotDatafeedSubscription` needs. `false` means the account had no feed and
-    /// nothing changed. No operation of this emulator calls it yet — the delete is still a
-    /// scaffold, and is its own issue — so it has no call site, the way
-    /// [`LOCAL_GATEWAY_VIF_GROUP_ASSOCIATION_LIMIT_EXCEEDED`] has none: it is here so that
-    /// the delete removes the record and releases the charge the create took in ONE place,
-    /// rather than reaching into the field itself.
+    /// What `DeleteSpotDatafeedSubscription` calls. `false` means the account had no feed and
+    /// nothing changed — which that delete answers the same success as a removal, because the
+    /// feed is a singleton with no id and the postcondition already holds. It lives here so
+    /// that the delete removes the record and releases the charge the create took in ONE
+    /// place, rather than reaching into the field itself.
     pub fn remove_spot_datafeed_subscription(&mut self) -> bool {
         let released = self.spot_datafeed_charge();
         let had_one = self.spot_datafeed_subscription.take().is_some();

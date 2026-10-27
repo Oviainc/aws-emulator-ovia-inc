@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceScanRelatedResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceScanRelatedResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceScanRelatedResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the resources of one resource scan that are RELATED to the resources a request
+//! names: a scan's rows record the stack that manages each resource
+//! ([`crate::state::resource_scans`]), and the resources one stack manages are the ones
+//! related to each other, so the answer is computed from the scan record rather than from the
+//! request.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +79,46 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::resource_scans::{
+    DEFAULT_RELATED_MAX_RESULTS, MAX_REQUESTED_RESOURCES, MAX_RESULTS_CEILING,
+};
+
+/// One resource the scan found, as the modelled `ScannedResource`: "a scanned resource
+/// returned by `ListResourceScanResources` or `ListResourceScanRelatedResources`", every
+/// member read off the row the scan took.
+fn scanned_resource(found: &crate::state::resource_scans::FoundResource) -> ScannedResource {
+    ScannedResource {
+        resource_type: Some(found.resource_type.clone()),
+        resource_identifier: Some(
+            found
+                .resource_identifier
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        ),
+        // "The response indicates whether each returned resource is already managed by
+        // CloudFormation": whether the row records the stack that manages it.
+        managed_by_stack: Some(found.is_managed_by_stack()),
+    }
+}
+
+/// How many related resources this response carries: `MaxResults` is what "the number of
+/// available results exceeds" before a `NextToken` is issued, and "by default the
+/// ListResourceScanRelatedResources API action will return up to 100 results in each response.
+/// The maximum value is 100."
+///
+/// The model's own `@range(min: 1, max: 100)` on `MaxResults` is refused before this handler
+/// runs, so what reaches here is either absent or inside that range; the documented ceiling is
+/// applied all the same, so this operation's published maximum does not depend on a constraint
+/// stated elsewhere. The default and the ceiling are the same published number but two separate
+/// sentences of the member's documentation, so they are two constants.
+fn page_size(max_results: Option<i32>) -> usize {
+    max_results
+        .and_then(|asked_for| usize::try_from(asked_for).ok())
+        .filter(|asked_for| *asked_for >= 1)
+        .unwrap_or(DEFAULT_RELATED_MAX_RESULTS)
+        .min(MAX_RESULTS_CEILING)
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +189,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceScanRelatedResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceScanRelatedResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceScanRelatedResources"))
+        use crate::state::resource_scans as scans;
+
+        // "Up to 100 resources can be provided": a bound the model carries no `@length` for,
+        // so a request past it is refused here rather than answered over a list this
+        // operation does not accept. Checked BEFORE the scan is resolved, so a request that
+        // is malformed as well as misaddressed is refused for being malformed.
+        if input.resources.len() > MAX_REQUESTED_RESOURCES {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                scans::too_many_requested_resources(input.resources.len()),
+            ));
+        }
+        // The resources the request ADDRESSES: each one a `ScannedResourceIdentifier`, which
+        // is a resource type plus the primary-identifier pairs that pick a scanned resource
+        // out.
+        let requested: Vec<(String, ::std::collections::BTreeMap<String, String>)> = input
+            .resources
+            .iter()
+            .map(|resource| {
+                (
+                    resource.resource_type.clone(),
+                    resource
+                        .resource_identifier
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no scan to read, so this answers 501
+            // rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListResourceScanRelatedResources",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a transition the clock had
+        // already made due — the scan's own conclusion, which was owed at the same instant
+        // whether or not anybody read it.
+        store.settle(now);
+
+        let scan = store
+            .resolve_resource_scan(&region, &input.resource_scan_id)
+            .ok_or_else(|| {
+                ListResourceScanRelatedResourcesErrorModeled::ResourceScanNotFoundException(
+                    ResourceScanNotFoundException {
+                        message: Some(scans::NOT_FOUND.to_string()),
+                    },
+                )
+            })?;
+
+        // A scan that is still running has no result to read: its rows are what it finds, and
+        // it has not finished finding them — the modelled `ResourceScanInProgressException`,
+        // the same set `DescribeResourceScan` withholds its counts for.
+        if scan.is_in_flight() {
+            return Err(
+                ListResourceScanRelatedResourcesErrorModeled::ResourceScanInProgressException(
+                    ResourceScanInProgressException {
+                        message: Some(scans::SCAN_IN_PROGRESS.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The related resources for a list of resources from a resource scan": the other
+        // resources of this scan that the same stack manages, read off the scan's own rows.
+        let related: Vec<ScannedResource> = scan
+            .related_resources(&requested)
+            .into_iter()
+            .map(scanned_resource)
+            .collect();
+
+        // `@paginated(inputToken: NextToken, outputToken: NextToken,
+        // items: RelatedResources, pageSize: MaxResults)`: one response carries one page, as
+        // large as the request asked for and no larger than the documented ceiling, plus the
+        // token that resumes just past it.
+        let (related_resources, next_token) = crate::state::paginate_at_most(
+            crate::state::PageOf::RelatedResources,
+            related,
+            input.next_token.as_deref(),
+            Some(page_size(input.max_results)),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListResourceScanRelatedResourcesOutput {
+            // Always present, as an empty element for a request whose resources the scan
+            // relates nothing to: a client reading the list sees the same shape either way.
+            related_resources: Some(related_resources),
+            next_token,
+        })
     }
 }
