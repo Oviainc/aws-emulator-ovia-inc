@@ -1323,6 +1323,30 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             .count()
     }
 
+    /// Whether a signed request presenting `access_key_id` carries a credential this
+    /// account will accept.
+    ///
+    /// `UpdateAccessKey$Status` documents what the stored value means: "Active means
+    /// that the key can be used for programmatic calls to Amazon Web Services, while
+    /// Inactive means that the key cannot be used" — so a key the account holds
+    /// authenticates a request only while its status is
+    /// [`ACCESS_KEY_ACTIVE_STATUS`], and deactivating one makes it unusable for API
+    /// calls while leaving it listed. Any other `statusType` value the member admits
+    /// is likewise not `Active`, so it is not usable either.
+    ///
+    /// A key id the account holds NO record of is usable: such a credential is not an
+    /// IAM user's at all — the key pair the emulator publishes at start, or a session
+    /// another service minted — and this account's `AccessKey$Status` says nothing
+    /// about it, so there is nothing here to refuse it on.
+    ///
+    /// A READ: the store is only consulted, so asking changes nothing a later caller
+    /// sees.
+    pub fn access_key_is_usable(&self, access_key_id: &str) -> bool {
+        self.access_keys
+            .get(access_key_id)
+            .is_none_or(|record| record.status == ACCESS_KEY_ACTIVE_STATUS)
+    }
+
     /// The groups the user keyed by `user_key` belongs to, by the key
     /// [`Self::groups`] holds each of them under, in that map's stable key order.
     ///
@@ -3051,6 +3075,24 @@ pub fn uncarried_aws_managed_policy(arn: &str, what: &str) -> crate::scaffolded:
 /// and a delete cannot describe the same missing policy three different ways.
 pub fn policy_not_found(arn: &str) -> String {
     format!("Policy {arn} was not found.")
+}
+
+/// The message IAM refuses an operation addressed by a `PolicyArn` and a `VersionId`
+/// with when the policy that ARN resolves to carries no such version — the
+/// `NoSuchEntityException` message, whose fixed text is `Policy `, ` version ` and
+/// ` does not exist or is not attachable.` around the two values the request supplied.
+///
+/// The closing clause is part of IAM's fixed text for a policy the request cannot be
+/// served from, not a statement about this particular version: the same clause closes
+/// the refusal of an attach or a permissions-boundary put naming a policy that cannot
+/// be attached (`AttachUserPolicy`, `AttachRolePolicy`, `PutUserPermissionsBoundary`,
+/// `PutRolePermissionsBoundary` in this crate all word it that way), so a caller
+/// matching IAM's text sees one wording however it addressed the policy.
+///
+/// ONE wording, shared by every operation taking a policy version, so a read and a
+/// delete cannot describe the same missing version two different ways.
+pub fn policy_version_not_found(arn: &str, version_id: &str) -> String {
+    format!("Policy {arn} version {version_id} does not exist or is not attachable.")
 }
 
 /// Encode a state map key as the opaque pagination `Marker` a client echoes back.

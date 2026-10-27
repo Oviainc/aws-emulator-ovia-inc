@@ -297,7 +297,7 @@ fn start_requests() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "deferred execution, so the job is queued first",
+            "deferred execution, which queues nothing below the concurrency ceiling",
             json!({
                 "TranscriptionJobName": "queued-job",
                 "Media": {"MediaFileUri": "s3://example-media/batch.amr"},
@@ -322,15 +322,14 @@ async fn a_started_job_reads_back_exactly_as_it_was_started() {
             .await;
         let job = started.ok(case)["TranscriptionJob"].clone();
 
-        let queued = request
-            .get("JobExecutionSettings")
-            .and_then(|settings| settings.get("AllowDeferredExecution"))
-            == Some(&Value::Bool(true));
-        let expected_status = if queued { "QUEUED" } else { "IN_PROGRESS" };
+        // Every row starts a job while the family is far below its concurrency
+        // ceiling, so none of them has a queue to enter — not even the row that
+        // deferred its execution (`crate::transcription_job_queueing` drives the
+        // ceiling that member matters at).
         assert_eq!(
             job["TranscriptionJobStatus"],
-            json!(expected_status),
-            "case {case:?}: a job just started must be {expected_status}, got {:?}",
+            json!("IN_PROGRESS"),
+            "case {case:?}: a job just started below the ceiling must be IN_PROGRESS, got {:?}",
             job["TranscriptionJobStatus"]
         );
         assert!(
@@ -394,8 +393,9 @@ async fn a_started_job_reads_back_exactly_as_it_was_started() {
 async fn a_job_completes_once_its_processing_span_has_elapsed() {
     let transcribe = Transcribe::new();
 
-    // Two rows: a job that starts processing immediately, and one whose execution
-    // the request deferred, so it is queued before it starts.
+    // Two rows: a job started with no `JobExecutionSettings` at all, and one whose
+    // execution the request deferred — which, below the concurrency ceiling, has no
+    // queue to enter either, so both take the same `IN_PROGRESS -> COMPLETED` path.
     let cases: &[(&str, bool)] = &[("immediate", false), ("deferred", true)];
     for (case, deferred) in cases {
         let mut request = json!({
@@ -415,14 +415,13 @@ async fn a_job_completes_once_its_processing_span_has_elapsed() {
         let job = started.ok(case)["TranscriptionJob"].clone();
         assert_eq!(
             job["TranscriptionJobStatus"],
-            json!(if *deferred { "QUEUED" } else { "IN_PROGRESS" }),
+            json!("IN_PROGRESS"),
             "case {case:?}: unexpected status just after the start call, got {:?}",
             job["TranscriptionJobStatus"]
         );
-        assert_eq!(
-            job["StartTime"].is_null(),
-            *deferred,
-            "case {case:?}: a queued job has no StartTime and a processing one does, got {:?}",
+        assert!(
+            !job["StartTime"].is_null(),
+            "case {case:?}: a job that is processing reports when it began, got {:?}",
             job["StartTime"]
         );
         assert!(

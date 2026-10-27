@@ -4,8 +4,9 @@
 //! Implemented: stores ONE lookup table under the name that identifies it, reads the CSV
 //! body it was handed to the header row and data rows it describes, and hands back the ARN
 //! it minted for the table and the instant it was created — refusing a request that names
-//! both content sources or neither, a CSV body it cannot read, a `queryId` naming no
-//! completed or cancelled query, a `kmsKeyId` that is not a KMS key's, a name the account
+//! both content sources or neither, a CSV body it cannot read or whose header row declares
+//! the same column name twice, a `queryId` naming no completed or cancelled query, a
+//! `kmsKeyId` that is not a KMS key's, a name the account
 //! already holds a table under, or a create that would grow the account's table store past
 //! the emulator's own ceilings — on the number of tables it holds, and on the bytes of CSV
 //! content they hold between them. This is the ONLY file to touch for this operation.
@@ -179,6 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         };
+        let validation = |message: String| {
+            CreateLookupTableError::from(CreateLookupTableErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            ))
+        };
 
         // "You must specify either tableBody or queryId, but not both" — a rule ACROSS two
         // members, which no single member's constraint can express, so it is refused with
@@ -188,22 +196,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.table_body.as_deref(),
             input.query_id.as_deref(),
         )
-        .map_err(|message| {
-            CreateLookupTableError::from(CreateLookupTableErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(message),
-                },
-            ))
-        })?;
+        .map_err(validation)?;
         // A create builds the table "by uploading CSV data or from CloudWatch Logs query
         // results", so a request naming neither names nothing to build it from.
         let Some(source) = source else {
-            return Err(
-                CreateLookupTableErrorModeled::ValidationException(ValidationException {
-                    message: Some(crate::state::LOOKUP_TABLE_SOURCE_REQUIRED.to_string()),
-                })
-                .into(),
-            );
+            return Err(validation(
+                crate::state::LOOKUP_TABLE_SOURCE_REQUIRED.to_string(),
+            ));
         };
 
         // The table's content is read HERE, before anything is stored: the header row names
@@ -211,7 +210,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // be read from creates no table.
         let (table_body, shape) = match source {
             crate::state::LookupTableSource::TableBody(table_body) => {
-                let shape = crate::state::parse_table_body(&table_body).map_err(invalid)?;
+                // A header row declaring one column name twice names no column set, which is
+                // a validation failure of the body as a whole rather than a member value
+                // this operation could not read — so each rejection is answered with the
+                // modelled error its own kind calls for.
+                let shape = crate::state::parse_table_body(&table_body).map_err(|rejection| {
+                    match rejection {
+                        crate::state::TableBodyRejection::Unreadable(message) => invalid(message),
+                        crate::state::TableBodyRejection::DuplicateFields => {
+                            validation(crate::state::DUPLICATE_TABLE_FIELDS_MESSAGE.to_string())
+                        }
+                    }
+                })?;
                 (table_body, shape)
             }
             // `queryId` names "a completed or cancelled CloudWatch Logs query whose results

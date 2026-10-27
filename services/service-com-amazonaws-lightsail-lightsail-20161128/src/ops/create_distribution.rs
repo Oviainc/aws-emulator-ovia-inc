@@ -262,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .to_string(),
             ));
         }
-        if !crate::state::distribution_bundle_is_creatable(&input.bundle_id) {
+        if !crate::state::distribution_bundle_is_applicable(&input.bundle_id) {
             return Err(invalid(format!(
                 "bundleId '{}' is not an active distribution bundle this service offers; use \
                  GetDistributionBundles to list the bundle IDs you can specify",

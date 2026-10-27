@@ -254,14 +254,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The range the association applies in: the start is inclusive and the end
         // exclusive, so an end at or before the start would cover no billing period.
         if let Some(range) = &input.billing_period_range {
-            if !crate::state::billing_period_range_is_ordered(range) {
-                return Err(validation(
-                    "ILLEGAL_BILLING_PERIOD_RANGE",
-                    "BillingPeriodRange.ExclusiveEndBillingPeriod",
-                    "the exclusive end billing period must be later than the inclusive \
-                     start billing period"
-                        .to_string(),
-                ));
+            if let Err((reason, field, message)) =
+                crate::state::check_billing_period_range_is_ordered(range)
+            {
+                return Err(validation(reason, field, message));
             }
         }
         let inclusive_start_billing_period = input

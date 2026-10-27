@@ -10,7 +10,9 @@
 //! `Allow` with no `Deny` permits, and a principal with neither is refused (the implicit
 //! deny). A refused call is answered HTTP 403 with the error code `AccessDenied`
 //! ([`crate::scaffolded::Scaffolded::access_denied`]) and a message built from the three
-//! things the decision was made about: the principal, the action and the resource.
+//! things the decision was made about: the principal, the action and the resource —
+//! closed by the sentence naming where the details of that one denial are readable, by
+//! the authorization id the refusal mints ([`authorization_details_sentence`]).
 //!
 //! The three pieces, each held in exactly one place:
 //!
@@ -40,11 +42,50 @@
 //!   deny access AWS permits. An explicit `Deny` in a document that is held still
 //!   refuses, because no grant overturns one.
 
+use ::std::sync::atomic::{AtomicU64, Ordering};
+
 use ::service_common::iam_authorization::{self as iam, Decision};
 
 use crate::scaffolded::AccessDenied;
 
 use super::{ComAmazonawsIamAwsidentitymanagementv20100508State as IamState, PrincipalPolicies};
+
+/// The Region a request that carries no SigV4 credential scope was served in.
+///
+/// IAM is global and its endpoint `iam.amazonaws.com` is in `us-east-1` ("AWS Identity
+/// and Access Management endpoints and quotas", AWS General Reference), so that is the
+/// Region such a request addressed. A request that DOES carry a scope names its own
+/// Region there, and that one is used instead ([`request_region`]).
+const IAM_GLOBAL_REGION: &str = "us-east-1";
+
+/// The alphabet an authorization id is spelled in.
+///
+/// It is the one the reader of these ids accepts: `GetRequestAuthorizationDetails`
+/// takes `authorizationId` constrained to the pattern
+/// `^[0123456789abcdefghijklmnopqrstuvwxyz]+$` (`smithy_query(query="operation",
+/// operation="GetRequestAuthorizationDetails", model_path=
+/// "services/service-com-amazonaws-iamtoolbox-authrequestservice/smithy-model/com-amazonaws-iamtoolbox-authrequestservice.json")`),
+/// so an id a denial hands a caller is one that reader takes.
+const AUTHORIZATION_ID_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// How many characters a minted authorization id carries. The reader's member declares
+/// no length bound, so the length is this emulator's own: long enough that an id is
+/// opaque rather than a readable counter.
+const AUTHORIZATION_ID_CHARACTERS: usize = 32;
+
+/// How many characters of [`AUTHORIZATION_ID_ALPHABET`] spell out a whole 64-bit word
+/// (36^13 > 2^64), so the first that many characters of an id carry every bit of the
+/// word they were drawn from.
+const AUTHORIZATION_ID_CHARACTERS_PER_WORD: usize = 13;
+
+/// How many requests this process has refused, which is what each refusal's
+/// authorization id is minted from.
+///
+/// Deliberately NOT a field of the service's state: reaching a decision is a READ (see
+/// [`authorize_named`]), so a refused call must leave nothing behind for a later caller
+/// to observe. All an id has to be is distinct per denial, which a fetch-and-add is
+/// without touching the store.
+static REFUSED_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 /// `iam:ListGroups`.
 pub const LIST_GROUPS: &str = "iam:ListGroups";
@@ -194,8 +235,11 @@ pub fn authorize_named(
     } else {
         format!("because no identity-based policy allows the {action} action")
     };
-    // Audit record for the refusal: the acting principal, what it asked for and the
-    // decision. The policy documents themselves are not logged.
+    // The handle this one denial is readable by, minted per refused request.
+    let authorization_id = next_authorization_id();
+    // Audit record for the refusal: the acting principal, what it asked for, the
+    // decision and the id the caller was handed, so a log entry and the caller's own
+    // message name the same denial. The policy documents themselves are not logged.
     ::tracing::info!(
         audit = true,
         outcome = "refused_access_denied",
@@ -203,11 +247,67 @@ pub fn authorize_named(
         action = %action,
         resource = %resource,
         explicit_deny = decided == Decision::Denied,
+        authorization_id = %authorization_id,
         "the caller's identity-based policies do not permit this call"
     );
+    // What the decision was about, then why it went that way, then where the caller
+    // reads the details of it: the three parts of AWS's `AccessDenied` text, with the
+    // closing sentence carried by every refusal this function words rather than by the
+    // operations that happen to have been measured.
     Err(AccessDenied::new(format!(
-        "User: {principal} is not authorized to perform: {action} on resource: {named_as} {reason}"
+        "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
+         {reason}{}",
+        authorization_details_sentence(&request_region(ctx), &authorization_id)
     )))
+}
+
+/// A fresh authorization id for one denied request: the handle the denial hands the
+/// caller so it can read that request's authorization details back.
+///
+/// Distinct for every denial. The first [`AUTHORIZATION_ID_CHARACTERS_PER_WORD`]
+/// characters spell out all 64 bits of a bijection of [`REFUSED_REQUESTS`], so two
+/// denials never mint the same id; the characters after them come from further words
+/// keyed to the same count, purely so the id is as long and as opaque as a service-minted
+/// handle rather than a readable counter.
+fn next_authorization_id() -> String {
+    let alphabet = AUTHORIZATION_ID_ALPHABET.len() as u64;
+    let refusal = REFUSED_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    let mut id = String::with_capacity(AUTHORIZATION_ID_CHARACTERS);
+    let mut word = super::splitmix64(refusal);
+    for position in 0..AUTHORIZATION_ID_CHARACTERS {
+        if position > 0 && position % AUTHORIZATION_ID_CHARACTERS_PER_WORD == 0 {
+            word = super::splitmix64(refusal ^ (position as u64).rotate_left(32));
+        }
+        id.push(char::from(AUTHORIZATION_ID_ALPHABET[(word % alphabet) as usize]));
+        word /= alphabet;
+    }
+    id
+}
+
+/// The Region the request `ctx` describes addressed: the one its SigV4 credential scope
+/// names, which is the only place a request carries a Region, and
+/// [`IAM_GLOBAL_REGION`] for a request that carries no scope to read one from.
+fn request_region(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| IAM_GLOBAL_REGION.to_string())
+}
+
+/// The sentence that closes an `AccessDenied` message: where the caller reads the
+/// authorization details of the request that was refused.
+///
+/// Both halves name the SAME `authorization_id` — the console view of that one denial,
+/// in the Region the request addressed, and the API that serves the same record
+/// (`GetRequestAuthorizationDetails`, served by this emulator's IAM Toolbox service).
+/// It is fixed text around two values taken from the request and from the id this
+/// denial minted, so it carries nothing of any other request.
+fn authorization_details_sentence(region: &str, authorization_id: &str) -> String {
+    format!(
+        ". Go to https://{region}.console.aws.amazon.com/iam/home?region={region}\
+         #/authorization-details/{authorization_id} for complete details, or call the \
+         GetRequestAuthorizationDetails API with the following authorization id: \
+         {authorization_id}"
+    )
 }
 
 /// The IAM user the access key id `access_key_id` belongs to — its ARN and the

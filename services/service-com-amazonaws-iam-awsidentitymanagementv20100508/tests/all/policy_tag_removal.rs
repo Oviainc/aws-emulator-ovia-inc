@@ -46,7 +46,8 @@ use crate::role_lifecycle::{borrowed, param, reported_tags};
 use crate::role_tag_removal::{fixture, keys, with_key_params};
 use crate::role_tags::{expected_map, tags};
 use crate::user_lifecycle::{
-    account_id, call, call_signed_by, element, elements, error_code, router,
+    account_id, assert_access_denied_message, call, call_signed_by, element, elements, error_code,
+    router,
 };
 
 /// One `UntagPolicy` call: the HTTP status and the XML body.
@@ -643,24 +644,22 @@ async fn a_signed_untag_is_decided_against_the_callers_identity_policies() {
                     "case {case:?}: expected the error code AccessDenied, got {body}"
                 );
                 // The message is built from the request: the principal that signed it,
-                // the action it named, the policy the decision was made on, and which of
-                // the two refusals this is.
+                // the action it named, the policy the decision was made on, which of
+                // the two refusals this is, and where this one denial's authorization
+                // details are readable.
                 let reason = if *expect == Decided::ExplicitDeny {
                     "with an explicit deny in an identity-based policy".to_string()
                 } else {
                     "because no identity-based policy allows the iam:UntagPolicy action"
                         .to_string()
                 };
-                let expected_message = format!(
-                    "User: arn:aws:iam::{}:user/{user_name} is not authorized to perform: \
-                     iam:UntagPolicy on resource: policy {arn} {reason}",
-                    account_id()
-                );
-                assert_eq!(
-                    element(&body, "Message"),
-                    expected_message,
-                    "case {case:?}: expected the refusal to name the principal, action and \
-                     policy, got {body}"
+                assert_access_denied_message(
+                    case,
+                    &element(&body, "Message"),
+                    &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
+                    "iam:UntagPolicy",
+                    &format!("policy {arn}"),
+                    &reason,
                 );
                 // A refused call removes nothing.
                 let (reported, key_count) = stored_tags(&router, &arn).await;

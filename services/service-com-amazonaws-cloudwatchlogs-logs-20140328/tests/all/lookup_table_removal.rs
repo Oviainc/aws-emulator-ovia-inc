@@ -234,9 +234,13 @@ async fn each_deleted_lookup_table_is_gone_from_every_read() {
         );
         assert_eq!(
             message,
-            resource_not_found_message("lookup table"),
-            "case {case:?}: the refusal states the resource kind that is missing, got \
-             {message:?}"
+            format!(
+                "Lookup table '{}' not found in account '{}'",
+                seed.name,
+                engine::emulator_account_id()
+            ),
+            "case {case:?}: the refusal states the table and the account it was looked for \
+             in, got {message:?}"
         );
 
         // The table the service no longer holds is the one it no longer enumerates, and the
@@ -414,19 +418,25 @@ async fn deleting_a_table_the_account_does_not_hold_is_refused() {
             "a lookup-table ARN for a name nothing created",
             lookup_table_arn(REGION, "users_never_created"),
             NOT_FOUND,
-            resource_not_found_message("lookup table"),
+            format!(
+                "Lookup table 'users_never_created' not found in account '{}'",
+                engine::emulator_account_id()
+            ),
         ),
         (
             "this table's name in ANOTHER Region, which this account does not hold here",
             lookup_table_arn("us-east-1", NAME),
             NOT_FOUND,
-            resource_not_found_message("lookup table"),
+            format!(
+                "Lookup table '{NAME}' not found in account '{}'",
+                engine::emulator_account_id()
+            ),
         ),
         (
             "this table's name in ANOTHER account",
             format!("arn:aws:logs:{REGION}:111122223333:lookup-table:{NAME}"),
             NOT_FOUND,
-            resource_not_found_message("lookup table"),
+            format!("Lookup table '{NAME}' not found in account '111122223333'"),
         ),
         (
             "a well-formed ARN of another resource kind",

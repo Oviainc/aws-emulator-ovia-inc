@@ -345,18 +345,18 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
                 .providers
                 .get_mut(&arn)
                 .expect("the ARN was just read out of the same map");
-            let mut merged = record.tags.clone();
-            merged.extend(tags);
-            if merged.len() > MAX_TAGS_PER_RESOURCE {
-                return Err(RegisterRefusal::TagLimitExceeded);
-            }
-            record.tags = merged;
+            // The repeat's pairs are merged into the registration's set under the ONE
+            // resultant-set bound every tag write of this service obeys ([`merge_tags`]),
+            // so this path and `TagResource` cannot disagree about either the merge or
+            // the bound; a refused repeat leaves the stored set as it was.
+            merge_tags(&mut record.tags, tags)?;
             return Ok(record.clone());
         }
 
-        if tags.len() > MAX_TAGS_PER_RESOURCE {
-            return Err(RegisterRefusal::TagLimitExceeded);
-        }
+        // A fresh registration starts from nothing stored, so the same merge decides the
+        // set it is created with — and refuses it through the same bound.
+        let mut fresh_tags = HashMap::new();
+        merge_tags(&mut fresh_tags, tags)?;
         // A registration this account cannot hold is refused BEFORE anything is written,
         // so the store cannot grow past the ceiling however often a caller registers.
         if self.providers.len() >= MAX_REGISTERED_PROVIDERS {
@@ -368,7 +368,7 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
             arn.clone(),
             source.to_string(),
             secret_arn.to_string(),
-            tags,
+            fresh_tags,
             now,
         );
         self.providers.insert(arn.clone(), record.clone());
@@ -479,6 +479,8 @@ pub enum RegisterRefusal {
     /// The resultant tag set would be larger than a resource of this service may carry
     /// ([`MAX_TAGS_PER_RESOURCE`]).
     ///
+    /// Reached through [`merge_tags`], the one place the bound is decided.
+    ///
     /// Answered with the TAGGING surface's `BadRequestException`, not this service's
     /// modelled `ValidationException`: a tag set past the limit is that surface's refusal
     /// wherever the tag map appears, which is what the request boundary already answers
@@ -489,6 +491,21 @@ pub enum RegisterRefusal {
     /// The account already holds [`MAX_REGISTERED_PROVIDERS`] registrations, so this one
     /// cannot be taken. Answered with the operation's modelled `ValidationException`.
     TooManyProviders,
+}
+
+/// A refused tag merge: the resultant set would be larger than
+/// [`MAX_TAGS_PER_RESOURCE`].
+///
+/// [`merge_tags`] is the only thing that produces it, and each caller maps it onto the
+/// answer its own surface states — which is the same refusal in both cases, since the
+/// bound belongs to the tag map rather than to the operation that carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TagLimitExceeded;
+
+impl From<TagLimitExceeded> for RegisterRefusal {
+    fn from(_: TagLimitExceeded) -> Self {
+        Self::TagLimitExceeded
+    }
 }
 
 /// The most registrations one account's provider store holds.
@@ -580,6 +597,36 @@ pub const MAX_HOME_REGIONS: usize = 100;
 /// reported by the operation that lists its tags. A tag write whose RESULTANT set would
 /// pass this bound is therefore refused instead of being stored.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// Merge the pairs a request carries into one resource's `stored` tag set, or refuse the
+/// write because the resultant set would not fit.
+///
+/// The RESULTANT set — what the resource would carry once the write landed — is the set
+/// [`MAX_TAGS_PER_RESOURCE`] bounds, so a key `stored` already holds is an OVERWRITE that
+/// does not grow the set while a key it does not hold does. A resultant set past the bound
+/// is refused with `stored` untouched, so a refused write stores nothing; otherwise
+/// `stored` is left carrying the union of both sets, with the requested value for every
+/// key the request names and the value it had for every key the request does not.
+///
+/// Every tag write of this service merges through here — `TagResource` and the
+/// `@idempotent` repeat path of
+/// [`register_provider`](ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState::register_provider)
+/// — so the bound is decided in ONE place and the two callers cannot drift apart.
+pub fn merge_tags(
+    stored: &mut HashMap<String, String>,
+    requested: HashMap<String, String>,
+) -> Result<(), TagLimitExceeded> {
+    let resultant = stored.len()
+        + requested
+            .keys()
+            .filter(|key| !stored.contains_key(*key))
+            .count();
+    if resultant > MAX_TAGS_PER_RESOURCE {
+        return Err(TagLimitExceeded);
+    }
+    stored.extend(requested);
+    Ok(())
+}
 
 /// What `GetServiceSettings` and `UpdateServiceSettings` report for this account.
 ///

@@ -3666,6 +3666,31 @@ pub fn billing_period_range_is_ordered(
     billing_period_key(&range.inclusive_start_billing_period).is_none_or(|start| start < end)
 }
 
+/// Does `range` describe a non-empty span of billing periods — or is that the refusal
+/// it earns?
+///
+/// The rule is [`billing_period_range_is_ordered`]: the end bound is exclusive, so a
+/// range whose end is at or before its inclusive start covers no billing period, which
+/// `ValidationExceptionReason` enumerates `ILLEGAL_BILLING_PERIOD_RANGE` for.
+///
+/// `Err` carries the `(reason, member, message)` of the modelled `ValidationException`
+/// the calling operation refuses the request with, so every operation taking that shape
+/// answers an empty range the same way.
+pub fn check_billing_period_range_is_ordered(
+    range: &crate::ops::types::CustomLineItemBillingPeriodRange,
+) -> Result<(), ValidationRefusal> {
+    if billing_period_range_is_ordered(range) {
+        return Ok(());
+    }
+    Err((
+        "ILLEGAL_BILLING_PERIOD_RANGE",
+        "BillingPeriodRange.ExclusiveEndBillingPeriod",
+        "the exclusive end billing period must be later than the inclusive start billing \
+         period"
+            .to_string(),
+    ))
+}
+
 /// How many billing periods back a request may still apply a change to, counted from
 /// the current one: the PREVIOUS billing period is the oldest, which is what the
 /// operations bounded to it document ("in the current, or previous billing period").

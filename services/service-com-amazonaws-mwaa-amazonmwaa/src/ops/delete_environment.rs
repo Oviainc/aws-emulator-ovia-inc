@@ -2,8 +2,9 @@
 
 //! @op DeleteEnvironment
 //!
-//! Removes the stored environment record — and with it the tags that live on it — so a
-//! later `GetEnvironment` answers 404 and `ListEnvironments` no longer names it.
+//! Starts the environment's teardown: the record enters the `DELETING` status the model
+//! documents and the clock owes its removal, so the environment (and the tags that live
+//! on it) stays readable and listed for the teardown window and only then answers 404.
 //!
 //! ## Shape of an operation
 //!
@@ -147,13 +148,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        // A second delete of the same name lands here, because the first one removed the
-        // record.
-        store.remove(&region, &input.name).ok_or_else(|| {
+        // A delete of a name the store does not hold is a lookup miss — and an
+        // environment whose teardown already finished is such a name, because the removal
+        // the clock owed it was materialised by the `settle` above.
+        let stored = store.environment_mut(&region, &input.name).ok_or_else(|| {
             DeleteEnvironmentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: Some(crate::state::environment_not_found_message(&input.name)),
             })
         })?;
+
+        // Deletion is asynchronous: this call only STARTS the teardown. The record is not
+        // dropped here — it enters `DELETING` and the clock owes its removal — so a caller
+        // polling for the teardown observes the transient status and the environment still
+        // listed, the same way it observes the transient statuses of a create and of an
+        // update. Repeating the delete while the teardown runs starts nothing further and
+        // moves no deadline (`begin_deletion` is idempotent), so the answer is the same
+        // empty 200.
+        stored.begin_deletion(now);
         Ok(DeleteEnvironmentOutput {})
     }
 }

@@ -59,6 +59,8 @@ mod sub_list_resolves_its_resource_first;
 mod tagged_resource_tag_lookup;
 #[path = "all/tagging_region_scope.rs"]
 mod tagging_region_scope;
+#[path = "all/task_in_flight_predicate.rs"]
+mod task_in_flight_predicate;
 #[path = "all/task_terminal_completed_at.rs"]
 mod task_terminal_completed_at;
 #[path = "all/unknown_resource_id.rs"]
