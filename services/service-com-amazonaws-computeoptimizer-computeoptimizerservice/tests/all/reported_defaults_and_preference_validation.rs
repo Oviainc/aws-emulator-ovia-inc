@@ -61,18 +61,27 @@ async fn enrollment_status_always_reports_the_opted_in_member_account_count() {
     let router = emulator();
 
     // Row 0 is the untouched account; the rest are every (status, includeMemberAccounts)
-    // combination `UpdateEnrollmentStatus` accepts (`Status` is settable only to `Active`
-    // or `Inactive`).
-    let rows: Vec<(&str, Option<(&str, bool)>)> = vec![
-        ("never enrolled", None),
-        ("Active with member accounts", Some(("Active", true))),
-        ("Active without member accounts", Some(("Active", false))),
-        ("Inactive with member accounts", Some(("Inactive", true))),
-        ("Inactive without member accounts", Some(("Inactive", false))),
+    // combination a client can send `UpdateEnrollmentStatus` (`Status` is settable only to
+    // `Active` or `Inactive`), with the status that write answers for this emulator's
+    // STANDALONE account: `includeMemberAccounts` enrolls "member accounts of the organization
+    // if the account is the management account of an organization", which it is not, so those
+    // rows are refused with 400 — and the count is reported after a refused write exactly as
+    // after an accepted one.
+    let rows: Vec<(&str, Option<&str>, bool, u16)> = vec![
+        ("never enrolled", None, false, 0),
+        ("Active with member accounts", Some("Active"), true, 400),
+        ("Active without member accounts", Some("Active"), false, 200),
+        ("Inactive with member accounts", Some("Inactive"), true, 400),
+        (
+            "Inactive without member accounts",
+            Some("Inactive"),
+            false,
+            200,
+        ),
     ];
 
-    for (case, update) in rows {
-        if let Some((status, include_member_accounts)) = update {
+    for (case, status, include_member_accounts, wanted) in rows {
+        if let Some(status) = status {
             let (code, body) = call(
                 &router,
                 "UpdateEnrollmentStatus",
@@ -80,8 +89,8 @@ async fn enrollment_status_always_reports_the_opted_in_member_account_count() {
             )
             .await;
             assert_eq!(
-                code, 200,
-                "case {case:?}: expected the update to be accepted, got {code}: {body}"
+                code, wanted,
+                "case {case:?}: expected the update to answer {wanted}, got {code}: {body}"
             );
         }
 

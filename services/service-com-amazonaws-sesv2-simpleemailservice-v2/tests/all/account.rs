@@ -14,9 +14,10 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::ops::types::{
-    AccountDetails, ReviewDetails, SuppressionConditionThreshold, SuppressionConfidenceThreshold,
-    SuppressionValidationAttributes, FEATURE_STATUS_VALUES, MAIL_TYPE_VALUES, PRICING_PLAN_VALUES,
-    REVIEW_STATUS_VALUES, SUPPRESSION_LIST_REASON_VALUES,
+    AccountDetails, DashboardAttributes, GuardianAttributes, ReviewDetails,
+    SuppressionConditionThreshold, SuppressionConfidenceThreshold, SuppressionValidationAttributes,
+    FEATURE_STATUS_VALUES, MAIL_TYPE_VALUES, PRICING_PLAN_VALUES, REVIEW_STATUS_VALUES,
+    SUPPRESSION_LIST_REASON_VALUES,
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
     AccountState, ComAmazonawsSesv2SimpleemailserviceV2State, SendQuotaState, SentMessage,
@@ -309,22 +310,28 @@ fn assert_mirrors(case: &str, account: &AccountState, quota: &SendQuotaState, re
         account.vdm_enabled,
         reply.body
     );
+    let engagement_metrics = account
+        .vdm_dashboard_attributes
+        .as_ref()
+        .and_then(|dashboard| dashboard.engagement_metrics.clone());
     assert_eq!(
         reply.text_at(&["VdmAttributes", "DashboardAttributes", "EngagementMetrics"]),
-        account.vdm_engagement_metrics.clone(),
-        "case {case:?}: expected EngagementMetrics {:?}, got {:?}",
-        account.vdm_engagement_metrics,
+        engagement_metrics,
+        "case {case:?}: expected EngagementMetrics {engagement_metrics:?}, got {:?}",
         reply.body
     );
+    let optimized_shared_delivery = account
+        .vdm_guardian_attributes
+        .as_ref()
+        .and_then(|guardian| guardian.optimized_shared_delivery.clone());
     assert_eq!(
         reply.text_at(&[
             "VdmAttributes",
             "GuardianAttributes",
             "OptimizedSharedDelivery"
         ]),
-        account.vdm_optimized_shared_delivery.clone(),
-        "case {case:?}: expected OptimizedSharedDelivery {:?}, got {:?}",
-        account.vdm_optimized_shared_delivery,
+        optimized_shared_delivery,
+        "case {case:?}: expected OptimizedSharedDelivery {optimized_shared_delivery:?}, got {:?}",
         reply.body
     );
 
@@ -470,8 +477,12 @@ async fn the_account_report_mirrors_every_persisted_account_attribute() {
             name: "vdm-enabled-with-both-features-set",
             account: AccountState {
                 vdm_enabled: FEATURE_ENABLED.to_string(),
-                vdm_engagement_metrics: Some(FEATURE_ENABLED.to_string()),
-                vdm_optimized_shared_delivery: Some(FEATURE_DISABLED.to_string()),
+                vdm_dashboard_attributes: Some(DashboardAttributes {
+                    engagement_metrics: Some(FEATURE_ENABLED.to_string()),
+                }),
+                vdm_guardian_attributes: Some(GuardianAttributes {
+                    optimized_shared_delivery: Some(FEATURE_DISABLED.to_string()),
+                }),
                 suppressed_reasons: vec![SUPPRESSION_LIST_REASON_VALUES[1].to_string()],
                 ..AccountState::default()
             },

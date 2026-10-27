@@ -253,13 +253,29 @@ async fn re_enabling_rotation_replaces_the_period() {
         assert_scheduled(&case, &status, &arn, expected, before, after);
 
         // "On-demand rotations do not change existing automatic rotation schedules"
-        // (`smithy_query(query="doc",shape="RotateKeyOnDemand")`).
+        // (`smithy_query(query="doc",shape="RotateKeyOnDemand")`), so every member that
+        // describes the SCHEDULE is unchanged by one — while the rotation it started is
+        // reported beside them, by `OnDemandRotationStartDate`, for as long as it is in
+        // progress (`tests/all/refusal_and_rotation_contracts.rs` asserts the whole span
+        // of that; this row asserts the two do not interfere).
         ok(&router, "RotateKeyOnDemand", &json!({"KeyId": key_id})).await;
         let after_rotation = rotation_status(&router, &key_id).await;
-        assert_eq!(
-            after_rotation, status,
-            "case {case:?}: an on-demand rotation must leave the automatic schedule \
-             alone, got {after_rotation} (was {status})"
+        for member in [
+            "KeyId",
+            "KeyRotationEnabled",
+            "RotationPeriodInDays",
+            "NextRotationDate",
+        ] {
+            assert_eq!(
+                after_rotation[member], status[member],
+                "case {case:?}: an on-demand rotation must leave {member} alone, got \
+                 {after_rotation} (was {status})"
+            );
+        }
+        assert!(
+            after_rotation["OnDemandRotationStartDate"].as_f64().is_some(),
+            "case {case:?}: the on-demand rotation just started must be reported as in \
+             progress, got {after_rotation}"
         );
     }
 }

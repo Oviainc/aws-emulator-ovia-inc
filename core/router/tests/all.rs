@@ -56,6 +56,11 @@ mod ses_family_signing_name_routing;
 // add their line to.
 #[path = "all/ses_event_destination_setup_across_services.rs"]
 mod ses_event_destination_setup_across_services;
+// Declared beside its two sibling suites, at the head, for the reason the entries above
+// record: the appended tail and the sorted `s…` span are both regions concurrently landing
+// suites add their line to.
+#[path = "all/ses_firehose_event_destination_setup.rs"]
+mod ses_firehose_event_destination_setup;
 // Declared beside the suites above, at the head, for the same reason: the appended tail and
 // the sorted `c…` span (where every cloudformation suite lands) are both regions concurrent
 // suites add their line to.
@@ -469,6 +474,8 @@ mod cloudformation_provisions_fis_experiment_templates;
 mod cloudformation_provisions_guardduty_detector;
 #[path = "all/cloudformation_provisions_sns_topics.rs"]
 mod cloudformation_provisions_sns_topics;
+#[path = "all/cloudformation_provisions_sns_subscriptions.rs"]
+mod cloudformation_provisions_sns_subscriptions;
 #[path = "all/cloudformation_provisions_waf_regional_ip_sets.rs"]
 mod cloudformation_provisions_waf_regional_ip_sets;
 #[path = "all/cloudformation_provisions_grafana_workspaces.rs"]

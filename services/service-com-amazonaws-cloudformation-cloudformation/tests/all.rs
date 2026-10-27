@@ -111,6 +111,8 @@ mod publisher_reads;
 mod publisher_registration;
 #[path = "all/rds_stack_resources.rs"]
 mod rds_stack_resources;
+#[path = "all/refused_stack_deletion.rs"]
+mod refused_stack_deletion;
 #[path = "all/regional_stack_namespace.rs"]
 mod regional_stack_namespace;
 #[path = "all/resource_scan_lifecycle.rs"]
@@ -167,6 +169,8 @@ mod stack_role_trust;
 mod stack_set_drift_lifecycle;
 #[path = "all/stack_set_lifecycle.rs"]
 mod stack_set_lifecycle;
+#[path = "all/stack_status_accepts_an_update.rs"]
+mod stack_status_accepts_an_update;
 #[path = "all/stack_tag_propagation.rs"]
 mod stack_tag_propagation;
 #[path = "all/state_roundtrip.rs"]

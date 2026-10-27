@@ -160,13 +160,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Argument validation, BEFORE the store is consulted: a `TopicArn` that is
-        // not an ARN at all is bad input, which this operation's documented
+        // not an ARN at all — or one naming another region, which this endpoint does
+        // not serve — is bad input, which this operation's documented
         // idempotence does not cover — "deleting a topic that does not exist does not
-        // result in an error" is about a topic, and this value names none.
-        if let Some(message) = crate::state::arn_refusal("TopicArn", &input.topic_arn) {
+        // result in an error" is about a topic of this region, and this value names
+        // none.
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) =
+            crate::state::regional_arn_refusal("TopicArn", &input.topic_arn, &region)
+        {
             return Err(DeleteTopicErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message),

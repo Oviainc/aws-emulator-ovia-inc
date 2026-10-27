@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopColumnStatisticsTaskRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopColumnStatisticsTaskRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopColumnStatisticsTaskRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops the column statistics task run in flight for ONE stored table: the run
+//! [`crate::state`] holds that has not reached a terminal `ColumnStatisticsState` is
+//! moved into the stopped one, so `GetColumnStatisticsTaskRun` reports it stopped and a
+//! further start of that table is served rather than refused.
+//!
+//! A table the addressed catalog does not hold is the operation's modelled
+//! `EntityNotFoundException`; a table whose runs have all finished (or that has none) is
+//! its `ColumnStatisticsTaskNotRunningException`, "thrown when you try to stop a task run
+//! when there is no task running" — so a second stop of the same run is refused that way
+//! rather than stopping anything twice.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +148,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopColumnStatisticsTaskRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopColumnStatisticsTaskRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopColumnStatisticsTaskRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error, the same way `GetCrawler` reports it.
+            return Err(
+                StopColumnStatisticsTaskRunErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Everything the clock already owed the stored runs is materialised first, so a
+        // run the clock had already finished is not stopped a second time.
+        store.settle_due_column_statistics_task_runs(now);
+
+        // `DatabaseName` and `TableName` are `@required`, so reaching here the only
+        // questions are whether the catalog holds that table and whether a run of it is in
+        // flight. The entity lookup comes first: a stop addressed at no stored table is a
+        // miss, not a "nothing is running".
+        {
+            let Some(database) = store.database(&catalog_id, &input.database_name) else {
+                return Err(not_found(crate::state::messages::database_not_found(
+                    &input.database_name,
+                )));
+            };
+            if !database
+                .tables
+                .contains_key(&crate::state::fold_name(&input.table_name))
+            {
+                return Err(not_found(crate::state::messages::table_not_found(
+                    &input.table_name,
+                )));
+            }
+        }
+
+        let Some(run) = store.running_column_statistics_task_run_mut(
+            &catalog_id,
+            &input.database_name,
+            &input.table_name,
+        ) else {
+            return Err(
+                StopColumnStatisticsTaskRunErrorModeled::ColumnStatisticsTaskNotRunningException(
+                    ColumnStatisticsTaskNotRunningException {
+                        message: Some(
+                            crate::state::messages::COLUMN_STATISTICS_TASK_NOT_RUNNING.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        run.stop(now);
+        let stopped = run.id.clone();
+        ::tracing::info!(
+            operation = "StopColumnStatisticsTaskRun",
+            database = %input.database_name,
+            table = %input.table_name,
+            run = %stopped,
+            "stopped a Glue column statistics task run"
+        );
+
+        Ok(StopColumnStatisticsTaskRunOutput {})
     }
+}
+
+/// This operation's modelled miss: "A specified entity does not exist".
+fn not_found(message: String) -> StopColumnStatisticsTaskRunError {
+    StopColumnStatisticsTaskRunErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }

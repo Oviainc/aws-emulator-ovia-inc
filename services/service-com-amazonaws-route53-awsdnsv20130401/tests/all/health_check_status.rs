@@ -43,16 +43,22 @@ use crate::hosted_zone_records::{
 };
 
 /// One observation as the wire carries it.
+///
+/// `pub(crate)` so the sibling suite that asserts the OTHER reader of a health
+/// check's observations reads them out of the wire the same way rather than
+/// growing a second copy of this.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Observation {
-    region: String,
-    ip_address: String,
-    status: String,
-    checked_time: String,
+pub(crate) struct Observation {
+    pub(crate) region: String,
+    pub(crate) ip_address: String,
+    pub(crate) status: String,
+    pub(crate) checked_time: String,
 }
 
 /// Send one `GetHealthCheckStatus` request.
-async fn get_status(router: &MultiServiceRouter, id: &str) -> Reply {
+///
+/// `pub(crate)` so a sibling suite reads the status through the SAME request.
+pub(crate) async fn get_status(router: &MultiServiceRouter, id: &str) -> Reply {
     call(
         router,
         "GET",
@@ -74,6 +80,15 @@ async fn observations(router: &MultiServiceRouter, id: &str, case: &str) -> Vec<
          got {} with body {}",
         reply.status, reply.body
     );
+    observations_in(&reply, case)
+}
+
+/// The observations one reply carries, in wire order.
+///
+/// `pub(crate)` because `GetHealthCheckStatus` and
+/// `GetHealthCheckLastFailureReason` answer the SAME modelled list, so both
+/// suites read it out of the body through this one reader.
+pub(crate) fn observations_in(reply: &Reply, case: &str) -> Vec<Observation> {
     let regions = reply.all("HealthCheckObservation/Region");
     let addresses = reply.all("HealthCheckObservation/IPAddress");
     let statuses = reply.all("StatusReport/Status");

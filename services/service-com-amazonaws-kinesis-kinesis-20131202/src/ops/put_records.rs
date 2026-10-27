@@ -327,9 +327,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is resolved in that same pass, so the store pass below has nothing left to fail
         // on halfway through.
         let maximum = stream.max_record_size_bytes();
+
+        // The stream's own maximum record size is a bound on the LENGTH of an entry's
+        // `Data`, so a blob past it is refused the way a modelled `@length` is: the
+        // validation envelope, naming the member at its position in the batch and the bound
+        // it failed. Every entry is measured in this one pass and EVERY member at fault
+        // contributes its clause, the way that envelope accumulates, so a batch with two
+        // oversize blobs names both rather than only the first. This operation models no
+        // `ValidationException`, so the refusal travels through the error channel's own
+        // validation variant, which answers that code with HTTP 400.
+        let too_long: Vec<String> = input
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.data.len() > maximum)
+            .map(|(index, _)| crate::state::put_records_data_path(index.saturating_add(1)))
+            .collect();
+        if !too_long.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::data_too_long_message(&too_long, maximum),
+            ));
+        }
+
         let mut placements: Vec<usize> = Vec::with_capacity(input.records.len());
         let mut batch_bytes = 0usize;
         for (index, entry) in input.records.iter().enumerate() {
+            let position = index.saturating_add(1);
+            // The TOTAL of the entry's two members, which no single member's length states,
+            // so it is the modelled "parameter ... can't be used" refusal.
             let size = entry.data.len()
                 + entry
                     .partition_key
@@ -338,8 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .unwrap_or_default();
             if size > maximum {
                 return Err(invalid_argument(format!(
-                    "record {} of the batch: {}",
-                    index.saturating_add(1),
+                    "record {position} of the batch: {}",
                     crate::state::record_too_large_message(size, maximum)
                 )));
             }

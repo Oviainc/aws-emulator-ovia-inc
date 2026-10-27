@@ -16,11 +16,14 @@
 //! a claim about the service's quota, so a caller that creates more grants on one key than
 //! that bound sees `LimitExceededException` where AWS would still succeed.
 //!
-//! A presented `GrantTokens` value is judged more loosely here than in a cryptographic
-//! operation: this is a MANAGEMENT operation, so a token has only to name a grant the
-//! store still holds — its key, its permitted operations and its encryption-context
-//! constraints (which apply to cryptographic operations) do not narrow it, and a token
-//! naming a grant on another key is accepted.
+//! Issuing a grant is authorized before anything is persisted, through the service's one
+//! authorization decision ([`crate::state::authorization`]): the key's own key policy,
+//! the calling principal's identity-based policies, and the grants on the key issued to
+//! that principal. A presented `GrantTokens` value is judged more loosely than in a
+//! cryptographic operation: this is a MANAGEMENT operation, so a token has only to name a
+//! grant the store still holds — its key, its permitted operations and its
+//! encryption-context constraints (which apply to cryptographic operations) do not narrow
+//! it, and a token naming a grant on another key is accepted.
 //!
 //! ## Shape of an operation
 //!
@@ -338,12 +341,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             if !crate::state::names_a_principal_arn(principal) {
                 return Err(CreateGrantErrorModeled::InvalidArnException(InvalidArnException {
-                    message: Some(crate::state::invalid_arn_message(principal)),
+                    message: Some(crate::state::invalid_principal_arn_message(principal)),
                 })
                 .into());
             }
         }
 
+        // Who the request speaks for, resolved BEFORE this service's store is locked, so
+        // the IAM and STS stores the resolution reads are never reached while this
+        // service's guard is held.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
 
@@ -415,29 +422,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // new grant that has not yet achieved eventual consistency"
         // (`smithy_query(query="doc",shape="CreateGrantRequest",member="GrantTokens")`).
         // A token that is not one this service minted names no grant at all, so the
-        // TOKEN "is not valid"; one whose grant is gone carries no permission, which is
-        // an authorization failure. `CreateGrant` is a management operation, so the
-        // grant's own encryption-context constraints — which apply to cryptographic
-        // operations — do not narrow it further.
-        if !tokens.is_empty() {
-            if let Err(refusal) = state.grants_for_tokens(&region, &tokens) {
-                return Err(match refusal {
-                    crate::state::GrantRefusal::MalformedToken => {
-                        CreateGrantErrorModeled::InvalidGrantTokenException(
-                            InvalidGrantTokenException {
-                                message: Some(
-                                    "The specified grant token is not valid.".to_string(),
-                                ),
-                            },
-                        )
-                        .into()
-                    }
-                    crate::state::GrantRefusal::NotAuthorized => {
-                        crate::scaffolded::Scaffolded::access_denied(
-                            crate::state::grant_access_denied_message(Self::NAME, &key_arn),
-                        )
-                    }
-                });
+        // TOKEN "is not valid".
+        let named = match state.grants_for_tokens(&region, &tokens) {
+            Ok(named) => named,
+            Err(crate::state::GrantRefusal::MalformedToken) => {
+                return Err(CreateGrantErrorModeled::InvalidGrantTokenException(
+                    InvalidGrantTokenException {
+                        message: Some("The specified grant token is not valid.".to_string()),
+                    },
+                )
+                .into());
+            }
+            // Every token is well formed but names a grant the store no longer holds,
+            // so the permission that came from them is gone.
+            Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
+        };
+
+        // Issuing a grant is itself an authorized operation — "to create a grant, you
+        // must have `kms:CreateGrant` permission", granted by the key policy, by an
+        // identity policy, or by a grant that carries the `CreateGrant` operation — and
+        // it is the most privilege-amplifying one KMS has, so a principal no authority in
+        // force reaches is refused here and no grant is minted.
+        //
+        // A token naming a grant the store still holds is itself that permission: this is
+        // a MANAGEMENT operation, so the named grant's key, its permitted operations and
+        // its encryption-context constraints — which "apply only to cryptographic
+        // operations that support an encryption context" — do not narrow it, which is the
+        // looseness this file's module doc records.
+        let Some(key) = state.key_in(&region, &key_id) else {
+            return Err(CreateGrantErrorModeled::KMSInternalException(KMSInternalException {
+                message: Some("the KMS key could not be read back".to_string()),
+            })
+            .into());
+        };
+        if named.is_empty() {
+            if let Err(message) = crate::state::authorization::authorize(
+                &caller,
+                &state,
+                &region,
+                key,
+                Self::NAME,
+                None,
+                (!tokens.is_empty()).then_some(named.as_slice()),
+            ) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(message));
             }
         }
 

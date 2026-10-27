@@ -41,6 +41,8 @@ mod list_resources_for_web_acl;
 mod list_rule_groups;
 #[path = "all/logging_configuration.rs"]
 mod logging_configuration;
+#[path = "all/logging_destination_names.rs"]
+mod logging_destination_names;
 #[path = "all/managed_products.rs"]
 mod managed_products;
 #[path = "all/managed_products_by_vendor.rs"]

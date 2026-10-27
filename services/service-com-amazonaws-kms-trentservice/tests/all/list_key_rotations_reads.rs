@@ -32,7 +32,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
     alias_arn, b64, create_alias, create_alias_in, create_key, describe, failure, failure_in,
-    is_lower_hex, ok, ok_in, router, text, REGION,
+    is_lower_hex, ok, ok_in, rotate_on_demand, rotate_on_demand_in, router, text, REGION,
 };
 
 /// How many on-demand rotations one key allows, from
@@ -103,7 +103,7 @@ async fn rotate(
     let mut materials = Vec::new();
     for round in 1..=count {
         let case = format!("{case} rotation {round}");
-        ok(router, "RotateKeyOnDemand", &json!({"KeyId": identifier})).await;
+        rotate_on_demand(router, &case, identifier).await;
         let described = describe(router, identifier).await;
         materials.push(text(&case, &described, "CurrentKeyMaterialId"));
     }
@@ -281,13 +281,7 @@ async fn the_reader_serves_only_the_keys_of_its_own_region_and_account() {
         let key_id = text(&case, &metadata, "KeyId");
         create_alias_in(&router, region, &case, "alias/regional-rotations", &key_id).await;
         for _ in 0..rotations {
-            ok_in(
-                &router,
-                region,
-                "RotateKeyOnDemand",
-                &json!({"KeyId": key_id}),
-            )
-            .await;
+            rotate_on_demand_in(&router, region, &case, &key_id).await;
         }
         keys.push((region, key_id, rotations));
     }

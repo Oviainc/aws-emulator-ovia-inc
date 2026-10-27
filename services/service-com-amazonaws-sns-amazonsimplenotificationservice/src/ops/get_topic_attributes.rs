@@ -146,11 +146,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Argument validation, BEFORE the store is consulted: a `TopicArn` that is
-        // not an ARN at all is bad input, not a topic that does not exist.
-        if let Some(message) = crate::state::arn_refusal("TopicArn", &input.topic_arn) {
+        // not an ARN at all — or one naming another region, which this endpoint does
+        // not serve — is bad input, not a topic that does not exist.
+        let region = crate::state::request_region(ctx.parts());
+        if let Some(message) =
+            crate::state::regional_arn_refusal("TopicArn", &input.topic_arn, &region)
+        {
             return Err(GetTopicAttributesErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message),

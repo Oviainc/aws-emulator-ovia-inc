@@ -22,7 +22,13 @@
 //! 5. one VPC holds at most ONE association: a second `AssociateRouteServer` naming a VPC
 //!    that already holds one is refused with `Resource.AlreadyAssociated` and writes
 //!    nothing, and deleting a VPC takes the association it held with it rather than leaving
-//!    one that names a VPC which no longer exists.
+//!    one that names a VPC which no longer exists;
+//! 6. every way `AssociateRouteServer` can be refused is rendered in THIS SERVICE'S
+//!    ec2Query error envelope: the status that refusal class carries, its code, the message
+//!    AWS words for it with the request's own values in it, the envelope's media type, and
+//!    one `<RequestID>` of its own naming the call — which is what a client of this
+//!    operation reads a refusal out of, and what an unimplemented operation's 501 never
+//!    gave it.
 //!
 //! Each table row is a distinct input along what those rules generalise over — which route
 //! server, which VPC, how many associations it holds, the form of an id that names nothing
@@ -30,12 +36,14 @@
 //! parameter is missing, and whether the second associate repeats the pair or names a
 //! different route server — so no one row is the specification.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use service_com_amazonaws_ec2_amazonec2::state::TRANSITION_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, element, error_code, error_message};
+use super::ec2_query::{call, call_with_content_type, element, error_code, error_message};
+use super::ec2_query_error_envelope::{RESPONSE_CONTENT_TYPE, refusal_request_id};
 use super::wire::{Param, child, child_text, document, param};
 
 /// The Region every call here is signed for.
@@ -162,6 +170,18 @@ async fn reported_pairs(
         .collect()
 }
 
+/// The form fields one `AssociateRouteServer` call carries: the pair it names, plus
+/// whatever extra parameters the case needs. Built here so the suite's own calls and the
+/// envelope table below name the operation's parameters the one way.
+fn associate_params(route_server_id: &str, vpc_id: &str, extra: &[Param]) -> Vec<Param> {
+    let mut params = vec![
+        param("RouteServerId", route_server_id),
+        param("VpcId", vpc_id),
+    ];
+    params.extend_from_slice(extra);
+    params
+}
+
 /// `AssociateRouteServer` for one pair, with whatever extra parameters the case needs.
 async fn associate(
     router: &MultiServiceRouter,
@@ -169,12 +189,12 @@ async fn associate(
     vpc_id: &str,
     extra: &[Param],
 ) -> (u16, String) {
-    let mut params = vec![
-        param("RouteServerId", route_server_id),
-        param("VpcId", vpc_id),
-    ];
-    params.extend_from_slice(extra);
-    action(router, "AssociateRouteServer", &params).await
+    action(
+        router,
+        "AssociateRouteServer",
+        &associate_params(route_server_id, vpc_id, extra),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -609,5 +629,189 @@ async fn one_vpc_holds_at_most_one_route_server_association() {
         second_pairs.len(),
         1,
         "the second route server must now hold one association, got {second_pairs:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 6: every refusal of the associate is rendered in the service's envelope
+// ---------------------------------------------------------------------------
+
+/// The status EC2 answers a `DryRun` the caller asked for with: the request was refused
+/// because a precondition the CALLER set holds, not because it was malformed.
+const DRY_RUN_STATUS: u16 = 412;
+
+/// One row of the envelope table: the case, the form fields the request carries, and the
+/// status, code and message the service must refuse it with.
+struct EnvelopeRow {
+    case: String,
+    params: Vec<Param>,
+    status: u16,
+    code: &'static str,
+    message: String,
+}
+
+/// The rule: whichever way `AssociateRouteServer` is refused, the refusal reaches the client
+/// as this service's ec2Query error envelope — the status that refusal class carries, its
+/// `<Code>`, a `<Message>` worded for that class with the request's own values quoted into
+/// it, the envelope's media type, and one `<RequestID>` of its own, in the 8-4-4-4-12 form,
+/// closing it.
+///
+/// The rows differ in WHICH refusal it is (a parameter sent empty, an id of neither route
+/// server form, a well-formed route server id the account holds nothing for at
+/// each published id length, a VPC the account does not hold, a VPC that already holds an
+/// association, and a `DryRun` of a request that would otherwise have succeeded), in WHICH
+/// member carries the offending value, and in WHICH status it carries — so no one row is the
+/// specification, and none of them is the 501 an operation nothing serves answers.
+#[tokio::test]
+async fn every_refusal_of_the_associate_is_rendered_in_this_services_error_envelope() {
+    let router = emulator();
+    let route_server_id = create_route_server("the route server", &router, "65020").await;
+    let associated_vpc =
+        create_vpc("the VPC that holds an association", &router, "10.41.0.0/16").await;
+    let free_vpc = create_vpc("a VPC that holds none", &router, "10.42.0.0/16").await;
+
+    // The one association every "already associated" row below is refused over.
+    let (status, body) = associate(&router, &route_server_id, &associated_vpc, &[]).await;
+    assert_eq!(
+        status, 200,
+        "the association under test must be written, got {status} with body {body}"
+    );
+
+    // A well-formed route server id at each of the two published EC2 id lengths that this
+    // store minted nothing for.
+    let unknown_short = "rs-1a2b3c4d";
+    let unknown_long = "rs-1a2b3c4d5e6f70819";
+    // A value that is not a route server id of either form.
+    let malformed = "rs-not-hex";
+    // A well-formed VPC id the account holds no VPC for.
+    let unknown_vpc = "vpc-1a2b3c4d5e6f70819";
+
+    let rows = vec![
+        // Both ids are modelled `clientOptional`, so a field sent EMPTY reaches the handler
+        // as an empty value and is the parameter missing. (A field left out of the body
+        // altogether never reaches the handler at all: the boundary validator in front of
+        // every operation of this service refuses it first, which is that validator's
+        // behaviour rather than this operation's.)
+        EnvelopeRow {
+            case: "an empty RouteServerId".to_string(),
+            params: associate_params("", &free_vpc, &[]),
+            status: 400,
+            code: "MissingParameter",
+            message: "The request must contain the parameter routeServerId".to_string(),
+        },
+        EnvelopeRow {
+            case: "an empty VpcId".to_string(),
+            params: associate_params(&route_server_id, "", &[]),
+            status: 400,
+            code: "MissingParameter",
+            message: "The request must contain the parameter vpcId".to_string(),
+        },
+        EnvelopeRow {
+            case: "a value that is not a route server id".to_string(),
+            params: associate_params(malformed, &free_vpc, &[]),
+            status: 400,
+            code: "InvalidRouteServerId.Malformed",
+            message: format!("Invalid id: '{malformed}'"),
+        },
+        EnvelopeRow {
+            case: "a well-formed short route server id the account holds nothing for".to_string(),
+            params: associate_params(unknown_short, &free_vpc, &[]),
+            status: 400,
+            code: "InvalidRouteServerId.NotFound",
+            message: format!("The route-server ID '{unknown_short}' does not exist"),
+        },
+        EnvelopeRow {
+            case: "a well-formed long route server id the account holds nothing for".to_string(),
+            params: associate_params(unknown_long, &free_vpc, &[]),
+            status: 400,
+            code: "InvalidRouteServerId.NotFound",
+            message: format!("The route-server ID '{unknown_long}' does not exist"),
+        },
+        EnvelopeRow {
+            case: "a VPC the account does not hold".to_string(),
+            params: associate_params(&route_server_id, unknown_vpc, &[]),
+            status: 400,
+            code: "InvalidVpcID.NotFound",
+            message: format!("The vpc ID '{unknown_vpc}' does not exist"),
+        },
+        EnvelopeRow {
+            case: "a VPC that already holds an association".to_string(),
+            params: associate_params(&route_server_id, &associated_vpc, &[]),
+            status: 400,
+            code: "Resource.AlreadyAssociated",
+            message: format!(
+                "The vpc '{associated_vpc}' is already associated with route server \
+                 '{route_server_id}'"
+            ),
+        },
+        EnvelopeRow {
+            case: "a DryRun of a request that would have succeeded".to_string(),
+            params: associate_params(&route_server_id, &free_vpc, &[param("DryRun", "true")]),
+            status: DRY_RUN_STATUS,
+            code: "DryRunOperation",
+            message: "Request would have succeeded, but DryRun flag is set.".to_string(),
+        },
+    ];
+
+    // Every row runs against ONE emulator, so the request ids are compared across refusals
+    // of this operation and not only within one row.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for row in rows {
+        let EnvelopeRow {
+            case,
+            params,
+            status,
+            code,
+            message,
+        } = row;
+        let (actual_status, content_type, body) =
+            call_with_content_type(&router, REGION, "AssociateRouteServer", &params).await;
+        assert_eq!(
+            actual_status, status,
+            "case {case:?}: expected HTTP {status}, got {actual_status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            code,
+            "case {case:?}: expected the code {code:?}, got body {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            message,
+            "case {case:?}: expected the message {message:?}, got body {body}"
+        );
+        assert_eq!(
+            content_type.as_deref(),
+            Some(RESPONSE_CONTENT_TYPE),
+            "case {case:?}: expected the media type {RESPONSE_CONTENT_TYPE:?}, got \
+             {content_type:?} with body {body}"
+        );
+        let request_id = refusal_request_id(&case, &body, code);
+        assert!(
+            seen.insert(request_id.clone()),
+            "case {case:?}: the request id {request_id:?} was already reported for another \
+             response"
+        );
+    }
+
+    // None of those refusals wrote anything: the one association made above is still the
+    // only one this route server holds, and the VPC the rows kept naming is still free.
+    let after = reported_pairs("after every refusal", &router, &route_server_id).await;
+    assert_eq!(
+        after.len(),
+        1,
+        "case {case:?}: a refused associate must write nothing, got {after:?}",
+        case = "after every refusal"
+    );
+    assert_eq!(
+        after[0].0, associated_vpc,
+        "case {case:?}: the one association must still be with {associated_vpc}, got {after:?}",
+        case = "after every refusal"
+    );
+    let (free_status, free_body) = associate(&router, &route_server_id, &free_vpc, &[]).await;
+    assert_eq!(
+        free_status, 200,
+        "the VPC only ever named in refused requests must still associate, got {free_status} \
+         with body {free_body}"
     );
 }

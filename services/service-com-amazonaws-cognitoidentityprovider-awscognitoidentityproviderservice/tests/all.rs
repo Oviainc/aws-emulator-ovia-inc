@@ -149,6 +149,8 @@ mod user_import_job_lifecycle;
 mod user_pool_domain;
 #[path = "all/user_pool_mfa_config.rs"]
 mod user_pool_mfa_config;
+#[path = "all/user_pool_replicas.rs"]
+mod user_pool_replicas;
 #[path = "all/verification_code_pipeline.rs"]
 mod verification_code_pipeline;
 #[path = "all/web_authn_registration.rs"]

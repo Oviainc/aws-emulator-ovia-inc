@@ -1140,6 +1140,33 @@ impl StoredHealthCheck {
             })
             .collect()
     }
+
+    /// The modelled `HealthCheckObservation` list
+    /// `GetHealthCheckLastFailureReason` reports: "one Observation element for
+    /// each Amazon Route 53 health checker that is reporting a last failure
+    /// reason".
+    ///
+    /// Read out of the SAME observations `GetHealthCheckStatus` reports
+    /// ([`StoredHealthCheck::to_health_check_observations`]), kept to the
+    /// checkers whose latest observation is a failure
+    /// ([`STATUS_FAILURE_PREFIX`]) — so the two readers of a health check's
+    /// status cannot disagree about what one checker observed, and a checker with
+    /// nothing to report about a failure is absent rather than reported with an
+    /// empty reason. A health check none of whose checkers has observed a failure
+    /// therefore has no observation to report at all, which is also what the
+    /// operation answers for a check nothing is checking.
+    pub fn to_last_failure_observations(&self, now_millis: i64) -> Vec<HealthCheckObservation> {
+        self.to_health_check_observations(now_millis)
+            .into_iter()
+            .filter(|observation| {
+                observation
+                    .status_report
+                    .as_ref()
+                    .and_then(|report| report.status.as_deref())
+                    .is_some_and(|status| status.starts_with(STATUS_FAILURE_PREFIX))
+            })
+            .collect()
+    }
 }
 
 /// Milliseconds in a second, for the `RequestInterval` (seconds) a probe cadence
@@ -1159,6 +1186,14 @@ pub const STATUS_HTTP_OK: &str = "Success: HTTP Status Code 200, OK";
 /// What a health checker reports for an endpoint that accepted the connection a
 /// `TCP` check opens.
 pub const STATUS_TCP_CONNECTION_ESTABLISHED: &str = "Success: TCP connection established";
+
+/// What a checker's `StatusReport$Status` opens with when the probe it describes
+/// FAILED, as opposed to the `Success: ` the descriptions above open with.
+///
+/// The one place that distinction is drawn, so the reader of a check's last
+/// failure reason ([`StoredHealthCheck::to_last_failure_observations`]) and the
+/// reader of its current status describe one probe the same way.
+pub const STATUS_FAILURE_PREFIX: &str = "Failure: ";
 
 /// The address the health checker in `region` reports from, when `region` is one
 /// the service checks from.
@@ -2676,14 +2711,17 @@ pub fn no_such_change(requested_id: &str) -> NoSuchChange {
 /// The ONE place this service words that refusal, beside
 /// [`no_such_hosted_zone`] and [`no_such_change`], so every health-check-addressed
 /// operation answers a missing health check identically. The message is
-/// REQUEST-DERIVED: it names the id the request asked about, as the request wrote
-/// it, which is what lets a caller tell which of a batch of ids was the missing
-/// one. The shape's own documentation states the rule it reports: "No health
-/// check exists with the specified ID."
+/// REQUEST-DERIVED and has one variable part: Route 53 states the fact about the
+/// id the request asked about, as the request wrote it, in the fixed form
+/// `A health check with id <id> does not exist.` — which is what lets a caller
+/// tell a missing health check apart from the other refusals that share this
+/// status, and read back which of a batch of ids was the missing one. The error
+/// shape's own documentation states the RULE the refusal reports, not the
+/// sentence it reports it in, so the sentence is not built from it.
 pub fn no_such_health_check(requested_id: &str) -> NoSuchHealthCheck {
     NoSuchHealthCheck {
         message: Some(format!(
-            "no health check exists with the ID {requested_id}"
+            "A health check with id {requested_id} does not exist."
         )),
     }
 }

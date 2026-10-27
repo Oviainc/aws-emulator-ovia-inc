@@ -309,8 +309,8 @@ async fn a_refusal_keeps_its_own_status() {
         ),
         (
             "an operation that is still a stub",
-            "DeleteMedicalVocabulary",
-            json!({"VocabularyName": "never-created"}),
+            "UpdateLanguageModel",
+            json!({"ModelName": "never-created"}),
             501,
             "NotImplemented",
         ),

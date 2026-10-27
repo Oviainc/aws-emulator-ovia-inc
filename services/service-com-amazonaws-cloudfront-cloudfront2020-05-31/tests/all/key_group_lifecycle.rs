@@ -62,7 +62,7 @@ use crate::response_headers_policy_lifecycle::escape;
 
 /// `POST /2020-05-31/key-group` with the `KeyGroupConfig` document `body` — the member the
 /// operation binds to the HTTP payload.
-async fn create_group(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_group(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -74,7 +74,7 @@ async fn create_group(router: &MultiServiceRouter, body: &str) -> Answer {
 }
 
 /// `GET /2020-05-31/key-group/{Id}`.
-async fn get_group(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_group(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -162,7 +162,11 @@ impl Group {
 }
 
 /// Upload `count` public keys and report the ids `CreatePublicKey` minted, in order.
-async fn mint_public_keys(router: &MultiServiceRouter, tag: &str, count: usize) -> Vec<String> {
+pub(crate) async fn mint_public_keys(
+    router: &MultiServiceRouter,
+    tag: &str,
+    count: usize,
+) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
     for index in 0..count {
         let body = format!(

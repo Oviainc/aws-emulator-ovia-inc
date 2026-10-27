@@ -45,16 +45,20 @@ async fn enrollment_defaults_to_inactive_and_round_trips_every_settable_status()
     // The rows span the model's `Status` enum (Active | Failed | Inactive | Pending —
     // `crate::ops::types::STATUS_VALUES`) crossed with `includeMemberAccounts`. Per the
     // `status` member's documentation only Active and Inactive may be supplied by a
-    // client; Pending and Failed "cannot be used to update the enrollment status".
+    // client; Pending and Failed "cannot be used to update the enrollment status". And
+    // `includeMemberAccounts` enrolls "member accounts of the organization if the account is
+    // the management account of an organization", which this emulator's standalone account is
+    // not — so every row that asks for them is refused too (`include_member_accounts.rs`
+    // pins that rule across every operation taking the member).
     let cases = [
-        ("Active", true, true),
+        ("Active", true, false),
         ("Active", false, true),
         ("Pending", false, false),
-        ("Inactive", true, true),
+        ("Inactive", true, false),
         ("Failed", true, false),
         ("Inactive", false, true),
     ];
-    for (wanted, include_member_accounts, settable) in cases {
+    for (wanted, include_member_accounts, accepted) in cases {
         let case = format!("status={wanted} includeMemberAccounts={include_member_accounts}");
         let (status, updated) = call(
             &router,
@@ -63,10 +67,11 @@ async fn enrollment_defaults_to_inactive_and_round_trips_every_settable_status()
         )
         .await;
 
-        if !settable {
+        if !accepted {
             assert_eq!(
                 status, 400,
-                "case {case:?}: a server-assigned status must be refused, got {status}: {updated}"
+                "case {case:?}: a server-assigned status, or member accounts a standalone \
+                 account cannot ask for, must be refused, got {status}: {updated}"
             );
             assert!(
                 error_code(&updated).contains("InvalidParameterValueException"),
@@ -119,7 +124,7 @@ async fn enrollment_defaults_to_inactive_and_round_trips_every_settable_status()
         );
     }
 
-    // The two refusals above changed nothing: the last accepted row is still in force.
+    // The refusals above changed nothing: the last accepted row is still in force.
     let (_, body) = call(&router, "GetEnrollmentStatus", json!({})).await;
     assert_eq!(
         body["status"], "Inactive",

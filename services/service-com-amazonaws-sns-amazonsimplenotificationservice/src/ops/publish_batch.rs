@@ -293,9 +293,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Argument validation first: a destination that is not an SNS topic ARN at all
-        // is bad input, not a topic that does not exist.
-        if let Some(message) = state::arn_refusal("TopicArn", &input.topic_arn) {
+        // Argument validation first: a destination that is not an SNS topic ARN of this
+        // endpoint's own region is bad input, not a topic that does not exist.
+        let region = state::request_region(ctx.parts());
+        if let Some(message) = state::regional_arn_refusal("TopicArn", &input.topic_arn, &region) {
             return Err(invalid_parameter(message));
         }
         if state::topic_name_from_arn(&input.topic_arn).is_none() {
