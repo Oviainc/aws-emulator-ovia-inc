@@ -520,6 +520,12 @@ mod describe_project_reads;
 // Declared last, for the same reason the suites above it are: both stretches
 // higher up are where every concurrent iotsitewise change inserts a declaration
 // of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/get_search_results.rs"]
+mod get_search_results;
+
+// Declared last, for the same reason the suites above it are: both stretches
+// higher up are where every concurrent iotsitewise change inserts a declaration
+// of its own. Fold it into the sorted list once the churn settles.
 #[path = "all/list_project_assets_paging.rs"]
 mod list_project_assets_paging;
 
