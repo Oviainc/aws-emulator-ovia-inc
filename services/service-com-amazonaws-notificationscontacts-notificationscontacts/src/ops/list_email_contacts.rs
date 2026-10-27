@@ -5,8 +5,9 @@
 //! stored records — so a contact a create added is listed, with whatever status the
 //! last activation wrote, and a deleted one is gone. `maxResults` bounds the page and
 //! an opaque `nextToken` names where it stopped, so the next call resumes beyond it;
-//! the last page carries no token. A token this operation did not issue is the
-//! modelled 400.
+//! the last page carries no token. The token carries an integrity tag over the position
+//! it names, so a value this operation did not issue is the modelled 400 rather than an
+//! arbitrary offset into the listing.
 //!
 //! ## Shape of an operation
 //!
@@ -84,31 +85,68 @@ use super::types::*;
 /// a size is already within it.
 const DEFAULT_PAGE_SIZE: usize = 100;
 
-/// The opaque `nextToken` for a page that stopped after `arn`.
+/// Bytes of the integrity tag a page token carries ahead of the position it names.
+///
+/// Eight bytes, as the token is a position marker rather than a credential: enough
+/// that a value this operation never cut is refused rather than read as some
+/// arbitrary offset into the listing.
+const PAGE_TOKEN_TAG_LEN: usize = 8;
+
+/// Domain separator mixed into every page-token tag, so a tag only ever verifies for
+/// the sequence it was computed over — this operation's walk of the contact ARNs — and
+/// the construction can be revised without an older token verifying under the new one.
+const PAGE_TOKEN_DOMAIN: &[u8] = b"notifications-contacts/ListEmailContacts/page-token/v1\0";
+
+/// The integrity tag of the position `arn`: the leading [`PAGE_TOKEN_TAG_LEN`] bytes of
+/// SHA-256 over [`PAGE_TOKEN_DOMAIN`] and the ARN itself.
+fn page_token_tag(arn: &str) -> Vec<u8> {
+    use ::sha2::Digest;
+    let mut hasher = ::sha2::Sha256::new();
+    hasher.update(PAGE_TOKEN_DOMAIN);
+    hasher.update(arn.as_bytes());
+    hasher.finalize()[..PAGE_TOKEN_TAG_LEN].to_vec()
+}
+
+/// The opaque `nextToken` for a page that stopped after `arn`: the position's integrity
+/// tag followed by the position, hex-encoded.
 ///
 /// Hex rather than base64 so the token is a single `[0-9a-f]+` word that needs no
 /// URL-escaping as a query parameter. It is opaque to the caller, not secret: it
-/// carries nothing beyond an ARN the caller already holds.
+/// carries nothing beyond an ARN the caller already holds. The tag is what makes the
+/// token SELF-VERIFYING, so [`decode_page_token`] can tell a token this operation cut
+/// from a value a caller assembled — the ARN alone cannot, since every well-formed ARN
+/// looks like a position whether this listing ever stopped at one or not.
 fn encode_page_token(arn: &str) -> String {
-    hex::encode(arn)
+    let mut bytes = page_token_tag(arn);
+    bytes.extend_from_slice(arn.as_bytes());
+    hex::encode(bytes)
 }
 
 /// The ARN a page token names, or the modelled 400 when the token is not one this
 /// operation issued.
 fn decode_page_token(token: &str) -> Result<String, ListEmailContactsError> {
-    hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .filter(|arn| crate::state::contact_id_from_arn(arn).is_some())
-        .ok_or_else(|| {
-            ListEmailContactsErrorModeled::ValidationException(
-                crate::state::field_validation_failure(
-                    "nextToken",
-                    "is not a pagination token issued by ListEmailContacts",
-                ),
-            )
-            .into()
-        })
+    issued_position(token).ok_or_else(|| {
+        ListEmailContactsErrorModeled::ValidationException(crate::state::field_validation_failure(
+            "nextToken",
+            "is not a pagination token issued by ListEmailContacts",
+        ))
+        .into()
+    })
+}
+
+/// The position a token [`encode_page_token`] produced names, or `None` for every value
+/// this operation did not produce: not hex, too short to carry a tag and a position, not
+/// UTF-8, naming something outside the key space this listing walks, or carrying a tag
+/// that is not the one this operation computes for the position it claims.
+fn issued_position(token: &str) -> Option<String> {
+    let bytes = hex::decode(token).ok()?;
+    if bytes.len() <= PAGE_TOKEN_TAG_LEN {
+        return None;
+    }
+    let (tag, position) = bytes.split_at(PAGE_TOKEN_TAG_LEN);
+    let arn = String::from_utf8(position.to_vec()).ok()?;
+    crate::state::contact_id_from_arn(&arn)?;
+    (page_token_tag(&arn) == tag).then_some(arn)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative

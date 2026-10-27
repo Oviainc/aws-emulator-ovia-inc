@@ -690,6 +690,16 @@ pub const DESCRIBE_CONFORMANCE_PACK_COMPLIANCE_PAGE_SIZE: usize = 1000;
 /// response carries.
 pub const GET_CONFORMANCE_PACK_COMPLIANCE_DETAILS_PAGE_SIZE: usize = 100;
 
+/// How many group summaries one `GetAggregateConformancePackComplianceSummary` page
+/// carries when the request does not ask for a page size, for the same reason as
+/// [`DESCRIBE_CONFORMANCE_PACK_STATUS_PAGE_SIZE`]: `Limit` defaults to 0, which is
+/// "unspecified" rather than "no results"
+/// (`GetAggregateConformancePackComplianceSummaryRequest$Limit`: "The maximum number of
+/// results returned on each page. The default is maximum. If you specify 0, Config uses
+/// the default"), and 100 is that member's own maximum (`Limit`, range 0..100), which is
+/// what "the default is maximum" names.
+pub const AGGREGATE_CONFORMANCE_PACK_COMPLIANCE_SUMMARY_PAGE_SIZE: usize = 100;
+
 /// Every `ComplianceType` a conformance pack's EVALUATION filter may name
 /// (`ConformancePackEvaluationFilters$ComplianceType`: "The allowed values are COMPLIANT
 /// and NON_COMPLIANT. INSUFFICIENT_DATA is not supported").
@@ -3793,6 +3803,21 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
                 Some((name.clone(), rule.compliance()))
             })
             .collect()
+    }
+
+    /// The `ComplianceType` the conformance pack `pack` ITSELF rolls up to: the
+    /// compliance of the Config rules it deployed
+    /// ([`Self::conformance_pack_rule_compliance`]), under the one precedence this
+    /// service rolls compliance up by ([`resource_evaluation::roll_up_compliance`]) —
+    /// noncompliant if any of those rules is, compliant if at least one is and none is
+    /// not, and `INSUFFICIENT_DATA` where no rule places it either way, which includes a
+    /// pack whose rules nothing has evaluated and a pack whose deployment created none.
+    ///
+    /// It is the SAME per-rule compliance the pack's own compliance report is built
+    /// from, so a count of compliant packs and a report of one pack's rules cannot
+    /// disagree.
+    pub fn conformance_pack_compliance(&self, pack: &ConformancePackEntry) -> &'static str {
+        roll_up_compliance(self.conformance_pack_rule_compliance(pack).into_values())
     }
 
     /// The tags of the resource `arn` identifies, or `None` when this store holds no
