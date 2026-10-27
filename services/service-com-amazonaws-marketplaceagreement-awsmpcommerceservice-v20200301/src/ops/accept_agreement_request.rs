@@ -224,10 +224,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.mint_agreement_id();
+        // "The list of resources involved in the agreement": the resources of
+        // the agreement an amendment or a replacement acts upon, and otherwise
+        // the products the published offer is for — see
+        // `crate::state::agreement_resources` for that one resolution, which
+        // both this summary and the entitlements below read.
+        let resources = crate::state::agreement_resources(
+            source
+                .as_ref()
+                .and_then(|source| source.proposal_summary.resources.as_deref()),
+        );
         let proposal_summary = ProposalSummary {
             // The only identity of the proposal this emulator holds is the
-            // identifier the request named; its resources and offer set live in
-            // the agreement proposal, which is not this service's resource.
+            // identifier the request named; its offer set lives in the
+            // agreement proposal, which is not this service's resource.
             offer_id: request
                 .agreement_proposal_identifier
                 .clone()
@@ -236,25 +246,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .as_ref()
                         .and_then(|source| source.proposal_summary.offer_id.clone())
                 }),
-            resources: source
-                .as_ref()
-                .and_then(|source| source.proposal_summary.resources.clone()),
+            resources: Some(resources.clone()),
             offer_set_id: source
                 .as_ref()
                 .and_then(|source| source.proposal_summary.offer_set_id.clone()),
         };
         // Accepting the quote is what provisions the agreement's entitlements:
-        // one licence per resource the proposal names, each `PENDING` until the
-        // clock owes it its `PROVISIONED` status. The licence is minted in the
-        // region this caller signed for, and reported from then on by
-        // `GetAgreementEntitlements`, `SearchAgreements` and its `LicenseArn`
-        // filter.
+        // one licence per resource the agreement is involved with, each
+        // `PENDING` until the clock owes it its `PROVISIONED` status. The
+        // licence is minted in the region this caller signed for, and reported
+        // from then on by `GetAgreementEntitlements`, `SearchAgreements` and its
+        // `LicenseArn` filter.
         let region = crate::state::request_region(ctx.parts());
-        let entitlements = store.provision_entitlements(
-            proposal_summary.resources.as_deref(),
-            &region,
-            now,
-        );
+        let entitlements = store.provision_entitlements(&resources, &region, now);
         // Both sides of the agreement name an account: the caller accepted these
         // terms (the buyer's call) and it is also the account this service lets
         // a seller act under, so it is the proposer too — see

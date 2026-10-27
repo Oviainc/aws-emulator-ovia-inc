@@ -17,7 +17,10 @@ pub struct GetConfigurationManagerInput {
     pub manager_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ssmquicksetup#GetConfigurationManagerOutput")]
+/// `CreatedAt` and `LastModifiedAt` carry `@timestampFormat("date-time")`, so this shape's
+/// schema comes from `qs_schema_and_codec!` rather than the derive — see
+/// `types/date_time_wire.rs`. Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="GetConfigurationManagerOutput")`.
 #[derive(Debug, Clone, Default)]
 pub struct GetConfigurationManagerOutput {
     pub manager_arn: String,
@@ -29,6 +32,36 @@ pub struct GetConfigurationManagerOutput {
     pub configuration_definitions: Option<Vec<ConfigurationDefinition>>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+qs_schema_and_codec!(
+    GetConfigurationManagerOutput,
+    GET_CONFIGURATION_MANAGER_OUTPUT_SCHEMA,
+    "com.amazonaws.ssmquicksetup#GetConfigurationManagerOutput",
+    "com.amazonaws.ssmquicksetup",
+    "GetConfigurationManagerOutput",
+    (M_MANAGER_ARN, manager_arn, "ManagerArn", 0, req, string),
+    (M_DESCRIPTION, description, "Description", 1, opt, string),
+    (M_NAME, name, "Name", 2, opt, string),
+    (M_CREATED_AT, created_at, "CreatedAt", 3, opt, date_time),
+    (M_LAST_MODIFIED_AT, last_modified_at, "LastModifiedAt", 4, opt, date_time),
+    (
+        M_STATUS_SUMMARIES,
+        status_summaries,
+        "StatusSummaries",
+        5,
+        opt,
+        list_of(StatusSummary)
+    ),
+    (
+        M_CONFIGURATION_DEFINITIONS,
+        configuration_definitions,
+        "ConfigurationDefinitions",
+        6,
+        opt,
+        list_of(ConfigurationDefinition)
+    ),
+    (M_TAGS, tags, "Tags", 7, opt, map_of_string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ssmquicksetup#ConfigurationDefinition")]
 #[derive(Debug, Clone, Default)]

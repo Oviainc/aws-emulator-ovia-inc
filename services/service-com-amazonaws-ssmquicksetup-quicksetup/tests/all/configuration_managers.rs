@@ -336,25 +336,23 @@ fn deployment_status(case: &str, summaries: &Value) -> String {
 /// A modelled timestamp member as seconds since the epoch, so two stamps can be
 /// ordered.
 ///
-/// The members carry `@timestampFormat("date-time")`, but the framework's restJson1
-/// serializer writes the JSON protocol's default epoch-seconds number; both renderings
-/// are read here so this assertion pins the ORDERING of the stamps, not the wire form
-/// the framework chooses for them.
+/// The member carries `@timestampFormat("date-time")`, so the only accepted rendering is
+/// the RFC 3339 string; `tests/all/date_time_timestamps.rs` pins that wire form in its own
+/// right, and reading it here keeps this helper about the ORDERING of the stamps.
 fn epoch_seconds(case: &str, value: &Value, member: &str) -> f64 {
     let stamp = value
         .get(member)
         .unwrap_or_else(|| panic!("case {case}: expected {member}, got {value:?}"));
     match stamp {
-        Value::Number(seconds) => seconds
-            .as_f64()
-            .unwrap_or_else(|| panic!("case {case}: {member} {stamp:?} is not a number")),
         Value::String(text) => aws_smithy_types::DateTime::from_str(
             text,
             aws_smithy_types::date_time::Format::DateTime,
         )
         .unwrap_or_else(|e| panic!("case {case}: {member} {text:?} is not a date-time: {e}"))
         .as_secs_f64(),
-        other => panic!("case {case}: {member} is neither a timestamp number nor a string: {other:?}"),
+        other => panic!(
+            "case {case}: {member} must be an RFC 3339 date-time string, got {other:?}"
+        ),
     }
 }
 
