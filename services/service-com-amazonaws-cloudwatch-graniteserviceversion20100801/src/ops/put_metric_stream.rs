@@ -395,10 +395,11 @@ const UNSUPPORTED_STATISTIC_PREFIX: &str = "Unsupported statistic ";
 
 /// Refuse a statistics configuration the stream's output format cannot carry.
 ///
-/// "If the `OutputFormat` for the stream is `opentelemetry1.0` or `opentelemetry0.7`, the
-/// only valid values are `p??` percentile statistics such as `p90`, `p99` and so on. If the
-/// `OutputFormat` for the stream is `json`, the valid values include the abbreviations for
-/// all of the statistics listed in CloudWatch statistics definitions."
+/// "If the `OutputFormat` for the stream is
+/// `opentelemetry1.0` or `opentelemetry0.7`, the only valid values are `p??` percentile
+/// statistics such as `p90`, `p99` and so on. If the `OutputFormat` for the stream is `json`,
+/// the valid values include the abbreviations for all of the statistics listed in CloudWatch
+/// statistics definitions. For example, this includes `tm98`, `wm90`, `PR(:300)`, and so on."
 /// (`MetricStreamStatisticsConfiguration$AdditionalStatistics`)
 ///
 /// The member carries the statistics that are ADDITIONAL to the ones a stream sends anyway:
@@ -480,7 +481,8 @@ fn is_opentelemetry_format(format: &str) -> bool {
 
 // The statistic grammar every operation of this service that takes a statistic NAME is
 // judged by lives in `crate::state` — `is_cloudwatch_statistic`, `is_extended_statistic` and
-// `parse_percentile` — so a metric stream, a metric read and an alarm all admit the same set.
+// `parse_percentile` — so a metric stream, a metric read and an alarm all read one grammar,
+// and this operation admits of it the statistics a stream does not already send.
 
 #[cfg(test)]
 mod tests {
@@ -502,7 +504,53 @@ mod tests {
     }
 
     #[test]
-    fn cloudwatch_statistics_cover_the_documented_forms() {
+    fn additional_statistics_are_the_extended_ones_the_definitions_page_lists() {
+        // The statistics a stream can be asked to ADD: the percentile, trimmed, Winsorized,
+        // percentile-rank and interquartile families of the "CloudWatch statistics
+        // definitions" page.
+        for statistic in [
+            "IQM",
+            "p99",
+            "tm98",
+            "wm90",
+            "TM(10%:90%)",
+            "PR(:300)",
+            "ts(100:)",
+            "TC(0.5:2.5)",
+        ] {
+            assert!(
+                crate::state::is_extended_statistic(statistic),
+                "case {statistic:?}: expected an additional statistic, got unsupported"
+            );
+        }
+        // The basic statistics a stream always sends are not ADDITIONAL ones, and neither is
+        // a name no family produces.
+        for statistic in [
+            "Average",
+            "SampleCount",
+            "Sum",
+            "Minimum",
+            "Maximum",
+            "Median",
+            "tm",
+            "tm110",
+            "TM(:)",
+            "PR(300)",
+            "PR(a:b)",
+            "",
+        ] {
+            assert!(
+                !crate::state::is_extended_statistic(statistic),
+                "case {statistic:?}: expected no additional statistic, got supported"
+            );
+        }
+    }
+
+    #[test]
+    fn the_whole_grammar_keeps_admitting_the_basic_statistics() {
+        // The other caller of the grammar — a metric READ, which takes any statistic
+        // CloudWatch supports — still admits the basic five a stream already sends, so
+        // narrowing this operation's member did not narrow the grammar itself.
         for statistic in [
             "Average",
             "SampleCount",
@@ -512,11 +560,7 @@ mod tests {
             "IQM",
             "p99",
             "tm98",
-            "wm90",
             "TM(10%:90%)",
-            "PR(:300)",
-            "ts(100:)",
-            "TC(0.5:2.5)",
         ] {
             assert!(
                 crate::state::is_cloudwatch_statistic(statistic),

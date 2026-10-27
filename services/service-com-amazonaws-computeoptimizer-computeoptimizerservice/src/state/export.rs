@@ -1180,6 +1180,10 @@ fn put_configuration(row: &mut ExportRow, prefix: &str, configuration: &GroupCon
 /// shares. The database surface, whose catalog row carries the configuration the analysis
 /// recorded for it, reports those members from the recommendation itself
 /// ([`rds_database_row`]).
+///
+/// A column whose value an effective recommendation preference switches off is left empty for
+/// as long as that preference is off, the way the recommendation readers of the same analysis
+/// leave the member unreported.
 fn analysed_resource_row(
     resource: &AnalysedResource,
     resource_type: &str,
@@ -1216,11 +1220,17 @@ fn analysed_resource_row(
         "RecommendationOptionsEstimatedMonthlySavingsCurrency",
         CURRENCY_USD,
     );
-    put_list(
-        &mut row,
-        "InferredWorkloadTypes",
-        &resource.inferred_workload_types,
-    );
+    // "The applications that might be running on the resource as inferred by Compute
+    // Optimizer" are reported only while the inference is active for the resource — the same
+    // gate the recommendation readers apply, so the cell cannot hold types the account
+    // switched off while the row's effective-preference cell says they are switched off.
+    if preferences.infers_workload_types() {
+        put_list(
+            &mut row,
+            "InferredWorkloadTypes",
+            &resource.inferred_workload_types,
+        );
+    }
     put_preferences(&mut row, preferences);
     if let Some(at) = last_refresh {
         put(&mut row, "LastRefreshTimestamp", timestamp(at));

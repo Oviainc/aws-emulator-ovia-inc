@@ -49,19 +49,23 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::bucket_lifecycle::{create_bucket, router, send, Answer};
 
 /// The XML namespace botocore puts on an S3 request payload.
-const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+///
+/// `pub(crate)`, like the constants and helpers below it: the inventory-table update suite
+/// ([`super::bucket_metadata_inventory_table_update`]) drives the same subresource through
+/// the same harness instead of standing up a second copy of it.
+pub(crate) const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// An account id that is NOT the one account this emulator serves, so an
 /// `x-amz-expected-bucket-owner` carrying it names an owner no bucket here has.
-const NOT_THE_OWNER: &str = "123456789012";
+pub(crate) const NOT_THE_OWNER: &str = "123456789012";
 
 /// An IAM role ARN of the shape `AnnotationTableConfiguration$Role` documents ("the ARN of
 /// the IAM role used to manage the annotation table").
-const ANNOTATION_ROLE: &str = "arn:aws:iam::000000000000:role/s3-metadata-annotations";
+pub(crate) const ANNOTATION_ROLE: &str = "arn:aws:iam::000000000000:role/s3-metadata-annotations";
 
 /// A customer-managed KMS key ARN, as `MetadataTableEncryptionConfiguration$KmsKeyArn`
 /// takes one.
-const KMS_KEY_ARN: &str = "arn:aws:kms:us-east-1:000000000000:key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+pub(crate) const KMS_KEY_ARN: &str = "arn:aws:kms:us-east-1:000000000000:key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
 /// How long a row waits for a table to fall due: the span the store records plus slack for
 /// a loaded machine.
@@ -69,14 +73,14 @@ const KMS_KEY_ARN: &str = "arn:aws:kms:us-east-1:000000000000:key/aaaaaaaa-bbbb-
 /// A blocking sleep rather than `tokio::time::sleep(..).await`, for the reason the restore
 /// suite in this crate gives: the workspace's tokio carries only the `macros`/`rt`
 /// features, so its timer driver is not built.
-fn wait_for_the_tables() {
+pub(crate) fn wait_for_the_tables() {
     std::thread::sleep(METADATA_TABLE_ACTIVATION_DELAY + Duration::from_millis(250));
 }
 
 /// `POST /<bucket>?metadataConfiguration` — `CreateBucketMetadataConfiguration`, with
 /// `payload` as the `MetadataConfiguration` container and whatever headers the case
 /// carries.
-async fn create_metadata_configuration(
+pub(crate) async fn create_metadata_configuration(
     router: &MultiServiceRouter,
     bucket: &str,
     headers: &[(&str, &str)],
@@ -93,7 +97,7 @@ async fn create_metadata_configuration(
 }
 
 /// `GET /<bucket>?metadataConfiguration` — `GetBucketMetadataConfiguration`.
-async fn get_metadata_configuration(
+pub(crate) async fn get_metadata_configuration(
     router: &MultiServiceRouter,
     bucket: &str,
     headers: &[(&str, &str)],
@@ -115,14 +119,14 @@ async fn get_metadata_configuration(
 /// Scoping a leaf read to its container is what keeps the three tables' identically named
 /// members apart: `TableName` appears once per table, so the journal table's is read out of
 /// the journal container rather than out of the whole body.
-fn inside<'a>(fragment: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn inside<'a>(fragment: &'a str, name: &str) -> Option<&'a str> {
     let (_, rest) = fragment.split_once(&format!("<{name}>"))?;
     let (inner, _) = rest.split_once(&format!("</{name}>"))?;
     Some(inner)
 }
 
 /// That same read, as an owned value — for a leaf element whose text is the value.
-fn text(fragment: &str, name: &str) -> Option<String> {
+pub(crate) fn text(fragment: &str, name: &str) -> Option<String> {
     inside(fragment, name).map(str::to_string)
 }
 
@@ -239,12 +243,12 @@ fn encryption(algorithm: &str) -> String {
 /// The table bucket ARN every configuration's destination reports, and the table ARN of
 /// `table` inside it: one managed table bucket per Region, in the Region the general
 /// purpose bucket lives in (`us-east-1` for every bucket this suite creates).
-fn table_bucket_arn() -> String {
+pub(crate) fn table_bucket_arn() -> String {
     String::from("arn:aws:s3tables:us-east-1:000000000000:bucket/aws-s3")
 }
 
 /// See [`table_bucket_arn`].
-fn table_arn(table: &str) -> String {
+pub(crate) fn table_arn(table: &str) -> String {
     format!("{}/table/{table}", table_bucket_arn())
 }
 

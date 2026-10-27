@@ -260,32 +260,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // `ClientToken` idempotency, for as long as the token's validity window is open
-        // (`crate::state::CLIENT_TOKEN_VALIDITY`): the same token with the same body
-        // answers with the export job the first call minted and creates nothing; with a
-        // different body it is a conflict, because that token already names another
-        // export job. Past that window the token names nothing and the call is a new
-        // request.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(job) = state.export_job_by_client_token(token, now) {
-                if job.request_fingerprint != fingerprint {
-                    return Err(StartSearchResultExportJobErrorModeled::ConflictException(
-                        ConflictException {
-                            message: format!(
-                                "ClientToken '{token}' was already used for a different \
-                                 StartSearchResultExportJob request"
-                            ),
-                            resource_id: job.identifier.clone(),
-                            resource_type: EXPORT_JOB_RESOURCE.to_string(),
-                        },
-                    )
-                    .into());
-                }
-                return Ok(StartSearchResultExportJobOutput {
-                    export_job_arn: Some(job.arn.clone()),
-                    export_job_identifier: job.identifier.clone(),
-                });
-            }
+        // `ClientToken` idempotency, decided by the one replay rule both `Start`
+        // operations of this service follow (`crate::state::client_token_replay`): inside
+        // the token's validity window the same body answers with the export job the first
+        // call minted and creates nothing, while a different body is a conflict, because
+        // that token already names another export job. Past that window the token names
+        // nothing and the call is a new request. The refusal names THIS operation and the
+        // export-job resource type; the rule itself lives in one place.
+        if let Some(job) = state
+            .export_job_replay(
+                input.client_token.as_deref(),
+                &fingerprint,
+                now,
+                Self::NAME,
+            )
+            .map_err(StartSearchResultExportJobErrorModeled::ConflictException)?
+        {
+            return Ok(StartSearchResultExportJobOutput {
+                export_job_arn: Some(job.arn.clone()),
+                export_job_identifier: job.identifier.clone(),
+            });
         }
 
         // The export is of ONE search job's results, so that job has to exist and its

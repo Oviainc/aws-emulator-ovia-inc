@@ -2493,6 +2493,17 @@ pub const DEFAULT_REFRESH_TIME_OF_DAY: &str = "00:00";
 /// operation answers a miss with the same words rather than wording its own.
 pub const DASHBOARD_NOT_FOUND_MESSAGE: &str = "No matching dashboard found.";
 
+/// The refusal text a dashboard operation answers with when the dashboard it
+/// addressed has termination protection enabled ("You cannot delete a dashboard that
+/// has termination protection enabled").
+///
+/// It is a FIXED service message — it carries no dashboard name, ARN, account or
+/// Region, and it is the text the recorded refusal of a delete against a protected
+/// dashboard carries — so a dashboard operation blocked by that protection answers
+/// with these words rather than wording its own.
+pub const DASHBOARD_TERMINATION_PROTECTED_MESSAGE: &str =
+    "This dashboard has termination protection enabled.";
+
 /// The HTTP status this service answers a dashboard `ConflictException` with.
 ///
 /// The model annotates the shape `@httpError(409)`
