@@ -593,7 +593,10 @@ fn x509_matches(filter: &X509AttributeFilter, cert: &crate::state::Certificate) 
         // The X.509 key-usage extensions exist only once the certificate has been
         // issued, so a pending or failed record carries none and no such filter keeps
         // it — which comes from the record rather than from the filter being unwritten.
-        X509AttributeFilter::ExtendedKeyUsage(name) => cert.extended_key_usages.contains(name),
+        X509AttributeFilter::ExtendedKeyUsage(name) => cert
+            .extended_key_usages
+            .iter()
+            .any(|usage| usage.name == *name),
         X509AttributeFilter::KeyUsage(name) => cert.key_usages.contains(name),
         X509AttributeFilter::KeyAlgorithm(algorithm) => cert.key_algorithm == *algorithm,
         // A serial number is assigned by the certificate authority that signs an
@@ -635,13 +638,19 @@ fn metadata_matches(
         AcmCertificateMetadataFilter::CertificateKeyPairOrigin(origin) => {
             cert.key_pair_origin == *origin
         }
-        // A renewal status belongs to a renewal ACM has started for a certificate, and
-        // an ACME endpoint arn / account id to a certificate obtained through an ACME
-        // endpoint. No stored record carries either — nothing in this service starts a
-        // renewal or issues through ACME — so these filters keep nothing, which is the
-        // record's answer and not a missing comparison.
-        AcmCertificateMetadataFilter::RenewalStatus(_)
-        | AcmCertificateMetadataFilter::AcmeEndpointArn(_)
+        // A renewal status belongs to a renewal ACM has started for a certificate,
+        // which `RenewCertificate` is what starts: a record carrying one is selected by
+        // the status it carries, and a record no renewal was asked for is selected by no
+        // such filter.
+        AcmCertificateMetadataFilter::RenewalStatus(status) => cert
+            .renewal
+            .as_ref()
+            .is_some_and(|renewal| renewal.status == *status),
+        // An ACME endpoint arn / account id belongs to a certificate obtained through an
+        // ACME endpoint. No stored record carries either — nothing in this service
+        // issues through ACME — so these filters keep nothing, which is the record's
+        // answer and not a missing comparison.
+        AcmCertificateMetadataFilter::AcmeEndpointArn(_)
         | AcmCertificateMetadataFilter::AcmeAccountId(_) => false,
     }
 }
@@ -713,7 +722,7 @@ impl ResultOrder {
             "TYPE" => cert.cert_type.clone(),
             "KEY_ALGORITHM" => cert.key_algorithm.clone(),
             "CERTIFICATE_KEY_PAIR_ORIGIN" => cert.key_pair_origin.clone(),
-            "RENEWAL_ELIGIBILITY" => cert.renewal_eligibility.clone(),
+            "RENEWAL_ELIGIBILITY" => cert.renewal_eligibility().to_string(),
             "EXPORT_OPTION" => crate::state::export_option(cert),
             "MANAGED_BY" => cert.managed_by.clone().unwrap_or_default(),
             "VALIDATION_METHOD" => cert.validation_method.clone().unwrap_or_default(),
@@ -724,10 +733,15 @@ impl ResultOrder {
             "ISSUED_AT" => instant_key(cert.issued_at),
             "IMPORTED_AT" => instant_key(cert.imported_at),
             "REVOKED_AT" => instant_key(cert.revoked_at),
-            // A renewal status and the ACME members are values no stored record
-            // carries (see [`metadata_matches`]), so sorting on one leaves every
-            // certificate in ARN order.
-            "RENEWAL_STATUS" | "ACME_ENDPOINT_ARN" | "ACME_ACCOUNT_ID" => String::new(),
+            "RENEWAL_STATUS" => cert
+                .renewal
+                .as_ref()
+                .map(|renewal| renewal.status.clone())
+                .unwrap_or_default(),
+            // The ACME members are values no stored record carries (see
+            // [`metadata_matches`]), so sorting on one leaves every certificate in ARN
+            // order.
+            "ACME_ENDPOINT_ARN" | "ACME_ACCOUNT_ID" => String::new(),
             // `CREATED_AT`, the model's default, and the field any value the model adds
             // later falls back to; the boundary validator refuses a value outside the
             // enum before this handler runs.
