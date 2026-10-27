@@ -1010,6 +1010,24 @@ pub const ATTRIBUTE_PRIVILEGED_CONTAINER: &str = "com.amazonaws.ecs.capability.p
 /// the driver name (`LogConfiguration$logDriver`) completes it.
 pub const ATTRIBUTE_LOGGING_DRIVER_PREFIX: &str = "com.amazonaws.ecs.capability.logging-driver.";
 
+/// The prefix of the attribute a container instance needs to run a task's LOG ROUTER;
+/// the router named by `FirelensConfiguration$type` ("The log router to use. The valid
+/// values are `fluentd` or `fluentbit`") completes it, so each router kind is its own
+/// capability.
+pub const ATTRIBUTE_FIRELENS_PREFIX: &str = "ecs.capability.firelens.";
+
+/// The attribute a container instance needs to let the task's EXECUTION ROLE carry the
+/// credentials the `awslogs` log driver ships logs with — the driver is configured on the
+/// agent's behalf, so the capability is required only where a revision pairs that driver
+/// with a `TaskDefinition$executionRoleArn` ("the task execution role that grants the
+/// Amazon ECS container agent permission to make Amazon Web Services API calls on your
+/// behalf").
+pub const ATTRIBUTE_EXECUTION_ROLE_AWSLOGS: &str = "ecs.capability.execution-role-awslogs";
+
+/// The `LogConfiguration$logDriver` that ships container logs to CloudWatch Logs through
+/// the agent, one of the `LogDriver` enum values.
+pub const LOG_DRIVER_AWSLOGS: &str = "awslogs";
+
 /// How many attributes ONE attribute write may carry.
 /// `DeleteAttributes$attributes`: "You can specify up to 10 attributes for each
 /// request" — the bound `PutAttributes$attributes` states for the same list ("You can
@@ -2232,8 +2250,14 @@ fn is_secrets_manager_reference(value_from: &str) -> bool {
 }
 
 /// The container-instance attributes ONE container of a revision requires, appended to
-/// `out`. See [`TaskDefinitionRecord::requires_attributes`] for the rule.
-fn container_required_attributes(container: &ContainerDefinition, out: &mut Vec<String>) {
+/// `out`. `has_execution_role` is whether the REVISION carries an `executionRoleArn`,
+/// which some container features need beside themselves. See
+/// [`TaskDefinitionRecord::requires_attributes`] for the rule.
+fn container_required_attributes(
+    container: &ContainerDefinition,
+    has_execution_role: bool,
+    out: &mut Vec<String>,
+) {
     for secret in container.secrets.iter().flatten() {
         out.push(
             if is_secrets_manager_reference(&secret.value_from) {
@@ -2252,11 +2276,17 @@ fn container_required_attributes(container: &ContainerDefinition, out: &mut Vec<
     if container.privileged == Some(true) {
         out.push(ATTRIBUTE_PRIVILEGED_CONTAINER.to_string());
     }
+    if let Some(firelens) = container.firelens_configuration.as_ref() {
+        out.push(format!("{ATTRIBUTE_FIRELENS_PREFIX}{}", firelens.r#type));
+    }
     if let Some(logging) = container.log_configuration.as_ref() {
         out.push(format!(
             "{ATTRIBUTE_LOGGING_DRIVER_PREFIX}{}",
             logging.log_driver
         ));
+        if has_execution_role && logging.log_driver == LOG_DRIVER_AWSLOGS {
+            out.push(ATTRIBUTE_EXECUTION_ROLE_AWSLOGS.to_string());
+        }
         for secret in logging.secret_options.iter().flatten() {
             out.push(
                 if is_secrets_manager_reference(&secret.value_from) {
@@ -2418,8 +2448,13 @@ impl TaskDefinitionRecord {
     /// the Docker remote-API version that carries task networking), a `secrets` or
     /// `secretOptions` reference needs the attribute of the secret store it names, an
     /// S3 `environmentFiles` entry needs [`ATTRIBUTE_ENV_FILES_S3`], a privileged
-    /// container needs [`ATTRIBUTE_PRIVILEGED_CONTAINER`] and a named `logDriver` needs
-    /// that driver's attribute. The names are the Amazon ECS container-agent
+    /// container needs [`ATTRIBUTE_PRIVILEGED_CONTAINER`], a named `logDriver` needs
+    /// that driver's attribute, a `firelensConfiguration` needs the log-router
+    /// capability of the router kind it names ([`ATTRIBUTE_FIRELENS_PREFIX`]) and the
+    /// `awslogs` driver on a revision that also carries an `executionRoleArn` needs
+    /// [`ATTRIBUTE_EXECUTION_ROLE_AWSLOGS`]. Each name is FIXED text completed only by
+    /// the feature it is derived from, never by the account, the family or the revision.
+    /// The names are the Amazon ECS container-agent
     /// capabilities, which is what an instance registers them as, so
     /// `ListAttributes`/`DescribeContainerInstances` and this list speak the same
     /// vocabulary.
@@ -2434,8 +2469,9 @@ impl TaskDefinitionRecord {
             names.push(ATTRIBUTE_DOCKER_REMOTE_API_1_18.to_string());
             names.push(ATTRIBUTE_TASK_ENI.to_string());
         }
+        let has_execution_role = self.execution_role_arn.is_some();
         for container in &self.container_definitions {
-            container_required_attributes(container, &mut names);
+            container_required_attributes(container, has_execution_role, &mut names);
         }
         names.sort();
         names.dedup();
