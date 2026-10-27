@@ -203,17 +203,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // malformed, exactly as the modelled constraints the framework checks ahead of
         // this handler are.
         let requested_attributes = input.attributes.unwrap_or_default();
-        let size = crate::state::attributes_size(&requested_attributes);
-        if size > crate::state::MAX_ATTRIBUTES_BYTES {
-            return Err(crate::state::validation_failed(
-                StartParticipantReplicationErrorModeled::ValidationException,
-                format!(
-                    "{}.attributes is required to have a maximum size of {} bytes, found {size}",
-                    Self::NAME,
-                    crate::state::MAX_ATTRIBUTES_BYTES,
-                ),
-            ));
-        }
+        crate::state::check_attributes_size(Self::NAME, "attributes", &requested_attributes)
+            .map_err(|message| {
+                crate::state::validation_failed(
+                    StartParticipantReplicationErrorModeled::ValidationException,
+                    message,
+                )
+            })?;
 
         // Replication is INTO another stage: the destination holds a replica of a
         // participant publishing somewhere else, so a request naming one stage twice
