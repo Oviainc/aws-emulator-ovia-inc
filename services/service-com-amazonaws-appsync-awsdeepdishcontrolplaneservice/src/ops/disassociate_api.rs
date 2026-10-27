@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the API association the custom domain the path addresses carries. The
+//! domain, and the deployment its association is in, decide the outcome: the rule both
+//! association modifications follow lives in
+//! [`crate::state::domain_for_association_change`].
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +139,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateApi"))
+        // The engine is reachable from `&self` (constructor-injected); nothing in the
+        // answer depends on this request's metadata, so `ctx` is unused here.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DisassociateApiErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut guard = state.lock();
+        // Materialise the association deployments the CLOCK already made due, which
+        // were owed at this instant whether or not anybody called: whether a mapping is
+        // still being deployed is what decides the refusal below.
+        guard.settle_api_associations(now);
+
+        let domain = match crate::state::domain_for_association_change(&mut guard, &input.domain_name)
+        {
+            Ok(domain) => domain,
+            Err(refusal) => return Err(refuse(refusal)),
+        };
+
+        // The call asks for the domain to carry no association. A domain that already
+        // carries none is left exactly as it is, so repeating the call neither reports
+        // a different outcome nor unmaps anything a later caller could still observe.
+        domain.api_association = None;
+
+        Ok(DisassociateApiOutput {})
     }
+}
+
+/// This operation's modelled error for a refusal the shared association rule states.
+///
+/// Each variant keeps the status the model gives its shape and that shape's own text:
+/// an absent domain is the not-found it is, and a mapping the service is still
+/// deploying is the modification already in progress that
+/// `ConcurrentModificationException` describes — which is why a domain that does not
+/// exist can never be answered with it.
+fn refuse(refusal: crate::state::DomainAssociationRefusal) -> DisassociateApiError {
+    match refusal {
+        crate::state::DomainAssociationRefusal::DomainNotFound => {
+            DisassociateApiErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::DOMAIN_NAME_NOT_FOUND_MESSAGE.to_string()),
+            })
+        }
+        crate::state::DomainAssociationRefusal::Processing => {
+            DisassociateApiErrorModeled::ConcurrentModificationException(
+                ConcurrentModificationException {
+                    message: Some(crate::state::CONCURRENT_MODIFICATION_MESSAGE.to_string()),
+                },
+            )
+        }
+    }
+    .into()
 }
