@@ -47,6 +47,8 @@ mod open_id_token;
 mod principal_tag_attribute_map;
 #[path = "all/redeemed_token_methods.rs"]
 mod redeemed_token_methods;
+#[path = "all/resource_not_found_precedence.rs"]
+mod resource_not_found_precedence;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/response_request_id.rs"]

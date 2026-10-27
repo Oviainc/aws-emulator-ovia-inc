@@ -162,14 +162,17 @@ pub fn plan_mutation_conflict(plan_id: &str, status: &str, verb: &str) -> Confli
 // ---------------------------------------------------------------------------
 // The validation report this service answers a constraint violation with.
 //
-// Two rules, both this service's own rendering of the standard AWS report, and
-// both applied to EVERY constraint class and every operation (the boundary
+// Three rules, all this service's own rendering of the standard AWS report, and
+// all applied to EVERY constraint class and every operation (the boundary
 // validator reaches them through `service.rs`'s `override_refusal`):
 //
 // * a clause names WHERE the offending value was and WHAT it had to satisfy, and
 //   never renders the value itself;
 // * a `@pattern` requirement quotes the expression WITHOUT the `^` / `$` the model
-//   spells it with, which is the expression the service advertises.
+//   spells it with, which is the expression the service advertises;
+// * the whole report fits the modelled length of the `Message` member that carries
+//   it (see `MAX_ERROR_MESSAGE_CHARS`), however many positions the request offended
+//   in.
 // ---------------------------------------------------------------------------
 
 /// The error code every refusal this service rewords answers with: the same code the
@@ -208,17 +211,70 @@ pub fn clause(member: &str, requirement: &str) -> String {
     format!("Value at '{member}' failed to satisfy constraint: {requirement}")
 }
 
-/// The standard AWS validation report around `clauses`: the violation count, then every
-/// clause joined with `; `.
-pub fn validation_report(clauses: &[String]) -> String {
-    match clauses {
-        [single] => format!("1 validation error detected: {single}"),
-        many => format!(
-            "{} validation errors detected: {}",
-            many.len(),
-            many.join("; ")
-        ),
+/// The number of characters a message this service answers an error with may carry.
+///
+/// Every modelled error of this service carries exactly one `Message` member, and every
+/// one of them targets `ErrorMessage`, which the model bounds at
+/// `@length(min: 1, max: 2048)`. A longer message is outside the shape the model
+/// publishes, so no message built here may exceed it — characters, not bytes, because a
+/// `@length` on a string counts characters.
+pub const MAX_ERROR_MESSAGE_CHARS: usize = 2048;
+
+/// What a validation report puts between two clauses.
+const CLAUSE_SEPARATOR: &str = "; ";
+
+/// The sentence a report of `count` clauses opens with, up to and including the space
+/// before its first clause.
+fn report_prefix(count: usize) -> String {
+    match count {
+        1 => "1 validation error detected: ".to_string(),
+        many => format!("{many} validation errors detected: "),
     }
+}
+
+/// How many of `clauses`, taken in order, one report may state and still fit
+/// [`MAX_ERROR_MESSAGE_CHARS`].
+///
+/// The number of offending positions is CALLER-CONTROLLED: one well-formed request may
+/// carry hundreds of list elements, each of which can contribute a clause, so a report
+/// stating every one of them amplifies a request into a message many times longer than
+/// the member that has to carry it may be. The clauses it states are therefore the
+/// LEADING ones — the report begins at the first offending position, in request order —
+/// and the count its sentence states is the count of exactly those, so the sentence stays
+/// literally true of the report carrying it and the format stays AWS's, with no
+/// truncation marker. The boundary validator bounds the violations it records in the same
+/// way.
+///
+/// At least one clause is always stated: `ErrorMessage` is modelled `min: 1`, so a report
+/// stating no clause at all is as far outside the shape as one past the maximum. One
+/// clause always fits in practice — a clause renders a member path and the requirement it
+/// failed, never the caller's value, and the framework elides a value it does echo.
+fn reported_clause_count(clauses: &[String]) -> usize {
+    let separator = CLAUSE_SEPARATOR.chars().count();
+    let mut stated = 0;
+    let mut clause_chars = 0;
+    for (index, clause) in clauses.iter().enumerate() {
+        clause_chars += clause.chars().count() + if index == 0 { 0 } else { separator };
+        if report_prefix(index + 1).chars().count() + clause_chars > MAX_ERROR_MESSAGE_CHARS {
+            break;
+        }
+        stated = index + 1;
+    }
+    // A report of one clause is stated whole even where it is the only one that does not
+    // fit, for the `min: 1` reason above.
+    stated.max(clauses.len().min(1))
+}
+
+/// The standard AWS validation report around `clauses`: the violation count, then every
+/// clause joined with `; ` — bounded by [`MAX_ERROR_MESSAGE_CHARS`], which
+/// [`reported_clause_count`] turns into the number of clauses this report states.
+pub fn validation_report(clauses: &[String]) -> String {
+    let stated = reported_clause_count(clauses);
+    format!(
+        "{}{}",
+        report_prefix(stated),
+        clauses[..stated].join(CLAUSE_SEPARATOR)
+    )
 }
 
 /// The clause one [`Violation`] states under this service's rules.
@@ -574,8 +630,10 @@ fn element_path(list: &str, position: usize, member: Option<&str>) -> String {
 /// when every key and value is one the service admits.
 ///
 /// Every offending key and value is reported, in request order, so a caller is told
-/// about all of them at once — the standard AWS report. A request this refuses is
-/// refused WHOLE: the caller applies it before writing any tag.
+/// about all of them at once — the standard AWS report, bounded by the modelled length
+/// of the member it is carried in ([`validation_report`] states the leading clauses that
+/// fit). A request this refuses is refused WHOLE: the caller applies it before writing
+/// any tag.
 pub fn tag_set_rejection(list_member: &str, tags: &[Tag]) -> Option<ValidationException> {
     let mut clauses = Vec::new();
     for (index, tag) in tags.iter().enumerate() {

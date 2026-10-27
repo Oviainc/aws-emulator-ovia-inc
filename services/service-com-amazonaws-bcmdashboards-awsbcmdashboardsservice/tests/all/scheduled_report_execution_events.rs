@@ -56,7 +56,7 @@ const DEFAULT_BUS: &str = "default";
 /// The `StatusReason` a delivery failure carries. Source:
 /// `smithy_query(query="shape",shape="StatusReason")` — the value that names a failure of
 /// neither the dashboard nor a widget.
-const INTERNAL_FAILURE: &str = "INTERNAL_FAILURE";
+pub(crate) const INTERNAL_FAILURE: &str = "INTERNAL_FAILURE";
 
 /// A well-formed `ScheduledReportArn` no report in a fresh store is keyed by.
 const MISSING_REPORT_ARN: &str =

@@ -24,6 +24,24 @@ pub fn router() -> MultiServiceRouter {
     router_with_engine().0
 }
 
+/// A router serving this service AND the Amazon Cognito user-pool service, over one
+/// shared engine.
+///
+/// An identity source references a user pool, and an authorization call that takes its
+/// principal from a token that pool issued verifies the token against the key set the
+/// pool publishes — so a suite about such a call needs the pool to really exist, with
+/// really signed tokens. Mounting both services on one engine is how this emulator serves
+/// them in the router its binary builds, so the suite exercises the same seam.
+pub fn router_with_user_pools() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (mut router, engine) = router_with_engine();
+    router.register_service(
+        service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    (router, engine)
+}
+
 /// The same router, plus the engine it was built on — for a suite that has to
 /// read or seed state no served request can reach. `router()` delegates here so
 /// there is ONE place that decides how the harness is wired.
@@ -94,6 +112,39 @@ pub async fn store_with_mode(router: &MultiServiceRouter, mode: &str) -> String 
 /// Create a store with validation mode `OFF` and return its `policyStoreId`.
 pub async fn store_with_validation_off(router: &MultiServiceRouter) -> String {
     store_with_mode(router, "OFF").await
+}
+
+/// Call one Amazon Cognito user-pool operation, requiring success, and return the parsed
+/// body. That service speaks awsJson1_1 under its own target prefix and is reached over
+/// the SAME router, so a pool a suite builds here is the pool this service's identity
+/// sources reference.
+pub async fn cognito(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("cognito-idp.{SIGNING_REGION}.amazonaws.com"))
+        .header("content-type", "application/x-amz-json-1.1")
+        .header(
+            "x-amz-target",
+            format!("AWSCognitoIdentityProviderService.{operation}"),
+        )
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIAEXAMPLE/20260101/{SIGNING_REGION}/cognito-idp/aws4_request, \
+                 SignedHeaders=host;x-amz-target, Signature=0"
+            ),
+        )
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(body).expect("a test request body always serializes"),
+        ))
+        .expect("a valid test request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    assert_eq!(status, 200, "{operation} failed: {parsed}");
+    parsed
 }
 
 /// The error code an awsJson1_0 fault carries in `__type`, without its namespace.

@@ -23,12 +23,19 @@
 //! of the comparison, the missing-data treatment, and the namespace the series lives in —
 //! because the switch is about the DELIVERY of a transition, which every one of those reaches
 //! the same way. The recorded high-resolution `Maximum` case is one row.
+//!
+//! Every state this suite asserts is one the evaluation computes from the datapoints a drive
+//! published, so each drive places its datapoint where the clock cannot take it away before
+//! the evaluation it makes due has been read: no drive sits at the oldest window the evaluation
+//! range still holds, each one measures from the window it is made in — so a later drive is
+//! never graded before an earlier one — and the drive that re-breaches after the clearing one
+//! breaches whether or not a new window has begun in between.
 
 use serde_json::{json, Value};
 
 use crate::harness::{
     element, emulator, given_queue, grant_sns_delivery_on, now_secs, received_messages, rpc, sns,
-    subscribe_queue, Emulator,
+    subscribe_queue, wait_for_period_room, Emulator, PAST_EVALUATION_DELAY,
 };
 
 /// The alarm whose actions stay on: the positive control.
@@ -48,6 +55,17 @@ const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(100);
 /// How long the absence of a delivery is measured over: several evaluation spans, so a
 /// notification the muted alarm would have published has had every chance to arrive.
 const SILENCE: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// How much of the current period window ONE drive needs left to it, in seconds.
+///
+/// A drive stamps its datapoint a whole number of windows before NOW, and the window an
+/// evaluation counts those back from is the one the evaluation itself runs in — so the publish
+/// and the read that materialises the evaluation it makes due are asked to land in the same
+/// window the drive measured against, rather than one the clock moved on to, where the
+/// datapoint is a window older than the drive placed it. Several evaluation spans, so the
+/// drive and the first read that grades it fit with room to spare ([`wait_for_period_room`]),
+/// and smaller than the shortest period a row uses.
+const WINDOW_ROOM_SECS: f64 = 4.0;
 
 /// One CloudWatch call, requiring a 200.
 async fn cw(emulator: &Emulator, operation: &str, body: &Value) -> Value {
@@ -87,6 +105,14 @@ struct Row {
     breaching: f64,
     /// A value the comparison puts in `OK`.
     clearing: f64,
+    /// The value the LAST drive re-breaches with.
+    ///
+    /// That drive is made after the clearing one, and whether the clock has started a new
+    /// period window in between is not something a test can pin — so this value is one the
+    /// row's statistic breaches with BOTH on its own and aggregated with `clearing`, and the
+    /// transition is the same either way. The lone-datapoint window is what `breaching`
+    /// covers, in the drive that is alone in its own window.
+    re_breaching: f64,
 }
 
 impl Row {
@@ -117,12 +143,17 @@ impl Row {
         request
     }
 
-    /// Publish `value` into the row's series, stamped `windows_back` whole periods before now,
-    /// so each drive lands in a window of its own and the newest window holding data is the one
-    /// the evaluation grades.
+    /// Publish `value` into the row's series, stamped `windows_back` whole periods before now.
+    ///
+    /// The drive waits for enough of the current window to be left for the evaluation it makes
+    /// due to be read inside that same window ([`WINDOW_ROOM_SECS`]): the windows are anchored
+    /// at multiples of the period, so a drive made as one window ends is graded from the next
+    /// one, where its datapoint is a window older than it was placed.
     async fn publish(&self, emulator: &Emulator, value: f64, windows_back: i64) {
         #[allow(clippy::cast_precision_loss)]
-        let age = (self.period * windows_back) as f64;
+        let (period, windows) = (self.period as f64, windows_back as f64);
+        wait_for_period_room(period, WINDOW_ROOM_SECS).await;
+        let age = period * windows;
         let mut datum = json!({
             "MetricName": self.metric,
             "Dimensions": self.dimensions(),
@@ -157,6 +188,34 @@ async fn state_of(emulator: &Emulator, name: &str) -> String {
         .to_string()
 }
 
+/// The state both twins report, as a client reads them.
+async fn both_states(emulator: &Emulator) -> (String, String) {
+    (
+        state_of(emulator, ENABLED).await,
+        state_of(emulator, MUTED).await,
+    )
+}
+
+/// The state each twin reports once the evaluations the WRITE made due have settled.
+///
+/// A new alarm is stored in `INSUFFICIENT_DATA` and evaluated a span later over a window
+/// holding no datapoint at all, and what that evaluation makes of an empty window is the row's
+/// missing-data treatment — `notBreaching` substitutes an `OK` for it. So the state a breaching
+/// datapoint moves the alarm OUT of is the one that has stopped changing, not the one the write
+/// left behind; waiting for two reads a span apart to agree is how a client sees that.
+async fn settled_states(emulator: &Emulator) -> (String, String) {
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let mut reported = both_states(emulator).await;
+    loop {
+        tokio::time::sleep(PAST_EVALUATION_DELAY).await;
+        let again = both_states(emulator).await;
+        if again == reported || std::time::Instant::now() >= deadline {
+            return again;
+        }
+        reported = again;
+    }
+}
+
 /// Read both twins until each reports `state`, and answer what they last reported.
 ///
 /// A transition is owed a span after the datapoint that makes it due, so a test waits for the
@@ -165,10 +224,7 @@ async fn state_of(emulator: &Emulator, name: &str) -> String {
 async fn await_both(emulator: &Emulator, state: &str) -> (String, String) {
     let deadline = std::time::Instant::now() + DEADLINE;
     loop {
-        let reported = (
-            state_of(emulator, ENABLED).await,
-            state_of(emulator, MUTED).await,
-        );
+        let reported = both_states(emulator).await;
         if (reported.0 == state && reported.1 == state) || std::time::Instant::now() >= deadline {
             return reported;
         }
@@ -212,7 +268,14 @@ impl Mailbox {
         }
     }
 
-    /// Read the queue once, keeping every notification it handed over.
+    /// Read the queue once, keeping every notification it handed over — and deleting each
+    /// message it keeps.
+    ///
+    /// A received message a client does not delete comes back when its visibility timeout
+    /// expires, so a mailbox that accumulates its reads would count one delivery as two the
+    /// moment a row takes longer than that timeout to run. Deleting what it has kept is both
+    /// what a client does and what makes "exactly one notification" mean the same thing however
+    /// long the reads take.
     async fn read(&mut self, emulator: &Emulator) {
         for message in received_messages(emulator, &self.url).await {
             let body = message["Body"].as_str().unwrap_or_default();
@@ -224,6 +287,17 @@ impl Mailbox {
                 panic!("a delivery is not an alarm notification ({error}): {inner}")
             });
             self.arrived.push(notification);
+            let receipt = message["ReceiptHandle"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a received message carries a receipt handle: {message}"));
+            rpc(
+                emulator,
+                "sqs",
+                "AmazonSQS",
+                "DeleteMessage",
+                &json!({"QueueUrl": self.url, "ReceiptHandle": receipt}),
+            )
+            .await;
         }
     }
 
@@ -359,6 +433,8 @@ async fn a_muted_alarm_transitions_on_published_data_and_delivers_only_once_re_e
             treat_missing: Some("ignore"),
             breaching: 211.0,
             clearing: 2.0,
+            // Maximum{clearing, re_breaching} is re_breaching, so one value serves both.
+            re_breaching: 211.0,
         },
         Row {
             case: "a standard-resolution Average at its threshold",
@@ -372,6 +448,9 @@ async fn a_muted_alarm_transitions_on_published_data_and_delivers_only_once_re_e
             treat_missing: None,
             breaching: 100.0,
             clearing: 99.0,
+            // The mean of the clearing value and this one is still at or above the threshold,
+            // which the breaching value sitting exactly ON it would not be.
+            re_breaching: 150.0,
         },
         Row {
             case: "a Minimum below its threshold",
@@ -385,6 +464,8 @@ async fn a_muted_alarm_transitions_on_published_data_and_delivers_only_once_re_e
             treat_missing: Some("notBreaching"),
             breaching: 1.0,
             clearing: 42.0,
+            // Minimum{clearing, re_breaching} is re_breaching, so one value serves both.
+            re_breaching: 1.0,
         },
         Row {
             case: "a percentile over a customer namespace",
@@ -398,6 +479,8 @@ async fn a_muted_alarm_transitions_on_published_data_and_delivers_only_once_re_e
             treat_missing: Some("ignore"),
             breaching: 99.0,
             clearing: 3.0,
+            // p90 of the two values, by nearest rank, is the larger one.
+            re_breaching: 99.0,
         },
     ];
 
@@ -427,14 +510,16 @@ async fn a_muted_alarm_transitions_on_published_data_and_delivers_only_once_re_e
         );
 
         // The state each twin reports before anything breaches: what the transition moves
-        // FROM, which the missing-data treatment of the row decides.
-        let before = (
-            state_of(&emulator, ENABLED).await,
-            state_of(&emulator, MUTED).await,
-        );
+        // FROM, which the missing-data treatment of the row decides, once the evaluation the
+        // write made due has settled on it.
+        let before = settled_states(&emulator).await;
 
         // One breaching datapoint, in a window of its own: both twins are evaluated into ALARM.
-        row.publish(&emulator, row.breaching, 2).await;
+        // A drive stamped ONE window back is the oldest this suite places: the evaluation range
+        // reaches further than that, so the datapoint is still graded after the clock has moved
+        // the window it counts back from, and every later drive measures from the window it is
+        // made in, which is never older than this one.
+        row.publish(&emulator, row.breaching, 1).await;
         let reached = await_both(&emulator, "ALARM").await;
         assert_eq!(
             reached,
@@ -499,16 +584,18 @@ async fn a_muted_alarm_transitions_on_published_data_and_delivers_only_once_re_e
              already happened, got {replayed:?}"
         );
 
-        // … and the NEXT real transition of that alarm is delivered. Driven by data in later
-        // windows, so it is the evaluation that moves both twins, not a forced state.
-        row.publish(&emulator, row.clearing, 1).await;
+        // … and the NEXT real transition of that alarm is delivered. Driven by data the
+        // evaluation grades, so it is the evaluation that moves both twins, not a forced state:
+        // the clearing drive lands in a window newer than the breaching one above, and the
+        // re-breaching drive in the window it is made in, which is that one or a newer still.
+        row.publish(&emulator, row.clearing, 0).await;
         let cleared = await_both(&emulator, "OK").await;
         assert_eq!(
             cleared,
             ("OK".to_string(), "OK".to_string()),
             "case {case:?}: a clearing datapoint must move both twins to OK, got {cleared:?}"
         );
-        row.publish(&emulator, row.breaching, 0).await;
+        row.publish(&emulator, row.re_breaching, 0).await;
         let again = await_both(&emulator, "ALARM").await;
         assert_eq!(
             again,

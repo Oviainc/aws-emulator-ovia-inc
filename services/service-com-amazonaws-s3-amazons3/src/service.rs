@@ -277,6 +277,192 @@ fn addresses_peer_path(parts: &http::request::Parts, peer_segments: &[&str]) -> 
     }
 }
 
+/// The shortest and longest a general purpose bucket's name may be: "Bucket names must be
+/// between 3 (min) and 63 (max) characters long" (Amazon S3 User Guide, *Bucket naming
+/// rules*).
+const BUCKET_NAME_CHARS: ::std::ops::RangeInclusive<usize> = 3..=63;
+
+/// Whether `label` is SHAPED like a bucket name: "Bucket names can consist only of
+/// lowercase letters, numbers, dots (.), and hyphens (-)", between 3 and 63 characters, and
+/// must "begin and end with a letter or number" (same rules).
+///
+/// A shape test, not a claim that any such bucket exists: it is what tells a host whose
+/// first label could be a bucket from one whose first label is an endpoint's own
+/// (`s3.us-east-1.amazonaws.com`, whose `s3` is two characters).
+fn bucket_name_shaped(label: &str) -> bool {
+    let allowed = |character: char| {
+        character.is_ascii_lowercase() || character.is_ascii_digit() || matches!(character, '.' | '-')
+    };
+    let alphanumeric = |character: char| character.is_ascii_lowercase() || character.is_ascii_digit();
+    BUCKET_NAME_CHARS.contains(&label.len())
+        && label.chars().all(allowed)
+        && label.chars().next().is_some_and(alphanumeric)
+        && label.chars().next_back().is_some_and(alphanumeric)
+}
+
+/// Whether the store in `engine` holds a bucket named `name`.
+///
+/// One reader for the two places that ask — this service's own seams and the wire layer's
+/// address normalization — so they cannot disagree about which names are buckets.
+fn holds_bucket_in<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) -> bool {
+    crate::state::service_state(engine)
+        .is_some_and(|state| state.lock().bucket(name).is_some())
+}
+
+/// Whether `host` carries a BUCKET as its first label, by shape alone: a host of at least
+/// two labels whose first could be a bucket name.
+///
+/// Shape is not enough to decide the address — an endpoint's own first label can be
+/// bucket-shaped (`s3-us-east-1.amazonaws.com`, `my-emulator.example.com`) — so
+/// [`addressed_in_host`] is what resolves it, against the buckets this emulator holds.
+fn host_style_label(host: &str) -> Option<&str> {
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let (label, rest) = host.split_once('.')?;
+    (!rest.is_empty() && bucket_name_shaped(label)).then_some(label)
+}
+
+/// The bucket a VIRTUAL-HOSTED-STYLE request addresses in `host`, when it is one —
+/// `holds_bucket` answering whether a name is a bucket this emulator holds.
+///
+/// "Both the virtual-hosted-style requests and the path-style requests are supported"
+/// (`GetObject`'s own documentation): a path-style request carries the bucket as the first
+/// segment of its path, and a virtual-hosted-style request carries it as the first label of
+/// its host — `https://bucket-name.s3.region-code.amazonaws.com/key-name` — leaving the path
+/// to be the key alone. Every AWS SDK's URL presigner writes the second form for an endpoint
+/// addressed by name, so a client that reads an object through a presigned URL addresses it
+/// that way.
+///
+/// WHICH form a request is in cannot be read off the host's shape, because an endpoint's own
+/// first label may be bucket-shaped and an emulator's endpoint is reached under a name
+/// nothing here knows. So it is resolved against the buckets this emulator HOLDS: the first
+/// host label addresses a bucket when it names one of them and the request's first path
+/// segment does not. A path-style request's first path segment names its bucket, so it is
+/// never read out of the host; and where both could (a bucket whose name is also the
+/// endpoint's first label), the PATH wins, which leaves every request that resolves today
+/// resolving the same way.
+///
+/// The LIMIT of resolving it that way: a host-style request naming a bucket this emulator
+/// does NOT hold is read as path-style, so `PUT /` with `Host: new-bucket.<endpoint>` (a
+/// host-style `CreateBucket`) and a read of an absent bucket resolve from the bare path
+/// instead of from the host. Both answer about the address the path names — a create of no
+/// bucket at all, a listing of the account's buckets — rather than about the host's. Serving
+/// them would need the endpoint's own name, which a client configures and never sends, so
+/// the choice here is to leave the requests that resolve today resolving unchanged;
+/// `tests/all/presigned_object_reads.rs` pins the boundary.
+pub(crate) fn addressed_in_host<'h>(
+    host: &'h str,
+    path: &str,
+    holds_bucket: &dyn Fn(&str) -> bool,
+) -> Option<&'h str> {
+    let label = host_style_label(host)?;
+    if !holds_bucket(label) {
+        return None;
+    }
+    if first_path_segment(path).is_some_and(holds_bucket) {
+        return None;
+    }
+    Some(label)
+}
+
+/// `path` with `bucket` put back in front of it, which is the PATH-STYLE address of the same
+/// object: a virtual-hosted-style request's path is the key alone, so the labels every
+/// operation of this service binds (`/{Bucket}`, `/{Bucket}/{Key+}`) read it from here.
+///
+/// The one place the two address forms are reduced to one, so the request this service
+/// ROUTES and the request it DESERIALIZES cannot disagree about which bucket was named.
+pub(crate) fn path_with_bucket(bucket: &str, path: &str) -> String {
+    match path {
+        // `https://bucket.s3.amazonaws.com/` addresses the BUCKET itself (`HeadBucket`,
+        // `ListObjects`), so its path-style form carries no trailing segment at all.
+        "" | "/" => format!("/{bucket}"),
+        path => format!("/{bucket}{path}"),
+    }
+}
+
+/// The query parameters a LEGACY presigned URL carries its credential in: the access key
+/// id, the signature and the expiry, all three required — "`AWSAccessKeyId`, `Signature`
+/// and `Expires`" (AWS General Reference, *Authenticating requests: using query
+/// parameters*). The signing scope of that form names no service, which is why a request
+/// carrying it resolves no routing key at all.
+const LEGACY_PRESIGNED_PARAMETERS: [&str; 3] = ["AWSAccessKeyId", "Signature", "Expires"];
+
+/// Whether `uri`'s query carries all three of [`LEGACY_PRESIGNED_PARAMETERS`] — the shape
+/// that makes a request a legacy presigned S3 URL rather than any other unroutable request.
+fn carries_legacy_presigned_credential(uri: &http::Uri) -> bool {
+    let Some(query) = uri.query() else {
+        return false;
+    };
+    let names: ::std::collections::BTreeSet<&str> = query
+        .split('&')
+        .filter_map(|pair| pair.split('=').next())
+        .collect();
+    LEGACY_PRESIGNED_PARAMETERS
+        .iter()
+        .all(|parameter| names.contains(parameter))
+}
+
+/// The host a request was addressed to: its `Host` header, else the authority its URI
+/// carries (which is where HTTP/2 puts it, and where an in-process caller's absolute URI
+/// carries it).
+fn request_host(parts: &http::request::Parts) -> Option<&str> {
+    parts
+        .headers
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| parts.uri.host())
+}
+
+/// [`request_host`] for the runtime-API request the routing seam is handed.
+fn request_host_of(req: &aws_smithy_runtime_api::http::Request) -> Option<&str> {
+    req.headers()
+        .get(http::header::HOST.as_str())
+        .or_else(|| authority_of(req.uri()))
+}
+
+/// The authority of an absolute request URI (`https://host/path` -> `host`), or `None` for
+/// the origin-form URI (`/path`) a request from the wire carries.
+fn authority_of(uri: &str) -> Option<&str> {
+    let after_scheme = uri.split_once("://")?.1;
+    let authority = after_scheme
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(after_scheme);
+    (!authority.is_empty()).then_some(authority)
+}
+
+/// `req` with the PATH-STYLE address of the same object: the request the model's routing
+/// table can name, which is what [`Service::override_operation`] resolves the operation
+/// from. Everything else about the request — its method, its query and its headers — is
+/// carried through unchanged, because the route is decided by all three.
+///
+/// `None` when the rewritten URI is not one the HTTP layer can hold, which leaves the
+/// request to the generated routing table rather than failing the lookup.
+fn with_path_style_address(
+    req: &aws_smithy_runtime_api::http::Request,
+    bucket: &str,
+) -> Option<aws_smithy_runtime_api::http::Request> {
+    let uri = req.uri();
+    let path = wire::request_path(uri);
+    let query = wire::request_query(uri);
+    let rewritten = match query.is_empty() {
+        true => path_with_bucket(bucket, path),
+        false => format!("{}?{query}", path_with_bucket(bucket, path)),
+    };
+    // The body is not read by a route lookup (this service's protocol routes on the method,
+    // the path, the query and the presence of bound headers), so an empty one stands in for
+    // it rather than copying the payload of every object write.
+    let mut routable =
+        aws_smithy_runtime_api::http::Request::new(::aws_smithy_types::body::SdkBody::empty());
+    routable.set_uri(rewritten.as_str()).ok()?;
+    routable.set_method(req.method()).ok()?;
+    for (name, value) in req.headers().iter() {
+        routable
+            .headers_mut()
+            .append(name.to_string(), value.to_string());
+    }
+    Some(routable)
+}
+
 /// The INPUT members this service binds as the request's XML DOCUMENT: every `@httpPayload`
 /// member of an operation input whose target is a structured shape (a structure, union,
 /// list or map), named the way a validation path names it — lowerCamel.
@@ -522,11 +708,25 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        // What the wire layer asks when it has to tell a virtual-hosted-style address from a
+        // path-style one ([`addressed_in_host`]): whether a name is a bucket this emulator
+        // holds. The closure captures the SAME shared engine every operation reads, so the
+        // answer is the store's rather than a copy of it; it is read-only.
+        let buckets = Arc::clone(&engine);
+        let holds_bucket: wire::BucketLookup =
+            Arc::new(move |name: &str| holds_bucket_in(&*buckets, name));
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             engine,
-            protocol: UnwrappedXmlRestXml::new(),
+            protocol: UnwrappedXmlRestXml::new().with_buckets(holds_bucket),
         }
+    }
+
+    /// Whether `name` is a bucket this emulator holds — the question an ADDRESS resolves
+    /// against (see [`addressed_in_host`]). Read-only: the guard is taken, the answer is
+    /// read, and nothing is written.
+    fn holds_bucket(&self, name: &str) -> bool {
+        holds_bucket_in(&*self.engine, name)
     }
 
     /// Whether `access_key_id` names a credential this emulator ISSUED, and so one an
@@ -635,7 +835,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             {
                 !addresses_peer_path(parts, PEER_PATH_SEGMENTS)
             }
-            _ => false,
+            // A VIRTUAL-HOSTED-STYLE request that names no service in a credential: with no
+            // `Authorization` header and no presigned credential scope, the only routable
+            // signal left is the host — whose first label is the BUCKET, not a service, so
+            // the resolved key is that bucket's name and no service would claim the request
+            // at all. It is this service's when that label addresses a bucket this emulator
+            // holds ([`addressed_in_host`]); requiring the resolved key to BE that label is
+            // what keeps a request signed for another service (whose own key the credential
+            // named) out of this branch.
+            Some(key) => request_host(parts)
+                .and_then(|host| {
+                    addressed_in_host(host, parts.uri.path(), &|name| self.holds_bucket(name))
+                })
+                .is_some_and(|bucket| key == bucket),
+            // A request whose ONLY credential is a query-string one the framework's routing
+            // key does not read: the legacy presigned form, whose three parameters
+            // ([`LEGACY_PRESIGNED_PARAMETERS`]) are S3's own — "you can use query parameters
+            // to … authenticate the request" (AWS General Reference, *Authenticating
+            // requests: using query parameters*). It names no service in a scope, so the
+            // framework resolves no routing key and no service would claim it; where the
+            // credential travels is not part of addressing, so it is this service's request
+            // and is claimed as one. Whether it then VERIFIES is the framework's own
+            // judgement, exactly as for the SigV4 query form.
+            None => carries_legacy_presigned_credential(&parts.uri),
         };
         if claimed {
             // The credential this request presented, kept for the length of the request so
@@ -650,12 +872,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // A VIRTUAL-HOSTED-STYLE request names its bucket in the host, so its path is the
+        // key alone — `GET /key-name` — which the model's routing table cannot name: every
+        // route of this service begins with the `{Bucket}` label, so the key would be read
+        // as the bucket and a read of an object would resolve as a read of a BUCKET that
+        // does not exist. The route is resolved from the PATH-STYLE address of the same
+        // object instead ([`path_with_bucket`]), through the same routing table and the same
+        // protocol the model-derived lookup uses; the matched operation then binds its
+        // `{Bucket}` label from that same normalized path (see
+        // [`wire::UnwrappedXmlRestXml::deserialize_input`]).
+        //
+        // `None` for every path-style request, which leaves the generated routing table to
+        // resolve it exactly as before.
+        let host = request_host_of(req)?;
+        let bucket = addressed_in_host(host, wire::request_path(req.uri()), &|name| {
+            self.holds_bucket(name)
+        })?;
+        let rewritten = with_path_style_address(req, bucket)?;
+        // The ENTRY's protocol, which is the one carrying this service's model-derived
+        // routes (this file's own `self.protocol` serializes and deserializes; it was built
+        // with no route table, because routing is the entry's job).
+        let operation = self
+            .entry
+            .protocol()
+            .routing_key(&rewritten)
+            .ok()?
+            .to_string();
+        self.entry.routing_table().get(&operation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

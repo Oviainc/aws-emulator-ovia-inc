@@ -22,14 +22,12 @@
 //! whether automatic rotation is on, and in which optional members the request
 //! carries (description, key policy, zero/one/several tags).
 
-use std::time::{Duration, Instant};
-
 use serde_json::{json, Value};
-use service_com_amazonaws_kms_trentservice::state::{key_arn, REPLICA_CREATING_SPAN};
+use service_com_amazonaws_kms_trentservice::state::key_arn;
 
 use super::harness::{
     b64, call, create_alias, create_key, describe, error_code, failure, failure_in, ok, ok_in,
-    router, text, unb64, REGION,
+    router, settle_key_state, text, unb64, REGION,
 };
 
 /// The metadata members a replica key SHARES with the primary key it was replicated
@@ -67,38 +65,6 @@ fn policy_document(sid: &str) -> String {
         }]
     })
     .to_string()
-}
-
-/// The `KeyMetadata` the endpoint of `region` reports for `identifier`.
-async fn describe_in(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    region: &str,
-    identifier: &str,
-) -> Value {
-    ok_in(router, region, "DescribeKey", &json!({"KeyId": identifier})).await["KeyMetadata"].clone()
-}
-
-/// The metadata of `identifier` at `region`'s endpoint once the transient `Creating`
-/// key state has passed, which the clock ends by itself: no call moves it, and this
-/// asserts it really ends rather than waiting forever.
-async fn settled_in(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    case: &str,
-    region: &str,
-    identifier: &str,
-) -> Value {
-    let deadline = Instant::now() + REPLICA_CREATING_SPAN * 20;
-    loop {
-        let metadata = describe_in(router, region, identifier).await;
-        if metadata["KeyState"] != json!("Creating") {
-            return metadata;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case}: the transient Creating key state must end by itself, got {metadata}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 /// The tags `region`'s endpoint reports for `key_id`, as (tag key, tag value) pairs
@@ -380,7 +346,7 @@ async fn replicate_key_creates_a_key_of_the_set_in_the_replica_region() {
         // The transient state ends by itself, leaving the key state the replica was
         // created for, and the record the replica Region serves is the one the answer
         // described.
-        let settled = settled_in(&router, case, replica_region, &key_id).await;
+        let settled = settle_key_state(&router, replica_region, case, &key_id, "Creating").await;
         assert_eq!(
             (settled["KeyState"].clone(), settled["Enabled"].clone()),
             (json!("Enabled"), json!(true)),

@@ -244,19 +244,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // missing.
         if statistics.is_empty() && extended.is_empty() {
             return Err(invalid_combination(crate::state::one_of_required_message(
-                "Statistics",
-                "ExtendedStatistics",
+                STATISTICS,
+                EXTENDED_STATISTICS,
             )));
         }
         // Resolve every extended statistic BEFORE any data is read, so an unsupported name is
         // refused whether or not the requested range happens to hold datapoints.
-        for name in &extended {
+        for (position, name) in extended.iter().enumerate() {
             // The grammar and the statistic itself are `crate::state`'s, shared with
             // `GetMetricData` and with the metric-alarm evaluation that reads an alarm's
             // `ExtendedStatistic` over the same stored datapoints, so no two of them can
             // compute a different number for one span.
             if !crate::state::is_extended_statistic(name) {
-                return Err(invalid_value(format!("{name} is not a supported statistic")));
+                // A name this member cannot compute — a basic statistic, whose place is
+                // `Statistics` — is refused naming the element it arrived on the way every
+                // refusal of a value inside a list on this service names one: the list, the
+                // element's 1-based position, and the list's own target shape.
+                return Err(invalid_value(crate::state::value_not_supported_message(
+                    name,
+                    &crate::state::list_target_path(&crate::state::list_element_path(
+                        EXTENDED_STATISTICS,
+                        position + 1,
+                    )),
+                )));
             }
         }
         validate_period(input.period)?;
@@ -345,6 +355,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The two members a read names the statistics it wants on, as a refusal names them: the
+/// modelled member names (`GetMetricStatisticsInput$Statistics`, `$ExtendedStatistics`).
+const STATISTICS: &str = "Statistics";
+
+/// The percentile-only one of that pair.
+const EXTENDED_STATISTICS: &str = "ExtendedStatistics";
 
 /// Refuse an out-of-range input value.
 fn invalid_value(message: String) -> GetMetricStatisticsError {

@@ -29,10 +29,9 @@
 //!   `ConflictException` — and mints a new association only once the teardown is done;
 //! * an association being torn down is no longer a resource the tagging surface resolves.
 //!
-//! `ListUserAssociations` is still a scaffolded 501 (see
-//! `issues/.../license-manager-user-subscriptions-listuserassociations-stub.md`), so the
-//! read-back of one association here is the `@idempotent` `DisassociateUser` itself, and
-//! `ListInstances` is the list the instance view is read from.
+//! The read-back of one association here is the `@idempotent` `DisassociateUser` itself,
+//! which answers the stored association as it stands, and `ListInstances` is the list the
+//! instance view is read from.
 
 use std::time::Duration;
 

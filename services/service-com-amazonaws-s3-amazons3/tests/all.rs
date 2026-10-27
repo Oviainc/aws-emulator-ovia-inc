@@ -47,6 +47,8 @@ mod bucket_location;
 mod bucket_logging;
 #[path = "all/bucket_metadata_configuration.rs"]
 mod bucket_metadata_configuration;
+#[path = "all/bucket_metadata_configuration_deletion.rs"]
+mod bucket_metadata_configuration_deletion;
 #[path = "all/bucket_metadata_inventory_table_update.rs"]
 mod bucket_metadata_inventory_table_update;
 #[path = "all/bucket_metrics_configuration.rs"]
@@ -131,6 +133,8 @@ mod object_batch_deletion;
 mod object_copy;
 #[path = "all/object_content_type.rs"]
 mod object_content_type;
+#[path = "all/object_conditional_writes.rs"]
+mod object_conditional_writes;
 #[path = "all/object_default_encryption.rs"]
 mod object_default_encryption;
 #[path = "all/object_encryption.rs"]
@@ -145,6 +149,8 @@ mod object_listing_and_deletion;
 mod object_listing_encoding;
 #[path = "all/object_listing_v1.rs"]
 mod object_listing_v1;
+#[path = "all/object_partial_reads.rs"]
+mod object_partial_reads;
 #[path = "all/object_retention.rs"]
 mod object_retention;
 #[path = "all/object_restore.rs"]
@@ -169,6 +175,10 @@ mod object_write_and_read_back;
 mod object_write_tagging_header;
 #[path = "all/objects.rs"]
 mod objects;
+#[path = "all/presigned_object_reads.rs"]
+mod presigned_object_reads;
+#[path = "all/published_refusal_wording.rs"]
+mod published_refusal_wording;
 #[path = "all/public_access_block_default.rs"]
 mod public_access_block_default;
 #[path = "all/public_access_guardrails.rs"]
@@ -185,3 +195,5 @@ mod signature_refusal_wording;
 mod state_roundtrip;
 #[path = "all/version_id_classification.rs"]
 mod version_id_classification;
+#[path = "all/zz_probe.rs"]
+mod zz_probe;

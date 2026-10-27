@@ -15,6 +15,13 @@
 //! replica of the set — the last of which is a bad `PrimaryRegion` value rather
 //! than a missing resource, so it is a validation failure.
 //!
+//! The move itself takes a span the clock ends by itself: while it is in flight the
+//! two keys the designation moves between report the transient `Updating` key state
+//! and a second promotion of that set is refused as a key state the operation is not
+//! compatible with, whichever Region it asks for. The concurrent case — several
+//! promotions of one set issued at once — is asserted by
+//! `tests/all/multi_region_primary_serialization.rs`.
+//!
 //! Every assertion is about that rule over a TABLE, whose rows differ in the Region
 //! the designation moves to (two-, three- and four-segment Region ids), in the
 //! member of the set the designation moves from, in the kind of key the request
@@ -29,8 +36,8 @@ use serde_json::json;
 use service_com_amazonaws_kms_trentservice::state::key_arn;
 
 use super::harness::{
-    assert_empty, call, create_alias, create_key, describe, error_code, failure, ok, router, text,
-    REGION,
+    assert_empty, call, create_alias, create_key, describe, error_code, failure, ok, refused,
+    replicate_into, router, settle_key_state, text, topology_at, REGION,
 };
 
 /// The Regions the promotion table moves the primary-key designation to, beside the
@@ -40,64 +47,15 @@ use super::harness::{
 /// segments before the digit, three of them, and a longer name.
 const REPLICA_REGIONS: [&str; 3] = ["eu-west-2", "ap-southeast-2", "us-gov-west-1"];
 
-/// Replicate the multi-Region key `key_id` into each of `regions`, which is what
-/// leaves a replica key of the set at each of those Regions' endpoints.
-async fn replicate_into(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    key_id: &str,
-    regions: &[&str],
-) {
-    for region in regions {
-        let answer = ok(
-            router,
-            "ReplicateKey",
-            &json!({"KeyId": key_id, "ReplicaRegion": region}),
-        )
-        .await;
-        let metadata = answer["ReplicaKeyMetadata"].clone();
-        assert_eq!(
-            metadata["Arn"],
-            json!(key_arn(region, key_id)),
-            "case replicate {key_id} into {region}: the replica is named by the key ARN of \
-             its own Region, got {metadata}"
-        );
-    }
-}
-
-/// The `MultiRegionConfiguration` of `key_id` as this endpoint reports it: which
-/// member of the set it serves, the Region of the primary key, and the Regions of
-/// the replica keys.
+/// The `MultiRegionConfiguration` of `key_id` as the creation Region's endpoint reports
+/// it — [`topology_at`] at [`REGION`], which is the endpoint every row of this suite
+/// reads the set through.
 async fn topology_of(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     key_id: &str,
 ) -> (String, String, Vec<String>) {
-    let metadata = describe(router, key_id).await;
-    let configuration = metadata["MultiRegionConfiguration"].clone();
-    let key_type = text(case, &configuration, "MultiRegionKeyType");
-    let primary = configuration["PrimaryKey"].clone();
-    let primary_region = text(case, &primary, "Region");
-    assert_eq!(
-        primary["Arn"],
-        json!(key_arn(&primary_region, key_id)),
-        "case {case}: the primary key is named by the key ARN of its own Region, got {primary}"
-    );
-    let replicas = configuration["ReplicaKeys"]
-        .as_array()
-        .unwrap_or_else(|| panic!("case {case}: expected ReplicaKeys in {configuration}"))
-        .iter()
-        .map(|replica| {
-            let region = text(case, replica, "Region");
-            assert_eq!(
-                replica["Arn"],
-                json!(key_arn(&region, key_id)),
-                "case {case}: a replica key is named by the key ARN of its own Region, \
-                 got {replica}"
-            );
-            region
-        })
-        .collect();
-    (key_type, primary_region, replicas)
+    topology_at(router, case, REGION, key_id).await
 }
 
 /// `UpdatePrimaryRegion` moves the primary-key designation of a multi-Region key
@@ -110,7 +68,7 @@ async fn update_primary_region_moves_the_primary_key_of_the_set() {
 
     let created = create_key(&router, &json!({"MultiRegion": true, "Description": "set"})).await;
     let key_id = text("seed", &created, "KeyId");
-    replicate_into(&router, &key_id, &REPLICA_REGIONS).await;
+    replicate_into(&router, "seed", &key_id, &REPLICA_REGIONS).await;
 
     // Every Region of the set: the one the key was created in (its first primary)
     // and the three the replicas live in.
@@ -127,6 +85,11 @@ async fn update_primary_region_moves_the_primary_key_of_the_set() {
         REGION,
         REPLICA_REGIONS[2],
     ];
+
+    // Where the designation rests before each row's move: with that row's target it is
+    // the PAIR of keys the move goes through, which is what decides which endpoints
+    // report the transient key state of a move in flight.
+    let mut former_primary = REGION.to_string();
 
     for primary_region in moves {
         let case = format!("primary moves to {primary_region}");
@@ -168,7 +131,7 @@ async fn update_primary_region_moves_the_primary_key_of_the_set() {
         // Nothing else about the key moved: a multi-Region set shares one key id,
         // one key ARN per Region and one piece of key material.
         let metadata = describe(&router, &key_id).await;
-        for member in ["KeyId", "Arn", "KeySpec", "KeyUsage", "KeyState", "CurrentKeyMaterialId"] {
+        for member in ["KeyId", "Arn", "KeySpec", "KeyUsage", "CurrentKeyMaterialId"] {
             assert_eq!(
                 metadata[member], created[member],
                 "case {case}: {member} must be untouched by a primary-Region move, got {metadata}"
@@ -180,8 +143,78 @@ async fn update_primary_region_moves_the_primary_key_of_the_set() {
             "case {case}: the key is still a multi-Region key, got {metadata}"
         );
 
+        // "The old and new primary keys have a transient key state of Updating. The
+        // original key state is restored when the update is complete"
+        // (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`): this endpoint
+        // serves one key of the set, so it reports that transient state exactly while
+        // the key it serves is one of the two the designation moved between. "When
+        // KeyState is Enabled this value is true, otherwise it is false"
+        // (`smithy_query(query="doc",shape="KeyMetadata",member="Enabled")`), so the
+        // two members move together.
+        let moves_this_key = former_primary == REGION || primary_region == REGION;
+        let in_flight_state = if moves_this_key { "Updating" } else { "Enabled" };
+        assert_eq!(
+            metadata["KeyState"],
+            json!(in_flight_state),
+            "case {case}: the key served in {REGION} is {}a key the designation moved \
+             between, so its key state while the move is in flight must be \
+             {in_flight_state}, got {metadata}",
+            if moves_this_key { "" } else { "not " }
+        );
+        assert_eq!(
+            metadata["Enabled"],
+            json!(!moves_this_key),
+            "case {case}: Enabled is true only while KeyState is Enabled, got {metadata}"
+        );
+
+        // While the clock still owes the set this move, the SET is busy: another
+        // promotion of it is refused as a key state this operation is not compatible
+        // with — whichever Region it asks for, including one that does hold a replica
+        // — and persists nothing. A busy set is not a malformed request.
+        for busy_target in [primary_region, former_primary.as_str()] {
+            let (status, code, message) = refused(
+                &router,
+                REGION,
+                "UpdatePrimaryRegion",
+                &json!({"KeyId": key_id, "PrimaryRegion": busy_target}),
+            )
+            .await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "KMSInvalidStateException"),
+                "case {case}: a promotion to {busy_target} while the set is still moving \
+                 its primary key must be refused as an invalid key state, got {status} {code}"
+            );
+            assert_eq!(
+                message,
+                format!("{} is updating.", key_arn(REGION, &key_id)),
+                "case {case}: the refusal of a set that is busy must name the key the \
+                 request resolved to and the state the move puts it in, got {message:?}"
+            );
+        }
+        let (_, unchanged_primary, unchanged_replicas) =
+            topology_of(&router, &case, &key_id).await;
+        assert_eq!(
+            (unchanged_primary, unchanged_replicas),
+            (primary_region.to_string(), expected_replicas.clone()),
+            "case {case}: a refused call must leave the set exactly as it was"
+        );
+
+        // Once the clock has ended the move, the original key state is restored and
+        // the set can be promoted again. The Region the designation moved TO is always
+        // one of the two keys the move went through, so its endpoint is where the move
+        // in flight is observable whichever Regions this row moved between.
+        settle_key_state(&router, primary_region, &case, &key_id, "Updating").await;
+        let settled = describe(&router, &key_id).await;
+        assert_eq!(
+            (settled["KeyState"].clone(), settled["Enabled"].clone()),
+            (created["KeyState"].clone(), created["Enabled"].clone()),
+            "case {case}: the key state the move suspended must be restored, got {settled}"
+        );
+
         // The Region that now holds the primary key holds no replica, so asking for
-        // it again names no key to promote.
+        // it again names no key to promote — a bad `PrimaryRegion` value rather than
+        // a set that is busy.
         let (status, code) = failure(
             &router,
             "UpdatePrimaryRegion",
@@ -203,6 +236,8 @@ async fn update_primary_region_moves_the_primary_key_of_the_set() {
             (primary_region.to_string(), expected_replicas),
             "case {case}: a refused call must leave the set exactly as it was"
         );
+
+        former_primary = primary_region.to_string();
     }
 }
 
@@ -222,7 +257,7 @@ async fn update_primary_region_refuses_what_it_cannot_promote() {
         &create_key(&router, &json!({"MultiRegion": true})).await,
         "KeyId",
     );
-    replicate_into(&router, &promotable, &[REPLICA_REGIONS[0]]).await;
+    replicate_into(&router, "setup", &promotable, &[REPLICA_REGIONS[0]]).await;
 
     // The keys the rows name, each in the state its row is about.
     let single = text("setup", &create_key(&router, &json!({})).await, "KeyId");
@@ -241,14 +276,14 @@ async fn update_primary_region_refuses_what_it_cannot_promote() {
         &create_key(&router, &json!({"MultiRegion": true})).await,
         "KeyId",
     );
-    replicate_into(&router, &disabled, &[REPLICA_REGIONS[0]]).await;
+    replicate_into(&router, "setup", &disabled, &[REPLICA_REGIONS[0]]).await;
     ok(&router, "DisableKey", &json!({"KeyId": disabled})).await;
     let pending_deletion = text(
         "setup",
         &create_key(&router, &json!({"MultiRegion": true})).await,
         "KeyId",
     );
-    replicate_into(&router, &pending_deletion, &[REPLICA_REGIONS[0]]).await;
+    replicate_into(&router, "setup", &pending_deletion, &[REPLICA_REGIONS[0]]).await;
     ok(
         &router,
         "ScheduleKeyDeletion",

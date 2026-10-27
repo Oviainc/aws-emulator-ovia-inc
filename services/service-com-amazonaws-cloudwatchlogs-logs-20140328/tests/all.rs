@@ -59,6 +59,8 @@ mod destination_removal;
 mod destinations;
 #[path = "all/event_cursor_envelope.rs"]
 mod event_cursor_envelope;
+#[path = "all/event_window_selection.rs"]
+mod event_window_selection;
 #[path = "all/export_task_cancellation.rs"]
 mod export_task_cancellation;
 #[path = "all/export_task_status_messages.rs"]

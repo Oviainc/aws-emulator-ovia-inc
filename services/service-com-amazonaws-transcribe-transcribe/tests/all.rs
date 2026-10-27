@@ -53,6 +53,8 @@ mod job_concurrency_quota;
 mod job_start_vocabulary_state;
 #[path = "all/language_model_delete_requires_the_model.rs"]
 mod language_model_delete_requires_the_model;
+#[path = "all/language_model_encryption_updates.rs"]
+mod language_model_encryption_updates;
 #[path = "all/language_model_listing.rs"]
 mod language_model_listing;
 #[path = "all/language_model_quota.rs"]

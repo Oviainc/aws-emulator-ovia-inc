@@ -159,39 +159,25 @@ fn refusal(
 /// pattern requires
 /// (`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).
 ///
-/// The digits are the leading 16 bytes of a SHA-256 — the crate's existing `sha2`
-/// dependency, the same one that digests a manifest — over three inputs: a per-process
-/// random seed from the standard library's `RandomState` (the OS-seeded randomness
-/// `HashMap` uses), a monotonically increasing counter, and the clock. The seed keeps
-/// two processes apart, and the counter keeps two uploads of one process apart even if
-/// the clock does not advance, so no two uploads — in this repository or any other —
-/// share an id. Nothing in it is derived from the request.
+/// The digits are the service's one mint, [`crate::state::mint_hex`] — nothing in them is
+/// derived from the request — laid out in the five groups the pattern requires. A hex id
+/// of 16 bytes is 32 digits, which is exactly what the layout consumes, so the slices
+/// below cannot be short.
 fn new_upload_id() -> String {
-    use ::sha2::Digest as _;
-    use ::std::hash::{BuildHasher as _, Hasher as _};
+    /// The bytes a minted `UploadId` carries: 16, whose hex rendering is the 32 digits
+    /// the model's layout spells out.
+    const UPLOAD_ID_BYTES: usize = 16;
 
-    static MINTED: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-
-    let counter = MINTED.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
-    let mut seeder = ::std::collections::hash_map::RandomState::new().build_hasher();
-    seeder.write_u64(counter);
-    let nanos = ::std::time::SystemTime::now()
-        .duration_since(::std::time::UNIX_EPOCH)
-        .map_or(0, |since_epoch| since_epoch.as_nanos());
-
-    let mut digest = ::sha2::Sha256::new();
-    digest.update(seeder.finish().to_be_bytes());
-    digest.update(counter.to_be_bytes());
-    digest.update(nanos.to_be_bytes());
-    let hex = ::hex::encode(&digest.finalize()[..16]);
+    let hex = crate::state::mint_hex(UPLOAD_ID_BYTES);
+    let group = |from: usize, to: usize| hex.get(from..to).unwrap_or_default();
 
     format!(
         "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
+        group(0, 8),
+        group(8, 12),
+        group(12, 16),
+        group(16, 20),
+        group(20, 32)
     )
 }
 

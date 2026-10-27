@@ -264,6 +264,43 @@ pub fn value_is_invalid_message(value: &str, parameter: &str) -> String {
     format!("The value {value} for parameter {parameter} is invalid.")
 }
 
+/// How CloudWatch states a value outside the SET its member accepts: the member path and the
+/// whole accepted set, and nothing of the submitted value.
+///
+/// The set is what a client repairs the request from — the message is only actionable when it
+/// enumerates the legal values — so it is passed in from the declaration that owns it (an
+/// enumerated member's own value set, as the model declares it) rather than written here.
+pub fn value_in_set_message(parameter: &str, allowed: &[String]) -> String {
+    format!(
+        "The parameter {parameter} must be a value in the set [{}].",
+        allowed.join(", ")
+    )
+}
+
+/// How CloudWatch states a value it understands but cannot serve on the member it arrived on —
+/// a statistic name that is not of the kind its member computes, say: the value, because which
+/// one of a collection was rejected is not derivable from the member path alone, and the path.
+pub fn value_not_supported_message(value: &str, parameter: &str) -> String {
+    format!("The value {value} for parameter {parameter} is not supported.")
+}
+
+/// The path a refusal of one ELEMENT of a request's list member names it by: the list, the
+/// collection step, and the element's 1-based position inside it.
+pub fn list_element_path(list: &str, position: usize) -> String {
+    format!("{list}.{COLLECTION_STEP}.{position}")
+}
+
+/// The same path extended by the step CloudWatch's parameter walk names a list's own TARGET
+/// shape with, which the refusals of a value inside a list carry after the position
+/// (`Statistics.member.1.<list element>`).
+pub fn list_target_path(element_path: &str) -> String {
+    format!("{element_path}.{LIST_TARGET_STEP}")
+}
+
+/// That step, as CloudWatch spells it: a list's target shape has no member name of its own, so
+/// the walk names it by what it IS.
+const LIST_TARGET_STEP: &str = "<list element>";
+
 /// How CloudWatch states a collection carrying more entries than its cap: the member and the
 /// cap, and nothing of the entries themselves.
 pub fn collection_too_large_message(collection: &str, cap: usize) -> String {

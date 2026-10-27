@@ -48,8 +48,9 @@
 //! `resourceArn` the service cannot parse as a resource ARN is HTTP 400
 //! `BadRequestException` ([`Scaffolded::invalid_resource_arn`], and the same refusal at
 //! the request boundary is worded in `crate::service::validation`), one that addresses no
-//! resource is HTTP 404 `NotFoundException` ([`Scaffolded::not_found`]), and a tag set
-//! past the size a resource may carry is HTTP 400 `BadRequestException`
+//! resource is HTTP 404 `NotFoundException` ([`Scaffolded::not_found`]), and a tag
+//! selection past the size a resource may carry — a write's tag map or a removal's tag-key
+//! list alike — is HTTP 400 `BadRequestException`
 //! ([`Scaffolded::tag_limit_exceeded`]). None of those codes is a shape this service's
 //! model declares, so they travel as [`Scaffolded::Unmodeled`], each carrying the status
 //! that goes with ITS code rather than one status for every client error.
@@ -240,13 +241,20 @@ pub const NOT_FOUND_CODE: &str = "NotFoundException";
 pub const NOT_FOUND_STATUS: u16 = 404;
 /// The text that refusal carries: a CONSTANT, naming nothing from the request.
 pub const NOT_FOUND_MESSAGE: &str = "Resource was not found";
-/// The wire error code the tag APIs answer when the tag set a write would leave on the
-/// resource is larger than the resource may carry, and when the `resourceArn` they were
-/// given cannot be parsed as a resource ARN at all.
+/// The wire error code the tag APIs answer when a request selects more tags than a
+/// resource may carry — the tag set a write would leave on the resource, or the key list
+/// a removal names — and when the `resourceArn` they were given cannot be parsed as a
+/// resource ARN at all.
 pub const BAD_REQUEST_CODE: &str = "BadRequestException";
 /// The HTTP status of that refusal.
 pub const BAD_REQUEST_STATUS: u16 = 400;
-/// The text that refusal carries, naming the limit and nothing from the request.
+/// The text that refusal carries, naming the limit and nothing from the request — which
+/// matters doubly here, because every member a tag selection travels in is `@sensitive`.
+///
+/// ONE sentence for the whole surface: the limit it states is the size of the tag set a
+/// resource may carry (50), and a write's tag map and a removal's key list are both
+/// selections out of that one set, so a request naming more than the limit is refused
+/// with the same words whichever member carried it.
 pub const TAG_LIMIT_MESSAGE: &str = "The resultant tag set must not have more than 50 user tags.";
 /// The text the tag APIs' refusal of an unparseable `resourceArn` carries: a CONSTANT,
 /// naming neither the member nor the value — which is what distinguishes it from the
@@ -282,8 +290,9 @@ impl UnmodeledRefusal {
         }
     }
 
-    /// The tag APIs' refusal of a write whose resultant tag set would be larger than a
-    /// resource may carry: HTTP 400 `BadRequestException`.
+    /// The tag APIs' refusal of a request selecting more tags than a resource may carry —
+    /// a write whose resultant tag set would be over the limit, or a removal naming more
+    /// keys than the limit: HTTP 400 `BadRequestException`.
     pub const fn tag_limit_exceeded() -> Self {
         Self {
             code: BAD_REQUEST_CODE,
@@ -356,8 +365,9 @@ impl<E> Scaffolded<E> {
         Self::Unmodeled(UnmodeledRefusal::not_found())
     }
 
-    /// Refuse a tag write whose resultant tag set would be larger than a resource may
-    /// carry: HTTP 400 `BadRequestException`.
+    /// Refuse a tag request selecting more tags than a resource may carry — a write whose
+    /// resultant tag set would be over the limit, or a removal naming more keys than the
+    /// limit: HTTP 400 `BadRequestException`.
     pub const fn tag_limit_exceeded() -> Self {
         Self::Unmodeled(UnmodeledRefusal::tag_limit_exceeded())
     }
