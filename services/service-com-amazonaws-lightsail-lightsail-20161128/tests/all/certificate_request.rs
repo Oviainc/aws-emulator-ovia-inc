@@ -107,7 +107,10 @@ fn now_epoch_seconds() -> f64 {
 /// number is printed as colon-separated hex byte pairs, and this service builds
 /// one from the certificate's own minted id, so the same id always yields the
 /// same serial.
-fn serial_number_of(id: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite in this test target checks a minted serial the
+/// same way rather than carrying a second copy of the derivation.
+pub(crate) fn serial_number_of(id: &str) -> String {
     let digits: Vec<char> = id.chars().filter(char::is_ascii_hexdigit).collect();
     digits
         .chunks(2)

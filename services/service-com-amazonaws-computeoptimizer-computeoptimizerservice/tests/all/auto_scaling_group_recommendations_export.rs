@@ -20,12 +20,15 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    EXPORT_JOB_STEP, JOB_STATUS_COMPLETE, JOB_STATUS_IN_PROGRESS, JOB_STATUS_QUEUED,
-    RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_RDS_DB_INSTANCE,
+    ANALYSIS_DELAY, EXPORT_JOB_STEP, JOB_STATUS_COMPLETE, JOB_STATUS_IN_PROGRESS,
+    JOB_STATUS_QUEUED, RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_RDS_DB_INSTANCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, call_in_region, create_bucket, emulator, error_code, opt_in, ACCOUNT};
+use crate::harness::{
+    call, call_in_region, cell, create_bucket, csv_rows, emulator, error_code, export_destination,
+    get_object, opt_in, ACCOUNT,
+};
 
 /// The operation under test.
 const EXPORT: &str = "ExportAutoScalingGroupRecommendations";
@@ -593,6 +596,100 @@ async fn an_export_is_refused_while_the_account_is_not_opted_in() {
             assert_eq!(
                 status, 200,
                 "case {case:?}: opting back out: got {status}: {body}"
+            );
+        }
+    }
+}
+
+/// The exported file names every group by the ARN of the Region the export request addressed,
+/// which is the ARN the recommendation reader answers that same endpoint with: Compute
+/// Optimizer is a regional service, so the endpoint a request addresses is the Region whose
+/// resources it answers for and every ARN it reports names that Region.
+///
+/// One row per Region a caller can address — the Regions are rows of the rule, not a catalog —
+/// with the expected ARNs read back from the reader at that endpoint rather than written out.
+#[tokio::test]
+async fn an_exported_group_names_the_region_the_export_request_addressed() {
+    let router = enrolled_emulator().await;
+    // The export holds what a reader reports, which is nothing until the analysis the
+    // enrollment started is due.
+    tokio::time::sleep(ANALYSIS_DELAY + SLACK).await;
+
+    for region in ["us-west-2", "eu-central-1", "us-east-1"] {
+        let request = json!({
+            "s3DestinationConfig": {"bucket": BUCKET},
+            "fieldsToExport": ["AutoScalingGroupArn", "AutoScalingGroupName"],
+        });
+        let (status, body) = call_in_region(&router, region, EXPORT, request.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {region}: expected {request} to be accepted, got {status}: {body}"
+        );
+        let (bucket, key, _) = export_destination(region, &body);
+
+        tokio::time::sleep(2 * EXPORT_JOB_STEP + SLACK).await;
+        let (status, exported) = get_object(&router, &bucket, &key).await;
+        assert_eq!(
+            status, 200,
+            "case {region}: downloading {key}: got {status}: {}",
+            String::from_utf8_lossy(&exported)
+        );
+        let exported = String::from_utf8(exported)
+            .unwrap_or_else(|error| panic!("case {region}: the export file is text: {error}"));
+        let rows = csv_rows(&exported);
+        let header = rows.first().cloned().unwrap_or_default();
+        let data = rows.get(1..).unwrap_or_default();
+        assert!(
+            !data.is_empty(),
+            "case {region}: the Region's analysis is exported, got {exported:?}"
+        );
+
+        // What the reader answers at the same endpoint: the ARNs the file must name.
+        let (status, reported) = call_in_region(
+            &router,
+            region,
+            "GetAutoScalingGroupRecommendations",
+            json!({"maxResults": 100}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {region}: reading the recommendations: got {status}: {reported}"
+        );
+        let expected: Vec<String> = reported["autoScalingGroupRecommendations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {region}: the reader reports a list, got {reported}"))
+            .iter()
+            .map(|recommendation| {
+                recommendation["autoScalingGroupArn"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "case {region}: the reader reports the Region's groups, got {reported}"
+        );
+
+        for row in data {
+            let arn = cell(&header, row, "AutoScalingGroupArn").to_string();
+            assert!(
+                arn.starts_with(&format!("arn:aws:autoscaling:{region}:{ACCOUNT}:")),
+                "case {region}: every exported ARN names this Region's endpoint, got {arn:?}"
+            );
+            assert!(
+                expected.contains(&arn),
+                "case {region}: the exported ARN must be one the reader reports ({expected:?}), \
+                 got {arn:?}"
+            );
+        }
+        for arn in &expected {
+            assert!(
+                data.iter()
+                    .any(|row| cell(&header, row, "AutoScalingGroupArn") == arn),
+                "case {region}: every group the reader reports has its rows, none for {arn}: \
+                 {exported:?}"
             );
         }
     }

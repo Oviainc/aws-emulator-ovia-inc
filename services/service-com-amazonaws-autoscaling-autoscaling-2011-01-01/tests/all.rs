@@ -23,6 +23,8 @@ mod metric_collection_catalog;
 mod reference_data_catalogs;
 #[path = "all/scale_out_launches_ec2_instances.rs"]
 mod scale_out_launches_ec2_instances;
+#[path = "all/set_desired_capacity_on_subnet_placed_groups.rs"]
+mod set_desired_capacity_on_subnet_placed_groups;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 // The shared harness the suites above drive the service through: the awsQuery POST

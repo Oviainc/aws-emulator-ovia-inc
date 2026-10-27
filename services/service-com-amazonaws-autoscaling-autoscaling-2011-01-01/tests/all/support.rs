@@ -11,6 +11,7 @@ use std::sync::Arc;
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
+use service_com_amazonaws_ec2_amazonec2::state as ec2;
 
 /// The region every suite signs for, so the ARNs the service stamps are checked
 /// against the region the request names rather than a default.
@@ -79,6 +80,70 @@ pub async fn query(
     let status = response.status().as_u16();
     let text = String::from_utf8_lossy(response.body()).to_string();
     (status, text)
+}
+
+/// One subnet seeded into the account's own Amazon EC2 store: its id, and the zone EC2
+/// holds it in.
+#[derive(Debug, Clone)]
+pub struct SeededSubnet {
+    pub id: String,
+    pub zone: String,
+}
+
+/// Seed `count` subnets into the account's own Amazon EC2 store, through EC2's own
+/// writers, and answer them in the order they were created.
+///
+/// THE ONE COPY for every suite that needs a group placed by subnet: the subnets an Auto
+/// Scaling request names are EC2's, so they are written through EC2's own store rather
+/// than invented here.
+///
+/// The i-th subnet is in the i-th Availability Zone of [`REGION`], wrapping when more
+/// subnets are asked for than the Region has zones — so asking for one more than the zone
+/// count puts two subnets in one zone. The zone names are EC2's own catalog for the Region
+/// (`ec2::availability_zones_in_region`), never written out here, and each block is the
+/// n-th default-sized block of the VPC's own CIDR (`ec2::nth_subnet_cidr_block`).
+pub fn seed_subnets(engine: &Arc<engine::InMemoryEngine>, count: usize) -> Vec<SeededSubnet> {
+    let state = ec2::service_state(&**engine).expect("the EC2 store is mounted on this engine");
+    let mut store = state.lock();
+    let vpc_id = store.insert_vpc(
+        ec2::DEFAULT_VPC_CIDR_BLOCK,
+        false,
+        ec2::DEFAULT_INSTANCE_TENANCY,
+        ec2::VPC_STATE_AVAILABLE,
+        REGION,
+        Vec::new(),
+    );
+    let zones = ec2::availability_zones_in_region(REGION);
+    assert!(
+        !zones.is_empty(),
+        "the Region {REGION} must have Availability Zones to seed subnets in"
+    );
+    (0..count)
+        .map(|index| {
+            let zone = zones[index % zones.len()].clone();
+            let cidr_block = ec2::nth_subnet_cidr_block(
+                ec2::DEFAULT_VPC_CIDR_BLOCK,
+                ec2::DEFAULT_SUBNET_PREFIX_LENGTH,
+                u32::try_from(index).expect("the seeded subnet count fits in a u32"),
+            )
+            .expect("a default-sized block inside the VPC's own block");
+            let id = store.insert_subnet(ec2::SubnetSpec {
+                vpc_id: vpc_id.clone(),
+                cidr_block,
+                availability_zone: zone.zone_name.clone(),
+                availability_zone_id: zone.zone_id,
+                region: REGION.to_string(),
+                state: ec2::SUBNET_STATE_AVAILABLE.to_string(),
+                default_for_az: false,
+                map_public_ip_on_launch: true,
+                tags: Vec::new(),
+            });
+            SeededSubnet {
+                id,
+                zone: zone.zone_name,
+            }
+        })
+        .collect()
 }
 
 /// The text of every `<tag>…</tag>` in document order.
