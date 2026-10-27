@@ -153,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // somehow reaches here is refused rather than silently rewritten.
         let requested_page_size = input.page_size.unwrap_or(DEFAULT_PAGE_SIZE);
         if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&requested_page_size) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "PageSize must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}; \
                  got {requested_page_size}"
             )));
@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // named load balancer is known to exist — and a region holds at most this
             // many, so a request whose names all exist never trips it.
             if wanted.len() > crate::state::MAX_LOAD_BALANCER_NAMES_PER_REQUEST {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                     "LoadBalancerNames must name at most {} distinct load balancers; got {}",
                     crate::state::MAX_LOAD_BALANCER_NAMES_PER_REQUEST,
                     wanted.len()
@@ -308,7 +308,10 @@ fn describe(record: &crate::state::LoadBalancer) -> LoadBalancerDescription {
         // what a later describe reports.
         policies: Some(policies(record)),
         backend_server_descriptions: Some(Vec::new()),
-        availability_zones: Some(record.availability_zones.clone()),
+        // Every zone the load balancer is in: the zones a request named directly plus the
+        // zone of each attached subnet, which is what makes a subnet-placed load balancer
+        // report the zones its placement puts it in.
+        availability_zones: Some(record.zones()),
         subnets: Some(record.subnets.clone()),
         vpc_id: record.vpc_id.clone(),
         instances: Some(

@@ -235,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let availability_zones = input.availability_zones.unwrap_or_default();
         let subnets = input.subnets.unwrap_or_default();
         if availability_zones.is_empty() && subnets.is_empty() {
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(crate::scaffolded::Scaffolded::validation_error(
                 "at least one of AvailabilityZones or Subnets must be specified",
             ));
         }
@@ -244,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ("Subnets", subnets.len()),
         ] {
             if len > crate::state::MAX_PLACEMENTS_PER_LOAD_BALANCER {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                     "{member} must carry at most {} entries; got {len}",
                     crate::state::MAX_PLACEMENTS_PER_LOAD_BALANCER
                 )));
@@ -252,18 +252,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let security_groups = input.security_groups.unwrap_or_default();
         if security_groups.len() > crate::state::MAX_SECURITY_GROUPS_PER_LOAD_BALANCER {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "SecurityGroups must carry at most {} entries; got {}",
                 crate::state::MAX_SECURITY_GROUPS_PER_LOAD_BALANCER,
                 security_groups.len()
             )));
         }
 
+        // The subnets a load balancer is placed in are EC2's resources, and they are what
+        // say which Availability Zones — and which VPC — the load balancer is in, so they
+        // are resolved against EC2 before anything is written. Nothing is held across that
+        // call: the store is locked only once the answer is in.
+        let placement = crate::state::resolve_subnet_placement(ctx, &region, &subnets).await;
+
         let listeners = build_listeners(&input.listeners)?;
         if listeners.is_empty() {
             // A load balancer with no listener routes nothing; the model requires the
             // member but cannot require the list to be non-empty.
-            return Err(crate::scaffolded::Scaffolded::validation(
+            return Err(crate::scaffolded::Scaffolded::validation_error(
                 "Listeners must carry at least one listener",
             ));
         }
@@ -279,9 +285,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateLoadBalancerErrorModeled::DuplicateAccessPointNameException(
                     DuplicateAccessPointNameException {
-                        message: Some(format!(
-                            "Load balancer named {} already exists",
-                            input.load_balancer_name
+                        message: Some(crate::state::duplicate_load_balancer_name_message(
+                            &input.load_balancer_name,
                         )),
                     },
                 )
@@ -321,12 +326,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             listeners,
             availability_zones,
             subnets,
+            // The zone of each attached subnet as EC2 reports it, so the load balancer is
+            // in the zones its placement really puts it in; a subnet EC2 could not be
+            // asked about contributes none.
+            subnet_zones: placement.zones,
             security_groups,
-            // No VPC topology is modelled, so a subnet-placed load balancer has no VPC
-            // to report: `DescribeLoadBalancers` leaves `VPCId` absent rather than
-            // inventing an id for a VPC nothing created. A later slice that models
-            // subnets and their VPCs fills this in.
-            vpc_id: None,
+            // The VPC those same subnets belong to, as EC2 reports it — left unreported
+            // when there is no EC2 to ask, rather than invented for a VPC nothing created.
+            vpc_id: placement.vpc_id,
             instances: crate::state::InstanceSet::default(),
             health_check,
             // A policy is created by its own operation, so a load balancer holds none
@@ -361,7 +368,7 @@ fn build_listeners(
     // Bound the caller-driven work before any of it runs: one load balancer holds at
     // most this many listeners, so a longer list cannot be satisfied anyway.
     if requested.len() > crate::state::MAX_LISTENERS_PER_LOAD_BALANCER {
-        return Err(crate::scaffolded::Scaffolded::validation(format!(
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
             "Listeners must carry at most {} listeners; got {}",
             crate::state::MAX_LISTENERS_PER_LOAD_BALANCER,
             requested.len()

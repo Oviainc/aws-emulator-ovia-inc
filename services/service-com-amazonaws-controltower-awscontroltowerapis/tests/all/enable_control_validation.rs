@@ -27,17 +27,12 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::enabled_control_lifecycle::catalog_arn;
 use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer};
 
 /// The AWS Control Tower ARN of a control, whose resource segment is the control's name.
 fn control_arn(name: &str) -> String {
     format!("arn:aws:controltower:us-west-2::control/{name}")
-}
-
-/// The AWS Control Catalog ARN of the same control, whose resource segment is its opaque
-/// id. That catalog is global, so the ARN names neither a region nor an account.
-fn catalog_arn(catalog_id: &str) -> String {
-    format!("arn:aws:controlcatalog:::control/{catalog_id}")
 }
 
 /// An organizational unit ARN, in the form the AWS Organizations documentation publishes.

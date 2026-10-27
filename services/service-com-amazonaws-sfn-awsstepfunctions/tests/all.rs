@@ -85,3 +85,5 @@ mod sync_execution;
 mod task_integrations;
 #[path = "all/test_state.rs"]
 mod test_state;
+#[path = "all/update_state_machine_alias_effects.rs"]
+mod update_state_machine_alias_effects;

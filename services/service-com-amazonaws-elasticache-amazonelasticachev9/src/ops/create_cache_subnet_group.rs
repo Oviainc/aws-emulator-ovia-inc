@@ -328,7 +328,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: crate::state::subnet_group_arn(&region, &name),
             subnets,
             name: name.clone(),
-            description: input.cache_subnet_group_description,
+            description: crate::state::stored_description(&input.cache_subnet_group_description),
             // The VPC of the subnets the group holds, not an invented one:
             // every subnet the account has belongs to its default VPC.
             vpc_id: crate::state::default_vpc_id(&region),

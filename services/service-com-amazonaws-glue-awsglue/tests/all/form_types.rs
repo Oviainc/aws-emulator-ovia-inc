@@ -340,9 +340,8 @@ async fn reading_an_unknown_form_type_is_refused() {
     let truncated = &id[..id.len() - 1];
     let extended = format!("{id}0");
     let recased = id.to_uppercase();
-    // Every row must name an identifier the store does NOT hold. A minted identifier is
-    // lowercase hexadecimal, so one drawn with no letter at all recases to itself; such a
-    // row would name the stored record, so it is dropped rather than asserted.
+    // Every row must name an identifier the store does NOT hold, so a row that happens to
+    // spell the stored identifier is dropped rather than asserted.
     let rows: Vec<(&str, &str)> = [
         ("never minted", "no-such-form-type"),
         ("a prefix of a stored identifier", truncated),

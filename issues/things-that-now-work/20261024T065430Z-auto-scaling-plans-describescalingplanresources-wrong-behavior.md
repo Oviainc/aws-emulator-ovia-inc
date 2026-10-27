@@ -27,3 +27,23 @@ Smithy model: `ScalingPlanResource$ScalingPolicies` (list<ScalingPolicy>) with `
 2. Wait for the plan to report StatusCode `Active` (DescribeScalingPlans).
 3. Call DescribeScalingPlanResources {"ScalingPlanName":"my-plan","ScalingPlanVersion":1}.
 4. Observe the single ScalingPlanResource has no `ScalingPolicies` member; the real service returns one TargetTrackingScaling policy carrying the configuration supplied at create time.
+
+## Resolution
+
+The code base drifted since the commit this report names: the projection no longer hardcodes
+`scaling_policies: None`. An applied resource reports one `TargetTrackingScaling` policy per
+target tracking configuration of its own scaling instruction, projected from the stored plan
+(`src/state.rs`, `ScalingPlanRecord::applied_policies`, read by
+`src/ops/describe_scaling_plan_resources.rs`), with the configuration echoed and a name that is
+unique within the plan and stable across reads.
+
+The rule is now pinned over the WHOLE catalog of scalable resources a plan can cover — one case per
+`ScalableDimension` the model lists, in both predefined and customized metric form, with one and
+with several configurations on one resource — and over a paged read, so a resource reports its own
+policies whichever page it arrives on (`tests/all/scaling_plan_resource_policies.rs`). The number
+and form of the configurations on one resource, and the resource of an instruction that disabled
+dynamic scaling, stay covered by `tests/all/applied_policies_and_status_narratives.rs`.
+
+`ScalingPolicies[*].PolicyName` remains a service-generated name: the model only requires 1-256
+printable characters, so the tests assert that bound, uniqueness within the plan and stability
+across reads rather than any one literal.

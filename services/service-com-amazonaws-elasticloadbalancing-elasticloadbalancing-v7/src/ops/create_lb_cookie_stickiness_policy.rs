@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `PolicyName` documents rather than models, enforced here through the helper
         // every policy-creating operation shares.
         if let Err(why) = crate::state::policy_name_rejection(&input.policy_name) {
-            return Err(crate::scaffolded::Scaffolded::validation(why));
+            return Err(crate::scaffolded::Scaffolded::validation_error(why));
         }
 
         // "The time period, in seconds, after which the cookie should be considered
@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cookie_expiration_period
             .unwrap_or(crate::state::DEFAULT_COOKIE_EXPIRATION_PERIOD_SECONDS);
         if cookie_expiration_period < 0 {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "CookieExpirationPeriod must be a number of seconds of zero or more, \
                  zero meaning the duration of the browser session; got \
                  {cookie_expiration_period}"

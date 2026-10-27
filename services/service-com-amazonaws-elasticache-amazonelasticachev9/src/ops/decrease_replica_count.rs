@@ -216,6 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than `ReplicationGroupNotFoundFault`. See
         // `crate::state::replica_count_targets`.
         let targets = match crate::state::replica_count_targets(
+            crate::state::DECREASE_REPLICA_COUNT_MIN,
             input.new_replica_count,
             input.replica_configuration.as_deref().unwrap_or_default(),
         ) {
@@ -260,11 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DecreaseReplicaCountErrorModeled::InvalidReplicationGroupStateFault(
                     InvalidReplicationGroupStateFault {
-                        message: Some(format!(
-                            "Replication group {key} is in {} state, not {}.",
-                            group.status,
-                            crate::state::STATUS_AVAILABLE
-                        )),
+                        message: Some(crate::state::replication_group_modify_state_refusal()),
                     },
                 )
                 .into(),
@@ -306,10 +303,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if *target >= current {
                 return Err(DecreaseReplicaCountErrorModeled::NoOperationFault(
                     NoOperationFault {
-                        message: Some(format!(
-                            "Node group {node_group_id} of replication group {key} already has \
-                             {current} replicas."
-                        )),
+                        message: Some(
+                            crate::state::REPLICA_COUNT_UNCHANGED_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

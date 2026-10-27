@@ -183,9 +183,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 BatchApplyUpdateActionErrorModeled::ServiceUpdateNotFoundFault(
                     ServiceUpdateNotFoundFault {
-                        message: Some(format!(
-                            "Service update {} not found.",
-                            request.service_update_name
+                        message: Some(crate::state::service_update_not_found_message(
+                            &request.service_update_name,
                         )),
                     },
                 )
