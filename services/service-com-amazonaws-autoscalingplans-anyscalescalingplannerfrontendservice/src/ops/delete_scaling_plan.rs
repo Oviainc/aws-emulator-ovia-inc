@@ -147,21 +147,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle_due(now);
 
+        // The admission rule every mutating operation shares — resolve the plan this
+        // request names, then refuse one whose lifecycle transition is still in flight —
+        // lives in `crate::state::admit_plan_mutation`; this operation only mints the
+        // refusal it answers in its own error shape.
         let plan = state
-            .plan_mut(&input.scaling_plan_name, input.scaling_plan_version)
-            .ok_or_else(|| {
-                not_found(crate::state::plan_not_found_message(
-                    &input.scaling_plan_name,
-                    input.scaling_plan_version,
-                ))
+            .admit_plan_mutation(
+                &input.scaling_plan_name,
+                input.scaling_plan_version,
+                crate::state::PlanMutation::Delete,
+            )
+            .map_err(|refusal| match refusal {
+                crate::state::PlanMutationRefusal::NotFound(message) => not_found(message),
+                crate::state::PlanMutationRefusal::InProgress(message) => {
+                    concurrent_update(message)
+                }
             })?;
-
-        if plan.is_in_progress() {
-            return Err(concurrent_update(format!(
-                "The scaling plan '{}' is in status {} and cannot be deleted",
-                input.scaling_plan_name, plan.status_code
-            )));
-        }
 
         plan.begin(
             crate::state::STATUS_DELETION_IN_PROGRESS,
