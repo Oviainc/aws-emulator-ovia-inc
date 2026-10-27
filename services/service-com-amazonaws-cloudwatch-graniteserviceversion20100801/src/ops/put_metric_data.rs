@@ -596,9 +596,10 @@ fn is_reserved_namespace(namespace: &str) -> bool {
 }
 
 /// The request member path of entry `index` of the list at `list`, as a refusal names it:
-/// the list's own path, then the one-based position of the entry inside it.
+/// the list's own path, then the one-based position of the entry inside it — the one spelling
+/// this service names a list element by ([`crate::state::list_element_path`]).
 fn member_path(list: &str, index: usize) -> String {
-    format!("{list}.member.{}", index + 1)
+    crate::state::list_element_path(list, index + 1)
 }
 
 /// Refuse an input value outside what this operation documents: the error channel every

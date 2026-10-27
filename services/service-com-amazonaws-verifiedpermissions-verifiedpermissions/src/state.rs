@@ -7,9 +7,11 @@
 //! idempotency-token ledger. The Cedar-specific helpers (parsing a policy's
 //! scope out of its statement, parsing a template, evaluating an authorization
 //! request) live beside it in [`cedar`], so every operation reaches one
-//! implementation rather than re-deriving the policy language.
+//! implementation rather than re-deriving the policy language, and the reading of
+//! an identity token an authorization call presents lives in [`token`].
 
 pub mod cedar;
+pub mod token;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};

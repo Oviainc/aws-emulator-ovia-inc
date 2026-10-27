@@ -3,7 +3,8 @@
 //! @op StartSuiteRun
 //!
 //! Creates and PERSISTS a suite run of one definition version: a new UUID id, the ARN, the
-//! endpoint a device under test connects to, and the `PENDING` status the run starts in.
+//! endpoint the run's primary device connects to, and the `PENDING` status the run starts
+//! in.
 //!
 //! ## The run itself cannot execute here
 //!
@@ -263,6 +264,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &format!("suiterun/{}/{id}", input.suite_definition_id),
         );
+        // The host this run reports is the host its PRIMARY DEVICE connects to, taken from
+        // the one derivation in `crate::state::endpoint_for` that `GetEndpoint` answers
+        // from: a run names a device, so what it reports is that device's own host, and a
+        // client told this host by the start call is told the same one when it asks
+        // `GetEndpoint` where that device should connect.
+        let endpoint = crate::state::endpoint_for(
+            &region,
+            &crate::state::DeviceIdentity::of(&input.suite_run_configuration.primary_device),
+        );
         // Retention, so a definition run over and over cannot grow the store without
         // limit: make room for this run by dropping the oldest finished ones.
         store.prune_runs(
@@ -283,7 +293,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             started_at: None,
             end_at: None,
             error_reason: None,
-            endpoint: crate::state::endpoint_for_region(&region),
+            endpoint,
             next_transition_at: Some(now + crate::state::STATUS_TRANSITION),
         };
 
