@@ -20,6 +20,11 @@
 //! `VocabularyFilterMethod` with a `VocabularyFilterName` — are refused with the
 //! modelled `BadRequestException`.
 //!
+//! The `Settings` members that NAME a custom resource are resolved in the store, and
+//! refused the same way: a name this Region holds no resource of that family under, and
+//! a custom vocabulary whose build has not finished successfully (only `READY` makes one
+//! usable), name nothing this job could apply.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -337,10 +342,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A Medical Scribe job may only apply a custom vocabulary or custom vocabulary
-        // filter this REGION holds — the rule every job family's settings follow, see
+        // filter this REGION holds, and only a custom vocabulary whose build has
+        // finished successfully — the rule every job family's settings follow, see
         // [`crate::state::unheld_reference_error`].
         if let Some(message) = store.unheld_reference_error(
             &region,
+            now,
             &[
                 (
                     crate::state::ResourceFamily::Vocabulary,

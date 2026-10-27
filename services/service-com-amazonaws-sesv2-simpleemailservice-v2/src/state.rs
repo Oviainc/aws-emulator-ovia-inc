@@ -260,13 +260,15 @@ pub fn aggregate_sending_status(customer_managed: &str, aws_ses_managed: &str) -
     SENDING_STATUS_ENABLED.to_string()
 }
 
-/// How this service words `BadRequestException` for a reputation entity reference
-/// that names no resource this account holds.
+/// How this service words the refusal of a reputation entity reference that names no
+/// resource this account holds.
 ///
-/// A reputation entity is not created by a request of its own, so the reference a
-/// write carries is invalid input rather than a missing resource of that write's
+/// A reputation entity is not created by a request of its own, so for a write the
+/// reference it carries is invalid input rather than a missing resource of that write's
 /// own making — which is why the writes model `BadRequestException` and no
-/// `NotFoundException` at all.
+/// `NotFoundException` at all. `GetReputationEntity` does model one, and reports the
+/// missing entity with it; the wording is this one either way, so a read and a write
+/// cannot disagree about what was not found.
 pub fn reputation_entity_not_found(reference: &str) -> String {
     format!("Reputation entity {reference} does not exist.")
 }

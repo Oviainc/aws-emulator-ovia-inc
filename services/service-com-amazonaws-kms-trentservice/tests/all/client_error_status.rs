@@ -329,7 +329,11 @@ async fn a_scaffolded_operation_still_answers_501() {
     // Rows: operations this crate has not implemented yet, control plane and data
     // plane (`grep -l 'SCAFFOLDED, NOT IMPLEMENTED' src/ops/`).
     let cases: Vec<(&str, Value)> = vec![
-        ("GetPublicKey", json!({"KeyId": key_id})),
+        (
+            "GenerateMac",
+            json!({"KeyId": key_id, "Message": b64(b"still a stub"),
+                   "MacAlgorithm": "HMAC_SHA_256"}),
+        ),
         (
             "GenerateDataKeyPair",
             json!({"KeyId": key_id, "KeyPairSpec": "RSA_2048"}),

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSigningPlatforms
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSigningPlatforms`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSigningPlatforms::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the signing-platform catalog this service publishes
+//! ([`crate::state::SIGNING_PLATFORM_CATALOG`]), narrowed to the `category`,
+//! `partner` and `target` the caller filtered on: a reporting operation, so it
+//! writes nothing — a signing platform is published by AWS Signer, never
+//! created by a caller.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +116,20 @@ impl From<ListSigningPlatformsErrorModeled> for ListSigningPlatformsError {
     }
 }
 
+/// The modelled 400 for a `nextToken` that is not one this listing handed out.
+///
+/// `code` names the condition a paginating client resets on, as the service's
+/// other paginated reads word it. The refused value is not echoed: a client that
+/// held a token from another listing learns that the token is not valid here,
+/// and nothing of what the token decodes to is reported back.
+fn invalid_next_token() -> ListSigningPlatformsError {
+    ListSigningPlatformsErrorModeled::ValidationException(ValidationException {
+        message: Some("Invalid next token provided".to_string()),
+        code: Some(crate::state::ERROR_CODE_INVALID_NEXT_TOKEN.to_string()),
+    })
+    .into()
+}
+
 /// The `ListSigningPlatforms` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -155,18 +166,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSigningPlatforms` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSigningPlatformsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSigningPlatforms"))
+        // A platform is a published fact about the service, not a stored
+        // resource: this call reads the catalog and writes nothing, so a later
+        // reader of any platform sees exactly what this one saw.
+        let _ = (ctx, &self.engine);
+
+        // `maxResults` is modelled `@range(min: 1, max: 25)` and the boundary
+        // validator refused anything outside it before this handler ran, so the
+        // only case left is an absent value: serve the largest page the model
+        // allows. The `clamp` states that invariant rather than correcting a
+        // caller — a value reaching here outside the range is a validator bug,
+        // which the debug assertion surfaces instead of silently repairing.
+        let requested = input
+            .max_results
+            .unwrap_or(crate::state::PLATFORM_PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::PLATFORM_PAGE_LIMIT).contains(&requested),
+            "maxResults {requested} should have been refused at the boundary"
+        );
+        let page_size = usize::try_from(requested.clamp(1, crate::state::PLATFORM_PAGE_LIMIT))
+            .expect("a page size clamped into 1..=25 fits in usize");
+
+        // Which platforms this call enumerates — the listing a page of it hands
+        // a token out for, and the only listing that token resumes. A filter
+        // naming a value no published platform carries narrows the listing to
+        // nothing, which is an empty page rather than a refusal: the request is
+        // well formed and the answer is that no platform matches it.
+        let listing = crate::state::PlatformListing {
+            category: input.category,
+            partner: input.partner,
+            target: input.target,
+        };
+
+        // `nextToken` is this service's own opaque cursor into THIS listing, so
+        // the platform the next page starts at is read back out of the token
+        // rather than taken from it. A value the service never handed out — one
+        // it cannot decode, or one issued for another filter set or another
+        // paginated read — is refused with the modelled 400, whose `code` names
+        // the condition a paginating client resets on, instead of serving a page
+        // out of some other ordering.
+        let resume_at = match input.next_token.as_deref() {
+            Some(token) => match listing.resume_at(token) {
+                Some(resume_at) => Some(resume_at),
+                None => return Err(invalid_next_token()),
+            },
+            None => None,
+        };
+
+        // The one enumeration every page of this listing is cut out of, and
+        // where in it the page starts. A cursor that names no platform OF THIS
+        // listing resumes nothing, so it is refused like any other token the
+        // listing did not hand out rather than answered with an empty page —
+        // which is what the listing says when no platform matches its filters,
+        // and a client must be able to tell the two apart.
+        let enumerated: Vec<&crate::state::SigningPlatformEntry> = listing.platforms().collect();
+        let resume_from = match resume_at.as_deref() {
+            Some(resume_at) => {
+                match enumerated
+                    .iter()
+                    .position(|entry| entry.platform_id == resume_at)
+                {
+                    Some(position) => position,
+                    None => return Err(invalid_next_token()),
+                }
+            }
+            None => 0,
+        };
+
+        let mut platforms = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for entry in enumerated.into_iter().skip(resume_from) {
+            if platforms.len() == page_size {
+                next_token = Some(listing.page_token(entry.platform_id));
+                break;
+            }
+            platforms.push(entry.to_signing_platform());
+        }
+
+        Ok(ListSigningPlatformsOutput {
+            platforms: Some(platforms),
+            next_token,
+        })
     }
 }

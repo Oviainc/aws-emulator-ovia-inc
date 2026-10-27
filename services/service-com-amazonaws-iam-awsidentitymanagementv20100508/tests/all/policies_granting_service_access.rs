@@ -23,7 +23,9 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::user_lifecycle::{account_id, call, call_signed_by, element, error_code, router};
+use crate::user_lifecycle::{
+    account_id, assert_access_denied_message, call, call_signed_by, element, error_code, router,
+};
 
 /// A trust policy every role this suite creates needs. It grants `sts:AssumeRole`,
 /// which is what makes it evidence for the rule: a trust policy is a RESOURCE-based
@@ -790,16 +792,13 @@ async fn the_signed_call_is_decided_against_the_callers_own_policies() {
                     "AccessDenied",
                     "case {case:?}: expected the error code AccessDenied, got {body}"
                 );
-                let expected = format!(
-                    "User: arn:aws:iam::{}:user/{caller} is not authorized to perform: \
-                     {ACTION} on resource: {subject} {reason}",
-                    account_id()
-                );
-                assert_eq!(
-                    element(&body, "Message"),
-                    expected,
-                    "case {case:?}: expected the refusal to name the principal, the action \
-                     and the identity, got {body}"
+                assert_access_denied_message(
+                    case,
+                    &element(&body, "Message"),
+                    &format!("arn:aws:iam::{}:user/{caller}", account_id()),
+                    ACTION,
+                    &subject,
+                    &reason,
                 );
             }
         }

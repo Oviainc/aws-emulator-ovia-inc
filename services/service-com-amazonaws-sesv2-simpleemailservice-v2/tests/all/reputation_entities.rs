@@ -9,15 +9,18 @@
 //!
 //! The rule these cases pin: no request creates a reputation entity — one exists for
 //! each resource whose reputation the service tracks, referenced by that resource's ARN
-//! — and every member of a listed entity is COMPUTED from that resource's record: its
+//! — and every member of a reported entity is COMPUTED from that resource's record: its
 //! customer-managed status record is the status the account last wrote and when it wrote
 //! it, its Amazon-SES-managed record is untouched by that write, and its aggregate
 //! status is `DISABLED` when either record disables sending, `REINSTATED` when either
 //! reinstates it and `ENABLED` otherwise. A listing reports the entities of the account
 //! in the Region the call executes in, ordered by reference, narrowed by every key the
-//! request's filter names and windowed by its `PageSize`/`NextToken`; input outside a
-//! modelled enum, a token this listing never handed out, and a reference naming no
-//! resource the call reaches are each refused `BadRequestException` with nothing stored.
+//! request's filter names and windowed by its `PageSize`/`NextToken`; a read reports the
+//! one entity its reference names, which is the entry a listing of the same call reports
+//! for it. Input outside a modelled enum, a token this listing never handed out, and a
+//! reference naming no resource the call reaches are each refused with nothing stored —
+//! the last one with the error for a missing resource where the operation models one, and
+//! as invalid input where it does not.
 //!
 //! The tables below span what the rule generalises over: the number of tracked
 //! resources (one, several), the form of their names, the Region a resource lives in and
@@ -51,6 +54,8 @@ trait ReputationEntities {
     async fn get_tenant(&self, name: &str) -> Reply;
     async fn list_entities(&self, body: Value) -> Reply;
     async fn list_entities_in(&self, region: &str, body: Value) -> Reply;
+    async fn get_entity(&self, entity_type: &str, reference: &str) -> Reply;
+    async fn get_entity_in(&self, region: &str, entity_type: &str, reference: &str) -> Reply;
     async fn set_customer_managed_status(
         &self,
         entity_type: &str,
@@ -97,6 +102,26 @@ impl ReputationEntities for Ses {
     async fn list_entities_in(&self, region: &str, body: Value) -> Reply {
         self.call_in(region, "POST", "/v2/email/reputation/entities", Some(body))
             .await
+    }
+
+    async fn get_entity(&self, entity_type: &str, reference: &str) -> Reply {
+        self.get_entity_in(DEFAULT_REGION, entity_type, reference)
+            .await
+    }
+
+    async fn get_entity_in(&self, region: &str, entity_type: &str, reference: &str) -> Reply {
+        // `ReputationEntityReference` is a non-greedy `@httpLabel`, so an ARN reaches
+        // the service percent-encoded, the way an SDK escapes a label.
+        self.call_in(
+            region,
+            "GET",
+            &format!(
+                "/v2/email/reputation/entities/{entity_type}/{}",
+                query_escaped(reference)
+            ),
+            None,
+        )
+        .await
     }
 
     async fn set_customer_managed_status(
@@ -849,5 +874,272 @@ async fn a_status_write_outside_the_modelled_input_is_refused_and_stores_nothing
         "ENABLED",
         "case {:?}: a refused write must leave the aggregate status as it was, got {entity:?}",
         "every refused write"
+    );
+}
+
+/// The entity a `GetReputationEntity` reply reported, or `Value::Null` when it reported
+/// none.
+fn read_entity(reply: &Reply) -> Value {
+    reply.member("ReputationEntity")
+}
+
+#[tokio::test]
+async fn a_read_of_one_entity_reports_the_entry_a_listing_of_it_reports() {
+    let ses = Ses::new();
+    // The resources span the documented `TenantName` form — one character, several
+    // characters, every documented character class and the documented 64-character bound
+    // — so the read is exercised over references of differing length and spelling.
+    let longest = format!(
+        "read-{}",
+        "y".repeat(state::MAX_TENANT_NAME_CHARS - "read-".len())
+    );
+    let tracked = tracked_resources(
+        &ses,
+        &["alpha", "b", "Tenant_02-delta", longest.as_str()],
+    )
+    .await;
+
+    // One row per resource, each left in a different `SendingStatus` (including one left
+    // exactly as created, which nothing wrote to): the read must report the status the
+    // account last wrote and the aggregate the two records imply, with the
+    // Amazon-SES-managed record permitting sending throughout.
+    let rows = [
+        ("a resource nobody has acted on", None, "ENABLED", "ENABLED"),
+        (
+            "a resource whose sending was prevented",
+            Some("DISABLED"),
+            "DISABLED",
+            "DISABLED",
+        ),
+        (
+            "a resource whose sending was reinstated",
+            Some("REINSTATED"),
+            "REINSTATED",
+            "REINSTATED",
+        ),
+        (
+            "a resource whose sending was allowed again",
+            Some("ENABLED"),
+            "ENABLED",
+            "ENABLED",
+        ),
+    ];
+
+    for (resource, (case, written, customer, aggregate)) in tracked.iter().zip(rows) {
+        if let Some(status) = written {
+            let updated = ses
+                .set_customer_managed_status(RESOURCE, &resource.reference, status)
+                .await;
+            assert_eq!(
+                updated.status, 200,
+                "case {case:?}: expected HTTP 200 writing the customer-managed status, \
+                 got {}",
+                updated.status
+            );
+        }
+
+        let read = ses.get_entity(RESOURCE, &resource.reference).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected HTTP 200 from GetReputationEntity, got {} {:?}",
+            read.status,
+            read.message()
+        );
+        let entity = read_entity(&read);
+        assert_eq!(
+            member(&entity, "/ReputationEntityReference"),
+            resource.reference,
+            "case {case:?}: the read must report the entity that was asked for, got \
+             {entity:?}"
+        );
+        assert_eq!(
+            member(&entity, "/ReputationEntityType"),
+            RESOURCE,
+            "case {case:?}: every entity is of the one modelled type, got {entity:?}"
+        );
+        assert_eq!(
+            member(&entity, "/CustomerManagedStatus/Status"),
+            customer,
+            "case {case:?}: the read must report the status the account last wrote, got \
+             {entity:?}"
+        );
+        assert_eq!(
+            member(&entity, "/AwsSesManagedStatus/Status"),
+            "ENABLED",
+            "case {case:?}: no finding was raised, so the Amazon-SES-managed status \
+             permits sending, got {entity:?}"
+        );
+        assert_eq!(
+            member(&entity, "/SendingStatusAggregate"),
+            aggregate,
+            "case {case:?}: the aggregate must follow both records, got {entity:?}"
+        );
+        for record in ["/CustomerManagedStatus", "/AwsSesManagedStatus"] {
+            assert!(
+                entity
+                    .pointer(&format!("{record}/LastUpdatedTimestamp"))
+                    .and_then(Value::as_f64)
+                    .is_some(),
+                "case {case:?}: {record} must report when it was last written, got \
+                 {entity:?}"
+            );
+        }
+        // "The reputation impact reflects the highest impact reputation finding for the
+        // entity": with no finding against the entity there is no highest one. No policy
+        // was attached to it either, so it reports none.
+        assert!(
+            entity.pointer("/ReputationImpact").is_none(),
+            "case {case:?}: an entity with no finding reports no impact, got {entity:?}"
+        );
+        assert!(
+            entity.pointer("/ReputationManagementPolicy").is_none(),
+            "case {case:?}: an entity with no policy attached reports none, got {entity:?}"
+        );
+
+        // A read of one entity reports exactly the entry a listing of the same call
+        // reports for it: both are computed from the one resource record.
+        let listed = ses.list_entities(json!({})).await;
+        assert_eq!(
+            entity_for(&listed, &resource.reference),
+            entity,
+            "case {case:?}: the read and the listing must agree, got {:?} then {entity:?}",
+            entity_for(&listed, &resource.reference)
+        );
+
+        // Reporting only: reading changed nothing a later caller sees.
+        let again = ses.get_entity(RESOURCE, &resource.reference).await;
+        assert_eq!(
+            read_entity(&again),
+            entity,
+            "case {case:?}: two reads must agree, got {entity:?} then {:?}",
+            read_entity(&again)
+        );
+    }
+
+    // Every entity is still reported, so no read removed or minted one.
+    let listed = ses.list_entities(json!({})).await;
+    assert_eq!(
+        references(&listed),
+        every_reference(&tracked),
+        "case {:?}: the listing must still report one entity per tracked resource, got \
+         {:?}",
+        "after reading every entity",
+        references(&listed)
+    );
+}
+
+#[tokio::test]
+async fn a_read_of_an_entity_no_call_reaches_is_refused_and_changes_nothing() {
+    let ses = Ses::new();
+    let tracked = tracked_resources(&ses, &["alpha"]).await;
+    let reference = tracked[0].reference.clone();
+
+    // One row per way the reference can name no entity this call reaches: a reference
+    // naming no resource, one that is not a resource ARN at all, one whose ARN names
+    // another account, and one whose ARN names another service. Each is "the resource you
+    // attempted to access doesn't exist", so none of them tells the caller anything about
+    // what exists outside its own scope.
+    for (case, target) in [
+        (
+            "a reference naming no resource this account holds",
+            format!("{reference}-never-created"),
+        ),
+        (
+            "a reference that is not a resource ARN at all",
+            "alpha".to_string(),
+        ),
+        (
+            "a reference whose ARN names another account",
+            reference.replace(ACCOUNT_ID, "999999999999"),
+        ),
+        (
+            "a reference whose ARN names another service",
+            reference.replacen("arn:aws:ses:", "arn:aws:sqs:", 1),
+        ),
+    ] {
+        let refused = ses.get_entity(RESOURCE, &target).await;
+        assert_eq!(
+            refused.status, 404,
+            "case {case:?}: expected HTTP 404 from GetReputationEntity, got {}",
+            refused.status
+        );
+        assert_eq!(
+            refused.error_code(),
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {:?}",
+            refused.error_code()
+        );
+        assert!(
+            refused.message().contains(&target),
+            "case {case:?}: the refusal must name the entity it did not find, got {:?}",
+            refused.message()
+        );
+        assert!(
+            read_entity(&refused).is_null(),
+            "case {case:?}: a refused read reports no entity, got {:?}",
+            read_entity(&refused)
+        );
+    }
+
+    // An entity type outside `ReputationEntityType` is invalid input, not a missing
+    // resource: the model binds `BadRequestException` for it.
+    for (case, entity_type) in [
+        ("an entity type the model does not bind", "TENANT"),
+        ("the modelled entity type in the wrong case", "resource"),
+    ] {
+        let refused = ses.get_entity(entity_type, &reference).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400 from GetReputationEntity, got {}",
+            refused.status
+        );
+        assert_eq!(
+            refused.error_code(),
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {:?}",
+            refused.error_code()
+        );
+        assert!(
+            !refused.message().is_empty(),
+            "case {case:?}: the refusal must say what was wrong with the request, got {:?}",
+            refused.message()
+        );
+    }
+
+    // A read executing in another Region reaches the entity no more than a listing
+    // there does: the resource's Region is the one its reference carries.
+    for (case, elsewhere) in [
+        ("a region in another continent", "eu-west-1"),
+        ("a region with a numbered suffix", "ap-southeast-2"),
+    ] {
+        let away = ses.get_entity_in(elsewhere, RESOURCE, &reference).await;
+        assert_eq!(
+            away.status, 404,
+            "case {case:?}: expected HTTP 404 reading from {elsewhere:?}, got {}",
+            away.status
+        );
+        assert_eq!(
+            away.error_code(),
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {:?}",
+            away.error_code()
+        );
+    }
+
+    // Not one of the refused reads touched the entity it failed to reach.
+    let read = ses.get_entity(RESOURCE, &reference).await;
+    let entity = read_entity(&read);
+    assert_eq!(
+        member(&entity, "/CustomerManagedStatus/Status"),
+        "ENABLED",
+        "case {:?}: a refused read must leave the entity as it was, got {entity:?}",
+        "every refused read"
+    );
+    assert_eq!(
+        references(&ses.list_entities(json!({})).await),
+        every_reference(&tracked),
+        "case {:?}: a refused read must mint no entity, got {:?}",
+        "every refused read",
+        references(&ses.list_entities(json!({})).await)
     );
 }

@@ -39,8 +39,9 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_kms_trentservice::state::{
-    mint_custom_key_store_id, mint_material, random_bytes, service_state, CloudHsmCluster,
-    CustomKeyStore, CustomKeyStoreBacking, KeyMaterial, MaterialKind, XksProxy,
+    key_spec_profile, mint_custom_key_store_id, mint_material, random_bytes, service_state,
+    CloudHsmCluster, CustomKeyStore, CustomKeyStoreBacking, KeyMaterial, MaterialKind, XksProxy,
+    KEY_SPEC_SYMMETRIC_DEFAULT,
 };
 
 use super::harness::{
@@ -934,8 +935,10 @@ fn seed_imported_material(engine: &Arc<engine::InMemoryEngine>, key_id: &str) ->
     let key = state
         .key_mut_in(REGION, key_id)
         .expect("the key is held");
-    let material =
-        mint_material(MaterialKind::Aes256).expect("the platform produces entropy for key material");
+    let material = mint_material(
+        key_spec_profile(KEY_SPEC_SYMMETRIC_DEFAULT).expect("the default key spec has a profile"),
+    )
+    .expect("the platform produces entropy for key material");
     let key_material_id = material.id().expect("symmetric key material carries an id");
     key.material = material;
     key.current_key_material_id = Some(key_material_id.clone());

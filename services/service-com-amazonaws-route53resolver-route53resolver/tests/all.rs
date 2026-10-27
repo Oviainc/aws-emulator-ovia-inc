@@ -45,6 +45,8 @@ mod resolver_endpoints;
 mod resolver_query_log_configs;
 #[path = "all/resolver_rule_association_listing.rs"]
 mod resolver_rule_association_listing;
+#[path = "all/resolver_rule_delete_identity.rs"]
+mod resolver_rule_delete_identity;
 #[path = "all/resolver_rule_deletion.rs"]
 mod resolver_rule_deletion;
 #[path = "all/resolver_rule_disassociation.rs"]

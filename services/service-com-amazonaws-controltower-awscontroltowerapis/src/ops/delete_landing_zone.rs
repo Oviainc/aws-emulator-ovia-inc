@@ -7,6 +7,11 @@
 //! zone's removal for that entry's due instant, returning its `operationIdentifier`. The
 //! landing zone stays a reportable resource, `PROCESSING`, until the removal is due.
 //!
+//! The operation carries `@idempotent`, so a repeat of the call while the
+//! decommissioning it started is still in flight reports that same
+//! `operationIdentifier`; only a DIFFERENT operation in flight against the landing zone
+//! is refused with `ConflictException`.
+//!
 //! Implemented: this operation no longer answers HTTP 501.
 //!
 //! ## Shape of an operation
@@ -199,8 +204,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Deleting a landing zone whose own asynchronous operation has not finished would
-        // leave it in an inconsistent state, which is what `ConflictException` reports.
+        // `@idempotent`: a `DELETE` already decommissioning this landing zone IS this
+        // request's work, so repeating the call reports that same operation rather than
+        // starting a second teardown or refusing. The identifier comes from the parked
+        // removal, so a retry reports the identifier its first call produced.
+        if let Some(in_flight) = store.deletion_in_flight_on(&arn) {
+            return Ok(DeleteLandingZoneOutput {
+                operation_identifier: in_flight,
+            });
+        }
+
+        // Any OTHER operation still changing this landing zone would be left half applied
+        // by a decommissioning starting now, which is what `ConflictException` reports.
         if store.has_operation_in_flight(&arn) {
             return Err(DeleteLandingZoneErrorModeled::ConflictException(
                 ConflictException {

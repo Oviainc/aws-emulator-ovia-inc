@@ -3891,6 +3891,10 @@ pub const LISTING_EXPERIMENT_RUN_EVENTS: &str = "ListExperimentRunEvents";
 /// listing cannot resume this one. See [`paginate`].
 pub const LISTING_EXPERIMENT_RUNS: &str = "ListExperimentRuns";
 
+/// The `kind` a `ListExperimentDefinitions` cursor is stamped with, so a token minted by
+/// another listing cannot resume this one. See [`paginate`].
+pub const LISTING_EXPERIMENT_DEFINITIONS: &str = "ListExperimentDefinitions";
+
 /// The sort key of a resource numbered within its parent, built so that ASCENDING key
 /// order is DESCENDING number order: this service lists a parent's numbered children
 /// newest first, and [`paginate`] walks its input in ascending key order.

@@ -362,6 +362,16 @@ async fn a_second_create_for_a_held_url_is_refused_and_changes_nothing() {
             "case {:?}: expected EntityAlreadyExists, got {body}",
             case.url
         );
+        // The same template the SAML provider create uses, over the attribute that
+        // identifies THIS kind of provider: `Provider with `, the attribute, the value
+        // the request supplied and ` already exists.`, with no provider type in it.
+        assert_eq!(
+            element(&body, "Message"),
+            format!("Provider with url {} already exists.", case.url),
+            "case {:?}: expected AWS's duplicate-provider wording, got {:?}",
+            case.url,
+            element(&body, "Message")
+        );
 
         let read_params = vec![param("OpenIDConnectProviderArn", &arn)];
         let (status, read) =

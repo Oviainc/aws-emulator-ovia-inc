@@ -26,7 +26,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::role_lifecycle::{borrowed, param, reported_tags};
 use crate::role_tags::{with_tag_params, TRUST_POLICY};
-use crate::user_lifecycle::{account_id, call, call_signed_by, element, elements, error_code, router};
+use crate::user_lifecycle::{
+    account_id, assert_access_denied_message, call, call_signed_by, element, elements, error_code,
+    router,
+};
 
 /// One role's tag set, as the create that persists it carries it.
 #[derive(Debug, Clone)]
@@ -757,24 +760,21 @@ async fn a_signed_listing_is_decided_against_the_callers_policies() {
                 );
                 // The message is built from the request: the principal that signed it, the
                 // action it named, the role it addressed — named as the request named it,
-                // not by ARN — and which of the two refusals this is.
+                // not by ARN — which of the two refusals this is, and where this one
+                // denial's authorization details are readable.
                 let reason = if case.expect == Expect::ExplicitDeny {
                     "with an explicit deny in an identity-based policy".to_string()
                 } else {
                     "because no identity-based policy allows the iam:ListRoleTags action"
                         .to_string()
                 };
-                let expected = format!(
-                    "User: {user_prefix}{user_name} is not authorized to perform: \
-                     iam:ListRoleTags on resource: role {role_name} {reason}"
-                );
-                assert_eq!(
-                    element(&body, "Message"),
-                    expected,
-                    "case {:?}: expected the refusal to name the principal, action and \
-                     role, got {:?}",
+                assert_access_denied_message(
                     case.case,
-                    element(&body, "Message")
+                    &element(&body, "Message"),
+                    &format!("{user_prefix}{user_name}"),
+                    "iam:ListRoleTags",
+                    &format!("role {role_name}"),
+                    &reason,
                 );
             }
         }

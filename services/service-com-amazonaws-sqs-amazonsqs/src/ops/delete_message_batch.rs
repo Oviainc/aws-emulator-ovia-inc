@@ -289,8 +289,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // handle whose message a delete has ALREADY removed names a deletion this
             // queue has performed, so this entry asks for nothing more and succeeds —
             // which is what makes two entries naming the SAME handle both successful.
-            // Anything else — a superseded handle, or a value no queue ever minted — is
-            // invalid, and invalid for THAT ENTRY alone.
+            // Anything else — a superseded handle, a handle of another queue or of an
+            // incarnation that is gone, or a value no receive ever minted — fails for
+            // THAT ENTRY alone, under the code the handle earns.
             match queue.handles.get(&entry.receipt_handle).cloned() {
                 Some(message_id) => {
                     // The message goes for good, so the lapsing visibility timeout
@@ -306,22 +307,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         id: entry.id.clone(),
                     });
                 }
-                None => failed.push(BatchResultErrorEntry {
-                    id: entry.id.clone(),
-                    // The caller supplied the handle, so the fault is the sender's.
-                    sender_fault: true,
-                    code: RECEIPT_HANDLE_IS_INVALID.to_string(),
-                    message: sqs::receipt_handle_is_invalid(origin).message,
-                }),
+                None => {
+                    let (code, message) = sqs::unresolvable_receipt_handle_batch_failure(origin);
+                    failed.push(BatchResultErrorEntry {
+                        id: entry.id.clone(),
+                        // The caller supplied the handle, so the fault is the sender's.
+                        sender_fault: true,
+                        code: code.to_string(),
+                        message,
+                    });
+                }
             }
         }
 
         Ok(DeleteMessageBatchOutput { successful, failed })
     }
 }
-
-/// The per-entry error code for a receipt handle this queue does not hold: the name of
-/// the modelled error `DeleteMessage` answers for the same condition
-/// (`com.amazonaws.sqs#ReceiptHandleIsInvalid`), which is what AWS reports in a batch
-/// result entry's `Code`.
-const RECEIPT_HANDLE_IS_INVALID: &str = "ReceiptHandleIsInvalid";

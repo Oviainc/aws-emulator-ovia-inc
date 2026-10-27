@@ -1414,6 +1414,23 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             .map(|pending| pending.operation_identifier.clone())
     }
 
+    /// The `operationIdentifier` of the `DELETE` still decommissioning the landing zone
+    /// `arn` names, or `None` when that landing zone is not being decommissioned. Call
+    /// [`settle`] first.
+    ///
+    /// Read off the parked removal rather than the operation log, for the same reason
+    /// `settle` derives the status from it: `enforce_log_bound` can evict the `DELETE`
+    /// record while the removal the clock owes is still parked, and the identifier a
+    /// repeated delete reports must be the one that removal carries.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn deletion_in_flight_on(&self, arn: &str) -> Option<String> {
+        self.landing_zones
+            .get(arn)
+            .and_then(|landing_zone| landing_zone.pending_deletion.as_ref())
+            .map(|pending| pending.operation_identifier.clone())
+    }
+
     /// Start a `DELETE` against the landing zone `arn` names, parking its removal for
     /// [`settle`] to apply once the clock makes it due, and return the operation's
     /// `operationIdentifier`.

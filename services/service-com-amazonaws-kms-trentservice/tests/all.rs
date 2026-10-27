@@ -65,6 +65,8 @@ mod list_key_rotations_reads;
 mod list_resource_tags_reads;
 #[path = "all/multi_region_primary.rs"]
 mod multi_region_primary;
+#[path = "all/public_key.rs"]
+mod public_key;
 #[path = "all/re_encrypt.rs"]
 mod re_encrypt;
 #[path = "all/replicate_key.rs"]

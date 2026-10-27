@@ -30,7 +30,13 @@ pub const STATUS_REGISTERED: &str = "REGISTERED";
 pub const STATUS_DEREGISTERING: &str = "DEREGISTERING";
 /// The status a product user carries while its subscription is active.
 pub const STATUS_SUBSCRIBED: &str = "SUBSCRIBED";
-/// The status returned by `StopProductSubscription` for the subscription it ended.
+/// The status a product user carries from the moment `StopProductSubscription` accepted
+/// the end of its subscription until the teardown that status announces completes.
+///
+/// Non-terminal: the subscription is REPORTED in it — that is what the status, and the
+/// `SubscriptionEndDate` reported beside it, are for — while it is being torn down, and it
+/// stops being reported when the teardown falls due; see [`UNSUBSCRIPTION_SPAN`] and
+/// [`begin_product_user_unsubscription`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::begin_product_user_unsubscription).
 pub const STATUS_UNSUBSCRIBED: &str = "UNSUBSCRIBED";
 /// The status a user association carries while the instance is being configured.
 pub const STATUS_ASSOCIATING: &str = "ASSOCIATING";
@@ -86,6 +92,20 @@ pub const HEALTH_STATUS_NOT_APPLICABLE: &str = "NOT_APPLICABLE";
 /// associated again until the teardown has completed.
 pub fn disassociation_started(status: &str) -> bool {
     status == STATUS_DISASSOCIATING
+}
+
+/// Whether `status` is a status a product user carries because the end of its subscription
+/// was accepted.
+///
+/// A subscription in it is still REPORTED — `ListProductSubscriptions` keeps reporting it,
+/// carrying this status and its end date, so a client polling the list observes the
+/// subscription ending — but it is no longer a LIVE subscription: it resolves for no
+/// operation that acts on a subscription, it is not taggable
+/// ([`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::holds_resource`]),
+/// and the `(IdentityProviderArn, product, username)` triple it occupies cannot be
+/// subscribed again until the teardown has completed.
+pub fn unsubscribe_started(status: &str) -> bool {
+    status == STATUS_UNSUBSCRIBED
 }
 
 /// Whether `status` is a registration status a record carries because its deregistration
@@ -167,6 +187,15 @@ const ENDPOINT_DELETION_SPAN: Duration = Duration::from_millis(500);
 /// straight away still observes that status, and a later read materialises the removal the
 /// clock already owed.
 const DEREGISTRATION_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after `StopProductSubscription` the teardown the `UNSUBSCRIBED` status
+/// announces completes — the instant the subscription stops being reported.
+///
+/// A chosen span, on the same footing as [`DEREGISTRATION_SPAN`]: AWS documents no duration
+/// for it, the call answers with the subscription already ended rather than removed, and
+/// the span is inside the emulator's 250-750 ms window so a caller that lists straight
+/// back still observes the ended subscription instead of it vanishing between two reads.
+const UNSUBSCRIPTION_SPAN: Duration = Duration::from_millis(500);
 
 /// How long the license a license server endpoint issues for a product subscription is
 /// valid: the term counted from the instant the subscription started.
@@ -501,7 +530,10 @@ pub struct ProductUserRecord {
     pub product: String,
     /// The ARN of the identity provider this user was resolved through.
     pub identity_provider_arn: String,
-    /// `SUBSCRIBED` while the subscription is active.
+    /// `SUBSCRIBED` while the subscription is active; [`STATUS_UNSUBSCRIBED`] from the
+    /// moment `StopProductSubscription` accepted the end of the subscription until
+    /// [`UNSUBSCRIPTION_SPAN`] has elapsed, at which point the record stops being reported
+    /// altogether (the model gives the status no terminal counterpart).
     pub status: String,
     /// Set only when the service has something to report; never fabricated.
     pub status_message: Option<String>,
@@ -511,8 +543,11 @@ pub struct ProductUserRecord {
     /// license-based subscription is counted from (see
     /// [`license_expiration_date`](ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::license_expiration_date)).
     pub subscribed_at: SystemTime,
-    /// When the subscription ended, once it has.
+    /// When the subscription ended, once it has — what `SubscriptionEndDate` reports.
     pub unsubscribed_at: Option<SystemTime>,
+    /// When the teardown the `UNSUBSCRIBED` status announces completes and the record stops
+    /// being reported, or `None` while the subscription is still live.
+    pub unsubscribed_due_at: Option<SystemTime>,
 }
 
 /// A user association to an EC2 instance, as `AssociateUser` stored it.
@@ -779,7 +814,8 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// deregistration was accepted has finished tearing down and stops being reported, a
     /// user association whose [`ASSOCIATION_SPAN`] has elapsed becomes `ASSOCIATED`, one
     /// whose disassociation was accepted [`DISASSOCIATION_SPAN`] ago has finished tearing
-    /// down and stops being reported, and a
+    /// down and stops being reported, a product user whose subscription was ended
+    /// [`UNSUBSCRIPTION_SPAN`] ago has finished tearing down and stops being reported, and a
     /// license server endpoint whose [`ENDPOINT_PROVISIONING_SPAN`] has elapsed becomes
     /// `PROVISIONED`, and one whose deletion was accepted [`ENDPOINT_DELETION_SPAN`] ago
     /// reaches the terminal `DELETED`. Reporting operations call this so a read reflects
@@ -848,6 +884,23 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
                 }
             }
         }
+        // The product subscriptions whose teardown the clock has made due, collected while
+        // the records are borrowed and dropped once the sweep is over.
+        let mut unsubscribed: Vec<String> = Vec::new();
+        for record in self.product_users.values() {
+            if !unsubscribe_started(&record.status) {
+                continue;
+            }
+            // The teardown the clock owes: a subscription that was ended has finished being
+            // torn down once its span has elapsed, whether or not anybody called.
+            if let Some(due_at) = record.unsubscribed_due_at {
+                if now >= due_at {
+                    unsubscribed.push(record.arn.clone());
+                } else {
+                    still_pending(due_at, &mut next);
+                }
+            }
+        }
         for record in self.license_server_endpoints.values_mut() {
             if record.provisioning_status == PROVISIONING_STATUS_PROVISIONING {
                 if now >= record.provisioned_due_at {
@@ -898,6 +951,11 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         // batch, so however many fell due together the work stays linear in what the
         // store holds.
         self.drop_instance_users(&torn_down, now);
+
+        // The same for an ended product subscription: the teardown the clock owed is what
+        // finally stops reporting it and frees the triple it occupied. Dropped in ONE batch
+        // for the same reason.
+        self.drop_product_users(&unsubscribed);
     }
 
     /// Record that a stored resource owes the clock a status transition at `due_at`.
@@ -985,6 +1043,15 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         self.identity_providers
             .get(arn)
             .filter(|record| !deregistration_started(&record.status))
+    }
+
+    /// The product user `arn` names, when it names a subscription this account can still
+    /// act on: one whose end was accepted resolves for nothing, exactly as one that is
+    /// gone, even though it is still reported while its teardown runs.
+    pub fn live_product_user(&self, arn: &str) -> Option<&ProductUserRecord> {
+        self.product_users
+            .get(arn)
+            .filter(|record| !unsubscribe_started(&record.status))
     }
 
     /// The user associations of one identity provider on one EC2 instance, in association
@@ -1373,11 +1440,15 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// reported in its `DELETING`/`DELETED` status, but it is on its way out and carries
     /// no tags any more, so the tagging surface resolves it exactly as it resolves an
     /// endpoint that is gone. A user association whose disassociation was accepted
-    /// ([`disassociation_started`]), and a registration whose deregistration was accepted,
-    /// are on their way out in exactly the same sense, so neither is one either.
+    /// ([`disassociation_started`]), a product subscription whose end was accepted
+    /// ([`unsubscribe_started`]), and a registration whose deregistration was accepted,
+    /// are on their way out in exactly the same sense, so none is one either.
     pub fn holds_resource(&self, arn: &str) -> bool {
         self.live_identity_provider(arn).is_some()
-            || self.product_users.contains_key(arn)
+            || self
+                .product_users
+                .get(arn)
+                .is_some_and(|record| !unsubscribe_started(&record.status))
             || self
                 .instance_users
                 .get(arn)
@@ -1798,6 +1869,11 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     ///
     /// `ValidationException` when neither addressing is complete, `ResourceNotFoundException`
     /// when no such subscription is in state.
+    ///
+    /// Only a LIVE subscription resolves: one whose end was already accepted is still
+    /// REPORTED in its ended status ([`unsubscribe_started`]), but it is on its way out, so
+    /// an operation that acts on a subscription is told the identifier names no
+    /// subscription exactly as it is once the record is gone.
     pub fn resolve_product_user(
         &self,
         product_user_arn: Option<&str>,
@@ -1807,7 +1883,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         domain: Option<&str>,
     ) -> Result<&ProductUserRecord, StateError> {
         let record = if let Some(arn) = product_user_arn {
-            self.product_users.get(arn).ok_or_else(|| {
+            self.live_product_user(arn).ok_or_else(|| {
                 StateError::NotFound(format!("product user {arn} has no subscription"))
             })?
         } else {
@@ -1834,7 +1910,7 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
                         "user {username} has no subscription to product {product}"
                     ))
                 })?;
-            self.product_users.get(arn).ok_or_else(|| {
+            self.live_product_user(arn).ok_or_else(|| {
                 StateError::NotFound(format!("product user {arn} has no subscription"))
             })?
         };
@@ -1990,12 +2066,79 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     }
 
     /// Remove one product user from the store and from every index that reaches it.
+    ///
+    /// This is the FINAL drop, which stops reporting the subscription altogether and frees
+    /// the `(IdentityProviderArn, product, username)` triple it occupied; an end of
+    /// subscription the caller asked for goes through
+    /// [`begin_product_user_unsubscription`](Self::begin_product_user_unsubscription)
+    /// instead, so the ended subscription stays observable until the teardown the clock
+    /// owes completes.
     pub fn remove_product_user(&mut self, arn: &str) -> Option<ProductUserRecord> {
-        let record = self.product_users.remove(arn)?;
-        self.product_user_order.retain(|a| a != arn);
-        self.product_user_index.retain(|_, indexed| indexed != arn);
-        self.tags.remove(arn);
+        let record = self.product_users.get(arn)?.clone();
+        self.drop_product_users(std::slice::from_ref(&record.arn));
         Some(record)
+    }
+
+    /// Drop the product users `arns` names from the store and from every index that reaches
+    /// them.
+    ///
+    /// Batched on purpose: the subscription ORDER and the triple index are each rebuilt in
+    /// ONE pass however many subscriptions are dropped together, so a request that finds
+    /// several teardowns due does not pay a scan of either list per record with the
+    /// service-state lock held.
+    fn drop_product_users(&mut self, arns: &[String]) {
+        let mut dropped: HashSet<String> = HashSet::new();
+        for arn in arns {
+            if self.product_users.remove(arn).is_some() {
+                self.tags.remove(arn);
+                dropped.insert(arn.clone());
+            }
+        }
+        if dropped.is_empty() {
+            return;
+        }
+        self.product_user_order.retain(|arn| !dropped.contains(arn));
+        self.product_user_index
+            .retain(|_, indexed| !dropped.contains(indexed));
+    }
+
+    /// Accept the end of one product user's subscription: it enters [`STATUS_UNSUBSCRIBED`]
+    /// now, reports the instant it ended, and owes the clock the completion of its teardown
+    /// at [`UNSUBSCRIPTION_SPAN`], which is what finally stops reporting it.
+    ///
+    /// Ending a user-based subscription is a teardown the service REPORTS while it runs, so
+    /// the record is NOT dropped here: a client polling `ListProductSubscriptions` keeps
+    /// seeing the subscription in its ended status, with the end date the stop stamped,
+    /// instead of it vanishing between two reads. The
+    /// `(IdentityProviderArn, product, username)` index entry is KEPT, because that triple
+    /// is still occupied: the user's subscription to that product is still being torn down,
+    /// so it cannot be subscribed again until the teardown has completed. What the end of
+    /// the subscription does take away immediately is what made it a LIVE subscription: its
+    /// tags, so the tagging surface no longer resolves it (see
+    /// [`holds_resource`](Self::holds_resource)).
+    ///
+    /// Returns the record as the end left it (`UNSUBSCRIBED`), or `None` when the ARN names
+    /// no stored subscription. A subscription whose end was ALREADY accepted is returned
+    /// unchanged, so a repeat neither restarts the teardown nor re-stamps the instant the
+    /// subscription ended.
+    pub fn begin_product_user_unsubscription(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<ProductUserRecord> {
+        let record = self.product_users.get_mut(arn)?;
+        if unsubscribe_started(&record.status) {
+            return Some(record.clone());
+        }
+        record.status = STATUS_UNSUBSCRIBED.to_string();
+        record.unsubscribed_at = Some(now);
+        let due_at = now + UNSUBSCRIPTION_SPAN;
+        record.unsubscribed_due_at = Some(due_at);
+        let ended = record.clone();
+        self.tags.remove(arn);
+        // The teardown the clock now owes, which is what stops reporting the subscription.
+        self.schedule_transition(due_at);
+        Some(ended)
     }
 }
 

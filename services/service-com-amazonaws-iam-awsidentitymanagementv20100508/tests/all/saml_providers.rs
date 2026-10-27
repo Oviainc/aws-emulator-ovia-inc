@@ -501,6 +501,18 @@ async fn a_second_create_for_a_held_name_is_refused_and_changes_nothing() {
             "case {:?}: expected EntityAlreadyExists, got {body}",
             case.name
         );
+        // The refusal names the identity that collided and nothing else: IAM's fixed
+        // text is `Provider with name ` and ` already exists.` around the `Name` the
+        // request supplied, with no provider TYPE in it — the same template
+        // `CreateOpenIDConnectProvider` uses for the attribute that identifies one of
+        // those (pinned by `tests/all/open_id_connect_providers.rs`).
+        assert_eq!(
+            element(&body, "Message"),
+            format!("Provider with name {} already exists.", case.name),
+            "case {:?}: expected AWS's duplicate-provider wording, got {:?}",
+            case.name,
+            element(&body, "Message")
+        );
 
         let read_params = vec![param("SAMLProviderArn", &arn)];
         let (status, read) = call(&router, "GetSAMLProvider", &borrowed(&read_params)).await;
