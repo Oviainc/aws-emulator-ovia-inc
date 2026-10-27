@@ -33,6 +33,8 @@ mod caller_reference_immutable;
 mod connection_function_code;
 #[path = "all/connection_function_lifecycle.rs"]
 mod connection_function_lifecycle;
+#[path = "all/connection_function_list.rs"]
+mod connection_function_list;
 #[path = "all/connection_function_publish.rs"]
 mod connection_function_publish;
 #[path = "all/connection_group_by_routing_endpoint.rs"]

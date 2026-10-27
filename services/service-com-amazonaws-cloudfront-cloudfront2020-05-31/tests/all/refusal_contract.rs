@@ -11,12 +11,12 @@
 //!   which is a property of the store rather than of the identifier submitted, so the same
 //!   sentence answers every identifier — whatever its form, and whichever operation of the
 //!   resource asked;
-//! * a value outside the value set of an enum the model declares for a member of the
-//!   request's DOCUMENT is an argument the operation cannot take, so it is refused with the
-//!   error the operation models for one (`InvalidArgument`, 400) — never with a code this
-//!   service's model declares nowhere. The same value in a QUERY PARAMETER keeps the code
-//!   the recorded contract pins for that binding (`MalformedXML`), so the two bindings stay
-//!   distinguishable.
+//! * a value outside the value set of an enum the model declares is no value of that member
+//!   at all: the value set is part of the schema this API publishes for the request, so the
+//!   request is one the service cannot read and is refused with the code the recorded
+//!   contract pins for that (`MalformedXML`, 400) — never with a code this service's model
+//!   declares nowhere — whichever BINDING carried the value, a member of the request's
+//!   document or a query parameter.
 //!
 //! The rows differ along what each rule generalises over: for the first, the operation
 //! asked (five of them, over four resource kinds and three error codes) and the form of the
@@ -420,9 +420,9 @@ fn inadmissible(admitted: &str) -> Vec<(String, String)> {
     ]
 }
 
-/// Assert one refusal is the modelled one for an argument the operation cannot take, and
-/// that its sentence still states the member and the value set that member broke.
-fn assert_invalid_argument(case: &str, value: &str, answer: &Answer, member: &str, values: &str) {
+/// Assert one refusal is the one this service answers a request whose schema it cannot read,
+/// and that its sentence still states the member and the value set that member broke.
+fn assert_malformed_xml(case: &str, value: &str, answer: &Answer, member: &str, values: &str) {
     assert_eq!(
         answer.status, 400,
         "case {case} ({value:?}): expected HTTP 400, got {} ({})",
@@ -430,8 +430,8 @@ fn assert_invalid_argument(case: &str, value: &str, answer: &Answer, member: &st
     );
     assert_eq!(
         answer.error_code(),
-        "InvalidArgument",
-        "case {case} ({value:?}): expected InvalidArgument, got {:?} ({})",
+        "MalformedXML",
+        "case {case} ({value:?}): expected MalformedXML, got {:?} ({})",
         answer.error_code(),
         answer.raw
     );
@@ -450,7 +450,7 @@ fn assert_invalid_argument(case: &str, value: &str, answer: &Answer, member: &st
 }
 
 #[tokio::test]
-async fn a_value_outside_a_modelled_enum_in_the_document_is_an_invalid_argument() {
+async fn a_value_outside_a_modelled_enum_is_a_request_that_cannot_be_read() {
     let router = emulator();
     let (list_id, etag) = anycast_ip_list(&router, "refusal-contract-enum").await;
 
@@ -463,7 +463,7 @@ async fn a_value_outside_a_modelled_enum_in_the_document_is_an_invalid_argument(
         // list, under a version token that IS the list's current one, so nothing but the
         // enum can be what the request is refused over.
         let answer = update_anycast_ip_list(&router, &list_id, &etag, &value).await;
-        assert_invalid_argument(
+        assert_malformed_xml(
             &format!("UpdateAnycastIpList/{case}"),
             &value,
             &answer,
@@ -485,7 +485,7 @@ async fn a_value_outside_a_modelled_enum_in_the_document_is_an_invalid_argument(
             &format!("<IpAddressType>{value}</IpAddressType></CreateAnycastIpListRequest>"),
         );
         let answer = create_anycast_ip_list(&router, &body).await;
-        assert_invalid_argument(
+        assert_malformed_xml(
             &format!("CreateAnycastIpList/{case}"),
             &value,
             &answer,
@@ -501,7 +501,7 @@ async fn a_value_outside_a_modelled_enum_in_the_document_is_an_invalid_argument(
     for (case, value) in inadmissible("sigv4") {
         let answer =
             create_origin_access_control(&router, "refusal-contract-oac", &value, "s3").await;
-        assert_invalid_argument(
+        assert_malformed_xml(
             &format!("CreateOriginAccessControl/SigningProtocol/{case}"),
             &value,
             &answer,
@@ -512,7 +512,7 @@ async fn a_value_outside_a_modelled_enum_in_the_document_is_an_invalid_argument(
     for (case, value) in inadmissible("s3") {
         let answer =
             create_origin_access_control(&router, "refusal-contract-oac", "sigv4", &value).await;
-        assert_invalid_argument(
+        assert_malformed_xml(
             &format!("CreateOriginAccessControl/OriginType/{case}"),
             &value,
             &answer,
@@ -521,14 +521,15 @@ async fn a_value_outside_a_modelled_enum_in_the_document_is_an_invalid_argument(
         );
     }
 
-    // The control for the OTHER binding: the recorded contract pins an enum-constrained
-    // QUERY PARAMETER to its own code, which the document rule above must not swallow.
+    // The OTHER binding: a value outside the same kind of value set, carried by a query
+    // parameter instead of a document, is the same refusal — the binding does not change
+    // which schema the request broke.
     let refused_query = list_cache_policies_by_type(&router, "not-a-policy-type").await;
     assert_eq!(
         refused_query.error_code(),
         "MalformedXML",
-        "case ListCachePolicies/Type: expected the query-parameter binding to keep its own \
-         code, got {:?} ({})",
+        "case ListCachePolicies/Type: expected the query-parameter binding to be refused the \
+         same way, got {:?} ({})",
         refused_query.error_code(),
         refused_query.raw
     );
