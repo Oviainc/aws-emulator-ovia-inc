@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDeploymentPatternVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDeploymentPatternVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDeploymentPatternVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the versions ONE deployment pattern of the seeded catalogue in
+//! [`crate::state`] publishes, narrowed by the filters the request carries. This is the
+//! ONLY file to touch for this operation.
+//!
+//! A 501 from this operation would mean "nobody has written it yet"; this operation is
+//! implemented, so it answers no 501 — an absent workload or pattern is the modelled
+//! `ResourceNotFoundException`, and an unusable filter or page token the modelled
+//! `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +154,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDeploymentPatternVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDeploymentPatternVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let filters = input.filters.unwrap_or_default();
+        // The request is judged BEFORE the store is reached, so no request-sized work
+        // happens while the shared state lock is held.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDeploymentPatternVersions"))
+        // A filter is a name-and-values PAIR, so a filter that names no value to match
+        // is refused rather than dropped — dropping it answers a BROADER result set
+        // than the caller asked for, with nothing on the wire to say so. Both halves
+        // are `@required`, so a null half never reaches here; what the model cannot
+        // express is that `values` has to name at least one value.
+        if let Some(message) = crate::state::filter_pair_refusal(
+            "filters",
+            filters
+                .iter()
+                .map(|filter| (Some(filter.name.as_str()), Some(filter.values.len()))),
+        ) {
+            return Err(ListDeploymentPatternVersionsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        for filter in &filters {
+            // Belt and braces: the boundary refuses a name outside the modelled enum,
+            // so this loop only guards against a key this handler cannot read reaching
+            // it — which must be a refusal, never a filter that quietly selects
+            // everything.
+            let name = filter.name.as_str();
+            if !DEPLOYMENT_PATTERN_VERSION_FILTER_KEY_VALUES.contains(&name) {
+                return Err(ListDeploymentPatternVersionsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "'{name}' is not a supported filter name; supported names are {}.",
+                            DEPLOYMENT_PATTERN_VERSION_FILTER_KEY_VALUES.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDeploymentPatternVersionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Launch Wizard state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // `@readonly`: a page is a pure read of the seeded catalogue. The workload and
+        // the pattern are resolved in the order they scope each other, so a name the
+        // catalogue does not hold is a 404 rather than an empty list — an empty list
+        // means "this pattern publishes no version the filters select". Both messages
+        // are the fixed, identifier-free ones a catalogue lookup carries, so a caller
+        // cannot probe the catalogue through the error channel.
+        let summaries: Vec<DeploymentPatternVersionDataSummary> = {
+            let store = state.lock();
+            let Some(workload) = store.workloads.get(&input.workload_name) else {
+                return Err(
+                    ListDeploymentPatternVersionsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::WORKLOAD_NOT_FOUND_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let Some(pattern) = workload.patterns.get(&input.deployment_pattern_name) else {
+                return Err(
+                    ListDeploymentPatternVersionsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(
+                                crate::state::DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // The versions this pattern publishes, oldest first, in the projection the
+            // single-version read reports from — so a version a page carries reads
+            // exactly as `GetDeploymentPatternVersion` reports it. Every filter has to
+            // hold (AND), as narrowing a result set by two criteria means.
+            pattern
+                .version_summaries()
+                .into_iter()
+                .filter(|summary| {
+                    let version = summary
+                        .deployment_pattern_version_name
+                        .as_deref()
+                        .unwrap_or_default();
+                    filters
+                        .iter()
+                        .all(|filter| matches_filter(pattern, version, filter))
+                })
+                .collect()
+        };
+
+        let (page, next_token) = crate::state::paginate(
+            summaries,
+            input.max_results,
+            input.next_token.as_deref(),
+            |summary| {
+                summary
+                    .deployment_pattern_version_name
+                    .clone()
+                    .unwrap_or_default()
+            },
+        )
+        .map_err(|message| {
+            ListDeploymentPatternVersionsErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+
+        Ok(ListDeploymentPatternVersionsOutput {
+            deployment_pattern_versions: Some(page),
+            next_token,
+        })
     }
+}
+
+/// The `DeploymentPatternVersionFilterKey` member the model declares — the one entry of
+/// `DEPLOYMENT_PATTERN_VERSION_FILTER_KEY_VALUES`.
+const UPDATE_FROM_VERSION: &str = "updateFromVersion";
+
+/// Whether the version named `version` of `pattern` satisfies one
+/// `DeploymentPatternVersionFilter`.
+///
+/// `updateFromVersion` names the version an update would START from, and its values are
+/// version numbers (`DeploymentPatternVersionFilterValue` is
+/// `^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$`), so the filter selects the versions an
+/// update can move a deployment onto from one of the versions it names — the rule
+/// `crate::state::DeploymentPattern::is_update_target` states, which is the same rule
+/// `UpdateDeployment` applies when it moves a deployment onto a version. Several values
+/// on one filter are joined with OR, as this service documents for a filter's values
+/// ("If you specify multiple values for a filter, the values are joined with an `OR`",
+/// `DeploymentFilter$values`), so a value naming a version this pattern does not publish
+/// contributes nothing rather than widening the page to everything.
+fn matches_filter(
+    pattern: &crate::state::DeploymentPattern,
+    version: &str,
+    filter: &DeploymentPatternVersionFilter,
+) -> bool {
+    if filter.name.as_str() != UPDATE_FROM_VERSION {
+        // Unreachable for a request this handler served: a filter naming no supported
+        // key is refused above, and a key this arm does not read would select
+        // everything, which is what a filter must never do.
+        return false;
+    }
+    filter
+        .values
+        .iter()
+        .any(|from| pattern.is_update_target(from, version))
 }

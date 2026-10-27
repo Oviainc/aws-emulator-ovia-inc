@@ -105,9 +105,10 @@ async fn write_batch(emulator: &Emulator, case: &str, stream: &str, entries: Vec
             &json!({"StreamName": stream, "Records": entries}),
         )
         .await;
-    assert!(
-        answer["FailedRecordCount"].is_null(),
-        "case {case}: a batch every record of which was stored reports no failed count, got \
+    assert_eq!(
+        answer["FailedRecordCount"].as_i64(),
+        Some(0),
+        "case {case}: a batch every record of which was stored reports a failed count of 0, got \
          {answer}"
     );
     answer["Records"]

@@ -16,11 +16,18 @@
 //! `ConnectorType` is the identity of a connector within its environment. The
 //! operation is `@idempotent`
 //! (`smithy_query(query="operation",operation="CreateEnvironmentConnector")`): a
-//! repeat call naming a type the environment already has a LIVE connector of reports
-//! that stored record when the request asks for the same appliance and secret, and is
+//! repeat call naming a type the environment already holds a connector of reports that
+//! stored record when the request asks for the same appliance and secret, and is
 //! refused with the modelled `ValidationException` when it asks for different ones —
 //! the second connector of a type cannot be created, and silently reconfiguring the
 //! first is `UpdateEnvironmentConnector`'s work, not a create's.
+//!
+//! The record a repeat reports is the one the caller is handed as the created
+//! connector, so it is reported only while it is still a connector a later call
+//! resolves ([`crate::state::StoredConnector::is_live`]): a connector whose teardown
+//! this service has already accepted is on its way to `DELETED` and resolves to
+//! nothing, so the type it still occupies ([`crate::state::live_connector_of_type`]) is
+//! the conflict above whatever metadata the request names.
 //!
 //! The credential secret is named on input by ARN OR by name (`secretIdentifier`) and
 //! reported through `Connector$secretArn`, so the identifier is resolved to that
@@ -264,11 +271,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the identity of a connector within its environment, so a second create for a
         // type already connected is either this request again or a conflict.
         if let Some(existing) = crate::state::live_connector_of_type(environment, &input.r#type) {
-            if existing.appliance_fqdn == input.appliance_fqdn
+            // `@idempotent`: the same create again reports the stored record and mints
+            // nothing. The caller is handed that record AS the connector the call
+            // created, so it is reported only while it is still one a later call
+            // resolves: a connector whose teardown this service has already accepted is
+            // on its way to `DELETED` and resolves to nothing, so reporting it would
+            // report a connector that never comes to exist. It still occupies its type,
+            // which is what makes such a request the conflict below.
+            if existing.is_live()
+                && existing.appliance_fqdn == input.appliance_fqdn
                 && existing.secret_arn == secret_arn
             {
-                // `@idempotent`: the same create again reports the stored record and
-                // mints nothing.
                 return Ok(CreateEnvironmentConnectorOutput {
                     connector: Some(existing.to_wire(&environment_id)),
                 });

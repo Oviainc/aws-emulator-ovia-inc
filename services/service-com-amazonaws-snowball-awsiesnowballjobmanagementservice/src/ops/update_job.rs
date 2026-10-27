@@ -256,8 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A request that names one of them for a node of a cluster that has left that state
         // is asking to change what the whole order already left behind, so it is refused
         // rather than served by writing one record out of step with the rest.
+        let members = crate::state::ClusterOrderMembers::from(&input);
         if let Some((cluster_id, cluster_state)) = &cluster {
-            if names_cluster_member(&input) && !cluster_state.is_updatable() {
+            if members.any_supplied() && !cluster_state.is_updatable() {
                 return Err(UpdateJobErrorModeled::InvalidJobStateException(
                     InvalidJobStateException {
                         message: Some(format!(
@@ -309,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some((cluster_id, _)) => {
                 let node_job_ids = match store.clusters.get_mut(&cluster_id) {
                     Some(cluster) => {
-                        apply_cluster_update(cluster, &input);
+                        members.apply_to_cluster(cluster);
                         cluster.node_job_ids.clone()
                     }
                     // Unreachable: the cluster was read out of this same store under the
@@ -319,7 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 for job_id in node_job_ids {
                     if let Some(job) = store.jobs.get_mut(&job_id) {
                         if job.job_state.is_updatable() {
-                            apply_cluster_members(job, &input);
+                            members.apply_to_job(job);
                         }
                     }
                 }
@@ -358,42 +359,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// type, its state, the instant it was created, the parts it holds) is something this
 /// operation takes.
 fn apply_update(job: &mut crate::state::StoredJob, input: &UpdateJobInput) {
-    apply_cluster_members(job, input);
+    crate::state::ClusterOrderMembers::from(input).apply_to_job(job);
     apply_job_members(job, input);
-}
-
-/// Apply the members a cluster holds for its whole order — every member
-/// `UpdateClusterRequest` models too — to `job`, leaving every member the request omitted
-/// as it was.
-///
-/// These are the attributes a node job carries for its cluster rather than as copies of
-/// its own, so they are what an update to one record of an order writes to every record of
-/// it.
-fn apply_cluster_members(job: &mut crate::state::StoredJob, input: &UpdateJobInput) {
-    if let Some(address_id) = &input.address_id {
-        job.address_id = Some(address_id.clone());
-    }
-    if let Some(forwarding_address_id) = &input.forwarding_address_id {
-        job.forwarding_address_id = Some(forwarding_address_id.clone());
-    }
-    if let Some(description) = &input.description {
-        job.description = Some(description.clone());
-    }
-    if let Some(role_arn) = &input.role_arn {
-        job.role_arn = Some(role_arn.clone());
-    }
-    if let Some(shipping_option) = &input.shipping_option {
-        job.shipping_option = Some(shipping_option.clone());
-    }
-    if let Some(notification) = &input.notification {
-        job.notification = Some(notification.clone());
-    }
-    if let Some(resources) = &input.resources {
-        job.resources = Some(resources.clone());
-    }
-    if let Some(configuration) = &input.on_device_service_configuration {
-        job.on_device_service_configuration = Some(configuration.clone());
-    }
 }
 
 /// Apply the members only a job has — the device capacity it is configured with and the
@@ -401,7 +368,8 @@ fn apply_cluster_members(job: &mut crate::state::StoredJob, input: &UpdateJobInp
 /// was.
 ///
 /// `UpdateClusterRequest` models neither, so neither is an attribute a cluster holds for
-/// its order: each belongs to the one job the request named.
+/// its order (`crate::state::ClusterOrderMembers`): each belongs to the one job the request
+/// named.
 fn apply_job_members(job: &mut crate::state::StoredJob, input: &UpdateJobInput) {
     if let Some(capacity_preference) = &input.snowball_capacity_preference {
         job.snowball_capacity_preference = Some(capacity_preference.clone());
@@ -411,50 +379,3 @@ fn apply_job_members(job: &mut crate::state::StoredJob, input: &UpdateJobInput) 
     }
 }
 
-/// Whether this request names any member a cluster holds for its whole order, i.e. any
-/// member [`apply_cluster_members`] applies.
-fn names_cluster_member(input: &UpdateJobInput) -> bool {
-    input.address_id.is_some()
-        || input.forwarding_address_id.is_some()
-        || input.description.is_some()
-        || input.role_arn.is_some()
-        || input.shipping_option.is_some()
-        || input.notification.is_some()
-        || input.resources.is_some()
-        || input.on_device_service_configuration.is_some()
-}
-
-/// Apply the members this request supplied that are the cluster's to `cluster`, leaving
-/// every member it omitted as it was.
-///
-/// A node job of the cluster is what the request named, and the attributes it carries are
-/// the cluster's, so the cluster is where they are written: its required members as plain
-/// values, the rest exactly as supplied. Nothing else about the cluster (its id, its job
-/// type, its device type, its state, the instant it was created, the key it was created
-/// with, the node jobs it holds) is something this operation takes.
-fn apply_cluster_update(cluster: &mut crate::state::StoredCluster, input: &UpdateJobInput) {
-    if let Some(address_id) = &input.address_id {
-        cluster.address_id = address_id.clone();
-    }
-    if let Some(forwarding_address_id) = &input.forwarding_address_id {
-        cluster.forwarding_address_id = Some(forwarding_address_id.clone());
-    }
-    if let Some(description) = &input.description {
-        cluster.description = Some(description.clone());
-    }
-    if let Some(role_arn) = &input.role_arn {
-        cluster.role_arn = Some(role_arn.clone());
-    }
-    if let Some(shipping_option) = &input.shipping_option {
-        cluster.shipping_option = shipping_option.clone();
-    }
-    if let Some(notification) = &input.notification {
-        cluster.notification = Some(notification.clone());
-    }
-    if let Some(resources) = &input.resources {
-        cluster.resources = Some(resources.clone());
-    }
-    if let Some(configuration) = &input.on_device_service_configuration {
-        cluster.on_device_service_configuration = Some(configuration.clone());
-    }
-}

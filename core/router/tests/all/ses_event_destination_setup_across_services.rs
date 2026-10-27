@@ -612,7 +612,10 @@ async fn a_setup_call_the_owning_service_refuses_answers_in_that_service_s_own_e
             }),
             status: 400,
             code: "BadRequestException",
-            names: "DELIVERED",
+            // The member whose value the model does not carry: a refusal for a value
+            // outside a modelled value set names the member and the set, and
+            // withholds the value.
+            names: "eventDestination.matchingEventTypes",
         },
         Refusal {
             case: "a configuration set created twice",

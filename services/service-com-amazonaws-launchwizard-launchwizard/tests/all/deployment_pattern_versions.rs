@@ -51,7 +51,7 @@ struct VersionSuite {
 const PATH: &str = "/getDeploymentPatternVersion";
 
 /// A `GetDeploymentPatternVersion` request body: every member of the input is required.
-fn version_body(workload: &str, pattern: &str, version: &str) -> Value {
+pub(crate) fn version_body(workload: &str, pattern: &str, version: &str) -> Value {
     json!({
         "workloadName": workload,
         "deploymentPatternName": pattern,
@@ -61,7 +61,7 @@ fn version_body(workload: &str, pattern: &str, version: &str) -> Value {
 
 /// The `DeploymentPatternVersionDataSummary` the service reports for one version of one
 /// pattern, requiring HTTP 200.
-async fn get_version(
+pub(crate) async fn get_version(
     harness: &Harness,
     case: &str,
     workload: &str,

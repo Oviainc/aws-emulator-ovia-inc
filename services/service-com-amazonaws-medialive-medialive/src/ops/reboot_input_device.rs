@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RebootInputDevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RebootInputDevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RebootInputDevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +146,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RebootInputDevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RebootInputDeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Clock-owed work first, as every operation of this service does, so a
+        // reboot this device was already going through has completed before this
+        // command starts the next one.
+        state.settle(now);
+
+        // A device is rebooted BY ID, and the id names a device this account has
+        // claimed: an id no claim registered is the operation's own modelled 404
+        // rather than a command recorded against nothing.
+        let device = state
+            .input_device_mut(&input.input_device_id)
+            .ok_or_else(|| {
+                RebootInputDeviceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        "InputDevice",
+                        &input.input_device_id,
+                    )),
+                })
+            })?;
+
+        // `Force` is a `RebootInputDeviceForce` the request may leave out, and
+        // the membership of that enum is enforced at the request boundary before
+        // this handler runs, so what is left to read is whether the value is the
+        // one that forces the reboot. A request that omits the member forces
+        // nothing, exactly as `NO` does.
+        let force = input.force.as_deref() == Some(crate::state::reboot_input_device_force::YES);
+
+        // Sending the command is the whole effect of the call: the device is
+        // rebooting from now until the clock completes the reboot, which is what
+        // takes it off the air, and a forced reboot of a streaming device is what
+        // resumes that stream afterwards. The rule and the span live on the
+        // device record (`begin_reboot`), so nothing here decides them a second
+        // way.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RebootInputDevice"))
+        // What it does NOT move is the device's connection state: the documented
+        // "connection status will change to connected" is a Link unit coming
+        // back on line, and no unit is connected to this emulator, which is why
+        // a device here is `DISCONNECTED` to begin with (see the device slice's
+        // module docs) and why a completed reboot has nothing to reconnect.
+        device.begin_reboot(force, now);
+
+        // The response shape models no member
+        // (`smithy_query(query="operation", operation="RebootInputDevice")`), so
+        // what the call asserts is readable through `DescribeInputDevice` and
+        // `ListInputDevices`.
+        Ok(RebootInputDeviceOutput {})
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no device store to reboot a device in. A modelled server error,
+/// never a fresh engine (which would drop the write on return).
+fn unavailable() -> RebootInputDeviceError {
+    RebootInputDeviceErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

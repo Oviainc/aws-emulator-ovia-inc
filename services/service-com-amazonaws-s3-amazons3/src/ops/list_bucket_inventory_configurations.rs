@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBucketInventoryConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBucketInventoryConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the S3 Inventory configurations the named bucket carries, in
+//! ascending id order, computed from the store `PutBucketInventoryConfiguration` wrote to.
+//! The listing PAGES: "This action supports list pagination and does not return more than
+//! 100 configurations at a time" ([`CONFIGURATIONS_PER_PAGE`]), with `IsTruncated` and a
+//! `NextContinuationToken` that resumes the next page, and the request's own
+//! `ContinuationToken` echoed back. A bucket carrying none lists nothing (an untruncated,
+//! empty list), a bucket this emulator does not hold answers `NoSuchBucket` (HTTP 404), and
+//! an `ExpectedBucketOwner` that is not the account's answers HTTP 403 `AccessDenied`.
+//! Nothing is written: this is a report.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBucketInventoryConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The write and read sides, `PutBucketInventoryConfiguration` and
+//! `GetBucketInventoryConfiguration`, are already implemented.
 //!
 //! ## Shape of an operation
 //!
@@ -128,14 +131,21 @@ use super::types::*;
 // `ListBucketInventoryConfigurationsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListBucketInventoryConfigurationsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#ListBucketInventoryConfigurations")]
+// The operation's MODELED errors, widened by `NoSuchBucket` the way
+// `ListBucketAnalyticsConfigurations` widens it: the model's error list for this operation is
+// empty (`smithy_query(query="operation",operation="ListBucketInventoryConfigurations")`
+// reports `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that
+// does not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped operation
+// does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#ListBucketInventoryConfigurations",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum ListBucketInventoryConfigurationsErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -151,6 +161,45 @@ impl From<ListBucketInventoryConfigurationsErrorModeled> for ListBucketInventory
     fn from(modeled: ListBucketInventoryConfigurationsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The most configurations one page of this listing carries.
+///
+/// The operation publishes its own page size: "This action supports list pagination and does
+/// not return more than 100 configurations at a time"
+/// (`ListBucketInventoryConfigurations`'s own documentation) — a tenth of the 1,000
+/// configurations a bucket may carry
+/// ([`crate::state::MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET`]), so a bucket at the ceiling is
+/// reported over pages rather than in one response.
+const CONFIGURATIONS_PER_PAGE: usize = 100;
+
+/// The marker a continuation token this operation issued carries, so a token it did not
+/// issue is refused rather than silently read as a cursor.
+///
+/// Distinct from the marker in [`super::list_bucket_analytics_configurations`] and the other
+/// configuration listings: a token minted for one listing is not a cursor into another.
+const CONTINUATION_TOKEN_MARKER: &str = "s3ic1 ";
+
+/// Encode the resume point of a truncated page as the response's `NextContinuationToken`.
+///
+/// "The continuation token is an opaque value that Amazon S3 understands"
+/// (`ListBucketInventoryConfigurationsOutput$NextContinuationToken`) — hex of a marker plus
+/// the first configuration id NOT returned, so the token a page hands back resumes exactly
+/// where it stopped without storing per-caller cursor state, the way the sibling
+/// configuration listings encode their own. Opaque, NOT confidential: hex is trivially
+/// reversible, and the token is only opaque in the sense that a client must not read an id
+/// out of it or mint one of its own.
+fn encode_continuation_token(first_id_not_returned: &str) -> String {
+    hex::encode(format!("{CONTINUATION_TOKEN_MARKER}{first_id_not_returned}").as_bytes())
+}
+
+/// The configuration id a `ContinuationToken` resumes at (inclusive), or `None` when the
+/// token is not one this operation issued.
+fn decode_continuation_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    decoded
+        .strip_prefix(CONTINUATION_TOKEN_MARKER)
+        .map(str::to_string)
 }
 
 /// The `ListBucketInventoryConfigurations` operation.
@@ -189,18 +238,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBucketInventoryConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBucketInventoryConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBucketInventoryConfigurations"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)", judged as every other bucket-scoped
+        // operation in this crate judges it: this emulator serves one account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        // `Token` is `length {min 0}`, so an EMPTY continuation token is a legal value that
+        // names no cursor — the first page, exactly as if none had been sent (the reading
+        // the sibling configuration listings give it).
+        let resume_at = match input.continuation_token.as_deref() {
+            Some(token) if !token.is_empty() => {
+                Some(decode_continuation_token(token).ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_ARGUMENT_CODE,
+                        crate::state::INVALID_ARGUMENT_STATUS,
+                        "The continuation token provided is incorrect",
+                    )
+                })?)
+            }
+            _ => None,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no bucket store to read, so this
+            // answers 501 rather than a truthful-looking "this bucket carries none".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListBucketInventoryConfigurations",
+            ));
+        };
+
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(
+                ListBucketInventoryConfigurationsErrorModeled::NoSuchBucket(NoSuchBucket {})
+                    .into(),
+            );
+        };
+
+        let mut reported: Vec<InventoryConfiguration> = Vec::new();
+        let mut next_continuation_token: Option<String> = None;
+
+        // `Bucket::inventory_configurations` walks the store's ordered map, so this is
+        // already ascending id order and a page's resume point is simply the next id in it.
+        // Nothing here writes: a listing reports what the puts recorded.
+        for (id, configuration) in bucket.inventory_configurations() {
+            // The token's id is the first one this page owes, inclusive.
+            if resume_at.as_deref().is_some_and(|from| id < from) {
+                continue;
+            }
+            // Out of slots: this configuration starts the NEXT page, and its id is what the
+            // token hands back.
+            if reported.len() >= CONFIGURATIONS_PER_PAGE {
+                next_continuation_token = Some(encode_continuation_token(id));
+                break;
+            }
+            reported.push(configuration.clone());
+        }
+
+        Ok(ListBucketInventoryConfigurationsOutput {
+            // "Tells whether the returned list of inventory configurations is complete. A
+            // value of true indicates that the list is not complete and the
+            // NextContinuationToken is provided for a subsequent request" — so it is true
+            // exactly when a next token was minted.
+            is_truncated: Some(next_continuation_token.is_some()),
+            // "If sent in the request, the marker that is used as a starting point for this
+            // inventory configuration list response": the token the REQUEST carried,
+            // reported back as sent.
+            continuation_token: input.continuation_token.clone(),
+            // "The marker used to continue this inventory configuration listing. Use the
+            // NextContinuationToken from this response to continue the listing in a
+            // subsequent request" — absent exactly when this page reported the last
+            // configuration.
+            next_continuation_token,
+            // "The list of inventory configurations for a bucket", one entry per
+            // configuration this page reports; a bucket carrying none lists an empty one
+            // rather than omitting the member.
+            inventory_configuration_list: Some(reported),
+        })
     }
 }
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;

@@ -10,8 +10,10 @@
 //! for member — the same record a read by `TermsId` renders, including whatever a
 //! later update wrote — it changes nothing a later caller sees, and an absent
 //! pool, an app client the pool does not hold, or a name that app client holds no
-//! documents under is a 404 `ResourceNotFoundException`, worded from the
-//! request's own values and carrying no terms documents.
+//! documents under is a 404 `ResourceNotFoundException` carrying no terms
+//! documents — an unresolved pool or app client worded from the request's own
+//! values, and an unresolved set of documents worded as the one fixed sentence
+//! that class of refusal carries.
 //!
 //! Each table row names the case it asserts and every assertion reports the
 //! actual value it saw.
@@ -54,6 +56,11 @@ const LANGUAGES: [&str; 13] = [
 /// (`^(terms-of-use|privacy-policy)$`, from
 /// `smithy_query(query="operation",operation="DescribeTermsByClient")`).
 const TERMS_NAMES: [&str; 2] = ["terms-of-use", "privacy-policy"];
+
+/// The one sentence a lookup that resolves no terms documents answers, however
+/// it looked them up — asserted over a whole class of such lookups in
+/// `terms_not_found_message`.
+const TERMS_NOT_FOUND_MESSAGE: &str = "Terms does not exist.";
 
 /// One emulator with just this service mounted.
 fn router() -> MultiServiceRouter {
@@ -464,11 +471,11 @@ async fn an_absent_pool_client_or_name_is_a_404() {
     )
     .await;
 
-    // Each row carries the message its refusal class is worded with, built from
-    // the request's own values: an unresolvable pool names the pool, an app
-    // client that is not one of the named pool's names both the client and the
-    // pool it was looked for in, and a name the client holds nothing under names
-    // the name and the client.
+    // Each row carries the message its refusal class is worded with: an
+    // unresolvable pool names the pool and an app client that is not one of the
+    // named pool's names both the client and the pool it was looked for in,
+    // while a lookup that resolves no terms documents answers the one fixed
+    // sentence for that class, naming nothing the request asked for.
     let other_pool_client = client(&router, &other_pool, "other-pool-client").await;
     for (label, body, expected_message) in [
         (
@@ -516,10 +523,7 @@ async fn an_absent_pool_client_or_name_is_a_404() {
                 "ClientId": client_id,
                 "TermsName": TERMS_NAMES[1],
             }),
-            format!(
-                "Terms with name {} does not exist for Client {client_id}.",
-                TERMS_NAMES[1]
-            ),
+            TERMS_NOT_FOUND_MESSAGE.to_string(),
         ),
         (
             "an app client of the same pool that holds no documents at all",
@@ -528,10 +532,7 @@ async fn an_absent_pool_client_or_name_is_a_404() {
                 "ClientId": bare_client,
                 "TermsName": TERMS_NAMES[0],
             }),
-            format!(
-                "Terms with name {} does not exist for Client {bare_client}.",
-                TERMS_NAMES[0]
-            ),
+            TERMS_NOT_FOUND_MESSAGE.to_string(),
         ),
     ] {
         let (status, payload) = call(&router, "DescribeTermsByClient", &body).await;
@@ -543,7 +544,7 @@ async fn an_absent_pool_client_or_name_is_a_404() {
         assert_eq!(
             error_message(&payload),
             expected_message,
-            "case {label:?}: the refusal must be worded from the request's own values, got {payload}"
+            "case {label:?}: the refusal must carry its class's wording, got {payload}"
         );
         // A refusal must never leak the terms documents of the pool it was asked
         // against.
