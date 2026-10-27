@@ -1050,6 +1050,12 @@ pub fn invalid_tagging(reason: String) -> InvalidTagging {
     }
 }
 
+/// `NoSuchResource`'s message, in the form CloudFront answers that code with: the error
+/// covers whichever resource the request named, so the sentence names none of them, and
+/// nothing in it is built out of the call.
+pub const NO_SUCH_RESOURCE_MESSAGE: &str =
+    "The specified resource doesn't exist. Update your request and try again.";
+
 /// The modelled `NoSuchResource` for an ARN no resource this emulator holds carries.
 ///
 /// The wording is the one CloudFront answers for this error class, and it names no part
@@ -1057,9 +1063,7 @@ pub fn invalid_tagging(reason: String) -> InvalidTagging {
 /// here is built out of the call.
 pub fn no_such_resource() -> NoSuchResource {
     NoSuchResource {
-        message: Some(
-            "The specified resource doesn't exist. Update your request and try again.".to_string(),
-        ),
+        message: Some(NO_SUCH_RESOURCE_MESSAGE.to_string()),
     }
 }
 
@@ -6112,6 +6116,26 @@ pub fn references_response_headers_policy(
         |behavior| behavior.response_headers_policy_id.as_deref(),
     )
     .any(|id| id == response_headers_policy_id)
+}
+
+/// Whether `config` references the key group `key_group_id` names in any of its cache
+/// behaviours.
+///
+/// A key group is referenced by a cache behaviour through its `TrustedKeyGroups` list —
+/// "a list of key groups that CloudFront can use to validate signed URLs or signed
+/// cookies" — rather than through a single-valued member, so the LIST of every behaviour
+/// is walked and a distribution references the group as soon as ONE entry names it. The
+/// behaviours walked are the same ones every other attachment predicate walks (the default
+/// cache behaviour together with the ordered ones), and the reference is what the stored
+/// list holds: the `Enabled` flag beside it says whether signed access is switched on, not
+/// whether the group is named, which is also how
+/// [`StoredDistribution::active_trusted_key_groups`] reports the trusted set.
+pub fn references_key_group(config: &DistributionConfig, key_group_id: &str) -> bool {
+    behavior_views(config)
+        .iter()
+        .filter_map(|behavior| behavior.trusted_key_groups)
+        .flat_map(|groups| groups.items.as_deref().unwrap_or_default())
+        .any(|id| id == key_group_id)
 }
 
 /// The `WebACLId` a listing names to select the distributions that are associated with NO

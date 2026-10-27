@@ -265,6 +265,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the revision of a state machine with the configuration of the state machine
         // used for executions".
         let ran = &execution.ran;
+        // The Map Run that dispatched this execution, for a CHILD workflow execution
+        // of a Distributed Map state: it is what carries the `Label` of the `Map`
+        // state that started it, so both members below come from the one record.
+        let map_run = execution
+            .map_run_arn
+            .as_deref()
+            .and_then(|arn| store.map_runs.get(arn));
 
         Ok(DescribeStateMachineForExecutionOutput {
             // `stateMachineArn` is "the state machine associated with the execution" —
@@ -289,12 +296,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ran.tracing_configuration.as_ref(),
             )),
             // `mapRunArn` and `label` are "returned only if the executionArn is a
-            // child workflow execution that was started by a Distributed Map state".
-            // A Map Run in this store belongs to the execution that ENTERED the
-            // Distributed Map state, and no Map Run here dispatches a child workflow
-            // execution of its own, so no stored execution is one.
-            map_run_arn: None,
-            label: None,
+            // child workflow execution that was started by a Distributed Map state":
+            // the Map Run the record names, and the `Label` of the `Map` state that
+            // Map Run belongs to. Both are null for an execution no Map Run
+            // dispatched.
+            map_run_arn: execution.map_run_arn.clone(),
+            label: map_run.map(|map_run| map_run.label.clone()),
             revision_id: ran.revision_id.clone(),
             encryption_configuration: Some(crate::state::reported_encryption_configuration(
                 ran.encryption_configuration.as_ref(),

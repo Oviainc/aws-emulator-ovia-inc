@@ -474,7 +474,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `ListExecutions` on a qualified ARN selects by.
             state_machine_version_arn: version_arn.clone(),
             state_machine_alias_arn: alias_arn.clone(),
-            ran: configuration,
+            ran: std::sync::Arc::new(configuration),
             redrive_count: 0,
             redrive_date: None,
             redrive_tokens: Vec::new(),
@@ -482,6 +482,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pending: planned.pending,
             // No attempt has stopped at a step of this execution yet.
             redrive_step: None,
+            // This execution was started by this call, not dispatched by a Map Run,
+            // so it belongs to no Map Run and processes no items of one.
+            map_run_arn: None,
+            item_count: None,
             // Measured and counted by `insert_execution`.
             retained_bytes: 0,
         };

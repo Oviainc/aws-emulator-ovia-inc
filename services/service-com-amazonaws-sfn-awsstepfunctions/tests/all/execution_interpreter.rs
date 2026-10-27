@@ -348,7 +348,7 @@ async fn the_data_flow_members_decide_what_a_state_reads_and_writes() {
             case: "an intrinsic this emulator declines is not faked",
             definition: r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Parameters":{"digest.$":"States.Hash($.text, 'SHA-256')"},"End":true}}}"#,
             input: r#"{"text":"abc"}"#,
-            expected: Expected::Failure("States.IntrinsicFailure"),
+            expected: Expected::Failure("States.Runtime"),
         },
         RunCase {
             case: "a Fail state reads its error and cause from the input",
@@ -916,7 +916,7 @@ async fn a_definition_past_what_the_interpreter_bounds_fails_rather_than_running
                 ")".repeat(20)
             ),
             "{}".to_string(),
-            "States.IntrinsicFailure",
+            "States.Runtime",
         ),
         (
             "an intrinsic invocation longer than this service evaluates",
@@ -925,28 +925,28 @@ async fn a_definition_past_what_the_interpreter_bounds_fails_rather_than_running
                 "p".repeat(5_000)
             ),
             "{}".to_string(),
-            "States.IntrinsicFailure",
+            "States.Runtime",
         ),
         (
             "an intrinsic invocation that is never closed",
             r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Parameters":{"x.$":"States.Array(1, 2"},"End":true}}}"#
                 .to_string(),
             "{}".to_string(),
-            "States.IntrinsicFailure",
+            "States.Runtime",
         ),
         (
             "an intrinsic invocation with an unterminated quoted string",
             r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Parameters":{"x.$":"States.Format('still going)"},"End":true}}}"#
                 .to_string(),
             "{}".to_string(),
-            "States.IntrinsicFailure",
+            "States.Runtime",
         ),
         (
             "an intrinsic name this service does not carry",
             r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Parameters":{"x.$":"States.Teleport($.anywhere)"},"End":true}}}"#
                 .to_string(),
             r#"{"anywhere":1}"#.to_string(),
-            "States.IntrinsicFailure",
+            "States.Runtime",
         ),
         (
             "a reference path with more segments than this service follows",
@@ -1019,7 +1019,7 @@ async fn a_definition_past_what_the_interpreter_bounds_fails_rather_than_running
             r#"{"StartAt":"A","States":{"A":{"Type":"Pass","Parameters":{"x.$":"States.Array($, $, $, $)"},"End":true}}}"#
                 .to_string(),
             format!(r#"{{"blob":"{}"}}"#, "b".repeat(80_000)),
-            "States.IntrinsicFailure",
+            "States.Runtime",
         ),
         (
             "a Choice state with more rules than this service evaluates",
