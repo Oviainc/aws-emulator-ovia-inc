@@ -21,8 +21,11 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly, or serve a modeled one through a wrapper. Every request this service
+//!   claims resolves through the generated routing table except the three that ask it
+//!   to assume one of the caller's IAM roles, which are served through
+//!   [`pass_role::PassRoleGate`] so that authorization decision is reached ahead of the
+//!   boundary's model-constraint validation.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -41,9 +44,17 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, ErasedOperation, Operation, OperationRoutingTable, Refusal, Refused, Service, Violation,
+    ViolationKind,
 };
 use std::sync::Arc;
+
+/// The authorization boundary in front of every operation that asks this service to
+/// assume one of the caller's IAM roles. Public because each such operation implements
+/// [`pass_role::PassesRole`] beside its own handler.
+pub mod pass_role;
+
+use pass_role::PassRoleGate;
 
 /// The error code this service answers an input-constraint violation with: the modelled
 /// `ValidationException` (`smithy_query(query="shape",shape="ValidationException")`:
@@ -120,6 +131,29 @@ fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The operations whose input carries a role this service has to assume, each the
+    /// SAME operation the generated table holds, wrapped in [`PassRoleGate`] so the
+    /// pass-role authorization decision is reached ahead of the model-constraint
+    /// validation. Keyed by the routing key the protocol resolves — the key the
+    /// generated table uses — and built from the SAME shared engine, so a wrapped
+    /// operation reads and writes the one store.
+    pass_role_gated: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`PassRoleGate`] and keyed by its operation shape name — the routing key
+/// `ServerProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! gate_pass_role_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                ::std::boxed::Box::new(PassRoleGate::over(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -127,8 +161,23 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        // EVERY operation whose input carries a `roleArn` this service must assume
+        // (`smithy_query(query="operation",operation="StartImportTask,CreateGraphUsingImportTask,StartExportTask")`),
+        // because each of them takes the same authorization decision about the caller
+        // and that one member, and each takes it ahead of its own validation. An
+        // operation that merely REPORTS the role a stored task was started with takes
+        // no such decision and is served through the generated table.
+        let mut pass_role_gated = OperationRoutingTable::new();
+        gate_pass_role_operations!(
+            pass_role_gated,
+            engine,
+            create_graph_using_import_task::CreateGraphUsingImportTask,
+            start_export_task::StartExportTask,
+            start_import_task::StartImportTask,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            pass_role_gated,
         }
     }
 }
@@ -155,12 +204,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol
+        // resolves, and the operation it names is the one served — wrapped in
+        // `PassRoleGate` for the three operations that ask this service to assume one
+        // of the caller's roles, so that authorization decision is reached ahead of the
+        // model-constraint validation, which no other seam is handed the request to do.
+        // Every other key resolves to `None` here and is served by the generated table
+        // unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.pass_role_gated.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

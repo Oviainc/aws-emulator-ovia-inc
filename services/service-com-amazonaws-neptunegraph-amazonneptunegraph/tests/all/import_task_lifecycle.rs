@@ -723,10 +723,12 @@ async fn start_import_task_refuses_a_request_the_rules_forbid() {
             "ValidationException",
         ),
         (
-            "a role ARN outside the modelled pattern",
+            // The pass-role decision is taken before the shape check, so a value that
+            // names no role the caller may pass is the authorization failure it is.
+            "a role ARN that names no IAM role",
             json!({"source": "s3://example-bucket/data/", "roleArn": "not-an-arn"}),
-            400,
-            "ValidationException",
+            403,
+            "AccessDeniedException",
         ),
     ];
     for (case, body, expected, expected_code) in cases {

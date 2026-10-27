@@ -79,6 +79,23 @@ pub fn service_managed_scheduled_queries<Eng: Send + Sync + 'static>(
     queries
 }
 
+/// The refusal CloudWatch Logs answers a WRITE of a scheduled query the service manages for a
+/// log alarm with.
+///
+/// The alarm's own `ScheduledQueryConfiguration` is the one home of such a query's
+/// configuration — which is why its schedule type is [`SCHEDULE_TYPE_AWS_MANAGED`] rather than
+/// the caller's — so the query the identifier names is not one a caller's write of a scheduled
+/// query configures: the configuration is written by writing the alarm. The message names the
+/// query the request asked for, taken from the record derived for it.
+///
+/// UNVERIFIED WORDING: neither this service's model nor its published documentation states a
+/// sentence for this refusal class, so the text below is this emulator's own statement of the
+/// rule rather than one taken from the service. Replace it with the service's own sentence when
+/// that becomes known.
+pub fn managed_query_not_writable_message(name: &str) -> String {
+    format!("The scheduled query {name} is managed by CloudWatch and cannot be updated.")
+}
+
 /// The scheduled query one log alarm's configuration describes, or `None` when that alarm has
 /// no scheduled query configuration (so no managed query belongs to it).
 ///

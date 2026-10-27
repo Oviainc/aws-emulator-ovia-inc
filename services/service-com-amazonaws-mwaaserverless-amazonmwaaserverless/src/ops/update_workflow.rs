@@ -364,31 +364,30 @@ fn unavailable() -> UpdateWorkflowError {
 /// configurations never share a version identifier.
 ///
 /// The configuration walk is the shared one
-/// ([`crate::state::WorkflowConfigurationView::digest_fields`]), so a member added
-/// to the configuration reaches this digest and every other one at once. The
+/// ([`crate::state::WorkflowConfigurationView::digest_group`]), so a member added
+/// to the configuration reaches this digest and every other one at once, and every
+/// member whose extent depends on the request announces that extent. The
 /// workflow's identity leads, because the same configuration under two workflows
 /// is two different snapshots.
 fn request_fingerprint(input: &UpdateWorkflowInput) -> String {
-    let mut fields: Vec<String> = vec![input.workflow_arn.clone()];
-    fields.extend(
-        crate::state::WorkflowConfigurationView {
-            role_arn: &input.role_arn,
-            description: input.description.as_deref(),
-            trigger_mode: input.trigger_mode.as_deref(),
-            engine_version: input.engine_version,
-            definition_s3_location: &input.definition_s3_location,
-            code: input.code.as_ref(),
-            // `UpdateWorkflowRequest` carries no `EncryptionConfiguration` member
-            // (`smithy_query(query="operation", operation="UpdateWorkflow")`), so this
-            // request supplies none to digest.
-            encryption_configuration: None,
-            logging_configuration: input.logging_configuration.as_ref(),
-            network_configuration: input.network_configuration.as_ref(),
-        }
-        .digest_fields(),
-    );
-    let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
-    crate::state::digest(&borrowed)
+    let mut fields = crate::state::DigestFields::new();
+    fields.field(input.workflow_arn.as_str());
+    crate::state::WorkflowConfigurationView {
+        role_arn: &input.role_arn,
+        description: input.description.as_deref(),
+        trigger_mode: input.trigger_mode.as_deref(),
+        engine_version: input.engine_version,
+        definition_s3_location: &input.definition_s3_location,
+        code: input.code.as_ref(),
+        // `UpdateWorkflowRequest` carries no `EncryptionConfiguration` member
+        // (`smithy_query(query="operation", operation="UpdateWorkflow")`), so this
+        // request supplies none to digest.
+        encryption_configuration: None,
+        logging_configuration: input.logging_configuration.as_ref(),
+        network_configuration: input.network_configuration.as_ref(),
+    }
+    .digest_group(&mut fields);
+    fields.digest()
 }
 
 /// Check every `UpdateWorkflow` input member whose modelled constraint this

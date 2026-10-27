@@ -274,19 +274,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // two cannot disagree. Both lookups above resolved under this same lock, so
         // the refusal below is DEFENCE IN DEPTH — this handler cannot reach it — and
         // it reports the modelled server failure rather than answering 200 after a
-        // partial write.
+        // partial write. The asset carrying the property moves its last-update
+        // instant to `now` inside that helper, as it does for every operation that
+        // binds or unbinds a property's alias.
         if !store.disassociate_time_series(&asset_id, &property_id, now) {
             return Err(internal_failure(format!(
                 "The property {property_id} of asset {asset_id} stopped resolving while the \
                  disassociation was being applied."
             )));
-        }
-
-        // The asset carries the property that just changed, so its last-update instant
-        // moves with it — the same write `UpdateAssetProperty` makes when it rebinds or
-        // removes a property's alias.
-        if let Some(asset) = store.assets.get_mut(&asset_id) {
-            asset.last_update_date = now;
         }
 
         // The token is spent only now that the association has been broken: a refused

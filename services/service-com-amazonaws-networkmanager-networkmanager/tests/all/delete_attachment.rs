@@ -62,7 +62,7 @@ const DELETING: &str = "DELETING";
 /// The four kinds are the ones this service mints, each an `AttachmentType` value
 /// (`smithy_query shape=AttachmentType`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Vpc,
     Connect,
     SiteToSiteVpn,
@@ -71,7 +71,7 @@ enum Kind {
 
 impl Kind {
     /// The `AttachmentType` an attachment of this kind reports.
-    fn attachment_type(self) -> &'static str {
+    pub(crate) fn attachment_type(self) -> &'static str {
         match self {
             Kind::Vpc => "VPC",
             Kind::Connect => "CONNECT",
@@ -81,7 +81,7 @@ impl Kind {
     }
 
     /// The `Get<Kind>Attachment` URI of `id`, the reader of this kind.
-    fn get_uri(self, id: &str) -> String {
+    pub(crate) fn get_uri(self, id: &str) -> String {
         match self {
             Kind::Vpc => format!("/vpc-attachments/{id}"),
             Kind::Connect => format!("/connect-attachments/{id}"),
@@ -92,7 +92,7 @@ impl Kind {
 
     /// The member of the `Get<Kind>Attachment` answer that wraps the shared `Attachment`
     /// envelope.
-    fn wrapper(self) -> &'static str {
+    pub(crate) fn wrapper(self) -> &'static str {
         match self {
             Kind::Vpc => "VpcAttachment",
             Kind::Connect => "ConnectAttachment",
@@ -106,7 +106,7 @@ impl Kind {
 /// one rule claiming every attachment (`any`) whose action asks for one. The key names are
 /// the published Cloud WAN core network policy schema's, the same source
 /// `crate::attachment_acceptance` builds its documents from.
-fn requires_acceptance() -> Value {
+pub(crate) fn requires_acceptance() -> Value {
     json!([{
         "rule-number": 100,
         "conditions": [{ "type": "any" }],
@@ -254,31 +254,56 @@ async fn core_network_for(emulator: &Emulator, case: &DeleteCase) -> String {
     }
 }
 
-/// Add the row's `Tags` to a create body, where it carries any.
-fn with_tags(mut body: Value, case: &DeleteCase) -> Value {
-    if !case.tags.is_null() {
-        body["Tags"] = case.tags.clone();
+/// Add `tags` to a create body, where the row carries any.
+fn with_tags(mut body: Value, tags: &Value) -> Value {
+    if !tags.is_null() {
+        body["Tags"] = tags.clone();
     }
     body
 }
 
 /// Create the attachment a row deletes, answering `(its id, the ids that must be removed
 /// before the core network can be deleted)`.
-///
-/// A Connect attachment needs a VPC attachment of the same core network as its transport, so
-/// a Connect row leaves that transport behind: it is the second entry of the teardown list.
 async fn create_for(emulator: &Emulator, index: usize, case: &DeleteCase) -> (String, Vec<String>) {
-    let name = case.name;
     let core_network = core_network_for(emulator, case).await;
-    match case.kind {
+    create_attachment_of_kind(
+        emulator,
+        case.name,
+        case.kind,
+        &core_network,
+        case.region,
+        index,
+        &case.tags,
+    )
+    .await
+}
+
+/// Create one attachment of `kind` on `core_network`, at edge location `region`, carrying
+/// `tags` (`Value::Null` for a create with no `Tags` member). `index` distinguishes the
+/// resource it attaches from every other row's, so one emulator can hold several.
+///
+/// Answers `(its id, the ids that must be removed before the core network can be deleted)`.
+/// A Connect attachment needs a VPC attachment of the same core network as its transport, so
+/// a Connect row leaves that transport behind: it is the second entry of that list. Shared
+/// with the suites that need an attachment of a chosen kind (`crate::attachment_rejection`).
+pub(crate) async fn create_attachment_of_kind(
+    emulator: &Emulator,
+    name: &str,
+    kind: Kind,
+    core_network: &str,
+    region: &str,
+    index: usize,
+    tags: &Value,
+) -> (String, Vec<String>) {
+    match kind {
         Kind::Vpc => {
             let body = with_tags(
                 json!({
                     "CoreNetworkId": core_network,
-                    "VpcArn": vpc_arn(case.region, index + 1),
-                    "SubnetArns": [subnet_arn(case.region, index + 1)],
+                    "VpcArn": vpc_arn(region, index + 1),
+                    "SubnetArns": [subnet_arn(region, index + 1)],
                 }),
-                case,
+                tags,
             );
             let (status, created) = create_vpc_attachment(emulator, body).await;
             assert_eq!(
@@ -293,8 +318,8 @@ async fn create_for(emulator: &Emulator, index: usize, case: &DeleteCase) -> (St
                 emulator,
                 json!({
                     "CoreNetworkId": core_network,
-                    "VpcArn": vpc_arn(case.region, index + 1),
-                    "SubnetArns": [subnet_arn(case.region, index + 1)],
+                    "VpcArn": vpc_arn(region, index + 1),
+                    "SubnetArns": [subnet_arn(region, index + 1)],
                 }),
             )
             .await;
@@ -306,11 +331,11 @@ async fn create_for(emulator: &Emulator, index: usize, case: &DeleteCase) -> (St
             let body = with_tags(
                 json!({
                     "CoreNetworkId": core_network,
-                    "EdgeLocation": case.region,
+                    "EdgeLocation": region,
                     "TransportAttachmentId": transport,
                     "Options": { "Protocol": "GRE" },
                 }),
-                case,
+                tags,
             );
             let (status, created) = create_connect_attachment(emulator, body).await;
             assert_eq!(
@@ -326,12 +351,12 @@ async fn create_for(emulator: &Emulator, index: usize, case: &DeleteCase) -> (St
                     "CoreNetworkId": core_network,
                     "VpnConnectionArn": vpn_arn(
                         "aws",
-                        case.region,
+                        region,
                         engine::emulator_account_id(),
                         &format!("{:08x}", index + 1),
                     ),
                 }),
-                case,
+                tags,
             );
             let (status, created) = emulator.post("/site-to-site-vpn-attachments", body).await;
             assert_eq!(
@@ -348,9 +373,9 @@ async fn create_for(emulator: &Emulator, index: usize, case: &DeleteCase) -> (St
                 json!({
                     "CoreNetworkId": core_network,
                     "DirectConnectGatewayArn": gateway_arn(index + 1),
-                    "EdgeLocations": [case.region],
+                    "EdgeLocations": [region],
                 }),
-                case,
+                tags,
             );
             let (status, created) = emulator
                 .post("/direct-connect-gateway-attachments", body)

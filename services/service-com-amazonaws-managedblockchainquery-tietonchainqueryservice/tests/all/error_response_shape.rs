@@ -29,7 +29,10 @@ use service_com_amazonaws_managedblockchainquery_tietonchainqueryservice::ops::t
     SORT_ORDER_VALUES,
 };
 
-use crate::chain_query_slice::{error_code, unseeded_address, Emulator, NetworkFixture};
+use crate::batch_token_balance::instant_secs;
+use crate::chain_query_slice::{
+    clock_secs, error_code, item_identity, token_json, unseeded_address, Emulator, NetworkFixture,
+};
 
 // ---------------------------------------------------------------------------
 // The modelled constraints, from the model rather than from the implementation
@@ -842,31 +845,53 @@ async fn a_rule_the_model_cannot_express_is_reported_in_the_field_list() {
 // Rule 3: a batch reports a per-item failure inside its 200
 // ---------------------------------------------------------------------------
 
+/// One item of a batch the ledger can answer: the request item, and the instant it
+/// pinned when it pinned one.
+///
+/// `TokenBalance$atBlockchainInstant` is "the time for when the TokenBalance is requested
+/// or the current time if a time is not provided in the request", so an item that pins no
+/// instant is answered as of whatever the serving call read off the clock, and only an
+/// item that pins one has an answer two calls must agree on member for member.
+#[derive(Debug, Clone)]
+struct GoodItem {
+    item: Value,
+    asked: Option<i64>,
+}
+
 #[tokio::test]
 async fn batch_get_token_balance_answers_the_good_items_and_reports_the_bad_ones() {
     let emulator = Emulator::new();
 
     for network in emulator.fixture() {
-        // Rows: the holdings the ledger really has, each answered; and four kinds of
-        // item that cannot be answered — a value outside an enum, a value outside a
-        // `@pattern`, an identifier that names no token, and an owner the ledger holds
-        // nothing for.
-        let good: Vec<Value> = network
+        // Rows: the holdings the ledger really has, each answered, and each asked for
+        // both ways the instant member admits — pinned to an instant of its own and left
+        // to the service's clock; and four kinds of item that cannot be answered — a
+        // value outside an enum, a value outside a `@pattern`, an identifier that names
+        // no token, and an owner the ledger holds nothing for.
+        let good: Vec<GoodItem> = network
             .holdings
             .iter()
             .take(3)
-            .map(|(key, _)| {
-                let mut token = json!({"network": network.network});
-                if let Some(contract) = &key.contract_address {
-                    token["contractAddress"] = json!(contract);
-                }
-                if let Some(token_id) = &key.token_id {
-                    token["tokenId"] = json!(token_id);
-                }
-                json!({
-                    "tokenIdentifier": token,
+            .flat_map(|(key, holding)| {
+                let item = json!({
+                    "tokenIdentifier": token_json(&network.network, key),
                     "ownerIdentifier": {"address": key.owner_address},
-                })
+                });
+                let mut rows = vec![GoodItem {
+                    item: item.clone(),
+                    asked: None,
+                }];
+                // The instant the holding last changed at: the balance the ledger holds
+                // now is the balance in force then, so the pinned row resolves too.
+                if let Some(record) = holding.history.last() {
+                    let mut pinned = item;
+                    pinned["atBlockchainInstant"] = json!({"time": record.time});
+                    rows.push(GoodItem {
+                        item: pinned,
+                        asked: Some(record.time),
+                    });
+                }
+                rows
             })
             .collect();
         assert!(
@@ -913,8 +938,17 @@ async fn batch_get_token_balance_answers_the_good_items_and_reports_the_bad_ones
             ),
         ];
 
-        let mut items = good.clone();
+        let mut items: Vec<Value> = good.iter().map(|row| row.item.clone()).collect();
         items.extend(bad.iter().map(|(item, _, _)| item.clone()));
+        assert!(
+            items.len() as i64 <= BATCH_LENGTH.1,
+            "case {}: the table has to stay inside the modelled batch bound of {}, got {} \
+             items",
+            network.network,
+            BATCH_LENGTH.1,
+            items.len()
+        );
+        let clock_before = clock_secs();
         let reply = emulator
             .ok(
                 "/batch-get-token-balance",
@@ -923,24 +957,66 @@ async fn batch_get_token_balance_answers_the_good_items_and_reports_the_bad_ones
             .await;
         let case = format!("{} mixed batch", network.network);
 
-        // Every good item is answered, and with exactly what the single read answers:
-        // the batch and `GetTokenBalance` share one read of the ledger.
+        // Every good item is answered, and with what the single read answers: the batch
+        // and `GetTokenBalance` share one read of the ledger.
         let balances = reply["tokenBalances"]
             .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: tokenBalances is required, got {reply:?}"));
+            .unwrap_or_else(|| panic!("case {case:?}: tokenBalances is required, got {reply:?}"))
+            .clone();
         assert_eq!(
             balances.len(),
             good.len(),
             "case {case:?}: expected every good item answered, got {reply:?}"
         );
-        for (position, item) in good.iter().enumerate() {
-            let single = emulator.ok("/get-token-balance", item).await;
-            assert_eq!(
-                balances[position], single,
-                "case {case:?} item {position}: expected the single read's answer {single:?}, \
-                 got {:?}",
-                balances[position]
-            );
+        for (position, row) in good.iter().enumerate() {
+            let got = &balances[position];
+            let single = emulator.ok("/get-token-balance", &row.item).await;
+            match row.asked {
+                // An item that PINNED an instant is answered as of exactly that instant,
+                // so the whole answer is reproducible and the two agree member for
+                // member.
+                Some(asked) => {
+                    assert_eq!(
+                        got, &single,
+                        "case {case:?} item {position}: expected the single read's answer \
+                         {single:?}, got {got:?}"
+                    );
+                    assert_eq!(
+                        instant_secs(&got["atBlockchainInstant"]),
+                        Some(asked),
+                        "case {case:?} item {position}: expected the instant it pinned \
+                         ({asked}), got {got:?}"
+                    );
+                }
+                // An item that pinned none is answered as of the CURRENT time, which each
+                // call reads off the clock for itself: the two answers agree on every
+                // member the ledger settles, and each reports an instant its own call
+                // saw.
+                None => {
+                    assert_eq!(
+                        item_identity(got),
+                        item_identity(&single),
+                        "case {case:?} item {position}: expected the single read's answer \
+                         {single:?} apart from the instant each call read off the clock, got \
+                         {got:?}"
+                    );
+                    let clock_after = clock_secs();
+                    for answer in [got, &single] {
+                        let reported = instant_secs(&answer["atBlockchainInstant"])
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "case {case:?} item {position}: atBlockchainInstant is \
+                                     required, got {answer:?}"
+                                )
+                            });
+                        assert!(
+                            (clock_before..=clock_after).contains(&reported),
+                            "case {case:?} item {position}: an unpinned read resolves to now \
+                             ({clock_before}..={clock_after}), got {reported}"
+                        );
+                    }
+                }
+            }
         }
 
         // Every bad item is reported in `errors`, echoing the identifiers it was asked

@@ -748,6 +748,23 @@ impl StoredConnector {
         self.pending = None;
     }
 
+    /// Whether this record is still a connector a request can USE: one whose teardown
+    /// has not started.
+    ///
+    /// A `DELETING` connector's connection to the appliance is being torn down and a
+    /// `DELETED` one is gone, so neither is a connector further work can be tracked
+    /// through ("The resource might not be specified correctly, or it may have a
+    /// `state` of `DELETED`", `ResourceNotFoundException` doc). The other states are
+    /// live — the connection is being established (`CREATING`), reconfigured
+    /// (`UPDATING`), up (`ACTIVE`) or concluded without one (`CREATE_FAILED`,
+    /// `UPDATE_FAILED`).
+    ///
+    /// The one predicate behind [`live_connector`] and [`live_connector_mut`], so a
+    /// reader and a writer resolve exactly the same records.
+    pub fn is_live(&self) -> bool {
+        self.state != CONNECTOR_DELETING && self.state != CONNECTOR_DELETED
+    }
+
     /// The `CheckResult` this connector's own stored record decides for every check of
     /// it, or `None` while the record decides nothing.
     ///
@@ -2797,13 +2814,8 @@ pub fn live_connector_of_type<'a>(
 /// request that wants to USE a connector resolves to.
 ///
 /// The id is scoped to the environment, exactly as `UpdateEnvironmentConnector` reads
-/// it, and a connector the service has started deleting resolves to nothing: a
-/// `DELETING` connector's connection to the appliance is being torn down and a
-/// `DELETED` one is gone, so neither is a connector new work can be tracked through
-/// ("The resource might not be specified correctly, or it may have a `state` of
-/// `DELETED`", `ResourceNotFoundException` doc). The other three states are live — the
-/// connection is being established (`CREATING`), reconfigured (`UPDATING`) or up
-/// (`ACTIVE`) — so the record exists and is the one the request named.
+/// it, and a connector the service has started deleting resolves to nothing
+/// ([`StoredConnector::is_live`]).
 ///
 /// [`live_connector_of_type`] draws the line one state later on purpose: a type whose
 /// connector is still being deleted is not free for a new connector yet, while the
@@ -2815,9 +2827,23 @@ pub fn live_connector<'a>(
     environment
         .connectors
         .get(connector_id)
-        .filter(|connector| {
-            connector.state != CONNECTOR_DELETING && connector.state != CONNECTOR_DELETED
-        })
+        .filter(|connector| connector.is_live())
+}
+
+/// Mutable form of [`live_connector`]: the record a request that RECONFIGURES a
+/// connector resolves to.
+///
+/// Exactly the same records as the reading form, because a connector whose teardown has
+/// started is no longer a connector any request can act on — writing to one would
+/// cancel a deletion the service already accepted.
+pub fn live_connector_mut<'a>(
+    environment: &'a mut StoredEnvironment,
+    connector_id: &str,
+) -> Option<&'a mut StoredConnector> {
+    environment
+        .connectors
+        .get_mut(connector_id)
+        .filter(|connector| connector.is_live())
 }
 
 /// The largest page a `@paginated` operation of this service returns when the caller

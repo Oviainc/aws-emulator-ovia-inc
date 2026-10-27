@@ -22,6 +22,8 @@
 //! `hosted_zone_records` and `record_set_validation`, so these suites drive the
 //! service through the same router a socket-served request goes through.
 
+use std::collections::BTreeSet;
+
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::hosted_zone_records::{call, create_zone_body, create_zone_ok, router, Reply};
@@ -437,21 +439,67 @@ struct WeightCase {
     name: &'static str,
     /// One `(SetIdentifier, Weight, value)` per member of the group.
     members: &'static [(&'static str, i64, &'static str)],
-    /// The values a query may be answered with.
+    /// The values a query may be answered with — and, over the draws below, the
+    /// values it must EACH be answered with at least once: a member that carries
+    /// a share answers in that proportion, so every one of them comes up.
     answerable: &'static [&'static str],
-    /// Whether the group must answer with more than one distinct value over the
-    /// draws below — true where more than one member carries a positive share,
-    /// or where every share is zero.
-    varies: bool,
 }
 
-/// How many times each weighted group is queried.
+/// The largest chance of a draw this table tolerates failing on: the chance that
+/// a member with a share happens not to come up over its row's draws.
 ///
-/// A proportional draw is a draw: one query says little, so each row is asked
-/// repeatedly. With the smallest group that must vary (three members of equal
-/// share), the chance of this many draws all falling to one member is below
-/// 10^-19, so the "varies" assertion is not a flake.
-const DRAWS: usize = 40;
+/// A proportional draw is a draw, so no finite number of queries proves a share
+/// answers; what a row can demand is that missing one is less likely than the
+/// test run itself being lost to something else.
+const FALSE_FAILURE: f64 = 1e-12;
+
+/// How many times a group whose answer cannot vary is queried.
+///
+/// One query says little about a member that must NEVER answer either, so even a
+/// row with a single answerable value is asked repeatedly.
+const MIN_DRAWS: usize = 40;
+
+/// The share the rarest answering member of a group takes.
+///
+/// `Weight`'s own documentation: a member answers "based on the ratio of a
+/// resource's weight to the total", except that a group whose weights are ALL
+/// zero answers "with equal probability", where every member's share is one over
+/// the size of the group.
+fn rarest_share(members: &[(&'static str, i64, &'static str)]) -> f64 {
+    let weights: Vec<u64> = members
+        .iter()
+        .map(|(_, weight, _)| u64::try_from(*weight).unwrap_or(0))
+        .collect();
+    let total: u64 = weights.iter().sum();
+    if total == 0 {
+        return 1.0 / members.len() as f64;
+    }
+    let rarest = weights
+        .iter()
+        .copied()
+        .filter(|weight| *weight > 0)
+        .min()
+        .unwrap_or(total);
+    rarest as f64 / total as f64
+}
+
+/// How many times ONE row is queried: enough that a member taking the rarest
+/// share of this group is all but certain to come up.
+///
+/// With `answerable` members, the rarest of them answering a share `p` of the
+/// time, the chance that some member never comes up over `n` draws is at most
+/// `answerable * (1 - p)^n`, so `n` is the smallest count that keeps it under
+/// [`FALSE_FAILURE`]. The count is therefore per ROW: a one-in-ten share needs
+/// several times the draws an equal three-way split does, and a single constant
+/// for the whole table is either a flake on the rarest row or waste on the rest.
+fn draws_for(members: &[(&'static str, i64, &'static str)], answerable: usize) -> usize {
+    let miss = 1.0 - rarest_share(members);
+    if miss <= 0.0 {
+        return MIN_DRAWS;
+    }
+    let needed = (FALSE_FAILURE / answerable as f64).ln() / miss.ln();
+    MIN_DRAWS.max(needed.ceil() as usize)
+}
 
 #[tokio::test]
 async fn weighted_routing_answers_in_proportion_and_never_with_a_zero_weight_record() {
@@ -467,7 +515,6 @@ async fn weighted_routing_answers_in_proportion_and_never_with_a_zero_weight_rec
             name: "blue-green.example.com",
             members: &[("blue", 100, "192.0.2.31"), ("green", 0, "192.0.2.32")],
             answerable: &["192.0.2.31"],
-            varies: false,
         },
         WeightCase {
             label: "two zero-weight siblings never answer",
@@ -478,14 +525,12 @@ async fn weighted_routing_answers_in_proportion_and_never_with_a_zero_weight_rec
                 ("off", 0, "192.0.2.35"),
             ],
             answerable: &["192.0.2.33"],
-            varies: false,
         },
         WeightCase {
             label: "unequal positive shares both answer",
             name: "uneven.example.com",
             members: &[("one", 1, "192.0.2.36"), ("nine", 9, "192.0.2.37")],
             answerable: &["192.0.2.36", "192.0.2.37"],
-            varies: true,
         },
         WeightCase {
             label: "a group whose every weight is zero answers with equal probability",
@@ -496,14 +541,12 @@ async fn weighted_routing_answers_in_proportion_and_never_with_a_zero_weight_rec
                 ("c", 0, "192.0.2.40"),
             ],
             answerable: &["192.0.2.38", "192.0.2.39", "192.0.2.40"],
-            varies: true,
         },
         WeightCase {
             label: "a lone zero-weight record set is the whole group, so it answers",
             name: "lone-zero.example.com",
             members: &[("only", 0, "192.0.2.41")],
             answerable: &["192.0.2.41"],
-            varies: false,
         },
     ];
 
@@ -524,8 +567,9 @@ async fn weighted_routing_answers_in_proportion_and_never_with_a_zero_weight_rec
             .await;
         }
 
-        let mut seen: Vec<String> = Vec::new();
-        for draw in 0..DRAWS {
+        let draws = draws_for(case.members, case.answerable.len());
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for draw in 0..draws {
             let reply = ask_for(&router, &zone_id, case.name, "A").await;
             assert_served(case.label, &reply);
             let data = record_data(&reply);
@@ -542,18 +586,19 @@ async fn weighted_routing_answers_in_proportion_and_never_with_a_zero_weight_rec
                 case.label,
                 case.answerable
             );
-            if !seen.contains(&answered) {
-                seen.push(answered);
-            }
+            seen.insert(answered);
         }
-        assert!(
-            seen.len() > 1 || !case.varies,
-            "case {:?}: every member with a share must be able to answer, only saw {seen:?}",
-            case.label
-        );
-        assert!(
-            seen.len() == 1 || case.varies,
-            "case {:?}: only the members with a share may answer, saw {seen:?}",
+        // Over the draws, EVERY member that carries a share has answered and no
+        // other value ever has: the values seen are exactly the answerable ones.
+        let expected: BTreeSet<String> = case
+            .answerable
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "case {:?}: over {draws} draws exactly the members with a share answer, expected \
+             {expected:?}, saw {seen:?}",
             case.label
         );
     }

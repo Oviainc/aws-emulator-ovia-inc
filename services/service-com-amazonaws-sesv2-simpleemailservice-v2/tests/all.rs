@@ -61,6 +61,8 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/suppressed_destinations.rs"]
 mod suppressed_destinations;
+#[path = "all/tenant_resource_association_removal.rs"]
+mod tenant_resource_association_removal;
 #[path = "all/tenant_resource_associations.rs"]
 mod tenant_resource_associations;
 #[path = "all/tenant_suppression_attributes.rs"]

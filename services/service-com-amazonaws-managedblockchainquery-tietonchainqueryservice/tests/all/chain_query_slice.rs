@@ -480,6 +480,20 @@ pub(crate) fn item_identity(item: &Value) -> Value {
     item
 }
 
+/// The test's own wall clock, in whole seconds since the Unix epoch.
+///
+/// Read from the clock here rather than from the service, so a window taken around a
+/// call bounds what that call could have read for itself.
+///
+/// `pub(crate)` because every suite that checks a member the service reads off the clock
+/// needs the same window.
+pub(crate) fn clock_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the test clock is after the Unix epoch")
+        .as_secs() as i64
+}
+
 /// Walk a listing to its end, following `nextToken`, and return every item in the order
 /// the service returned them.
 ///

@@ -197,6 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
 
         // `workspaceName` scopes the delete to one SiteWise workspace. This store
         // holds no time series inside a workspace — nothing that ingests one
@@ -274,7 +275,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request leave the store in one state.
         match &stream {
             crate::state::SeriesKey::Property(asset_id, property_id) => {
-                store.forget_property_series(asset_id, property_id);
+                // Dropping the binding is an accepted write to the asset that
+                // carries the property, so the asset's last-update instant moves
+                // to this call's inside the helper that moves the alias.
+                store.forget_property_series(asset_id, property_id, now);
             }
             crate::state::SeriesKey::Disassociated(alias) => {
                 store.forget_disassociated_time_series(alias);

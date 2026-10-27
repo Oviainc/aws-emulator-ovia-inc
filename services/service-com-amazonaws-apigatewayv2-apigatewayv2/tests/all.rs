@@ -21,6 +21,8 @@ mod api_import;
 mod api_lifecycle;
 #[path = "all/api_mapping_lifecycle.rs"]
 mod api_mapping_lifecycle;
+#[path = "all/api_mapping_update.rs"]
+mod api_mapping_update;
 #[path = "all/api_reimport.rs"]
 mod api_reimport;
 #[path = "all/api_update.rs"]

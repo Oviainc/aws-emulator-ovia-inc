@@ -21,6 +21,8 @@ mod associate_link_refusals;
 mod attachment_acceptance;
 #[path = "all/attachment_lifecycle.rs"]
 mod attachment_lifecycle;
+#[path = "all/attachment_rejection.rs"]
+mod attachment_rejection;
 #[path = "all/attachment_routing_policy_associations.rs"]
 mod attachment_routing_policy_associations;
 #[path = "all/attachment_routing_policy_label.rs"]
