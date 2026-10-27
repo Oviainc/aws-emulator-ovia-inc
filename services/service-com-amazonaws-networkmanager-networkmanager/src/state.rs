@@ -49,6 +49,9 @@
 //! job that analysed the routing path between two attachments against what the global
 //! network held when it was started, and holds the paths it found for `GetRouteAnalysis`
 //! to read back.
+//! Any resource of a global network's network-resource inventory can in turn carry
+//! METADATA — the key/value map `UpdateNetworkResourceMetadata` stores for it and
+//! `GetNetworkResources` reports beside its definition — held under that resource's own ARN.
 //! Everything
 //! the implemented operations answer is computed from the records below — no handler
 //! echoes its input back without storing it.
@@ -3746,6 +3749,21 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// Bounded by [`MAX_ROUTE_ANALYSES_PER_GLOBAL_NETWORK`] per global network, so
     /// repeated `StartRouteAnalysis` calls cannot grow it without end.
     pub route_analyses: BTreeMap<String, RouteAnalysisRecord>,
+    /// The metadata one network resource of a global network's inventory carries, by the
+    /// ARN of that resource — the one store `UpdateNetworkResourceMetadata` writes and
+    /// [`Self::network_resources_of`] reports in `NetworkResource$Metadata`.
+    ///
+    /// Keyed by ARN alone rather than by the global network and the ARN together: a network
+    /// resource of this inventory belongs to exactly one global network, so its ARN already
+    /// identifies the pair the operation addresses, which the write path checks before it
+    /// stores anything. An entry holds the WHOLE metadata of its resource, so a later write
+    /// replaces it rather than growing it, and a resource nobody has written metadata for
+    /// has no entry at all — which is what makes `Metadata` absent rather than empty for it.
+    ///
+    /// Bounded by the resources that exist: at most one entry per stored resource, which the
+    /// per-global-network and per-core-network quotas bound, and the write path drops the
+    /// entry of a resource that has since been deleted.
+    pub network_resource_metadata: BTreeMap<String, BTreeMap<String, String>>,
     /// This account's organization service-access record, or `None` while no
     /// `StartOrganizationServiceAccessUpdate` has ever been called: this service then
     /// knows of no organization, so `ListOrganizationServiceAccessStatus` reports no
@@ -4286,7 +4304,64 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 },
             );
         }
+        // "The resource metadata" (`smithy_query shape=NetworkResource`) is what
+        // `UpdateNetworkResourceMetadata` stores for one resource ARN, so every resource of
+        // this inventory reports the map last stored under its own ARN, whatever its kind,
+        // and a resource nobody has stored metadata for reports none.
+        for resource in resources.values_mut() {
+            if let Some(stored) = resource
+                .resource_arn
+                .as_deref()
+                .and_then(|arn| self.network_resource_metadata.get(arn))
+            {
+                resource.metadata = Some(metadata_shape(stored));
+            }
+        }
         resources.into_iter().collect()
+    }
+
+    /// Store `metadata` as the WHOLE metadata of the network resource `resource_arn` names
+    /// inside the global network `global_network_id`, answering the map that resource then
+    /// carries, or `None` when that global network holds no such network resource.
+    ///
+    /// The resource is resolved through the global network's own inventory
+    /// ([`Self::network_resources_of`]), so exactly the resources a caller can SEE in that
+    /// global network can be given metadata, and one naming another global network's
+    /// resource — or none at all — is refused by the caller rather than stored.
+    ///
+    /// The map REPLACES whatever the resource carried: the operation's input carries the
+    /// resource metadata in full, so a key the request leaves out is a key the resource no
+    /// longer has.
+    ///
+    /// Writing also drops the entries of resources that have since been deleted, so the
+    /// store holds metadata only for resources that still exist (see
+    /// [`Self::network_resource_metadata`]).
+    pub fn put_network_resource_metadata(
+        &mut self,
+        global_network_id: &str,
+        resource_arn: &str,
+        metadata: BTreeMap<String, String>,
+        now: SystemTime,
+    ) -> Option<BTreeMap<String, String>> {
+        if !self
+            .network_resources_of(global_network_id, now)
+            .iter()
+            .any(|(_, resource)| resource.resource_arn.as_deref() == Some(resource_arn))
+        {
+            return None;
+        }
+        let deleted: Vec<String> = self
+            .network_resource_metadata
+            .keys()
+            .filter(|arn| self.tags_of(arn.as_str()).is_none())
+            .cloned()
+            .collect();
+        for arn in deleted {
+            self.network_resource_metadata.remove(&arn);
+        }
+        self.network_resource_metadata
+            .insert(resource_arn.to_string(), metadata);
+        self.network_resource_metadata.get(resource_arn).cloned()
     }
 
     /// Every relationship the global network `global_network_id` holds, keyed by
@@ -4796,6 +4871,50 @@ pub fn relationship_key(from: &str, to: &str) -> String {
     format!("{from}|{to}")
 }
 
+/// How many entries the metadata map of one network resource may carry.
+///
+/// CHOSEN, like [`MAX_RESOURCE_POLICIES`], and for the same reason: an entry of
+/// [`ComAmazonawsNetworkmanagerNetworkmanagerState::network_resource_metadata`] holds the
+/// map a request carried, so without a bound one request could grow this emulator's store
+/// without end. AWS publishes no per-resource limit for this map, and the model bounds only
+/// each key and each value inside it (a `ConstrainedString` of 0 to 256 characters,
+/// `smithy_query shape=NetworkResourceMetadataMap`), so the number here is the emulator's
+/// own: the same one as this service's per-resource key/value quota for tags
+/// ([`MAX_TAGS_PER_RESOURCE`]), the closest limit AWS does publish.
+///
+/// A map carrying more entries is refused with `UpdateNetworkResourceMetadata`'s modelled
+/// `ValidationException` (HTTP 400) naming [`FIELD_METADATA`], and stores nothing.
+pub const MAX_METADATA_ENTRIES: usize = MAX_TAGS_PER_RESOURCE;
+
+/// Check a requested metadata map of `given` entries against [`MAX_METADATA_ENTRIES`].
+pub fn check_metadata_entries(given: usize) -> Result<(), ValidationException> {
+    if given > MAX_METADATA_ENTRIES {
+        return Err(field_rejection(
+            FIELD_METADATA,
+            REASON_FIELD_VALIDATION_FAILED,
+            format!(
+                "a network resource's metadata may carry at most {MAX_METADATA_ENTRIES} entries, but {given} were given"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The stored metadata of one network resource as the modelled `NetworkResourceMetadataMap`
+/// is carried on the wire.
+///
+/// The store keeps the map ordered by key, like every other map of this state, while the
+/// modelled shape is a plain map whose order the protocol does not fix, so this is the one
+/// place the two representations meet.
+pub fn metadata_shape(
+    stored: &BTreeMap<String, String>,
+) -> ::std::collections::HashMap<String, String> {
+    stored
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 /// The members every network resource of this service carries, whatever its kind: the
 /// account that holds it, its type, id and ARN, its tags, and the instant the answer read
 /// its definition. The caller fills `Definition` (and, where the kind has one,
@@ -4811,7 +4930,7 @@ pub fn relationship_key(from: &str, to: &str) -> String {
 /// `Edges`, a Direct Connect gateway attachment's `EdgeLocations`), which a single-valued
 /// member cannot carry.
 ///
-/// Two members are deliberately left absent, because nothing in the store holds them:
+/// One member is deliberately left absent, because nothing in the store holds it:
 ///
 /// * `RegisteredGatewayArn` — only a resource reached THROUGH a registered gateway carries
 ///   one, and every resource of this inventory is one this service holds in its own right.
@@ -4819,9 +4938,10 @@ pub fn relationship_key(from: &str, to: &str) -> String {
 ///   the resources reached through the gateway belong to Amazon VPC, of which this service
 ///   holds no inventory. Associating a customer gateway with a device does not register one
 ///   either: it ties a gateway the global network already holds to a device of it.
-/// * `Metadata` — "The resource metadata" (`smithy_query shape=NetworkResource`) is what
-///   `UpdateNetworkResourceMetadata` stores, which is still a scaffold stub, so no resource
-///   has any.
+///
+/// `Metadata` defaults to absent here too and is filled in by
+/// [`ComAmazonawsNetworkmanagerNetworkmanagerState::network_resources_of`] for a resource
+/// whose ARN the metadata store holds an entry for, whatever its kind.
 fn network_resource(
     resource_type: &str,
     resource_id: &str,
@@ -4965,6 +5085,9 @@ pub const FIELD_POLICY_DOCUMENT: &str = "PolicyDocument";
 /// The input member every operation that stores tags names in a refusal of them: the
 /// `Tags` list itself, as [`validate_tags`] and [`tag_problem_rejection`] both report it.
 pub const FIELD_TAGS: &str = "Tags";
+/// See [`FIELD_RESOURCE_ARN`]: the member carrying the resource metadata an update of one
+/// network resource's metadata stores, as [`check_metadata_entries`] reports it.
+pub const FIELD_METADATA: &str = "Metadata";
 
 /// The modelled `ValidationException` (HTTP 400) for a refusal of the single input member
 /// `member`, carrying `reason` and one `Fields` entry explaining `message`.

@@ -5,15 +5,17 @@
 //! This module owns the stream records the implemented operations read and write: the
 //! shard map `CreateStream` lays down, the ARN a stream is addressed by, the tags assigned
 //! to it, the record log a producer appends to and a consumer drains, and the single place
-//! where the `CREATING` -> `ACTIVE` and `DELETING` -> gone transitions the clock owes a
-//! stream are decided ([`Stream::status`], [`Stream::is_held`]).
+//! where the `CREATING` -> `ACTIVE`, `UPDATING` -> `ACTIVE` and `DELETING` -> gone
+//! transitions the clock owes a stream are decided ([`Stream::status`],
+//! [`Stream::is_held`]).
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    EnhancedMetrics, HashKeyRange, Record, SequenceNumberRange, Shard, StreamDescription,
-    StreamDescriptionSummary, StreamModeDetails, StreamSummary, Tag, WarmThroughputObject,
+    ChildShard, EnhancedMetrics, HashKeyRange, Record, SequenceNumberRange, Shard,
+    StreamDescription, StreamDescriptionSummary, StreamModeDetails, StreamSummary, Tag,
+    WarmThroughputObject,
 };
 
 /// The region a stream is created in when the request carries no SigV4 credential scope
@@ -35,6 +37,12 @@ pub const STREAM_ACTIVE: &str = "ACTIVE";
 /// call armed completes: "After a DeleteStream request, the specified stream is in the
 /// DELETING state until Kinesis Data Streams completes the deletion" (`DeleteStream`).
 pub const STREAM_DELETING: &str = "DELETING";
+
+/// A stream whose shard map is being re-tiled: "Upon receiving the request, Kinesis Data
+/// Streams returns immediately and sets the status of the stream to UPDATING. After the
+/// update is complete, Kinesis Data Streams sets the status of the stream back to ACTIVE"
+/// (`UpdateShardCount`).
+pub const STREAM_UPDATING: &str = "UPDATING";
 
 /// The `StreamMode` whose streams carry the shard count the caller asked for.
 pub const STREAM_MODE_PROVISIONED: &str = "PROVISIONED";
@@ -59,6 +67,22 @@ pub const ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 /// non-zero, so a caller that reads the stream straight after deleting it still observes
 /// `DELETING`. The instant it falls due is stored on the record and never slept on.
 pub const DELETION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after a shard-count change the stream's `UPDATING` -> `ACTIVE` transition
+/// falls due. A CHOSEN span, not an AWS-documented duration ("the scaling action could
+/// take a few minutes to complete" names no value): it only has to be non-zero, so a
+/// caller that reads the stream straight after scaling it still observes `UPDATING`. The
+/// instant it falls due is stored on the record and never slept on.
+pub const RESHARD_DELAY: Duration = Duration::from_millis(500);
+
+/// How many shard-count changes one stream may be scaled by inside [`RESHARD_WINDOW`]: by
+/// default you cannot "scale more than ten times per rolling 24-hour period per stream"
+/// (`UpdateShardCount`).
+pub const MAX_RESHARDS_PER_WINDOW: usize = 10;
+
+/// The rolling window [`MAX_RESHARDS_PER_WINDOW`] scaling actions are counted over: the
+/// "rolling 24-hour period per stream" `UpdateShardCount` documents.
+pub const RESHARD_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The retention window a new stream gets, in hours: "By default, a stream's data records
 /// are accessible for 24 hours from the time they are added to the stream"
@@ -292,6 +316,12 @@ pub struct ShardRecord {
     /// When the shard was closed, `None` while it is open. A reshard is what closes a
     /// shard, and it sets this instant and [`Self::ending_sequence_number`] together.
     pub closed_at: Option<SystemTime>,
+    /// `Shard$ParentShardId` — "The shard ID of the shard's parent": the shard this one
+    /// was produced from by a split or a merge. `None` for a shard a create laid down.
+    pub parent_shard_id: Option<String>,
+    /// `Shard$AdjacentParentShardId` — "The shard ID of the shard adjacent to the shard's
+    /// parent": the second shard this one was produced from, which only a merge has.
+    pub adjacent_parent_shard_id: Option<String>,
     /// The records written to the shard, oldest first — the order `GetRecords` reads them
     /// in ("the shard iterator specifies the position in the shard from which you want to
     /// start reading data records sequentially").
@@ -325,10 +355,83 @@ impl ShardRecord {
             ending_sequence_number: None,
             created_at,
             closed_at: None,
+            // A shard a create laid down came from no split and no merge, so it names no
+            // parent; [`Self::from_parents`] is what a reshard lays a child down with.
+            parent_shard_id: None,
+            adjacent_parent_shard_id: None,
             records: Vec::new(),
             records_written: 0,
             records_bytes: 0,
         }
+    }
+
+    /// The same brand-new OPEN shard, produced from the shards named in `parents` — the
+    /// open shards whose hash key ranges the new one covers.
+    ///
+    /// "The shard ID of the shard's parent" and "the shard ID of the shard adjacent to the
+    /// shard's parent" (`Shard`): a child of ONE shard is a split's, a child of two is a
+    /// merge's. A re-tiling that covers more than two of them reaches the child through
+    /// short-lived intermediate shards — "this can cause short-lived shards to be created,
+    /// in addition to the final shards" (`UpdateShardCount`) — none of which this emulator
+    /// lays down, so the lineage it records names the lowest and the highest of the shards
+    /// the child covers.
+    pub fn from_parents(
+        index: u32,
+        created_at: SystemTime,
+        starting_hash_key: String,
+        ending_hash_key: String,
+        parents: &[String],
+    ) -> Self {
+        Self {
+            parent_shard_id: parents.first().cloned(),
+            // One parent is a split's child: it has a parent and no adjacent parent.
+            adjacent_parent_shard_id: parents.last().filter(|_| parents.len() > 1).cloned(),
+            ..Self::open_at(index, created_at, starting_hash_key, ending_hash_key)
+        }
+    }
+
+    /// Close the shard at `at`, which is what a reshard does to every shard it re-tiles:
+    /// the shard stops being open, so it takes the ending sequence number its write
+    /// counter has reached — "shards that are in the OPEN state have an ending sequence
+    /// number of null" (`SequenceNumberRange$EndingSequenceNumber`), and a closed one does
+    /// not. The records it holds stay readable until the retention window releases them.
+    pub fn close_at(&mut self, at: SystemTime) {
+        self.ending_sequence_number = Some(record_sequence_number(
+            &self.starting_sequence_number,
+            self.records_written,
+        ));
+        self.closed_at = Some(at);
+    }
+
+    /// Whether `shard_id` is one of the shards this one was produced from.
+    pub fn is_child_of(&self, shard_id: &str) -> bool {
+        [
+            self.parent_shard_id.as_deref(),
+            self.adjacent_parent_shard_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|parent| parent == shard_id)
+    }
+
+    /// The shards this one was produced from, as `ChildShard$ParentShards` reports them.
+    pub fn parent_shard_ids(&self) -> Vec<String> {
+        [
+            self.parent_shard_id.clone(),
+            self.adjacent_parent_shard_id.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// The slice of the hash key space this shard covers, as a pair of integers. A bound
+    /// this emulator did not write — one that does not parse — covers nothing.
+    pub fn hash_key_bounds(&self) -> Option<(u128, u128)> {
+        Some((
+            self.starting_hash_key.parse::<u128>().ok()?,
+            self.ending_hash_key.parse::<u128>().ok()?,
+        ))
     }
 
     /// Append `record` to the shard and answer the sequence number it was stored under.
@@ -409,10 +512,11 @@ impl ShardRecord {
     pub fn to_shape(&self) -> Shard {
         Shard {
             shard_id: self.shard_id.clone(),
-            // Both are set only on a shard produced by a split or a merge, which is
-            // `SplitShard`/`MergeShards` work, not a create's.
-            parent_shard_id: None,
-            adjacent_parent_shard_id: None,
+            // Both are set only on a shard produced by a split or a merge, which is what a
+            // reshard performs ([`Self::from_parents`]); a shard a create laid down has
+            // neither.
+            parent_shard_id: self.parent_shard_id.clone(),
+            adjacent_parent_shard_id: self.adjacent_parent_shard_id.clone(),
             hash_key_range: HashKeyRange {
                 starting_hash_key: self.starting_hash_key.clone(),
                 ending_hash_key: self.ending_hash_key.clone(),
@@ -503,6 +607,17 @@ pub struct Stream {
     /// specified stream is in the DELETING state until Kinesis Data Streams completes the
     /// deletion" (`DeleteStream`). `None` for a stream nothing has deleted.
     pub deleted_at: Option<SystemTime>,
+    /// When the stream's `UPDATING` -> `ACTIVE` transition falls due, set by the
+    /// shard-count change that accepted the re-tiling: "Upon receiving the request...
+    /// sets the status of the stream to UPDATING. After the update is complete, Kinesis
+    /// Data Streams sets the status of the stream back to ACTIVE" (`UpdateShardCount`).
+    /// `None` for a stream nothing has rescaled.
+    pub updating_until: Option<SystemTime>,
+    /// The instants the stream's shard count was changed at, youngest last — what the
+    /// documented "ten times per rolling 24-hour period per stream" ceiling
+    /// ([`MAX_RESHARDS_PER_WINDOW`]) is counted over. Pruned to [`RESHARD_WINDOW`] by the
+    /// change that counts it, so it holds at most that many instants.
+    pub reshards: Vec<SystemTime>,
     /// The tags the create carried.
     pub tags: HashMap<String, String>,
 }
@@ -622,17 +737,133 @@ impl Stream {
     }
 
     /// The stream's status at `now`: `DELETING` once a delete has been accepted for it,
-    /// `CREATING` until the transition the create armed falls due, `ACTIVE` from then on.
-    /// Derived from the stored instants, so two reads at the same instant agree and no read
-    /// has to write.
+    /// `CREATING` until the transition the create armed falls due, `UPDATING` until the
+    /// one a shard-count change armed falls due, `ACTIVE` from then on. Derived from the
+    /// stored instants, so two reads at the same instant agree and no read has to write.
     pub fn status(&self, now: SystemTime) -> &'static str {
         if self.deleted_at.is_some() {
             STREAM_DELETING
         } else if now < self.active_at {
             STREAM_CREATING
+        } else if self.updating_until.is_some_and(|due| now < due) {
+            STREAM_UPDATING
         } else {
             STREAM_ACTIVE
         }
+    }
+
+    /// Whether the stream serves its shard map and its records at `now`.
+    ///
+    /// "You can continue to read and write data to your stream while its status is
+    /// UPDATING" (`UpdateShardCount`), so a stream whose re-tiling is still due serves a
+    /// read and a write exactly as an `ACTIVE` stream does; a stream whose create or whose
+    /// removal is still due has no shard map to serve at all.
+    pub fn serves_shards(&self, now: SystemTime) -> bool {
+        matches!(self.status(now), STREAM_ACTIVE | STREAM_UPDATING)
+    }
+
+    /// How many shard-count changes the stream has been scaled by inside the window
+    /// ending at `now`, which is what [`MAX_RESHARDS_PER_WINDOW`] bounds.
+    pub fn reshards_in_window(&self, now: SystemTime) -> usize {
+        let from = now.checked_sub(RESHARD_WINDOW).unwrap_or(UNIX_EPOCH);
+        self.reshards.iter().filter(|at| **at >= from).count()
+    }
+
+    /// Re-tile the stream's open shards onto `target_shard_count` equal slices of the hash
+    /// key space at `at`, answering how many shards were open before.
+    ///
+    /// "To update the shard count, Kinesis Data Streams performs splits or merges on
+    /// individual shards" (`UpdateShardCount`), and a uniform scaling "creates shards of
+    /// equal size" (`ScalingType`): every shard that was open is closed, and the whole key
+    /// space is covered again by `target_shard_count` contiguous equal slices, each child
+    /// naming the shards it was produced from. A shard that is already closed is left as it
+    /// is, so the records it holds stay readable until the retention window releases them,
+    /// and a map that already tiles the key space the target way is left untouched —
+    /// nothing is split or merged to reach a tiling it already has.
+    ///
+    /// Bounded by the caller: a target past the shard ceilings is refused BEFORE this
+    /// allocates from it.
+    pub fn reshard_uniformly(&mut self, target_shard_count: u32, at: SystemTime) -> i32 {
+        let open_before = self.open_shard_count();
+        let target = hash_key_ranges(target_shard_count);
+        let parents: Vec<(u128, u128, String)> = self
+            .shards
+            .iter()
+            .filter(|shard| shard.is_open())
+            .filter_map(|shard| {
+                let (starting, ending) = shard.hash_key_bounds()?;
+                Some((starting, ending, shard.shard_id.clone()))
+            })
+            .collect();
+
+        // The shard count is being changed, so the stream owes the `ACTIVE` it goes back
+        // to, and this change counts towards the rolling-window ceiling.
+        self.updating_until = Some(at + RESHARD_DELAY);
+        let from = at.checked_sub(RESHARD_WINDOW).unwrap_or(UNIX_EPOCH);
+        self.reshards.retain(|instant| *instant >= from);
+        self.reshards.push(at);
+
+        // A map whose open shards already are the target tiling needs no split and no
+        // merge: the shards stay open, keeping the sequence numbers their readers hold.
+        let unchanged = parents.len() == target.len()
+            && target.iter().zip(parents.iter()).all(
+                |((starting, ending), (parent_starting, parent_ending, _))| {
+                    starting.parse::<u128>().ok() == Some(*parent_starting)
+                        && ending.parse::<u128>().ok() == Some(*parent_ending)
+                },
+            );
+        if unchanged {
+            return open_before;
+        }
+
+        for shard in self.shards.iter_mut().filter(|shard| shard.is_open()) {
+            shard.close_at(at);
+        }
+        // A shard id is the shard's position in the map, so the children take the
+        // positions after every shard the map already holds and no id is ever reused.
+        let first_index = u32::try_from(self.shards.len()).unwrap_or(u32::MAX);
+        for (offset, (starting_hash_key, ending_hash_key)) in target.into_iter().enumerate() {
+            let index = first_index.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
+            let covered: Vec<String> = match (
+                starting_hash_key.parse::<u128>(),
+                ending_hash_key.parse::<u128>(),
+            ) {
+                (Ok(starting), Ok(ending)) => parents
+                    .iter()
+                    .filter(|(parent_starting, parent_ending, _)| {
+                        *parent_starting <= ending && *parent_ending >= starting
+                    })
+                    .map(|(_, _, shard_id)| shard_id.clone())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            self.shards.push(ShardRecord::from_parents(
+                index,
+                at,
+                starting_hash_key,
+                ending_hash_key,
+                &covered,
+            ));
+        }
+        open_before
+    }
+
+    /// The children of the shard `shard_id`, as `GetRecords` reports them — "the existing
+    /// child shard of the current shard" (`ChildShard`), which is what a reader that has
+    /// reached the end of a closed shard reads on from.
+    pub fn child_shards_of(&self, shard_id: &str) -> Vec<ChildShard> {
+        self.shards
+            .iter()
+            .filter(|shard| shard.is_child_of(shard_id))
+            .map(|shard| ChildShard {
+                shard_id: shard.shard_id.clone(),
+                parent_shards: shard.parent_shard_ids(),
+                hash_key_range: HashKeyRange {
+                    starting_hash_key: shard.starting_hash_key.clone(),
+                    ending_hash_key: shard.ending_hash_key.clone(),
+                },
+            })
+            .collect()
     }
 
     /// Whether this account and region still hold the stream at `now`: a stream a delete
@@ -1007,6 +1238,22 @@ pub fn stream_not_active_message(identifier: &str, status: &str) -> String {
     format!(
         "stream {identifier} is in state {status}, not {STREAM_ACTIVE}; the stream must be \
          {STREAM_ACTIVE} for this operation"
+    )
+}
+
+/// How an operation that only serves a provisioned stream refuses one whose shard count
+/// the service manages itself: "specifies that you tried to invoke this API for a data
+/// stream with the on-demand capacity mode. This API is only supported for data streams
+/// with the provisioned capacity mode" (`ValidationException`). Built FROM the stored
+/// record and this account, so the stream at fault names it.
+///
+/// ONE sentence for the one rule: `UpdateShardCount`, `SplitShard` and `MergeShards` all
+/// re-tile the shard map a provisioned stream owns, so they refuse an on-demand stream
+/// identically rather than each wording it.
+pub fn stream_on_demand_message(stream_name: &str) -> String {
+    format!(
+        "Request is invalid. Stream {stream_name} under account {} is in On-Demand mode.",
+        ::engine::emulator_account_id()
     )
 }
 

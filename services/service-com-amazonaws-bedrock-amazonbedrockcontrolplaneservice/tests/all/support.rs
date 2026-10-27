@@ -116,13 +116,18 @@ pub fn error_code(raw: &str) -> &str {
 /// in-process.
 pub struct Emulator {
     router: smithy_server_runtime::MultiServiceRouter,
+    /// The very engine the registered service holds, so a suite whose rule is about a span
+    /// of WALL-CLOCK time can read the store the handlers write and age a record it holds
+    /// instead of sleeping for that span. Requests still travel through
+    /// [`Self::call_in_region`]; this is never a second store.
+    pub engine: Arc<engine::InMemoryEngine>,
 }
 
 pub fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = smithy_server_runtime::MultiServiceRouter::new();
-    router.register_service(bedrock::EmulatedService::new(engine));
-    Emulator { router }
+    router.register_service(bedrock::EmulatedService::new(Arc::clone(&engine)));
+    Emulator { router, engine }
 }
 
 impl Emulator {

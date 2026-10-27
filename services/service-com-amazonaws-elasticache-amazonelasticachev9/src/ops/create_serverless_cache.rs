@@ -402,6 +402,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // `KmsKeyId` is the "ARN of the customer managed key for encrypting the
+        // data at rest", which the cache reports for the rest of its life, so the
+        // identifier the request named is resolved to the key's own ARN before it
+        // is stored (`crate::state::kms_key`) — before the store is locked,
+        // because resolving it is a call into KMS.
+        let kms_key_id = crate::state::kms_key::stored_key_id(ctx, &region, input.kms_key_id).await;
         let mut store = state.lock();
         // A user group that has become active since it was created is active
         // now, so the status read below is the settled one.
@@ -479,7 +485,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             engine,
             major_engine_version,
             cache_usage_limits: input.cache_usage_limits,
-            kms_key_id: input.kms_key_id,
+            kms_key_id,
             security_group_ids: input.security_group_ids.unwrap_or_default(),
             subnet_ids,
             user_group_id: input.user_group_id,
