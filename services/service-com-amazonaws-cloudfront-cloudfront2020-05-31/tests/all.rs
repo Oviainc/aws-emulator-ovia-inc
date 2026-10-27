@@ -91,6 +91,8 @@ mod error_envelope;
 mod field_level_encryption_config_lifecycle;
 #[path = "all/field_level_encryption_profile_lifecycle.rs"]
 mod field_level_encryption_profile_lifecycle;
+#[path = "all/field_level_encryption_profile_list.rs"]
+mod field_level_encryption_profile_list;
 #[path = "all/function_delete.rs"]
 mod function_delete;
 #[path = "all/function_lifecycle.rs"]
