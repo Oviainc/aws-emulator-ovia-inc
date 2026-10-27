@@ -166,12 +166,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a workspace created in another Region is not
+        // reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.materialize_due(now);
 
         // The configuration is a child of the scraper, so a scraper this account does
-        // not hold has no configuration to delete and is itself the missing resource.
-        if !store.scrapers.contains_key(&input.scraper_id) {
+        // not hold has no configuration to delete and is itself the missing resource —
+        // and a Region this account holds nothing in holds no scraper either.
+        let Some(store) = store
+            .held_region_mut(&region)
+            .filter(|store| store.scrapers.contains_key(&input.scraper_id))
+        else {
             return Err(
                 DeleteScraperLoggingConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -182,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
+        };
 
         let Some(configuration) = store.scraper_logging.get_mut(&input.scraper_id) else {
             return Err(

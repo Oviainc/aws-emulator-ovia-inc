@@ -186,12 +186,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.materialize_due(now);
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a workspace created in another Region is not
+        // reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
+        let mut guard = state.lock();
+        guard.materialize_due(now);
 
         // The namespace lives "within a workspace", so without that workspace there is
-        // nothing to delete: `ResourceNotFoundException` (404).
-        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+        // nothing to delete: `ResourceNotFoundException` (404) — and a Region this account
+        // holds nothing in holds no workspace either.
+        let Some(workspace) = guard
+            .held_region_mut(&region)
+            .and_then(|store| store.workspaces.get_mut(&input.workspace_id))
+        else {
             return Err(
                 DeleteRuleGroupsNamespaceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -288,7 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             namespace.update_token = None;
         }
         let namespace_arn = namespace.arn.clone();
-        drop(store);
+        drop(guard);
 
         // The call changed stored state (or replayed the call that did), so it leaves an
         // access record naming the operation, the resource and the key id the request

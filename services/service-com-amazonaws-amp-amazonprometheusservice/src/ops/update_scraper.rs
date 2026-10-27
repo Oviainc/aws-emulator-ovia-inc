@@ -187,22 +187,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.materialize_due(now);
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a scraper created in another Region is not
+        // reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
+        let mut guard = state.lock();
+        guard.materialize_due(now);
 
         // The destination this call would persist is a REFERENCE to another resource, so
         // it is resolved against the store before anything is written, exactly as it is
         // on the create path — one rule, shared in
-        // `crate::state::ComAmazonawsAmpAmazonprometheusserviceState::unresolved_destination_workspace`,
-        // so a reference this service refuses to store is never reachable by changing a
-        // scraper it already stored. Resolved HERE, before the record is borrowed to be
-        // written, because resolving a reference searches the whole store.
-        let unresolved_destination = input
-            .destination
-            .as_ref()
-            .and_then(|destination| store.unresolved_destination_workspace(destination));
+        // `crate::state::RegionalState::unresolved_destination_workspace` — and resolved
+        // against THIS REGION's records, since a workspace of another Region is not
+        // reachable from this endpoint. Resolved HERE, before the record is borrowed to be
+        // written, because resolving a reference searches the whole Region's store.
+        let unresolved_destination = input.destination.as_ref().and_then(|destination| {
+            guard
+                .region(&region)
+                .unresolved_destination_workspace(destination)
+        });
 
-        let Some(scraper) = store.scrapers.get_mut(&input.scraper_id) else {
+        // A Region this account holds nothing in holds no scraper either, so it answers
+        // the same refusal the missing scraper does.
+        let Some(scraper) = guard
+            .held_region_mut(&region)
+            .and_then(|store| store.scrapers.get_mut(&input.scraper_id))
+        else {
             return Err(UpdateScraperErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::SCRAPER_NOT_FOUND_MESSAGE.to_string(),
@@ -299,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             tags: crate::state::tag_map(&scraper.tags),
         };
-        drop(store);
+        drop(guard);
         // Recorded only where the call actually CHANGED this service's state: a replay of
         // the pending update wrote nothing, so it is not a state change to record. What is
         // recorded is the operation, the resource and the access-key id the request

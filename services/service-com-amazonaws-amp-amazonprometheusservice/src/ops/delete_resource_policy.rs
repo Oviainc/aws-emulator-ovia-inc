@@ -182,15 +182,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a workspace created in another Region is not
+        // reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.materialize_due(now);
 
-        let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
+        // A Region this account holds nothing in holds no workspace either, so it answers
+        // the same refusal the missing workspace does.
+        let Some(store) = store
+            .held_region_mut(&region)
+            .filter(|store| store.workspaces.contains_key(&input.workspace_id))
+        else {
             return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
                     resource_id: input.workspace_id.clone(),
                     resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+        let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
+            // Unreachable: the store is locked for this whole handler, and the line above
+            // established that it holds this workspace. Answered rather than asserted, so
+            // a future refactor cannot turn it into a success that persisted nothing.
+            return Err(DeleteResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "The workspace went away while its resource-based policy was \
+                              being deleted"
+                        .to_string(),
+                    retry_after_seconds: None,
                 },
             )
             .into());
