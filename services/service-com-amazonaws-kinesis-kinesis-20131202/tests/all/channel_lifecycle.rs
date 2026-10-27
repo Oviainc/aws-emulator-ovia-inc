@@ -210,7 +210,7 @@ pub(crate) fn description(case: &str, response: &Value) -> Value {
 
 /// The channel's description with the status taken out: the status is the one member the clock
 /// moves, so this is what two reads of one channel must agree on.
-fn description_without_status(case: &str, response: &Value) -> Value {
+pub(crate) fn description_without_status(case: &str, response: &Value) -> Value {
     let mut description = description(case, response);
     if let Some(members) = description.as_object_mut() {
         members.remove("ChannelStatus");

@@ -339,15 +339,27 @@ impl Emulator {
     }
 }
 
-/// Wait until the clock-owed `PENDING` -> `ACTIVE` transition of a just-created Outpost
-/// has fallen due.
+/// Bring every install the orders placed in the co-hosted AWS Outposts control plane
+/// owe due NOW.
 ///
-/// AWS Outposts answers `CreateOutpost` with a provisioning Outpost and materialises
-/// that transition at the instant it stored, so a case that wants active Outposts waits
-/// past that span plus a margin. Blocking with `std::thread::sleep` because the
-/// workspace's `tokio` carries no timer driver.
-fn settle_outposts() {
-    std::thread::sleep(outposts_state::OUTPOST_PROVISIONING + Duration::from_millis(400));
+/// An Outpost of that control plane holds no hardware, and reports the non-terminal
+/// lifecycle status, until an order placed on it has delivered hardware and that
+/// hardware has been installed — the steps of which fall due over spans far longer than
+/// a case may sleep for. So every order is placed over the wire, exactly as a caller
+/// places one, and only the instants its steps fall due at are moved, through the same
+/// store seam this suite reaches that control plane through. The next call materialises
+/// what the clock then owes. An order nothing is owed on — a cancelled one — is left
+/// exactly as it is.
+fn deliver_orders(emulator: &Emulator) {
+    let store = emulator.outposts_store();
+    let mut store = store.lock();
+    let (due, at) = (std::time::Instant::now(), std::time::SystemTime::now());
+    for record in store.orders.values_mut() {
+        for transition in record.pending.iter_mut() {
+            transition.due = due;
+            transition.at = at;
+        }
+    }
 }
 
 /// Which catalog configuration a line item of a case names.
@@ -559,7 +571,7 @@ async fn an_outpost_is_reported_with_the_s3_capacity_its_orders_provisioned() {
                 .an_order_in(REGION, &outpost_id, &catalog.line_items(order))
                 .await;
         }
-        settle_outposts();
+        deliver_orders(&emulator);
 
         let reported = only_outpost(case, &emulator.inventory(REGION).await);
         let expected = catalog.provisioned(orders);
@@ -643,7 +655,7 @@ async fn an_outpost_without_ordered_s3_capacity_is_reported_and_resolved_nowhere
                 emulator.cancel_order_in(REGION, &order_id).await;
             }
         }
-        settle_outposts();
+        deliver_orders(&emulator);
 
         assert!(
             emulator.inventory(REGION).await.is_empty(),
@@ -705,8 +717,8 @@ async fn only_an_active_outpost_that_is_not_being_decommissioned_is_reported() {
         )
         .await;
 
-    // Straight after the create the Outpost is still provisioning, so it has no S3
-    // capacity to report yet and nothing resolves it.
+    // Nothing has been installed on the Outpost yet, so it has no S3 capacity to
+    // report and nothing resolves it.
     assert!(
         emulator.inventory(REGION).await.is_empty(),
         "an Outpost that is still provisioning is in no inventory, got {:?}",
@@ -719,7 +731,7 @@ async fn only_an_active_outpost_that_is_not_being_decommissioned_is_reported() {
         early.status, early.body
     );
 
-    settle_outposts();
+    deliver_orders(&emulator);
     assert_eq!(
         reported_ids(&emulator.inventory(REGION).await),
         vec![outpost_id.clone()],
@@ -759,7 +771,7 @@ async fn the_endpoint_lifecycle_runs_on_an_outpost_the_control_plane_provisioned
             &catalog.line_items(&[(Item::S3(1), 2)]),
         )
         .await;
-    settle_outposts();
+    deliver_orders(&emulator);
 
     let created = emulator.create_endpoint_in(REGION, &outpost_id, 3).await;
     assert_eq!(
@@ -855,7 +867,7 @@ async fn each_region_reports_only_the_outposts_provisioned_in_it() {
             .await;
         placed.push((region, partition, outpost_id));
     }
-    settle_outposts();
+    deliver_orders(&emulator);
 
     for (region, partition, outpost_id) in &placed {
         let case = format!("{region} ({partition})");
@@ -907,7 +919,7 @@ async fn a_shared_outpost_is_reported_beside_the_accounts_own() {
             .await;
         own.push(outpost_id);
     }
-    settle_outposts();
+    deliver_orders(&emulator);
 
     // And one of ANOTHER account, shared through Resource Access Manager. No AWS API
     // of this emulator shares an Outpost, so it is declared through the store seam the

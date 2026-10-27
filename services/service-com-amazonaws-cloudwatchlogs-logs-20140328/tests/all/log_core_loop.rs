@@ -12,7 +12,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{base_ms, batch, group_with_stream, Logs, REGION};
+use crate::harness::{base_ms, batch, group_with_stream, messages, Logs, REGION};
 
 /// A log group class the model declares. Source: the `LogGroupClass` enum, surfaced in
 /// the crate as `LOG_GROUP_CLASS_VALUES` ("DELIVERY", "INFREQUENT_ACCESS", "STANDARD").
@@ -20,22 +20,6 @@ const LOG_GROUP_CLASSES: &[&str] = &["STANDARD", "INFREQUENT_ACCESS", "DELIVERY"
 
 /// The account id every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
-
-/// The `message` values of a `GetLogEvents` page, in the order returned.
-fn messages(page: &Value) -> Vec<String> {
-    page.get("events")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("GetLogEvents must return events, got {page}"))
-        .iter()
-        .map(|event| {
-            event
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("every event carries a message, got {event}"))
-                .to_string()
-        })
-        .collect()
-}
 
 /// A create is readable back through `DescribeLogGroups`, with the ARNs, the class and
 /// the counters the model declares — over the whole class of accepted names and classes.

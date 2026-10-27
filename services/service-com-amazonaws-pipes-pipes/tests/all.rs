@@ -25,6 +25,8 @@ mod pipe_description;
 mod pipe_lifecycle;
 #[path = "all/pipe_lifecycle_conflicts.rs"]
 mod pipe_lifecycle_conflicts;
+#[path = "all/pipe_metrics.rs"]
+mod pipe_metrics;
 #[path = "all/pipe_refusal_bodies.rs"]
 mod pipe_refusal_bodies;
 #[path = "all/pipe_tagging.rs"]

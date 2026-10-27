@@ -17,7 +17,8 @@
 //!    of each instance family the ordered configuration publishes EC2 capacity of
 //!    (read off `ListCatalogItems`, which every expectation below is computed from
 //!    rather than spelled out). Capacity is configured ON compute hardware, so an
-//!    Outpost holding none — one still provisioning — is configured with nothing.
+//!    Outpost holding none — one whose ordered hardware is not installed yet — is
+//!    configured with nothing.
 //! 3. Every reported entry carries the `VCPUs` the published instance-type catalog
 //!    reports for its type, so this report cannot disagree with what
 //!    `ListOrderableInstanceTypes` says about an instance type; a type that catalog
@@ -47,8 +48,8 @@ use service_com_amazonaws_outposts_outpostsolafservice::ops::types::{AssetInfo, 
 use crate::capacity_task_lifecycle::{an_order, pool, settle_capacity_task, start_ok};
 use crate::outpost_assets::record;
 use crate::site_and_outpost_lifecycle::{
-    query_value, refusal, segment, settle, text, Outposts, Refusal, ABSENT_OUTPOST_ID,
-    OUTPOST_ARN_PREFIX,
+    deliver_orders, install_hardware, query_value, refusal, segment, text, Outposts, Refusal,
+    ABSENT_OUTPOST_ID, OUTPOST_ARN_PREFIX,
 };
 
 /// An instance type the modelled `InstanceTypeName` pattern (`^[a-z0-9\-]+\.[a-z0-9\-]+$`)
@@ -572,21 +573,21 @@ async fn an_outpost_no_capacity_task_has_touched_is_configured_by_its_orders() {
         placed.push(outpost_id);
     }
 
-    // Capacity is configured ON hardware, so an Outpost that is still provisioning is
-    // configured with nothing however much it has ordered — asserted BEFORE the wait
-    // that installs that hardware.
+    // Capacity is configured ON hardware, so an Outpost whose ordered hardware has not
+    // been installed is configured with nothing however much it has ordered — asserted
+    // BEFORE that hardware is delivered and installed.
     for (row, outpost_id) in rows.iter().zip(&placed) {
         let answer = configured(&outposts, outpost_id, "").await;
         assert_eq!(
             reported(&answer),
             Vec::new(),
-            "case {:?}: an Outpost still provisioning holds no hardware, so nothing is \
-             configured on it, got {answer:?}",
+            "case {:?}: an Outpost holding no hardware yet has nothing configured on it, \
+             got {answer:?}",
             row.case
         );
     }
 
-    settle();
+    deliver_orders(&outposts);
     for (row, outpost_id) in rows.iter().zip(&placed) {
         let case = row.case;
         // What the rule expects, computed from the published catalog: the largest size
@@ -753,6 +754,7 @@ async fn the_report_pages_and_refuses_a_token_it_did_not_issue() {
 async fn the_report_names_its_outpost_and_leaves_everything_as_it_was() {
     let outposts = Outposts::new();
     let (outpost_id, outpost_arn) = an_outpost(&outposts, "reporting", Some("RACK")).await;
+    install_hardware(&outposts, &outpost_id).await;
     let started = start_ok(
         &outposts,
         &outpost_id,

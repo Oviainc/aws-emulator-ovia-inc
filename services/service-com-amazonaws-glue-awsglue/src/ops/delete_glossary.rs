@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGlossary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGlossary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGlossary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the business glossary the request's `Identifier` names from this account's
+//! glossary namespace ([`crate::state::ComAmazonawsGlueAwsglueState::glossaries`]), so a
+//! later `GetGlossary` of that identifier misses. The identifier is the opaque
+//! `GlossaryId` `CreateGlossary` minted, which is the key the namespace holds the record
+//! under.
+//!
+//! Two things this delete does NOT do:
+//!
+//! * It does not refuse a glossary that still holds glossary TERMS, and does not remove
+//!   those terms. The model's prose says a glossary cannot be deleted while it still
+//!   contains terms, but the behaviour RECORDED for exactly that case is a served delete,
+//!   after which the glossary itself misses — the same divergence `DeleteFormType` records
+//!   for a form type an asset type still references — so the recording is what this
+//!   follows. A term is not held by the glossary record either: it records the glossary it
+//!   was created in ([`crate::state::GlossaryTermEntry::glossary_id`]) and is addressed by
+//!   its own `GlossaryTermId`, so each term is still read back by `GetGlossaryTerm` and
+//!   still listed by `ListGlossaryTerms` for the identifier it was created under, naming
+//!   that identifier, while the glossary itself is gone. Only the glossary record is
+//!   removed.
+//! * It reports no miss. `GetGlossary` models `EntityNotFoundException` and this operation
+//!   does not model it at all, so an identifier this account holds no glossary under is
+//!   answered as the delete of something already absent: the caller asked for the state
+//!   the store is already in, and a repeated delete of one identifier answers the same way
+//!   as the first — the reading `DeleteFormType` takes of the same error list.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +160,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGlossary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGlossaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGlossary"))
+        // Glossaries live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(DeleteGlossaryErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue glossary store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The record is removed through the one accessor that resolves a `GlossaryId`
+        // ([`crate::state::ComAmazonawsGlueAwsglueState::remove_glossary`]), and ONLY that
+        // record: the glossary's terms live in their own namespace and are left exactly as
+        // their own writes left them. An identifier that resolves to nothing removes
+        // nothing and is still served: this operation models no miss.
+        match store.remove_glossary(&input.identifier) {
+            Some(removed) => ::tracing::info!(
+                operation = "DeleteGlossary",
+                glossary = %removed.id,
+                "deleted a Glue business glossary"
+            ),
+            None => ::tracing::info!(
+                operation = "DeleteGlossary",
+                "no Glue business glossary to delete for the requested identifier"
+            ),
+        }
+
+        // `DeleteGlossaryResponse` models no members: the delete reports only that it
+        // happened.
+        Ok(DeleteGlossaryOutput {})
     }
 }

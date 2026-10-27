@@ -23,6 +23,8 @@ mod account_sending_attributes;
 mod account_suppression_attributes;
 #[path = "all/account_vdm_attributes.rs"]
 mod account_vdm_attributes;
+#[path = "all/boundary_validation_message.rs"]
+mod boundary_validation_message;
 #[path = "all/configuration_set_event_destination_deletion.rs"]
 mod configuration_set_event_destination_deletion;
 #[path = "all/configuration_set_event_destinations.rs"]
@@ -47,14 +49,20 @@ mod email_identity_certificates;
 mod email_identity_configuration_set_association;
 #[path = "all/email_identity_dkim_attributes.rs"]
 mod email_identity_dkim_attributes;
+#[path = "all/email_identity_dkim_inheritance.rs"]
+mod email_identity_dkim_inheritance;
 #[path = "all/email_identity_feedback_attributes.rs"]
 mod email_identity_feedback_attributes;
 #[path = "all/email_identity_lifecycle.rs"]
 mod email_identity_lifecycle;
+#[path = "all/email_identity_listing_route.rs"]
+mod email_identity_listing_route;
 #[path = "all/email_identity_mail_from_attributes.rs"]
 mod email_identity_mail_from_attributes;
 #[path = "all/email_identity_policies.rs"]
 mod email_identity_policies;
+#[path = "all/email_identity_verification_info.rs"]
+mod email_identity_verification_info;
 #[path = "all/email_templates.rs"]
 mod email_templates;
 #[path = "all/export_jobs.rs"]
@@ -73,6 +81,8 @@ mod reputation_entities;
 mod request_claim;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/send_list_management_options.rs"]
+mod send_list_management_options;
 #[path = "all/send_unverified_identity_refusal.rs"]
 mod send_unverified_identity_refusal;
 #[path = "all/state_roundtrip.rs"]

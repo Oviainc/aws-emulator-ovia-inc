@@ -27,8 +27,10 @@
 //! commissions a node or isolates it
 //! ([`ComAmazonawsMedialiveMedialiveState::apply_node_state`]), and every other
 //! value of the `NodeState` enum is either where a create starts
-//! ([`node_state::CREATED`]), what a deletion walks through, or a state only the
-//! node's own hardware could reach (see [`node_state`]).
+//! ([`node_state::CREATED`]), what a deletion walks through, what the service's
+//! OWN work puts the node in while a channel runs on it
+//! ([`ComAmazonawsMedialiveMedialiveState::reported_node_state`]), or a state
+//! only the node's own hardware could reach (see [`node_state`]).
 //!
 //! A node's SETTINGS — its `Name`, its `Role` and its SDI source mappings — are
 //! what `UpdateNode` changes
@@ -41,7 +43,11 @@
 //! A node's DELETION is a DEREGISTRATION: the `NodeState` enum models no
 //! `DELETING`/`DELETED` pair, it models `DEREGISTERING` and the terminal
 //! `DEREGISTERED`, which is what `DeleteNode`'s `202 Accepted` accepts and what
-//! the clock then settles the node into ([`NodeRecord::settle`]). As everywhere
+//! the clock then settles the node into ([`NodeRecord::settle`]). It is accepted
+//! only for a node that is IDLE — a node still running a channel is refused
+//! before anything is written
+//! ([`ComAmazonawsMedialiveMedialiveState::deregister_node_description`]), the
+//! same precondition the cluster's own delete enforces. As everywhere
 //! else in this service a delete never drops the record: the node stays readable
 //! in its terminal state instead of vanishing. The instant is STORED and never
 //! slept on — [`ComAmazonawsMedialiveMedialiveState::settle`], which every
@@ -64,17 +70,18 @@ use super::{ComAmazonawsMedialiveMedialiveState, SdiSourceRecord, TRANSIENT_STAT
 /// READY | IN_USE | DEREGISTERING | DRAINING | DEREGISTRATION_FAILED |
 /// DEREGISTERED).
 ///
-/// The seven the model declares but this slice does not name are the ones
-/// nothing here can reach. A node's registration, activation and encoding all
-/// happen on node HARDWARE running the Elemental Anywhere software, which this
-/// emulator does not run: nothing registers (`REGISTERING`,
-/// `READY_TO_ACTIVATE`, `REGISTRATION_FAILED`), nothing reports a readiness it
-/// learnt from that software (`ACTIVATION_FAILED`, `READY`), and no node ever
-/// encodes (`IN_USE`) — a channel placed in a ChannelPlacementGroup that names a
-/// node is an ASSOCIATION, which the node reports through its
-/// `ChannelPlacementGroups` and the group through its own `State`, not work
-/// running on the node. `DEREGISTRATION_FAILED` reports a failure of that same
-/// software, which this emulator never fabricates either.
+/// The six the model declares but this slice does not name are the ones
+/// nothing here can reach. A node's registration and activation happen on node
+/// HARDWARE running the Elemental Anywhere software, which this emulator does
+/// not run: nothing registers (`REGISTERING`, `READY_TO_ACTIVATE`,
+/// `REGISTRATION_FAILED`) and nothing reports a readiness it learnt from that
+/// software (`ACTIVATION_FAILED`, `READY`). `DEREGISTRATION_FAILED` reports a
+/// failure of that same software, which this emulator never fabricates either.
+///
+/// `IN_USE` IS reached, and is derived rather than stored
+/// ([`ComAmazonawsMedialiveMedialiveState::reported_node_state`]): a node is in
+/// use exactly while a channel placed in one of the ChannelPlacementGroups it
+/// is assigned to is running, which is the state this emulator does model.
 ///
 /// `ACTIVE` and `DRAINING` are the two the CALLER asks for: they are exactly the
 /// value set of `UpdateNodeStateShape` (`smithy_query(query="shape",
@@ -92,6 +99,9 @@ pub mod node_state {
     /// A node the caller has ISOLATED: `UpdateNodeState`'s `State` "Set to
     /// DRAINING to isolate the Node so that MediaLive Anywhere won't use it".
     pub const DRAINING: &str = "DRAINING";
+    /// A node a channel is RUNNING on, which is what the node's delete is
+    /// refused on ("Delete a Node. The Node must be IDLE").
+    pub const IN_USE: &str = "IN_USE";
     /// What `DeleteNode` accepts a node into, and what the clock settles.
     pub const DEREGISTERING: &str = "DEREGISTERING";
     /// The terminal state a deregistered node keeps.
@@ -212,6 +222,38 @@ pub enum NodeStateRefusal {
     /// The node exists but its deregistration has already been accepted, so it
     /// is readable and no longer writable.
     DeleteAccepted,
+}
+
+/// Why [`ComAmazonawsMedialiveMedialiveState::deregister_node_description`]
+/// accepted no delete. Each variant leaves the stored node exactly as it was.
+#[derive(Debug)]
+pub enum NodeDeleteRefusal {
+    /// The cluster and node id pair names no node at all — an id no node ever
+    /// had, or one presented under a cluster it does not belong to.
+    NoSuchNode,
+    /// Channels are still running on the node, so it is not idle. Carries their
+    /// ids as the refusal names them, in the order
+    /// [`ComAmazonawsMedialiveMedialiveState::channels_running_on_node`]
+    /// derives them.
+    NotIdle { channels: Vec<String> },
+}
+
+/// The message a delete refused on a node that is still running channels
+/// carries: the node the REQUEST named, how many channels are running on it and
+/// which they are, then the rule the delete is held to ("Delete a Node. The
+/// Node must be IDLE").
+///
+/// The same shape as the cluster side's refusal for the same rejection class
+/// ([`super::cluster_not_idle_message`]), so the two deletes of this family
+/// cannot word "this resource is not idle" two ways. Every value is read off
+/// the request and the store.
+pub fn node_not_idle_message(node_id: &str, channels: &[String]) -> String {
+    format!(
+        "Node {node_id} still has {} channel(s) running on it ({}); a node must be idle \
+         before it can be deleted",
+        channels.len(),
+        channels.join(", ")
+    )
 }
 
 /// Why [`ComAmazonawsMedialiveMedialiveState::apply_node_changes`] wrote
@@ -564,8 +606,47 @@ impl ComAmazonawsMedialiveMedialiveState {
             name: node.name.clone(),
             node_interface_mappings: Some(node.node_interface_mappings.clone()),
             role: node.role.clone(),
-            state: Some(node.state.clone()),
+            // "The current state of the Node": the state the node is in as the
+            // store sees it, which is the record's own except while work is
+            // running on the node ([`Self::reported_node_state`]).
+            state: Some(self.reported_node_state(node).to_string()),
             sdi_source_mappings: Some(node.sdi_source_mappings.clone()),
+        }
+    }
+
+    /// The `State` a node REPORTS — "The current state of the Node"
+    /// (`smithy_query(query="doc", shape="DescribeNodeSummary",
+    /// member="State")`).
+    ///
+    /// A node whose deregistration has been accepted reports that: the
+    /// `DEREGISTERING` it was accepted into and the terminal `DEREGISTERED` the
+    /// clock settles it to are where the node is on its way out of the cluster,
+    /// and nothing may be running on it from there.
+    ///
+    /// Otherwise `IN_USE` while a channel is running on the node
+    /// ([`Self::channels_running_on_node`]) — that is the one `NodeState` value
+    /// for a node a channel is using, and it is a fact about the service's own
+    /// work rather than something a caller sets: `UpdateNodeState` asks whether
+    /// MediaLive Anywhere MAY use the node (`ACTIVE` "to indicate that the Node
+    /// is deployable", `DRAINING` "to isolate the Node so that MediaLive
+    /// Anywhere won't use it"), not whether it currently IS using it, so a node
+    /// the caller has drained still reports the work it has not finished yet.
+    ///
+    /// Otherwise the state the record carries: where the create left it
+    /// ([`node_state::CREATED`]) or the state a caller last asked for. Derived
+    /// on every read and never written, so a read reports what a later caller
+    /// would see too.
+    fn reported_node_state<'a>(&self, node: &'a NodeRecord) -> &'a str {
+        if node.is_delete_accepted() {
+            return &node.state;
+        }
+        if self
+            .channels_running_on_node(&node.cluster_id, &node.id)
+            .is_empty()
+        {
+            &node.state
+        } else {
+            node_state::IN_USE
         }
     }
 
@@ -576,8 +657,60 @@ impl ComAmazonawsMedialiveMedialiveState {
         Some(self.node_summary(node))
     }
 
+    /// The ids of the channels this node is RUNNING right now — what makes a
+    /// node NOT idle, and what the refusal of its delete reports.
+    ///
+    /// A channel reaches a node through the ChannelPlacementGroup it is placed
+    /// in: the group is assigned to the nodes it names
+    /// ([`Self::channel_placement_groups_with_node`]) and a channel names the
+    /// group it is placed in, so the channels on this node are the ones placed
+    /// in those groups. Of those, only the ones whose pipelines are UP occupy
+    /// the node ([`super::ChannelRecord::is_on_air`]): a channel that is
+    /// waiting idle, being created, having its configuration applied or on its
+    /// way out of the account runs nothing on the hardware, so it leaves the
+    /// node idle.
+    ///
+    /// Derived from the store on every call, so it tracks every later start,
+    /// stop, placement and delete rather than being recorded on the node.
+    ///
+    /// BOUNDED work: the group scan and the channel scan are each bounded by
+    /// their own store's ceiling ([`super::MAX_CHANNEL_PLACEMENT_GROUPS`],
+    /// [`super::MAX_CHANNELS`]).
+    pub fn channels_running_on_node(&self, cluster_id: &str, node_id: &str) -> Vec<String> {
+        self.channel_placement_groups_with_node(cluster_id, node_id)
+            .iter()
+            .flat_map(|group| self.channels_in_channel_placement_group(cluster_id, group))
+            .filter(|channel| {
+                self.channels
+                    .get(channel)
+                    .is_some_and(super::ChannelRecord::is_on_air)
+            })
+            .collect()
+    }
+
     /// Accept a delete for the node `node_id` of `cluster_id` and answer the node
-    /// as the acceptance left it, or `None` when the store holds no such node.
+    /// as the acceptance left it, or refuse.
+    ///
+    /// "Delete a Node. The Node must be IDLE" is the documented precondition: a
+    /// node that is still running channels ([`Self::channels_running_on_node`])
+    /// is refused, exactly as a cluster that still holds resources refuses its
+    /// own identically-worded precondition ([`Self::delete_cluster`]), and the
+    /// refusal is taken BEFORE the first write, so a refused delete leaves the
+    /// stored node exactly as it was.
+    ///
+    /// Which state the node is in is NOT a precondition of its own. The two
+    /// states a caller can ask for are `ACTIVE` and `DRAINING`
+    /// (`UpdateNodeStateShape`), and `DRAINING` is documented as the state that
+    /// isolates the node "so that MediaLive Anywhere won't use it" — the state
+    /// a node is put into on its way out of the cluster — so a drained node is
+    /// idle rather than busy. What makes a node busy is work running on it, and
+    /// that is what this checks.
+    ///
+    /// IDEMPOTENT: a delete already accepted writes nothing and is accepted
+    /// again — the state the caller is asking for is the one the node is
+    /// already heading for or in, so nothing about the request conflicts with
+    /// the stored node, a repeat can neither restart the clock nor revive a
+    /// deregistered node, and the idle rule is not applied a second time.
     ///
     /// The state write and the projection live together here, so the response
     /// reports the state that was stored rather than one a handler assembled: its
@@ -589,10 +722,22 @@ impl ComAmazonawsMedialiveMedialiveState {
         cluster_id: &str,
         node_id: &str,
         now: SystemTime,
-    ) -> Option<DescribeNodeSummary> {
-        let node = self.node_mut(cluster_id, node_id)?;
-        node.begin_deregister(now);
+    ) -> Result<DescribeNodeSummary, NodeDeleteRefusal> {
+        let accepted = self
+            .node(cluster_id, node_id)
+            .ok_or(NodeDeleteRefusal::NoSuchNode)?
+            .is_delete_accepted();
+        if !accepted {
+            let channels = self.channels_running_on_node(cluster_id, node_id);
+            if !channels.is_empty() {
+                return Err(NodeDeleteRefusal::NotIdle { channels });
+            }
+            self.node_mut(cluster_id, node_id)
+                .ok_or(NodeDeleteRefusal::NoSuchNode)?
+                .begin_deregister(now);
+        }
         self.node_description(cluster_id, node_id)
+            .ok_or(NodeDeleteRefusal::NoSuchNode)
     }
 
     /// Put the node `node_id` of `cluster_id` into the state `state` asks for

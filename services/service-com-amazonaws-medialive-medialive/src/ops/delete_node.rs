@@ -11,6 +11,10 @@
 //! `DescribeNode` reports. As everywhere else in this service the record stays
 //! in the account in its terminal state rather than vanishing.
 //!
+//! "The Node must be IDLE" is the precondition, so a node a channel is still
+//! running on is refused with the modelled `ConflictException` and nothing is
+//! written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -202,30 +206,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // gives a repeated delete.
         //
         // "The Node must be IDLE" is the documented precondition, and the
-        // modelled `ConflictException` is what refuses a node that is not: a node
-        // the real service is RUNNING a channel on (`IN_USE`, `DRAINING`). No
-        // node in this emulator can be in either state — nothing encodes on a
-        // node here, and a channel placed in a ChannelPlacementGroup that names
-        // a node is an association the node reports through its
-        // `ChannelPlacementGroups`, not work running on it — so that refusal
-        // belongs to the change that makes a node run something, and claiming it
-        // now would refuse a delete no stored state justifies.
+        // modelled `ConflictException` is what refuses a node that is not: a
+        // node the service is RUNNING a channel on, which it reports as
+        // `IN_USE`. The precondition, the acceptance and the projection all live
+        // in the slice, so the body reports what was STORED rather than
+        // something assembled here, and a refused delete leaves the node exactly
+        // as it was.
         //
         // The response is the node this call deregistered, projected by the
         // store: its `State` is the one the acceptance just wrote and every other
         // member is the stored record's.
         let node = state
             .deregister_node_description(&input.cluster_id, &input.node_id, now)
-            .ok_or_else(|| {
-                DeleteNodeError::from(DeleteNodeErrorModeled::NotFoundException(
-                    NotFoundException {
-                        message: Some(crate::state::not_found_message("Node", &input.node_id)),
-                    },
-                ))
-            })?;
+            .map_err(|refusal| refused(refusal, &input.node_id))?;
 
         Ok(crate::state::node_description_output!(DeleteNodeOutput, node))
     }
+}
+
+/// The modelled error a [`crate::state::NodeDeleteRefusal`] is answered with.
+///
+/// A cluster/node pair the store holds no node for is this operation's modelled
+/// `NotFoundException` (404), worded by the shared helper every reader of this
+/// service uses, exactly as `DescribeNode` refuses the same pair. A node that is
+/// not idle is the modelled `ConflictException` (409) — the refusal a delete
+/// blocked by what the resource still holds gets throughout this service
+/// (`DeleteCluster`, `DeleteChannelPlacementGroup`) — carrying the node slice's
+/// own wording for that rejection class.
+fn refused(refusal: crate::state::NodeDeleteRefusal, node_id: &str) -> DeleteNodeError {
+    use crate::state::NodeDeleteRefusal as Refusal;
+    match refusal {
+        Refusal::NoSuchNode => DeleteNodeErrorModeled::NotFoundException(NotFoundException {
+            message: Some(crate::state::not_found_message("Node", node_id)),
+        }),
+        Refusal::NotIdle { channels } => {
+            DeleteNodeErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::node_not_idle_message(node_id, &channels)),
+            })
+        }
+    }
+    .into()
 }
 
 /// The engine this operation was built from is not the shared in-memory engine,

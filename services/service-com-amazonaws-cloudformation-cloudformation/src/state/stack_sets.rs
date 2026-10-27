@@ -318,6 +318,14 @@ pub fn target_accounts(
     Ok(selected)
 }
 
+/// The `OperationInProgressException` message CloudFormation answers a request that asks a
+/// stack set to perform an operation while it is already performing one: the stack set the
+/// request named, by ARN, and the `OperationId` of the operation that still holds it — both
+/// taken from the record the store holds, never from any one run.
+pub fn operation_in_progress_message(stack_set_arn: &str, operation_id: &str) -> String {
+    format!("Another Operation on StackSet {stack_set_arn} is in progress: {operation_id}")
+}
+
 /// One resource of one stack instance, as the drift detection that covered it found it —
 /// every member `StackInstanceResourceDriftsSummary` reports.
 #[derive(Debug, Clone)]
@@ -476,15 +484,22 @@ impl StoredStackSet {
             .find(|operation| operation.operation_id == operation_id)
     }
 
-    /// Whether an operation on this stack set is still RUNNING — the state
-    /// `OperationInProgressException` reports ("another operation is currently in progress
-    /// for this StackSet").
-    pub fn operation_in_progress(&self) -> bool {
-        self.operations.iter().any(|operation| {
+    /// The operation still in flight on this stack set, if one is — the operation
+    /// `OperationInProgressException` names ("another operation is currently in progress for
+    /// this StackSet").
+    pub fn operation_in_flight(&self) -> Option<&StoredStackSetOperation> {
+        self.operations.iter().find(|operation| {
             operation.status == operation_status::RUNNING
                 || operation.status == operation_status::QUEUED
                 || operation.status == operation_status::STOPPING
         })
+    }
+
+    /// Whether an operation on this stack set is still RUNNING — the state
+    /// `OperationInProgressException` reports ("another operation is currently in progress
+    /// for this StackSet").
+    pub fn operation_in_progress(&self) -> bool {
+        self.operation_in_flight().is_some()
     }
 
     /// The instance deployed in `account` and `region`, if this stack set holds one.

@@ -9,11 +9,12 @@
 //! test, each stated once and then exercised over a SET of inputs:
 //!
 //! 1. Hardware is what an Outpost IS: Amazon Web Services installs the configuration
-//!    the Outpost's form factor names, and the Outpost reaches its settled lifecycle
-//!    status with that hardware in it — so an Outpost still provisioning holds no
-//!    asset, and one that has settled holds one `AssetInfo` per physical unit of its
-//!    configuration. An Outpost whose form factor names no configuration this service
-//!    holds is installed with nothing.
+//!    the Outpost's form factor names once an order placed on it has delivered
+//!    hardware to its site, and the Outpost reaches its settled lifecycle status with
+//!    that hardware in it — so an Outpost nothing has been ordered for holds no
+//!    asset, and one whose order has been installed holds one `AssetInfo` per physical
+//!    unit of its configuration. An Outpost whose form factor names no configuration
+//!    this service holds is installed with nothing.
 //! 2. Each installed asset reports what that unit is and where it is: an `AssetId` of
 //!    the ten digits the modelled `AssetIdInput` takes, its `AssetType` from the
 //!    modelled enum, the `RackId` of the one rack a rack configuration's units share,
@@ -40,7 +41,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_outposts_outpostsolafservice::ops::types::ASSET_TYPE_VALUES;
 
 use crate::capacity_task_lifecycle::capacity_route;
-use crate::site_and_outpost_lifecycle::{query_value, segment, settle, text, Outposts};
+use crate::site_and_outpost_lifecycle::{install_hardware, query_value, segment, text, Outposts};
 
 /// The route `ListAssets` binds, for one identifier form and one query string.
 fn assets_route(identifier: &str, query: &str) -> String {
@@ -161,14 +162,14 @@ async fn published(outposts: &Outposts, form_factor: &str) -> (BTreeSet<String>,
     (families, max_vcpus)
 }
 
-/// Rules 1 and 2: over every form factor an Outpost can carry, what the clock installs
-/// on it as it settles, and what each installed unit reports.
+/// Rules 1 and 2: over every form factor an Outpost can carry, what an order's
+/// fulfilment installs on it, and what each installed unit reports.
 #[tokio::test]
 async fn an_outpost_settles_holding_the_hardware_of_its_form_factor() {
     let outposts = Outposts::new();
 
-    // Before the transition the clock owes a just-created Outpost, nothing has been
-    // installed: an Outpost that is still provisioning holds no hardware.
+    // Nothing has been ordered for these Outposts, so nothing has been installed on
+    // them: an Outpost holds only hardware an order delivered.
     let mut provisioning = Vec::new();
     for form_factor in HARDWARE_TYPES {
         let case = format!("{form_factor:?} while provisioning");
@@ -181,18 +182,20 @@ async fn an_outpost_settles_holding_the_hardware_of_its_form_factor() {
         let reply = list(&outposts, &outpost_id, "").await;
         assert!(
             assets(&reply, &case).is_empty(),
-            "case {case:?}: an Outpost that has not finished provisioning holds no hardware, \
+            "case {case:?}: an Outpost nothing has been ordered for holds no hardware, \
              got {reply}"
         );
         provisioning.push((case, outpost_id, *form_factor));
     }
 
-    settle();
+    for (_, outpost_id, _) in &provisioning {
+        install_hardware(&outposts, outpost_id).await;
+    }
 
     for (case, outpost_id, form_factor) in &provisioning {
-        let case = &format!("{case} once settled");
+        let case = &format!("{case} once installed");
         // The Outpost has reached its settled lifecycle status, which is the transition
-        // the hardware arrives with.
+        // its ordered hardware arrives with.
         let outpost = outposts.get_outpost(outpost_id).await;
         assert_eq!(
             text(&outpost, "LifeCycleStatus"),
@@ -382,7 +385,9 @@ async fn hardware_is_installed_once_and_belongs_to_one_outpost() {
         }
     }
 
-    settle();
+    for (_, outpost_id) in &created {
+        install_hardware(&outposts, outpost_id).await;
+    }
 
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for (case, outpost_id) in &created {
@@ -396,7 +401,6 @@ async fn hardware_is_installed_once_and_belongs_to_one_outpost() {
                 "case {case:?} ({pass}): every read of an Outpost's hardware answers the same"
             );
         }
-        settle();
         let later = list(&outposts, outpost_id, "").await;
         assert_eq!(
             later, first,
@@ -434,7 +438,9 @@ async fn an_installed_asset_id_is_usable_where_the_api_takes_one() {
         ));
     }
 
-    settle();
+    for (_, outpost_id) in &created {
+        install_hardware(&outposts, outpost_id).await;
+    }
 
     for (form_factor, outpost_id) in &created {
         let reply = list(&outposts, outpost_id, "").await;
@@ -520,7 +526,7 @@ async fn an_installed_asset_id_is_usable_where_the_api_takes_one() {
 async fn filters_and_paging_are_observable_on_installed_hardware() {
     let outposts = Outposts::new();
     let outpost_id = an_outpost(&outposts, "installed-filters", Some("RACK")).await;
-    settle();
+    install_hardware(&outposts, &outpost_id).await;
 
     let whole = list(&outposts, &outpost_id, "").await;
     let installed = assets(&whole, "installed");
