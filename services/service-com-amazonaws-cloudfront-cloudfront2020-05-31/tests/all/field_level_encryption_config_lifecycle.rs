@@ -28,6 +28,8 @@
 //!   (`TooManyFieldLevelEncryptionQueryArgProfiles` /
 //!   `TooManyFieldLevelEncryptionContentTypeProfiles`, 400);
 //! * an id no configuration holds is `NoSuchFieldLevelEncryptionConfig` (404);
+//! * the CONFIGURATION reader reports the stored `FieldLevelEncryptionConfig` document on its
+//!   own, at the version the configuration itself is read at, and reading it changes nothing;
 //! * a refusal stores nothing: the caller reference it named is still free afterwards.
 //!
 //! The table rows differ along everything these rules generalise over: which mapping
@@ -91,6 +93,21 @@ async fn get_config(router: &MultiServiceRouter, id: &str) -> Answer {
         router,
         "GET",
         &format!("/{API_VERSION}/field-level-encryption/{id}"),
+        None,
+        None,
+    )
+    .await
+}
+
+/// `GET /2020-05-31/field-level-encryption/{Id}/config` — the CONFIGURATION half of one
+/// stored field-level encryption configuration
+/// (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` states the
+/// route).
+async fn get_config_document(router: &MultiServiceRouter, id: &str) -> Answer {
+    call(
+        router,
+        "GET",
+        &format!("/{API_VERSION}/field-level-encryption/{id}/config"),
         None,
         None,
     )
@@ -1275,5 +1292,175 @@ async fn an_id_no_configuration_holds_is_refused_by_the_reader() {
         "case the one stored configuration: expected it to remain readable at {stored_id}, got {} \
          with {}",
         read.status, read.raw
+    );
+}
+
+/// The CONFIGURATION reader reports the stored `FieldLevelEncryptionConfig` document on its
+/// own — the configuration as submitted, down to the members the create left out, at the
+/// version token the create handed back and the same one `GetFieldLevelEncryption` is read at,
+/// so the two readers of one record never disagree. The document carries only the submitted
+/// configuration: the resource members (`Id`, `LastModifiedTime`) belong to the configuration
+/// resource, not to its configuration document. Reading reports, so a second read answers
+/// exactly the same and the resource read after it is untouched.
+#[tokio::test]
+async fn the_configuration_reader_reports_the_stored_configuration_document() {
+    let router = emulator();
+    let profile = store_profile(&router, "fle-config-document-profile").await;
+
+    for row in table(&profile) {
+        let created = create_config(&router, &row.xml()).await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: expected HTTP 201 from CreateFieldLevelEncryptionConfig, got {} with {}",
+            row.case, created.status, created.raw
+        );
+        let id = created.root().text_at("Id").unwrap_or_default().to_string();
+        let etag = created.header("etag").to_string();
+        let last_modified = created
+            .root()
+            .text_at("LastModifiedTime")
+            .unwrap_or_default()
+            .to_string();
+
+        let document = get_config_document(&router, &id).await;
+        assert_eq!(
+            document.status, 200,
+            "case {:?}: expected HTTP 200 from GetFieldLevelEncryptionConfig, got {} with {}",
+            row.case, document.status, document.raw
+        );
+        assert_eq!(
+            document.header("etag"),
+            etag,
+            "case {:?}: expected the configuration read at the create's version {etag:?}, got {:?}",
+            row.case,
+            document.header("etag")
+        );
+        row.assert_matches(document.root(), "the configuration read", &document.raw);
+        for member in ["Id", "LastModifiedTime"] {
+            assert!(
+                document.root().child(member).is_none(),
+                "case {:?}: expected the configuration document to carry no {member}, got {}",
+                row.case,
+                document.raw
+            );
+        }
+
+        // A report writes nothing: the second read answers exactly the same document at the
+        // same version, and the resource read sees the record as the create left it.
+        let again = get_config_document(&router, &id).await;
+        assert_eq!(
+            (again.status, again.raw.as_str(), again.header("etag")),
+            (document.status, document.raw.as_str(), etag.as_str()),
+            "case {:?}: expected the second configuration read to answer the same, got {} with {}",
+            row.case,
+            again.status,
+            again.raw
+        );
+        let resource = get_config(&router, &id).await;
+        assert_eq!(
+            (
+                resource.status,
+                resource.root().text_at("Id"),
+                resource.root().text_at("LastModifiedTime"),
+                resource.header("etag")
+            ),
+            (
+                200,
+                Some(id.as_str()),
+                Some(last_modified.as_str()),
+                etag.as_str()
+            ),
+            "case {:?}: expected the configuration read to leave the record untouched, got {} \
+             with {}",
+            row.case,
+            resource.status,
+            resource.raw
+        );
+        row.assert_matches(
+            resource
+                .root()
+                .at("FieldLevelEncryptionConfig")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the resource read answers with the configuration: {}",
+                        resource.raw
+                    )
+                }),
+            "the resource read after the configuration read",
+            &resource.raw,
+        );
+    }
+}
+
+/// An id no stored configuration carries names no configuration for the CONFIGURATION reader
+/// either: it answers `NoSuchFieldLevelEncryptionConfig` (404) with the modelled sentence,
+/// whatever shape the id has, and the one stored configuration's document is still read at its
+/// own id afterwards.
+#[tokio::test]
+async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
+    let router = emulator();
+    let profile = store_profile(&router, "fle-config-document-reader-profile").await;
+
+    let stored = simple(
+        "the one stored configuration",
+        "fle-config-document-stored",
+        &profile,
+    );
+    let created = create_config(&router, &stored.xml()).await;
+    assert_eq!(
+        created.status, 201,
+        "case the one stored configuration: expected HTTP 201, got {} with {}",
+        created.status, created.raw
+    );
+    let stored_id = created.root().text_at("Id").unwrap_or_default().to_string();
+
+    // The rows span the ways an id can name no configuration: a well-shaped configuration id
+    // that was never minted, an id of another CloudFront namespace (including the profile's,
+    // a different resource under the same surface), the configuration's own id with a
+    // character changed, and a value of no CloudFront id shape at all.
+    let mut mangled: Vec<char> = stored_id.chars().collect();
+    if let Some(last) = mangled.last_mut() {
+        *last = if *last == 'A' { 'B' } else { 'A' };
+    }
+    let mangled: String = mangled.into_iter().collect();
+    for case in [
+        "C3V3PVOY5NSBVE",
+        "EDFDVBD6EXAMPLE",
+        profile.as_str(),
+        mangled.as_str(),
+        "not-a-configuration-id",
+        "0",
+    ] {
+        let answer = get_config_document(&router, case).await;
+        assert_eq!(
+            answer.status, 404,
+            "case {case:?}: expected HTTP 404 for an unknown id, got {} with {}",
+            answer.status, answer.raw
+        );
+        assert_eq!(
+            answer.error_code(),
+            "NoSuchFieldLevelEncryptionConfig",
+            "case {case:?}: expected NoSuchFieldLevelEncryptionConfig, got {}",
+            answer.raw
+        );
+        assert_eq!(
+            answer.root().find_text("Message"),
+            Some(NO_SUCH_CONFIG_MESSAGE),
+            "case {case:?}: expected the modelled message, got {:?}",
+            answer.root().find_text("Message")
+        );
+    }
+
+    let document = get_config_document(&router, &stored_id).await;
+    assert_eq!(
+        document.status, 200,
+        "case the one stored configuration: expected its document to remain readable at \
+         {stored_id}, got {} with {}",
+        document.status, document.raw
+    );
+    stored.assert_matches(
+        document.root(),
+        "the configuration read after the refusals",
+        &document.raw,
     );
 }

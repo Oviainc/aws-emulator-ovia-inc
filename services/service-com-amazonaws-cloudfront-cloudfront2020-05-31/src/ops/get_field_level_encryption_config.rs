@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFieldLevelEncryptionConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFieldLevelEncryptionConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFieldLevelEncryptionConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the CONFIGURATION half of one field-level encryption configuration — the
+//! `FieldLevelEncryptionConfig` document the last mutation stored, beside the version token
+//! that mutation handed back — read from the one stored record `GetFieldLevelEncryption`
+//! reads, so the two never disagree.
+//!
+//! A reporting operation — "Get the field-level encryption configuration information" — so it
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +140,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFieldLevelEncryptionConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFieldLevelEncryptionConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let store = state.lock();
+
+        // "Get the field-level encryption configuration information" — a report, so this
+        // reads the stored record and writes nothing. Nothing is owed by the clock either:
+        // a field-level encryption configuration carries no status and no propagation
+        // deadline, so one this service accepted is readable as it stands.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFieldLevelEncryptionConfig"))
+        // "Request the ID for the field-level encryption configuration information": an id
+        // no stored configuration carries names no configuration, whatever shape it has.
+        let Some(stored) = store.field_level_encryption_config(&input.id) else {
+            return Err(
+                GetFieldLevelEncryptionConfigErrorModeled::NoSuchFieldLevelEncryptionConfig(
+                    crate::state::no_such_field_level_encryption_config(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetFieldLevelEncryptionConfigOutput {
+            // "Return the field-level encryption configuration information" — the
+            // configuration as the last mutation stored it, read from that record rather
+            // than rebuilt from anything, down to the members the request left out.
+            field_level_encryption_config: Some(stored.config.clone()),
+            // "The current version of the field level encryption configuration": the token
+            // the last mutation handed back, the same one the configuration itself is read
+            // at through `GetFieldLevelEncryption`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }
