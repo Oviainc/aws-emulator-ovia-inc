@@ -230,3 +230,5 @@ mod authorizer_in_use;
 mod gateway_response_parameter_mappings;
 #[path = "all/documentation_part_import_atomicity.rs"]
 mod documentation_part_import_atomicity;
+#[path = "all/delete_model.rs"]
+mod delete_model;
