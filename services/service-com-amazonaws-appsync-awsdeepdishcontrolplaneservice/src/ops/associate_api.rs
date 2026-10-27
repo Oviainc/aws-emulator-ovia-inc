@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Maps an API onto the custom domain the path addresses, and reports the
+//! `ApiAssociation` the mapping left behind. The domain side of the rule, which
+//! `DisassociateApi` follows too, lives in
+//! [`crate::state::domain_for_association_change`].
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +142,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateApi"))
+        // The engine is reachable from `&self` (constructor-injected); nothing in the
+        // answer depends on this request's metadata, so `ctx` is unused here.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AssociateApiErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut guard = state.lock();
+        // Materialise the association deployments the CLOCK already made due, which
+        // were owed at this instant whether or not anybody called: whether a mapping is
+        // still being deployed is what decides the refusal below.
+        guard.settle_api_associations(now);
+
+        // The API the request names, read before the domain is taken for the write.
+        // An `apiId` is ONE identifier space over both API resource families — a
+        // `GraphqlApi` and an `Api` are created by operations of their own — and either
+        // is mapped onto a custom domain through this same path, so the id is resolved
+        // against both stores and only an id that names no API at all is absent.
+        let visibility = guard
+            .graphql_apis
+            .get(&input.api_id)
+            .map(|api| api.visibility.clone());
+        let api_exists = visibility.is_some() || guard.event_apis.contains_key(&input.api_id);
+
+        // The custom domain is the resource the path addresses, so it is resolved
+        // first: nothing about the API the body names is reported for a domain this
+        // account does not hold.
+        let domain = match crate::state::domain_for_association_change(&mut guard, &input.domain_name)
+        {
+            Ok(domain) => domain,
+            Err(crate::state::DomainAssociationRefusal::DomainNotFound) => {
+                return Err(AssociateApiErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::DOMAIN_NAME_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into())
+            }
+            // `AssociateApi` models no concurrent-modification error, so the one
+            // modification-in-progress rule `AssociationStatus` states is answered here
+            // with the malformed-request error this operation does model.
+            Err(crate::state::DomainAssociationRefusal::Processing) => {
+                return Err(AssociateApiErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(crate::state::ASSOCIATION_PROCESSING_MESSAGE.to_string()),
+                    ..Default::default()
+                })
+                .into())
+            }
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a missing
+        // resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(AssociateApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+        if !api_exists {
+            return Err(AssociateApiErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+            })
+            .into());
+        }
+        // "Private APIs can not be associated with custom domains"
+        // (`AssociateApiRequest$apiId`): an API reachable only from inside a VPC is not
+        // served through a custom domain, so the mapping is refused rather than stored.
+        if visibility.as_deref() == Some(crate::state::PRIVATE_VISIBILITY) {
+            return Err(AssociateApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::PRIVATE_API_NOT_ASSOCIABLE_MESSAGE.to_string()),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        // Every ground for refusing the mapping has been read, so nothing below writes
+        // over a request that should have been refused. The mapping REPLACES whatever
+        // the domain carried: a custom domain is mapped onto one API at a time, and
+        // deploying the new mapping is what the status reports.
+        domain.api_association = Some(crate::state::ApiAssociationRecord::new(
+            input.api_id.clone(),
+            now,
+        ));
+
+        // Answer from the STORED record, so this body is the one `GetApiAssociation`
+        // answers with later.
+        let api_association = domain
+            .api_association
+            .as_ref()
+            .map(|association| association.to_api_association(&domain.domain_name));
+
+        Ok(AssociateApiOutput { api_association })
     }
 }

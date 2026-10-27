@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DiscoverPollEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DiscoverPollEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DiscoverPollEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers the Amazon ECS agent with the endpoints it polls: the agent-communication
+//! endpoint, the telemetry endpoint and the Service Connect configuration endpoint, each
+//! the host of this service in the Region the request was signed for. The call RESOLVES
+//! the cluster and, when the request names one, the container instance it is called for,
+//! so an agent that names a cluster or an instance this store does not hold is refused
+//! rather than handed endpoints.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +152,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DiscoverPollEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DiscoverPollEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DiscoverPollEndpoint"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DiscoverPollEndpointErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx);
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+
+        // "The container instance ID or full ARN of the container instance": the agent
+        // polling for updates names the instance it runs on. The id is checked for FORM
+        // first — before any cluster or instance is resolved — because a value that is not
+        // an id names no instance in any cluster, and the refusal states the form an id
+        // takes rather than the value it was given.
+        let named_instance = input
+            .container_instance
+            .as_deref()
+            .filter(|reference| !reference.trim().is_empty());
+        if let Some(reference) = named_instance {
+            let instance_id = crate::state::container_instance_id_from_reference(reference);
+            if !crate::state::is_container_instance_id(instance_id) {
+                return Err(DiscoverPollEndpointErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(crate::state::container_instance_id_pattern_message()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        // A transition the clock already owed is materialised here, so what this call
+        // resolves the instance against is the store as it stands at THIS instant.
+        guard.advance_clock(now);
+
+        // "If you do not specify a cluster, the default cluster is assumed": the cluster
+        // the agent reports into has to be one this account holds, and this operation
+        // models no cluster-specific error, so a cluster that is not there is the client
+        // error for an identifier that names nothing.
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(DiscoverPollEndpointErrorModeled::ClientException(
+                ClientException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // An instance named in a form an id takes but never registered into that cluster
+        // is no instance of it, so there is no agent of it to hand endpoints to.
+        if let Some(reference) = named_instance {
+            if guard
+                .resolve_container_instance(&region, &cluster_name, reference)
+                .is_none()
+            {
+                return Err(DiscoverPollEndpointErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(crate::state::container_instance_not_found_message(
+                            reference,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The endpoints are the Region's own: each is a host of this service under the
+        // Region the request was signed for, so an agent registered through a Region's
+        // endpoint is pointed back at that same Region's.
+        Ok(DiscoverPollEndpointOutput {
+            endpoint: Some(crate::state::agent_poll_endpoint(&region)),
+            telemetry_endpoint: Some(crate::state::agent_telemetry_endpoint(&region)),
+            service_connect_endpoint: Some(crate::state::agent_service_connect_endpoint(&region)),
+        })
     }
 }

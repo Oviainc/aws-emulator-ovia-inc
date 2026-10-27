@@ -21,6 +21,8 @@ mod launch_configurations_are_unavailable;
 mod metric_collection_catalog;
 #[path = "all/reference_data_catalogs.rs"]
 mod reference_data_catalogs;
+#[path = "all/scale_out_launches_ec2_instances.rs"]
+mod scale_out_launches_ec2_instances;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 // The shared harness the suites above drive the service through: the awsQuery POST

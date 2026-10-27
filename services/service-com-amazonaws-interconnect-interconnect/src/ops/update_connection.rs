@@ -218,21 +218,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let environment_id = stored.connection.environment_id.clone();
 
         // A new bandwidth is allocated on the SAME environment, so it is held to
-        // that environment's currently available set, exactly as on create.
+        // that environment's currently available set by the one rule both writers
+        // of a connection's bandwidth judge their input with
+        // (`crate::state::bandwidth_availability_violation`): create and update
+        // cannot drift apart over which bandwidths a connection may hold.
         if let Some(bandwidth) = input.bandwidth.as_deref() {
-            let available = store
-                .environments
-                .get(&environment_id)
-                .and_then(|environment| environment.bandwidths.available.as_deref())
-                .unwrap_or_default();
-            if !available.iter().any(|offered| offered == bandwidth) {
+            if let Some(message) = crate::state::bandwidth_availability_violation(
+                store.environments.get(&environment_id),
+                &environment_id,
+                bandwidth,
+            ) {
                 return Err(UpdateConnectionErrorModeled::InterconnectValidationException(
-                    InterconnectValidationException {
-                        message: format!(
-                            "bandwidth '{bandwidth}' is not available on environment '{environment_id}'; available bandwidths are [{}]",
-                            available.join(", ")
-                        ),
-                    },
+                    InterconnectValidationException { message },
                 )
                 .into());
             }

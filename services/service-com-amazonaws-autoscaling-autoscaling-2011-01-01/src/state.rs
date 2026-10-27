@@ -20,6 +20,14 @@
 //!   leaves the group ([`LIFECYCLE_TRANSITION`]);
 //! * a capacity change that asked to honour the group's cooldown waits for that
 //!   cooldown to elapse before it is applied (`HonorCooldown`).
+//!
+//! # The instances a group holds
+//!
+//! An instance of a group is an Amazon EC2 instance OF THE ACCOUNT: a capacity change
+//! launches it in the account's own Amazon EC2 store and terminates it there when the
+//! group scales in ([`ec2_instances`]), so every id a group reports is one Amazon EC2
+//! resolves. This struct holds the group's own view of it — its lifecycle state, its
+//! health and the zone it was placed in — and nothing that Amazon EC2's record owns.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -34,6 +42,11 @@ use crate::ops::types::{
 /// The Availability Zones of the subnets a request's `VPCZoneIdentifier` names, read
 /// from the account's own Amazon EC2 store.
 pub mod ec2_subnets;
+
+/// The Amazon EC2 instances a capacity change launches and terminates, in the
+/// account's own Amazon EC2 store: an instance id a group reports names an instance of
+/// the account, not one of this service's own invention.
+pub mod ec2_instances;
 
 /// How long a lifecycle transition this service owes takes to come due.
 ///
@@ -86,6 +99,8 @@ pub const HEALTH_STATUS_HEALTHY: &str = "Healthy";
 pub const ACTIVITY_IN_PROGRESS: &str = "InProgress";
 /// A scaling activity that finished.
 pub const ACTIVITY_SUCCESSFUL: &str = "Successful";
+/// A scaling activity that did not place the instance it was started for.
+pub const ACTIVITY_FAILED: &str = "Failed";
 
 /// `Activity$AutoScalingGroupState` for a group that still exists.
 pub const GROUP_STATE_IN_SERVICE: &str = "InService";
@@ -162,7 +177,11 @@ pub struct StoredLaunchConfiguration {
     pub created_time: SystemTime,
 }
 
-/// One synthetic instance attached to a group.
+/// One instance attached to a group.
+///
+/// [`StoredInstance::instance_id`] is the id of an Amazon EC2 instance OF THE ACCOUNT,
+/// launched through [`ec2_instances`] by the capacity change that placed it, so every
+/// id a group reports resolves in the account's own Amazon EC2 state.
 #[derive(Debug, Clone)]
 pub struct StoredInstance {
     pub instance_id: String,
@@ -193,6 +212,9 @@ pub struct PendingCapacity {
 pub struct StoredGroup {
     pub name: String,
     pub arn: String,
+    /// The Region the group was created in, which is the Region the instances it
+    /// launches run in.
+    pub region: String,
     pub launch_configuration_name: Option<String>,
     pub launch_template: Option<LaunchTemplateSpecification>,
     pub mixed_instances_policy: Option<MixedInstancesPolicy>,
@@ -305,8 +327,6 @@ pub struct ComAmazonawsAutoscalingAutoscaling20110101State {
     pub groups: BTreeMap<String, StoredGroup>,
     /// Every scaling activity this service has recorded, oldest first.
     pub activities: Vec<StoredActivity>,
-    /// Source of instance ids, so they are unique and deterministic in a process.
-    pub next_instance_seq: u64,
     /// Source of activity ids.
     pub next_activity_seq: u64,
     /// Source of the opaque id segment of a resource ARN.
@@ -324,13 +344,6 @@ fn uuid_shaped(seq: u64) -> String {
 }
 
 impl AutoScalingState {
-    /// Mint the next instance id: `i-` plus 17 hex digits, the 19-character form
-    /// the model's `XmlStringMaxLen19` bound on `Instance$InstanceId` allows.
-    pub fn mint_instance_id(&mut self) -> String {
-        self.next_instance_seq += 1;
-        format!("i-{:017x}", self.next_instance_seq)
-    }
-
     /// Mint the next activity id.
     pub fn mint_activity_id(&mut self) -> String {
         self.next_activity_seq += 1;
@@ -355,25 +368,67 @@ impl AutoScalingState {
         start_time: SystemTime,
         completes_at: Option<SystemTime>,
     ) {
-        let activity_id = self.mint_activity_id();
         let finished = completes_at.is_none();
-        self.activities.push(StoredActivity {
-            activity_id,
+        let status_code = if finished {
+            ACTIVITY_SUCCESSFUL
+        } else {
+            ACTIVITY_IN_PROGRESS
+        };
+        self.push_activity(StoredActivity {
+            activity_id: String::new(),
             auto_scaling_group_name: group_name.to_string(),
             auto_scaling_group_arn: Some(group_arn.to_string()),
             description: Some(description),
             cause,
             start_time,
             end_time: if finished { Some(start_time) } else { None },
-            status_code: if finished {
-                ACTIVITY_SUCCESSFUL.to_string()
-            } else {
-                ACTIVITY_IN_PROGRESS.to_string()
-            },
+            status_code: status_code.to_string(),
             progress: if finished { 100 } else { 50 },
             details: None,
             auto_scaling_group_state: Some(group_state.to_string()),
             completes_at,
+        });
+    }
+
+    /// Append a scaling activity that FAILED: the capacity change asked for an
+    /// instance Amazon EC2 did not place, so the group reports no instance for it and
+    /// the activity it recorded says so instead of claiming a launch that never
+    /// happened.
+    pub fn record_failed_activity(
+        &mut self,
+        group_name: &str,
+        group_arn: &str,
+        description: String,
+        cause: String,
+        start_time: SystemTime,
+    ) {
+        self.push_activity(StoredActivity {
+            activity_id: String::new(),
+            auto_scaling_group_name: group_name.to_string(),
+            auto_scaling_group_arn: Some(group_arn.to_string()),
+            description: Some(description),
+            cause,
+            start_time,
+            // Nothing is owed on a launch that failed: it ended when it failed.
+            end_time: Some(start_time),
+            status_code: ACTIVITY_FAILED.to_string(),
+            progress: 100,
+            details: None,
+            auto_scaling_group_state: Some(GROUP_STATE_IN_SERVICE.to_string()),
+            completes_at: None,
+        });
+    }
+
+    /// Store one activity under a freshly minted id, keeping the log bounded.
+    ///
+    /// The ONE writer of [`Self::activities`], so the id every activity carries comes
+    /// from one minter and the retention bound is applied in one place however the
+    /// activity ended: `activity_id` on the way in is ignored.
+    fn push_activity(&mut self, activity: StoredActivity) {
+        let activity_id = self.mint_activity_id();
+        self.activities.push(StoredActivity {
+            activity_id,
+            ..activity
         });
         // Keep the activity log bounded: the oldest activity is the first to go.
         if self.activities.len() > MAX_RETAINED_ACTIVITIES {
@@ -389,7 +444,11 @@ impl AutoScalingState {
     /// Every handler calls this first — including the reporting ones, which may
     /// write exactly this much and nothing else, because each of these changes was
     /// owed at `now` whether or not anybody called.
-    pub fn materialize_due(&mut self, now: SystemTime) {
+    ///
+    /// `engine` is the shared engine the handler holds: a deferred capacity change
+    /// launches and terminates the account's own Amazon EC2 instances when it comes
+    /// due, exactly as the change a request applies straight away does.
+    pub fn materialize_due<Eng: Send + Sync + 'static>(&mut self, engine: &Eng, now: SystemTime) {
         let due_changes: Vec<(String, i32, String, SystemTime)> = self
             .groups
             .values()
@@ -419,7 +478,7 @@ impl AutoScalingState {
         // so the passes below retire whatever that instant has itself made due and
         // the state a caller sees does not depend on when they read.
         for (name, desired_capacity, cause, due) in due_changes {
-            self.apply_capacity(&name, desired_capacity, &cause, due);
+            self.apply_capacity(engine, &name, desired_capacity, &cause, due);
         }
 
         for group in self.groups.values_mut() {
@@ -453,11 +512,19 @@ impl AutoScalingState {
     /// and each termination records its own scaling activity, and the group enters
     /// its cooldown.
     ///
+    /// The instances are the account's OWN Amazon EC2 instances: the launch goes
+    /// through [`ec2_instances::launch`], which mints them in the account's Amazon EC2
+    /// store from the group's launch source, and the scale-in terminates those same
+    /// instances there — so every id the group reports resolves in Amazon EC2. A unit
+    /// of capacity Amazon EC2 could not place records a failed activity instead of an
+    /// instance, since there is no instance to report.
+    ///
     /// Does nothing when `group_name` names no group. The capacity is clamped to
     /// [`MAX_GROUP_CAPACITY`] here as well as refused by the handlers, so the
     /// allocation below is bounded however it is reached.
-    pub fn apply_capacity(
+    pub fn apply_capacity<Eng: Send + Sync + 'static>(
         &mut self,
+        engine: &Eng,
         group_name: &str,
         desired_capacity: i32,
         cause: &str,
@@ -468,19 +535,22 @@ impl AutoScalingState {
             return;
         };
         let arn = group.arn.clone();
+        let region = group.region.clone();
         let zones = group.availability_zones.clone();
+        let vpc_zone_identifier = group.vpc_zone_identifier.clone();
         let launch_configuration_name = group.launch_configuration_name.clone();
         let launch_template = group.launch_template.clone();
+        let mixed_instances_policy = group.mixed_instances_policy.clone();
+        let tags = group.tags.clone();
         let protected = group.new_instances_protected_from_scale_in;
         let cooldown = group.default_cooldown.max(0);
         let previous = group.active_instance_count();
         let placed = group.instances.len();
         let headroom = group.launch_headroom();
-        let launch_config = launch_configuration_name
+        let launch_configuration = launch_configuration_name
             .as_ref()
-            .and_then(|name| self.launch_configurations.get(name));
-        let instance_type = launch_config.map(|config| config.instance_type.clone());
-        let image_id = launch_config.map(|config| config.image_id.clone());
+            .and_then(|name| self.launch_configurations.get(name))
+            .cloned();
 
         let to_launch = if zones.is_empty() {
             // Without a zone to place an instance in, nothing can be launched; the
@@ -498,21 +568,40 @@ impl AutoScalingState {
         let to_terminate = (previous - desired_capacity).max(0);
         let due = now + LIFECYCLE_TRANSITION;
 
-        let launched: Vec<StoredInstance> = (0..to_launch)
-            .map(|offset| {
-                let zone_index = (placed + offset as usize) % zones.len();
-                StoredInstance {
-                    instance_id: self.mint_instance_id(),
-                    availability_zone: zones[zone_index].clone(),
-                    lifecycle_state: LIFECYCLE_PENDING.to_string(),
-                    health_status: HEALTH_STATUS_HEALTHY.to_string(),
-                    launch_configuration_name: launch_configuration_name.clone(),
-                    launch_template: launch_template.clone(),
-                    instance_type: instance_type.clone(),
-                    image_id: image_id.clone(),
-                    protected_from_scale_in: protected,
-                    transition_due: Some(due),
-                }
+        let wanted = usize::try_from(to_launch).unwrap_or(0);
+        let launched = ec2_instances::launch(
+            engine,
+            &ec2_instances::LaunchRequest {
+                region: &region,
+                group_name,
+                count: wanted,
+                placed,
+                zones: &zones,
+                vpc_zone_identifier: vpc_zone_identifier.as_deref(),
+                launch_configuration: launch_configuration.as_ref(),
+                launch_template: launch_template.as_ref(),
+                mixed_instances_policy: mixed_instances_policy.as_ref(),
+                tags: &tags,
+            },
+        );
+        // A unit of capacity Amazon EC2 did not place is a launch that failed, so the
+        // group is given no instance for it: an id it reported would resolve nowhere.
+        let unplaced = wanted.saturating_sub(launched.len());
+        let launched: Vec<StoredInstance> = launched
+            .into_iter()
+            .map(|instance| StoredInstance {
+                instance_id: instance.instance_id,
+                availability_zone: instance.availability_zone,
+                lifecycle_state: LIFECYCLE_PENDING.to_string(),
+                health_status: HEALTH_STATUS_HEALTHY.to_string(),
+                launch_configuration_name: launch_configuration_name.clone(),
+                launch_template: launch_template.clone(),
+                // What Amazon EC2 launched it as, so the two services report one
+                // instance the same way.
+                instance_type: instance.instance_type,
+                image_id: instance.image_id,
+                protected_from_scale_in: protected,
+                transition_due: Some(due),
             })
             .collect();
 
@@ -551,6 +640,11 @@ impl AutoScalingState {
             remaining -= 1;
         }
 
+        // The instances leaving the group are terminated where they live: the same
+        // Amazon EC2 instances the launch minted, so the account sees them shut down
+        // rather than vanish from one service's view alone.
+        ec2_instances::terminate(engine, &terminated_ids);
+
         for instance_id in launched_ids {
             self.record_activity(
                 group_name,
@@ -571,6 +665,16 @@ impl AutoScalingState {
                 GROUP_STATE_IN_SERVICE,
                 now,
                 Some(due),
+            );
+        }
+        for _ in 0..unplaced {
+            self.record_failed_activity(
+                group_name,
+                &arn,
+                "Launching a new EC2 instance failed: the account could not place it"
+                    .to_string(),
+                cause.to_string(),
+                now,
             );
         }
     }

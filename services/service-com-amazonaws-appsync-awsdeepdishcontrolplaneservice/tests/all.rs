@@ -23,6 +23,8 @@ mod api_keys_across_api_families;
 mod association_refusal_messages;
 #[path = "all/channel_namespaces.rs"]
 mod channel_namespaces;
+#[path = "all/custom_domain_api_association.rs"]
+mod custom_domain_api_association;
 #[path = "all/data_source_delete.rs"]
 mod data_source_delete;
 #[path = "all/data_source_list.rs"]
