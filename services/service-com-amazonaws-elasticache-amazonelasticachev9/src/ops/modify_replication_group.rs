@@ -498,9 +498,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyReplicationGroupErrorModeled::ReplicationGroupNotFoundFault(
                     ReplicationGroupNotFoundFault {
-                        message: Some(format!(
-                            "Replication group {} not found.",
-                            input.replication_group_id
+                        message: Some(crate::state::replication_group_not_found_message(
+                            &input.replication_group_id,
                         )),
                     },
                 )
@@ -525,11 +524,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyReplicationGroupErrorModeled::InvalidReplicationGroupStateFault(
                     InvalidReplicationGroupStateFault {
-                        message: Some(format!(
-                            "Replication group {key} is in {} state, not {}.",
-                            group.status,
-                            crate::state::STATUS_AVAILABLE
-                        )),
+                        message: Some(crate::state::replication_group_modify_state_refusal()),
                     },
                 )
                 .into(),
@@ -859,8 +854,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The members the pending shape does NOT carry have nowhere to be
         // reported as pending, so they are applied at once, exactly as
         // `ModifyCacheCluster` applies its own.
-        if let Some(description) = input.replication_group_description.clone() {
-            group.description = description;
+        if let Some(description) = input.replication_group_description.as_deref() {
+            group.description = crate::state::stored_description(description);
         }
         if let Some(window) = input.preferred_maintenance_window.clone() {
             group.preferred_maintenance_window = window;

@@ -251,7 +251,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateCacheParameterGroupErrorModeled::CacheParameterGroupAlreadyExistsFault(
                     CacheParameterGroupAlreadyExistsFault {
-                        message: Some(format!("Cache parameter group {name} already exists.")),
+                        message: Some(
+                            crate::state::cache_parameter_group_already_exists_message(&name),
+                        ),
                     },
                 )
                 .into(),
@@ -293,7 +295,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::CacheParameterGroupRecord {
             name: name.clone(),
             family,
-            description: input.description,
+            // A blank `Description` is normalised the one way the service does
+            // it (`crate::state::stored_description`), so what a later describe
+            // reports is a value the service would answer.
+            description: crate::state::stored_description(&input.description),
             tags,
             // A new group is exactly its family's engine defaults: this call
             // sets no parameter value, which is what `ModifyCacheParameterGroup`
