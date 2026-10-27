@@ -892,10 +892,10 @@ async fn a_role_is_reported_with_its_trust_policy_and_instance_profiles() {
 /// each named as the account holds it, and a user the account records no membership
 /// for carries none.
 ///
-/// `AddUserToGroup` — the operation that writes a membership — is still a scaffolded
-/// 501 with its own stub issue, so the memberships read back here are written into the
-/// service's OWN store (`state::group_members`), the way `tests/all/group_membership.rs`
-/// seeds the memberships `GetGroup` reports.
+/// The memberships read back here are seeded into the service's OWN store
+/// (`state::group_members`), the way `tests/all/group_membership.rs` seeds the
+/// memberships `GetGroup` reports, so this case exercises the REPORT alone;
+/// `tests/all/group_membership_writes.rs` drives `AddUserToGroup`, which writes one.
 #[tokio::test]
 async fn a_user_is_reported_with_the_groups_it_belongs_to() {
     let (router, engine) = router_with_engine();
