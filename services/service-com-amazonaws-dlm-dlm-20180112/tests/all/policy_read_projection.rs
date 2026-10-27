@@ -257,6 +257,36 @@ fn image_details_with_cron() -> Value {
     })
 }
 
+/// A custom AMI policy's `PolicyDetails` with an interval-driven creation rule
+/// and every defaultable member left out.
+fn image_details_with_defaults_omitted() -> Value {
+    json!({
+        "PolicyType": "IMAGE_MANAGEMENT",
+        "ResourceTypes": ["INSTANCE"],
+        "TargetTags": [{"Key": "backup", "Value": "daily"}],
+        "Schedules": [{
+            "Name": "daily",
+            "CreateRule": {"Interval": 24, "IntervalUnit": "HOURS"},
+            "RetainRule": {"Count": 7},
+        }],
+    })
+}
+
+/// A custom snapshot policy whose creation rule is a cron expression, so its
+/// `Interval` is one of the members the service materializes.
+fn snapshot_details_with_cron() -> Value {
+    json!({
+        "PolicyType": "EBS_SNAPSHOT_MANAGEMENT",
+        "ResourceTypes": ["VOLUME"],
+        "TargetTags": [{"Key": "backup", "Value": "weekly"}],
+        "Schedules": [{
+            "Name": "weekly",
+            "CreateRule": {"CronExpression": "cron(0 1 ? * MON *)"},
+            "RetainRule": {"Count": 2},
+        }],
+    })
+}
+
 /// One read-projection case: a `CreateLifecyclePolicy` body, and whether its
 /// configuration is one the custom snapshot/AMI defaults apply to.
 struct Case {
@@ -667,57 +697,78 @@ async fn a_read_reports_the_stored_policy_with_its_materialized_members() {
 /// An update that replaces the configuration stores the materialized members for
 /// the REPLACEMENT, and an update that moves the activation state moves the status
 /// description with it.
+///
+/// The replacement states the policy's OWN type and target, since "You cannot
+/// update the policy type or the resource type"
+/// (`smithy_query(query="doc", shape="UpdateLifecyclePolicyRequest",
+/// member="PolicyDetails")`); what it changes is which members the service has to
+/// materialize, with one row per kind of custom policy those defaults apply to.
 #[tokio::test]
 async fn an_update_restamps_the_materialized_members() {
     let router = emulator();
-    let request = json!({
-        "ExecutionRoleArn": ROLE_ARN,
-        "Description": "nightly ebs",
-        "State": "ENABLED",
-        "PolicyDetails": snapshot_details_with_defaults_omitted(),
-    });
-    let id = create(&router, request.clone()).await.policy_id();
+    let rows: Vec<(&str, Value, Value)> = vec![
+        (
+            "a snapshot policy replaced by a cron-driven snapshot configuration",
+            snapshot_details_with_defaults_omitted(),
+            snapshot_details_with_cron(),
+        ),
+        (
+            "an AMI policy replaced by a cron-driven AMI configuration",
+            image_details_with_defaults_omitted(),
+            image_details_with_cron(),
+        ),
+    ];
 
-    let replacement = image_details_with_cron();
-    let patched = update(
-        &router,
-        &id,
-        json!({"State": "DISABLED", "PolicyDetails": replacement.clone()}),
-    )
-    .await;
-    assert_eq!(
-        patched.status, 200,
-        "expected HTTP 200 from UpdateLifecyclePolicy, got {} with {:?}",
-        patched.status, patched.body
-    );
+    for (case, created, replacement) in rows {
+        let request = json!({
+            "ExecutionRoleArn": ROLE_ARN,
+            "Description": "nightly ebs",
+            "State": "ENABLED",
+            "PolicyDetails": created,
+        });
+        let id = create(&router, request.clone()).await.policy_id();
 
-    let read = get(&router, &id).await;
-    let after = json!({
-        "ExecutionRoleArn": ROLE_ARN,
-        "Description": "nightly ebs",
-        "State": "DISABLED",
-        "PolicyDetails": replacement,
-    });
-    assert_read_satisfies_the_rule("after an update", &after, read.policy());
-    assert_eq!(
-        at(read.policy(), "/StatusMessage"),
-        json!("DISABLED"),
-        "an update that disables a policy moves its status description, got {:?}",
-        at(read.policy(), "/StatusMessage")
-    );
-    // "The local date and time when the lifecycle policy was last modified": the
-    // update moved it, and both members are still `date-time` strings.
-    assert!(
-        at(read.policy(), "/DateModified")
-            .as_str()
-            .unwrap_or_default()
-            >= at(read.policy(), "/DateCreated")
+        let patched = update(
+            &router,
+            &id,
+            json!({"State": "DISABLED", "PolicyDetails": replacement.clone()}),
+        )
+        .await;
+        assert_eq!(
+            patched.status, 200,
+            "case {case:?}: expected HTTP 200 from UpdateLifecyclePolicy, got {} with {:?}",
+            patched.status, patched.body
+        );
+
+        let read = get(&router, &id).await;
+        let after = json!({
+            "ExecutionRoleArn": ROLE_ARN,
+            "Description": "nightly ebs",
+            "State": "DISABLED",
+            "PolicyDetails": replacement,
+        });
+        assert_read_satisfies_the_rule(case, &after, read.policy());
+        assert_eq!(
+            at(read.policy(), "/StatusMessage"),
+            json!("DISABLED"),
+            "case {case:?}: an update that disables a policy moves its status description, \
+             got {:?}",
+            at(read.policy(), "/StatusMessage")
+        );
+        // "The local date and time when the lifecycle policy was last modified": the
+        // update moved it, and both members are still `date-time` strings.
+        assert!(
+            at(read.policy(), "/DateModified")
                 .as_str()
-                .unwrap_or_default(),
-        "DateModified {:?} must not precede DateCreated {:?}",
-        at(read.policy(), "/DateModified"),
-        at(read.policy(), "/DateCreated")
-    );
+                .unwrap_or_default()
+                >= at(read.policy(), "/DateCreated")
+                    .as_str()
+                    .unwrap_or_default(),
+            "case {case:?}: DateModified {:?} must not precede DateCreated {:?}",
+            at(read.policy(), "/DateModified"),
+            at(read.policy(), "/DateCreated")
+        );
+    }
 }
 
 /// `GetLifecyclePolicies` summaries report each policy's tag set, by the same rule
