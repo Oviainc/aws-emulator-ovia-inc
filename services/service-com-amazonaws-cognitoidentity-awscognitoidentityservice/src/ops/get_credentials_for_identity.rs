@@ -273,6 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                 .into());
             };
             let identity_pool_id = identity.identity_pool_id.clone();
+            let identity_is_disabled = identity.is_disabled();
 
             // "Any provided logins will be validated against supported login providers"
             // (this operation's own doc): a `Logins` entry that names an Amazon Cognito user
@@ -281,6 +282,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
             // none of that pool's `CognitoIdentityProviders` authorizes nobody here.
             let logins = input.logins.clone().unwrap_or_default();
             if !logins.is_empty() {
+                // An identity an unlink left linked to NO provider can no longer be reached
+                // through a login of a provider: nothing resolves to it there. What can
+                // still name it is a token THIS service minted for it, which IS a login of
+                // that identity — so a vend presenting one is served, and one presenting
+                // nothing of this identity's is refused. A vend presenting no login at all
+                // asks nothing of a login: it is the unauthenticated exchange, which the
+                // identity's id is all of.
+                if identity_is_disabled
+                    && !store.logins_name_identity(
+                        &identity_pool_id,
+                        &input.identity_id,
+                        &logins,
+                        now,
+                    )
+                {
+                    return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
+                        NotAuthorizedException {
+                            message: Some(crate::state::UNMATCHED_LOGINS_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                }
+
                 let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
                     return Err(GetCredentialsForIdentityErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {

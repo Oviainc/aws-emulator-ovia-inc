@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account.rs"]
 mod account;
+#[path = "all/account_dedicated_ip_warmup_attributes.rs"]
+mod account_dedicated_ip_warmup_attributes;
 #[path = "all/account_details.rs"]
 mod account_details;
 #[path = "all/account_sending_attributes.rs"]
@@ -69,6 +71,8 @@ mod reputation_entities;
 mod request_claim;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/send_unverified_identity_refusal.rs"]
+mod send_unverified_identity_refusal;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/suppressed_destinations.rs"]

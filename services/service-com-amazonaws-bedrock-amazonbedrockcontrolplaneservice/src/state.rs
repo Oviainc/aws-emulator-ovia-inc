@@ -2802,31 +2802,6 @@ pub fn pass_role_denial(config: &LoggingConfig) -> Option<String> {
     None
 }
 
-/// The account whose principals a model-customization role can be passed to, or `None`
-/// when that side of the `iam:PassRole` comparison names no account at all.
-///
-/// The principal that takes a customization role on is the one that RUNS the customization:
-/// Amazon Bedrock's own service principal, which belongs to no customer account — so there
-/// is no account id on that side of the comparison, and `None` is that absence rather than a
-/// placeholder for one.
-const CUSTOMIZATION_ASSUMING_ACCOUNT: Option<&str> = None;
-
-/// The account the role `role_arn` names belongs to, or `None` when the value names no IAM
-/// role of any account.
-///
-/// The account field of a well-formed IAM role ARN ([`::service_common::arn::IAM_ROLE`]).
-/// A value that names some other vendor or resource type names no role, and the EMPTY
-/// account field the member's published pattern admits
-/// (`^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`) names no account — both leave the
-/// caller's side of the comparison without an account, which is not the same as matching
-/// one.
-fn role_arn_account(role_arn: &str) -> Option<&str> {
-    ::service_common::arn::parse(role_arn)
-        .filter(|_| ::service_common::arn::IAM_ROLE.admits(role_arn))
-        .map(|arn| arn.account)
-        .filter(|account| !account.is_empty())
-}
-
 /// Why Amazon Bedrock may not be passed the role a model customization job names, or
 /// `None` when it may be passed.
 ///
@@ -2836,27 +2811,24 @@ fn role_arn_account(role_arn: &str) -> Option<&str> {
 /// decides whether this caller may pass it stands in front of everything else the request
 /// needs: no resource it names is resolved until that decision is taken.
 ///
-/// A role can be passed only to a principal of the role's OWN account, so what decides is
-/// the role's account ([`role_arn_account`]) against the account of the principal that would
-/// take it on ([`CUSTOMIZATION_ASSUMING_ACCOUNT`]) — and only two accounts that are the SAME
-/// account admit the pass, so a side that names no account admits nothing. For a
-/// customization the far side names no account, so the comparison fails for every value the
-/// member can carry: a role of the very account making the call included, which the corpus
-/// records being refused with this same sentence on every attempt, over minutes of retries
-/// and for either spelling of `baseModelIdentifier`. That is the same shape the one logging
-/// destination [`pass_role_denial`] judges is refused in, and it is why this decision is
-/// stated as the comparison rather than as its current answer.
+/// What a caller may pass is a role of its OWN account: `iam:PassRole` is granted by the
+/// account that holds the role, so a value naming a role of ANOTHER account is one no
+/// principal of this account can hand to a service, whatever the role is named or trusts.
+/// So the decision is the one reading of a caller-supplied IAM role ARN this tree shares
+/// ([`::service_common::iam_role::role_name`]): a role of this account admits the pass and
+/// the create goes on to mint the job, and everything else — another account's role, an IAM
+/// ARN that names no role — is the denial. That reading takes an EMPTY account field (which
+/// this member's published pattern admits, `^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`)
+/// as naming no other account, hence as this one's.
 ///
 /// A denial is the modelled `AccessDeniedException` (`@httpError(403)`) carrying
 /// [`CROSS_ACCOUNT_PASS_ROLE_DENIED`], with no job and no custom model written, which is
 /// what every recording of such a create shows.
 #[must_use]
 pub fn customization_pass_role_denial(role_arn: &str) -> Option<String> {
-    let passable = matches!(
-        (role_arn_account(role_arn), CUSTOMIZATION_ASSUMING_ACCOUNT),
-        (Some(role_account), Some(assuming_account)) if role_account == assuming_account
-    );
-    (!passable).then(|| CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string())
+    ::service_common::iam_role::role_name(role_arn)
+        .is_none()
+        .then(|| CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string())
 }
 
 /// Per-service state for com-amazonaws-bedrock-amazonbedrockcontrolplaneservice. A handler reaches it through [`service_state`].

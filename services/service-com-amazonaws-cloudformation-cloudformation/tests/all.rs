@@ -89,6 +89,10 @@ mod hook_result_invocations;
 mod iam_capability_gate;
 #[path = "all/include_transform.rs"]
 mod include_transform;
+#[path = "all/in_flight_resource_status.rs"]
+mod in_flight_resource_status;
+#[path = "all/in_place_resource_updates.rs"]
+mod in_place_resource_updates;
 #[path = "all/list_change_sets.rs"]
 mod list_change_sets;
 #[path = "all/list_generated_templates.rs"]
@@ -207,6 +211,8 @@ mod template_stages_and_resource_events;
 mod template_summary;
 #[path = "all/template_validation.rs"]
 mod template_validation;
+#[path = "all/type_configurations.rs"]
+mod type_configurations;
 #[path = "all/type_deactivation.rs"]
 mod type_deactivation;
 #[path = "all/type_deregistration.rs"]

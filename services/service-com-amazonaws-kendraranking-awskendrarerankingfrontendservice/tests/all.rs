@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_refusal_single_source.rs"]
 mod arn_refusal_single_source;
+#[path = "all/arn_resolution_single_source.rs"]
+mod arn_resolution_single_source;
 #[path = "all/control_plane_fidelity.rs"]
 mod control_plane_fidelity;
 #[path = "all/create_plan_tag_charset.rs"]

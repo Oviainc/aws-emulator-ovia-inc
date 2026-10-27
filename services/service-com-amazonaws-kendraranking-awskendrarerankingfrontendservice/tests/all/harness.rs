@@ -75,9 +75,13 @@ pub async fn call_in(
     (status, parsed)
 }
 
+/// The region the region-less helpers here sign for: the emulator's default region, the
+/// one a request carrying no credential scope is served in.
+pub const DEFAULT_TEST_REGION: &str = "us-east-1";
+
 /// [`call_in`] for the emulator's default region.
 pub async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
-    call_in(router, "us-east-1", operation, body).await
+    call_in(router, DEFAULT_TEST_REGION, operation, body).await
 }
 
 /// The wire error code of an error body (`__type`), without any namespace prefix.
@@ -86,15 +90,23 @@ pub fn error_code(body: &Value) -> String {
     raw.rsplit('#').next().unwrap_or(raw).to_string()
 }
 
-/// The tags `ListTagsForResource` reports for `arn`, as `(Key, Value)` pairs in the
-/// order the service returned them. Shared here because every tagging suite reads a
-/// plan's tags back the same way; they differ in the rules they assert.
-pub async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Vec<(String, String)> {
-    let (status, answer) = call(router, "ListTagsForResource", json!({ "ResourceARN": arn })).await;
-    assert_eq!(status, 200, "list tags for {arn}: unexpected answer {answer}");
+/// The tags `ListTagsForResource` reports for `arn` in `region`, as `(Key, Value)`
+/// pairs in the order the service returned them. Shared here because every tagging
+/// suite reads a plan's tags back the same way; they differ in the rules they assert.
+pub async fn list_tags_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    arn: &str,
+) -> Vec<(String, String)> {
+    let (status, answer) =
+        call_in(router, region, "ListTagsForResource", json!({ "ResourceARN": arn })).await;
+    assert_eq!(
+        status, 200,
+        "list tags for {arn} in {region}: unexpected answer {answer}"
+    );
     answer["Tags"]
         .as_array()
-        .unwrap_or_else(|| panic!("list tags for {arn}: no Tags list in {answer}"))
+        .unwrap_or_else(|| panic!("list tags for {arn} in {region}: no Tags list in {answer}"))
         .iter()
         .map(|tag| {
             (
@@ -103,6 +115,11 @@ pub async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Vec<(String, S
             )
         })
         .collect()
+}
+
+/// [`list_tags_in`] for the emulator's default region.
+pub async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Vec<(String, String)> {
+    list_tags_in(router, DEFAULT_TEST_REGION, arn).await
 }
 
 /// Assert `answer` is the refusal a tag the service does not admit produces: HTTP 400,
@@ -162,11 +179,13 @@ pub async fn list_plan_summaries(router: &MultiServiceRouter) -> Vec<Value> {
         .clone()
 }
 
-/// Create a plan named `name`, carrying `tags` (`Value::Null` for a plan created with
-/// no `Tags` member at all), and return its `(Id, Arn)`. The plan is `CREATING` when
-/// this returns: creation is asynchronous, and the clock owes it `ACTIVE`.
-pub async fn create_plan_with_tags(
+/// Create a plan named `name` in `region`, carrying `tags` (`Value::Null` for a plan
+/// created with no `Tags` member at all), and return its `(Id, Arn)`. The plan is
+/// `CREATING` when this returns: creation is asynchronous, and the clock owes it
+/// `ACTIVE`.
+pub async fn create_plan_in_with_tags(
     router: &MultiServiceRouter,
+    region: &str,
     name: &str,
     tags: Value,
 ) -> (String, String) {
@@ -174,18 +193,30 @@ pub async fn create_plan_with_tags(
     if !tags.is_null() {
         request["Tags"] = tags;
     }
-    let (status, body) = call(router, "CreateRescoreExecutionPlan", request).await;
-    assert_eq!(status, 200, "create {name}: unexpected answer {body}");
+    let (status, body) = call_in(router, region, "CreateRescoreExecutionPlan", request).await;
+    assert_eq!(
+        status, 200,
+        "create {name} in {region}: unexpected answer {body}"
+    );
     (
         body["Id"]
             .as_str()
-            .unwrap_or_else(|| panic!("create {name}: no Id in {body}"))
+            .unwrap_or_else(|| panic!("create {name} in {region}: no Id in {body}"))
             .to_string(),
         body["Arn"]
             .as_str()
-            .unwrap_or_else(|| panic!("create {name}: no Arn in {body}"))
+            .unwrap_or_else(|| panic!("create {name} in {region}: no Arn in {body}"))
             .to_string(),
     )
+}
+
+/// [`create_plan_in_with_tags`] for the emulator's default region.
+pub async fn create_plan_with_tags(
+    router: &MultiServiceRouter,
+    name: &str,
+    tags: Value,
+) -> (String, String) {
+    create_plan_in_with_tags(router, DEFAULT_TEST_REGION, name, tags).await
 }
 
 /// Create a plan named `name` and return its id. The plan is `CREATING` when this

@@ -3328,6 +3328,12 @@ pub struct TranscriptionJobRecord {
     pub media_sample_rate_hertz: Option<i32>,
     pub output_bucket_name: Option<String>,
     pub output_key: Option<String>,
+    /// `OutputEncryptionKMSKeyId`: the key the transcript would be encrypted with.
+    /// Recorded as asked for; nothing encrypts anything, because nothing is written.
+    pub output_encryption_kms_key_id: Option<String>,
+    /// `KMSEncryptionContext`, recorded for the same reason as
+    /// [`Self::output_encryption_kms_key_id`].
+    pub kms_encryption_context: Option<std::collections::HashMap<String, String>>,
     /// `OutputLocationType`, decided once at start from `OutputBucketName`.
     pub output_location_type: String,
     /// The region the start request was signed for; the service-managed transcript

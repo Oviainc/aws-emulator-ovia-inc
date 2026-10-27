@@ -5,12 +5,13 @@
 //! `StopModelCustomizationJob` winds down, and what the clock owes a running job — over the
 //! same `MultiServiceRouter` the emulator boots (`crate::support`).
 //!
-//! `CreateModelCustomizationJob` is refused for every role a caller can pass, because the
-//! principal that would take a customization role on is Amazon Bedrock's own and so is a
-//! principal of no caller's account; that rule and its effect-absent leg are asserted in
-//! `model_customization_pass_role.rs`. The jobs these suites read are therefore written
-//! into the store the handlers share — through the SAME minting helpers and the same shapes
-//! the create used — rather than through a call that cannot be admitted.
+//! `CreateModelCustomizationJob` is what mints these jobs, and the `iam:PassRole` decision
+//! that gates it — a role of the caller's own account is passed, another account's is not —
+//! is asserted in `model_customization_pass_role.rs`, which also reads an admitted mint back
+//! through `GetModelCustomizationJob`. The jobs THIS suite reads span states and shapes a
+//! single create cannot reach at once, so they are written into the store the handlers share
+//! — through the SAME minting helpers and the same shapes the create uses — which is also
+//! how a rule about a span of wall-clock time is asserted without sleeping through one.
 //!
 //! The rules under test, each asserted over a SET of records rather than over one:
 //!

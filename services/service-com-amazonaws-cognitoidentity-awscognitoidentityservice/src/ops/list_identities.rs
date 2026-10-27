@@ -261,14 +261,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ListIdentities<En
         let page_size = usize::try_from(input.max_results).unwrap_or(1).max(1);
         let end = start.saturating_add(page_size).min(identity_ids.len());
 
-        // Nothing in this slice disables an identity, so `HideDisabled` hides none: every
-        // stored identity is an enabled one.
+        // `HideDisabled` "allows you to hide disabled identities", and a DISABLED identity
+        // is one an unlink left linked to no login provider at all; every other stored
+        // identity is an enabled one, so a page that hides none reports them all. Each
+        // description carries the identity's own login projection, which for a disabled one
+        // is the sentinel standing in place of the providers the unlink removed.
         let identities: Vec<DescribeIdentityOutput> = identity_ids[start..end]
             .iter()
             .filter_map(|identity_id| store.identities.get(identity_id))
+            .filter(|identity| !(input.hide_disabled && identity.is_disabled()))
             .map(|identity| DescribeIdentityOutput {
                 identity_id: Some(identity.identity_id.clone()),
-                logins: Some(identity.logins.clone()),
+                logins: Some(identity.projected_logins()),
                 creation_date: Some(::aws_smithy_types::DateTime::from(identity.creation_date)),
                 last_modified_date: Some(::aws_smithy_types::DateTime::from(
                     identity.last_modified_date,

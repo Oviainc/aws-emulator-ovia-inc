@@ -167,9 +167,14 @@ pub fn billing_period_at(millis: i64) -> String {
 /// a resource association carries?
 ///
 /// The member names carry the rule — `InclusiveStartBillingPeriod` is in the range and
-/// `ExclusiveEndBillingPeriod` is not — and an ABSENT bound is open, so a resource
-/// stored without a range covers every billing period. A `billing_period` that is not
-/// a billing period at all covers nothing.
+/// `ExclusiveEndBillingPeriod` is not — and an ABSENT bound is open. A `billing_period`
+/// that is not a billing period at all covers nothing.
+///
+/// A STORED resource never carries an absent inclusive start: a resource is in effect no
+/// earlier than the billing period the call that minted it was made in, so every record
+/// here is built through [`BillingPeriodSpan::started_now`], which fills that bound in.
+/// The open-start case is left to this predicate because a REMOVAL range, which bounds
+/// what a call takes away rather than when a resource exists, is still open below.
 pub fn billing_period_range_covers(
     inclusive_start: Option<&str>,
     exclusive_end: Option<&str>,
@@ -246,8 +251,11 @@ pub fn billing_period_precedes(start: Option<i64>, end: Option<i64>) -> bool {
 
 /// One half-open span of billing periods, `[InclusiveStartBillingPeriod,
 /// ExclusiveEndBillingPeriod)`, as a `CustomLineItemBillingPeriodRange` names one and
-/// as [`billing_period_range_covers`] reads it: an ABSENT bound is open, so a span with
-/// neither bound is every billing period.
+/// as [`billing_period_range_covers`] reads it: an ABSENT bound is open.
+///
+/// A span a STORED resource is in effect over is built through [`Self::started_now`], so
+/// its inclusive start is always a real billing period; an open start is left to the
+/// ranges that describe what a call REMOVES.
 ///
 /// The bounds are kept as the STRINGS a request carried, because a billing period has
 /// two spellings of one month (`2026-7` and `2026-07`) and a read reports the period
@@ -266,6 +274,24 @@ impl BillingPeriodSpan {
             inclusive_start,
             exclusive_end,
         }
+    }
+
+    /// The span a resource MINTED NOW is in effect over, given the bounds the minting
+    /// call named.
+    ///
+    /// A resource is in effect no earlier than the billing period the call that minted it
+    /// was made in, because it did not exist in any period before that one and a closed
+    /// bill never acquires a resource that was not in it. So a call that named NO
+    /// inclusive start begins in the CURRENT billing period rather than in the unbounded
+    /// past — the bound every billing-period-scoped record this service stores carries
+    /// ([`PricingRuleAssociationRecord::started_now`]). An inclusive start the call did
+    /// name is kept as the call spelled it, and an absent END stays open: nothing has
+    /// ended the resource, so it stands in every later period.
+    pub fn started_now(inclusive_start: Option<String>, exclusive_end: Option<String>) -> Self {
+        Self::new(
+            Some(inclusive_start.unwrap_or_else(current_billing_period)),
+            exclusive_end,
+        )
     }
 
     /// Is `billing_period` inside this span? See [`billing_period_range_covers`].
@@ -1484,20 +1510,11 @@ impl ResourceAssociationRecord {
     /// associating call named.
     ///
     /// An association is in effect no EARLIER than the billing period the call that made
-    /// it was made in, because it did not exist before that period: a call that named no
-    /// inclusive start begins in the CURRENT billing period rather than in the unbounded
-    /// past, which is the bound every other association this service stores carries too
-    /// ([`PricingRuleAssociationRecord::started_now`]). An inclusive start the call did
-    /// name is kept as the call spelled it, and an absent END is still open: an
-    /// association with nothing to end it stands in every later period.
+    /// it was made in, because it did not exist before that period: the bound
+    /// [`BillingPeriodSpan::started_now`] fills in, so a call that named no inclusive
+    /// start begins in the CURRENT billing period rather than in the unbounded past.
     pub fn new(arn: String, span: BillingPeriodSpan) -> Self {
-        let span = BillingPeriodSpan::new(
-            Some(
-                span.inclusive_start
-                    .unwrap_or_else(current_billing_period),
-            ),
-            span.exclusive_end,
-        );
+        let span = BillingPeriodSpan::started_now(span.inclusive_start, span.exclusive_end);
         Self {
             arn,
             spans: vec![span],
@@ -1677,8 +1694,9 @@ pub struct CustomLineItemRecord {
     pub presentation_service: Option<String>,
     /// The billing periods this item's CURRENT generation applies in, as the stretches
     /// ([`BillingPeriodSpan`]) a read reports that generation for. An item created with
-    /// no `BillingPeriodRange` at all is the one fully open span, so it applies to every
-    /// billing period.
+    /// no `BillingPeriodRange` at all is the one stretch that runs from the billing
+    /// period it was created in on ([`BillingPeriodSpan::started_now`]), so an earlier,
+    /// already closed period does not report it.
     ///
     /// The periods the item applies in AT ALL are these plus the ones its superseded
     /// generations still hold ([`Self::covers`]), because a write applied from a billing
@@ -1725,9 +1743,8 @@ impl CustomLineItemRecord {
     }
 
     /// Is this custom line item in effect during `billing_period`? Each stretch a
-    /// generation of it applies in is half-open and an item stored without a
-    /// `BillingPeriodRange` applies to every billing period — see
-    /// [`billing_period_range_covers`].
+    /// generation of it applies in is half-open and starts no earlier than the period
+    /// the item was created in — see [`billing_period_range_covers`].
     ///
     /// EVERY generation counts, not just the one in effect now: a write applied from a
     /// billing period on leaves the periods before it to the generation it superseded
@@ -1901,8 +1918,9 @@ pub struct CustomLineItemVersion {
 
 impl CustomLineItemVersion {
     /// Does this generation apply in `billing_period`? Each stretch it applies in is
-    /// half-open, and a generation left by a write that named no billing period range
-    /// applies in every period — see [`billing_period_range_covers`].
+    /// half-open, and a write that named no billing period range leaves the generation
+    /// holding the stretches the item already applied in — see
+    /// [`billing_period_range_covers`].
     pub fn covers(&self, billing_period: &str) -> bool {
         self.spans.iter().any(|span| span.covers(billing_period))
     }

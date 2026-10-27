@@ -98,6 +98,9 @@ mod refusal_messages;
 #[path = "all/regional_isolation.rs"]
 mod regional_isolation;
 
+#[path = "all/report_generation_conflict.rs"]
+mod report_generation_conflict;
+
 #[path = "all/server_config.rs"]
 mod server_config;
 
