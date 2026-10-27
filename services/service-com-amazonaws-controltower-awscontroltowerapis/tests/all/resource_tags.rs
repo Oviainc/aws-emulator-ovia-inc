@@ -40,7 +40,7 @@ use crate::landing_zone_lifecycle::{
 ///
 /// The label is NON-greedy, so the ARN is a single path segment and its `/` separators
 /// travel percent-encoded; the front door decodes the segment before the handler sees it.
-fn tags_path(arn: &str) -> String {
+pub(crate) fn tags_path(arn: &str) -> String {
     format!("/tags/{}", arn.replace('/', "%2F"))
 }
 

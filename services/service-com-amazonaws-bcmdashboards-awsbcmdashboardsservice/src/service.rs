@@ -43,7 +43,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! Four of those seams are taken here, all for the one reason named in
+//! Five of those seams are taken here. Four of them are taken for the one reason named in
 //! [`response_media_type`]: every response this service answers announces the media type
 //! the real service stamps (`application/x-amz-json-1.1`) rather than the one the model's
 //! `awsJson1_0` protocol trait implies.
@@ -57,7 +57,10 @@
 //!   `override_protocol` does not reach: a refusal of a modelled constraint, an unroutable
 //!   request, and a transport-level failure.
 //!
-//! Routing, status, codes, messages and bodies all stay with the framework.
+//! The fifth, `override_refusal`, is taken for a different reason: a boundary refusal of a
+//! `@pattern`-constrained member quotes the expression the service publishes rather than
+//! the anchored spelling the model wraps it in. Routing, status, codes, the envelope, the
+//! member paths and every other requirement stay with the framework.
 
 pub mod response_media_type;
 
@@ -141,15 +144,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service state it its own way. This service states it as the
+        // `ValidationException` envelope the framework already renders, except that a
+        // `@pattern` requirement is quoted as the expression a value has to satisfy,
+        // WITHOUT the `^` / `$` the model wraps it in to demand a whole-value match: the
+        // anchoring is how Smithy spells that match, not part of the expression the
+        // service publishes, so a client that lifts the expression out of the message and
+        // re-validates locally gets the one it advertises. The CHECK is unchanged — it
+        // still runs the model's pattern as written — and so are the code, the envelope,
+        // the member paths and every other requirement.
+        //
+        // That wording is shared by every service on a JSON protocol (this one answers
+        // awsJson), so it lives in `service-common` rather than being spelled here.
+        ::service_common::validation_message::aws_validation_refusal(refusal)
     }
 
     fn override_routing_error(
