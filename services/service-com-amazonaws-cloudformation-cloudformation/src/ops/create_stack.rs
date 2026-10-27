@@ -33,7 +33,11 @@
 //! `ResourceTypes` (which resource types the stack's operations may work with).
 //! `DisableValidation` turns off pre-deployment template validation, which this emulator
 //! does not perform either way. `StackPolicyURL` names a policy in Amazon S3 and is
-//! answered 501, like `TemplateURL`.
+//! answered 501.
+//!
+//! A `TemplateURL` says WHERE the template is rather than what it means, so the object it
+//! addresses is read from this emulator's own Amazon S3 and the stack is created from it
+//! exactly as from an inline body ([`crate::state::template_url`]).
 //!
 //! `Capabilities` is WEIGHED against the template's own declarations: a template declaring
 //! an IAM resource the request did not acknowledge is refused with the modelled
@@ -340,15 +344,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "Either TemplateBody or TemplateURL must be specified",
                 ))
             }
-            // A `TemplateURL` names a template in an Amazon S3 bucket or a Systems
-            // Manager document, which would have to be fetched over the network — this
-            // emulator makes no outbound connections. Answered 501 rather than with a
-            // stack created from a template nobody read.
-            (None, Some(_)) => {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "CreateStack with TemplateURL (fetching a template from Amazon S3)",
-                ))
-            }
+            // A `TemplateURL` says WHERE the template is, not what it means: the object it
+            // addresses is read from this emulator's own Amazon S3 and becomes the body
+            // this create deploys, so a template submitted by reference and the same one
+            // submitted inline create the same stack (`crate::state::template_url`).
+            (None, Some(url)) => crate::state::template_url::fetch(
+                ctx,
+                &crate::state::request_region(ctx.parts()),
+                url,
+            )
+            .await
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?,
         };
         // "You can specify either DisableRollback or OnFailure, but not both."
         if input.disable_rollback.is_some() && input.on_failure.is_some() {

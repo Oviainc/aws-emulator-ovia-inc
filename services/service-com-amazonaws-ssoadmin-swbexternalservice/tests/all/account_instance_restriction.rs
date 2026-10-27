@@ -111,8 +111,8 @@ pub(crate) fn instance_id_of(instance_arn: &str) -> &str {
 /// Every operation of the permission-set / account-assignment / ABAC surface, as the one
 /// request each takes for `variant` under `instance_arn`.
 ///
-/// `DeleteInlinePolicyFromPermissionSet` is the one operation of the surface still
-/// scaffolded, so it is not a row here: it answers 501 for every instance.
+/// Every operation of the surface is a row: none of them is scaffolded any more, so each
+/// one resolves the instance itself and answers the restriction on an account instance.
 pub(crate) fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<SurfaceCall> {
     let permission_set_arn = format!(
         "arn:aws:sso:::permissionSet/{}/{}",
@@ -280,6 +280,12 @@ pub(crate) fn surface_calls(instance_arn: &str, variant: &Variant) -> Vec<Surfac
         SurfaceCall {
             label: format!("{}: GetInlinePolicyForPermissionSet", variant.label),
             operation: "GetInlinePolicyForPermissionSet",
+            unknown_instance_status: 400,
+            body: on_set.clone(),
+        },
+        SurfaceCall {
+            label: format!("{}: DeleteInlinePolicyFromPermissionSet", variant.label),
+            operation: "DeleteInlinePolicyFromPermissionSet",
             unknown_instance_status: 400,
             body: on_set.clone(),
         },

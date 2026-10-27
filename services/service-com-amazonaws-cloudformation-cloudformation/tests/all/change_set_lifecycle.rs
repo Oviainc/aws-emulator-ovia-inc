@@ -977,19 +977,20 @@ async fn create_change_set_refuses_what_it_cannot_plan() {
             error_code: "ValidationError",
         },
         // What this slice cannot plan is answered 501 — "nobody has written it yet" —
-        // rather than guessed at: a template that would have to be fetched from Amazon S3
-        // (this emulator makes no outbound connections) and resources to import (it
-        // creates no stack resources).
+        // rather than guessed at: resources to import (this emulator creates no stack
+        // resources). A `TemplateURL`, by contrast, is RESOLVED: the object it addresses is
+        // read out of this emulator's own Amazon S3, so a URL naming a bucket nothing
+        // created is the request's own bad reference.
         RefusalCase {
-            case: "a template fetched from Amazon S3",
+            case: "a template URL naming no object this account can read",
             members: vec![
                 member("StackName", "s3-template"),
                 member("ChangeSetName", "cs"),
                 member("ChangeSetType", "CREATE"),
                 member("TemplateURL", "https://s3.amazonaws.com/b/t.json"),
             ],
-            status: 501,
-            error_code: "NotImplemented",
+            status: 400,
+            error_code: "ValidationError",
         },
         RefusalCase {
             case: "importing resources that already exist",

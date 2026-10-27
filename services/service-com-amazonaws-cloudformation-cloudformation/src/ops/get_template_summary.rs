@@ -21,6 +21,10 @@
 //! published primary identifier — something this emulator's type catalogue deliberately
 //! carries none of ([`crate::state::resource_schema`]).
 //!
+//! A `TemplateURL` says WHERE the body is rather than what it means, so the object it
+//! addresses is read from this emulator's own Amazon S3 and summarised exactly as an inline
+//! body ([`crate::state::template_url`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -303,22 +307,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Which template this is a summary of. A `TemplateURL` names a template in an
-        // Amazon S3 bucket or a Systems Manager document, which would have to be fetched
-        // over the network — this emulator makes no outbound connections, so it is answered
-        // 501 rather than with a summary of a template nobody read.
+        // Which template this is a summary of. A `TemplateURL` says WHERE the body is, not
+        // what it means: the object it addresses is read from this emulator's own Amazon S3
+        // and summarised exactly as an inline body (`crate::state::template_url`). Read
+        // only where the URL is the ONE template source the request states, so the
+        // exclusivity rule below still answers a request stating several.
+        let staged: Option<String> = match (
+            &input.template_body,
+            &input.template_url,
+            &input.stack_name,
+            &input.stack_set_name,
+        ) {
+            (None, Some(url), None, None) => Some(
+                crate::state::template_url::fetch(
+                    ctx,
+                    &crate::state::request_region(ctx.parts()),
+                    url,
+                )
+                .await
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?,
+            ),
+            _ => None,
+        };
         let summarised = match (
-            input.template_body.as_deref(),
-            input.template_url.as_deref(),
+            input.template_body.as_deref().or(staged.as_deref()),
+            input.template_url.as_deref().filter(|_| staged.is_none()),
             input.stack_name.as_deref(),
             input.stack_set_name.as_deref(),
         ) {
             (Some(body), None, None, None) => Summarised::Body(body),
-            (None, Some(_), None, None) => {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "GetTemplateSummary with TemplateURL (fetching a template from Amazon S3)",
-                ))
-            }
             (None, None, Some(name_or_id), None) => Summarised::Stack(name_or_id),
             (None, None, None, Some(name_or_id)) => Summarised::StackSet(name_or_id),
             _ => {

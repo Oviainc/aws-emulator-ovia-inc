@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConnectionFunctions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConnectionFunctions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConnectionFunctions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the listing answers from the connection functions `crate::state` holds, each
+//! item projected from the STAGE record the request asks for, served one page at a time with
+//! the id the page ended at as the resume point. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +71,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::ops::Bound;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,20 +142,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConnectionFunctions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConnectionFunctionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConnectionFunctions"))
+        // The engine is reachable from `&self` (constructor-injected); this operation
+        // needs nothing from the request metadata the context carries.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // "The maximum number of connection functions that you want returned in the
+        // response" — a page holds at least one item, so a non-positive size names no page
+        // at all. The size served is bounded above by this emulator's own page ceiling, the
+        // same one every listing of this service is bounded by, so one request cannot serve
+        // the whole store in a single response.
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListConnectionFunctionsErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        // "The connection function's stage": a request that names no stage lists every
+        // connection function under the stage one is created in — the SAME default the
+        // connection function reads take — while `LIVE` lists only the ones a publish has
+        // copied into that stage. The value is constrained to the modelled `FunctionStage`
+        // enum, so reaching here means it names one of the two stages.
+        let stage = input
+            .stage
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_FUNCTION_STAGE);
+
+        // A READ: nothing about a connection function is owed by the clock — it reaches its
+        // `LIVE` stage through a `PublishConnectionFunction` call rather than by waiting —
+        // so this read materialises nothing and leaves what a later caller sees untouched.
+        let store = state.lock();
+
+        // The marker is "the value of NextMarker from the current page's response", which is
+        // a connection function id this service handed out: a value that is not one was never
+        // a resume point, which is what this listing's `InvalidArgument` is about. A
+        // well-shaped id naming no stored connection function IS still a resume point — the
+        // page after it is whatever the store holds beyond it — so it lists rather than
+        // refuses.
+        if let Some(marker) = input.marker.as_deref() {
+            if !crate::state::is_connection_function_id(marker) {
+                return Err(ListConnectionFunctionsErrorModeled::InvalidArgument(
+                    InvalidArgument {
+                        message: Some(format!(
+                            "Marker {marker} is not a connection function id returned by \
+                             ListConnectionFunctions"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // `Marker` names where the previous page ENDED, so this page starts after it — "The
+        // response includes items in the list that occur after the marker" — and walking the
+        // pages enumerates every connection function of the stage exactly once. A connection
+        // function is held under its id, which is what the store is ordered by, so the resume
+        // point is a range bound rather than a scan.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        let mut functions: Vec<ConnectionFunctionSummary> = Vec::new();
+        let mut more_remain = false;
+        for (_, stored) in store
+            .connection_functions
+            .range::<str, _>((start, Bound::Unbounded))
+        {
+            // A connection function with no record for the stage asked for is not in that
+            // stage, so it is not on this page; every item is projected from the STAGE
+            // record, so a listed connection function reports the configuration, the status
+            // and the timestamps that stage holds.
+            let Some(stage_record) = stored.stage(stage) else {
+                continue;
+            };
+            if functions.len() >= page_size {
+                more_remain = true;
+                break;
+            }
+            functions.push(stage_record.to_summary(&stored.name, &stored.id, &stored.arn));
+        }
+
+        Ok(ListConnectionFunctionsOutput {
+            // "Indicates the next page of connection functions. To get the next page of the
+            // list, use this value in the Marker field of your request": present exactly when
+            // connection functions of this stage remain, carrying the id this page ended at.
+            // A page that left items behind is a FULL page, so it has a last summary to name.
+            next_marker: functions
+                .last()
+                .filter(|_| more_remain)
+                .map(|summary| summary.id.clone()),
+            // "A list of connection functions" — every one of them read from its stored
+            // record.
+            connection_functions: Some(functions),
+        })
     }
 }
+

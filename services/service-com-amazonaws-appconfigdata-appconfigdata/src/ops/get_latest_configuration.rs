@@ -304,11 +304,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(unresolved) => {
                 return Err(GetLatestConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(unresolved.message),
+                        message: Some(unresolved.message.clone()),
                         resource_type: Some(unresolved.resource_type.to_string()),
-                        referenced_by: unresolved.referenced_by.map(|(member, identifier)| {
-                            std::collections::HashMap::from([(member.to_string(), identifier)])
-                        }),
+                        referenced_by: unresolved.referenced_by(),
                     },
                 )
                 .into());

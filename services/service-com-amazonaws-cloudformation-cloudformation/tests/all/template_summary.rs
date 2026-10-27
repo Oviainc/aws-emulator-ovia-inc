@@ -767,17 +767,19 @@ async fn get_template_summary_refuses_a_request_it_cannot_summarise() {
             message: "only one of the following parameters".to_string(),
         },
         RefusalCase {
-            // Fetching a template out of Amazon S3 needs an outbound connection this
-            // emulator does not make: 501 says "nobody has written it", which is the honest
-            // answer, rather than a summary of a template nobody read.
-            case: "a TemplateURL, which would have to be fetched over the network",
+            // A `TemplateURL` is resolved by reading the object it addresses out of this
+            // emulator's own Amazon S3, so one naming a bucket nothing created is the
+            // REQUEST's own bad reference — not a summary of a template nobody read.
+            case: "a TemplateURL naming no object this account can read",
             members: vec![member(
                 "TemplateURL",
                 "https://s3.amazonaws.com/a-bucket/a-template.json",
             )],
-            status: 501,
-            code: "NotImplemented",
-            message: "GetTemplateSummary with TemplateURL".to_string(),
+            status: 400,
+            code: "ValidationError",
+            message: "S3 object does not exist. Bucket: a-bucket, Key: a-template.json. \
+                      Error: NoSuchBucket"
+                .to_string(),
         },
         RefusalCase {
             case: "a StackName no stack of this Region carries",

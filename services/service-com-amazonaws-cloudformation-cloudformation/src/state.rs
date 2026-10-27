@@ -248,6 +248,10 @@ pub mod sam;
 /// provisioned.
 pub mod include;
 
+/// A template submitted BY REFERENCE: the Amazon S3 object a `TemplateURL` addresses, read
+/// so the operation goes on exactly as it would with an inline `TemplateBody`.
+pub mod template_url;
+
 /// Computing a change set: comparing the stack's template and parameters with the ones a
 /// change set submits, and the resource-level change list that comparison answers.
 pub mod change_plan;
@@ -554,13 +558,20 @@ pub const MAX_DESCRIBED_STACK_RESOURCES: usize = 100;
 /// the constraint it failed.
 pub fn validate_template_body(template_body: &str) -> Result<(), String> {
     if template_body.len() > TEMPLATE_BODY_MAX_BYTES {
-        return Err(format!(
-            "1 validation error detected: Value at 'templateBody' failed to satisfy \
-             constraint: Member must have length less than or equal to \
-             {TEMPLATE_BODY_MAX_BYTES}"
-        ));
+        return Err(template_body_too_long());
     }
     Ok(())
+}
+
+/// The refusal a template body past [`TEMPLATE_BODY_MAX_BYTES`] is held to, in the one
+/// place that words it: a body submitted by REFERENCE is held to the same ceiling, and the
+/// two cannot drift apart about what it is ([`template_url`]).
+pub fn template_body_too_long() -> String {
+    format!(
+        "1 validation error detected: Value at 'templateBody' failed to satisfy \
+         constraint: Member must have length less than or equal to \
+         {TEMPLATE_BODY_MAX_BYTES}"
+    )
 }
 
 /// `CAPABILITY_AUTO_EXPAND` when the template declares a transform the request has not

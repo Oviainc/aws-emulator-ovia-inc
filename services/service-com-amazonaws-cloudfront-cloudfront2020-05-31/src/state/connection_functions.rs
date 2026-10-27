@@ -277,6 +277,20 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     }
 }
 
+/// Whether `value` has the shape of a connection function id this service mints
+/// ([`CONNECTION_FUNCTION_ID_PREFIX`] followed by [`ID_BODY_LEN`] characters of the id
+/// alphabet).
+///
+/// `ListConnectionFunctions`'s `Marker` is a resume point "the value of `NextMarker` from
+/// the current page's response", which is an id this service handed out, and the model
+/// constrains it no further than `string` — so this is what tells a resume point the service
+/// issued from a value a client made up.
+pub fn is_connection_function_id(value: &str) -> bool {
+    value
+        .strip_prefix(CONNECTION_FUNCTION_ID_PREFIX)
+        .is_some_and(super::is_token_body)
+}
+
 /// Whether `config` attaches the connection function `id` names.
 ///
 /// A distribution attaches a connection function through its `ConnectionFunctionAssociation`,

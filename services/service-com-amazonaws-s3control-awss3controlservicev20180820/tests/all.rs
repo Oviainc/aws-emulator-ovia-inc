@@ -21,6 +21,8 @@ mod access_grants_location_register;
 mod access_grants_location_update;
 #[path = "all/access_point_lifecycle.rs"]
 mod access_point_lifecycle;
+#[path = "all/access_point_policy_delete.rs"]
+mod access_point_policy_delete;
 #[path = "all/access_point_public_access_block_default.rs"]
 mod access_point_public_access_block_default;
 #[path = "all/batch_job_lifecycle.rs"]

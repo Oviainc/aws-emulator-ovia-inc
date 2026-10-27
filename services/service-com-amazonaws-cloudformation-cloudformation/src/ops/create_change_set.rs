@@ -45,9 +45,13 @@
 //! same validation pass `CreateStack` holds a submitted template to
 //! ([`crate::state::template_validation`]).
 //!
-//! Answered 501 rather than guessed at: `TemplateURL` (fetching a template from Amazon S3
-//! needs an outbound connection this emulator does not make) and `ChangeSetType=IMPORT`
-//! (importing resources that already exist, which this emulator does not create).
+//! A `TemplateURL` says WHERE that body is rather than what it means, so the object it
+//! addresses is read from this emulator's own Amazon S3 and everything above happens on it
+//! unchanged ([`crate::state::template_url`]); a URL naming no readable object is the
+//! `ValidationError` the request's own reference earns.
+//!
+//! Answered 501 rather than guessed at: `ChangeSetType=IMPORT` (importing resources that
+//! already exist, which this emulator does not create).
 //!
 //! ## Shape of an operation
 //!
@@ -307,7 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "Conditional: You must specify only one of the following parameters:
@@ -326,13 +330,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  UsePreviousTemplate",
             ));
         }
-        // A `TemplateURL` names a template in an Amazon S3 bucket or a Systems Manager
-        // document, which would have to be fetched over the network — this emulator makes
-        // no outbound connections.
-        if input.template_url.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "CreateChangeSet with TemplateURL (fetching a template from Amazon S3)",
-            ));
+        // A `TemplateURL` says WHERE the revised template is, not what it means: the
+        // object it addresses is read from this emulator's own Amazon S3 and becomes the
+        // body everything below plans from, so a template submitted by reference and the
+        // same one submitted inline produce the same change set
+        // (`crate::state::template_url`).
+        if let Some(url) = input.template_url.take() {
+            let body = crate::state::template_url::fetch(
+                ctx,
+                &crate::state::request_region(ctx.parts()),
+                &url,
+            )
+            .await
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            input.template_body = Some(body);
         }
         // "By default, CloudFormation specifies UPDATE."
         let requested_type = input

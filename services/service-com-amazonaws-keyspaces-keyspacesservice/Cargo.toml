@@ -23,7 +23,8 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Hex codec for the opaque `nextToken` ListTables issues (encode/decode only).
+# Hex codec for the opaque `nextToken` this service's paginated listings issue
+# (encode/decode only, through the one codec in `state`).
 hex = { workspace = true }
 # The CDC STREAM STORE, which that crate owns: Amazon Keyspaces creates a table's CDC
 # stream when `CreateTable`/`UpdateTable` is given a `cdcSpecification`, and

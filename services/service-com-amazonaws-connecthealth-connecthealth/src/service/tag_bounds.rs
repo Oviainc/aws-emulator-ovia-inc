@@ -49,6 +49,25 @@
 //! one made at the boundary; the reserved-namespace refusal is the service's own sentence,
 //! because no modelled constraint states that rule for it to borrow.
 //!
+//! That parity covers a request that breaks several rules at once. The boundary walk
+//! COLLECTS every violation of one request and renders them into one envelope whose count
+//! is the number of clauses it states, so a refusal made here collects every entry it
+//! refuses too rather than stopping at whichever one it met first. The order is fixed by
+//! the request's own content: a `TagMap` reaches a handler as an unordered map, whose
+//! iteration order is neither the order the caller spelled nor stable between two maps
+//! holding the same entries, so the entries are walked in order of their KEY — the one
+//! order derivable from the entries themselves, which is why one request has exactly ONE
+//! refusal text, whichever operation carried the map and however that map was built. A
+//! `TagKeyList` arrives already ordered by the request, and its elements keep that order.
+//! A refusal names at most [`MAX_NAMED_ENTRIES`] entries, so one request cannot size the
+//! response it is answered with.
+//!
+//! The two classes are not mixed into one sentence: AWS's envelope states
+//! modelled-constraint clauses, so a request that breaks a modelled length is answered by
+//! that envelope, and the reserved-namespace sentence — the service's own words, naming
+//! every key the request spells in that namespace — answers a request whose only fault is
+//! the namespace.
+//!
 //! How many entries one resource may hold is the service's own rule too — `TagMap`
 //! declares no `@length`, so the count is [`crate::state::MAX_TAGS_PER_RESOURCE`] — and
 //! it is likewise compared in one place, [`merged_within_cap`]. What each operation
@@ -80,6 +99,16 @@ use crate::state::{
 
 /// This service's Smithy namespace, for the member schemas below.
 const NAMESPACE: &str = "com.amazonaws.connecthealth";
+
+/// How many entries one refusal names.
+///
+/// Every clause echoes the value it refused, so a refusal that named every entry of an
+/// arbitrarily long request would turn one request into a response sized by it. The most
+/// entries a caller could usefully be told about is the most a resource may hold
+/// ([`MAX_TAGS_PER_RESOURCE`]) — a request naming more than that cannot be served whatever
+/// its entries say — so collecting stops there, and the count a refusal states is the
+/// number of entries it names.
+const MAX_NAMED_ENTRIES: usize = MAX_TAGS_PER_RESOURCE;
 
 /// The member every operation of this service binds a `TagMap` to — `CreateDomainInput`
 /// and `TagResourceInput` both spell it `tags` — which is the path a violation of one of
@@ -202,83 +231,150 @@ fn reserved(key: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
 }
 
-/// The refusal text for a key in the namespace the service reserves for the tags it
-/// sets itself, or `None` when `key` is outside that namespace.
+/// The refusal text for the keys in the namespace the service reserves for the tags it
+/// sets itself, or `None` when `keys` is empty.
 ///
 /// The namespace is the service's own rule rather than a modelled constraint, so its
-/// sentence is the service's own too: it names the key the caller asked for, the member
-/// that carried it, and the prefix no caller may use. ONE sentence for every member a
-/// key can be spelled at, so naming a reserved key to SET it and naming one to REMOVE it
-/// are refused the same way.
-fn reserved_violation(member: &str, key: &str) -> Option<String> {
-    reserved(key).then(|| {
-        format!(
-            "Tag keys cannot start with '{RESERVED_TAG_KEY_PREFIX}': the tag key '{key}' \
-             at '{member}' uses the prefix reserved for tags this service sets"
-        )
-    })
+/// sentence is the service's own too: it names every key the caller asked for that is in
+/// the namespace, the member that carried them, and the prefix no caller may use. ONE
+/// sentence for every member a key can be spelled at, so naming a reserved key to SET it
+/// and naming one to REMOVE it are refused the same way, and one request naming several
+/// of them is answered once rather than told about an arbitrary one of them.
+fn reserved_violation(member: &str, keys: &[String]) -> Option<String> {
+    // One key is the sentence's subject, several are its subjects; the clause agrees with
+    // the count the request carried rather than claiming a single offender.
+    let (noun, verb) = match keys.len() {
+        0 => return None,
+        1 => ("key", "uses"),
+        _ => ("keys", "use"),
+    };
+    let named: Vec<String> = keys.iter().map(|key| format!("'{key}'")).collect();
+    Some(format!(
+        "Tag keys cannot start with '{RESERVED_TAG_KEY_PREFIX}': the tag {noun} {} at \
+         '{member}' {verb} the prefix reserved for tags this service sets",
+        named.join(", ")
+    ))
 }
 
-/// The refusal text for a tag KEY this service does not accept — one outside the
-/// modelled `TagKey` length (BOTH ends, so an empty key is refused) or one in the
-/// reserved [`RESERVED_TAG_KEY_PREFIX`] namespace — or `None` when the key is
-/// acceptable.
+/// Everything the tag keys and values ONE request names do not satisfy — collected, not
+/// stopped at, so a request that breaks several rules is answered by a refusal naming
+/// every one of them, exactly as the boundary walk answers a request with several bad
+/// members.
 ///
-/// The ONE place the two per-key rules and their ORDER are stated, so every member a key
-/// can be spelled at is held to the same rule in the same sequence: the length first,
-/// because a key outside its bound has no further rule to answer to.
-///
-/// `member_schema` carries `TagKey`'s bound under the name of the member that carried the
-/// key and `member` is that same name; `at` is the path a LENGTH refusal is reported at
-/// when it is not that member's own name — a list element names its 1-based position,
-/// where a map's key names the member it is bound to.
-fn key_violation(
-    member_schema: &'static Schema,
-    member: &str,
-    key: &str,
-    at: Option<String>,
-) -> Option<String> {
-    if let Some(mut violation) = checked(member_schema, key) {
-        if let Some(path) = at {
-            violation.path = path;
-        }
-        return envelope(&[violation]);
+/// The two classes are kept apart because different authorities word them: a modelled
+/// length is the framework's clause inside AWS's envelope, while the reserved namespace
+/// is a rule no modelled constraint states and so is the service's own sentence.
+#[derive(Debug, Default)]
+struct Refused {
+    /// Violations of a modelled `@length`, in the order the halves were walked in.
+    lengths: Vec<Violation>,
+    /// The keys that lie in the reserved namespace, in that same order.
+    reserved: Vec<String>,
+}
+
+impl Refused {
+    /// Whether this refusal already names as many entries as one refusal names.
+    fn full(&self) -> bool {
+        self.lengths.len() + self.reserved.len() >= MAX_NAMED_ENTRIES
     }
-    reserved_violation(member, key)
+
+    /// Record whatever `key` does not satisfy, and report whether it satisfied
+    /// everything — a caller holding the rest of the entry needs to know, since an entry
+    /// whose key is refused has no position to report its value at.
+    ///
+    /// The ONE place the two per-key rules and their ORDER are stated, so every member a
+    /// key can be spelled at is held to the same rules in the same sequence: the length
+    /// first, because a key outside its bound has no further rule to answer to.
+    ///
+    /// `member_schema` carries `TagKey`'s bound under the name of the member that carried
+    /// the key; `at` is the path a LENGTH violation is reported at when it is not that
+    /// member's own name — a list element names its 1-based position, where a map's key
+    /// names the member it is bound to.
+    fn key(&mut self, member_schema: &'static Schema, key: &str, at: Option<String>) -> bool {
+        if let Some(mut violation) = checked(member_schema, key) {
+            if let Some(path) = at {
+                violation.path = path;
+            }
+            self.lengths.push(violation);
+            return true;
+        }
+        if reserved(key) {
+            self.reserved.push(key.to_string());
+            return true;
+        }
+        false
+    }
+
+    /// Record whatever the value of the entry keyed `key` does not satisfy. Only the KEY
+    /// answers to the namespace rule — a VALUE may say anything its own length allows.
+    fn value(&mut self, key: &str, value: &str) {
+        if let Some(mut violation) = checked(&M_TAG_VALUE, value) {
+            // A map value's path is `<member>.<key>.member` — the spelling the walk
+            // itself gives a map entry (`constraints::path::entry`), applied here because
+            // the key is known only at request time.
+            violation.path = format!("{TAG_MAP_MEMBER}.{}", path::entry(key));
+            self.lengths.push(violation);
+        }
+    }
+
+    /// The refusal text for everything recorded, or `None` when nothing was: the
+    /// framework's envelope over every modelled-constraint clause — so its count is the
+    /// number of clauses it states — and otherwise the service's own sentence for the
+    /// keys in the reserved namespace, reported at `member`.
+    ///
+    /// A request that breaks a modelled length is answered by the envelope ALONE, with
+    /// the reserved keys it also named left unstated: the envelope's clauses are AWS's
+    /// words for a modelled constraint and the namespace sentence is this service's, so
+    /// appending one to the other would put a sentence no constraint states inside a count
+    /// of constraint violations. The caller is told the whole of one class, and a request
+    /// whose only fault is the namespace is told the whole of the other.
+    fn text(&self, member: &str) -> Option<String> {
+        envelope(&self.lengths).or_else(|| reserved_violation(member, &self.reserved))
+    }
 }
 
-/// The refusal text for the first of `keys` this service does not accept, or `None` when
+/// The refusal text for every one of `keys` this service does not accept, or `None` when
 /// every key is acceptable — the check the one operation that names tag keys for REMOVAL
-/// applies to its `tagKeys` list.
+/// applies to its `tagKeys` list. At most [`MAX_NAMED_ENTRIES`] of them are named.
 ///
 /// The per-key rules are exactly the ones [`violation`] applies to the keys of a
-/// `TagMap`, because both go through [`key_violation`]: a key outside the modelled
+/// `TagMap`, because both go through [`Refused::key`]: a key outside the modelled
 /// `TagKey` length, and a key in the reserved namespace, which names a tag no caller may
 /// set OR remove. A length violation is reported at the element's own 1-based position in
 /// the list — the spelling the boundary walk itself gives a list element
 /// (`constraints::path::element`) — because a request may name up to fifty keys and the
-/// caller has to know which one was refused.
+/// caller has to know which one was refused. A list is ordered by the request, so the
+/// clauses are reported in the order the caller spelled the keys in.
 ///
 /// The caller renders the text through its own `ValidationException` channel (HTTP 400)
 /// and writes nothing.
 pub fn removed_key_violation<'k>(keys: impl IntoIterator<Item = &'k String>) -> Option<String> {
-    keys.into_iter().enumerate().find_map(|(index, key)| {
-        key_violation(
+    let mut refused = Refused::default();
+    for (index, key) in keys.into_iter().enumerate() {
+        if refused.full() {
+            break;
+        }
+        refused.key(
             &M_REMOVED_TAG_KEY,
-            TAG_KEY_LIST_MEMBER,
             key,
             Some(format!(
                 "{TAG_KEY_LIST_MEMBER}.{}",
                 path::element(index + 1)
             )),
-        )
-    })
+        );
+    }
+    refused.text(TAG_KEY_LIST_MEMBER)
 }
 
-/// The refusal text for the first entry of `tags` this service does not accept — one
-/// outside the modelled `TagKey` / `TagValue` lengths (BOTH ends of both bounds, so an
-/// empty key is refused and an empty value is not), or one whose key lies in the reserved
+/// The refusal text for every entry of `tags` this service does not accept — one outside
+/// the modelled `TagKey` / `TagValue` lengths (BOTH ends of both bounds, so an empty key
+/// is refused and an empty value is not), or one whose key lies in the reserved
 /// [`RESERVED_TAG_KEY_PREFIX`] namespace — or `None` when every entry is acceptable.
+///
+/// Every refused entry is named, up to [`MAX_NAMED_ENTRIES`], and the entries are walked
+/// in order of their KEY: `tags` reaches a handler as an unordered map, so the key is the
+/// only ordering the entries themselves fix, and one request therefore has exactly one
+/// refusal text — the same text whichever operation carried the map.
 ///
 /// This is the CONTENT of the per-entry rule. A handler reaches it through
 /// [`accepted_entries`], which is where the rule's place in a handler is stated: calling
@@ -289,24 +385,24 @@ pub fn removed_key_violation<'k>(keys: impl IntoIterator<Item = &'k String>) -> 
 pub fn violation<'t>(
     tags: impl IntoIterator<Item = (&'t String, &'t String)>,
 ) -> Option<String> {
-    tags.into_iter().find_map(|(key, value)| {
-        // The key first, by the rule every key of this service answers to: an entry
-        // whose key is refused has no position to report its value at. Only the KEY is
-        // subject to that rule — a VALUE may say anything its own length allows.
-        if let Some(reported) = key_violation(&M_TAG_KEY, TAG_MAP_MEMBER, key, None) {
-            return Some(reported);
+    let mut entries: Vec<(&String, &String)> = tags.into_iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    let mut refused = Refused::default();
+    for (key, value) in entries {
+        if refused.full() {
+            break;
         }
-        let mut violation = checked(&M_TAG_VALUE, value)?;
-        // A map value's path is `<member>.<key>.member` — the spelling the walk itself
-        // gives a map entry (`constraints::path::entry`), applied here because the key
-        // is known only at request time.
-        violation.path = format!("{TAG_MAP_MEMBER}.{}", path::entry(key));
-        envelope(&[violation])
-    })
+        // The key first, by the rule every key of this service answers to; an entry whose
+        // key is refused contributes that refusal alone.
+        if !refused.key(&M_TAG_KEY, key, None) {
+            refused.value(key, value);
+        }
+    }
+    refused.text(TAG_MAP_MEMBER)
 }
 
 /// The entries a request asks for, key-ordered and every one of them acceptable, or the
-/// refusal text for the first entry this service does not accept ([`violation`]).
+/// refusal text naming every entry this service does not accept ([`violation`]).
 ///
 /// This states the per-entry rule's PLACE as well as its content, which is why both
 /// operations that accept a `TagMap` enter the rule through here. The rule is decided
@@ -317,9 +413,9 @@ pub fn violation<'t>(
 /// once is therefore refused for its entry, with the one status and the one error code
 /// the entry rule carries, whichever operation the map arrived on.
 ///
-/// The entries are ordered by key before the walk, so the entry a map of SEVERAL
-/// unacceptable entries is refused for is the same one however the request's map was
-/// ordered on the wire — the operations cannot word one map's refusal differently.
+/// The entries are ordered by key before the walk, so a map of SEVERAL unacceptable
+/// entries is refused with the same text however the request's map was ordered on the
+/// wire — the operations cannot word one map's refusal differently.
 ///
 /// The caller renders an `Err` through its own `ValidationException` channel (HTTP 400)
 /// and hands an `Ok` on as the request's entries to merge; nothing is written here.
