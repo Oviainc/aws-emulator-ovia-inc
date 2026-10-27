@@ -31,6 +31,8 @@ mod auto_snapshots;
 mod blueprint_catalog;
 #[path = "all/bucket_access_keys.rs"]
 mod bucket_access_keys;
+#[path = "all/bucket_bundle_update.rs"]
+mod bucket_bundle_update;
 #[path = "all/bucket_bundles.rs"]
 mod bucket_bundles;
 #[path = "all/bucket_configuration_update.rs"]

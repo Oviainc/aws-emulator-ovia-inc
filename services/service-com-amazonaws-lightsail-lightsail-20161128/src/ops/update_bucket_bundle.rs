@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBucketBundle
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBucketBundle`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Moves one stored bucket onto another of the published object-storage plans — the
+//! plan that sets its monthly cost, its storage space and its data transfer quota —
+//! and answers the operation-log entry the change wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBucketBundle::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A bucket's bundle can be changed only one time within a monthly Amazon Web Services
+//! billing cycle, so the change the request asks for also SPENDS that allowance: the
+//! `ableToUpdateBundle` a later read reports is what says whether another change is
+//! still available, and a request made once it is gone is refused and moves nothing.
+//!
+//! A plan a bucket may be put on is one this service still offers, which is the same
+//! rule the create applies, so both ask the one owner of it in [`crate::state`] rather
+//! than deriving it twice.
+//!
+//! A request made once that allowance is gone is a well-formed one this bucket's state
+//! does not allow. The sibling bundle update of a CDN distribution answers that with the
+//! modelled `OperationFailureException`; THIS operation declares no such error, so the
+//! refusal is its modelled `InvalidInputException` instead — the difference is the two
+//! models', not a choice made here.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +180,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBucketBundle` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBucketBundleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBucketBundle"))
+        // A bucket is a REGIONAL resource — `GetBuckets` reports "all of your
+        // buckets in the Amazon Web Services Region where the request is made" —
+        // so the Region the request is signed for is what `bucketName` addresses
+        // a bucket in, exactly as it is for the create and for the configuration
+        // update.
+        let region = crate::state::request_region(ctx.parts());
+
+        // Both members are modelled `@required` and the name carries the modelled
+        // length and pattern, so the centralized walk refused anything outside
+        // them before this body ran. What is left is what the model cannot
+        // express: the plan has to be one a bucket may be put on — "Use the
+        // GetBucketBundles action to get a list of bundle IDs that you can
+        // specify" — asked of the crate's one owner of that rule, the same one
+        // `CreateBucket` asks, rather than re-derived here. Checked BEFORE the
+        // first write, so a refused request moves no bucket.
+        let bundle = crate::state::applicable_bucket_bundle(&input.bundle_id).ok_or_else(|| {
+            invalid(format!(
+                "bundleId '{}' is not an active bucket bundle this service offers; use \
+                 GetBucketBundles to list the bundle IDs you can specify",
+                input.bundle_id
+            ))
+        })?;
+
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The addressed bucket, taken mutably once; a name this account holds
+            // no bucket under in this Region is Lightsail's `DoesNotExist`
+            // rejection, the same one every other reader and writer of a bucket
+            // answers.
+            let bucket = store
+                .bucket_mut(&region, &input.bucket_name)
+                .ok_or_else(|| not_found(&input.bucket_name))?;
+            // "You can update a bucket's bundle only one time within a monthly
+            // Amazon Web Services billing cycle. To determine if you can update a
+            // bucket's bundle, use the GetBuckets action. The ableToUpdateBundle
+            // parameter in the response will indicate whether you can currently
+            // update a bucket's bundle." — so a bucket that has already spent
+            // that one change cannot be moved again, and this operation models no
+            // separate failure for a state like that, so it is the modelled
+            // `InvalidInputException` naming the rule. Refused BEFORE the first
+            // write, so it changes nothing.
+            if !bucket.able_to_update_bundle {
+                return Err(invalid(format!(
+                    "The bundle of the bucket {} has already been updated within this monthly \
+                     Amazon Web Services billing cycle. You can update a bucket's bundle only \
+                     one time within a monthly Amazon Web Services billing cycle.",
+                    input.bucket_name
+                )));
+            }
+
+            // The change itself: the bucket is billed, and its storage space and
+            // data transfer quota measured, against the plan this request names
+            // from here on, and the one change its monthly billing cycle allows is
+            // spent — including by a request naming the plan the bucket is already
+            // on, which asks for a bundle to be applied like any other rather than
+            // being short-circuited. The plan is named by the id the catalog
+            // carries rather than by whatever the request spelled it.
+            bucket.bundle_id = bundle.bundle_id.to_string();
+            // Spending the allowance is one-way here: this store keeps no billing
+            // cycle boundary, so nothing makes the allowance due again and a
+            // bucket is moved at most once. The refusal above is what a caller
+            // sees after that, which is the rule's answer for the rest of the
+            // cycle.
+            bucket.able_to_update_bundle = false;
+            // The bucket's own state is left alone: a bundle names the monthly
+            // cost, the storage space and the data transfer quota, none of what
+            // makes the bucket serve, so this change takes nothing offline and
+            // touches no object it holds.
+            let location = bucket.location.clone();
+
+            // One log entry, for the bucket that was moved. It is TERMINAL: the
+            // new plan is in force as this call returns, so the next read already
+            // reports it and the spent allowance, and the clock owes the entry
+            // nothing.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_UPDATE_BUCKET_BUNDLE,
+                crate::state::RESOURCE_TYPE_BUCKET,
+                &input.bucket_name,
+                &location,
+                None,
+            );
+            Ok(UpdateBucketBundleOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong, or the rule the request broke.
+fn invalid(message: String) -> UpdateBucketBundleError {
+    UpdateBucketBundleErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No bucket of that name is stored in this Region: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message naming the resource type and the requested name.
+fn not_found(name: &str) -> UpdateBucketBundleError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(crate::state::RESOURCE_TYPE_BUCKET, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> UpdateBucketBundleError {
+    UpdateBucketBundleErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail bucket store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
