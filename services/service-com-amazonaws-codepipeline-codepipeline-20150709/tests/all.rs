@@ -55,6 +55,8 @@ mod rollback_stage;
 mod rule_executions;
 #[path = "all/s3_deploy_object_key.rs"]
 mod s3_deploy_object_key;
+#[path = "all/source_revision_overrides.rs"]
+mod source_revision_overrides;
 #[path = "all/stage_condition_rules.rs"]
 mod stage_condition_rules;
 #[path = "all/stage_transitions.rs"]

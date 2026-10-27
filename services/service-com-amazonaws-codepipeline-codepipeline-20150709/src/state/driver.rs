@@ -512,16 +512,14 @@ fn start_action(
         )
         .find(|store| store.location == artifact_bucket)
         .and_then(|store| store.encryption_key.clone());
-    let pinned: BTreeMap<String, String> = record
-        .source_revisions
-        .iter()
-        .filter_map(|revision| {
-            Some((
-                revision.action_name.clone(),
-                revision.revision_id.clone()?,
-            ))
-        })
-        .collect();
+    // What a source action of THIS action's name is to read, when the start that created
+    // the execution overrode it: each override's `revisionType` says what its value
+    // pins, so only an S3 one names an object or a version (see
+    // `execution::s3_source_pin`).
+    let pin = super::execution::s3_source_pin(
+        &record.source_overrides,
+        &record.stages[stage].actions[index].name,
+    );
     let produced = record.artifacts.clone();
     // What the action IS comes from the pinned declaration, not from a copy in the
     // execution record, and from the declared stage the PLAN names rather than from the
@@ -644,7 +642,8 @@ fn start_action(
             fail_action(action, FAILURE_CONFIGURATION_ERROR, &detail, now);
             return None;
         }
-        let (Some(bucket), Some(key)) = (config.get("S3Bucket"), config.get("S3ObjectKey")) else {
+        let (Some(bucket), Some(declared_key)) = (config.get("S3Bucket"), config.get("S3ObjectKey"))
+        else {
             fail_action(
                 action,
                 FAILURE_CONFIGURATION_ERROR,
@@ -671,14 +670,18 @@ fn start_action(
                 revision: None,
             })
             .collect();
+        // The object this run reads: the key the declaration states, under the key an
+        // `S3_OBJECT_KEY` override names instead, at the version an
+        // `S3_OBJECT_VERSION_ID` override pins — and otherwise at the object's CURRENT
+        // version, because nothing pinned one.
         action.claimed = Some(now);
         return Some(Job::S3Source {
             execution_id,
             stage,
             action: index,
             bucket: bucket.clone(),
-            key: key.clone(),
-            version_id: pinned.get(&action.name).cloned(),
+            key: pin.key.unwrap_or_else(|| declared_key.clone()),
+            version_id: pin.version_id,
             outputs,
         });
     }
