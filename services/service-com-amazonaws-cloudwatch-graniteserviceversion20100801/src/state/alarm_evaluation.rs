@@ -428,7 +428,7 @@ impl State {
             .get(&watched_series(alarm))
             .is_some_and(|series| {
                 series.iter().any(|datum| {
-                    datum.timestamp_secs >= range_from && carries_alarm_unit(alarm, datum)
+                    datum.aggregated_instant() >= range_from && carries_alarm_unit(alarm, datum)
                 })
             })
     }
@@ -579,13 +579,14 @@ impl State {
             // A datapoint belongs to the period its OWN time stamp falls in, so which window
             // it is aggregated into is decided by the datapoint and not by the instant the
             // evaluation runs — the same fold this store's readers make over a series
-            // ([`super::windows_of`]).
+            // ([`super::windows_of`]), down to the granularity the datapoint's own
+            // `StorageResolution` stores it at ([`StoredDatum::aggregated_instant`]).
             //
             // A datapoint may be stamped up to two hours ahead of now ("as much as 2 hours
             // after the current day and time", `PutMetricData`); it belongs to the newest
             // window, the one the evaluation instant falls in.
             let periods_back =
-                (current_period - (datum.timestamp_secs / period).floor()).max(0.0);
+                (current_period - (datum.aggregated_instant() / period).floor()).max(0.0);
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let index = periods_back as usize;
             if let Some(window) = windows.get_mut(index) {
@@ -1127,7 +1128,8 @@ fn decimal_text(value: f64) -> String {
 /// "An explanation for the alarm state, in JSON format." (`MetricAlarm$StateReasonData`),
 /// bounded by [`MAX_STATE_REASON_DATA_LEN`] — a document is JSON, so it can never be
 /// truncated to fit: the datapoint list is dropped instead when an alarm evaluates more
-/// windows than the bound holds.
+/// windows than the bound holds. Every instant inside it is written in the form a document of
+/// this service stamps an instant with ([`super::document_instant`]).
 fn state_reason_data(
     statistic: &AlarmStatistic<'_>,
     period: f64,
@@ -1140,16 +1142,16 @@ fn state_reason_data(
     document.insert("version".to_string(), Value::from(HISTORY_DATA_VERSION));
     // The instant the evaluation queried the series at, and the start of the OLDEST period it
     // graded: together they say which span of the series the state was decided over. Both are
-    // the modelled timestamp type's own rendering ([`super::rfc3339`]), the one this crate
-    // writes every instant with.
-    if let Some(at) = super::rfc3339(now_secs) {
+    // written in the form this service's JSON documents stamp an instant with
+    // ([`super::document_instant`]).
+    if let Some(at) = super::document_instant(now_secs) {
         document.insert("queryDate".to_string(), Value::from(at));
     }
     if let Some(at) = evaluated
         .iter()
         .filter_map(|slot| slot.window)
         .max()
-        .and_then(|index| super::rfc3339(window_start(now_secs, index, period)))
+        .and_then(|index| super::document_instant(window_start(now_secs, index, period)))
     {
         document.insert("startDate".to_string(), Value::from(at));
     }
@@ -1183,7 +1185,7 @@ fn state_reason_data(
             let mut entry = Map::new();
             if let Some(at) = slot
                 .window
-                .and_then(|index| super::rfc3339(window_start(now_secs, index, period)))
+                .and_then(|index| super::document_instant(window_start(now_secs, index, period)))
             {
                 entry.insert("timestamp".to_string(), Value::from(at));
             }

@@ -200,12 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // delete was already accepted keeps the deletion it is in, so a repeat of this
         // `@idempotent` call answers the same thing rather than restarting it.
         if !router_output.is_deleting() {
-            router_output.state = crate::state::ROUTER_OUTPUT_STATE_DELETING.to_string();
-            // The delete supersedes whatever state change was owed before it: a router
-            // output on its way out does not settle into `STANDBY` on the way.
-            router_output.pending = None;
-            router_output.removal_due_at = Some(now + crate::state::TRANSITION_SPAN);
-            router_output.updated_at = now;
+            router_output.begin_deletion(now);
         }
 
         Ok(DeleteRouterOutputOutput {

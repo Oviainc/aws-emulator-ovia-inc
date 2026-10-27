@@ -41,6 +41,8 @@ mod connection_function_publish;
 mod connection_group_by_routing_endpoint;
 #[path = "all/connection_group_tags.rs"]
 mod connection_group_tags;
+#[path = "all/connection_group_update.rs"]
+mod connection_group_update;
 #[path = "all/connection_groups.rs"]
 mod connection_groups;
 #[path = "all/continuous_deployment_policies.rs"]

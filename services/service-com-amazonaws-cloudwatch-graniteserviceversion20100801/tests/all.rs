@@ -25,6 +25,8 @@ mod alarm_actions_switch;
 mod alarm_configuration;
 #[path = "all/alarm_delete_semantics.rs"]
 mod alarm_delete_semantics;
+#[path = "all/alarm_document_timestamps.rs"]
+mod alarm_document_timestamps;
 #[path = "all/alarm_evaluation.rs"]
 mod alarm_evaluation;
 #[path = "all/alarm_history.rs"]
@@ -83,6 +85,8 @@ mod metric_data;
 mod metric_math;
 #[path = "all/metric_read_identity.rs"]
 mod metric_read_identity;
+#[path = "all/metric_storage_resolution.rs"]
+mod metric_storage_resolution;
 #[path = "all/metric_stream_additional_statistics.rs"]
 mod metric_stream_additional_statistics;
 #[path = "all/metric_stream_unknown_names.rs"]

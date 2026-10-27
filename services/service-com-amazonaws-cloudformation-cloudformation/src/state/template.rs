@@ -4480,6 +4480,15 @@ pub const GUARDDUTY_DETECTOR: &str = "AWS::GuardDuty::Detector";
 /// `kms DescribeKey` (and every service that resolves a `KmsMasterKeyId`) resolves.
 pub const KMS_KEY: &str = "AWS::KMS::Key";
 
+/// A KMS alias's resource type (the same `cloudFormationName: KMS`). This is a type
+/// `super::provisioning` creates in KMS itself, and "Ref returns the alias name" — the
+/// `AliasName` the declaration states, which is what `CreateAlias` creates the alias under
+/// and what every operation taking a `KeyId` resolves to the key the alias points at. The
+/// type publishes no `Fn::GetAtt` attribute, so the name is the whole of what a stack
+/// reports for one, and no naming rule computes it: an alias KMS would refuse the name of
+/// is the refusal that service answers, which is what the deployment reports.
+pub const KMS_ALIAS: &str = "AWS::KMS::Alias";
+
 /// KMS's ARN namespace, which is its model's own `awsService.arnNamespace` (`kms`) — the
 /// service segment of a key ARN.
 pub const KMS_ARN_NAMESPACE: &str = "kms";

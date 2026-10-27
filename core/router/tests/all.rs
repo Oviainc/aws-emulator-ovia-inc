@@ -20,6 +20,11 @@
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
 // Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `c…` span (where every cloudformation suite lands) are both regions
+// concurrently landing suites add their line to.
+#[path = "all/cloudformation_provisions_kms_aliases.rs"]
+mod cloudformation_provisions_kms_aliases;
+// Declared beside the entry above, at the head, for the same reason: the appended tail and
 // the sorted `c…` span (where the other cloudwatch/cloudformation suites land) are both
 // regions concurrently landing suites add their line to.
 #[path = "all/cloudwatch_alarm_action_reaches_its_subscribed_queue.rs"]

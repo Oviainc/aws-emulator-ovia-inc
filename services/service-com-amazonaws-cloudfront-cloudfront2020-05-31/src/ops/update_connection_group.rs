@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConnectionGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConnectionGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConnectionGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the connection group `Id` names: the settings the request states become the
+//! stored ones, the group re-enters its transient status while they reach the edge
+//! locations, and a fresh version token is minted.
+//!
+//! ## What this operation decides
+//!
+//! * an id no stored group carries names nothing to update — `EntityNotFound` — and is
+//!   answered BEFORE the precondition, which can only be checked against a stored version;
+//! * the `If-Match` is checked against the STORED version token, so an update only lands
+//!   on the group its caller actually read ([`crate::state::check_if_match`]);
+//! * `AnycastIpListId` names an Anycast static IP list, so a value this service cannot
+//!   resolve to one is an invalid argument — the same rule `CreateConnectionGroup` and
+//!   `ListConnectionGroups` apply to the id they take;
+//! * every updatable member is optional, so one the request leaves out keeps the value the
+//!   record held and one it states replaces it;
+//! * the group's identity (id, ARN, name, routing endpoint, creation time, whether it is
+//!   the account's default one) is never updated: the request submits none of it.
+//!
+//! Every refusal is decided BEFORE anything is written, so a refused update leaves the
+//! store exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +93,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -157,18 +173,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConnectionGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConnectionGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConnectionGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // Materialise the propagation the clock already owes, so the precondition below is
+        // checked against the record as it stands at this instant.
+        store.settle(now);
+
+        // "The ID of the connection group": an id no group carries names nothing to
+        // update, and that refusal comes first because a precondition can only be checked
+        // against a stored version.
+        let Some(current_etag) = store
+            .connection_groups
+            .get(&input.id)
+            .map(|stored| stored.etag.clone())
+        else {
+            return Err(UpdateConnectionGroupErrorModeled::EntityNotFound(
+                crate::state::connection_group_not_found(),
+            )
+            .into());
+        };
+
+        // "The value of the ETag header that you received when retrieving the connection
+        // group that you're updating": a token that is no version token at all is "missing
+        // or not valid", and a well-formed token that is not the current one is a failed
+        // precondition.
+        match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(UpdateConnectionGroupErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(UpdateConnectionGroupErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // "The ID of the Anycast static IP list": the member names an Anycast static IP
+        // list, so a value this service cannot resolve to one is an invalid argument — the
+        // same rule the create applies to the id it takes.
+        if let Some(anycast_ip_list_id) = &input.anycast_ip_list_id {
+            if !store.holds_anycast_ip_list(anycast_ip_list_id) {
+                return Err(UpdateConnectionGroupErrorModeled::InvalidArgument(
+                    crate::state::invalid_anycast_ip_list(anycast_ip_list_id),
+                )
+                .into());
+            }
+        }
+
+        // The members this update submits are all optional and are applied by the one
+        // mutator the store owns, so what an omitted member leaves alone is decided in one
+        // place.
+        let Some(stored) = store.apply_connection_group_update(
+            &input.id,
+            input.anycast_ip_list_id,
+            input.enabled,
+            input.ipv6_enabled,
+            now,
+        ) else {
+            return Err(UpdateConnectionGroupErrorModeled::EntityNotFound(
+                crate::state::connection_group_not_found(),
+            )
+            .into());
+        };
+
+        Ok(UpdateConnectionGroupOutput {
+            // "The connection group that you updated" — read back from the one stored
+            // record, so the answer and every later read are the same document.
+            connection_group: Some(stored.to_connection_group()),
+            // "The current version of the connection group": the freshly minted token, so
+            // the version this caller just replaced no longer satisfies an `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

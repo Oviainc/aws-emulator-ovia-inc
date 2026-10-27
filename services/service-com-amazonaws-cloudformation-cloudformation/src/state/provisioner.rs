@@ -73,6 +73,11 @@
 //!   carries at all — the rotation of the key's material and whether the key is enabled,
 //!   each applied through the KMS call that owns it, the rotation period that first one
 //!   takes, and the waiting period the key's deletion is scheduled with;
+//! * `AWS::KMS::Alias`'s two properties ARE `CreateAlias`'s own members, named identically
+//!   on both sides: the alias name, which is this resource's physical id and so
+//!   CloudFormation's to decide, and the `TargetKeyId` the alias is bound to — which the
+//!   declaration states as a reference to the key, so what reaches KMS is the identifier
+//!   KMS minted for it;
 //! * `AWS::SageMaker::ModelPackageGroup`'s are its create's members EXCEPT ONE — a model
 //!   group's resource policy is attached through SageMaker's own
 //!   `PutModelPackageGroupPolicy` — so its arm passes the properties through and then makes
@@ -344,7 +349,7 @@ use super::template::{
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
-    ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, KMS_KEY,
+    ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, KMS_ALIAS, KMS_KEY,
     MQ_BROKER, MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER, ROUTE53RESOLVER_ENDPOINT, ROUTE53RESOLVER_RULE,
     ROUTE53RESOLVER_RULE_ASSOCIATION, ROUTE53_HOSTED_ZONE, ROUTE53_RECORD_SET,
@@ -436,6 +441,7 @@ pub(super) enum Provisioner {
     GrafanaWorkspace,
     GuardDutyDetector,
     KmsKey,
+    KmsAlias,
     MskCluster,
     MskServerlessCluster,
     MqBroker,
@@ -510,6 +516,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         GRAFANA_WORKSPACE => Some(Provisioner::GrafanaWorkspace),
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
         KMS_KEY => Some(Provisioner::KmsKey),
+        KMS_ALIAS => Some(Provisioner::KmsAlias),
         MSK_CLUSTER => Some(Provisioner::MskCluster),
         MSK_SERVERLESS_CLUSTER => Some(Provisioner::MskServerlessCluster),
         MQ_BROKER => Some(Provisioner::MqBroker),
@@ -662,6 +669,10 @@ impl Provisioner {
                 create_detector(ctx, region, resource, propagated).await
             }
             Self::KmsKey => create_kms_key(ctx, region, resource, propagated).await,
+            // `AWS::KMS::Alias` publishes `AliasName` and `TargetKeyId` and no `Tags`: an
+            // alias is not a taggable resource — KMS holds tags on KEYS — so no tags are
+            // propagated to one.
+            Self::KmsAlias => create_kms_alias(ctx, region, resource).await,
             Self::MskCluster => create_msk_cluster(ctx, region, resource, propagated).await,
             Self::MskServerlessCluster => {
                 create_msk_serverless_cluster(ctx, region, resource, propagated).await
@@ -1008,6 +1019,10 @@ impl Provisioner {
             // — so a changed declaration is applied to the key the stack created rather
             // than replacing it ([`update_kms_key`]).
             Self::KmsKey => update_kms_key(ctx, region, resource, declared).await.map(Some),
+            // `UpdateAlias` "associates an existing KMS alias with a different KMS key", so
+            // a declaration that re-points an alias is applied to the alias the stack
+            // created rather than replacing it ([`update_kms_alias`]).
+            Self::KmsAlias => update_kms_alias(ctx, region, resource, declared).await,
             // Every attribute of a live subscription has one SNS call that writes it, so a
             // changed declaration of one is applied to the subscription the stack created
             // rather than dropped ([`update_subscription`]).
@@ -1151,6 +1166,9 @@ impl Provisioner {
                 let properties = resource.properties.as_object().cloned().unwrap_or_default();
                 schedule_kms_key_deletion(ctx, region, physical_resource_id, &properties).await
             }
+            // An alias is deleted at once, and deleting it leaves the key it pointed at as
+            // it is ("These operations don't affect the underlying KMS key").
+            Self::KmsAlias => delete_kms_alias(ctx, region, physical_resource_id).await,
             // One `DeleteCluster` deletes a cluster of either kind, addressed by the ARN
             // Amazon MSK minted for it.
             Self::MskCluster | Self::MskServerlessCluster => {
@@ -1373,6 +1391,7 @@ impl Provisioner {
             }
             Self::GuardDutyDetector => describe_detector(ctx, region, physical_resource_id).await,
             Self::KmsKey => describe_kms_key(ctx, region, physical_resource_id).await,
+            Self::KmsAlias => describe_kms_alias(ctx, region, physical_resource_id).await,
             // One `DescribeClusterV2` reads a cluster of either kind back.
             Self::MskCluster | Self::MskServerlessCluster => {
                 describe_msk_cluster(ctx, region, physical_resource_id).await
@@ -14194,10 +14213,7 @@ async fn create_kms_key(
 /// The first declared property of an `AWS::KMS::Key` this arm does not carry to KMS, or
 /// `None` for a declaration whose every property it does ([`KMS_KEY_PROPERTIES`]).
 fn kms_key_unmapped_property(properties: &Map<String, Value>) -> Option<String> {
-    properties
-        .keys()
-        .find(|property| !KMS_KEY_PROPERTIES.contains(&property.as_str()))
-        .cloned()
+    unmapped_property(properties, KMS_KEY_PROPERTIES)
 }
 
 /// Put the key the create just minted into the state the declaration asks for, through the
@@ -14616,6 +14632,196 @@ async fn call_kms(
 }
 
 // ---------------------------------------------------------------------------
+// KMS: AWS::KMS::Alias
+// ---------------------------------------------------------------------------
+
+/// The property naming the key an alias is bound to, which is the member that carries it on
+/// both of the calls that bind one: `CreateAlias$TargetKeyId` and `UpdateAlias$TargetKeyId`
+/// (`smithy_query(operation="CreateAlias,UpdateAlias")`), spelled identically on both sides.
+const KMS_ALIAS_TARGET_PROPERTY: &str = "TargetKeyId";
+
+/// The property carrying the alias's own name, which is this resource's physical id: "Ref
+/// returns the alias name", and [`super::template::physical_name`] takes a resource's
+/// physical name from exactly this property.
+const KMS_ALIAS_NAME_PROPERTY: &str = "AliasName";
+
+/// Every property `AWS::KMS::Alias` publishes, which is what this arm carries to KMS: the
+/// alias's name and the key it points at. A declaration naming anything else is refused
+/// rather than deployed with the property dropped, exactly as a key's is
+/// ([`KMS_KEY_PROPERTIES`]).
+const KMS_ALIAS_PROPERTIES: &[&str] = &[KMS_ALIAS_NAME_PROPERTY, KMS_ALIAS_TARGET_PROPERTY];
+
+/// Create the alias an `AWS::KMS::Alias` declares, in KMS itself, so a client that deployed
+/// the stack resolves the key by that friendly name afterwards — `DescribeKey` with
+/// `alias/<name>` (or the alias ARN) answers the target key's metadata — rather than KMS's
+/// `NotFoundException` for an alias nothing created.
+///
+/// The alias's identity is CloudFormation's: the type requires an `AliasName`, and that
+/// property's value IS the resource's physical id, so the alias is created under the very
+/// name the stack publishes for the resource. The type publishes no `Fn::GetAtt` attribute,
+/// so there is nothing to adopt from the answer — `CreateAlias` "does not return a
+/// response".
+///
+/// The `TargetKeyId` a declaration states is normally a reference to a key of the same
+/// template, which by the time this runs carries the identifier KMS minted for that key
+/// ([`super::provisioning`]'s re-pointing), so the alias is bound to the key the stack
+/// really created. A target KMS resolves to no key is that service's own refusal, and it is
+/// what this answers with: the resource's create FAILED, which is what makes the stack roll
+/// back instead of reporting a deployment whose alias does not exist.
+async fn create_kms_alias(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let properties = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    if let Some(unmapped) = kms_alias_unmapped_property(&properties) {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not carry the {unmapped} property of an {KMS_ALIAS} to \
+                 KMS; the resource was not created."
+            ),
+        });
+    }
+    // Both members are required by `CreateAlias` and by the type, so a declaration missing
+    // either names no alias that could be created and is refused here rather than with a
+    // request KMS would have to reject.
+    let alias_name = required_property(resource, KMS_ALIAS_NAME_PROPERTY)?;
+    let target_key_id = required_property(resource, KMS_ALIAS_TARGET_PROPERTY)?;
+    call_kms(
+        ctx,
+        region,
+        "CreateAlias",
+        &serde_json::json!({ "AliasName": alias_name, "TargetKeyId": target_key_id }),
+    )
+    .await?;
+    Ok(Created::default())
+}
+
+/// The first declared property of an `AWS::KMS::Alias` this arm does not carry to KMS, or
+/// `None` for a declaration whose every property it does ([`KMS_ALIAS_PROPERTIES`]).
+fn kms_alias_unmapped_property(properties: &Map<String, Value>) -> Option<String> {
+    unmapped_property(properties, KMS_ALIAS_PROPERTIES)
+}
+
+/// Apply a changed `AWS::KMS::Alias` declaration to the alias that already exists, through
+/// the KMS call that owns the one property of it that can change: `UpdateAlias`
+/// "associates an existing KMS alias with a different KMS key".
+///
+/// The alias's NAME cannot change here — "you cannot use `UpdateAlias` to change an alias
+/// name" — and it does not have to: the name is the resource's physical id, so a declaration
+/// that renames the alias is a different resource, which the deployment creates and whose
+/// predecessor it deletes rather than updating ([`super::provisioning::is_same_resource`]).
+/// So what is left for this arm is the target key, and nothing is called where the
+/// declaration points the alias at the key it already points at.
+async fn update_kms_alias(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+) -> Result<Option<Created>, Refusal> {
+    let after_properties = match declared {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    if let Some(unmapped) = kms_alias_unmapped_property(&after_properties) {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not carry the {unmapped} property of an {KMS_ALIAS} to \
+                 KMS; the resource was left as it is."
+            ),
+        });
+    }
+    let before = resource
+        .properties
+        .get(KMS_ALIAS_TARGET_PROPERTY)
+        .and_then(scalar_text);
+    let after = after_properties
+        .get(KMS_ALIAS_TARGET_PROPERTY)
+        .and_then(scalar_text)
+        .filter(|target| !target.is_empty());
+    let Some(target_key_id) = after else {
+        // An alias points at ONE key, and `UpdateAlias` has no way to unbind it: a
+        // declaration that states no target describes no alias that could exist, so it is
+        // refused rather than applied as a change that dropped the caller's property.
+        return Err(Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!("{KMS_ALIAS} declares no {KMS_ALIAS_TARGET_PROPERTY}"),
+        });
+    };
+    if before.as_deref() == Some(target_key_id.as_str()) {
+        return Ok(Some(Created::default()));
+    }
+    call_kms(
+        ctx,
+        region,
+        "UpdateAlias",
+        &serde_json::json!({
+            "AliasName": resource.physical_resource_id.clone(),
+            "TargetKeyId": target_key_id,
+        }),
+    )
+    .await?;
+    // The alias keeps its name, which is the identity everything that resolves it addresses
+    // it by: this arm reports no attribute of its own.
+    Ok(Some(Created::default()))
+}
+
+/// Delete the alias a stack created. An alias is deleted at once — there is no waiting
+/// period, unlike the key it points at — and deleting it leaves that key exactly as it is
+/// ("These operations don't affect the underlying KMS key").
+///
+/// An alias KMS no longer holds (`NotFoundException`, judged on the CODE and never on a
+/// message that carries the request's own name) is already in the state the delete asks for.
+async fn delete_kms_alias(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    alias_name: &str,
+) -> Result<(), Refusal> {
+    match call_kms(
+        ctx,
+        region,
+        "DeleteAlias",
+        &serde_json::json!({ "AliasName": alias_name }),
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == KMS_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// Whether KMS still holds the alias a stack created, for drift detection: an alias IS an
+/// identifier of a key, so asking KMS about the key the alias names resolves one that exists
+/// and answers `NotFoundException` for one that does not — which is the `DELETED` drift
+/// status.
+///
+/// No property of the type is reported with it. `AliasName` is the resource's own identity,
+/// and the `TargetKeyId` a read could report is the key's canonical id while the declaration
+/// may name that same key by its ARN: the drift comparison is textual
+/// (`super::drift::differs`), so reporting it would read a difference in the identifier's
+/// FORM as a changed target. A property the read does not report is not compared, which is
+/// what keeps this check to what it really establishes.
+async fn describe_kms_alias(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    alias_name: &str,
+) -> Result<Option<Value>, Refusal> {
+    if describe_kms_key_metadata(ctx, region, alias_name)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(Value::Object(Map::new())))
+}
+
+// ---------------------------------------------------------------------------
 // Amazon SES: AWS::SES::ConfigurationSet
 // ---------------------------------------------------------------------------
 
@@ -14905,18 +15111,29 @@ fn refuse_unmapped_properties(
     let Value::Object(properties) = &resource.properties else {
         return Ok(());
     };
-    for property in properties.keys() {
-        if !mapped.contains(&property.as_str()) {
-            return Err(Refusal {
-                code: NOT_IMPLEMENTED.to_string(),
-                message: format!(
-                    "this emulator does not apply the {property} property of {}",
-                    resource.resource_type
-                ),
-            });
-        }
+    match unmapped_property(properties, mapped) {
+        Some(property) => Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not apply the {property} property of {}",
+                resource.resource_type
+            ),
+        }),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// The first property of a declared document that `mapped` does not name, or `None` for a
+/// document whose every property it does.
+///
+/// The ONE place that rule is written: an arm that refuses such a property outright goes
+/// through [`refuse_unmapped_properties`], and an arm whose refusal says more than that
+/// ([`create_kms_key`]'s, which says whether the resource was created) asks this directly.
+fn unmapped_property(properties: &Map<String, Value>, mapped: &[&str]) -> Option<String> {
+    properties
+        .keys()
+        .find(|property| !mapped.contains(&property.as_str()))
+        .cloned()
 }
 
 /// The `CallerReference` CloudFormation sends with `CreateHostedZone`.
