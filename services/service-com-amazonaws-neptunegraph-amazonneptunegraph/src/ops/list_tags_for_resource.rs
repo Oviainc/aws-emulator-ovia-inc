@@ -150,10 +150,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting in the strict sense: the tags answered are the ones stored on the
         // resource — supplied at create time or written later by
         // `TagResource`/`UntagResource`. The one write is the bookkeeping every read of
-        // this store makes: a graph whose deletion has already fallen due is no longer
-        // a resource this service holds, so its record is reclaimed before the ARN is
-        // resolved.
-        store.reap_deleted_graphs(::std::time::Instant::now());
+        // this store makes: a graph or snapshot whose deletion has already fallen due is
+        // no longer a resource this service holds, so its record is reclaimed before the
+        // ARN is resolved.
+        let now = ::std::time::Instant::now();
+        store.reap_deleted_graphs(now);
+        store.materialise_snapshots(now);
         let Some(tags) = store.tags_of(&input.resource_arn, &region) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(&input.resource_arn),

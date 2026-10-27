@@ -153,23 +153,34 @@ async fn an_out_of_scope_policy_refuses_the_edit_and_the_delete() {
                          {after}"
                     );
 
-                    let (status, body) = call_in(
-                        &router,
-                        "DeletePolicy",
-                        &json!({ "PolicyId": stored.policy_id }),
-                        region,
-                    )
-                    .await;
-                    assert_eq!(
-                        status, 400,
-                        "case {row:?}: expected the delete of a view-only policy to be refused \
-                         with 400, got {status} with {body}"
-                    );
-                    assert_eq!(
-                        error_code(&body),
-                        REFUSAL,
-                        "case {row:?}: expected the refusal {REFUSAL}, got {body}"
-                    );
+                    // The cleanup selector is a dimension of the refusal: a
+                    // delete that would ALSO take the policy's protections with
+                    // it is refused exactly as the bare one is, because
+                    // "existing policy protections stay in place".
+                    for cleanup in [false, true] {
+                        let (status, body) = call_in(
+                            &router,
+                            "DeletePolicy",
+                            &json!({
+                                "PolicyId": stored.policy_id,
+                                "DeleteAllPolicyResources": cleanup
+                            }),
+                            region,
+                        )
+                        .await;
+                        assert_eq!(
+                            status, 400,
+                            "case {row:?}: expected the delete of a view-only policy with \
+                             DeleteAllPolicyResources {cleanup} to be refused with 400, got \
+                             {status} with {body}"
+                        );
+                        assert_eq!(
+                            error_code(&body),
+                            REFUSAL,
+                            "case {row:?}: expected the refusal {REFUSAL} with \
+                             DeleteAllPolicyResources {cleanup}, got {body}"
+                        );
+                    }
                     let after = read(&router, &row, &stored.policy_id).await;
                     assert_eq!(
                         after["PolicyId"],

@@ -271,17 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let captured_data = snapshot.data.clone();
 
         // Only a complete snapshot can be restored: while its creation is still
-        // outstanding the snapshot holds no usable copy of the data, which is the same
-        // precondition `CreateGraphSnapshot` states about the graph it snapshots.
+        // outstanding the snapshot holds no usable copy of the data, and one whose
+        // deletion has been accepted is on its way out. That is the same precondition
+        // `CreateGraphSnapshot` states about the graph it snapshots, and it is worded by
+        // the one builder every snapshot state gate in this service reaches.
         if snapshot_status != crate::state::SnapshotStatus::Available {
             return Err(RestoreGraphFromSnapshotErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "snapshot {snapshot_id} is in status {} and cannot be restored",
-                        snapshot_status.as_wire()
-                    ),
-                    reason: None,
-                },
+                crate::state::snapshot_state_conflict("restore", snapshot_status),
             )
             .into());
         }

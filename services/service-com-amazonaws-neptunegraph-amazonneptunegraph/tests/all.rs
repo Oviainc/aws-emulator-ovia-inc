@@ -35,6 +35,8 @@ mod graph_reset;
 mod graph_restore_from_snapshot;
 #[path = "all/graph_run_state.rs"]
 mod graph_run_state;
+#[path = "all/graph_snapshot_deletion.rs"]
+mod graph_snapshot_deletion;
 #[path = "all/graph_snapshot_lifecycle.rs"]
 mod graph_snapshot_lifecycle;
 #[path = "all/graph_snapshot_listing.rs"]

@@ -67,10 +67,10 @@ const CUSTOM_PROVIDER_ARN: &str = "arn:aws:sso::aws:applicationProvider/custom";
 /// The only value the model's `AuthenticationMethodType` enum admits.
 ///
 /// SOURCE: `smithy_query(query="shape",shape="AuthenticationMethodType")` — `IAM`.
-const IAM: &str = "IAM";
+pub(crate) const IAM: &str = "IAM";
 
 /// Create one application and return its `ApplicationArn`.
-async fn create_application(
+pub(crate) async fn create_application(
     router: &MultiServiceRouter,
     instance_arn: &str,
     name: &str,
@@ -96,7 +96,7 @@ async fn create_application(
 }
 
 /// `PutApplicationAuthenticationMethod` with an IAM method carrying `actor_policy`.
-async fn put_iam_method(
+pub(crate) async fn put_iam_method(
     router: &MultiServiceRouter,
     application_arn: &str,
     actor_policy: &Value,
@@ -131,7 +131,7 @@ async fn put_method(
 }
 
 /// `GetApplicationAuthenticationMethod` for one type of one application.
-async fn get_method(
+pub(crate) async fn get_method(
     router: &MultiServiceRouter,
     application_arn: &str,
     method_type: &str,
@@ -148,7 +148,7 @@ async fn get_method(
 }
 
 /// `DeleteApplicationAuthenticationMethod` for one type of one application.
-async fn delete_method(
+pub(crate) async fn delete_method(
     router: &MultiServiceRouter,
     application_arn: &str,
     method_type: &str,
@@ -165,7 +165,7 @@ async fn delete_method(
 }
 
 /// The body a get must answer with when `actor_policy` was put as an IAM method.
-fn expected_iam_body(actor_policy: &Value) -> Value {
+pub(crate) fn expected_iam_body(actor_policy: &Value) -> Value {
     json!({"AuthenticationMethod": {"Iam": {"ActorPolicy": actor_policy}}})
 }
 
@@ -177,7 +177,7 @@ fn expected_iam_body(actor_policy: &Value) -> Value {
 /// along: member count, nesting depth, the value kinds inside (string, integer, float,
 /// boolean, null, list, object), the shape of `Statement` (one object, a list, many) and
 /// the overall size.
-fn actor_policies() -> Vec<(&'static str, Value)> {
+pub(crate) fn actor_policies() -> Vec<(&'static str, Value)> {
     vec![
         (
             "the smallest JSON object the rule admits",

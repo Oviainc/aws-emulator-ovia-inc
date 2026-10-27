@@ -32,8 +32,41 @@ use std::sync::Arc;
 const MANAGED_PRICING_PLAN: &str = "arn:aws:billingconductor::aws:pricingplan/BasicPricingPlan";
 
 /// The billing period every item here is created to apply from, so each probe period is
-/// either inside the item's life or knowingly before it.
-const CREATED_FROM: &str = "2026-01";
+/// either inside the item's life or knowingly before it: a create may put an item only
+/// into the current or the PREVIOUS billing period, so this is the previous one and
+/// every other period here is named as an offset from it.
+fn created_from() -> String {
+    period(-1)
+}
+
+/// The `BillingPeriod` `months` after the CURRENT billing period (negative for
+/// earlier), in the zero-padded spelling the modelled `BillingPeriod` pattern
+/// `^\d{4}-(0?[1-9]|1[012])$` allows.
+///
+/// Which period is the current one the wall clock decides, so no fixture here names a
+/// fixed month.
+fn period(months: i64) -> String {
+    let current =
+        service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
+    let (year, month) = current
+        .split_once('-')
+        .expect("the current billing period is spelled YYYY-MM");
+    let total = year.parse::<i64>().expect("a four-digit year") * 12
+        + month.parse::<i64>().expect("a month")
+        - 1
+        + months;
+    format!("{:04}-{:02}", total.div_euclid(12), total.rem_euclid(12) + 1)
+}
+
+/// The same billing period with its month spelled without a leading zero — the other
+/// spelling the modelled `BillingPeriod` pattern allows. A month from October on has
+/// only the one spelling, so for those this is the value it was given.
+fn one_digit_month(billing_period: &str) -> String {
+    let (year, month) = billing_period
+        .split_once('-')
+        .expect("a billing period is spelled YYYY-MM");
+    format!("{year}-{}", month.trim_start_matches('0'))
+}
 
 /// How far two reported amounts may differ and still be the same amount.
 const TOLERANCE: f64 = 1e-6;
@@ -112,7 +145,7 @@ impl Emulator {
         arn_of(&body, &format!("billing group {name:?}"))
     }
 
-    /// Create a custom line item applying from [`CREATED_FROM`] on, overriding the
+    /// Create a custom line item applying from [`created_from`] on, overriding the
     /// default members with whatever `request` carries, and return its ARN.
     async fn custom_line_item(&self, group_arn: &str, name: &str, request: Value) -> String {
         let mut body = json!({
@@ -120,7 +153,7 @@ impl Emulator {
             "Description": "the original custom line item",
             "BillingGroupArn": group_arn,
             "ChargeDetails": { "Type": "FEE", "Flat": { "ChargeValue": 10.0 } },
-            "BillingPeriodRange": { "InclusiveStartBillingPeriod": CREATED_FROM },
+            "BillingPeriodRange": { "InclusiveStartBillingPeriod": created_from() },
         });
         for (member, value) in members(&request) {
             body[member] = value;
@@ -316,11 +349,11 @@ struct Row {
     /// The value the billing periods the write claims report.
     updated: Value,
     /// The periods that must report `kept`.
-    keeping: Vec<&'static str>,
+    keeping: Vec<String>,
     /// The periods that must report `updated`.
-    updating: Vec<&'static str>,
+    updating: Vec<String>,
     /// The periods that must report no item at all.
-    absent: Vec<&'static str>,
+    absent: Vec<String>,
 }
 
 /// THE RULE on a single write: the update's values answer for the billing period it is
@@ -335,13 +368,13 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
             create: json!({ "Type": "FEE", "Flat": { "ChargeValue": 10.0 } }),
             update: json!({
                 "Name": "renamed",
-                "BillingPeriodRange": { "InclusiveStartBillingPeriod": "2026-06" },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(4) },
             }),
             path: "Name",
             kept: json!("versioned"),
             updated: json!("renamed"),
-            keeping: vec!["2026-01", "2026-02", "2026-05"],
-            updating: vec!["2026-06", "2026-07", "2031-12"],
+            keeping: vec![period(-1), period(0), period(3)],
+            updating: vec![period(4), period(5), period(70)],
             absent: vec![],
         },
         Row {
@@ -349,13 +382,13 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
             create: json!({ "Type": "FEE", "Flat": { "ChargeValue": 10.0 } }),
             update: json!({
                 "Description": "a new description",
-                "BillingPeriodRange": { "InclusiveStartBillingPeriod": "2026-06" },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(4) },
             }),
             path: "Description",
             kept: json!("the original custom line item"),
             updated: json!("a new description"),
-            keeping: vec!["2026-01", "2026-05"],
-            updating: vec!["2026-06", "2027-01"],
+            keeping: vec![period(-1), period(3)],
+            updating: vec![period(4), period(11)],
             absent: vec![],
         },
         Row {
@@ -364,31 +397,31 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
             update: json!({
                 "ChargeDetails": { "Flat": { "ChargeValue": 42.5 } },
                 "BillingPeriodRange": {
-                    "InclusiveStartBillingPeriod": "2026-06",
-                    "ExclusiveEndBillingPeriod": "2026-09",
+                    "InclusiveStartBillingPeriod": period(4),
+                    "ExclusiveEndBillingPeriod": period(7),
                 },
             }),
             path: "ChargeDetails/Flat/ChargeValue",
             kept: json!(10.0),
             updated: json!(42.5),
-            keeping: vec!["2026-01", "2026-05"],
-            updating: vec!["2026-06", "2026-07", "2026-08"],
-            // The write named the periods the item applies in from 2026-06 on, so the
-            // item applies in none of the periods from its exclusive end.
-            absent: vec!["2026-09", "2027-01"],
+            keeping: vec![period(-1), period(3)],
+            updating: vec![period(4), period(5), period(6)],
+            // The write named the periods the item applies in from its own start on, so
+            // the item applies in none of the periods from its exclusive end.
+            absent: vec![period(7), period(11)],
         },
         Row {
             case: "the percentage value of a percentage item",
             create: json!({ "Type": "CREDIT", "Percentage": { "PercentageValue": 2.0 } }),
             update: json!({
                 "ChargeDetails": { "Percentage": { "PercentageValue": 7.5 } },
-                "BillingPeriodRange": { "InclusiveStartBillingPeriod": "2026-06" },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(4) },
             }),
             path: "ChargeDetails/Percentage/PercentageValue",
             kept: json!(2.0),
             updated: json!(7.5),
-            keeping: vec!["2026-01", "2026-05"],
-            updating: vec!["2026-06", "2029-03"],
+            keeping: vec![period(-1), period(3)],
+            updating: vec![period(4), period(37)],
             absent: vec![],
         },
         Row {
@@ -396,13 +429,13 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
             create: json!({ "Type": "FEE", "Flat": { "ChargeValue": 10.0 } }),
             update: json!({
                 "ChargeDetails": { "LineItemFilters": [filter.clone()] },
-                "BillingPeriodRange": { "InclusiveStartBillingPeriod": "2026-06" },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(4) },
             }),
             path: "ChargeDetails/LineItemFilters",
             kept: Value::Null,
             updated: json!([filter.clone()]),
-            keeping: vec!["2026-01", "2026-05"],
-            updating: vec!["2026-06", "2026-12"],
+            keeping: vec![period(-1), period(3)],
+            updating: vec![period(4), period(10)],
             absent: vec![],
         },
         Row {
@@ -411,16 +444,16 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
             update: json!({
                 "Name": "one_month",
                 "BillingPeriodRange": {
-                    "InclusiveStartBillingPeriod": "2026-6",
-                    "ExclusiveEndBillingPeriod": "2026-7",
+                    "InclusiveStartBillingPeriod": one_digit_month(&period(4)),
+                    "ExclusiveEndBillingPeriod": one_digit_month(&period(5)),
                 },
             }),
             path: "Name",
             kept: json!("versioned"),
             updated: json!("one_month"),
-            keeping: vec!["2026-01", "2026-05", "2026-5"],
-            updating: vec!["2026-06", "2026-6"],
-            absent: vec!["2026-07", "2026-08"],
+            keeping: vec![period(-1), period(3), one_digit_month(&period(3))],
+            updating: vec![period(4), one_digit_month(&period(4))],
+            absent: vec![period(5), period(6)],
         },
     ];
 
@@ -430,7 +463,7 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
             fixture("versioned", json!({ "ChargeDetails": row.create })).await;
         emulator.update_ok(case, &item, row.update).await;
 
-        for period in row.keeping {
+        for period in &row.keeping {
             let read = emulator.listed_ok(case, &item, period).await;
             assert_eq!(
                 at(&read, row.path),
@@ -440,7 +473,7 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
                 row.path
             );
         }
-        for period in row.updating {
+        for period in &row.updating {
             let read = emulator.listed_ok(case, &item, period).await;
             assert_eq!(
                 at(&read, row.path),
@@ -450,7 +483,7 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
                 row.path
             );
         }
-        for period in row.absent {
+        for period in &row.absent {
             let read = emulator.listed(case, &item, period).await;
             assert!(
                 read.is_none(),
@@ -470,7 +503,8 @@ async fn every_billing_period_of_the_item_reports_one_version_after_an_open_ende
     let case = "a sweep across the write";
     // The write lands in the middle of the swept run, so periods on both sides of it are
     // checked, plus the period before the item existed at all.
-    let applied_from = "2026-07";
+    let applied_from_offset = 5;
+    let applied_from = period(applied_from_offset);
     emulator
         .update_ok(
             case,
@@ -482,20 +516,18 @@ async fn every_billing_period_of_the_item_reports_one_version_after_an_open_ende
         )
         .await;
 
+    let before_the_item = period(-2);
     assert!(
-        emulator.listed(case, &item, "2025-12").await.is_none(),
-        "case {case:?}: the item applies from {CREATED_FROM}, so the period before it \
-         reports nothing"
+        emulator.listed(case, &item, &before_the_item).await.is_none(),
+        "case {case:?}: the item applies from {} on, so the period before it reports \
+         nothing",
+        created_from()
     );
-    for month in 1..=24 {
-        let period = format!("2026-{month:02}");
-        let period = if month <= 12 {
-            period
-        } else {
-            format!("2027-{:02}", month - 12)
-        };
-        let read = emulator.listed_ok(case, &item, &period).await;
-        let expected = if period.as_str() < applied_from {
+    // The two years of billing periods from the one the item was created in on.
+    for offset in -1..=22 {
+        let probe = period(offset);
+        let read = emulator.listed_ok(case, &item, &probe).await;
+        let expected = if offset < applied_from_offset {
             "swept"
         } else {
             "swept_update"
@@ -503,7 +535,7 @@ async fn every_billing_period_of_the_item_reports_one_version_after_an_open_ende
         assert_eq!(
             at(&read, "Name"),
             json!(expected),
-            "case {case:?}: expected {period} to report {expected:?}, got {read}"
+            "case {case:?}: expected {probe} to report {expected:?}, got {read}"
         );
     }
 }
@@ -519,11 +551,11 @@ async fn repeated_writes_leave_one_version_per_stretch_of_billing_periods() {
     // (the period the write is applied from, the name and the flat charge value it
     // leaves)
     let writes = [
-        ("2026-03", "second", 20.0),
-        ("2026-06", "third", 30.0),
-        ("2026-09", "fourth", 40.0),
+        (period(1), "second", 20.0),
+        (period(4), "third", 30.0),
+        (period(7), "fourth", 40.0),
     ];
-    for (from, name, charge_value) in writes {
+    for (from, name, charge_value) in &writes {
         emulator
             .update_ok(
                 case,
@@ -539,36 +571,36 @@ async fn repeated_writes_leave_one_version_per_stretch_of_billing_periods() {
 
     // (the period read, the name and the charge value the version in force there holds)
     let expected = [
-        ("2026-01", "history", 10.0),
-        ("2026-02", "history", 10.0),
-        ("2026-03", "second", 20.0),
-        ("2026-05", "second", 20.0),
-        ("2026-06", "third", 30.0),
-        ("2026-08", "third", 30.0),
-        ("2026-09", "fourth", 40.0),
-        ("2030-04", "fourth", 40.0),
+        (period(-1), "history", 10.0),
+        (period(0), "history", 10.0),
+        (period(1), "second", 20.0),
+        (period(3), "second", 20.0),
+        (period(4), "third", 30.0),
+        (period(6), "third", 30.0),
+        (period(7), "fourth", 40.0),
+        (period(50), "fourth", 40.0),
     ];
-    for (period, name, charge_value) in expected {
-        let read = emulator.listed_ok(case, &item, period).await;
+    for (probe, name, charge_value) in &expected {
+        let read = emulator.listed_ok(case, &item, probe).await;
         assert_eq!(
             at(&read, "Name"),
             json!(name),
-            "case {case:?}: expected {period} to report {name:?}, got {read}"
+            "case {case:?}: expected {probe} to report {name:?}, got {read}"
         );
         assert_eq!(
             at(&read, "ChargeDetails/Flat/ChargeValue"),
             json!(charge_value),
-            "case {case:?}: expected {period} to charge {charge_value}, got {read}"
+            "case {case:?}: expected {probe} to charge {charge_value}, got {read}"
         );
     }
 
     // The history is those same four generations, each with the stretch it applies in.
     let reported = emulator.versions(case, &item).await;
     let generations = [
-        ("history", CREATED_FROM, Some("2026-03")),
-        ("second", "2026-03", Some("2026-06")),
-        ("third", "2026-06", Some("2026-09")),
-        ("fourth", "2026-09", None),
+        ("history", created_from(), Some(period(1))),
+        ("second", period(1), Some(period(4))),
+        ("third", period(4), Some(period(7))),
+        ("fourth", period(7), None),
     ];
     assert_eq!(
         reported.len(),
@@ -589,7 +621,7 @@ async fn repeated_writes_leave_one_version_per_stretch_of_billing_periods() {
         );
         assert_eq!(
             at(version, "EndBillingPeriod"),
-            end.map_or(Value::Null, |end| json!(end)),
+            end.as_ref().map_or(Value::Null, |end| json!(end)),
             "case {case:?}: expected the {name:?} generation to end at {end:?}, got {version}"
         );
     }
@@ -597,19 +629,19 @@ async fn repeated_writes_leave_one_version_per_stretch_of_billing_periods() {
     // The bill of a billing period is computed from the version in force in it, so the
     // charge each period carries is that generation's own charge value.
     let reported = emulator
-        .proforma_by_period(case, &group, "2026-01", "2026-11")
+        .proforma_by_period(case, &group, &period(-1), &period(9))
         .await;
     let expected = [
-        ("2026-01", 10.0),
-        ("2026-02", 10.0),
-        ("2026-03", 20.0),
-        ("2026-04", 20.0),
-        ("2026-05", 20.0),
-        ("2026-06", 30.0),
-        ("2026-07", 30.0),
-        ("2026-08", 30.0),
-        ("2026-09", 40.0),
-        ("2026-10", 40.0),
+        (period(-1), 10.0),
+        (period(0), 10.0),
+        (period(1), 20.0),
+        (period(2), 20.0),
+        (period(3), 20.0),
+        (period(4), 30.0),
+        (period(5), 30.0),
+        (period(6), 30.0),
+        (period(7), 40.0),
+        (period(8), 40.0),
     ];
     assert_eq!(
         reported.len(),
@@ -619,7 +651,8 @@ async fn repeated_writes_leave_one_version_per_stretch_of_billing_periods() {
     for ((period, proforma), (expected_period, expected_proforma)) in reported.iter().zip(expected)
     {
         assert_eq!(
-            period, expected_period,
+            period.as_str(),
+            expected_period.as_str(),
             "case {case:?}: expected the {expected_period} row, got {period}"
         );
         assert!(
@@ -641,8 +674,8 @@ async fn a_write_naming_no_range_replaces_the_version_it_applies_in() {
         .update_ok(case, &item, json!({ "Name": "replaced" }))
         .await;
 
-    for period in ["2026-01", "2026-06", "2027-11"] {
-        let read = emulator.listed_ok(case, &item, period).await;
+    for period in [period(-1), period(4), period(21)] {
+        let read = emulator.listed_ok(case, &item, &period).await;
         assert_eq!(
             at(&read, "Name"),
             json!("replaced"),
