@@ -47,6 +47,8 @@ mod pagination_window;
 mod regional_partitioning;
 #[path = "all/replication_region_catalog.rs"]
 mod replication_region_catalog;
+#[path = "all/replication_region_set.rs"]
+mod replication_region_set;
 #[path = "all/reserved_tag_key_stage.rs"]
 mod reserved_tag_key_stage;
 #[path = "all/resource_tagging.rs"]

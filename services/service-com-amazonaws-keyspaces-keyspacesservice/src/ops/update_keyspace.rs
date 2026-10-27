@@ -207,9 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The same replication rules a create is held to — a `MULTI_REGION` specification
-        // carries a `regionList`, and that list contains the current Region — in the one
-        // place this crate states them.
-        let (replication_strategy, requested_regions) =
+        // carries a `regionList`, that list contains the current Region, and it denotes at
+        // least one Region besides it — in the one place this crate states them. What comes
+        // back is the SET of Regions the list names, each once, in the order the request
+        // first named it.
+        let (replication_strategy, regions) =
             crate::state::resolve_replication(Some(&input.replication_specification), &region)
                 .map_err(invalid)?;
 
@@ -225,31 +227,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // A Region list is a SET of Regions: a repeated entry names the same Region twice,
-        // so it is kept once, in the order the request first named it — the set beside the
-        // list is what keeps that one pass linear, as `UpdateTable`'s and `CreateType`'s
-        // duplicate-name checks do. The count is already capped by
-        // `crate::state::MAX_REPLICATION_REGIONS`, which `resolve_replication` refused
-        // above. The modelled minimum length of 2 is on the list, not on the set it
-        // denotes, so a list that only repeats one Region is what breaks the documented
-        // "the `regionList` requires the current Region and at least one additional Amazon
-        // Web Services Region".
-        let mut seen: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
-        let mut regions: Vec<String> = Vec::with_capacity(requested_regions.len());
-        for requested in requested_regions {
-            if seen.insert(requested.clone()) {
-                regions.push(requested);
-            }
-        }
-        if regions.len() < 2 {
-            return Err(invalid(format!(
-                "replicationSpecification.regionList names only Region '{}': a {} keyspace \
-                 requires the current Region and at least one additional Amazon Web \
-                 Services Region",
-                regions.join(", "),
-                crate::state::MULTI_REGION_STRATEGY
-            )));
-        }
+        // The Regions the request names, as a set, so the comparisons against the
+        // keyspace's own Regions below are set comparisons: both sides hold each Region
+        // once.
+        let requested: ::std::collections::BTreeSet<&str> =
+            regions.iter().map(String::as_str).collect();
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -295,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let dropped: Vec<&str> = keyspace
             .replication_regions
             .iter()
-            .filter(|existing| !seen.contains(existing.as_str()))
+            .filter(|existing| !requested.contains(existing.as_str()))
             .map(String::as_str)
             .collect();
         if !dropped.is_empty() {
@@ -309,7 +291,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // ... and it has to add at least one, for the same reason `UpdateTable` refuses a
         // request that names no setting: a request that changes nothing is not an update.
-        if regions.len() == keyspace.replication_regions.len() {
+        // What counts as an addition is a Region the keyspace is not replicated in yet, not
+        // a difference in how many entries each side carries.
+        let adds_a_region = requested
+            .iter()
+            .any(|region| !keyspace.replication_regions.iter().any(|held| held == region));
+        if !adds_a_region {
             return Err(invalid(format!(
                 "replicationSpecification.regionList adds no Amazon Web Services Region: \
                  the keyspace is already replicated in {}",
