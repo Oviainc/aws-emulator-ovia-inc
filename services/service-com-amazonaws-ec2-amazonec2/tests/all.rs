@@ -117,6 +117,9 @@ mod transit_gateway_prefix_list_references;
 // the tail.
 #[path = "all/transit_gateway_route_table_announcements.rs"]
 mod transit_gateway_route_table_announcements;
+// What `CreateTransitGatewayRouteTableAnnouncement` advertises, and what it refuses.
+#[path = "all/create_transit_gateway_route_table_announcement.rs"]
+mod create_transit_gateway_route_table_announcement;
 // What `RebootInstances` queues, which instances it can be queued for, and what it
 // refuses. Declared beside the suites above rather than in sorted position or at the tail,
 // for the reason this file's header note gives: both are contended regions where a
