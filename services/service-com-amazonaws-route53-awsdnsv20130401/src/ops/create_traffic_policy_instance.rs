@@ -214,10 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|version| version.record_type.clone())
             .ok_or_else(|| {
                 CreateTrafficPolicyInstanceErrorModeled::NoSuchTrafficPolicy(
-                    no_such_traffic_policy(
-                        &input.traffic_policy_id,
-                        Some(input.traffic_policy_version),
-                    ),
+                    no_such_traffic_policy(),
                 )
             })?;
 

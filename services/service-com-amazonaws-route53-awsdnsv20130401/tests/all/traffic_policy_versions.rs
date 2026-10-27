@@ -18,8 +18,9 @@
 //!    policy is not a new policy — the account's traffic policy count does not
 //!    move for one.
 //! 3. An `Id` the account holds no policy under names nothing to add a version
-//!    to: the modelled `NoSuchTrafficPolicy` (HTTP 404), naming the id the
-//!    request asked about and no version, and nothing is persisted.
+//!    to: the modelled `NoSuchTrafficPolicy` (HTTP 404), worded as the one
+//!    fixed sentence Route 53 refuses a traffic policy it does not hold with,
+//!    and nothing is persisted.
 //! 4. The document is the version's definition, so a document the published
 //!    traffic policy document format does not define is refused with the
 //!    modelled `InvalidTrafficPolicyDocument` (HTTP 400) and adds no version —
@@ -37,7 +38,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_route53_awsdnsv20130401::ops::types::R_R_TYPE_VALUES;
 use service_com_amazonaws_route53_awsdnsv20130401::state::{
-    MAX_TRAFFIC_POLICY_VERSION, TRAFFIC_POLICY_FORMAT_VERSION,
+    MAX_TRAFFIC_POLICY_VERSION, NO_SUCH_TRAFFIC_POLICY_MESSAGE, TRAFFIC_POLICY_FORMAT_VERSION,
 };
 
 use crate::hosted_zone_records::{call, escape_xml, router, Reply, ENDPOINT};
@@ -381,12 +382,13 @@ async fn an_id_that_names_no_policy_is_refused() {
             "case {case:?}: expected NoSuchTrafficPolicy, got body {}",
             reply.body
         );
-        // The refusal names what the request asked about — the policy id — and
-        // no version, because the request named none.
+        // Route 53 words this refusal as one fixed sentence about the resource
+        // class, taking no part of it from the request, so every id above is
+        // refused with the same message.
         assert_eq!(
             reply.first("Error/Message"),
-            Some(format!("No traffic policy exists with ID {id}").as_str()),
-            "case {case:?}: the refusal must name the id the request asked about; body {}",
+            Some(NO_SUCH_TRAFFIC_POLICY_MESSAGE),
+            "case {case:?}: expected the message {NO_SUCH_TRAFFIC_POLICY_MESSAGE:?}; body {}",
             reply.body
         );
     }
