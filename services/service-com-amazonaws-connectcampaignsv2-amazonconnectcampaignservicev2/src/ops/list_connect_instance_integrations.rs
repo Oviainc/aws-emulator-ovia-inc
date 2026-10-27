@@ -153,11 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        /// The page size when the caller names none: the model's `maxResults`
-        /// upper bound (`range 1..50`), so an unpaged call sees as much as one
-        /// page can carry.
-        const DEFAULT_MAX_RESULTS: usize = 50;
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 ListConnectInstanceIntegrationsErrorModeled::InternalServerException(
@@ -202,48 +197,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The cursor is the sequence number the previous page ended at, so this page
         // is every integration stored after it. An integration removed between two
         // pages therefore does not invalidate a token already handed out. A token
-        // this service did not mint is a bad request.
-        let start = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                let Some(after) = crate::state::decode_next_token(token) else {
-                    return Err(
-                        ListConnectInstanceIntegrationsErrorModeled::ValidationException(
-                            ValidationException {
-                                message: "nextToken is not a cursor this service issued"
-                                    .to_string(),
-                                x_amz_error_type: None,
-                            },
-                        )
-                        .into(),
-                    );
-                };
-                integrations
-                    .iter()
-                    .position(|stored| stored.sequence > after)
-                    .unwrap_or(integrations.len())
-            }
-        };
-
-        let page_size = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(DEFAULT_MAX_RESULTS);
-        let end = start.saturating_add(page_size).min(integrations.len());
-        let page = &integrations[start..end];
+        // this service did not mint is a bad request. The window itself is the one
+        // `crate::state::cursor_page` computes for every paged list of this service.
+        let window = crate::state::cursor_page(
+            &integrations,
+            |stored| stored.sequence,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|unissued| {
+            ListConnectInstanceIntegrationsErrorModeled::ValidationException(ValidationException {
+                message: unissued.message(),
+                x_amz_error_type: None,
+            })
+        })?;
 
         Ok(ListConnectInstanceIntegrationsOutput {
             // Absent on the last page: a client stops paging when there is no token.
-            next_token: if end < integrations.len() {
-                page.last()
-                    .map(|stored| crate::state::encode_next_token(stored.sequence))
-            } else {
-                None
-            },
+            next_token: window.next_token,
             integration_summary_list: Some(
-                page.iter()
-                    .map(|stored| stored.to_summary())
-                    .collect(),
+                window.page.iter().map(|stored| stored.to_summary()).collect(),
             ),
         })
     }

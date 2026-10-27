@@ -141,11 +141,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        /// The page size when the caller names none: the model's `maxResults`
-        /// upper bound (`range 1..50`), so an unpaged call sees as much as one
-        /// page can carry.
-        const DEFAULT_MAX_RESULTS: usize = 50;
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListCampaignsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -183,42 +178,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so this page is everything matching that was created after it. A
         // campaign deleted between two pages therefore does not invalidate a token
         // already handed out. A token this service did not mint is a bad request.
-        let start = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                let Some(after) = crate::state::decode_next_token(token) else {
-                    return Err(ListCampaignsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: "nextToken is not a cursor this service issued".to_string(),
-                            x_amz_error_type: None,
-                        },
-                    )
-                    .into());
-                };
-                matching
-                    .iter()
-                    .position(|(sequence, _)| *sequence > after)
-                    .unwrap_or(matching.len())
-            }
-        };
-
-        let page_size = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .unwrap_or(DEFAULT_MAX_RESULTS);
-        let end = start.saturating_add(page_size).min(matching.len());
-        let page = &matching[start..end];
+        // The window itself is the one `crate::state::cursor_page` computes for
+        // every paged list of this service.
+        let window = crate::state::cursor_page(
+            &matching,
+            |(sequence, _)| *sequence,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|unissued| {
+            ListCampaignsErrorModeled::ValidationException(ValidationException {
+                message: unissued.message(),
+                x_amz_error_type: None,
+            })
+        })?;
 
         Ok(ListCampaignsOutput {
             // Absent on the last page: a client stops paging when there is no token.
-            next_token: if end < matching.len() {
-                page.last()
-                    .map(|(sequence, _)| crate::state::encode_next_token(*sequence))
-            } else {
-                None
-            },
+            next_token: window.next_token,
             campaign_summary_list: Some(
-                page.iter()
+                window
+                    .page
+                    .iter()
                     .map(|(_, campaign)| campaign.to_summary())
                     .collect(),
             ),
