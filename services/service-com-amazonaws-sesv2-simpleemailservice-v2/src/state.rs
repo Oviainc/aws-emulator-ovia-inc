@@ -2661,6 +2661,58 @@ pub fn invalid_next_token() -> String {
     "Token is invalid.".to_string()
 }
 
+/// The version prefix an outbound message id carries: SES spells the id of a
+/// message it accepted as `0100`, then hyphen-separated hexadecimal fields, which
+/// is also the shape
+/// [`ComAmazonawsSesv2SimpleemailserviceV2State::next_message_id`] mints.
+pub const MESSAGE_ID_VERSION_PREFIX: &str = "0100";
+
+/// `EventType`'s value for the acceptance of a message, as the model spells it
+/// (see `crate::ops::types::EVENT_TYPE_VALUES`): the one sending event this slice
+/// observes, because accepting the message is all it does with one.
+pub const EVENT_TYPE_SEND: &str = "SEND";
+
+/// Whether `message_id` has the form of an id this service could have issued for
+/// an accepted message: the version prefix followed by at least one further
+/// hyphen-separated field, every field non-empty and hexadecimal.
+///
+/// `OutboundMessageId` carries no modelled constraint, so this is what separates
+/// the caller's mistake from a message that is simply not held: a value outside
+/// the form names no message SES could ever have accepted, while a value inside it
+/// names one the account may or may not hold.
+pub fn message_id_is_well_formed(message_id: &str) -> bool {
+    let Some((first, rest)) = message_id.split_once('-') else {
+        return false;
+    };
+    first.len() > MESSAGE_ID_VERSION_PREFIX.len()
+        && first.starts_with(MESSAGE_ID_VERSION_PREFIX)
+        && [first]
+            .into_iter()
+            .chain(rest.split('-'))
+            .all(|field| !field.is_empty() && field.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// How this service words `BadRequestException` for a `MessageId` that is not an
+/// outbound message id at all, stated once for every operation that takes one.
+///
+/// The sentence carries no part of the request: the value is refused for not being
+/// a message id at all, and there is nothing else to say about it.
+pub fn invalid_message_id() -> String {
+    "Invalid MessageId".to_string()
+}
+
+/// How this service words `NotFoundException` for a well-formed message id the
+/// account holds no accepted message for, stated once for every operation that
+/// reads a message by its id.
+///
+/// `NotFoundException` is documented only as "the resource you attempted to access
+/// doesn't exist", which names no resource, so the sentence follows this service's
+/// own wording for a resource it does not hold — [`tenant_not_found`]'s form, with
+/// the requested id as its only variable part, taken from the request.
+pub fn message_not_found(message_id: &str) -> String {
+    format!("Message {message_id} does not exist.")
+}
+
 /// One accepted outbound message.
 #[derive(Debug, Clone)]
 pub struct SentMessage {
@@ -2700,6 +2752,46 @@ impl SentMessage {
     /// recipient as one message against the account's sending quota.
     pub fn recipients(&self) -> impl Iterator<Item = &String> {
         self.to.iter().chain(self.cc.iter()).chain(self.bcc.iter())
+    }
+
+    /// The tags the accepted message carries, as the modelled `MessageTagList`
+    /// reports them: the name/value pairs the request supplied, in the order it
+    /// supplied them.
+    ///
+    /// Only those: the tags the real service adds of its own accord describe a
+    /// delivery attempt nothing here makes, so none is invented here.
+    pub fn email_tag_list(&self) -> Vec<crate::ops::types::MessageTag> {
+        self.email_tags
+            .iter()
+            .map(|(name, value)| crate::ops::types::MessageTag {
+                name: name.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+
+    /// The per-recipient insights of this message, one entry per recipient in
+    /// `To`, `Cc`, `Bcc` order — the order [`Self::recipients`] walks.
+    ///
+    /// The only event an entry carries is the acceptance of the message, stamped
+    /// with the instant it was accepted: nothing in this slice delivers a message,
+    /// opens it, bounces it or complains about it, so there is no later event that
+    /// has happened to report, and no event `Details`, which only a bounce or a
+    /// complaint carries. `Isp` is the recipient's own mail provider, which is not
+    /// observable without a delivery attempt, so it is absent too.
+    pub fn insights(&self) -> Vec<crate::ops::types::EmailInsights> {
+        let accepted = ::aws_smithy_types::DateTime::from(self.sent_at);
+        self.recipients()
+            .map(|destination| crate::ops::types::EmailInsights {
+                destination: Some(destination.clone()),
+                isp: None,
+                events: Some(vec![crate::ops::types::InsightsEvent {
+                    timestamp: Some(accepted),
+                    r#type: Some(EVENT_TYPE_SEND.to_string()),
+                    details: None,
+                }]),
+            })
+            .collect()
     }
 }
 

@@ -38,7 +38,10 @@ const NOT_FOUND: &str = "NotFoundException";
 /// From `CreateModel$schema`'s own documentation: "The maximum size of the model is 400
 /// KB." Written out here rather than read from the service, so the test checks the bound
 /// instead of restating it.
-const MAX_SCHEMA_CHARS: usize = 400 * 1024;
+///
+/// `pub(crate)` so a sibling suite of the family asserts the one published bound rather
+/// than keeping its own copy (the `update_model` suite does).
+pub(crate) const MAX_SCHEMA_CHARS: usize = 400 * 1024;
 
 /// `CreateModel` on `api`, with `request` as its body.
 pub async fn create_model(gateway: &Gateway, api: &str, request: Value) -> Answer {
@@ -69,7 +72,10 @@ pub async fn get_model(gateway: &Gateway, api: &str, name: &str, flatten: bool) 
 }
 
 /// A JSON Schema document of `properties` named properties, as a caller writes one.
-fn json_schema(title: &str, properties: usize) -> String {
+///
+/// `pub(crate)` for the reason [`MAX_SCHEMA_CHARS`] is: one spelling of a schema document
+/// for every suite of the `Model` family.
+pub(crate) fn json_schema(title: &str, properties: usize) -> String {
     let members: serde_json::Map<String, Value> = (0..properties)
         .map(|index| (format!("member{index}"), json!({ "type": "string" })))
         .collect();
@@ -84,7 +90,9 @@ fn json_schema(title: &str, properties: usize) -> String {
 
 /// A JSON Schema document whose text is exactly `chars` characters long, so a row can sit
 /// on the published maximum and one character past it.
-fn schema_of_length(chars: usize) -> String {
+///
+/// `pub(crate)` for the reason [`MAX_SCHEMA_CHARS`] is.
+pub(crate) fn schema_of_length(chars: usize) -> String {
     let envelope = json!({ "type": "object", "title": "" }).to_string();
     let padding = chars.saturating_sub(envelope.chars().count());
     json!({ "type": "object", "title": "x".repeat(padding) }).to_string()

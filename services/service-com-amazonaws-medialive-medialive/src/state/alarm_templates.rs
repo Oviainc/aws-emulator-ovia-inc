@@ -63,6 +63,126 @@ pub const MAX_ALARM_PERIOD_SECONDS: i32 = 86_400;
 /// and, when it names one at all, needs at least one breaching datapoint.
 pub const MIN_ALARM_DATAPOINTS: i32 = 1;
 
+/// The settings a request asks a cloudwatch alarm template to carry: the
+/// members a create supplies in full and the members an update supplies in
+/// part.
+///
+/// A member a request did not carry is `None` and asks for no setting, so it
+/// breaks no rule — which is why a create fills in every member and an update
+/// only the ones its request named.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AlarmTemplateSettings<'a> {
+    pub name: Option<&'a str>,
+    pub description: Option<&'a str>,
+    /// The create's `@idempotencyToken` `RequestId`; an update has none.
+    pub request_id: Option<&'a str>,
+    pub metric_name: Option<&'a str>,
+    pub comparison_operator: Option<&'a str>,
+    pub statistic: Option<&'a str>,
+    pub target_resource_type: Option<&'a str>,
+    pub treat_missing_data: Option<&'a str>,
+    pub period: Option<i32>,
+    pub evaluation_periods: Option<i32>,
+    pub datapoints_to_alarm: Option<i32>,
+    pub threshold: Option<f64>,
+}
+
+/// Check the settings a request asks a cloudwatch alarm template to carry,
+/// answering the message the refusal carries.
+///
+/// ONE copy of that rule set for every operation that writes a template's
+/// settings (`CreateCloudWatchAlarmTemplate` and
+/// `UpdateCloudWatchAlarmTemplate`), which name the same members of the same
+/// resource and document them identically, so the length bounds, the closed
+/// enum sets, the numeric ranges, the finite threshold and the refusal wording
+/// cannot drift apart between them; the handler's job is only to carry the
+/// message in its own modelled client error. Every setting is checked before
+/// the caller writes anything, so a refused request leaves a stored template as
+/// it was.
+///
+/// Each rule is the shared one the whole service states: the length bounds the
+/// members' target shapes name (`__stringMin1Max255PatternS` for `Name`,
+/// `__stringMin0Max1024` for `Description`, `__stringMin1Max256PatternS` for
+/// `RequestId`, `__stringMax64` for `MetricName`), the four closed enum
+/// catalogs the model declares, and the ranges `__integerMin10Max86400`
+/// (`Period`) and `__integerMin1` (`EvaluationPeriods`, `DatapointsToAlarm`)
+/// name. The modelled constraints are refused before a handler runs where the
+/// model declares them; these checks are what makes the bounds hold either way.
+pub fn check_alarm_template_settings(settings: &AlarmTemplateSettings<'_>) -> Result<(), String> {
+    super::bounded_length("name", settings.name, 1, super::MAX_RESOURCE_NAME_LEN)?;
+    super::bounded_length(
+        "description",
+        settings.description,
+        0,
+        super::MAX_RESOURCE_DESCRIPTION_LEN,
+    )?;
+    super::bounded_length("requestId", settings.request_id, 1, super::MAX_REQUEST_ID_LEN)?;
+    super::bounded_length("metricName", settings.metric_name, 0, MAX_METRIC_NAME_LEN)?;
+
+    // Each of the four enum members is a CLOSED set ("The comparison operator
+    // used to compare the specified statistic and the threshold", "The
+    // statistic to apply to the alarm's metric data", "The resource type this
+    // template should dynamically generate cloudwatch metric alarms for",
+    // "Specifies how missing data points are treated"), so a value outside its
+    // catalog names nothing the service can evaluate. The catalogs are the
+    // model's own, generated into `crate::ops::types`.
+    for (member, values, value) in [
+        (
+            "comparisonOperator",
+            crate::ops::types::CLOUD_WATCH_ALARM_TEMPLATE_COMPARISON_OPERATOR_VALUES,
+            settings.comparison_operator,
+        ),
+        (
+            "statistic",
+            crate::ops::types::CLOUD_WATCH_ALARM_TEMPLATE_STATISTIC_VALUES,
+            settings.statistic,
+        ),
+        (
+            "targetResourceType",
+            crate::ops::types::CLOUD_WATCH_ALARM_TEMPLATE_TARGET_RESOURCE_TYPE_VALUES,
+            settings.target_resource_type,
+        ),
+        (
+            "treatMissingData",
+            crate::ops::types::CLOUD_WATCH_ALARM_TEMPLATE_TREAT_MISSING_DATA_VALUES,
+            settings.treat_missing_data,
+        ),
+    ] {
+        super::one_of(member, values, value)?;
+    }
+
+    super::bounded_integer(
+        "period",
+        settings.period,
+        MIN_ALARM_PERIOD_SECONDS,
+        MAX_ALARM_PERIOD_SECONDS,
+    )?;
+    super::bounded_integer(
+        "evaluationPeriods",
+        settings.evaluation_periods,
+        MIN_ALARM_DATAPOINTS,
+        i32::MAX,
+    )?;
+    super::bounded_integer(
+        "datapointsToAlarm",
+        settings.datapoints_to_alarm,
+        MIN_ALARM_DATAPOINTS,
+        i32::MAX,
+    )?;
+
+    // `Threshold` is a `__double` with no modelled bound, but a value that is
+    // not a real number is no threshold to compare a statistic against.
+    if let Some(threshold) = settings.threshold {
+        if !threshold.is_finite() {
+            return Err(format!(
+                "threshold must be a finite number, but was {threshold}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Why [`ComAmazonawsMedialiveMedialiveState::insert_alarm_template`] stored
 /// nothing. Each variant is one modelled refusal of
 /// `CreateCloudWatchAlarmTemplate`.

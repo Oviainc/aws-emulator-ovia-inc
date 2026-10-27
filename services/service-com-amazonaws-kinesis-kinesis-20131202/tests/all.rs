@@ -17,6 +17,8 @@ mod account_limits;
 mod batch_write_failure_count;
 #[path = "all/capacity_mode.rs"]
 mod capacity_mode;
+#[path = "all/channel_lifecycle.rs"]
+mod channel_lifecycle;
 #[path = "all/data_records.rs"]
 mod data_records;
 #[path = "all/encrypted_records.rs"]

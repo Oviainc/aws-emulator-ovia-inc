@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPortfolioSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPortfolioSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPortfolioSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -65,6 +56,17 @@
 //! * `InternalServerException` (HTTP 500) — The server experienced an internal error. Try
 //!   again.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
+//!
+//! ## What this operation reports
+//!
+//! The input shape has no members, so there is nothing a caller can send wrongly here: the
+//! answer is the summary of the portfolio of the Region this request was signed for,
+//! counted off the records that portfolio holds
+//! ([`crate::state::RegionState::to_assessment_summary`]) — the servers and application
+//! components grouped by the member each summary's own type names, and the latest instant
+//! an analysis was recorded on any of them. A portfolio holding neither summarises as the
+//! empty portfolio it is: the summary is not a per-account record that can be absent, so
+//! this read answers no not-found.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -139,18 +141,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPortfolioSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPortfolioSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The input shape has no members at all, so there is nothing a caller could have
+        // sent wrongly for this handler to refuse.
+        let _ = &input;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPortfolioSummaryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the migrationhub-strategy portfolio is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `@readonly`: every number this answers is counted off the records the portfolio
+        // holds. The one write it makes is materialising what the clock already owed that
+        // portfolio — an assessment whose completion was due at this same instant even if
+        // nobody had called, and the per-server status and the analysis that completion
+        // records — so the summary counts the statuses the clock has reached.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPortfolioSummary"))
+        // The portfolio is the one of the Region this request was signed for: a Region
+        // nothing was stored in summarises as the empty portfolio it is, and this read
+        // mints no partition for it.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        if let Some(portfolio) = store.region_mut(&region) {
+            portfolio.settle_all(now);
+        }
+
+        Ok(GetPortfolioSummaryOutput {
+            assessment_summary: Some(store.region(&region).to_assessment_summary()),
+        })
     }
 }

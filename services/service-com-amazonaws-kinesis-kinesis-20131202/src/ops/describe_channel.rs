@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the channel `crate::state`'s `channels` store holds under the `ChannelARN` the
+//! request names, inside the region the request was signed for, projected onto
+//! `ChannelDescription` ([`crate::state::Channel::to_description`]) — so what
+//! `CreateChannel` accepted is what this reports, including the status the clock owes the
+//! channel: "Use this operation to verify that a channel reached the ACTIVE state after
+//! creation". A pure read: it answers from the stored record and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -95,7 +93,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `DescribeChannelError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#DescribeChannel")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#DescribeChannel",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models
+    // it, the operation shape does not list it, and it is the only honest answer for a
+    // service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum DescribeChannelErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -103,6 +107,7 @@ pub enum DescribeChannelErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -156,18 +161,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeChannel"))
+        // A channel name "is unique within your Amazon Web Services account and Amazon Web
+        // Services Region", so the region the request was signed for is the one whose
+        // channels it addresses.
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeChannelError::from(DescribeChannelErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the channel store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let channel = store
+            .channel_by_arn(&region, &input.channel_arn)
+            .ok_or_else(|| {
+                DescribeChannelError::from(DescribeChannelErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::channel_not_found_message(
+                            &input.channel_arn,
+                        )),
+                    },
+                ))
+            })?;
+
+        Ok(DescribeChannelOutput {
+            channel_description: channel.to_description(now),
+        })
     }
 }

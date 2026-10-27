@@ -83,6 +83,9 @@ mod page_size_bound;
 #[path = "all/portfolio_preferences.rs"]
 mod portfolio_preferences;
 
+#[path = "all/portfolio_summary.rs"]
+mod portfolio_summary;
+
 #[path = "all/preferences_conflict.rs"]
 mod preferences_conflict;
 

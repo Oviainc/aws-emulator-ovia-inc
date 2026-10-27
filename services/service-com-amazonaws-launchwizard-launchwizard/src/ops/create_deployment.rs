@@ -397,7 +397,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         ]);
 
-        let deployment = crate::state::Deployment {
+        let mut deployment = crate::state::Deployment {
             id: id.clone(),
             sequence,
             name: input.name,
@@ -415,9 +415,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             modified_at: now,
             deleted_at: None,
-            events: vec![created],
+            // The create's own event goes in through `append_event` below, the one path
+            // every appender takes, so it is counted like every later one and carries the
+            // same kind of identity.
+            events: Vec::new(),
+            events_appended: 0,
             pending,
         };
+        deployment.append_event(created);
         store.deployments.insert(id.clone(), deployment);
 
         // The id is reported only because the record behind it is now stored.
