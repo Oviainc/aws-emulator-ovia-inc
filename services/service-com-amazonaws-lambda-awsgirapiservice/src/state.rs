@@ -3139,6 +3139,17 @@ pub const EVENT_SOURCE_MAPPING_STATE_UPDATING: &str = "Updating";
 /// caller asked it to, which Lambda reports as `USER_INITIATED`.
 pub const EVENT_SOURCE_MAPPING_USER_INITIATED: &str = "USER_INITIATED";
 
+/// The `ResourceInUseException` sentence `DeleteEventSourceMapping` refuses a mapping that
+/// is not available to be deleted with.
+///
+/// Entirely FIXED text: it names neither the mapping nor the state it is in, so a caller
+/// compares it exactly. `ResourceInUseException` is "The operation conflicts with the
+/// resource's availability. For example, you tried to update an event source mapping in
+/// the CREATING state, or you tried to delete an event source mapping currently UPDATING"
+/// — the delete half of that sentence is the refusal this states.
+pub const EVENT_SOURCE_MAPPING_DELETE_IN_USE_MESSAGE: &str =
+    "Cannot delete the event source mapping because it is in use.";
+
 /// How long after `CreateEventSourceMapping` or `UpdateEventSourceMapping` the move out
 /// of `Creating` or `Updating` becomes due.
 ///
@@ -3624,6 +3635,20 @@ impl EventSourceMappingRecord {
     #[must_use]
     pub fn is_deleting(&self) -> bool {
         self.removal_due.is_some()
+    }
+
+    /// Whether a change this mapping already accepted is still being applied — the
+    /// `Updating` window [`Self::begin_update`] opens and the clock closes at
+    /// [`Self::settled_due`].
+    ///
+    /// What it is for: `ResourceInUseException` names that window as one a mapping is NOT
+    /// available in ("you tried to delete an event source mapping currently UPDATING"), so
+    /// a mapping inside it is immutable until the change it acknowledged has settled.
+    /// Read it only after [`Self::materialize`], so a window the clock has already closed
+    /// is not read as still open.
+    #[must_use]
+    pub fn is_updating(&self) -> bool {
+        self.state == EVENT_SOURCE_MAPPING_STATE_UPDATING
     }
 
     /// Whether the clock has already made this mapping's removal due; see

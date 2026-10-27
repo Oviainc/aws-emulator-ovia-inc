@@ -6,8 +6,10 @@
 //! and might not be completely deleted for several seconds", so the call persists that
 //! state and answers the record carrying it, and the REMOVAL is owed by the CLOCK (see
 //! [`crate::state::EventSourceMappingRecord::begin_delete`]). A UUID this account holds
-//! no mapping under is the modelled not-found, and a mapping already being deleted is
-//! refused with the modelled `ResourceInUseException`.
+//! no mapping under is the modelled not-found, and a mapping that is not available to be
+//! deleted — one already being deleted, or one still applying an update it accepted — is
+//! refused with the modelled `ResourceInUseException`, whose own documentation names that
+//! second window ("you tried to delete an event source mapping currently UPDATING").
 //!
 //! ## Shape of an operation
 //!
@@ -297,6 +299,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "The event source mapping {} is already being deleted",
                         record.uuid
                     )),
+                },
+            )
+            .into());
+        }
+
+        // And a mapping that is still applying a change it already acknowledged is not
+        // available either: `ResourceInUseException` names that window itself — "you tried
+        // to delete an event source mapping currently UPDATING" — so the delete is refused
+        // while the `UpdateEventSourceMapping` it accepted is still settling, and the
+        // identical delete is accepted once the clock has closed that window. The window a
+        // CREATE opens is not one of them: the modelled sentence names `Updating` for a
+        // delete, and a mapping nobody has changed is deletable from the moment it exists.
+        if record.is_updating() {
+            return Err(DeleteEventSourceMappingErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    r#type: None,
+                    message: Some(
+                        crate::state::EVENT_SOURCE_MAPPING_DELETE_IN_USE_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());
