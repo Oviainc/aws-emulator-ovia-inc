@@ -340,3 +340,8 @@ mod workload_create_token_parameters;
 // Declared last for the same reason as the declaration above.
 #[path = "all/workload_from_review_template_content.rs"]
 mod workload_from_review_template_content;
+
+// Declared last for the same reason as the declarations above: the sorted position for an
+// agent suite is the one gap of this list every new agent suite lands in.
+#[path = "all/agent_recommendation_feedback.rs"]
+mod agent_recommendation_feedback;
