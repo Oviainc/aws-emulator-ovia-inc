@@ -15,7 +15,9 @@
 //! published `ThresholdPercentage` bounds (`@range(0, 100)`) and values in between, both
 //! `ThresholdComparator` values and its omission, a policy that names no threshold at
 //! all, `YES` and `NO` vote orders that approve, reject and leave a proposal open, both
-//! action kinds an approved proposal carries out, and every way a vote is refused.
+//! action kinds an approved proposal carries out, and every way a vote is refused —
+//! including every value `MemberStatus` declares, since only a member that participates in
+//! the network casts a vote.
 
 use std::time::{Duration, SystemTime};
 
@@ -27,8 +29,10 @@ use service_com_amazonaws_managedblockchain_taigawebservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, create_network, create_network_body, router_and_engine, ACCOUNT, PAST_TRANSITION, REGION,
+    call, create_network, create_network_body, delete_member, get_member, router_and_engine,
+    ACCOUNT, PAST_TRANSITION, REGION,
 };
+use crate::list_members::{seed_members, Seed};
 use crate::network_and_node_lifecycle::{create_node, Answer};
 
 /// An id with the shape every Managed Blockchain resource id takes that no create ever
@@ -901,5 +905,220 @@ async fn voting_as_a_member_another_account_holds_is_denied() {
         answer.status, 200,
         "case voting as this account's own member: expected VoteOnProposal 200, got {} {:?}",
         answer.status, answer.body
+    );
+}
+
+/// Every value `MemberStatus` declares, with whether a member in it participates in the
+/// network and can therefore cast a vote.
+///
+/// The catalog is the model's own enum — `smithy_query(query="shape",
+/// shape="MemberStatus")`: `CREATING | AVAILABLE | CREATE_FAILED | UPDATING | DELETING |
+/// DELETED | INACCESSIBLE_ENCRYPTION_KEY`. Which of them participates comes from
+/// `Member$Status`: "AVAILABLE - The member has been created and can participate in the
+/// network", "UPDATING - The member is in the process of being updated" (a configuration
+/// change leaves it participating), while a member still `CREATING` has not joined yet,
+/// one whose creation failed never did, one being removed or removed "can no longer
+/// participate on the network", and one that cannot reach its encryption key "is impaired
+/// and might not function as expected".
+const MEMBER_STATUS_CASES: &[(&str, bool)] = &[
+    ("CREATING", false),
+    ("AVAILABLE", true),
+    ("CREATE_FAILED", false),
+    ("UPDATING", true),
+    ("DELETING", false),
+    ("DELETED", false),
+    ("INACCESSIBLE_ENCRYPTION_KEY", false),
+];
+
+/// A vote is cast "on behalf of a member", so only a member that participates in the
+/// network casts one: a member in any other `MemberStatus` is refused and its vote is
+/// recorded nowhere — over the whole enum.
+#[tokio::test]
+async fn only_a_member_that_participates_in_the_network_can_vote() {
+    for (status, can_vote) in MEMBER_STATUS_CASES {
+        let (router, engine) = router_and_engine();
+        // 100% `GREATER_THAN_OR_EQUAL_TO`: with both members participating approval takes
+        // two `YES` votes, so an accepted vote leaves the proposal open and the row's
+        // assertions are about the vote itself rather than the outcome.
+        let (network_id, founder) = create_network(
+            &router,
+            network_body(
+                &format!("status-{status}"),
+                "participation-net",
+                Some(100),
+                Some("GREATER_THAN_OR_EQUAL_TO"),
+            ),
+        )
+        .await;
+        tokio::time::sleep(PAST_TRANSITION).await;
+        let seeded = seed_members(
+            &engine,
+            &network_id,
+            &[Seed {
+                name: "org2",
+                status,
+                account: ACCOUNT,
+            }],
+        );
+        let voter = seeded
+            .first()
+            .cloned()
+            .expect("the one seeded member of this row");
+
+        // The member really is in the row's status over the wire: no transition the clock
+        // owes has moved it before the vote is cast.
+        let read_member = get_member(&router, &network_id, &voter).await;
+        assert_eq!(
+            read_member.text(&["Member", "Status"]),
+            *status,
+            "case {status}: expected the voter to still be {status}, got {:?}",
+            read_member.body
+        );
+
+        let proposal_id = create_proposal(
+            &router,
+            &network_id,
+            &founder,
+            &format!("prop-{status}"),
+            json!({ "Invitations": [{ "Principal": OTHER_ACCOUNT }] }),
+        )
+        .await;
+
+        let answer = vote(&router, &network_id, &proposal_id, &voter, "YES").await;
+        let (expected_status, expected_error) = if *can_vote {
+            (200, "")
+        } else {
+            (400, "IllegalActionException")
+        };
+        assert_eq!(
+            (answer.status, answer.error_type.as_str()),
+            (expected_status, expected_error),
+            "case {status}: expected {expected_status} {expected_error:?} voting as a member \
+             that {} participate in the network, got {} {:?}",
+            if *can_vote { "does" } else { "does not" },
+            answer.status,
+            answer.body
+        );
+        if !*can_vote {
+            assert!(
+                answer.text(&["Message"]).contains(status),
+                "case {status}: a refusal must say what was wrong, got {:?}",
+                answer.body
+            );
+        }
+
+        // The vote of a member that does not participate is recorded nowhere: the counts
+        // the threshold is compared against stay as they were, and the proposal stays
+        // open.
+        let read = get_proposal(&router, &network_id, &proposal_id).await;
+        let proposal = &read.body["Proposal"];
+        let expected_yes = i64::from(*can_vote);
+        assert_eq!(
+            (
+                proposal["Status"].as_str(),
+                proposal["YesVoteCount"].as_i64(),
+                proposal["NoVoteCount"].as_i64()
+            ),
+            (Some(PROPOSAL_IN_PROGRESS), Some(expected_yes), Some(0)),
+            "case {status}: expected the proposal {PROPOSAL_IN_PROGRESS} with {expected_yes} YES \
+             vote(s) counted, got {proposal:?}"
+        );
+
+        // `ListProposalVotes` reports the same: only a vote that was accepted is there.
+        let votes = call(
+            &router,
+            "GET",
+            &format!("/networks/{network_id}/proposals/{proposal_id}/votes"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            votes.body["ProposalVotes"].as_array().map(Vec::len),
+            Some(usize::from(*can_vote)),
+            "case {status}: expected {} vote(s) listed on the proposal, got {:?}",
+            usize::from(*can_vote),
+            votes.body
+        );
+    }
+}
+
+/// A member whose removal has begun no longer decides a proposal: it is out of the
+/// membership the threshold is measured against, so its vote is refused rather than
+/// counted against the smaller membership it left behind.
+#[tokio::test]
+async fn a_member_being_removed_cannot_decide_a_proposal() {
+    let (router, engine) = router_and_engine();
+    // 50% `GREATER_THAN` on a two-member network: approval takes both `YES` votes while
+    // both members participate, and one once only a single member does.
+    let (network_id, founder) = create_network(
+        &router,
+        network_body("removed-voter", "removed-voter-net", Some(50), Some("GREATER_THAN")),
+    )
+    .await;
+    tokio::time::sleep(PAST_TRANSITION).await;
+    let other = seed_member(&engine, &network_id, "org2");
+
+    let proposal_id = create_proposal(
+        &router,
+        &network_id,
+        &founder,
+        "removed-voter-prop",
+        json!({ "Invitations": [{ "Principal": OTHER_ACCOUNT }] }),
+    )
+    .await;
+
+    // The member leaves the membership through the service's own `DeleteMember`.
+    let deleted = delete_member(&router, &network_id, &other).await;
+    assert_eq!(
+        deleted.status, 200,
+        "arranging the member being removed: expected DeleteMember 200, got {} {:?}",
+        deleted.status, deleted.body
+    );
+
+    let answer = vote(&router, &network_id, &proposal_id, &other, "YES").await;
+    assert_eq!(
+        (answer.status, answer.error_type.as_str()),
+        (400, "IllegalActionException"),
+        "case voting as the member being removed: expected 400 IllegalActionException, got {} {:?}",
+        answer.status,
+        answer.body
+    );
+
+    let read = get_proposal(&router, &network_id, &proposal_id).await;
+    let proposal = &read.body["Proposal"];
+    assert_eq!(
+        (
+            proposal["Status"].as_str(),
+            proposal["YesVoteCount"].as_i64(),
+            proposal["OutstandingVoteCount"].as_i64()
+        ),
+        (Some(PROPOSAL_IN_PROGRESS), Some(0), Some(1)),
+        "case voting as the member being removed: the refused vote must decide nothing, got \
+         {proposal:?}"
+    );
+    let listing = call(&router, "GET", "/invitations", None).await;
+    assert_eq!(
+        listing.body["Invitations"].as_array().map(Vec::len),
+        Some(0),
+        "case voting as the member being removed: no InviteAction may have been carried out, \
+         got {:?}",
+        listing.body
+    );
+
+    // The member that does participate still decides the proposal: it is now the whole
+    // membership, so its one `YES` carries the 50% `GREATER_THAN` threshold.
+    let answer = vote(&router, &network_id, &proposal_id, &founder, "YES").await;
+    assert_eq!(
+        answer.status, 200,
+        "case voting as the remaining member: expected VoteOnProposal 200, got {} {:?}",
+        answer.status, answer.body
+    );
+    let read = get_proposal(&router, &network_id, &proposal_id).await;
+    let proposal = &read.body["Proposal"];
+    assert_eq!(
+        (proposal["Status"].as_str(), proposal["YesVoteCount"].as_i64()),
+        (Some(PROPOSAL_APPROVED), Some(1)),
+        "case voting as the remaining member: expected the proposal {PROPOSAL_APPROVED} on its \
+         one YES vote, got {proposal:?}"
     );
 }

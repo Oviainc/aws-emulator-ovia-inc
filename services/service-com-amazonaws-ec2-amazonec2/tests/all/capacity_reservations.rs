@@ -1381,9 +1381,15 @@ async fn the_describe_refuses_what_it_cannot_answer() {
             400,
         ),
         (
-            "an id no reservation of the account has",
-            indexed("CapacityReservationId", &["cr-00000000000000000"]),
+            "a well-formed id no reservation of the account has",
+            indexed("CapacityReservationId", &["cr-0ffffffffffffffff"]),
             "InvalidCapacityReservationId.NotFound",
+            400,
+        ),
+        (
+            "a value outside the Capacity Reservation id form",
+            indexed("CapacityReservationId", &["cr-1234567890abcdef0"]),
+            "InvalidCapacityReservationId.Malformed",
             400,
         ),
         (

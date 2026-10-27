@@ -5,7 +5,9 @@
 //! [`crate::state`], then decides the proposal against the network's own
 //! `ApprovalThresholdPolicy` — approving it once the `YES` votes reach the threshold
 //! (carrying out its `ProposalActions`), rejecting it once the `NO` votes put that
-//! threshold out of reach, and leaving it open otherwise. `GetProposal`,
+//! threshold out of reach, and leaving it open otherwise. Only a member that participates
+//! in the network ([`crate::state::is_in_service`]) casts a vote, so the votes counted and
+//! the membership the threshold is measured against are the same members. `GetProposal`,
 //! `ListProposals` and `ListInvitations` answer from what this writes.
 //!
 //! This operation "Applies only to Hyperledger Fabric", which holds by construction here
@@ -223,6 +225,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "member {} is not held by account {} and cannot be voted as",
                         voter.id,
                         ::engine::emulator_account_id()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A vote is cast "on behalf of a member", so the member must be one that
+        // participates in the network: "AVAILABLE - The member has been created and can
+        // participate in the network", while one still being created has not joined it yet
+        // and one whose removal has begun or finished "can no longer participate on the
+        // network" (`Member$Status`). A configuration change under way (`UPDATING`) leaves
+        // the member participating, so it is not a refusal. This is the same membership
+        // the threshold above is measured against, which is what keeps the YES/NO totals
+        // and that threshold counting the same members — and the same rule the sibling
+        // writes a member makes on the network apply (`CreateProposal`, `CreateNode`).
+        // This operation models no `ResourceNotReadyException`, and voting as a member
+        // that cannot participate is an action the resource does not allow rather than a
+        // malformed request.
+        if !crate::state::is_in_service(&voter.status) {
+            return Err(VoteOnProposalErrorModeled::IllegalActionException(
+                IllegalActionException {
+                    message: Some(format!(
+                        "member {} is {} and cannot vote until it is {}",
+                        voter.id,
+                        voter.status,
+                        crate::state::STATUS_AVAILABLE
                     )),
                 },
             )

@@ -658,3 +658,7 @@ mod create_transit_gateway_route_table;
 // size narrow it.
 #[path = "all/transit_gateway_metering_policies.rs"]
 mod transit_gateway_metering_policies;
+// Appended at the END for the same reason. What `MoveCapacityReservationInstances` shifts
+// between two Capacity Reservations, what it conserves, and what it refuses.
+#[path = "all/move_capacity_reservation_instances.rs"]
+mod move_capacity_reservation_instances;
