@@ -33,6 +33,7 @@ use service_com_amazonaws_glue_awsglue::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::error_messages::JOB_RUN_NOT_FOUND_MESSAGE;
 use crate::job_runs::{
     already_past, emulator_with_engine, far_future, get_run, job_body, set_due_instant, start_run,
     stored_runs, OWED_TRANSITION_WINDOW,
@@ -447,10 +448,21 @@ async fn a_run_the_stop_cannot_reach_is_reported_per_run() {
             code, expected_code,
             "case {case:?}: expected error code {expected_code}, got {answer}"
         );
-        assert!(
-            message.contains(&unreachable) || message.contains(name),
-            "case {case:?}: the message must name what was not found, got {message:?}"
-        );
+        if code == ENTITY_NOT_FOUND_CODE {
+            // A run the job holds none of is the job-run miss every lookup refuses with
+            // one fixed sentence: the entry names the run in `JobRunId`, so the detail
+            // echoes nothing back.
+            assert_eq!(
+                message, JOB_RUN_NOT_FOUND_MESSAGE,
+                "case {case:?}: expected the job-run miss sentence, got {message:?}"
+            );
+        } else {
+            assert!(
+                message.contains(&unreachable),
+                "case {case:?}: the message must name the run that could not be stopped, \
+                 got {message:?}"
+            );
+        }
         assert_eq!(
             stored_state(&engine, name, &reachable),
             JOB_RUN_STATE_STOPPING,

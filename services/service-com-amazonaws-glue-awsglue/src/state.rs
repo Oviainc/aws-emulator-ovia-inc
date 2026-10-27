@@ -7577,6 +7577,17 @@ pub mod messages {
         )
     }
 
+    /// A job run addressed by id that the job it was addressed through does not hold —
+    /// the read (`GetJobRun`), the retry a start names (`StartJobRun$JobRunId`) and each
+    /// entry of a stop the job holds no such run for (`BatchStopJobRun`).
+    ///
+    /// Recorded CONSTANT, and the whole message: the service states the pair it could not
+    /// resolve a run for — the job name and the run id — in fixed words and echoes back
+    /// neither of them, so the refusal a client matches on is the same whatever was
+    /// asked. Shared by every job-run lookup, so one operation's miss cannot drift from
+    /// another's.
+    pub const JOB_RUN_NOT_FOUND: &str = "Job run not found for the given job name and runId.";
+
     /// `StartJobRun` for a `JobName` the endpoint's Region holds no job definition for —
     /// a name nothing created, or one created through ANOTHER Region's endpoint.
     /// Recorded constant: the start's refusal names the metadata it could not read rather

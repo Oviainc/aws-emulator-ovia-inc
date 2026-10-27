@@ -24,6 +24,15 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{call, emulator, error_code, error_message, ok, ACCOUNT_ID};
 
+/// The whole `Message` a job-run miss carries — fixed text with no variable part, so a
+/// client that matches refusals on their wording recognises the miss whatever it asked
+/// for. Written out here, beside this module's other expected wordings, so every suite
+/// that drives a job-run lookup pins the same spelling: the read, the retry a start names
+/// and each entry of a stop ([`crate::job_run_miss_message`],
+/// [`crate::batch_stop_job_run`]).
+pub(crate) const JOB_RUN_NOT_FOUND_MESSAGE: &str =
+    "Job run not found for the given job name and runId.";
+
 /// Names that span the axis the templates generalise over: the recorded fixture's own
 /// shape, a short name, a mixed-case name, one with the punctuation `NameString`'s
 /// pattern admits, and one at the member's documented 255-character ceiling
