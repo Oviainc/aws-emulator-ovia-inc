@@ -33,6 +33,8 @@ mod config_listing;
 mod contact_cancellation;
 #[path = "all/contact_dataflows_and_pass_stages.rs"]
 mod contact_dataflows_and_pass_stages;
+#[path = "all/contact_endpoint_settle_consistency.rs"]
+mod contact_endpoint_settle_consistency;
 #[path = "all/contact_version_description.rs"]
 mod contact_version_description;
 #[path = "all/contact_version_listing.rs"]
