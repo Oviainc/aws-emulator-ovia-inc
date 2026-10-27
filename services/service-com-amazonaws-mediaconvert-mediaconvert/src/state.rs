@@ -32,8 +32,10 @@
 //!   `ForbiddenException`. `idempotency` holds at most one entry per stored job, so it is
 //!   bounded by `MAX_JOBS` too, and `endpoints` (one account endpoint per region a request
 //!   was signed for) is capped at [`MAX_ENDPOINTS`] the same way.
-//! * A record's `tags` are capped at [`MAX_TAGS_PER_RESOURCE`], so `TagResource` cannot
-//!   grow one record without limit either; past the cap it answers the same quota error.
+//! * A record's `tags` are capped at [`MAX_TAGS_PER_RESOURCE`], so no door onto a record's
+//!   tag set — the four `Create*` paths or `TagResource` — can grow one record without
+//!   limit either; past the cap each answers the same quota error, out of the one rule in
+//!   [`check_tags`].
 //!   A job's share attempt ([`ShareAttempt`], what `CreateResourceShare` records) is a
 //!   SINGLE field on the job — "the most recent share attempt" — so sharing a job over
 //!   and over replaces that one attempt instead of growing anything, and
@@ -1429,6 +1431,76 @@ pub const RESOURCE_TYPE_JOB_TEMPLATES: &str = "jobTemplates";
 /// without limit. Past it the call answers the error the model already declares for
 /// growing past a quota, `ServiceQuotaExceededException` (HTTP 402).
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// Why the tag set a request asks a record to carry cannot be stored on it (see
+/// [`check_tags`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagRefusal {
+    /// The set carries a key with no characters at all: a problem in the request, which a
+    /// handler answers with its modelled `BadRequestException` (HTTP 400).
+    EmptyKey,
+    /// The set holds more than [`MAX_TAGS_PER_RESOURCE`] tags, so the record would carry
+    /// more tags than one holds: a quota refusal, which a handler answers with its
+    /// modelled `ServiceQuotaExceededException` (HTTP 402).
+    PastCap,
+}
+
+impl TagRefusal {
+    /// The sentence the refusal states, so no door onto a record's tag set can word the
+    /// same refusal differently.
+    pub fn message(self) -> String {
+        match self {
+            Self::EmptyKey => empty_tag_key_message(),
+            Self::PastCap => tags_past_cap_message(),
+        }
+    }
+}
+
+/// How this service words the refusal of a tag whose key carries no characters.
+pub fn empty_tag_key_message() -> String {
+    "Tags must not contain an empty tag key.".to_string()
+}
+
+/// How this service words the refusal of a call that would carry a record past
+/// [`MAX_TAGS_PER_RESOURCE`] tags; the bound comes from the constant, never a second
+/// hand-written number.
+pub fn tags_past_cap_message() -> String {
+    format!("A resource holds at most {MAX_TAGS_PER_RESOURCE} tags.")
+}
+
+/// Whether the tag set a call asks a record to carry can be STORED on that record.
+///
+/// Every operation that writes a record's `tags` — the four `Create*` paths and
+/// `TagResource` — is a door onto the one tag map [`ComAmazonawsMediaconvertMediaconvertState::tags`]
+/// reports, so the tests a tag set takes belong to the RECORD rather than to one
+/// operation: `Tags` is documented as pairs where "you can tag resources with a key-value
+/// pair or with only a key", so an empty VALUE is a tag but a key with no characters names
+/// nothing a later `UntagResource` or `ListTagsForResource` could address, and a record's
+/// tag count is bounded by [`MAX_TAGS_PER_RESOURCE`]. `tags` here is the set the record
+/// would carry AFTER the call, so a merge is tested on its result and a create on the set
+/// it would persist.
+pub fn check_tags(tags: &BTreeMap<String, String>) -> Result<(), TagRefusal> {
+    if tags.keys().any(|key| key.is_empty()) {
+        return Err(TagRefusal::EmptyKey);
+    }
+    if tags.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(TagRefusal::PastCap);
+    }
+    Ok(())
+}
+
+/// The tag set a `Create*` request asks the new record to carry, as it is STORED — or the
+/// refusal the request earns, from the one rule in [`check_tags`].
+///
+/// A new record starts with no tags, so the set the request carried IS the set the record
+/// would carry, and it takes the record's tests before anything is persisted.
+pub fn tags_to_store(
+    tags: Option<HashMap<String, String>>,
+) -> Result<BTreeMap<String, String>, TagRefusal> {
+    let stored: BTreeMap<String, String> = tags.unwrap_or_default().into_iter().collect();
+    check_tags(&stored)?;
+    Ok(stored)
+}
 
 /// A resource a MediaConvert ARN names, as the tagging operations resolve it.
 ///
