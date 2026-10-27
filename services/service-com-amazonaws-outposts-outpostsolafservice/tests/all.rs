@@ -67,6 +67,8 @@ mod outpost_assets;
 mod outpost_decommission;
 #[path = "all/outpost_hardware_installation.rs"]
 mod outpost_hardware_installation;
+#[path = "all/outpost_hardware_type_change.rs"]
+mod outpost_hardware_type_change;
 #[path = "all/outpost_server_connection.rs"]
 mod outpost_server_connection;
 #[path = "all/private_connectivity.rs"]
