@@ -327,7 +327,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.title.trim().is_empty() {
             return Err(CreatePullRequestErrorModeled::TitleRequiredException(
                 TitleRequiredException {
-                    message: Some("A pull request title is required.".to_string()),
+                    message: Some(crate::state::TITLE_REQUIRED_MESSAGE.to_string()),
                 },
             )
             .into());
