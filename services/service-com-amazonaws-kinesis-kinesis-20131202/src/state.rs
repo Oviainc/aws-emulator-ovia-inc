@@ -1461,9 +1461,11 @@ pub enum StreamLookupFailure {
 
 /// How a request that names no stream is refused: the rule `DescribeStream` publishes
 /// ("you must use either the StreamARN or the StreamName parameter, or both"), which is
-/// what makes the refusal part of the contract rather than wording.
+/// what makes the refusal part of the contract rather than wording, worded the way the
+/// service words it for a request carrying neither identifier — one sentence of fixed
+/// text, with nothing taken from the request.
 pub const STREAM_IDENTIFIER_REQUIRED_MESSAGE: &str =
-    "you must use either the StreamARN or the StreamName parameter, or both";
+    "Stream arn and stream name can't be empty at the same time";
 
 /// How an operation whose ONLY stream identifier is `StreamARN` refuses a request that
 /// names no stream.

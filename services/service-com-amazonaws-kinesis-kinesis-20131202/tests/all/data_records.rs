@@ -268,9 +268,10 @@ async fn every_iterator_type_reads_the_records_its_position_names() {
             }),
         )
         .await;
-    assert!(
-        batch["FailedRecordCount"].is_null(),
-        "case every type: a batch nothing failed in reports no FailedRecordCount, got {batch}"
+    assert_eq!(
+        batch["FailedRecordCount"].as_i64(),
+        Some(0),
+        "case every type: a batch nothing failed in reports a FailedRecordCount of 0, got {batch}"
     );
     for entry in batch["Records"].as_array().unwrap_or(&Vec::new()) {
         assert_eq!(
