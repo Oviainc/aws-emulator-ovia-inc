@@ -380,12 +380,14 @@ async fn the_listing_reports_what_the_store_holds_now() {
 
     // A term keeps the glossary it was created in even once that glossary is gone — which
     // is what `GetGlossaryTerm` reports too — so the orphaned records are still the listing
-    // of that identifier. `DeleteGlossary` is a scaffold, so the glossary is dropped from
-    // the store directly.
-    {
-        let state = engine.state::<ComAmazonawsGlueAwsglueState>();
-        state.lock().glossaries.remove(&glossary);
-    }
+    // of that identifier. The glossary goes through `DeleteGlossary`, which removes the
+    // glossary record and nothing else.
+    ok(
+        &router,
+        "DeleteGlossary",
+        &json!({ "Identifier": glossary }),
+    )
+    .await;
     let orphaned = listed_names(&ok(
         &router,
         "ListGlossaryTerms",
