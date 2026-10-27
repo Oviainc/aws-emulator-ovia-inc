@@ -161,9 +161,6 @@ pub const IMAGE_STATE_CREATED: &str = "CREATED";
 /// A `MicrovmImageState` value (`MICROVM_IMAGE_STATE_VALUES`): the state an image
 /// carries while `DeleteMicrovmImage`'s asynchronous deletion is in flight.
 pub const IMAGE_STATE_DELETING: &str = "DELETING";
-/// A `MicrovmImageState` value (`MICROVM_IMAGE_STATE_VALUES`): the state
-/// `DeleteMicrovmImage` reports for an image this account no longer holds.
-pub const IMAGE_STATE_DELETED: &str = "DELETED";
 
 /// The version the FIRST build of a MicroVM image is minted as.
 ///
@@ -177,6 +174,17 @@ pub const FIRST_IMAGE_VERSION: &str = "1.0";
 /// `imageIdentifier` the request carried.
 pub fn image_not_found_message(identifier: &str) -> String {
     format!("MicroVMImage not found for MicroVMImageID: {identifier}")
+}
+
+/// The `message` of the 404 the DELETE path answers for an `imageIdentifier` that
+/// resolves to no record, built from the identifier the request carried.
+///
+/// The delete of a resource that is already gone names the resource it was asked to
+/// delete in its own words rather than reusing the read path's wording
+/// ([`image_not_found_message`]): the two are distinct messages of the same error
+/// class.
+pub fn delete_image_not_found_message(identifier: &str) -> String {
+    format!("MicroVM image not found: {identifier}")
 }
 
 /// The `message` of the 400 a MicroVM-image lookup answers for an `imageIdentifier`
@@ -206,10 +214,9 @@ pub fn image_name_conflict_message(name: &str) -> String {
 ///
 /// `baseImageArn` is "The ARN of the Lambda-managed base MicroVM image to build upon",
 /// so the one refusal for an unresolvable base-image reference is worded for a managed
-/// image whatever namespace the ARN names. The same wording names a missing managed
-/// image wherever one is addressed: as `CreateMicrovmImage`'s 400 on its own
-/// `baseImageArn` member, and as the 404 the managed-catalogue reads answer for an
-/// `imageIdentifier` the catalogue does not publish.
+/// image whatever namespace the ARN names: `CreateMicrovmImage`'s 400 on its own
+/// `baseImageArn` member is where a managed reference is resolved and can therefore be
+/// refused.
 pub fn base_image_not_found_message(base_image_arn: &str) -> String {
     format!("Managed VMI not found: {base_image_arn}")
 }
@@ -278,6 +285,18 @@ pub fn managed_microvm_image_id(arn: &str) -> Option<&str> {
         return None;
     }
     parsed.resource.strip_prefix("microvm-image:")
+}
+
+/// Whether `arn` names a MicroVM image in the AWS-OWNED namespace — the one
+/// `ListManagedMicrovmImages` publishes, whose ARNs carry [`MANAGED_RESOURCE_ACCOUNT`]
+/// in the account field.
+///
+/// Such a resource belongs to AWS rather than to the calling account, so a
+/// customer-facing operation addressed at one is reaching OUTSIDE the caller's own
+/// namespace — whether or not the catalogue publishes it, which is why this says
+/// nothing about resolution; see [`managed_microvm_image_id`].
+pub fn is_managed_microvm_image_arn(arn: &str) -> bool {
+    managed_microvm_image_id(arn).is_some()
 }
 
 /// Whether the AWS-managed catalogue publishes a base image with id `image_id`.
@@ -546,7 +565,7 @@ pub struct BuildTarget {
     /// A `Chipset` (`CHIPSET_VALUES`).
     pub chipset: &'static str,
     /// The chipset generation, as `MicrovmImageBuildSummary$chipsetGeneration` reports
-    /// it.
+    /// it: the generation NUMBER of [`Self::chipset`], as a decimal string.
     pub chipset_generation: &'static str,
 }
 
@@ -556,19 +575,24 @@ pub struct BuildTarget {
 /// (`smithy_query(query="shape",shape="Architecture,Chipset")`), so an `ARM_64` image is
 /// built for `GRAVITON`; a build is per chipset GENERATION, so one scheduled build fans
 /// out across the generations the service builds that chipset for.
-/// `chipsetGeneration` is a free-form `NonBlankString` the model publishes no values
-/// for, so the generations named here are chosen (like [`IMAGE_BUILD_SPAN`]) rather
-/// than modelled.
+/// `chipsetGeneration` is "The target chipset generation for the build." and is modelled
+/// SEPARATELY from `chipset` ("The target chipset for the build."), so the chipset FAMILY
+/// lives in `chipset` and this member carries only the generation of it, as a bare
+/// decimal string — the same form `ListMicrovmImageBuilds` filters on through its
+/// `chipsetGeneration` httpQuery parameter, so a client can feed a generation it was
+/// told straight back as a filter. It is a free-form `NonBlankString` the model
+/// publishes no values for, so WHICH generations are built is chosen (like
+/// [`IMAGE_BUILD_SPAN`]) rather than modelled.
 pub const BUILD_TARGETS: &[BuildTarget] = &[
     BuildTarget {
         architecture: DEFAULT_CPU_ARCHITECTURE,
         chipset: "GRAVITON",
-        chipset_generation: "GRAVITON_2",
+        chipset_generation: "2",
     },
     BuildTarget {
         architecture: DEFAULT_CPU_ARCHITECTURE,
         chipset: "GRAVITON",
-        chipset_generation: "GRAVITON_3",
+        chipset_generation: "3",
     },
 ];
 

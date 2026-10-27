@@ -11,8 +11,9 @@
 //!
 //! The `imageIdentifier` is resolved against that catalogue by both forms
 //! `MicrovmImageIdentifier` accepts ([`crate::state::resolve_managed_base_image`]): a
-//! well-formed reference the catalogue does not publish is the modelled 404, and a
-//! value that is neither a published id nor an ARN is the modelled 400.
+//! well-formed reference the catalogue does not publish has an empty published version
+//! set, so it pages through to a terminal empty page, and a value that is neither a
+//! published id nor an ARN is the modelled 400.
 //!
 //! A pure report: nothing here writes, so a later caller sees exactly what this one
 //! saw. The `@paginated` contract is honoured as `ListManagedMicrovmImages` honours it
@@ -178,29 +179,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The identifier addresses a MANAGED image, so it is resolved against the
-        // published catalogue rather than against this account's store. The outcomes
-        // mean different things to a caller: a reference the catalogue does not publish
-        // is a missing resource (404), while a value that is no identifier of this API
-        // at all is a request that can never succeed (400).
+        // published catalogue rather than against this account's store. The catalogue
+        // publishes a VERSION SET per reference, and the set of a reference it does not
+        // publish is empty — so a well-formed reference outside the catalogue pages
+        // through to a terminal EMPTY page (`items` is `@required` on this `@paginated`
+        // listing) rather than a refusal, and a caller learns the versions AWS publishes
+        // without learning anything about what it does not. A value that is no
+        // identifier of this API at all is still a request that can never succeed (400).
         let image_id = match crate::state::resolve_managed_base_image(&input.image_identifier) {
             crate::state::ImageReference::Resolved(image_id) => image_id,
             crate::state::ImageReference::Absent => {
-                // `ResourceNotFoundException` models `message` as the only required
-                // member; `resourceType` and `resourceId` are optional and this service
-                // leaves them unset, so the message — built from the identifier the
-                // request carried — is the whole envelope.
-                return Err(
-                    ListManagedMicrovmImageVersionsErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: crate::state::base_image_not_found_message(
-                                &input.image_identifier,
-                            ),
-                            resource_type: None,
-                            resource_id: None,
-                        },
-                    )
-                    .into(),
-                );
+                crate::state::managed_microvm_image_id(&input.image_identifier)
+                    .unwrap_or(&input.image_identifier)
+                    .to_string()
             }
             crate::state::ImageReference::Malformed => {
                 return Err(
