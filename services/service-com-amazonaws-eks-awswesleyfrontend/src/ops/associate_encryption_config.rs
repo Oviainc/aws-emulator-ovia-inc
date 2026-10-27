@@ -68,7 +68,7 @@ use std::time::SystemTime;
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    self, PendingClusterConfig, UpdateRecord, STATUS_ACTIVE, STATUS_UPDATING,
+    self, PendingClusterConfig, UpdateRecord, UpdateScope, STATUS_ACTIVE, STATUS_UPDATING,
     UPDATE_COMPLETION_DELAY, UPDATE_IN_PROGRESS, UPDATE_PARAM_ENCRYPTION_CONFIG,
     UPDATE_TYPE_ASSOCIATE_ENCRYPTION_CONFIG,
 };
@@ -302,6 +302,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // update": none has been, so `CancelUpdate` is the only writer of either.
             cancellation: None,
             cancellation_request_token: None,
+            // The encryption configuration is the cluster's own, so this is an
+            // update of the cluster rather than of a resource inside it.
+            scope: UpdateScope::Cluster,
         };
         let answer = update.to_update();
 

@@ -101,7 +101,10 @@
 //! qualifier, and `GetFunctionScalingConfig` reports exactly that record. The bounds the
 //! call asked for are the REQUESTED configuration at once, and become the APPLIED one —
 //! "the actual scaling settings in effect" — when the CLOCK makes that due (see
-//! [`FunctionScalingConfigRecord::materialize`]); nothing sleeps for it.
+//! [`FunctionScalingConfigRecord::materialize`]); nothing sleeps for it. A qualifier
+//! nobody has configured still reports what the SERVICE scales it by, because a Managed
+//! Instances function is scaled from the moment it exists (see
+//! [`FunctionRecord::reported_function_scaling_config`]).
 //!
 //! `GetAccountSettings` reports on the same records at the account level:
 //! "Retrieves details about your account's limits and usage in an Amazon Web Services
@@ -1489,6 +1492,28 @@ pub const VERSION_LATEST_PUBLISHED: &str = "$LATEST.PUBLISHED";
 /// and not yet applied.
 pub const FUNCTION_SCALING_APPLY_DELAY: Duration = Duration::from_millis(500);
 
+/// The minimum number of execution environments the service itself keeps a Lambda
+/// Managed Instances function's qualifier at while nothing else has been asked for.
+///
+/// Scaling such a function is the SERVICE's job from the moment the function exists —
+/// `PutFunctionScalingConfig` only "defines the minimum and maximum number of execution
+/// environments that CAN be provisioned" on top of that — so a qualifier nobody has
+/// configured still has a requested configuration, and this floor is it. It sits inside
+/// the model's `FunctionScalingConfigExecutionEnvironments` range (`0..15000`), and no
+/// maximum goes with it, because nothing caps the function until a caller asks for a cap.
+pub const DEFAULT_MIN_EXECUTION_ENVIRONMENTS: i32 = 3;
+
+/// The scaling configuration a Managed Instances function's qualifier carries until a
+/// `PutFunctionScalingConfig` call stores one of its own: the service-managed floor of
+/// [`DEFAULT_MIN_EXECUTION_ENVIRONMENTS`] environments, with no maximum.
+#[must_use]
+pub fn service_managed_function_scaling_config() -> FunctionScalingConfig {
+    FunctionScalingConfig {
+        min_execution_environments: Some(DEFAULT_MIN_EXECUTION_ENVIRONMENTS),
+        max_execution_environments: None,
+    }
+}
+
 /// The scaling configuration of one qualifier of a function: the execution-environment
 /// bounds a `PutFunctionScalingConfig` call asked for, and the bounds in effect.
 ///
@@ -2237,6 +2262,55 @@ impl FunctionRecord {
             return self.arn.clone();
         }
         self.versioned_arn(published_qualifier)
+    }
+
+    /// The configuration the qualifier a `PublishedFunctionQualifier` names holds:
+    /// [`VERSION_LATEST_PUBLISHED`] is the published view of the unpublished
+    /// configuration, and a number names the configuration that version froze.
+    ///
+    /// Read it only through a qualifier [`Self::published_qualifier`] resolved, which is
+    /// what establishes that the qualifier exists at all.
+    #[must_use]
+    pub fn published_qualifier_config(&self, published_qualifier: &str) -> Option<&FunctionConfig> {
+        if published_qualifier == VERSION_LATEST_PUBLISHED {
+            return Some(&self.config);
+        }
+        self.config_of(published_qualifier)
+    }
+
+    /// What a read of one qualifier's scaling configuration reports, built entirely out of
+    /// what is stored.
+    ///
+    /// A qualifier a `PutFunctionScalingConfig` call has set bounds on reports that record
+    /// ([`FunctionScalingConfigRecord::reported`]). A qualifier nobody has configured
+    /// reports the configuration the SERVICE manages for it: a Managed Instances function
+    /// — one whose configuration names a capacity provider — is scaled by the service from
+    /// the moment it exists, so its requested configuration is
+    /// [`service_managed_function_scaling_config`], while a function that runs on no
+    /// capacity provider has no scaling configuration of any kind and none is invented for
+    /// it. Neither reports an APPLIED configuration before one is in effect.
+    ///
+    /// Read it only after [`Self::materialize`], so bounds the clock has already applied
+    /// are not reported as still only requested.
+    #[must_use]
+    pub fn reported_function_scaling_config(
+        &self,
+        published_qualifier: &str,
+    ) -> GetFunctionScalingConfigOutput {
+        let function_arn = self.published_qualifier_arn(published_qualifier);
+        if let Some(stored) = self.function_scaling_configs.get(published_qualifier) {
+            return stored.reported(function_arn);
+        }
+        let service_managed = self
+            .published_qualifier_config(published_qualifier)
+            .and_then(configured_capacity_provider)
+            .is_some();
+        GetFunctionScalingConfigOutput {
+            function_arn: Some(function_arn),
+            applied_function_scaling_config: None,
+            requested_function_scaling_config: service_managed
+                .then(service_managed_function_scaling_config),
+        }
     }
 
     /// The configuration of `version`, or `None` when this function has no such

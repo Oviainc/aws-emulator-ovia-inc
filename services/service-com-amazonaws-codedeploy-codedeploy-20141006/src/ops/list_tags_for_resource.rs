@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the tags carried by the CodeDeploy resource a `ResourceArn` names.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting operation: it reads the tags off the resource's own record and
+//! writes nothing. The ARN is read as the resource it identifies by the same
+//! rule the tagging operations use, so a value that is not in the ARN format is
+//! the modelled `InvalidArnException` and an ARN naming something these
+//! operations do not act on is `ArnNotSupportedException`. The operation models
+//! no "does not exist" error, so a well-formed ARN whose resource the store does
+//! not hold carries no tags and is reported as an empty list.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +113,28 @@ impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     }
 }
 
+/// The modelled refusal of a `ResourceArn` this service cannot read as one of
+/// the resources it tags; see [`crate::state::parse_tagged_resource_arn`].
+fn arn_refused(
+    resource_arn: &str,
+    refusal: crate::state::ArnRefusal,
+) -> ListTagsForResourceErrorModeled {
+    match refusal {
+        crate::state::ArnRefusal::Malformed => {
+            ListTagsForResourceErrorModeled::InvalidArnException(InvalidArnException {
+                message: Some(crate::state::malformed_resource_arn_message(resource_arn)),
+            })
+        }
+        crate::state::ArnRefusal::Unsupported => {
+            ListTagsForResourceErrorModeled::ArnNotSupportedException(ArnNotSupportedException {
+                message: Some(crate::state::resource_arn_not_supported_message(
+                    resource_arn,
+                )),
+            })
+        }
+    }
+}
+
 /// The `ListTagsForResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,18 +171,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        // `ResourceArn` is @required with a modelled length, so an absent or
+        // empty one was already refused at the boundary in
+        // `ResourceArnRequiredException`'s words.
+        let resource_arn = input.resource_arn;
+        let resource = crate::state::parse_tagged_resource_arn(&resource_arn)
+            .map_err(|refusal| arn_refused(&resource_arn, refusal))?;
+        let token = input.next_token;
+
+        let page = crate::state::with_state(&*self.engine, |state| {
+            // A resource the store does not hold carries no tags; see the module
+            // doc for why that is a listing and not a refusal.
+            let tags = state.tags_of(&resource).unwrap_or_default().to_vec();
+            // The listing is keyed on the tag KEYS, which identify a resource's
+            // tags uniquely, so a continuation resumes after the last key
+            // returned rather than at an offset that a later tagging call would
+            // shift.
+            let keys: Vec<String> = tags
+                .iter()
+                .filter_map(|tag| tag.key.clone())
+                .collect();
+            crate::state::paginate(&keys, token.as_deref()).map(|(page, next)| {
+                let page: Vec<crate::ops::types::Tag> = tags
+                    .iter()
+                    .filter(|tag| {
+                        tag.key
+                            .as_ref()
+                            .is_some_and(|key| page.contains(key))
+                    })
+                    .cloned()
+                    .collect();
+                (page, next)
+            })
+        })
+        .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE))?
+        // A resource holds fewer tags than one page carries, so this listing
+        // never hands out a continuation token: one presented here names no tag
+        // of this resource, and the operation models no error for it.
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(
+                "The next token was specified in an invalid format",
+            )
+        })?;
+
+        let (tags, next_token) = page;
+        Ok(ListTagsForResourceOutput {
+            // The tags a resource carries are reported as the list it HOLDS,
+            // empty included, so an untagged resource and one whose tags were all
+            // removed read back the same way.
+            tags: Some(tags),
+            next_token,
+        })
     }
 }

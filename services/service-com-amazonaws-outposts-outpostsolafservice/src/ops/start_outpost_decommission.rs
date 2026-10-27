@@ -184,14 +184,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved — one region's endpoint cannot decommission another region's
         // Outpost.
         let region = crate::state::request_region(ctx.parts());
-        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
-        // the same stored Outpost.
-        let outpost_id =
-            crate::state::resolve_outpost_id(&input.outpost_identifier).ok_or_else(|| {
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN. A bare id
+        // names an Outpost of the inventory this endpoint serves; an ARN carries a
+        // partition, a Region and an account of its own, and one that is not this
+        // endpoint's names no Outpost it holds — so there is no Outpost here to
+        // decommission.
+        let not_found = || {
+            StartOutpostDecommissionErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                    &input.outpost_identifier,
+                )),
+            })
+        };
+        let outpost_id = crate::state::resolve_outpost_id(&input.outpost_identifier, &region)
+            .ok_or_else(|| {
                 StartOutpostDecommissionErrorModeled::ValidationException(ValidationException {
                     message: Some(crate::state::outpost_identifier_pattern_report()),
                 })
-            })?;
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
+
 
         let mut store = state.lock();
         // Only the quote and order statuses matter to this call, and each moves on
@@ -209,15 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved to. Judged before anything else is looked at, so an identifier
         // that names nothing costs nothing.
         if store.outpost(&region, &outpost_id).is_none() {
-            return Err(StartOutpostDecommissionErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(crate::state::identifier_not_found(
-                        crate::state::OUTPOST_IDENTIFIER_MEMBER,
-                        &input.outpost_identifier,
-                    )),
-                },
-            )
-            .into());
+            return Err(not_found().into());
         }
 
         // Something still associated with the Outpost stops the decommission from

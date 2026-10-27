@@ -202,7 +202,7 @@ use crate::ops::types::{
     SchemaChangePolicy, SchemaColumn, SchemaId, SecurityConfiguration, SourceControlDetails,
     StartColumnStatisticsTaskRunInput,
     StartDataQualityRuleRecommendationRunInput,
-    StartJobRunInput, StartWorkflowRunInput, StorageDescriptor, Table, TableIdentifier, TableInput,
+    StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput,
     TableVersion,
     TransformEncryption, TransformFilterCriteria, TransformParameters, TransformSortCriteria,
     Trigger, TriggerNodeDetails,
@@ -1528,6 +1528,15 @@ impl ComAmazonawsGlueAwsglueState {
         self.triggers
             .get(region)
             .and_then(|triggers| triggers.get(name))
+    }
+
+    /// [`Self::trigger`] mutably: where every write to a stored trigger lands, so the
+    /// operations that start, stop and update a trigger reach the one record its reads
+    /// report rather than a copy of it.
+    pub fn trigger_mut(&mut self, region: &str, name: &str) -> Option<&mut TriggerEntry> {
+        self.triggers
+            .get_mut(region)
+            .and_then(|triggers| triggers.get_mut(name))
     }
 
     /// Store `entry` as the Region `region`'s trigger under its own name.
@@ -7723,6 +7732,46 @@ impl WorkflowEntry {
         self.runs.iter().filter(|run| !run.is_terminal()).count()
     }
 
+    /// Begin a run of this workflow at `now` and answer the id minted for it, or the
+    /// concurrency ceiling the run would have exceeded.
+    ///
+    /// The ONE place a run of a workflow is recorded, whatever began it: a caller's
+    /// `StartWorkflowRun`, or a trigger of this workflow that fired. Everything the clock
+    /// already owed this workflow's runs is materialised first, so a run the clock has
+    /// already finished does not count as one in flight, and the ceiling the workflow named
+    /// is then what decides whether another run may begin.
+    ///
+    /// `requested_properties` are the run properties the caller asked this run to carry,
+    /// and `None` for a run nobody passed any for — a trigger firing passes none, so such a
+    /// run carries the workflow's own defaults. `total_actions` is how many actions the
+    /// entry point that began the run initiates.
+    pub fn begin_run(
+        &mut self,
+        requested_properties: Option<&HashMap<String, String>>,
+        now: SystemTime,
+        total_actions: i32,
+    ) -> Result<String, i32> {
+        self.settle_due_runs(now);
+        // "You can use this parameter to prevent unwanted multiple updates to data … If you
+        // leave this parameter blank, there is no limit to the number of concurrent workflow
+        // runs": past a ceiling the workflow named, no further run begins.
+        if let Some(ceiling) = self.concurrent_run_ceiling() {
+            if self.runs_in_flight() >= usize::try_from(ceiling).unwrap_or(usize::MAX) {
+                return Err(ceiling);
+            }
+        }
+        let run_id = new_workflow_run_id();
+        let run = WorkflowRunEntry::begin(
+            self,
+            requested_properties,
+            run_id.clone(),
+            now,
+            total_actions,
+        );
+        self.record_run(run);
+        Ok(run_id)
+    }
+
     /// Append a run, keeping at most [`MAX_RUNS_PER_WORKFLOW`] of them.
     pub fn record_run(&mut self, run: WorkflowRunEntry) {
         self.runs.push(run);
@@ -7870,15 +7919,16 @@ pub struct WorkflowRunEntry {
 }
 
 impl WorkflowRunEntry {
-    /// Record a run of `workflow` as the `StartWorkflowRun` request asks for it, in
-    /// [`WORKFLOW_RUN_STATUS_RUNNING`] with its next status due
-    /// [`WORKFLOW_RUN_SETTLES_AFTER`] out.
+    /// Record a run of `workflow` whatever began it — a caller's `StartWorkflowRun`, or a
+    /// trigger of the workflow that fired — in [`WORKFLOW_RUN_STATUS_RUNNING`] with its
+    /// next status due [`WORKFLOW_RUN_SETTLES_AFTER`] out.
     ///
-    /// `total_actions` is how many actions the trigger that began this run initiates, which
-    /// is the run's total action count.
-    pub fn start(
+    /// `requested_properties` are the run properties asked for this run, and `None` when
+    /// nothing asked for any. `total_actions` is how many actions the entry point that
+    /// began this run initiates, which is the run's total action count.
+    pub fn begin(
         workflow: &WorkflowEntry,
-        input: &StartWorkflowRunInput,
+        requested_properties: Option<&HashMap<String, String>>,
         id: String,
         now: SystemTime,
         total_actions: i32,
@@ -7888,7 +7938,7 @@ impl WorkflowRunEntry {
         // for the new workflow run" (`StartWorkflowRunRequest$RunProperties`) are this
         // run's own, so they win where both name a key.
         let mut run_properties = workflow.default_run_properties.clone().unwrap_or_default();
-        if let Some(requested) = input.run_properties.as_ref() {
+        if let Some(requested) = requested_properties {
             run_properties.extend(
                 requested
                     .iter()
