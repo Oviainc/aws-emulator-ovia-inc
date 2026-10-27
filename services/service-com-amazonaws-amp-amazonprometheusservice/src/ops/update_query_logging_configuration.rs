@@ -195,9 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `clientToken` carries `@idempotencyToken`: replaying the very call that last
-        // changed this configuration is that same call, so it answers from the stored
-        // record instead of applying the change twice (and restarting its span).
-        if input.client_token.is_some() && configuration.client_token == input.client_token {
+        // UPDATED this configuration is that same call, so it answers from the stored
+        // record instead of applying the change twice (and restarting its span). Only
+        // this operation's own token speaks for that call — a token some other
+        // operation recorded names a request this one never carried out, so it is a new
+        // update here.
+        if input.client_token.is_some() && configuration.update_token == input.client_token {
             return Ok(UpdateQueryLoggingConfigurationOutput {
                 status: crate::state::query_logging_status(configuration),
             });
@@ -230,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         configuration.status_reason = None;
         configuration.modified_at = now;
         configuration.transition_due = Some(now + crate::state::TRANSITION_DELAY);
-        configuration.client_token = input.client_token;
+        configuration.update_token = input.client_token;
 
         Ok(UpdateQueryLoggingConfigurationOutput {
             status: crate::state::query_logging_status(configuration),

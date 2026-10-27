@@ -212,14 +212,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clientToken` carries `@idempotencyToken`: re-sending the very call that
         // started the pending deletion is that same call, so it is accepted again
-        // without restarting the span the removal is owed at. A deletion already under
-        // way is likewise left alone.
+        // without restarting the span the removal is owed at — whatever token it
+        // carries, since the record's own `DELETING` status is that evidence. A deletion
+        // already under way is likewise left alone.
         if configuration.status_code != crate::state::QUERY_LOGGING_STATUS_DELETING {
             configuration.status_code = crate::state::QUERY_LOGGING_STATUS_DELETING.to_string();
             configuration.status_reason = None;
             configuration.modified_at = now;
             configuration.transition_due = Some(now + crate::state::TRANSITION_DELAY);
-            configuration.client_token = input.client_token;
+            // The stored update token stood for the update that made this record what it
+            // is; it does not speak for a record on its way out, so a later call
+            // carrying it is a new request against a configuration that is being
+            // deleted.
+            configuration.update_token = None;
         }
 
         Ok(DeleteQueryLoggingConfigurationOutput)
