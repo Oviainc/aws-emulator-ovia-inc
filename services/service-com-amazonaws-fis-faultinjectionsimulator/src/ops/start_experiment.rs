@@ -14,6 +14,14 @@
 //! The move to `running`, the span the run lasts and the terminal status it earns after it
 //! are owed to the clock rather than to this call, so a caller reading the experiment
 //! immediately still sees it initiating; see [`crate::state::ExperimentRecord::settle`].
+//!
+//! A request whose `@idempotencyToken` already started an experiment REPORTS that
+//! experiment and starts nothing, so it is a READ of it: every write the clock owes that
+//! experiment is materialised before it is reported — the settle, and the report
+//! generation an ENDED experiment that configured one owes
+//! ([`crate::state::materialise_experiment_report`]) — so this replay and a
+//! `GetExperiment` at the same instant report the same status and the same
+//! `experimentReport`.
 //! What this call decides about the run is what the account's IAM store SHOWS about it:
 //! whether the template's role lets FIS assume it (a start it could never carry out is
 //! refused), and whether that role is allowed to perform the API calls the actions this run
@@ -154,6 +162,28 @@ impl<Eng> StartExperiment<Eng> {
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<Eng> {
+    /// The experiment this request's `@idempotencyToken` has ALREADY started, when the
+    /// request is a retry of the call that started it, and `None` for a token this store
+    /// has not spent on a live experiment — which includes a token reused for a DIFFERENT
+    /// request, refused as a conflict under the start's own guard rather than here.
+    ///
+    /// A reporting-only pass over the store, asked BEFORE that guard is taken: the writes
+    /// the clock owes the replayed experiment take the store lock themselves, so the id
+    /// they need has to be resolved with no guard held.
+    fn replayed_experiment_id(&self, input: &StartExperimentInput) -> Option<String> {
+        let store = crate::state::service_state(&*self.engine)?;
+        let store = store.lock();
+        let fingerprint = crate::state::start_experiment_fingerprint(input);
+        match store.replayed(
+            crate::state::IdempotentResource::Experiment,
+            &input.client_token,
+            &fingerprint,
+        ) {
+            crate::state::TokenReplay::Replay(id) => Some(id),
+            crate::state::TokenReplay::Mismatch | crate::state::TokenReplay::Fresh => None,
+        }
+    }
+
     /// Everything this start does to the STORE, under ONE guard that this call takes and
     /// releases: the settle, the idempotency check, the template lookup, the role checks,
     /// the quotas and the experiment this start persists.
@@ -200,6 +230,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
         ) {
             crate::state::TokenReplay::Replay(id) => {
                 if let Some(record) = store.experiments.get(&id) {
+                    // Reported with every write the clock owed it materialised: the settle
+                    // above, and the report generation `handle` materialised before taking
+                    // this guard.
                     let experiment = record.to_experiment();
                     // A replay starts nothing, so it produces no record of its own; what
                     // the settle above materialised is still delivered.
@@ -390,6 +423,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+
+        // A replay of a token that already started an experiment reports THAT experiment,
+        // so the report generation the clock owes it is materialised first: the generation
+        // was due at `now` whether or not anybody called, so this replay reports the same
+        // report state as any other read of the experiment at this instant, and the report
+        // object is written to the configured output just the same. It takes the store lock
+        // itself and holds it across no call, so it runs before the start below takes its
+        // guard; a token that started nothing owes nothing, and a start that mints a new
+        // experiment has not ended, so neither reaches it.
+        if let Some(id) = self.replayed_experiment_id(&input) {
+            crate::state::materialise_experiment_report(&*self.engine, ctx, &region, &id, now)
+                .await;
+        }
+
         let (experiment, deliveries) =
             self.start_under_guard(&input, &actions_mode, &region, now)?;
 

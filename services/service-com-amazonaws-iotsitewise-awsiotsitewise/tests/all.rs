@@ -311,6 +311,12 @@ mod list_dashboards;
 mod list_datasets;
 #[path = "all/list_pipelines.rs"]
 mod list_pipelines;
+// In its alphabetical place inside the sorted list rather than appended after it:
+// the END of this file is where every concurrent iotsitewise change appends a
+// declaration of its own, and two appends there lost the squash race with this
+// one.
+#[path = "all/list_searches.rs"]
+mod list_searches;
 #[path = "all/logging_options.rs"]
 mod logging_options;
 // In the sorted list, in its alphabetical place beside the other portal suite,

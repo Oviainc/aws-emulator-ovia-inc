@@ -73,20 +73,20 @@ const TERMINAL_BUDGET: Duration = Duration::from_secs(25);
 
 /// A role ARN the emulator's IAM store holds no role for, so nothing about its trust policy
 /// or its permissions refuses or fails a run here.
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/fis-report";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/fis-report";
 
 /// The bucket every row that expects its report to be WRITTEN names, created in S3 before
 /// the rows run.
-const BUCKET: &str = "fis-reports";
+pub(crate) const BUCKET: &str = "fis-reports";
 
 /// The name the report object carries under `<prefix>/<experimentId>/`, spelled out here so
 /// a changed key fails this suite.
-const REPORT_OBJECT_NAME: &str = "experiment-report.json";
+pub(crate) const REPORT_OBJECT_NAME: &str = "experiment-report.json";
 
 /// One emulator carrying FIS *and* S3 over one shared engine — what the assembled emulator
 /// does. The report of an ended experiment is written by calling S3 in process, so a suite
 /// that asserts the written report needs object storage answering.
-fn emulator_with_object_storage() -> MultiServiceRouter {
+pub(crate) fn emulator_with_object_storage() -> MultiServiceRouter {
     let engine: std::sync::Arc<engine::InMemoryEngine> =
         std::sync::Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -101,7 +101,7 @@ fn emulator_with_object_storage() -> MultiServiceRouter {
 /// Send one path-style request to the emulator's S3 front door. S3 is a REST service: the
 /// bucket and key live in the URI and the body is the object's own bytes, and the credential
 /// scope names `s3`, which is what the router claims on.
-async fn s3(router: &MultiServiceRouter, method: &str, path: &str) -> (u16, Vec<u8>) {
+pub(crate) async fn s3(router: &MultiServiceRouter, method: &str, path: &str) -> (u16, Vec<u8>) {
     let request = ::http::Request::builder()
         .method(method)
         .uri(path)
@@ -124,7 +124,7 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str) -> (u16, Vec<
 
 /// How a row's run ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ending {
+pub(crate) enum Ending {
     /// The actions elapse on the emulator's compressed run clock: `completed`.
     Elapses,
     /// `StopExperiment` is called on it: `stopping` -> `stopped`.
@@ -136,7 +136,7 @@ enum Ending {
 
 impl Ending {
     /// The terminal `state.status` this ending reaches.
-    fn terminal(self) -> &'static str {
+    pub(crate) fn terminal(self) -> &'static str {
         match self {
             Self::Elapses => "completed",
             Self::Stopped => "stopped",
@@ -145,7 +145,7 @@ impl Ending {
     }
 
     /// The `targets` a template needs for this ending.
-    fn targets(self) -> Value {
+    pub(crate) fn targets(self) -> Value {
         match self {
             // A target identified by TAG: this emulator holds no other service's resources
             // to resolve a tag against, so it resolves to nothing, which the documented
@@ -162,7 +162,7 @@ impl Ending {
     }
 
     /// The `actions` a template needs for this ending.
-    fn actions(self) -> Value {
+    pub(crate) fn actions(self) -> Value {
         match self {
             Self::EmptyTargetResolution => json!({
                 "stopInstances": {
@@ -181,7 +181,7 @@ impl Ending {
 }
 
 /// Create a template for `case` with `extra` merged over the base body, and return its id.
-async fn template_for(
+pub(crate) async fn template_for(
     router: &MultiServiceRouter,
     case: &str,
     ending: Ending,
@@ -211,7 +211,11 @@ async fn template_for(
 }
 
 /// Start an experiment from `template_id` and return the answer.
-async fn start_from(router: &MultiServiceRouter, case: &str, template_id: &str) -> Answer {
+pub(crate) async fn start_from(
+    router: &MultiServiceRouter,
+    case: &str,
+    template_id: &str,
+) -> Answer {
     let started = start_experiment(
         router,
         json!({

@@ -729,3 +729,156 @@ async fn the_modelled_refusals() {
         keyless.error_type
     );
 }
+
+/// A `JobsQueryFilter` is a key-value pair — "each containing a Key with an associated
+/// Values array" — so a filter that states only one half of it describes nothing to match
+/// and is refused, whichever half is missing: it is never dropped, which would WIDEN the
+/// query it was sent to narrow.
+///
+/// The table spans both halves, both forms the missing half comes in (absent, and an
+/// empty list), several keys of the `JobsQueryFilterKey` catalogue
+/// (`smithy_query(query="shape",shape="JobsQueryFilterKey")`) and both positions in a
+/// filter list that also holds a well-formed filter. The accepted rows below it pin the
+/// boundary: a filter list that names NO filter at all still narrows nothing, and a
+/// well-formed filter still narrows.
+#[tokio::test]
+async fn a_filter_must_carry_both_a_key_and_a_value_to_match_on() {
+    let emulator = Emulator::new();
+    pin_query_span(&emulator, SHORT_QUERY);
+    let jobs = seed_jobs(&emulator).await;
+
+    // The case, the request body, and the member the filter leaves out — the one the
+    // refusal has to name.
+    let refusals: Vec<(&str, Value, &str)> = vec![
+        (
+            "values, no key",
+            json!({ "filterList": [{ "values": ["alpha"] }] }),
+            "Key",
+        ),
+        (
+            "neither half",
+            json!({ "filterList": [{}] }),
+            "Key",
+        ),
+        (
+            "empty values, no key",
+            json!({ "filterList": [{ "values": [] }] }),
+            "Key",
+        ),
+        (
+            "key status, values absent",
+            json!({ "filterList": [{ "key": "status" }] }),
+            "Values",
+        ),
+        (
+            "key status, values empty",
+            json!({ "filterList": [{ "key": "status", "values": [] }] }),
+            "Values",
+        ),
+        (
+            "key queue, values absent",
+            json!({ "filterList": [{ "key": "queue" }] }),
+            "Values",
+        ),
+        (
+            "key errorCode, values empty",
+            json!({ "filterList": [{ "key": "errorCode", "values": [] }] }),
+            "Values",
+        ),
+        (
+            "key audioCodec, values absent",
+            json!({ "filterList": [{ "key": "audioCodec" }] }),
+            "Values",
+        ),
+        (
+            "valueless filter after a well-formed one",
+            json!({ "filterList": [
+                { "key": "status", "values": ["SUBMITTED"] },
+                { "key": "videoCodec" }
+            ] }),
+            "Values",
+        ),
+        (
+            "valueless filter before a well-formed one",
+            json!({ "filterList": [
+                { "key": "jobEngineVersionUsed", "values": [] },
+                { "key": "queue", "values": ["alpha"] }
+            ] }),
+            "Values",
+        ),
+    ];
+
+    for (case, body, member) in refusals {
+        let refused = start_query(&emulator, body.clone()).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400 for body {body}, got {} with body {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_type.as_deref(),
+            Some("BadRequestException"),
+            "case {case:?}: expected BadRequestException, got {:?}",
+            refused.error_type
+        );
+        let message = refused.string("/message");
+        assert!(
+            message.contains(member) && message.contains("filterList"),
+            "case {case:?}: the refusal must name the missing member {member:?} and the \
+             member it is in, got {message:?}"
+        );
+        assert!(
+            refused.at("/id").is_null(),
+            "case {case:?}: a refused query must answer no id, got {}",
+            refused.body
+        );
+    }
+
+    // None of those refusals started a query: a request refused for its filter list is
+    // not stored at all.
+    assert!(
+        emulator
+            .engine
+            .state::<ComAmazonawsMediaconvertMediaconvertState>()
+            .lock()
+            .jobs_queries
+            .is_empty(),
+        "a refused StartJobsQuery must store no query"
+    );
+
+    // The boundary: a filter list naming no filter narrows nothing, and a filter carrying
+    // both halves narrows to exactly what it names.
+    let accepted: Vec<(&str, Value, Vec<&String>)> = vec![
+        (
+            "no filter list",
+            json!({}),
+            vec![&jobs.alpha, &jobs.beta, &jobs.gamma],
+        ),
+        (
+            "empty filter list",
+            json!({ "filterList": [] }),
+            vec![&jobs.alpha, &jobs.beta, &jobs.gamma],
+        ),
+        (
+            "key queue with a value",
+            json!({ "filterList": [{ "key": "queue", "values": ["alpha"] }] }),
+            vec![&jobs.alpha, &jobs.gamma],
+        ),
+        (
+            "key status with a value no job is in",
+            json!({ "filterList": [{ "key": "status", "values": ["PROGRESSING"] }] }),
+            vec![],
+        ),
+    ];
+
+    for (case, body, expected) in accepted {
+        let results = run_query(&emulator, body).await;
+        let actual: BTreeSet<String> = result_ids(&results).into_iter().collect();
+        let expected: BTreeSet<String> = expected.into_iter().cloned().collect();
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected the jobs {expected:?}, got {actual:?} from body {}",
+            results.body
+        );
+    }
+}

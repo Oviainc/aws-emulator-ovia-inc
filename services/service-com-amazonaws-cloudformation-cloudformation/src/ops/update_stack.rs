@@ -423,7 +423,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let not_found = || {
                 crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::stack_does_not_exist(&input.stack_name),
+                    crate::state::changed_stack_does_not_exist(&input.stack_name),
                 )
             };
             let previous = store
@@ -652,7 +652,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|stack| stack.is_live())
                 .ok_or_else(|| {
                     crate::scaffolded::Scaffolded::validation_error(
-                        crate::state::stack_does_not_exist(&input.stack_name),
+                        crate::state::changed_stack_does_not_exist(&input.stack_name),
                     )
                 })?;
             // Re-asserted under the WRITING lock, like the preconditions below: between
@@ -840,8 +840,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let failed_at = ::std::time::SystemTime::now();
                     stack.fail_transition(failed_at, status::UPDATE_FAILED, failure.clone());
                     // Nothing to put back, or a caller that asked for the failed state to be
-                    // kept (`DisableRollback`), which says what it wants left behind.
+                    // kept (`DisableRollback`), which says what it wants left behind. The
+                    // plan is HELD in the second case: `RollbackStack` is the call that
+                    // clears such a stack up, and this is the only record of what the failed
+                    // update changed in the owning services.
                     if !applied_a_change || stack.disable_rollback {
+                        stack.hold_rollback_plan(applied_a_change.then(|| {
+                            crate::state::OwedRollback {
+                                previous: previous_resources.clone(),
+                                applied: materialised.resources.clone(),
+                            }
+                        }));
                         None
                     } else {
                         stack.begin_update_rollback(failed_at, failure);

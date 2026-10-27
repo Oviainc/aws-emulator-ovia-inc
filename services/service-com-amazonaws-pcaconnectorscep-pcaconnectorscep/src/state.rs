@@ -333,9 +333,10 @@ impl StoredConnector {
         self.status == STATUS_DELETING
     }
 
-    /// The modelled `Connector`, as `GetConnector` returns it.
-    pub fn to_connector(&self) -> Connector {
-        Connector {
+    /// The modelled `ConnectorSummary`, as `ListConnectors` returns it. This is the ONE place
+    /// the stored record is projected onto the connector output shapes.
+    pub fn to_summary(&self) -> ConnectorSummary {
+        ConnectorSummary {
             arn: Some(self.arn.clone()),
             certificate_authority_arn: Some(self.certificate_authority_arn.clone()),
             r#type: Some(self.connector_type.clone()),
@@ -349,20 +350,23 @@ impl StoredConnector {
         }
     }
 
-    /// The modelled `ConnectorSummary`, as `ListConnectors` returns it. It carries the same
-    /// members as `Connector`, so a listing and a get cannot disagree.
-    pub fn to_summary(&self) -> ConnectorSummary {
-        ConnectorSummary {
-            arn: Some(self.arn.clone()),
-            certificate_authority_arn: Some(self.certificate_authority_arn.clone()),
-            r#type: Some(self.connector_type.clone()),
-            mobile_device_management: self.mobile_device_management.clone(),
-            open_id_configuration: self.open_id_configuration.clone(),
-            status: Some(self.status.clone()),
-            status_reason: self.status_reason.clone(),
-            endpoint: Some(self.endpoint.clone()),
-            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
-            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+    /// The modelled `Connector`, as `GetConnector` returns it. Its members are the same ten
+    /// `ConnectorSummary` carries, so it is built FROM [`Self::to_summary`] rather than
+    /// re-listing them: the single read and the listing report one record identically, and a
+    /// member newly reported or newly derived reaches both at once.
+    pub fn to_connector(&self) -> Connector {
+        let summary = self.to_summary();
+        Connector {
+            arn: summary.arn,
+            certificate_authority_arn: summary.certificate_authority_arn,
+            r#type: summary.r#type,
+            mobile_device_management: summary.mobile_device_management,
+            open_id_configuration: summary.open_id_configuration,
+            status: summary.status,
+            status_reason: summary.status_reason,
+            endpoint: summary.endpoint,
+            created_at: summary.created_at,
+            updated_at: summary.updated_at,
         }
     }
 }

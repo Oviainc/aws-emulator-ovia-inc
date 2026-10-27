@@ -608,7 +608,14 @@ pub struct S3RecordingSinkRuntimeConfiguration {
     pub recording_file_format: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipeline")]
+// `MediaInsightsPipeline`'s schema is written out by hand for the reason the note on
+// `MediaCapturePipeline` states: the model targets `CreatedTimestamp` at
+// `Iso8601Timestamp`, which carries `@timestampFormat("date-time")`
+// (`smithy_query(query="shape", shape="MediaInsightsPipeline")`), and the derive does not
+// carry that trait onto the member schema, so a derived shape renders the protocol default
+// of epoch seconds — a JSON number no SDK built from this model can read into the modelled
+// `date-time`. The three blocks share `member_schema` below; all of them go away with the
+// one core-library change filed in the issue the `MediaCapturePipeline` note names.
 #[derive(Debug, Clone, Default)]
 pub struct MediaInsightsPipeline {
     pub media_pipeline_id: Option<String>,
@@ -621,6 +628,209 @@ pub struct MediaInsightsPipeline {
     pub s3_recording_sink_runtime_configuration: Option<S3RecordingSinkRuntimeConfiguration>,
     pub created_timestamp: Option<::aws_smithy_types::DateTime>,
     pub element_statuses: Option<Vec<MediaInsightsPipelineElementStatus>>,
+}
+
+impl MediaInsightsPipeline {
+    // Associated member-schema consts, in the model's member order.
+    const M_MEDIA_PIPELINE_ID: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipeline$MediaPipelineId",
+        "MediaPipelineId",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    const M_MEDIA_PIPELINE_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipeline$MediaPipelineArn",
+        "MediaPipelineArn",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    const M_CONFIGURATION_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipeline$MediaInsightsPipelineConfigurationArn",
+        "MediaInsightsPipelineConfigurationArn",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    const M_STATUS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipeline$Status",
+        "Status",
+        ::aws_smithy_schema::ShapeType::String,
+        3,
+    );
+    const M_SOURCE_RUNTIME_CONFIGURATION: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipeline$KinesisVideoStreamSourceRuntimeConfiguration",
+        "KinesisVideoStreamSourceRuntimeConfiguration",
+        ::aws_smithy_schema::ShapeType::Structure,
+        4,
+    );
+    const M_RUNTIME_METADATA: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipeline$MediaInsightsRuntimeMetadata",
+        "MediaInsightsRuntimeMetadata",
+        ::aws_smithy_schema::ShapeType::Map,
+        5,
+    );
+    const M_RECORDING_SOURCE_RUNTIME_CONFIGURATION: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipeline$KinesisVideoStreamRecordingSourceRuntimeConfiguration",
+        "KinesisVideoStreamRecordingSourceRuntimeConfiguration",
+        ::aws_smithy_schema::ShapeType::Structure,
+        6,
+    );
+    const M_S3_RECORDING_SINK_RUNTIME_CONFIGURATION: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipeline$S3RecordingSinkRuntimeConfiguration",
+        "S3RecordingSinkRuntimeConfiguration",
+        ::aws_smithy_schema::ShapeType::Structure,
+        7,
+    );
+    /// `@timestampFormat("date-time")`, from the `Iso8601Timestamp` shape this member
+    /// targets. THE reason this schema is hand-written.
+    const M_CREATED_TIMESTAMP: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipeline$CreatedTimestamp",
+        "CreatedTimestamp",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        8,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    const M_ELEMENT_STATUSES: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipeline$ElementStatuses",
+        "ElementStatuses",
+        ::aws_smithy_schema::ShapeType::List,
+        9,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipeline",
+            "com.amazonaws.chimesdkmediapipelines",
+            "MediaInsightsPipeline",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_MEDIA_PIPELINE_ID,
+            &Self::M_MEDIA_PIPELINE_ARN,
+            &Self::M_CONFIGURATION_ARN,
+            &Self::M_STATUS,
+            &Self::M_SOURCE_RUNTIME_CONFIGURATION,
+            &Self::M_RUNTIME_METADATA,
+            &Self::M_RECORDING_SOURCE_RUNTIME_CONFIGURATION,
+            &Self::M_S3_RECORDING_SINK_RUNTIME_CONFIGURATION,
+            &Self::M_CREATED_TIMESTAMP,
+            &Self::M_ELEMENT_STATUSES,
+        ],
+    );
+}
+
+pub static MEDIA_INSIGHTS_PIPELINE_SCHEMA: &::aws_smithy_schema::Schema =
+    &MediaInsightsPipeline::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for MediaInsightsPipeline {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.media_pipeline_id.as_ref() {
+            s.write_string(&Self::M_MEDIA_PIPELINE_ID, v.as_str())?;
+        }
+        if let Some(v) = self.media_pipeline_arn.as_ref() {
+            s.write_string(&Self::M_MEDIA_PIPELINE_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.media_insights_pipeline_configuration_arn.as_ref() {
+            s.write_string(&Self::M_CONFIGURATION_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.kinesis_video_stream_source_runtime_configuration.as_ref() {
+            s.write_struct(&Self::M_SOURCE_RUNTIME_CONFIGURATION, v)?;
+        }
+        if let Some(v) = self.media_insights_runtime_metadata.as_ref() {
+            s.write_map(&Self::M_RUNTIME_METADATA, &|entries| {
+                for (key, value) in v.iter() {
+                    entries.write_string(&Self::M_RUNTIME_METADATA, key.as_str())?;
+                    entries.write_string(&Self::M_RUNTIME_METADATA, value.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self
+            .kinesis_video_stream_recording_source_runtime_configuration
+            .as_ref()
+        {
+            s.write_struct(&Self::M_RECORDING_SOURCE_RUNTIME_CONFIGURATION, v)?;
+        }
+        if let Some(v) = self.s3_recording_sink_runtime_configuration.as_ref() {
+            s.write_struct(&Self::M_S3_RECORDING_SINK_RUNTIME_CONFIGURATION, v)?;
+        }
+        if let Some(v) = self.created_timestamp.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_TIMESTAMP, v)?;
+        }
+        if let Some(v) = self.element_statuses.as_ref() {
+            s.write_list(&Self::M_ELEMENT_STATUSES, &|statuses| {
+                for status in v.iter() {
+                    // A list of structures writes each element against the ELEMENT
+                    // shape's own schema, as the generator does.
+                    statuses.write_struct(&MediaInsightsPipelineElementStatus::SCHEMA, status)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for MediaInsightsPipeline {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.media_pipeline_id = Some(d.read_string(member)?),
+                Some(1) => out.media_pipeline_arn = Some(d.read_string(member)?),
+                Some(2) => {
+                    out.media_insights_pipeline_configuration_arn = Some(d.read_string(member)?)
+                }
+                Some(3) => out.status = Some(d.read_string(member)?),
+                Some(4) => {
+                    out.kinesis_video_stream_source_runtime_configuration = Some(
+                        <KinesisVideoStreamSourceRuntimeConfiguration as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    )
+                }
+                Some(5) => {
+                    let mut entries: std::collections::HashMap<String, String> =
+                        ::std::default::Default::default();
+                    d.read_map(member, &mut |key, dm| {
+                        let value = dm.read_string(member)?;
+                        entries.insert(key, value);
+                        Ok(())
+                    })?;
+                    out.media_insights_runtime_metadata = Some(entries);
+                }
+                Some(6) => {
+                    out.kinesis_video_stream_recording_source_runtime_configuration = Some(
+                        <KinesisVideoStreamRecordingSourceRuntimeConfiguration as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    )
+                }
+                Some(7) => {
+                    out.s3_recording_sink_runtime_configuration = Some(
+                        <S3RecordingSinkRuntimeConfiguration as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    )
+                }
+                Some(8) => out.created_timestamp = Some(d.read_timestamp(member)?),
+                Some(9) => {
+                    let mut statuses: Vec<MediaInsightsPipelineElementStatus> = Vec::new();
+                    d.read_list(member, &mut |status| {
+                        statuses.push(
+                            <MediaInsightsPipelineElementStatus as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(status)?,
+                        );
+                        Ok(())
+                    })?;
+                    out.element_statuses = Some(statuses);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.chimesdkmediapipelines#MediaInsightsPipelineElementStatus")]
@@ -1028,7 +1238,11 @@ pub struct KinesisVideoStreamConfiguration {
     pub data_retention_in_hours: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.chimesdkmediapipelines#KinesisVideoStreamPoolConfiguration")]
+// `KinesisVideoStreamPoolConfiguration`'s schema is written out by hand for the reason the
+// note on `MediaCapturePipeline` states: the model targets both timestamp members at
+// `Iso8601Timestamp`, which carries `@timestampFormat("date-time")`
+// (`smithy_query(query="shape", shape="KinesisVideoStreamPoolConfiguration")`), and the
+// derive does not carry that trait onto the member schema.
 #[derive(Debug, Clone, Default)]
 pub struct KinesisVideoStreamPoolConfiguration {
     pub pool_arn: Option<String>,
@@ -1039,6 +1253,145 @@ pub struct KinesisVideoStreamPoolConfiguration {
     pub stream_configuration: Option<KinesisVideoStreamConfiguration>,
     pub created_timestamp: Option<::aws_smithy_types::DateTime>,
     pub updated_timestamp: Option<::aws_smithy_types::DateTime>,
+}
+
+impl KinesisVideoStreamPoolConfiguration {
+    // Associated member-schema consts, in the model's member order.
+    const M_POOL_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#KinesisVideoStreamPoolConfiguration$PoolArn",
+        "PoolArn",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    const M_POOL_NAME: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#KinesisVideoStreamPoolConfiguration$PoolName",
+        "PoolName",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    const M_POOL_ID: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#KinesisVideoStreamPoolConfiguration$PoolId",
+        "PoolId",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    const M_POOL_STATUS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#KinesisVideoStreamPoolConfiguration$PoolStatus",
+        "PoolStatus",
+        ::aws_smithy_schema::ShapeType::String,
+        3,
+    );
+    const M_POOL_SIZE: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#KinesisVideoStreamPoolConfiguration$PoolSize",
+        "PoolSize",
+        ::aws_smithy_schema::ShapeType::Integer,
+        4,
+    );
+    const M_STREAM_CONFIGURATION: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#KinesisVideoStreamPoolConfiguration$StreamConfiguration",
+        "StreamConfiguration",
+        ::aws_smithy_schema::ShapeType::Structure,
+        5,
+    );
+    /// `@timestampFormat("date-time")`, from the `Iso8601Timestamp` shape this member
+    /// targets. THE reason this schema is hand-written.
+    const M_CREATED_TIMESTAMP: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#KinesisVideoStreamPoolConfiguration$CreatedTimestamp",
+        "CreatedTimestamp",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        6,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as `CreatedTimestamp` above.
+    const M_UPDATED_TIMESTAMP: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.chimesdkmediapipelines#KinesisVideoStreamPoolConfiguration$UpdatedTimestamp",
+        "UpdatedTimestamp",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        7,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.chimesdkmediapipelines#KinesisVideoStreamPoolConfiguration",
+            "com.amazonaws.chimesdkmediapipelines",
+            "KinesisVideoStreamPoolConfiguration",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_POOL_ARN,
+            &Self::M_POOL_NAME,
+            &Self::M_POOL_ID,
+            &Self::M_POOL_STATUS,
+            &Self::M_POOL_SIZE,
+            &Self::M_STREAM_CONFIGURATION,
+            &Self::M_CREATED_TIMESTAMP,
+            &Self::M_UPDATED_TIMESTAMP,
+        ],
+    );
+}
+
+pub static KINESIS_VIDEO_STREAM_POOL_CONFIGURATION_SCHEMA: &::aws_smithy_schema::Schema =
+    &KinesisVideoStreamPoolConfiguration::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for KinesisVideoStreamPoolConfiguration {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.pool_arn.as_ref() {
+            s.write_string(&Self::M_POOL_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.pool_name.as_ref() {
+            s.write_string(&Self::M_POOL_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.pool_id.as_ref() {
+            s.write_string(&Self::M_POOL_ID, v.as_str())?;
+        }
+        if let Some(v) = self.pool_status.as_ref() {
+            s.write_string(&Self::M_POOL_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.pool_size.as_ref() {
+            s.write_integer(&Self::M_POOL_SIZE, *v)?;
+        }
+        if let Some(v) = self.stream_configuration.as_ref() {
+            s.write_struct(&Self::M_STREAM_CONFIGURATION, v)?;
+        }
+        if let Some(v) = self.created_timestamp.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_TIMESTAMP, v)?;
+        }
+        if let Some(v) = self.updated_timestamp.as_ref() {
+            s.write_timestamp(&Self::M_UPDATED_TIMESTAMP, v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for KinesisVideoStreamPoolConfiguration {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.pool_arn = Some(d.read_string(member)?),
+                Some(1) => out.pool_name = Some(d.read_string(member)?),
+                Some(2) => out.pool_id = Some(d.read_string(member)?),
+                Some(3) => out.pool_status = Some(d.read_string(member)?),
+                Some(4) => out.pool_size = Some(d.read_integer(member)?),
+                Some(5) => {
+                    out.stream_configuration = Some(
+                        <KinesisVideoStreamConfiguration as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    )
+                }
+                Some(6) => out.created_timestamp = Some(d.read_timestamp(member)?),
+                Some(7) => out.updated_timestamp = Some(d.read_timestamp(member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.chimesdkmediapipelines#ConflictException")]

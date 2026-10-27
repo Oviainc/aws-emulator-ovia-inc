@@ -236,43 +236,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
-        let Some(record) = store
-            .vocabulary_filters
-            .get_mut(&region, &input.vocabulary_filter_name)
-        else {
-            // As `UpdateVocabulary`: a resource this Region does not hold is this
-            // service's `BadRequestException`, whose documentation covers an entity that
-            // "doesn't exist", and not the modelled `NotFoundException`.
-            return Err(bad_request(&crate::state::not_found_message(
-                crate::state::KIND_VOCABULARY_FILTER,
-            )));
+        // The guard is SCOPED: the store lock is released before this handler awaits
+        // the write of the file the filter's `DownloadUri` names, which is a call out to
+        // another emulated service and reaches none of this state.
+        let (output, name, content) = {
+            let mut store = state.lock();
+            let Some(record) = store
+                .vocabulary_filters
+                .get_mut(&region, &input.vocabulary_filter_name)
+            else {
+                // As `UpdateVocabulary`: a resource this Region does not hold is this
+                // service's `BadRequestException`, whose documentation covers an entity
+                // that "doesn't exist", and not the modelled `NotFoundException`.
+                return Err(bad_request(&crate::state::not_found_message(
+                    crate::state::KIND_VOCABULARY_FILTER,
+                )));
+            };
+
+            // "The new list you provide overwrites all previous entries; you cannot
+            // append new terms onto an existing custom vocabulary filter." The language
+            // code is not an input of this operation, so the stored one is kept.
+            record.words = words;
+            record.file_uri = file_uri;
+            record.last_modified_time = now;
+            // As `UpdateVocabulary`: the Region a resource lives in is fixed when it is
+            // created, because the store is keyed by it, so an update never migrates
+            // one.
+            record.data_access_role_arn = input.data_access_role_arn;
+            record.encryption_configuration = input.encryption_configuration;
+
+            ::tracing::info!(
+                operation = "UpdateVocabularyFilter",
+                filter = %record.name,
+                words = record.words.len(),
+                from_file = record.file_uri.is_some(),
+                "custom vocabulary filter updated"
+            );
+
+            let output = UpdateVocabularyFilterOutput {
+                vocabulary_filter_name: Some(record.name.clone()),
+                language_code: Some(record.language_code.clone()),
+                last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+            };
+            // The words the rebuild has to store, taken from the record rather than from
+            // the request: what is served is what was persisted.
+            (output, record.name.clone(), record.words.clone())
         };
 
-        // "The new list you provide overwrites all previous entries; you cannot append
-        // new terms onto an existing custom vocabulary filter." The language code is
-        // not an input of this operation, so the stored one is kept.
-        record.words = words;
-        record.file_uri = file_uri;
-        record.last_modified_time = now;
-        // As `UpdateVocabulary`: the Region a resource lives in is fixed when it is
-        // created, because the store is keyed by it, so an update never migrates one.
-        record.data_access_role_arn = input.data_access_role_arn;
-        record.encryption_configuration = input.encryption_configuration;
+        // "The new list you provide overwrites all previous entries": the file this
+        // filter's `DownloadUri` names is rewritten from the words just recorded, so
+        // that location serves the filter's CURRENT words. A rebuild whose words were
+        // to be read from a caller-named file has none, which withdraws the file the
+        // previous build left (`crate::state::store_vocabulary_content`).
+        crate::state::store_vocabulary_content(
+            ctx,
+            &region,
+            crate::state::RESOURCE_TYPE_VOCABULARY_FILTER,
+            &name,
+            &content,
+        )
+        .await;
 
-        ::tracing::info!(
-            operation = "UpdateVocabularyFilter",
-            filter = %record.name,
-            words = record.words.len(),
-            from_file = record.file_uri.is_some(),
-            "custom vocabulary filter updated"
-        );
-
-        Ok(UpdateVocabularyFilterOutput {
-            vocabulary_filter_name: Some(record.name.clone()),
-            language_code: Some(record.language_code.clone()),
-            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
-        })
+        Ok(output)
     }
 }
 

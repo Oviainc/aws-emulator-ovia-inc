@@ -37,6 +37,8 @@ mod ses_configuration_set_sending_state;
 mod ses_custom_verification_email_send;
 #[path = "all/ses_identity_policies.rs"]
 mod ses_identity_policies;
+#[path = "all/ses_identity_policy_delete.rs"]
+mod ses_identity_policy_delete;
 #[path = "all/ses_identity_send_loop.rs"]
 mod ses_identity_send_loop;
 #[path = "all/ses_receipt_filters.rs"]

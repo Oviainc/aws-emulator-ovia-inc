@@ -275,6 +275,24 @@ fn custom_image_details() -> Value {
     })
 }
 
+/// A second custom EBS snapshot configuration, for an update that replaces
+/// [`custom_snapshot_details`] wholesale: the same policy type and target
+/// resource type, since `UpdateLifecyclePolicyRequest$PolicyDetails` is "the
+/// configuration of the lifecycle policy. You cannot update the policy type or
+/// the resource type", and every other member different.
+fn replacement_snapshot_details() -> Value {
+    json!({
+        "PolicyType": "EBS_SNAPSHOT_MANAGEMENT",
+        "ResourceTypes": ["VOLUME"],
+        "TargetTags": [{"Key": "backup", "Value": "weekly"}],
+        "Schedules": [{
+            "Name": "weekly",
+            "CreateRule": {"Interval": 12, "IntervalUnit": "HOURS"},
+            "RetainRule": {"Count": 2},
+        }],
+    })
+}
+
 /// `CreateLifecyclePolicy` persists what it was given and `GetLifecyclePolicy`
 /// reports that record: for every input member the policy shape carries, the
 /// value read back is the created one.
@@ -931,19 +949,26 @@ async fn update_overwrites_only_the_members_the_request_carries() {
         UpdateCase {
             case: "PolicyDetails replaced wholesale",
             create: custom.clone(),
-            patch: json!({"PolicyDetails": custom_image_details()}),
+            patch: json!({"PolicyDetails": replacement_snapshot_details()}),
             // The replacement configuration, with the members the service
-            // materializes stamped onto it as at create.
+            // materializes stamped onto it as at create — and with the members
+            // the created configuration carried and the replacement does not
+            // (`Schedules[0].TagsToAdd`) gone, since the structure replaces the
+            // configuration rather than patching it.
             changed: vec![
-                ("/PolicyDetails/PolicyType", json!("IMAGE_MANAGEMENT")),
-                ("/PolicyDetails/ResourceTypes", json!(["INSTANCE"])),
+                (
+                    "/PolicyDetails/TargetTags",
+                    json!([{"Key": "backup", "Value": "weekly"}]),
+                ),
                 ("/PolicyDetails/Schedules/0/Name", json!("weekly")),
+                ("/PolicyDetails/Schedules/0/TagsToAdd", Value::Null),
+                ("/PolicyDetails/Schedules/0/CreateRule/Interval", json!(12)),
                 (
                     // `CreateRule$Location` is `[Custom snapshot policies only]`,
-                    // so replacing a snapshot configuration with an AMI one drops
-                    // the location the snapshot policy carried.
+                    // so a snapshot policy's creation rule carries the
+                    // materialized location.
                     "/PolicyDetails/Schedules/0/CreateRule/Location",
-                    Value::Null,
+                    json!("CLOUD"),
                 ),
                 ("/PolicyDetails/Schedules/0/CopyTags", json!(false)),
             ],
@@ -953,6 +978,11 @@ async fn update_overwrites_only_the_members_the_request_carries() {
                 "/ExecutionRoleArn",
                 "/Tags",
                 "/DateCreated",
+                // "You cannot update the policy type or the resource type":
+                // `policy_identity_immutability.rs` owns that rule, and a
+                // wholesale replacement does not touch either member.
+                "/PolicyDetails/PolicyType",
+                "/PolicyDetails/ResourceTypes",
             ],
         },
         UpdateCase {
