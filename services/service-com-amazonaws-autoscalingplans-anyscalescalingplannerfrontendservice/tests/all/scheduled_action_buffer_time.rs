@@ -163,9 +163,12 @@ impl Shape {
 
     /// "The minimum capacity for each scheduled scaling action … calculated as the larger
     /// of two values: the capacity forecast or the minimum capacity in the scaling
-    /// instruction."
+    /// instruction" — inside the band that scheduled scaling action provisions in, so never
+    /// above the maximum capacity the same action may reach.
     fn scheduled_action_min_capacity(&self, capacity_forecast: f64) -> f64 {
-        capacity_forecast.max(self.min_capacity as f64)
+        capacity_forecast
+            .max(self.min_capacity as f64)
+            .min(self.scheduled_action_max_capacity(capacity_forecast))
     }
 
     /// The maximum capacity for each scheduled scaling action, by the instruction's
