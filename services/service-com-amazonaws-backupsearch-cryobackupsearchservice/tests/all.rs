@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/backup_index_status_gate.rs"]
 mod backup_index_status_gate;
+#[path = "all/client_token_replay_rule.rs"]
+mod client_token_replay_rule;
 #[path = "all/client_token_window.rs"]
 mod client_token_window;
 #[path = "all/export_client_token_expiry.rs"]
