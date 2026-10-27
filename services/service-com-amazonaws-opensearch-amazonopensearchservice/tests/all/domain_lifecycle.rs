@@ -31,6 +31,14 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The API version every path of this service is prefixed with.
 pub(crate) const PREFIX: &str = "/2021-01-01";
 
+/// The Region every request below is signed for — what a domain's ARN names.
+pub(crate) const REGION: &str = "us-east-1";
+
+/// The access key id a request carries unless a suite names another: the long-term key
+/// this emulator publishes, which names no session and so speaks for the account's own
+/// identity.
+pub(crate) const DEFAULT_ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
+
 /// Long enough for the LONGEST span this emulator owes a clock move (the 750 ms a
 /// change to a domain's package associations takes; a domain's own provisioning span is
 /// shorter) to have fallen due, so the next read materialises the settled record.
@@ -75,7 +83,26 @@ impl Emulator {
             .expect("the shared engine holds this service's store")
     }
 
+    /// The SAME engine the mounted service holds, so a suite can seed the store of
+    /// ANOTHER service mounted on it — the STS session and IAM policies an
+    /// authorization decision is read from.
+    pub(crate) fn engine(&self) -> &std::sync::Arc<engine::InMemoryEngine> {
+        &self.engine
+    }
+
     pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+        self.call_as(DEFAULT_ACCESS_KEY_ID, method, uri, body).await
+    }
+
+    /// The same request, signed with `access_key_id` — the credential whose principal
+    /// the service resolves the caller from.
+    pub(crate) async fn call_as(
+        &self,
+        access_key_id: &str,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> Answer {
         let payload = body.map(|value| value.to_string()).unwrap_or_default();
         let request = http::Request::builder()
             .method(method)
@@ -83,9 +110,11 @@ impl Emulator {
             .header("host", "es.us-east-1.amazonaws.com")
             .header(
                 "authorization",
-                "AWS4-HMAC-SHA256 \
-                 Credential=AKIAIOSFODNN7EXAMPLE/20260101/us-east-1/es/aws4_request, \
-                 SignedHeaders=host, Signature=0",
+                format!(
+                    "AWS4-HMAC-SHA256 \
+                     Credential={access_key_id}/20260101/{REGION}/es/aws4_request, \
+                     SignedHeaders=host, Signature=0"
+                ),
             )
             .header("content-type", "application/json")
             .body(Bytes::from(payload))

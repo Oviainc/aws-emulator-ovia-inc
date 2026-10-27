@@ -168,7 +168,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state =
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
 
@@ -183,11 +182,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // IAM decides whether the caller may do this BEFORE the service looks at the
+        // request's schema document or at the index, the same step `UpdateIndex` takes:
+        // the resource is the ARN of the domain the request names, taken from the
+        // request rather than from a stored record, so the decision does not depend on
+        // whether that domain exists.
+        crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::domain_arn(
+                &input.domain_name,
+                &crate::state::request_region(ctx.parts()),
+            ),
+        )
+        .map_err(CreateIndexErrorModeled::AccessDeniedException)?;
+
         // The schema is a set of named sections, so a document carrying a scalar or
         // an array instead is refused rather than persisted as this index's schema.
         if !matches!(input.index_schema, ::aws_smithy_types::Document::Object(_)) {
             return Err(CreateIndexErrorModeled::ValidationException(
                 crate::state::malformed_index_schema("IndexSchema"),
+            )
+            .into());
+        }
+
+        // A stored schema is walked member by member by every later update, which
+        // addresses a member by its path: a document nesting past the emulator's own
+        // depth bound, or holding more values than one index may, is refused rather
+        // than persisted, so what an index carries stays tied to the size of the
+        // request that wrote it and no stored schema starts out past the bound every
+        // later update is held to. The same two bounds `UpdateIndex` applies to the
+        // change it merges.
+        let depth = crate::state::index_schema_depth(&input.index_schema);
+        if depth > crate::state::INDEX_SCHEMA_MAX_DEPTH {
+            return Err(CreateIndexErrorModeled::ValidationException(
+                crate::state::index_schema_too_deep(depth),
+            )
+            .into());
+        }
+        let values = crate::state::index_schema_values(&input.index_schema);
+        if values > crate::state::INDEX_SCHEMA_QUOTA {
+            return Err(CreateIndexErrorModeled::ValidationException(
+                crate::state::index_schema_over_quota(values),
             )
             .into());
         }
