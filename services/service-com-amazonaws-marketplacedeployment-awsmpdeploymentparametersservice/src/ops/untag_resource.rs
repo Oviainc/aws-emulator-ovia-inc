@@ -7,6 +7,11 @@
 //! a key that is already absent is removed by doing nothing, so a repeat of the
 //! same call answers 204 again.
 //!
+//! Resolving the label is the sequence every operation that addresses a deployment
+//! parameter by a caller-supplied `resourceArn` runs, written once as
+//! `crate::state::with_tagged_parameter`; what follows is what that sequence decides,
+//! and this handler adds only the removal from the resolved record.
+//!
 //! The label is judged as an INPUT first (`crate::state::validate_resource_arn`): a
 //! value that is not a resource ARN of this service's vendor names nothing this API
 //! can address, so it is refused as a bad request (HTTP 400, error code
@@ -155,49 +160,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // Input before lookup: a value that is not a resource ARN this API addresses is
-        // a bad request, not a missing resource.
-        crate::state::validate_resource_arn(&input.resource_arn)?;
-        // A tag key in the namespace AWS reserves for its own generated tags cannot
-        // be removed by a caller either, so a `tagKeys` naming one is refused on the
-        // input before the resource is resolved — the reservation covers removal as
-        // much as creation, and the request removes nothing.
-        if let Err(why) = crate::state::validate_tag_keys_unreserved(
-            input.tag_keys.iter().map(String::as_str),
-            "tagKeys",
-        ) {
-            return Err(UntagResourceErrorModeled::ValidationException(why).into());
-        }
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(UntagResourceErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: "the deployment-parameter store is unavailable".to_string(),
-                },
-            )
-            .into());
-        };
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-
-        // Materialise the expiry the clock has already made due before resolving the
-        // ARN: a parameter past its `expirationDate` is scheduled for deletion, so a
-        // tag removal against it is a write to a resource that no longer exists. ONE
-        // clock sample decides it.
-        store.purge_expired(now);
-
-        let Some(record) = store.parameters.get_mut(&input.resource_arn) else {
-            // The not-found CODE this service emits is `NotFoundException`, not the
-            // modelled `ResourceNotFoundException` shape name; see
-            // `crate::state::parameter_not_found`.
-            return Err(crate::state::parameter_not_found());
-        };
-
-        // `@idempotent`: removing a key the record does not hold is a no-op, so the
-        // same call repeated answers the same success.
-        for key in &input.tag_keys {
-            record.tags.remove(key);
-        }
-
-        Ok(UntagResourceOutput {})
+        // ONE sequence, stated once in `crate::state`: judge the `resourceArn` as an
+        // input, judge the rest of the request on its own content, take the store,
+        // materialise the expiry the clock has already made due, then resolve the
+        // record or answer the service's not-found failure. The removal below is
+        // everything this operation adds to it.
+        //
+        // The ARN check comes first: a value that is not a resource ARN this API
+        // addresses is a bad request, not a missing resource. A tag key in the
+        // namespace AWS reserves for its own generated tags cannot be removed by a
+        // caller either, so a `tagKeys` naming one is refused on the input before the
+        // resource is resolved — the reservation covers removal as much as creation,
+        // and the request removes nothing. A record whose `expirationDate` has passed
+        // is scheduled for deletion, so a tag removal against it is a write to a
+        // resource that no longer exists.
+        crate::state::with_tagged_parameter(
+            &*self.engine,
+            &input.resource_arn,
+            UntagResourceErrorModeled::InternalServerException,
+            || {
+                crate::state::validate_tag_keys_unreserved(
+                    input.tag_keys.iter().map(String::as_str),
+                    "tagKeys",
+                )
+                .map_err(UntagResourceErrorModeled::ValidationException)
+            },
+            |record| {
+                // `@idempotent`: removing a key the record does not hold is a no-op,
+                // so the same call repeated answers the same success.
+                for key in &input.tag_keys {
+                    record.tags.remove(key);
+                }
+                Ok(UntagResourceOutput {})
+            },
+        )
     }
 }

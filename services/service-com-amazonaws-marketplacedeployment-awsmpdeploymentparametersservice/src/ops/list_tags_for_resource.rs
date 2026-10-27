@@ -12,6 +12,11 @@
 //! rather than report a resource the clock has taken. Such an ARN then gets the same
 //! not-found failure as one that never named a record.
 //!
+//! Resolving the label is the sequence every operation that addresses a deployment
+//! parameter by a caller-supplied `resourceArn` runs, written once as
+//! `crate::state::with_tagged_parameter`; what follows is what that sequence decides,
+//! and this handler adds only the reporting of the resolved record's tag map.
+//!
 //! The label is judged as an INPUT first (`crate::state::validate_resource_arn`): a
 //! value that is not a resource ARN of this service's vendor names nothing this API
 //! can address, so it is refused as a bad request (HTTP 400, error code
@@ -158,36 +163,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // Input before lookup: a value that is not a resource ARN this API addresses is
-        // a bad request, not a missing resource.
-        crate::state::validate_resource_arn(&input.resource_arn)?;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(ListTagsForResourceErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: "the deployment-parameter store is unavailable".to_string(),
-                },
-            )
-            .into());
-        };
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-
-        // Materialise the expiry the clock has already made due before resolving the
-        // ARN: a parameter past its `expirationDate` is scheduled for deletion, and
-        // that deletion was owed at this instant whether or not anybody called — so
-        // this reporting operation may apply it, and must not report a resource the
-        // clock has already taken. ONE clock sample decides it.
-        store.purge_expired(now);
-
-        let Some(record) = store.parameters.get(&input.resource_arn) else {
-            // The not-found CODE this service emits is `NotFoundException`, not the
-            // modelled `ResourceNotFoundException` shape name; see
-            // `crate::state::parameter_not_found`.
-            return Err(crate::state::parameter_not_found());
-        };
-
-        Ok(ListTagsForResourceOutput {
-            tags: Some(record.tags_map()),
-        })
+        // ONE sequence, stated once in `crate::state`: judge the `resourceArn` as an
+        // input, take the store, materialise the expiry the clock has already made
+        // due, then resolve the record or answer the service's not-found failure.
+        // Reporting the record's tag map is everything this operation adds to it.
+        //
+        // The ARN check comes first: a value that is not a resource ARN this API
+        // addresses is a bad request, not a missing resource — and this operation
+        // judges nothing else about the request, so it carries no judgement of its
+        // own into the step that runs before the store is taken. A parameter past its
+        // `expirationDate` is scheduled for deletion, and that deletion was owed at
+        // the sequence's own clock sample whether or not anybody called — so this
+        // reporting operation may apply it, and must not report a resource the clock
+        // has already taken.
+        crate::state::with_tagged_parameter(
+            &*self.engine,
+            &input.resource_arn,
+            ListTagsForResourceErrorModeled::InternalServerException,
+            || Ok(()),
+            |record| {
+                Ok(ListTagsForResourceOutput {
+                    tags: Some(record.tags_map()),
+                })
+            },
+        )
     }
 }

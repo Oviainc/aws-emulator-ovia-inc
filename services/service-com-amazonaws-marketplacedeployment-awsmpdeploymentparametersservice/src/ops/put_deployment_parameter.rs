@@ -256,9 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutDeploymentParameterErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: "the deployment-parameter store is unavailable".to_string(),
-                },
+                crate::state::store_unavailable(),
             )
             .into());
         };
