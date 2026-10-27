@@ -61,3 +61,5 @@ mod untag_resource;
 mod update_dashboard_partial_update;
 #[path = "all/update_scheduled_report.rs"]
 mod update_scheduled_report;
+#[path = "all/validation_pattern_rendering.rs"]
+mod validation_pattern_rendering;

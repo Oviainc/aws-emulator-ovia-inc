@@ -5,12 +5,16 @@
 //! Summarises the recommendations the calling account may read — the catalog an
 //! ENROLLED account has once the analysis its enrollment started is due, which
 //! is the visibility `ListRecommendations` serves: narrows them by every
-//! `filter` member the request sets, groups the surviving rows by the `groupBy`
-//! dimension, and reports per group how many recommendations fall under it and
-//! what they save per month together. `estimatedTotalDedupedSavings` is that
-//! total taken over one recommendation per resource, so a resource several
-//! recommendation types cover is counted once. Every figure is computed from
-//! the rows' stored prices under the caller's effective `savingsEstimationMode`
+//! `filter` member the request sets, keeps one recommendation per resource (the
+//! one that saves the most, because a caller can adopt only one of a resource's
+//! alternatives), groups the surviving rows by the `groupBy` dimension, and
+//! reports per group how many recommendations fall under it and what they save
+//! per month together. That per-resource de-duplication is the aggregated view
+//! every figure here is taken over — each group's `estimatedMonthlySavings`,
+//! which `RecommendationSummary` models as "de-duped savings from all types of
+//! recommendations", and the overall `estimatedTotalDedupedSavings`, which is
+//! therefore the sum of the groups. Every figure is computed from the rows'
+//! stored prices under the caller's effective `savingsEstimationMode`
 //! preference, so a summary never disagrees with `ListRecommendations`.
 //!
 //! `metrics` asks for the additional metric `savingsPercentage`, which
@@ -288,12 +292,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
         );
 
-        let groups = summarise(&rows, dimension, mode);
-
         // De-duped: one recommendation per resource, so a resource covered by
-        // several recommendation types contributes its best saving once. The
-        // total is of the whole filtered view, not of the page being returned.
+        // several recommendation types contributes its best saving once. This is
+        // the aggregated view every figure this operation reports is taken over
+        // — the groups, the overall total and the additional metric — because
+        // `RecommendationSummary` is modelled as carrying "de-duped savings from
+        // all types of recommendations"
+        // (`smithy_query(query="shape", shape="RecommendationSummary")`), and a
+        // caller can adopt only one of a resource's alternatives.
         let deduped = crate::state::dedupe_by_resource(&rows, mode);
+
+        let groups = summarise(&deduped, dimension, mode);
+
+        // The total is of the whole filtered view, not of the page being
+        // returned, so it is the sum of every group and not only the ones this
+        // page carries.
         let total_deduped_savings = crate::state::round_cents(
             deduped.iter().map(|row| row.monthly_savings(mode)).sum(),
         );
@@ -359,6 +372,9 @@ const SAVINGS_PERCENTAGE_BEFORE_DISCOUNTS: &str = "Savings percentage is not sup
 /// Total the rows per group: one `RecommendationSummary` per distinct value of
 /// the grouping dimension, carrying how many recommendations fall under that
 /// value and what they save per month together.
+///
+/// `rows` is the de-duplicated view (one recommendation per resource), so no
+/// group counts two mutually exclusive recommendations for one resource.
 ///
 /// The groups come out biggest saving first — which is what a savings summary
 /// ranks by — with ties broken by the group label, so the order is total and a

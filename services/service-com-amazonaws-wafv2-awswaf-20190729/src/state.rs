@@ -327,6 +327,18 @@ pub fn apply_tags(stored: &mut Vec<Tag>, requested: &[Tag]) {
     }
 }
 
+/// Take away the tags a resource carries under `keys`, and leave every other tag
+/// it carries exactly as it was.
+///
+/// The counterpart of [`apply_tags`]: a tag is a key:value PAIR identified by its
+/// key, so an untagging request names KEYS alone and the pair held under each one
+/// goes; a key the resource does not carry removes nothing, which is what makes
+/// the removal idempotent. The tags that stay keep their relative order, so the
+/// collection still reads in the order its keys were first set.
+pub fn remove_tags(stored: &mut Vec<Tag>, keys: &[String]) {
+    stored.retain(|held| !keys.contains(&held.key));
+}
+
 /// How many tags a resource holding `stored` would carry once `requested` is
 /// applied to it: the keys it already has, plus the requested keys it does not.
 ///

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Cross-stack references, end to end over the awsQuery wire: `Fn::ImportValue`,
-//! `ListImports`, and the guard that keeps an export in use from being deleted.
+//! `ListImports`, and what becomes of a deletion that would remove an export in use.
 //!
 //! The rule under test: `Fn::ImportValue` resolves to the value of the output another LIVE
 //! stack of the same account and Region exported under that name, and the importing stack
 //! becomes part of the cross-stack reference index — `ListImports(ExportName)` reports the
 //! name of every live stack of that Region whose deployed template resolved an import for
-//! it, and while that index names an importer, deleting the EXPORTING stack is refused with
-//! a message naming the export and the importing stack. Once the last importer is gone the
-//! byte-identical `DeleteStack` succeeds and the export disappears from `ListExports`.
+//! it, and while that index names an importer, deleting the EXPORTING stack is ACCEPTED and
+//! then cancelled, leaving the stack where it was with a reason naming the export and the
+//! importing stack (the cancellation itself is pinned by
+//! `delete_canceled_export_in_use.rs`). Once the last importer is gone the byte-identical
+//! `DeleteStack` succeeds and the export disappears from `ListExports`.
 //!
 //! Every case drives the real request path (form-encoded body in, XML envelope out) through
 //! the wire harness, so what it asserts is what a client reasoning about cross-stack
@@ -252,7 +254,7 @@ async fn an_import_resolves_and_puts_the_importing_stack_in_the_export_index() {
 }
 
 #[tokio::test]
-async fn deleting_an_exporting_stack_is_refused_while_an_importer_holds_its_export() {
+async fn deleting_an_exporting_stack_is_canceled_while_an_importer_holds_its_export() {
     let router = router();
     deploy_exporter(&router, "held-exporter").await;
 
@@ -273,8 +275,9 @@ async fn deleting_an_exporting_stack_is_refused_while_an_importer_holds_its_expo
         "the importer is registered"
     );
 
-    // While the index names an importer, deleting the EXPORTING stack is refused and the
-    // stack remains unchanged — and the refusal names both halves of the reference.
+    // While the index names an importer, deleting the EXPORTING stack is accepted and then
+    // cancelled: the stack is left where it was, and says which export and which importer
+    // stood in the way.
     let (status, body) = call(
         &router,
         "DeleteStack",
@@ -282,15 +285,11 @@ async fn deleting_an_exporting_stack_is_refused_while_an_importer_holds_its_expo
     )
     .await;
     assert_eq!(
-        status, 400,
-        "case {:?}: expected the delete to be refused with 400, got {status} {body}",
+        status, 200,
+        "case {:?}: expected the delete to be accepted, got {status} {body}",
         "deleting the exporter while its export is in use"
     );
-    assert!(
-        body.contains("shared-queue") && body.contains("held-importer"),
-        "case {:?}: expected the refusal to name the export and the importing stack, got {body}",
-        "deleting the exporter while its export is in use"
-    );
+    wait_for_the_transition().await;
     let (status, body) = call(
         &router,
         "DescribeStacks",
@@ -305,7 +304,15 @@ async fn deleting_an_exporting_stack_is_refused_while_an_importer_holds_its_expo
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
         Some("CREATE_COMPLETE"),
-        "case {:?}: expected the refused delete to leave the exporter where it was, got {body}",
+        "case {:?}: expected the cancelled delete to leave the exporter where it was, got \
+         {body}",
+        "deleting the exporter while its export is in use"
+    );
+    let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+    assert!(
+        reason.contains("shared-queue") && reason.contains("held-importer"),
+        "case {:?}: expected the reason to name the export and the importing stack, got \
+         {reason:?}",
         "deleting the exporter while its export is in use"
     );
 

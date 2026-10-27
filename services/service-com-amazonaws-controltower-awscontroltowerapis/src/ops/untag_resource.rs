@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes tags from one of this service's resources: every key the request names is
+//! DROPPED from the resource's tag set and every key it does not name is left exactly as
+//! it was, so untagging states the keys a caller no longer wants rather than replacing the
+//! tag set. A key the resource does not carry has nothing to remove, which makes the call
+//! idempotent: repeating it answers the same way and changes nothing more. The tags live
+//! in [`crate::state`]'s one tag store, keyed by the tagged resource's ARN, which is where
+//! `TagResource` writes them and `ListTagsForResource` reads them back from.
+//!
+//! An ARN that names no resource of this service is refused with the modelled
+//! `ResourceNotFoundException` (404) and writes nothing, and so is a request naming a key
+//! in the reserved [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace, refused with the
+//! modelled `ValidationException` (400): such a key names a tag Amazon Web Services
+//! applies itself, which a caller may neither create nor delete. Success is HTTP 204 with
+//! no body, as the model's `@http` trait says.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +147,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // Untagging is identified by the resource's ARN alone; nothing else about the
+        // request takes part in it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A tag key Amazon Web Services keeps for itself is not a caller's to delete, and
+        // the check reads the REQUEST alone, so it is settled before the store is reached
+        // and a refused request cannot have removed anything.
+        if let Some(message) = crate::state::reserved_tag_key_message(
+            "tagKeys",
+            input.tag_keys.iter().map(String::as_str),
+        ) {
+            return Err(
+                UntagResourceErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // Only materialises transitions the clock already owed, so a resource whose
+        // teardown has become due is already gone and cannot be untagged.
+        store.settle(::std::time::SystemTime::now());
+
+        // `resourceArn` is modelled as an `Arn`, so the only value the front door lets
+        // through is an ARN — and the ARNs this service mints are the keys of its
+        // resource stores.
+        if !store.taggable_resource_exists(&input.resource_arn) {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no resource matches resourceArn {}", input.resource_arn),
+                },
+            )
+            .into());
+        }
+
+        // The single removal site for the tag store: a key the resource does not carry has
+        // nothing to remove, so the call cannot fail once the resource is found.
+        store.remove_tags(&input.resource_arn, input.tag_keys.iter().map(String::as_str));
+
+        Ok(UntagResourceOutput {})
     }
 }

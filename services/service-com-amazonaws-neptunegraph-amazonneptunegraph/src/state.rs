@@ -1463,6 +1463,77 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.snapshots.insert(snapshot.id.clone(), snapshot);
     }
 
+    /// Take the FINAL snapshot of `graph` that a request whose required `skipSnapshot`
+    /// is `false` asks for, and return the id it was minted under — or the reason the
+    /// store had no room for it.
+    ///
+    /// ONE rule, stated once: a final snapshot captures the graph AS THE CALL FOUND IT
+    /// — the data it holds and the configuration it is provisioned with, under the
+    /// graph's own encryption key — and is not restorable until the clock makes its
+    /// move to `AVAILABLE` due, exactly as an explicitly named snapshot is not. Every
+    /// operation that empties or removes a graph's data takes the same snapshot, so
+    /// neither what it captures, nor the span it settles over, nor the wording of the
+    /// no-room refusal can differ between them. The Err is the refusal's MESSAGE: each
+    /// operation reports it through its own modelled error channel, which is all that
+    /// is left to the caller of this helper.
+    ///
+    /// The graph is passed in rather than looked up here, because the caller has
+    /// already resolved it (in its own Region, with the transitions the clock owes it
+    /// settled) and gated the call on the status it was found in.
+    pub fn mint_final_snapshot(
+        &mut self,
+        graph: &Graph,
+        region: &str,
+        now: Instant,
+    ) -> Result<String, String> {
+        // The name a snapshot reserves is released, and the room it takes given back,
+        // when its deletion completes, so the removals the clock has already made due
+        // are materialised before the ceiling and the name are checked against what the
+        // store holds.
+        self.materialise_snapshots(now);
+        // The snapshot store grows by one entry per final snapshot, so it has the same
+        // ceiling `CreateGraphSnapshot` enforces. Neither operation that takes a final
+        // snapshot models a quota error, so a store with no room for the snapshot the
+        // caller asked for is reported as the conflict it is: the request cannot be
+        // carried out against what the store already holds.
+        if self.snapshots.len() >= MAX_SNAPSHOTS {
+            return Err(format!(
+                "a final snapshot of graph {} cannot be taken because this emulator \
+                 holds at most {MAX_SNAPSHOTS} graph snapshots; delete a snapshot or \
+                 pass skipSnapshot=true",
+                graph.id
+            ));
+        }
+        // The request carries no name for the snapshot, so the service names it after
+        // the graph it is taken of, the way it mints the id.
+        let id = self.next_snapshot_id();
+        let name = self.free_final_snapshot_name(&graph.name, &id, region);
+        self.insert_snapshot(Snapshot {
+            arn: ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("graph-snapshot/{id}")),
+            id: id.clone(),
+            name,
+            // The final snapshot lives in the Region of the graph it was taken of,
+            // which is the Region the asking request was signed for.
+            region: region.to_string(),
+            source_graph_id: graph.id.clone(),
+            // Not restorable when the call returns; the clock owes the move to
+            // `AVAILABLE` a fixed span later.
+            status: SnapshotStatus::Creating,
+            settles_at: Some(now + PROVISIONING_SPAN),
+            snapshot_create_time: SystemTime::now(),
+            // A snapshot of an encrypted graph is encrypted with the graph's own key:
+            // the key belongs to the data being snapshotted, not to a request that
+            // carries no key member at all.
+            kms_key_identifier: graph.kms_key_identifier.clone(),
+            // No request that asks for a final snapshot carries tags, and a snapshot's
+            // tags are its own: the graph's tag set is not copied onto it.
+            tags: BTreeMap::new(),
+            source_configuration: GraphConfiguration::from(graph),
+            data: graph.data.clone(),
+        });
+        Ok(id)
+    }
+
     /// Store a new import task. Tasks are keyed by their minted id alone: the model
     /// gives a task no name, so there is no second index to keep in step.
     pub fn insert_import_task(&mut self, task: ImportTask) {

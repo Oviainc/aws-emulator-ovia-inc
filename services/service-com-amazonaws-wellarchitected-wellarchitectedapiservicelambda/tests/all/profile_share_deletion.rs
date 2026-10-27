@@ -81,8 +81,10 @@ fn revoked_principals() -> Vec<(String, String)> {
 
 /// `DELETE /profiles/{ProfileArn}/shares/{ShareId}?ClientRequestToken=…`, the wire form of
 /// `DeleteProfileShare`: both labels are non-greedy, so each travels percent-encoded in one
-/// path segment, and the `@idempotencyToken` is bound to the query string.
-async fn delete_share(client: &Client, profile_arn: &str, share_id: &str, token: &str) -> Answer {
+/// path segment, and the `@idempotencyToken` is bound to the query string. `pub(crate)`
+/// because `super::profile_share_quota` revokes the share it frees room with through this
+/// one spelling of the request.
+pub(crate) async fn delete_share(client: &Client, profile_arn: &str, share_id: &str, token: &str) -> Answer {
     client
         .send(
             "DELETE",
