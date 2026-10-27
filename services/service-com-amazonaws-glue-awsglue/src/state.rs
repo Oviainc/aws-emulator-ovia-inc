@@ -7701,14 +7701,26 @@ pub mod messages {
         format!("Registry {name} not found.")
     }
 
-    /// An operation that addresses ONE integration resource property record
-    /// (`GetIntegrationResourceProperty`) for a `ResourceArn` this account holds no record
-    /// for. NOT recorded: the wording follows [`database_not_found`], this crate's template
-    /// for a reference that resolves to nothing, and carries the ARN the request addressed;
-    /// what is pinned is the behaviour — `EntityNotFoundException`.
-    pub fn integration_resource_property_not_found(resource_arn: &str) -> String {
-        format!("Integration resource property for {resource_arn} not found.")
+    /// An operation of the integration API family that addresses ONE record by the ARN of
+    /// the resource it belongs to, for a `ResourceArn` this account holds no such record
+    /// for — the integration resource property read
+    /// (`GetIntegrationResourceProperty`), and the resource miss of an integration table
+    /// properties write. RECORDED template: the sentence is fixed around its one variable
+    /// part, the ARN the request addressed, taken verbatim from `ResourceArn`; what is
+    /// pinned is the behaviour — `EntityNotFoundException`.
+    pub fn target_resource_not_found(resource_arn: &str) -> String {
+        format!("The target resource {resource_arn} is not found.")
     }
+
+    /// `CreateIntegrationResourceProperty` whose request states NEITHER
+    /// `SourceProcessingProperties` nor `TargetProcessingProperties`. Both members are
+    /// optional on their own, so this is the service's own requirement rather than a
+    /// modelled constraint. RECORDED constant: the whole sentence is fixed — it names the
+    /// two sides in prose and interpolates neither the addressed resource nor a member
+    /// path — and the refusal is the operation's modelled `ValidationException`.
+    pub const INTEGRATION_PROCESSING_PROPERTIES_REQUIRED: &str =
+        "Either source processing properties or target processing properties must be provided \
+         in the request.";
 
     /// An operation that addresses ONE integration table property record
     /// (`GetIntegrationTableProperties`) for a `ResourceArn` and `TableName` this account
@@ -7720,14 +7732,6 @@ pub mod messages {
             "Failed to find the sourceTableProperties with sourceArn {resource_arn} and tableName \
              {table_name}"
         )
-    }
-
-    /// A `CreateIntegrationTableProperties` whose `ResourceArn` names a resource this
-    /// account does not hold. Fixed text around the ARN the request addressed, as this API
-    /// family words a miss of the resource a call is addressed at; what is pinned is the
-    /// behaviour — `EntityNotFoundException`.
-    pub fn integration_table_target_resource_not_found(resource_arn: &str) -> String {
-        format!("The target resource {resource_arn} is not found.")
     }
 
     /// A `CreateIntegrationTableProperties` (or its update) that states BOTH table
@@ -7773,6 +7777,15 @@ pub mod messages {
     /// values it sent, so neither the database nor the table name appears in it.
     pub const COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND: &str =
         "ColumnStatisticsTaskSettings entry for input DatabaseName and TableName does not exist";
+
+    /// `CreateColumnStatisticsTaskSettings` addressed at a `TableName` the addressed
+    /// database holds no table under. RECORDED constant: the whole sentence is fixed — it
+    /// names the MEMBERS the request addressed the table by rather than the values it
+    /// sent, like this operation's other recorded refusals, so the requested table name is
+    /// withheld. A SEPARATE string from the catalog's own [`table_not_found`] template,
+    /// which is the recorded wording of the table writes (`DeleteTable`, `UpdateTable`).
+    pub const COLUMN_STATISTICS_TASK_SETTINGS_TABLE_NOT_FOUND: &str =
+        "Table passed as input within input database not found.";
 
     /// `CreateColumnStatisticsTaskSettings` for a table whose settings a create already
     /// wrote. NOT recorded: inferred from the recorded `CreateDatabase` duplicate, like
