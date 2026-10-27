@@ -27,8 +27,9 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{
-    LIST_QUEUES_MAX_RESULTS_RANGE, MAX_MESSAGES_PER_SECOND, MAX_MESSAGE_ATTRIBUTES,
-    MAX_MESSAGE_TOKEN_LENGTH, MAX_QUEUE_NAME_LENGTH, MAX_TAGS_PER_QUEUE, MAX_TAG_VALUE_LENGTH,
+    INVALID_NEXT_TOKEN_MESSAGE, LIST_QUEUES_MAX_RESULTS_RANGE, MAX_MESSAGES_PER_SECOND,
+    MAX_MESSAGE_ATTRIBUTES, MAX_MESSAGE_TOKEN_LENGTH, MAX_QUEUE_NAME_LENGTH, MAX_TAGS_PER_QUEUE,
+    MAX_TAG_VALUE_LENGTH,
 };
 
 use super::support::{call, create_ok, dead_letter_queue, emulator, error_code, expected_arn};
@@ -469,11 +470,9 @@ async fn every_input_refusal_carries_a_code_this_service_has() {
             address: Address::None,
             request: json!({"NextToken": "not-a-cursor"}),
             code: "InvalidParameterValue",
-            message: invalid(
-                "not-a-cursor",
-                "NextToken",
-                "it was not issued by this listing.",
-            ),
+            // Amazon SQS states this one as wholly fixed text: no parameter name and no
+            // echo of the token the request carried.
+            message: INVALID_NEXT_TOKEN_MESSAGE.to_string(),
         },
         // A value outside the SET its member accepts, on each member that carries one.
         Row {

@@ -149,6 +149,11 @@ const NOT_IMPLEMENTED_CODE: &str = "NotImplemented";
 /// leaves.
 pub const TASK_FAILED_ERROR: &str = "States.TaskFailed";
 
+/// The most bytes the `resourceType` and `resource` a `Task` state's events report
+/// carry: both target the modelled `Name` shape, whose `length` is 1..80
+/// (`smithy_query(query="shape",shape="TaskScheduledEventDetails")`).
+const MAX_NAME_BYTES: usize = 80;
+
 /// The header an AWS JSON service names its error shape in, beside the `__type`
 /// member of the body.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
@@ -433,6 +438,45 @@ fn operation_of(action: &str) -> String {
         Some(first) => first.to_uppercase().chain(characters).collect(),
         None => String::new(),
     }
+}
+
+/// How a `Task` state's own history events name the work its `Resource` asked for:
+/// "the service name of the resource in a task state" and "the action of the resource
+/// called by a task state"
+/// (`smithy_query(query="shape",shape="TaskScheduledEventDetails")`).
+///
+/// A `Resource` names the integration as `<kind>:<action>`, where the kind is the
+/// service alone for the optimized family (`lambda:invoke`) and the family plus the
+/// service for the AWS SDK one (`aws-sdk:dynamodb:putItem`): the ACTION is the last
+/// field and the kind is everything before it, so one reading serves both families.
+/// A `Resource` with no action at all is its own kind, which is what a state naming
+/// work no call is made for reports.
+pub fn named_work(resource: &str) -> (String, String) {
+    let rest = match resource.splitn(6, ':').collect::<Vec<&str>>().as_slice() {
+        ["arn", _partition, _vendor, _region, _account, rest] => (*rest).to_string(),
+        _ => resource.to_string(),
+    };
+    let (kind, action) = match rest.rsplit_once(':') {
+        Some((kind, action)) if !kind.is_empty() && !action.is_empty() => {
+            (kind.to_string(), action.to_string())
+        }
+        _ => (rest.clone(), rest),
+    };
+    (clip_name(kind), clip_name(action))
+}
+
+/// `name` within the bytes the modelled `Name` shape (len 1..80) carries, cut at a
+/// character boundary: a `Resource` is a caller's text, so what it names is reported
+/// through the member's own bound rather than past it.
+fn clip_name(name: String) -> String {
+    if name.len() <= MAX_NAME_BYTES {
+        return name;
+    }
+    let mut end = MAX_NAME_BYTES;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_string()
 }
 
 /// One integration call handed from the walk to the operation that is running it.

@@ -22,6 +22,7 @@ use ::service_com_amazonaws_outposts_outpostsolafservice::state as outposts;
 
 use crate::ops::types::{
     AccessDeniedException, FirewallConfig, FirewallDomainList, FirewallDomainListMetadata,
+    FirewallRule, FirewallRuleGroup,
     InvalidParameterException,
     InvalidPolicyDocument, InvalidRequestException, IpAddressResponse, IpAddressUpdate,
     LimitExceededException, OutpostResolver, ResolverConfig, ResolverDnssecConfig, ResolverEndpoint,
@@ -413,6 +414,33 @@ pub const RESOURCE_TYPE_FIREWALL_DOMAIN_LIST: &str = "FirewallDomainList";
 /// `CreatorRequestId` already stored stays allowed, because it allocates no new
 /// record.
 pub const MAX_STORED_FIREWALL_DOMAIN_LISTS: usize = 1_000;
+
+/// The `FirewallRuleGroupStatus` a rule group reports once no change to it is
+/// still settling.
+///
+/// The model's enum (`smithy_query(query="shape",shape="FirewallRuleGroupStatus")`,
+/// re-exported as [`crate::ops::types::FIREWALL_RULE_GROUP_STATUS_VALUES`]) is
+/// `COMPLETE | DELETING | UPDATING`: the other two describe a delete or an
+/// update in flight, neither of which a create performs —
+/// `CreateFirewallRuleGroup` "creates an empty DNS Firewall rule group", which
+/// is settled the moment it exists, so the clock owes it no transition.
+pub const FIREWALL_RULE_GROUP_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// `ResourceNotFoundException$ResourceType` for a firewall rule group: the
+/// modelled shape name of the resource, as for
+/// [`RESOURCE_TYPE_RESOLVER_ENDPOINT`].
+pub const RESOURCE_TYPE_FIREWALL_RULE_GROUP: &str = "FirewallRuleGroup";
+
+/// The most firewall rule groups this store holds, for the same reason as
+/// [`MAX_STORED_FIREWALL_DOMAIN_LISTS`]: `CreateFirewallRuleGroup` admits any
+/// new `CreatorRequestId`, so without a bound a caller looping creates would
+/// grow one emulator process without limit. A create past this count is REFUSED
+/// by
+/// [`ComAmazonawsRoute53resolverRoute53resolverState::can_store_another_firewall_rule_group`]
+/// with the `LimitExceededException` the operation models; a retry of a
+/// `CreatorRequestId` already stored stays allowed, because it allocates no new
+/// record.
+pub const MAX_STORED_FIREWALL_RULE_GROUPS: usize = 1_000;
 
 /// The most VPC firewall configurations this store holds records for.
 ///
@@ -1074,6 +1102,46 @@ pub fn name_satisfies_pattern(name: &str) -> bool {
         && !name.chars().all(|c| c.is_ascii_digit())
 }
 
+/// The expression a refusal QUOTES for `Name`: the model's pattern
+/// (`smithy_query(query="shape",shape="Name")` reports
+/// `^(?!^[0-9]+$)([a-zA-Z0-9\-_' ']+)$`) WITHOUT the `^`/`$` pair the model
+/// wraps it in.
+///
+/// The pair is dropped because the recorded refusal of a digits-only `Name`
+/// quotes the expression inside it: those anchors are how a model turns a find
+/// into a whole-value match, and what the service publishes is the expression a
+/// value has to satisfy — so a client that lifts it out of the message and
+/// re-validates locally gets the one the service advertises. The CHECK is made
+/// against the whole pattern, by [`name_satisfies_pattern`]; this constant is
+/// only what the message states.
+pub const NAME_PATTERN_AS_STATED: &str = r"(?!^[0-9]+$)([a-zA-Z0-9\-_' ']+)";
+
+/// The message a `Name` the model's pattern excludes is refused with.
+///
+/// A name the pattern excludes violates a MODELLED constraint, so the sentence
+/// is the framework's own for that class rather than one worded by hand: the
+/// violation count, the rejected value, the member path in the lowerCamel
+/// spelling every path of this emulator uses, and the expression the value had
+/// to satisfy. Only that expression is this service's own
+/// ([`NAME_PATTERN_AS_STATED`]), so a name refused here differs from one the
+/// boundary validator refuses in the clause's requirement half alone.
+pub fn name_pattern_violation(name: &str) -> String {
+    let violation = ::aws_smithy_schema_server::constraints::Violation {
+        path: ::aws_smithy_schema_server::constraints::path::member(NAME_MEMBER),
+        kind: ::aws_smithy_schema_server::constraints::ViolationKind::Pattern(
+            NAME_PATTERN_AS_STATED.to_string(),
+        ),
+        // `Name`'s modelled length (0..64) is checked before a handler runs, so
+        // the value echoed here is already bounded.
+        value: Some(name.to_string()),
+    };
+    ::aws_smithy_schema_server::constraints::envelope(std::slice::from_ref(&violation))
+        .unwrap_or_else(|| String::from("Name is outside the pattern the model declares for it"))
+}
+
+/// The modelled member name the `Name` refusal states, as the model spells it.
+const NAME_MEMBER: &str = "Name";
+
 /// The `ResourceNotFoundException` the firewall domain-list operations answer
 /// for a list the caller cannot address, built here so every operation that
 /// resolves a `FirewallDomainListId` reports the same body.
@@ -1090,6 +1158,21 @@ pub fn firewall_domain_list_not_found(
     ResourceNotFoundException {
         message: Some(resource_not_found_message(firewall_domain_list_id)),
         resource_type: Some(RESOURCE_TYPE_FIREWALL_DOMAIN_LIST.to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` the firewall rule-group operations answer for
+/// a rule group the caller cannot address, built here so every operation that
+/// resolves a `FirewallRuleGroupId` reports the same body.
+///
+/// It carries the same RSLVR-coded sentence as every other resource of this
+/// service a caller names but cannot address
+/// ([`resource_not_found_message`]), with the rule group's modelled shape name
+/// as the resource type.
+pub fn firewall_rule_group_not_found(firewall_rule_group_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(firewall_rule_group_id)),
+        resource_type: Some(RESOURCE_TYPE_FIREWALL_RULE_GROUP.to_string()),
     }
 }
 
@@ -1393,6 +1476,85 @@ impl FirewallDomainListRecord {
             managed_owner_name: None,
             managed_list_type: None,
             category: None,
+        }
+    }
+}
+
+/// A DNS Firewall rule group, as stored.
+///
+/// `RuleCount` is DERIVED from [`Self::rules`] and never held separately — the
+/// same way [`FirewallDomainListRecord::domain_count`] derives from its domains
+/// — so the count and the rules cannot disagree.
+#[derive(Debug, Clone, Default)]
+pub struct FirewallRuleGroupRecord {
+    /// Position in the store's creation order, from
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::id_seq`]. It is the
+    /// list order and the source of the minted id.
+    pub seq: u64,
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    /// "The Amazon Web Services account ID for the account that created the rule
+    /// group."
+    pub owner_id: String,
+    pub creator_request_id: String,
+    /// The `ShareStatus` this rule group reports; the emulator has one account,
+    /// so it is [`SHARE_STATUS_NOT_SHARED`] until a resource policy shares it.
+    pub share_status: String,
+    /// The rules this group filters DNS traffic with, in the order they were
+    /// added — a group is created empty ("you can add rules to the new rule
+    /// group by calling CreateFirewallRule"), so the rule operations are what
+    /// populate it.
+    pub rules: Vec<FirewallRule>,
+    /// The `FirewallRuleGroupStatus` this group reports, as of
+    /// [`Self::settled_at`].
+    pub status: String,
+    pub status_message: Option<String>,
+    /// `CreateFirewallRuleGroup$Tags`, kept with the record so they are not
+    /// silently discarded. `FirewallRuleGroup` models no `Tags` member, so no
+    /// response reports them: `ListTagsForResource` is a separate operation.
+    pub tags: Vec<Tag>,
+    pub creation_time: String,
+    pub modification_time: String,
+    /// The instant at which the move from the transient [`Self::status`] to
+    /// [`FIREWALL_RULE_GROUP_STATUS_COMPLETE`] is owed, or `None` for a group
+    /// with no transition in flight (one nobody has changed since it was
+    /// created empty).
+    pub settled_at: Option<Instant>,
+}
+
+impl FirewallRuleGroupRecord {
+    /// `RuleCount`: "The number of rules in the rule group."
+    pub fn rule_count(&self) -> i32 {
+        i32::try_from(self.rules.len()).unwrap_or(i32::MAX)
+    }
+
+    /// This group's `FirewallRuleGroupStatus` as of `now`: the transient status
+    /// until the transition the clock owes falls due,
+    /// [`FIREWALL_RULE_GROUP_STATUS_COMPLETE`] after it — the same shape as
+    /// [`FirewallDomainListRecord::status_at`].
+    pub fn status_at(&self, now: Instant) -> &str {
+        match self.settled_at {
+            Some(due) if now < due => &self.status,
+            Some(_) => FIREWALL_RULE_GROUP_STATUS_COMPLETE,
+            None => &self.status,
+        }
+    }
+
+    /// Project the record onto the modelled `FirewallRuleGroup`.
+    pub fn to_rule_group(&self, now: Instant) -> FirewallRuleGroup {
+        FirewallRuleGroup {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            rule_count: Some(self.rule_count()),
+            status: Some(self.status_at(now).to_string()),
+            status_message: self.status_message.clone(),
+            owner_id: Some(self.owner_id.clone()),
+            creator_request_id: Some(self.creator_request_id.clone()),
+            share_status: Some(self.share_status.clone()),
+            creation_time: Some(self.creation_time.clone()),
+            modification_time: Some(self.modification_time.clone()),
         }
     }
 }
@@ -2969,11 +3131,12 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 /// `firewall-domain-list/<id>`, `resolver-query-log-config/<id>`); the shape
 /// names are what every other refusal of this service reports in
 /// `ResourceNotFoundException$ResourceType`.
-const TAGGABLE_ARN_SEGMENTS: [(&str, &str); 5] = [
+const TAGGABLE_ARN_SEGMENTS: [(&str, &str); 6] = [
     ("resolver-endpoint", RESOURCE_TYPE_RESOLVER_ENDPOINT),
     ("resolver-rule", RESOURCE_TYPE_RESOLVER_RULE),
     ("outpost-resolver", RESOURCE_TYPE_OUTPOST_RESOLVER),
     ("firewall-domain-list", RESOURCE_TYPE_FIREWALL_DOMAIN_LIST),
+    ("firewall-rule-group", RESOURCE_TYPE_FIREWALL_RULE_GROUP),
     (
         "resolver-query-log-config",
         RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG,
@@ -3007,6 +3170,7 @@ pub enum TaggedResource {
     ResolverRule(String),
     OutpostResolver(String),
     FirewallDomainList(String),
+    FirewallRuleGroup(String),
     ResolverQueryLogConfig(String),
 }
 
@@ -3140,6 +3304,13 @@ pub struct ComAmazonawsRoute53resolverRoute53resolverState {
     /// `CreatorRequestId` identifies a request to ONE operation, so this map is
     /// kept apart from theirs.
     pub firewall_domain_list_creator_request_ids: HashMap<String, String>,
+    /// Every stored DNS Firewall rule group, keyed by its `Id`.
+    pub firewall_rule_groups: HashMap<String, FirewallRuleGroupRecord>,
+    /// `CreatorRequestId` -> firewall rule group id, the same retry index as
+    /// [`Self::creator_request_id_index`] for the other resources: a
+    /// `CreatorRequestId` identifies a request to ONE operation, so this map is
+    /// kept apart from theirs.
+    pub firewall_rule_group_creator_request_ids: HashMap<String, String>,
     /// Every stored Resolver query logging configuration, keyed by its `Id`.
     pub resolver_query_log_configs: HashMap<String, ResolverQueryLogConfigRecord>,
     /// `CreatorRequestId` -> query logging configuration id, the same retry
@@ -3296,6 +3467,13 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
     /// refuses answers `LimitExceededException` and writes nothing.
     pub fn can_store_another_firewall_domain_list(&self) -> bool {
         self.firewall_domain_lists.len() < MAX_STORED_FIREWALL_DOMAIN_LISTS
+    }
+
+    /// Whether one more firewall rule group may be stored, i.e. the store is
+    /// still below [`MAX_STORED_FIREWALL_RULE_GROUPS`]. A create that this
+    /// refuses answers `LimitExceededException` and writes nothing.
+    pub fn can_store_another_firewall_rule_group(&self) -> bool {
+        self.firewall_rule_groups.len() < MAX_STORED_FIREWALL_RULE_GROUPS
     }
 
     /// Whether one more query logging configuration may be stored, i.e. the
@@ -3553,6 +3731,13 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             return Some(TaggedResource::FirewallDomainList(record.id.clone()));
         }
         if let Some(record) = self
+            .firewall_rule_groups
+            .values()
+            .find(|record| record.arn == resource_arn)
+        {
+            return Some(TaggedResource::FirewallRuleGroup(record.id.clone()));
+        }
+        if let Some(record) = self
             .resolver_query_log_configs
             .values()
             .find(|record| record.arn == resource_arn)
@@ -3582,6 +3767,10 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                 .firewall_domain_lists
                 .get(&id)
                 .map(|record| record.tags.as_slice()),
+            TaggedResource::FirewallRuleGroup(id) => self
+                .firewall_rule_groups
+                .get(&id)
+                .map(|record| record.tags.as_slice()),
             TaggedResource::ResolverQueryLogConfig(id) => self
                 .resolver_query_log_configs
                 .get(&id)
@@ -3608,6 +3797,10 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
                 .map(|record| &mut record.tags),
             TaggedResource::FirewallDomainList(id) => self
                 .firewall_domain_lists
+                .get_mut(&id)
+                .map(|record| &mut record.tags),
+            TaggedResource::FirewallRuleGroup(id) => self
+                .firewall_rule_groups
                 .get_mut(&id)
                 .map(|record| &mut record.tags),
             TaggedResource::ResolverQueryLogConfig(id) => self
@@ -3703,6 +3896,13 @@ pub fn mint_rule_association_id(seq: u64) -> String {
 /// (length 1..64).
 pub fn mint_firewall_domain_list_id(seq: u64) -> String {
     format!("rslvr-fdl-{:016x}", scramble(seq))
+}
+
+/// Mint the `Id` of a firewall rule group from the id sequence. AWS names a DNS
+/// Firewall rule group `rslvr-frg-<hex>`. Every result fits `ResourceId`
+/// (length 1..64).
+pub fn mint_firewall_rule_group_id(seq: u64) -> String {
+    format!("rslvr-frg-{:016x}", scramble(seq))
 }
 
 /// The `Id` of a VPC's DNS Firewall configuration. AWS names one

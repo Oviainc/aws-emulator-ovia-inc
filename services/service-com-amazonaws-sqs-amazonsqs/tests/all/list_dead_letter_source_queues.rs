@@ -20,7 +20,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{
-    invalid_parameter_message, invalid_parameter_message_without_value,
+    invalid_parameter_message_without_value, INVALID_NEXT_TOKEN_MESSAGE,
     LIST_DEAD_LETTER_SOURCE_QUEUES_MAX_RESULTS_RANGE, QUEUE_DOES_NOT_EXIST_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -385,22 +385,14 @@ async fn a_request_the_listing_will_not_take_is_refused_with_its_own_message() {
             request: json!({"QueueUrl": dead_letter, "NextToken": "not-a-cursor"}),
             status: 400,
             code: "InvalidParameterValue",
-            message: invalid_parameter_message(
-                "not-a-cursor",
-                "NextToken",
-                "it was not issued by this listing.",
-            ),
+            message: INVALID_NEXT_TOKEN_MESSAGE.to_string(),
         },
         Refusal {
             case: "a cursor past the end of the listing it claims to continue",
             request: json!({"QueueUrl": dead_letter, "NextToken": "9"}),
             status: 400,
             code: "InvalidParameterValue",
-            message: invalid_parameter_message(
-                "9",
-                "NextToken",
-                "it was not issued by this listing.",
-            ),
+            message: INVALID_NEXT_TOKEN_MESSAGE.to_string(),
         },
         Refusal {
             case: "a url of a queue that was never created",

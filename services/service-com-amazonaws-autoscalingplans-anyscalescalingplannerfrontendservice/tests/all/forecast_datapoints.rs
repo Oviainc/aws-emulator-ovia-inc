@@ -101,7 +101,10 @@ fn forecast_request(
 ///
 /// Both members of `Datapoint` are read: a data point that carries neither is not a
 /// forecast of anything.
-async fn points(
+///
+/// `pub(crate)` so a suite asserting what the data points of an answer carry reads them
+/// here rather than parsing the list a second way.
+pub(crate) async fn points(
     emulator: &Emulator,
     plan: &str,
     resource_id: &str,
@@ -151,7 +154,9 @@ fn whole_units(value: f64) -> f64 {
 }
 
 /// Assert two doubles are the same value to within floating-point slack.
-fn assert_close(actual: f64, expected: f64, case: &str) {
+///
+/// `pub(crate)` so every suite comparing two forecast values allows the same slack.
+pub(crate) fn assert_close(actual: f64, expected: f64, case: &str) {
     assert!(
         (actual - expected).abs() <= TOLERANCE * expected.abs().max(1.0),
         "case {case}: expected {expected}, got {actual}"
