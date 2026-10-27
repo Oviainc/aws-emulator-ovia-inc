@@ -3,18 +3,19 @@
 //! The `{{resolve:...}}` DYNAMIC REFERENCES a template's resource properties carry, end to
 //! end over the wire.
 //!
-//! RULE: a dynamic reference in a resource property is resolved as the resource is
-//! DEPLOYED, against the store the reference names, and the FORM of the reference decides
-//! both which values that store may answer with — `ssm` resolves a Parameter Store
-//! parameter held as plain text (`String`, `StringList`) and `ssm-secure` resolves only one
-//! held encrypted (`SecureString`) — and WHERE the reference may stand: a secure reference
-//! is supported only in the resource properties AWS publishes for it. A reference the
-//! deployment cannot honour (no such parameter, no such version, a type that form does not
-//! resolve, or a secure one standing in an unsupported property) FAILS the resource
-//! carrying it: the resource is recorded `CREATE_FAILED` and the stack rolls back to
-//! `ROLLBACK_COMPLETE`. A reference it can honour reaches the service that owns the
-//! resource as the VALUE, and a secure one's value is kept out of everything the stack
-//! itself reports.
+//! RULE: CloudFormation resolves a template's dynamic references ITSELF, against the store
+//! each one names, BEFORE the deployment asks any owning service for anything, and the FORM
+//! of the reference decides both which values that store may answer with — `ssm` resolves a
+//! Parameter Store parameter held as plain text (`String`, `StringList`) and `ssm-secure`
+//! resolves only one held encrypted (`SecureString`) — and WHERE the reference may stand: a
+//! secure reference is supported only in the resource properties AWS publishes for it. A
+//! reference the deployment cannot honour (no such parameter, no such version, a type that
+//! form does not resolve, or a secure one standing in an unsupported property) is
+//! CloudFormation's OWN refusal of the deployment: no resource is deployed at all, the
+//! diagnostic saying which reference could not be honoured and why is what the STACK
+//! reports as its status reason, and the create rolls back to `ROLLBACK_COMPLETE`. A
+//! reference it can honour reaches the service that owns the resource as the VALUE, and a
+//! secure one's value is kept out of everything the stack itself reports.
 //!
 //! The rows differ along what the rule generalises over: the form, the type the parameter
 //! is held under, whether a version selector is given and whether it exists, whether the
@@ -229,9 +230,9 @@ struct Row<'a> {
     /// For a row that completes and whose carrier reports the property back: the value the
     /// deployed resource must carry, which is the property with its reference resolved.
     deployed_value: Option<&'a str>,
-    /// For a row that rolls back: the fixed texts the failed resource's
-    /// `ResourceStatusReason` must carry, so the reason says WHY the reference could not be
-    /// honoured and not merely that it could not. `{name}` stands for the parameter name.
+    /// For a row that rolls back: the fixed texts the STACK's own `ResourceStatusReason`
+    /// must carry, so the reason says WHY the reference could not be honoured and not merely
+    /// that something could not be created. `{name}` stands for the parameter name.
     reason: &'a [&'a str],
 }
 
@@ -494,34 +495,51 @@ async fn a_dynamic_reference_is_honoured_only_as_its_form_allows() {
             row.case
         );
 
-        // The resource carrying the reference is what failed, and the reason says which
-        // reference could not be honoured and why.
+        // A reference the deployment cannot honour is CLOUDFORMATION's own refusal: the
+        // diagnostic is on the stack's own events and nothing was asked about the resource
+        // carrying it. One it can honour is resolved and the resource really deployed.
         let events = resource_events(&router, row.stack, CARRIER).await;
+        let stack_events = resource_events(&router, row.stack, row.stack).await;
         let failed = events
             .iter()
             .find(|(event_status, _)| event_status == resource_status::CREATE_FAILED);
         match row.expected {
             Deployed::RolledBack => {
-                let Some((_, reason)) = failed else {
+                // The newest event the stack recorded about ITSELF that carries a reason:
+                // what a client reads to learn why the deployment failed.
+                let Some((_, reason)) = stack_events
+                    .iter()
+                    .find(|(_, reason)| !reason.is_empty())
+                else {
                     panic!(
-                        "case {:?}: expected a CREATE_FAILED event for {CARRIER}, got \
-                         {events:?}",
+                        "case {:?}: expected the stack's own events to report why the \
+                         deployment failed, got {stack_events:?}",
                         row.case
                     );
                 };
+                let stack_reason = xml_text(&described, "StackStatusReason").unwrap_or_default();
                 for fragment in row.reason {
                     let fragment = fragment.replace("{name}", &name);
                     assert!(
                         reason.contains(&fragment),
-                        "case {:?}: expected the reason to carry {fragment:?}, got {reason:?}",
+                        "case {:?}: expected the stack's reason to carry {fragment:?}, got \
+                         {reason:?}",
+                        row.case
+                    );
+                    assert!(
+                        stack_reason.contains(&fragment),
+                        "case {:?}: expected StackStatusReason to carry {fragment:?}, got \
+                         {stack_reason:?}",
                         row.case
                     );
                 }
-                let stack_reason = xml_text(&described, "StackStatusReason").unwrap_or_default();
+                // Nothing was asked of the service that owns the resource carrying the
+                // reference: CloudFormation refused the deployment before it deployed
+                // anything, so that resource has no event of its own at all.
                 assert!(
-                    stack_reason.contains(CARRIER),
-                    "case {:?}: expected the stack's reason to name the failed resource, got \
-                     {stack_reason:?}",
+                    events.is_empty(),
+                    "case {:?}: expected no event for {CARRIER} — nothing was deployed — got \
+                     {events:?}",
                     row.case
                 );
             }
@@ -561,6 +579,99 @@ async fn a_dynamic_reference_is_honoured_only_as_its_form_allows() {
                 row.case
             );
         }
+    }
+}
+
+/// CloudFormation's resolution of a template's dynamic references is its OWN gate on the
+/// deployment, run BEFORE any owning service is asked for anything: a reference it cannot
+/// honour fails the stack with the resolver's diagnostic and NOTHING is deployed — not even
+/// a resource the template declares ahead of the one carrying the reference.
+#[tokio::test]
+async fn a_reference_that_cannot_be_honoured_is_refused_before_anything_is_deployed() {
+    let router = router();
+    let stack = "dynref-gate";
+    // A parameter held as plain text, which is not what the secure form resolves.
+    let source = format!("/{stack}/source");
+    put_parameter(&router, "the gate", &source, "String", "not-a-secret").await;
+
+    // Two resources, with the misuse on the one declared SECOND: a deployment that resolved
+    // each reference only as it reached that resource would already have created `Alpha` in
+    // Systems Manager by the time it reached `Zulu`.
+    let deployed_by_the_stack = format!("/{stack}/alpha");
+    let misuse = format!("{{{{resolve:ssm-secure:{source}}}}}");
+    let template = json!({
+        "Resources": {
+            "Alpha": {
+                "Type": "AWS::SSM::Parameter",
+                "Properties": {
+                    "Name": deployed_by_the_stack,
+                    "Type": "String",
+                    "Value": "a plain literal"
+                }
+            },
+            "Zulu": {
+                "Type": "AWS::RDS::DBInstance",
+                "Properties": {
+                    "DBInstanceIdentifier": db_identifier(stack),
+                    "Engine": "mysql",
+                    "DBInstanceClass": "db.t3.micro",
+                    "MasterUsername": "probeadmin",
+                    "MasterUserPassword": misuse
+                }
+            }
+        }
+    })
+    .to_string();
+    let (status_code, created) = create_stack(&router, stack, &template, &[]).await;
+    assert_eq!(
+        status_code, 200,
+        "CreateStack must answer 200 — the deployment is what reports the outcome — got \
+         {status_code} {created}"
+    );
+    // Twice: a failed create owes its rollback a transition of its own past the one the
+    // create itself took.
+    wait_for_the_transition().await;
+    wait_for_the_transition().await;
+
+    let (_, described) = describe_stack(&router, stack).await;
+    assert_eq!(
+        xml_text(&described, "StackStatus").as_deref(),
+        Some(status::ROLLBACK_COMPLETE),
+        "a reference the deployment cannot honour rolls the create back, got {described}"
+    );
+    let stack_reason = xml_text(&described, "StackStatusReason").unwrap_or_default();
+    for fragment in [
+        "ssm-secure prefix was used for non-secure parameter",
+        source.as_str(),
+    ] {
+        assert!(
+            stack_reason.contains(fragment),
+            "case {stack:?}: expected the stack's reason to carry {fragment:?}, got \
+             {stack_reason:?}"
+        );
+    }
+
+    // Neither resource was asked of its owning service: the parameter the stack would have
+    // written is not in Systems Manager, the database is not in Amazon RDS, and neither
+    // logical resource has an event of its own.
+    let alpha = parameter_value(&router, &deployed_by_the_stack).await;
+    assert_eq!(
+        alpha, None,
+        "expected the resource declared ahead of the misuse never to be deployed, got \
+         {alpha:?}"
+    );
+    let zulu = master_username(&router, &db_identifier(stack)).await;
+    assert_eq!(
+        zulu, None,
+        "expected the resource carrying the misuse never to be deployed, got {zulu:?}"
+    );
+    for logical_id in ["Alpha", "Zulu"] {
+        let events = resource_events(&router, stack, logical_id).await;
+        assert!(
+            events.is_empty(),
+            "case {logical_id:?}: expected no resource event — nothing was deployed — got \
+             {events:?}"
+        );
     }
 }
 

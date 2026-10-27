@@ -83,6 +83,8 @@ mod snapshot_copy_configuration;
 mod snapshot_copy_grant_kms_keys;
 #[path = "all/snapshot_copy_grants.rs"]
 mod snapshot_copy_grants;
+#[path = "all/snapshot_copy_retention_period.rs"]
+mod snapshot_copy_retention_period;
 #[path = "all/snapshot_restore.rs"]
 mod snapshot_restore;
 #[path = "all/state_roundtrip.rs"]

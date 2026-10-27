@@ -363,7 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // distribution naming a certificate that secures nothing.
             if let Some(certificate_name) = &input.certificate_name {
                 store
-                    .attachable_certificate(certificate_name)
+                    .issued_certificate(certificate_name)
                     .map_err(|refusal| certificate_refusal(certificate_name, refusal))?;
             }
 
@@ -478,19 +478,21 @@ fn not_found(message: String) -> CreateDistributionError {
 /// This operation's rendering of a certificate the store says no distribution
 /// may serve HTTPS traffic with: a name this account holds no certificate under
 /// is the `DoesNotExist` envelope, and a certificate that is not issued yet is
-/// the modelled `OperationFailureException` carrying the store's message.
+/// the modelled `OperationFailureException` carrying the rule's own message.
 fn certificate_refusal(
     certificate_name: &str,
-    refusal: crate::state::CertificateNotAttachable,
+    refusal: crate::state::CertificateNotUsable,
 ) -> CreateDistributionError {
     match refusal {
-        crate::state::CertificateNotAttachable::DoesNotExist => {
+        crate::state::CertificateNotUsable::DoesNotExist => {
             crate::scaffolded::Scaffolded::resource_does_not_exist(
                 crate::state::RESOURCE_TYPE_CERTIFICATE,
                 certificate_name,
             )
         }
-        crate::state::CertificateNotAttachable::NotIssued(message) => operation_failure(message),
+        crate::state::CertificateNotUsable::NotIssued { status } => operation_failure(
+            crate::state::certificate_not_issued_for_distribution(certificate_name, status),
+        ),
     }
 }
 

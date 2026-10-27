@@ -5076,6 +5076,10 @@ pub fn stack_cannot_be_updated(stack_id: &str, status: &str) -> String {
 /// Whether a stack whose last operation left it in `status` can take an UPDATE at all, or
 /// whether the request is the refusal [`stack_cannot_be_updated`] words.
 ///
+/// Shared by `UpdateStack` and by the UPDATE change sets `CreateChangeSet` plans, which is
+/// an update of the stack as it stands: the statuses that take the plan are the statuses
+/// that take the update, so the two cannot drift apart.
+///
 /// An update changes the configuration the stack HOLDS, so it is accepted from the statuses
 /// a stack's last operation COMPLETED in — and from the two failed statuses an operation
 /// that PRESERVED what it had provisioned leaves (`UpdateStackInput$DisableRollback`:

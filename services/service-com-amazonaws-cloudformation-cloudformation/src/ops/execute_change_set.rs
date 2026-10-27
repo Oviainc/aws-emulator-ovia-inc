@@ -464,11 +464,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     match materialised.failure {
                         None => None,
                         Some(failure) => {
-                            // A resource an owning service refused: the stack does not
+                            // The deployment could not be carried out: the stack does not
                             // reach the status this execution was headed for, and it
-                            // reports the summary of what failed
-                            // ([`crate::state::resource_failure_summary`]) — that
-                            // service's own refusal is on the failing resource's event.
+                            // reports what failed
+                            // ([`crate::state::provisioning::Materialised::failure`]) —
+                            // the summary of the resources an owning service refused,
+                            // whose own refusals are on those resources' events, or
+                            // CloudFormation's own diagnostic where it refused the
+                            // deployment before asking anybody.
                             let creating = stack.status == status::CREATE_IN_PROGRESS;
                             let failed = if creating {
                                 status::CREATE_FAILED

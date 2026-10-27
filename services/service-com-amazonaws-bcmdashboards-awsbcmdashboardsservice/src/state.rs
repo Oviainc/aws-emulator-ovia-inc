@@ -351,6 +351,32 @@ impl ScheduledReportCreation {
     pub fn in_progress_at(&self, now: SystemTime) -> bool {
         now < self.in_progress_until
     }
+
+    /// The `ConflictException` message a `CreateScheduledReport` call presenting this
+    /// record's `clientToken` is refused with at `now`.
+    ///
+    /// The service words the refusal from the state of the create the token already
+    /// started, and the wording is part of the contract: a client decides from it whether
+    /// to back off and retry (the creation is still in flight, so the conflict is
+    /// transient) or to pick another token (the report exists, so the conflict is
+    /// terminal). Both texts are therefore FIXED; the only value either of them carries
+    /// is the ARN this record stores, which the caller may act on. The presented token is
+    /// deliberately absent from both: it is the caller's idempotency key, and an error
+    /// body is not where it belongs.
+    pub fn conflict_message(&self, now: SystemTime) -> String {
+        if self.in_progress_at(now) {
+            "A scheduled report creation is already in progress for the provided \
+             clientToken. Please retry after some time."
+                .to_string()
+        } else {
+            format!(
+                "A scheduled report with the provided clientToken already exists (ARN: {}). \
+                 Use a different clientToken to create a new scheduled report, or use the \
+                 existing report's ARN to update it.",
+                self.arn
+            )
+        }
+    }
 }
 
 /// A canonical rendering of a `CreateScheduledReport` request, so two calls can be

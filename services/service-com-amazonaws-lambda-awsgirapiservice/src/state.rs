@@ -412,10 +412,10 @@ pub const CODE_SIGNING_CONFIG_IN_USE_MESSAGE: &str =
 ///
 /// A code-signing configuration is one of the resource kinds AWS gives its own 404 sentence
 /// to rather than the canonical [`RESOURCE_NOT_FOUND_MESSAGE`], so every operation whose
-/// OWN resource is the configuration — `GetCodeSigningConfig`, `UpdateCodeSigningConfig`
-/// and `DeleteCodeSigningConfig`, each addressing it by `CodeSigningConfigArn` — answers
-/// this one sentence, and a configuration that was deleted reads exactly like one that
-/// never existed.
+/// OWN resource is the configuration — `GetCodeSigningConfig`, `UpdateCodeSigningConfig`,
+/// `DeleteCodeSigningConfig` and `ListFunctionsByCodeSigningConfig`, each addressing it by
+/// `CodeSigningConfigArn` — answers this one sentence, and a configuration that was
+/// deleted reads exactly like one that never existed.
 ///
 /// It is a different sentence from [`code_signing_config_not_found_message`], which belongs
 /// to the modelled `CodeSigningConfigNotFoundException` an operation on a FUNCTION answers
@@ -1664,6 +1664,18 @@ pub const ASYNC_NOT_EXECUTED_REASON: &str =
 /// the event was queued, and no operation reads the queue back out.
 pub const MAX_QUEUED_ASYNC_INVOCATIONS: usize = 100;
 
+/// The most durable executions this emulator keeps for one function.
+///
+/// An EMULATOR-CHOSEN ceiling for the same reason as [`MAX_FUNCTIONS`]: the executions
+/// are held in memory, every start adds one keyed by the name the caller chose and
+/// nothing ever removes one, so past this point a start is REFUSED rather than the store
+/// growing without bound. It refuses rather than making room the way the asynchronous
+/// queue does ([`MAX_QUEUED_ASYNC_INVOCATIONS`]), because `ListDurableExecutionsByFunction`
+/// reports every execution that was started: dropping one would un-report work this
+/// emulator accepted. AWS bounds a function's executions by its concurrency quotas
+/// instead.
+pub const MAX_DURABLE_EXECUTIONS: usize = 1_000;
+
 /// The model's `ExecutionStatus` value a durable execution carries while it is still
 /// running (`smithy_query(query="shape", shape="ExecutionStatus")`: `RUNNING`,
 /// `SUCCEEDED`, `FAILED`, `TIMED_OUT`, `STOPPED`).
@@ -1956,7 +1968,8 @@ pub struct FunctionRecord {
     /// The durable executions of this function, keyed by execution name — the name
     /// "must be unique within the function"
     /// (`Invoke$DurableExecutionAlreadyStartedException`), so one name names one
-    /// execution however it is addressed, and the map's order is stable.
+    /// execution however it is addressed, and the map's order is stable. Bounded by
+    /// [`MAX_DURABLE_EXECUTIONS`].
     pub durable_executions: BTreeMap<String, DurableExecutionRecord>,
     /// The runtime management configuration of each version that has had one stored,
     /// keyed by the version label it belongs to — [`VERSION_LATEST`] or a published
@@ -2121,10 +2134,16 @@ impl FunctionRecord {
     }
 
     /// Start a durable execution named `name` against `version` at `now`, answering the
-    /// ARN it is addressed by, or `None` when this function already holds an execution
-    /// of that name — the state `Invoke`'s `DurableExecutionAlreadyStartedException`
-    /// describes ("Each durable execution name must be unique within the function"), so
-    /// a start never replaces an execution already held.
+    /// ARN it is addressed by, or `None` when it cannot be started.
+    ///
+    /// It is not started, and nothing is stored, in either of two cases, which a caller
+    /// tells apart by reading [`FunctionRecord::durable_executions`] itself: this
+    /// function already holds an execution of that name — the state `Invoke`'s
+    /// `DurableExecutionAlreadyStartedException` describes ("Each durable execution name
+    /// must be unique within the function"), so a start never replaces an execution
+    /// already held — or it already holds [`MAX_DURABLE_EXECUTIONS`] of them, the
+    /// ceiling that keeps the map (and the per-read walk over it in
+    /// [`FunctionRecord::materialize`]) bounded.
     ///
     /// The execution's settings come from the function's own `DurableConfig`: the key it
     /// encrypts payload data under, and the `ExecutionTimeout` whose due instant is
@@ -2136,6 +2155,9 @@ impl FunctionRecord {
         now: SystemTime,
     ) -> Option<String> {
         if self.durable_executions.contains_key(name) {
+            return None;
+        }
+        if self.durable_executions.len() >= MAX_DURABLE_EXECUTIONS {
             return None;
         }
         let durable_config = self
@@ -3841,6 +3863,11 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
     /// set and read it take an unqualified `FunctionName`, so a published version is not
     /// a separate user of the configuration and a function appears here at most once,
     /// under its own unqualified ARN.
+    ///
+    /// It is the one place the association is read from the other side: both
+    /// `ListFunctionsByCodeSigningConfig`, which reports these ARNs, and
+    /// `DeleteCodeSigningConfig`, which refuses a delete while any of them hold the
+    /// configuration, answer from this list.
     #[must_use]
     pub fn code_signing_config_users(&self, config_arn: &str) -> Vec<String> {
         self.functions

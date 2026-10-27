@@ -193,7 +193,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name one this service serves, and the caller-sized collection of
         // public domain names must be within its bound. Both are resolved
         // BEFORE the store is reached, so a request with one bad member changes
-        // none of the others either.
+        // none of the others either. WHICH certificate those names may be keyed
+        // by is the store's business, asked below.
         let power = input
             .power
             .as_deref()
@@ -206,9 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })
             .transpose()?;
-        // Whether a public domain name is backed by a validated certificate is
-        // `CreateCertificate`'s business, which this emulator does not hold yet,
-        // so the names are kept as asked for and only their COUNT is bounded.
         let public_domain_names = input
             .public_domain_names
             .as_ref()
@@ -229,6 +227,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::with_state(&*self.engine, |store| {
             // A service is UPDATED here, never created, so a name that names
             // none in this region is the service's `DoesNotExist` rejection.
+            if store
+                .container_service(&region, &input.service_name)
+                .is_none()
+            {
+                return Err(not_found(&input.service_name));
+            }
+            // A group of public domain names is keyed by the SSL/TLS certificate
+            // that secures them — "You must create and validate an SSL/TLS
+            // certificate before you can use public domain names with your
+            // container service" — so each key the request carries has to name a
+            // certificate this account holds and one the certificate authority
+            // has already issued, the same rule a distribution's certificate
+            // answers to, asked of the store's one owner of it. Answered BEFORE
+            // the first write, so a refused update leaves the service reporting
+            // the domains it already served and none under a certificate that
+            // secures nothing.
+            if let Some((certificate_name, refusal)) = public_domain_names
+                .as_ref()
+                .and_then(|names| store.unusable_public_domain_certificate(names))
+            {
+                return Err(certificate_refusal(&certificate_name, refusal));
+            }
+            // The record to change, taken mutably now that both refusals above
+            // are past: the name resolved a moment ago under this same lock, so
+            // the `DoesNotExist` arm here is unreachable rather than a second
+            // rule.
             let service = store
                 .container_service_mut(&region, &input.service_name)
                 .ok_or_else(|| not_found(&input.service_name))?;
@@ -338,6 +362,29 @@ fn not_found(name: &str) -> UpdateContainerServiceError {
         crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
         name,
     )
+}
+
+/// This operation's rendering of a certificate the store says no public domain
+/// name may be served under: a name this account holds no certificate under is
+/// Lightsail's `DoesNotExist` envelope, and a certificate the certificate
+/// authority has not issued yet is the modelled `InvalidInputException` — the
+/// one client-input error this operation declares — carrying the rule's own
+/// message.
+fn certificate_refusal(
+    certificate_name: &str,
+    refusal: crate::state::CertificateNotUsable,
+) -> UpdateContainerServiceError {
+    match refusal {
+        crate::state::CertificateNotUsable::DoesNotExist => {
+            crate::scaffolded::Scaffolded::resource_does_not_exist(
+                crate::state::RESOURCE_TYPE_CERTIFICATE,
+                certificate_name,
+            )
+        }
+        crate::state::CertificateNotUsable::NotIssued { status } => invalid(
+            crate::state::certificate_not_issued_for_public_domain_names(certificate_name, status),
+        ),
+    }
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

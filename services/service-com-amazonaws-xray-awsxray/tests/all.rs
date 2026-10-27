@@ -26,6 +26,9 @@ mod group_identifier_exclusivity;
 #[path = "all/indexing_rules.rs"]
 mod indexing_rules;
 
+#[path = "all/inferred_service_type.rs"]
+mod inferred_service_type;
+
 #[path = "all/insight_impact_graph.rs"]
 mod insight_impact_graph;
 

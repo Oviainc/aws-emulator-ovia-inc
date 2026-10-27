@@ -253,6 +253,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A hop destination's `Queue` is a reference to a queue resource exactly as the
+        // member above is, so a value carrying no characters is the same problem in the
+        // request, answered here — before any reference is resolved — rather than as a
+        // lookup of a name nothing could hold.
+        if let Some(problem) = input
+            .hop_destinations
+            .as_deref()
+            .and_then(crate::state::hop_destination_blank_queue_problem)
+        {
+            return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some(problem),
+            })
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 

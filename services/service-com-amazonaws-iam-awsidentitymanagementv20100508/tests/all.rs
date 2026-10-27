@@ -59,6 +59,8 @@ mod group_policy_listing;
 mod human_readable_summaries;
 #[path = "all/identity_policy_enforcement.rs"]
 mod identity_policy_enforcement;
+#[path = "all/inline_policy_size_quota.rs"]
+mod inline_policy_size_quota;
 #[path = "all/instance_profile_listing.rs"]
 mod instance_profile_listing;
 #[path = "all/instance_profile_role_binding.rs"]

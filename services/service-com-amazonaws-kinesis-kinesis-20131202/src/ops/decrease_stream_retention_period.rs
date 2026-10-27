@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DecreaseStreamRetentionPeriod
+//!
 //! Shortens the retention window of the stream the request names, reading and writing the
 //! `streams` store this service's [`crate::state`] owns.
 //!

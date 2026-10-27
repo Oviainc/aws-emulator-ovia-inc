@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchAssociateDataSegmentsToDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchAssociateDataSegmentsToDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchAssociateDataSegmentsToDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below stores, on the curated dataset the request
+//! names, one data segment per entry — the slice of ONE time series the entry's
+//! half-open span covers, taken from the source session dataset the entry names —
+//! and takes the dataset to its next version when it accepted at least one entry.
+//! An entry whose span covers no time, whose source dataset or time series the
+//! store does not hold, whose source is not a session dataset, or whose span
+//! overlaps a data segment of the same time series already associated with any
+//! dataset, is reported in `failedAssociations` with its own
+//! `DataSegmentErrorCode` while the rest of the batch is applied. A request
+//! naming more entries than one dataset can hold at all is refused outright with
+//! the modelled quota error.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +177,319 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchAssociateDataSegmentsToDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchAssociateDataSegmentsToDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchAssociateDataSegmentsToDataset"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchAssociateDataSegmentsToDatasetError::Modeled(
+                BatchAssociateDataSegmentsToDatasetErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> answer mapping, so a retry with the same token is applied as a
+        // fresh request — reporting the segments the first call stored as the
+        // overlaps they now are — rather than replaying the first answer. Left to
+        // the idempotency issue, exactly as `BatchDeleteDatasetDataSegments`,
+        // `CreateDataset` and `UpdateDataset` leave it.
+
+        // The model puts no `@length` on `associateDataSegmentEntries`, so what
+        // bounds the work one request asks for under the held store lock is this:
+        // a dataset holds at most [`crate::state::MAX_DATA_SEGMENTS_PER_DATASET`]
+        // segments, so a request naming more entries than that could not store them
+        // all whatever they said. The emulator's own bound rather than a published
+        // AWS default, which is why it is the modelled quota refusal.
+        if input.associate_data_segment_entries.len()
+            > crate::state::MAX_DATA_SEGMENTS_PER_DATASET
+        {
+            return Err(limit_exceeded(format!(
+                "A request associates at most {} data segments with a dataset, but this one \
+                 named {}.",
+                crate::state::MAX_DATA_SEGMENTS_PER_DATASET,
+                input.associate_data_segment_entries.len()
+            )));
+        }
+
+        let mut store = state.lock();
+
+        // `workspaceName` names "the name of the workspace that contains the
+        // dataset", so it SCOPES the lookup: a dataset held by another workspace, or
+        // by none at all, is not the dataset this request addresses — the same
+        // narrowing every other workspace-scoped lookup in this service applies.
+        let dataset = store
+            .datasets
+            .get(&input.dataset_id)
+            .filter(|dataset| dataset.workspace_name.as_deref() == Some(&input.workspace_name))
+            .ok_or_else(|| not_found(&input.dataset_id))?;
+        let dataset_type = dataset.dataset_type.clone();
+        // The version the dataset reports if this call accepts no entry at all.
+        let unchanged_version = dataset.version_label();
+
+        // This operation "associates a batch of data segments with a CURATED
+        // dataset", a curated dataset being the one that "curates data segments
+        // selected from source session datasets": a session dataset's segments are
+        // its own ingested data rather than a selection, so it is not a dataset
+        // segments are associated WITH. A dataset the store holds no type for states
+        // which side of that rule it falls on, so it is not refused here —
+        // `CreateDataset` keeps `datasetType` absent rather than guessing one.
+        if let Some(dataset_type) = dataset_type.filter(|held| held != DATASET_TYPE_CURATED) {
+            return Err(invalid_request(format!(
+                "Data segments can be associated only with a {DATASET_TYPE_CURATED} dataset, \
+                 but the dataset {} is a {dataset_type} dataset.",
+                input.dataset_id
+            )));
+        }
+
+        let mut failed_associations: Vec<FailedDataSegmentAssociation> = Vec::new();
+        let mut associated = 0usize;
+        for entry in &input.associate_data_segment_entries {
+            // A segment covers the half-open span its two bounds name, so a span
+            // whose start is not before its end covers no time and selects no data.
+            // The model constrains each bound on its own and says nothing about the
+            // pair, so this is the entry's own validation failure rather than a
+            // refusal of the whole batch.
+            if crate::state::timestamp_key(&entry.start_timestamp)
+                >= crate::state::timestamp_key(&entry.end_timestamp)
+            {
+                failed_associations.push(failed(
+                    entry,
+                    ERROR_CODE_VALIDATION_ERROR,
+                    crate::state::empty_span_message(),
+                ));
+                continue;
+            }
+
+            // A data segment is a slice "selected FROM a source session dataset"
+            // into the dataset that curates it, so the two are different datasets:
+            // the dataset a request addresses cannot also be the source its own
+            // data came from.
+            if entry.source_dataset_id == input.dataset_id {
+                failed_associations.push(failed(
+                    entry,
+                    ERROR_CODE_VALIDATION_ERROR,
+                    "sourceDatasetId must name a dataset other than the dataset the data \
+                     segments are associated with."
+                        .to_string(),
+                ));
+                continue;
+            }
+
+            // The source is resolved in the SAME workspace the request names, for
+            // the reason the target is: a dataset of another workspace is not one
+            // this request can reach.
+            let source_type = match store
+                .datasets
+                .get(&entry.source_dataset_id)
+                .filter(|source| source.workspace_name.as_deref() == Some(&input.workspace_name))
+            {
+                Some(source) => source.dataset_type.clone(),
+                None => {
+                    failed_associations.push(failed(
+                        entry,
+                        ERROR_CODE_RESOURCE_NOT_FOUND,
+                        crate::state::not_found_message(
+                            crate::state::RESOURCE_DATASET,
+                            &entry.source_dataset_id,
+                        ),
+                    ));
+                    continue;
+                }
+            };
+
+            // "Data segments are time-bounded slices of time series data selected
+            // from source SESSION datasets", so a dataset of any other type holds
+            // nothing an association can select. A source the store holds no type
+            // for is not refused, for the reason the target's own type is not.
+            if let Some(source_type) = source_type.filter(|held| held != DATASET_TYPE_SESSION) {
+                failed_associations.push(failed(
+                    entry,
+                    ERROR_CODE_VALIDATION_ERROR,
+                    format!(
+                        "Data segments can be associated only from a {DATASET_TYPE_SESSION} \
+                         dataset, but the dataset {} is a {source_type} dataset.",
+                        entry.source_dataset_id
+                    ),
+                ));
+                continue;
+            }
+
+            // A segment is a slice of ONE time series' data, so an entry naming a
+            // time series no stored data stream carries selects nothing: there is no
+            // series for the span to cut.
+            if store
+                .series_by_time_series_id(&entry.time_series_id)
+                .is_none()
+            {
+                failed_associations.push(failed(
+                    entry,
+                    ERROR_CODE_RESOURCE_NOT_FOUND,
+                    crate::state::not_found_message(
+                        crate::state::RESOURCE_TIME_SERIES,
+                        &entry.time_series_id,
+                    ),
+                ));
+                continue;
+            }
+
+            // "Data segments that belong to the same time series can't overlap in
+            // time, regardless of which dataset they belong to": the span offered is
+            // compared against every association this store holds of that series —
+            // this dataset's own, including one an earlier entry of this same batch
+            // has just stored, and every other dataset's.
+            if let Some(holder) = store
+                .overlapping_data_segment_association(
+                    &entry.time_series_id,
+                    &entry.start_timestamp,
+                    &entry.end_timestamp,
+                )
+                .map(|(dataset_id, _)| dataset_id.to_string())
+            {
+                failed_associations.push(failed(
+                    entry,
+                    ERROR_CODE_CONFLICTING_OPERATION,
+                    format!(
+                        "The data segment of time series {} overlaps a data segment already \
+                         associated with the dataset {holder}. Data segments that belong to \
+                         the same time series can't overlap in time, regardless of which \
+                         dataset they belong to.",
+                        entry.time_series_id
+                    ),
+                ));
+                continue;
+            }
+
+            // What the dataset now holds: the slice this entry selected, naming the
+            // source dataset its data came from, which is what tells an association
+            // apart from a session dataset's own data.
+            if !store.put_dataset_data_segment(
+                &input.dataset_id,
+                crate::state::DataSegmentRecord {
+                    source_dataset_id: entry.source_dataset_id.clone(),
+                    time_series_id: entry.time_series_id.clone(),
+                    start_timestamp: entry.start_timestamp.clone(),
+                    end_timestamp: entry.end_timestamp.clone(),
+                },
+            ) {
+                // Every other reason the writer refuses a segment was ruled out
+                // above (the span covers time, and a bound outside the modelled
+                // `TimeInNanos` is refused before this handler runs), so what is
+                // left is the dataset standing at the segments one dataset holds.
+                failed_associations.push(failed(
+                    entry,
+                    ERROR_CODE_LIMIT_EXCEEDED,
+                    format!(
+                        "This emulator holds at most {} data segments per dataset.",
+                        crate::state::MAX_DATA_SEGMENTS_PER_DATASET
+                    ),
+                ));
+                continue;
+            }
+            associated += 1;
+        }
+
+        // "The version of the dataset after association": a dataset's version counts
+        // the writes it has accepted, so a call that stored at least one segment
+        // takes it to its next version and reports `UPDATING` until the transition
+        // that write owes falls due, exactly as `UpdateDataset` does; a call every
+        // entry of which failed accepted no write and leaves the version where it
+        // was.
+        let dataset_version = match store.datasets.get_mut(&input.dataset_id) {
+            Some(dataset) if associated > 0 => {
+                dataset.begin_update(now);
+                dataset.version_label()
+            }
+            // The dataset resolved under this same held lock, so it is still there;
+            // the version it was read at is the answer when nothing was written.
+            _ => unchanged_version,
+        };
+
+        Ok(BatchAssociateDataSegmentsToDatasetOutput {
+            dataset_id: input.dataset_id.clone(),
+            dataset_version,
+            failed_associations,
+        })
     }
+}
+
+/// The `DatasetTypeEnum` value a data-segment association applies TO. Source:
+/// `smithy_query(query="shape", shape="DatasetTypeEnum")` — SESSION, CURATED,
+/// EXTERNAL.
+const DATASET_TYPE_CURATED: &str = "CURATED";
+
+/// The `DatasetTypeEnum` value a data-segment association selects FROM; see
+/// [`DATASET_TYPE_CURATED`] for the value list.
+const DATASET_TYPE_SESSION: &str = "SESSION";
+
+/// The `DataSegmentErrorCode` an entry naming a resource the store does not hold
+/// reports. Source: `crate::ops::types::DATA_SEGMENT_ERROR_CODE_VALUES` — the
+/// enum's whole value list is CONFLICTING_OPERATION | INTERNAL_FAILURE |
+/// LIMIT_EXCEEDED | RESOURCE_NOT_FOUND | VALIDATION_ERROR.
+const ERROR_CODE_RESOURCE_NOT_FOUND: &str = "RESOURCE_NOT_FOUND";
+
+/// The `DataSegmentErrorCode` an entry the request itself states wrongly
+/// reports; see [`ERROR_CODE_RESOURCE_NOT_FOUND`] for the value list.
+const ERROR_CODE_VALIDATION_ERROR: &str = "VALIDATION_ERROR";
+
+/// The `DataSegmentErrorCode` an entry overlapping an association already held
+/// reports; see [`ERROR_CODE_RESOURCE_NOT_FOUND`] for the value list.
+const ERROR_CODE_CONFLICTING_OPERATION: &str = "CONFLICTING_OPERATION";
+
+/// The `DataSegmentErrorCode` an entry the dataset has no room for reports; see
+/// [`ERROR_CODE_RESOURCE_NOT_FOUND`] for the value list.
+const ERROR_CODE_LIMIT_EXCEEDED: &str = "LIMIT_EXCEEDED";
+
+/// The `failedAssociations` element for an entry this call could not apply: the
+/// segment the entry addressed, echoed exactly as the request named it, plus the
+/// code and the message saying why.
+fn failed(
+    entry: &AssociateDataSegmentEntry,
+    error_code: &str,
+    error_message: String,
+) -> FailedDataSegmentAssociation {
+    FailedDataSegmentAssociation {
+        source_dataset_id: entry.source_dataset_id.clone(),
+        time_series_id: entry.time_series_id.clone(),
+        start_timestamp: entry.start_timestamp.clone(),
+        end_timestamp: entry.end_timestamp.clone(),
+        error_code: error_code.to_string(),
+        error_message,
+    }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the dataset id that resolved to
+/// nothing in the workspace the request named.
+fn not_found(dataset_id: &str) -> BatchAssociateDataSegmentsToDatasetError {
+    BatchAssociateDataSegmentsToDatasetError::Modeled(
+        BatchAssociateDataSegmentsToDatasetErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: crate::state::not_found_message(
+                    crate::state::RESOURCE_DATASET,
+                    dataset_id,
+                ),
+            },
+        ),
+    )
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> BatchAssociateDataSegmentsToDatasetError {
+    BatchAssociateDataSegmentsToDatasetError::Modeled(
+        BatchAssociateDataSegmentsToDatasetErrorModeled::InvalidRequestException(
+            InvalidRequestException { message },
+        ),
+    )
+}
+
+/// HTTP 410 `LimitExceededException` carrying `message`: the quota refusal this
+/// operation models, which is how a request asking for more work than the store
+/// can hold is answered.
+fn limit_exceeded(message: String) -> BatchAssociateDataSegmentsToDatasetError {
+    BatchAssociateDataSegmentsToDatasetError::Modeled(
+        BatchAssociateDataSegmentsToDatasetErrorModeled::LimitExceededException(
+            LimitExceededException { message },
+        ),
+    )
 }

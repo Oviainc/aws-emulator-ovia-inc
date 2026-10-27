@@ -6930,6 +6930,25 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             .iter_in_order()
             .filter(move |_| visible)
     }
+
+    /// The findings catalog rows a caller can read, in catalog order.
+    ///
+    /// The same gate [`visible_volumes`] applies: Compute Optimizer reports recommendations
+    /// for an ENROLLED account only, and only once the analysis that enrollment starts is
+    /// due ([`ANALYSIS_DELAY`]), so an account that never opted in, one that opted out, and
+    /// one that has just opted in all read the empty set rather than an analysis nothing has
+    /// produced yet. Every reader of [`Self::analysed_resources`] goes through here — the
+    /// per-resource readers of a catalogued recommendation and
+    /// [`analysed_resources_by_type`], which the summary reader and the export plan group
+    /// the catalog with — so no two readers of one analysis can disagree about whether it
+    /// exists yet.
+    ///
+    /// [`visible_volumes`]: Self::visible_volumes
+    /// [`analysed_resources_by_type`]: Self::analysed_resources_by_type
+    pub fn visible_analysed_resources(&self) -> impl Iterator<Item = &AnalysedResource> {
+        let visible = self.enrollment.is_opted_in() && self.enrollment.analysis_due();
+        self.analysed_resources.iter().filter(move |_| visible)
+    }
 }
 
 /// The Amazon EBS volume inventory this emulator observes, generated once when the store
@@ -7247,15 +7266,20 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// keyed by it, so a reader walks the groups in one stable order whatever the catalog's
     /// own order is.
     ///
+    /// The rows are the ones a caller can read ([`visible_analysed_resources`]), so a group
+    /// an account has no analysis for yet is absent rather than summarised.
+    ///
     /// This emulator presents exactly one account ([`engine::emulator_account_id`]), so a
     /// request that asks for any other account's findings — which only an organization's
     /// management account may do — selects nothing rather than someone else's resources.
+    ///
+    /// [`visible_analysed_resources`]: Self::visible_analysed_resources
     pub fn analysed_resources_by_type(
         &self,
         account_id: &str,
     ) -> BTreeMap<&str, Vec<&AnalysedResource>> {
         let mut grouped: BTreeMap<&str, Vec<&AnalysedResource>> = BTreeMap::new();
-        for resource in &self.analysed_resources {
+        for resource in self.visible_analysed_resources() {
             if resource.account_id != account_id {
                 continue;
             }
