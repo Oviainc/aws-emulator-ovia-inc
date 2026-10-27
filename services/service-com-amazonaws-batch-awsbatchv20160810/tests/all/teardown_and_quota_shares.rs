@@ -36,8 +36,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_batch_awsbatchv20160810::state;
 
 use crate::job_lifecycle::{
-    arn, compute_environment, container_properties, error_code, error_message, job_definition,
-    job_queue, Batch,
+    arn, assert_clock_owed_status, bracketed, compute_environment, container_properties,
+    error_code, error_message, job_definition, job_queue, Batch,
 };
 
 /// How long to wait for a clock-owed transition to fall due: the span the clock owes it
@@ -572,7 +572,10 @@ async fn a_created_quota_share_is_read_back_by_its_arn() {
     let mut created: BTreeMap<String, String> = BTreeMap::new();
     for (case, name, queue, extra) in &cases {
         let request = quota_share_request(name, queue, extra.clone());
-        let body = batch.ok("/v1/createquotashare", request.clone()).await;
+        // Bracketed: the move out of the transient status this create stores falls due one
+        // span after THIS call, which is what decides what the read below must report.
+        let accepted = bracketed(batch.ok("/v1/createquotashare", request.clone())).await;
+        let body = accepted.value.clone();
         assert_eq!(
             body["quotaShareName"].as_str(),
             Some(*name),
@@ -586,12 +589,12 @@ async fn a_created_quota_share_is_read_back_by_its_arn() {
         );
         created.insert((*case).to_string(), expected_arn.clone());
 
-        let described = batch
-            .ok(
-                "/v1/describequotashare",
-                json!({"quotaShareArn": expected_arn}),
-            )
-            .await;
+        let read = bracketed(batch.ok(
+            "/v1/describequotashare",
+            json!({"quotaShareArn": expected_arn}),
+        ))
+        .await;
+        let described = read.value.clone();
         assert_eq!(
             described["quotaShareName"].as_str(),
             Some(*name),
@@ -628,11 +631,15 @@ async fn a_created_quota_share_is_read_back_by_its_arn() {
                 "case {case:?}: expected the stored tags, got {described}"
             );
         }
-        // A fresh share is handed back non-terminal, and the span is never zero.
-        assert_eq!(
-            described["status"].as_str(),
-            Some(state::STATUS_CREATING),
-            "case {case:?}: expected CREATING straight after the create, got {described}"
+        // A fresh share is handed back non-terminal, and the span is never zero: this read
+        // reports the transient status while its own bracket is certainly before the move
+        // fell due, and `VALID` once it is certainly after it.
+        assert_clock_owed_status(
+            case,
+            &read,
+            accepted.due_window(),
+            state::STATUS_CREATING,
+            Some(state::STATUS_VALID),
         );
     }
 

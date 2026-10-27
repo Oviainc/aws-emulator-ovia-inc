@@ -28,8 +28,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_batch_awsbatchv20160810::state;
 
 use crate::job_lifecycle::{
-    compute_environment, container_properties, describe_job, job_definition, job_queue,
-    until_status, Batch,
+    assert_clock_owed_status, bracketed, compute_environment, container_properties, describe_job,
+    job_definition, job_queue, until_status, Batch, Bracketed,
 };
 
 /// One emulator with a queue and a container job definition to submit into.
@@ -72,25 +72,9 @@ async fn submit(fixture: &Fixture, job_name: &str) -> String {
         .to_string()
 }
 
-/// One `DescribeJobs` read, bracketed by the instant the test read the clock before the
-/// call and the instant it read it after: the emulator read its own clock somewhere
-/// between the two, so `before <= the instant the answer describes <= after`.
-struct Observation {
-    detail: Value,
-    before: i64,
-    after: i64,
-}
-
 /// Read `job_id` back, bracketing the call.
-async fn observe(batch: &Batch, job_id: &str) -> Observation {
-    let before = state::now_millis();
-    let detail = describe_job(batch, job_id).await;
-    let after = state::now_millis();
-    Observation {
-        detail,
-        before,
-        after,
-    }
+async fn observe(batch: &Batch, job_id: &str) -> Bracketed<Value> {
+    bracketed(describe_job(batch, job_id)).await
 }
 
 /// The `createdAt` of a read job: the instant its own span starts.
@@ -103,27 +87,18 @@ fn created_at(case: &str, detail: &Value) -> i64 {
 /// Assert that `observation` reports the job where its OWN span puts it: still `SUBMITTED`
 /// when the read is certainly before its due instant, and `RUNNABLE` when the read is
 /// certainly after it.
-fn assert_phase(case: &str, observation: &Observation, created_at: i64) {
+///
+/// The job's `createdAt` pins the instant its span starts exactly, so the due window the
+/// shared assertion takes is a single instant here.
+fn assert_phase(case: &str, observation: &Bracketed<Value>, created_at: i64) {
     let due = created_at + state::JOB_PHASE_MILLIS;
-    let status = observation.detail["status"].as_str();
-    let detail = &observation.detail;
-    if observation.after < due {
-        assert_eq!(
-            status,
-            Some(state::JOB_SUBMITTED),
-            "case {case}: a job read {} ms before its own span elapsed has not moved yet, \
-             got {detail}",
-            due - observation.after
-        );
-    } else if observation.before >= due {
-        assert_eq!(
-            status,
-            Some(state::JOB_RUNNABLE),
-            "case {case}: a job read {} ms after its own span elapsed rests in RUNNABLE, got \
-             {detail}",
-            observation.before - due
-        );
-    }
+    assert_clock_owed_status(
+        case,
+        observation,
+        (due, due),
+        state::JOB_SUBMITTED,
+        Some(state::JOB_RUNNABLE),
+    );
 }
 
 /// RULE: each job's clock-owed move out of `SUBMITTED` falls due one span after THAT job's
@@ -150,7 +125,7 @@ async fn every_job_leaves_submitted_one_span_after_its_own_submit() {
         }
         let job_id = submit(&fixture, case).await;
         let observation = observe(&fixture.batch, &job_id).await;
-        let created = created_at(case, &observation.detail);
+        let created = created_at(case, &observation.value);
         assert_phase(case, &observation, created);
         submitted.push((case, job_id, created));
 
@@ -160,11 +135,11 @@ async fn every_job_leaves_submitted_one_span_after_its_own_submit() {
         for (earlier, earlier_id, earlier_created) in &submitted {
             let observation = observe(&fixture.batch, earlier_id).await;
             assert_eq!(
-                created_at(earlier, &observation.detail),
+                created_at(earlier, &observation.value),
                 *earlier_created,
                 "case {earlier}: the instant a job's span starts does not change from one \
                  read to the next, got {}",
-                observation.detail
+                observation.value
             );
             assert_phase(earlier, &observation, *earlier_created);
         }

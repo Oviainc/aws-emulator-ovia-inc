@@ -172,6 +172,66 @@ pub struct StackRevision<'a> {
     pub imports: &'a BTreeMap<String, String>,
 }
 
+/// The stack a submitted revision is compared AGAINST, as the operations that compare
+/// against a LIVE stack hold it: the stack's identity, the template body in force with the
+/// stage computed for it, the parameter values in force, the resources it has deployed and
+/// the exported values its imports resolved to.
+///
+/// [`StackRevision`] is that same stack once its template has been READ; this is the step
+/// before, which is what a handler has — so reading the stack's PROCESSED stage and
+/// building the revision from it happens HERE, once, rather than in each operation that
+/// compares against a stack ([`changes_against`]).
+#[derive(Debug, Clone, Copy)]
+pub struct DeployedStack<'a> {
+    pub region: &'a str,
+    pub stack_name: &'a str,
+    pub stack_id: &'a str,
+    /// The body the stack's processed stage was computed over — the stored body with any
+    /// `AWS::Include` snippet already spliced into it where the operation that holds one
+    /// has it. `None` for a stack with no template at all.
+    pub body: Option<&'a str>,
+    pub processed: &'a template::Processed,
+    pub parameters: &'a [StoredParameter],
+    pub deployed: &'a [DeployedResource],
+    pub imports: &'a BTreeMap<String, String>,
+}
+
+/// [`computed_changes`] against a stack whose template has not been read yet: the stack's
+/// PROCESSED stage is what the comparison reads, since that is the document it deploys.
+///
+/// A stack whose processed stage is unavailable, or whose body the reader will not read,
+/// declares nothing to compare against — the same answer a stack with no template gives —
+/// so every resource the submitted template declares is an addition.
+pub fn changes_against(
+    current: Option<DeployedStack<'_>>,
+    submitted: &template::Template,
+    submitted_parameters: &[StoredParameter],
+) -> Vec<StoredResourceChange> {
+    let Some(current) = current else {
+        return computed_changes(None, submitted, submitted_parameters);
+    };
+    let declared = current
+        .body
+        .and_then(|body| current.processed.body(body))
+        .and_then(super::declared_template)
+        .unwrap_or_default();
+    computed_changes(
+        Some(StackRevision {
+            stack: template::StackScope {
+                region: current.region,
+                stack_name: current.stack_name,
+                stack_id: current.stack_id,
+            },
+            template: &declared,
+            parameters: current.parameters,
+            deployed: current.deployed,
+            imports: current.imports,
+        }),
+        submitted,
+        submitted_parameters,
+    )
+}
+
 /// The resource-level changes that applying `submitted` with `submitted_parameters` to the
 /// stack `current` describes would make.
 ///

@@ -650,16 +650,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // same reason.
             None => crate::state::template::Template::default(),
         };
-        // The stack's own template is read at its processed stage too, for the same reason.
-        // A stack with no template yet, or one whose template declares no resources, simply
-        // has none to compare against, so every resource the submitted template declares is
-        // an addition.
-        let current = previous_template
-            .as_deref()
-            .and_then(|body| previous_processed.body(body))
-            .and_then(crate::state::declared_template)
-            .unwrap_or_default();
-        // The plan itself, over the two processed stages. A template with NO processed
+        // The plan itself, over the two processed stages: the stack's own template is read at
+        // its processed stage too, by the shared reader `UpdateStack` plans through — a stack
+        // with no template yet, or one whose template declares no resources, simply has none
+        // to compare against, so every resource the submitted template declares is an
+        // addition. A SUBMITTED template with NO processed
         // stage leaves the change set with no plan at all: not a removal of everything the
         // stack holds (which is what comparing against an empty declaration set would
         // read as), because nothing was computed from any document — the change set
@@ -667,15 +662,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let changes = if unprocessable.is_some() {
             Vec::new()
         } else {
-            crate::state::computed_changes(
+            crate::state::changes_against(
                 stack_identity.as_ref().map(|(region, stack_name, stack_id)| {
-                    crate::state::StackRevision {
-                        stack: crate::state::template::StackScope {
-                            region,
-                            stack_name,
-                            stack_id,
-                        },
-                        template: &current,
+                    crate::state::DeployedStack {
+                        region,
+                        stack_name,
+                        stack_id,
+                        body: previous_template.as_deref(),
+                        processed: &previous_processed,
                         parameters: &previous_parameters,
                         deployed: &deployed,
                         imports: &previous_imports,

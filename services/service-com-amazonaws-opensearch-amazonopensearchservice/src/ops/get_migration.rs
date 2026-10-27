@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMigration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMigration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMigration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the ONE [`crate::state::Migration`] the `migrationId` names — the record
+//! `StartMigration` persisted — with every status move the clock owes it already
+//! materialised, so a caller polling the job sees the export and the import complete
+//! without any call having asked for the move.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +88,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    datetime, migration_not_found, service_state, state_unavailable,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +164,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMigration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMigrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMigration"))
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let migration = store
+            .settled_migration_mut(&input.migration_id, now)
+            .ok_or_else(|| {
+                GetMigrationErrorModeled::ResourceNotFoundException(migration_not_found(
+                    &input.migration_id,
+                ))
+            })?;
+
+        // Answered from the STORED record, so the start's answer and this read report
+        // one job.
+        Ok(GetMigrationOutput {
+            migration_id: Some(migration.migration_id.clone()),
+            status: Some(migration.status.clone()),
+            application_id: Some(migration.application_id.clone()),
+            source: Some(migration.source.clone()),
+            exported_count: migration.exported_count,
+            imported_count: migration.imported_count,
+            // "Error details if the migration failed or completed with errors": no path
+            // of this control plane fails a job, so there is nothing to report here.
+            error: None,
+            created_at: Some(datetime(migration.created_at)),
+            updated_at: Some(datetime(migration.updated_at)),
+        })
     }
 }
