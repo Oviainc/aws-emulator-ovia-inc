@@ -561,7 +561,7 @@ async fn one_s3_path_is_registered_once_per_instance_and_read_only_there() {
             );
             assert_eq!(
                 elsewhere.code(),
-                "AccessGrantsLocationNotExistsError",
+                "NoSuchAccessGrantsLocationError",
                 "case {account_id:?}/{region:?}: expected the location not-exists error code \
                  from {other_account:?}/{other_region:?}, got body {}",
                 elsewhere.body

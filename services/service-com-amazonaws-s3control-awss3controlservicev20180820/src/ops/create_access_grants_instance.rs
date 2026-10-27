@@ -221,6 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             identity_center_instance_arn: input.identity_center_arn.clone(),
             identity_center_application_arn,
             tags: input.tags.clone().unwrap_or_default(),
+            // An instance is created without a resource policy; one exists
+            // only once `PutAccessGrantsInstanceResourcePolicy` stores it.
+            resource_policy: None,
         };
 
         let output = CreateAccessGrantsInstanceOutput {
