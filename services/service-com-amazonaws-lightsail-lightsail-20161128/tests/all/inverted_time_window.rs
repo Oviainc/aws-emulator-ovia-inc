@@ -41,11 +41,20 @@ use crate::instance_lifecycle::{error_code, Emulator};
 const DISTRIBUTION_REGION: &str = "us-east-1";
 
 /// The fixed text of the refusal, either side of the two instants it names.
-const MESSAGE_PREFIX: &str = "startTime must be earlier than endTime, got startTime ";
+///
+/// Shared with the per-operation suites that pin the rendering of one operation's
+/// bounds exactly, so the sentence has one source in this test crate.
+pub(crate) const MESSAGE_PREFIX: &str = "startTime must be earlier than endTime, got startTime ";
 /// See [`MESSAGE_PREFIX`].
-const MESSAGE_INFIX: &str = " and endTime ";
+pub(crate) const MESSAGE_INFIX: &str = " and endTime ";
 /// See [`MESSAGE_PREFIX`].
-const MESSAGE_SUFFIX: &str = " (seconds since the epoch)";
+pub(crate) const MESSAGE_SUFFIX: &str = " (seconds since the epoch)";
+
+/// The whole sentence an inverted window earns, with each bound rendered as the
+/// text the refusal names it by.
+pub(crate) fn inverted_window_message(start: &str, end: &str) -> String {
+    format!("{MESSAGE_PREFIX}{start}{MESSAGE_INFIX}{end}{MESSAGE_SUFFIX}")
+}
 
 /// How far a reported bound may sit from the instant the request named, in
 /// seconds.

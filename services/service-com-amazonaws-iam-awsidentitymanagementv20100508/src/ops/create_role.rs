@@ -212,16 +212,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The request was rejected because the policy document was malformed" — a
         // trust policy must be an IAM JSON policy, not merely a non-empty string, which
-        // is all `policyDocumentType`'s own pattern asks for. The rule is the shared
-        // one every operation taking a policy document applies.
-        if !crate::state::is_policy_document(&input.assume_role_policy_document) {
+        // is all `policyDocumentType`'s own pattern asks for. The rule, and the fixed
+        // sentence each way of breaking it is refused with, are the shared ones every
+        // operation taking a policy document applies
+        // (`crate::state::policy_document_defect`), so the refusal names neither this
+        // member nor anything a reader of the document observed.
+        if let Some(defect) =
+            crate::state::policy_document_defect(&input.assume_role_policy_document)
+        {
             return Err(CreateRoleErrorModeled::MalformedPolicyDocumentException(
                 MalformedPolicyDocumentException {
-                    message: Some(
-                        "Syntax errors in policy: AssumeRolePolicyDocument must be a JSON \
-                         object carrying a Statement element"
-                            .to_string(),
-                    ),
+                    message: Some(defect.message().to_string()),
                 },
             )
             .into());

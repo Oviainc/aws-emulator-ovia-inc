@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteGroupErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(
-                        "Cannot delete entity, must remove users from group first.".to_string(),
+                        crate::state::DELETE_CONFLICT_REMOVE_USERS_FROM_GROUP.to_string(),
                     ),
                 },
             )
@@ -243,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if embeds_policies {
             return Err(DeleteGroupErrorModeled::DeleteConflictException(
                 DeleteConflictException {
-                    message: Some("Cannot delete entity, must delete policies first.".to_string()),
+                    message: Some(crate::state::DELETE_CONFLICT_DELETE_POLICIES.to_string()),
                 },
             )
             .into());
@@ -256,7 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteGroupErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(
-                        "Cannot delete entity, must detach all policies first.".to_string(),
+                        crate::state::DELETE_CONFLICT_DETACH_POLICIES.to_string(),
                     ),
                 },
             )

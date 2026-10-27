@@ -185,9 +185,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(GetTableVersionErrorModeled::InvalidInputException(
                         InvalidInputException {
-                            message: Some(format!(
-                                "VersionId {version_id} is not a string representation of an \
-                                 integer"
+                            message: Some(crate::state::messages::malformed_version_id(
+                                version_id,
                             )),
                             from_federation_source: None,
                         },
@@ -256,9 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(table_version) = entry.table_version(requested, &database.database_id) else {
                 return Err(GetTableVersionErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        message: Some(crate::state::messages::table_version_not_found(
-                            input.version_id.as_deref().unwrap_or_default(),
-                        )),
+                        message: Some(
+                            crate::state::messages::TABLE_VERSION_NOT_FOUND.to_string(),
+                        ),
                         from_federation_source: None,
                     },
                 )

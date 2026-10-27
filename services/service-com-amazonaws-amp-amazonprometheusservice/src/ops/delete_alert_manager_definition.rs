@@ -251,13 +251,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             definition.status_code = crate::state::DEFINITION_STATUS_DELETING.to_string();
             definition.transition_due = Some(now + crate::state::TRANSITION_DELAY);
             definition.change_token = input.client_token;
-        }
-        drop(guard);
+            drop(guard);
 
-        // The call changed stored state (or replayed the call that did), so it leaves an
-        // access record naming the operation, the resource and the key id the request
-        // presented — see `crate::state::record_state_change`.
-        crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
+            // The call changed stored state, so it leaves an access record naming the
+            // operation, the resource and the key id the request presented — see
+            // `crate::state::record_state_change`. A replay of the pending deletion
+            // writes nothing, so it records nothing.
+            crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
+        }
 
         Ok(DeleteAlertManagerDefinitionOutput)
     }

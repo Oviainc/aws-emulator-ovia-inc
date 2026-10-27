@@ -69,6 +69,8 @@ mod list_encoder_configurations;
 mod list_ingest_configurations;
 #[path = "all/list_participant_replicas_paging.rs"]
 mod list_participant_replicas_paging;
+#[path = "all/minted_identities.rs"]
+mod minted_identities;
 #[path = "all/participant_events.rs"]
 mod participant_events;
 #[path = "all/participant_ingest_configuration.rs"]

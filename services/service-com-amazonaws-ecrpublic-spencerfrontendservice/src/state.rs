@@ -41,8 +41,9 @@ use crate::ops::types::{
 /// (`OPERATIONS.md`, "Wire protocol": ARN namespace `ecr-public`).
 pub const ARN_NAMESPACE: &str = "ecr-public";
 
-/// The Regions an ECR Public API endpoint is published in, the Region the account-global
-/// registry-catalog write is served from first.
+/// The Regions an ECR Public API endpoint is published in — every Region a caller can
+/// reach this surface from, NOT the set a Region-scoped call is served from (that is
+/// [`API_REGION`] alone; see [`serves_region`]).
 ///
 /// `UnsupportedCommandException` ("The action isn't supported in this Region", client,
 /// HTTP 400) is a SERVICE-level error in this model: it is bound to every one of the 23
@@ -56,25 +57,30 @@ pub const ARN_NAMESPACE: &str = "ecr-public";
 /// either of them.
 ///
 /// The ONE Region-scoped call is the write of the account-global registry catalog data
-/// (`PutRegistryCatalogData`); the matching read (`GetRegistryCatalogData`) is served
-/// everywhere, so a caller outside the write's Region can still see what the record holds.
+/// (`PutRegistryCatalogData`): the record is written from [`API_REGION`] only, so the same
+/// well-formed request addressed to the OTHER published endpoint is refused rather than
+/// served. The matching read (`GetRegistryCatalogData`) is served everywhere, so a caller
+/// outside the write's Region can still see what the record holds.
 pub const ENDPOINT_REGIONS: &[&str] = &["us-east-1", "us-west-2"];
 
-/// The Region AWS serves the account-global registry-catalog write from, which is the
-/// Region its refusal names: the first of [`ENDPOINT_REGIONS`].
+/// The single Region AWS performs the account-global registry-catalog write in, which is
+/// the Region its refusal names: the first of [`ENDPOINT_REGIONS`].
+///
+/// Publishing an API endpoint in a Region and performing a Region-scoped write in it are
+/// different properties: this is the second one, and it holds for exactly one Region.
 pub const API_REGION: &str = ENDPOINT_REGIONS[0];
 
 /// The environment variable the operator names the Region THIS emulator instance stands in
-/// for in, on top of the published ones ([`ENDPOINT_REGIONS`]).
+/// for in, on top of the Region a Region-scoped call is performed in ([`API_REGION`]).
 pub const API_REGION_ENV: &str = "ECR_PUBLIC_API_REGION";
 
 /// The Region THIS emulator instance is deployed as, when [`API_REGION_ENV`] names one.
 ///
 /// Which Region an endpoint is reached as is a property of the deployment, not of the
 /// service: an instance deployed as a Region stands in for that Region's endpoint on top
-/// of the published ones ([`ENDPOINT_REGIONS`]), so a Region-scoped call that reaches it as
-/// that Region is served instead of being refused for a Region it IS being served on. An
-/// instance the operator tells nothing stands in for the published endpoints alone.
+/// of [`API_REGION`], so a Region-scoped call that reaches it as that Region is served
+/// instead of being refused for a Region it IS being served on. An instance the operator
+/// tells nothing serves a Region-scoped call as [`API_REGION`] alone.
 pub fn configured_region() -> Option<String> {
     ::std::env::var(API_REGION_ENV)
         .ok()
@@ -84,14 +90,16 @@ pub fn configured_region() -> Option<String> {
 
 /// Whether an instance deployed as `configured` — `None` when its environment names no
 /// Region ([`configured_region`]) — serves a Region-scoped call that reaches it as
-/// `region`: one of the Regions the service publishes an endpoint in, or the Region this
-/// instance is deployed as.
+/// `region`: the single Region that call is performed in ([`API_REGION`]), or the Region
+/// this instance is deployed as.
+///
+/// The Regions that merely publish an endpoint ([`ENDPOINT_REGIONS`]) are NOT consulted
+/// here, and that is the point: a call scoped to one Region is refused for every OTHER
+/// Region the service answers in, which is the only place the refusal can be observed.
 ///
 /// A Region name is case-insensitive, so every comparison here is too.
 pub fn serves_region(configured: Option<&str>, region: &str) -> bool {
-    ENDPOINT_REGIONS
-        .iter()
-        .any(|published| region.eq_ignore_ascii_case(published))
+    region.eq_ignore_ascii_case(API_REGION)
         || configured.is_some_and(|configured| region.eq_ignore_ascii_case(configured))
 }
 
