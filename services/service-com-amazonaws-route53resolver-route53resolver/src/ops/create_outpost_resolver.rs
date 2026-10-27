@@ -189,6 +189,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let region = crate::state::request_region(&ctx.parts().headers);
+        // `OutpostArn` is "the Amazon Resource Name (ARN) of the Outpost": the
+        // Resolver this call creates runs ON that Outpost, so it can only be
+        // created on one the account actually has — a value satisfying the
+        // member's pattern names an Outpost only if the account's own Outposts
+        // inventory holds it. Resolved AFTER the cheap `InstanceCount` check
+        // and BEFORE this service's store is locked, so a refused create writes
+        // nothing at all and the two stores are never held at once.
+        if !crate::state::account_holds_outpost(&*self.engine, &region, &input.outpost_arn) {
+            return Err(CreateOutpostResolverErrorModeled::ValidationException(
+                crate::state::outpost_not_found(&input.outpost_arn),
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         // `CreatorRequestId` is "a unique string that identifies the request and
         // that allows failed requests to be retried without the risk of running
@@ -225,7 +240,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let region = crate::state::request_region(&ctx.parts().headers);
         let now = ::std::time::Instant::now();
         // AWS answers with `Status: CREATING` and provisions the EC2 instances
         // behind the Resolver afterwards, so the move to `OPERATIONAL` is owed

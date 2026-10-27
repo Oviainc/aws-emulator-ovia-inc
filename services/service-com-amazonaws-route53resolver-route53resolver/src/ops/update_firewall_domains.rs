@@ -250,21 +250,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             // A list DNS Firewall publishes itself belongs to the service, not
             // to the account reading it: nothing this account does changes it,
-            // so an update that names one is refused rather than resolving to a
-            // record this store could write.
-            if crate::state::managed_firewall_domain_list(&input.firewall_domain_list_id).is_some()
-            {
-                return Err(UpdateFirewallDomainsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "Firewall domain list with ID \"{}\" is managed by {} and its domains cannot be updated",
-                            input.firewall_domain_list_id,
-                            crate::state::MANAGED_FIREWALL_DOMAIN_LIST_OWNER
-                        )),
-                    },
-                )
-                .into());
-            }
+            // so it is not visible as a writable resource at all and an update
+            // naming one is answered exactly as an update naming a list that
+            // does not exist (see `crate::state::firewall_domain_list_not_found`).
             return Err(
                 UpdateFirewallDomainsErrorModeled::ResourceNotFoundException(
                     crate::state::firewall_domain_list_not_found(&input.firewall_domain_list_id),

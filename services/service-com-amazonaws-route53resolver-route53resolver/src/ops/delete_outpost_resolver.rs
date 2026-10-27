@@ -166,11 +166,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(record) = store.outpost_resolvers.remove(&input.id) else {
             // Nothing is stored under that id — including a second delete of the
-            // same Resolver, which the first one already removed.
-            return Err(DeleteOutpostResolverErrorModeled::ResourceNotFoundException(
-                crate::state::outpost_resolver_not_found(&input.id),
-            )
-            .into());
+            // same Resolver, which the first one already removed. The delete is
+            // satisfied by the absence it was asked to bring about, so it
+            // SUCCEEDS and reports no Resolver: there is none to describe, and
+            // `ListOutpostResolvers` goes on not listing the id. A retried
+            // delete therefore answers the same way as the one that removed the
+            // record.
+            return Ok(DeleteOutpostResolverOutput {
+                outpost_resolver: None,
+            });
         };
 
         // The `CreatorRequestId` is released with the Resolver, so a create that

@@ -642,9 +642,10 @@ async fn an_unknown_domain_list_id_is_reported_as_missing() {
     assert_domains(&router, &stored, &[], "the stored list after the refusals").await;
 }
 
-/// A domain list DNS Firewall publishes itself belongs to the service: an
-/// account cannot change its domains, and this emulator holds none of them, so
-/// it reports no `Domains` rather than claiming the published list is empty.
+/// A domain list DNS Firewall publishes itself belongs to the service, not to
+/// the account reading it: it is not visible as a writable resource at all, so
+/// a write naming one is answered as a write naming a list that does not exist,
+/// and the domains inside it are not this account's to read either.
 #[tokio::test]
 async fn a_published_domain_list_is_not_this_accounts_to_update() {
     let router = emulator();
@@ -667,26 +668,18 @@ async fn a_published_domain_list_is_not_this_accounts_to_update() {
             "Domains": ["example.com"],
         }),
         "a published list",
-        "ValidationException",
+        "ResourceNotFoundException",
     )
     .await;
 
-    let listed = ok(
+    expect_error(
         &router,
         "ListFirewallDomains",
         json!({ "FirewallDomainListId": published }),
+        "a published list",
+        "AccessDeniedException",
     )
     .await;
-    assert_eq!(
-        listed.get("Domains"),
-        None,
-        "case \"a published list\": its domains are the service's, so none are claimed, got {listed}"
-    );
-    assert_eq!(
-        listed.get("NextToken"),
-        None,
-        "case \"a published list\": nothing is left to page, got {listed}"
-    );
 }
 
 /// `Domains`' doc states the requirements a domain specification must satisfy,

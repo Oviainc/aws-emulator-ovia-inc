@@ -157,10 +157,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant, so nothing about the record changes for the next caller.
         let store = state.lock();
         let Some(record) = store.outpost_resolvers.get(&input.id) else {
-            return Err(GetOutpostResolverErrorModeled::ResourceNotFoundException(
-                crate::state::outpost_resolver_not_found(&input.id),
-            )
-            .into());
+            // The account has no Resolver on an Outpost under that id, so the
+            // read SUCCEEDS carrying no `OutpostResolver` member: the absence of
+            // the member is what reports the absence of the Resolver, which is
+            // the same answer `ListOutpostResolvers` gives by not listing the
+            // id.
+            return Ok(GetOutpostResolverOutput {
+                outpost_resolver: None,
+            });
         };
 
         Ok(GetOutpostResolverOutput {

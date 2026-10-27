@@ -25,6 +25,9 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex encoding for those digests and for the opaque pagination cursor.
 hex = { workspace = true }
+# The account's own AWS Outposts inventory: `CreateOutpostResolver` resolves its
+# `OutpostArn` against the Outposts that service holds.
+service-com-amazonaws-outposts-outpostsolafservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

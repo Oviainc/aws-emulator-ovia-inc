@@ -25,6 +25,10 @@ mod firewall_domain_lists;
 mod firewall_domains;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/managed_firewall_domain_lists.rs"]
+mod managed_firewall_domain_lists;
+#[path = "all/outpost_binding.rs"]
+mod outpost_binding;
 #[path = "all/outpost_resolvers.rs"]
 mod outpost_resolvers;
 #[path = "all/resolver_config_listing.rs"]

@@ -19,8 +19,8 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    call, emulator, error_type, expect_error, ok, parse_time, string_member, without_status,
-    ACCOUNT, REGION,
+    call, emulator_with_outposts, error_type, expect_error, ok, parse_time, rack_outpost,
+    string_member, without_status, ACCOUNT, REGION,
 };
 
 /// The `OutpostResolver` of a create/get/update/delete response.
@@ -31,10 +31,15 @@ fn resolver(body: &Value) -> &Value {
 
 /// An `OutpostArn` satisfying the member's documented pattern
 /// `^arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:outpost/op-[a-f0-9]{17}$`
-/// (`smithy_query(query="shape",shape="OutpostResolver")`): `partition` is the
-/// `aws…` partition, `region` the Outpost's region, and `tail` the 17 hex
-/// characters of the Outpost id.
-fn outpost_arn(partition: &str, region: &str, tail: &str) -> String {
+/// (`smithy_query(query="shape",shape="OutpostResolver")`) that names no Outpost
+/// of this account: `partition` is the `aws…` partition, `region` the Outpost's
+/// region, and `tail` the 17 hex characters of the Outpost id.
+///
+/// No Resolver can be created on it — which Outposts the account has is
+/// [`super::outpost_binding`]'s subject — so it appears here only where an
+/// Outpost is a value a request carries rather than hardware a Resolver sits
+/// on: the `OutpostArn` a list query selects on.
+fn unracked_outpost_arn(partition: &str, region: &str, tail: &str) -> String {
     assert_eq!(
         tail.len(),
         17,
@@ -43,19 +48,38 @@ fn outpost_arn(partition: &str, region: &str, tail: &str) -> String {
     format!("arn:{partition}:outposts:{region}:123456789012:outpost/op-{tail}")
 }
 
-/// The default Outpost every case that does not care which Outpost it is on
-/// uses.
-fn default_outpost() -> String {
-    outpost_arn("aws", "us-west-2", "0123456789abcdef0")
+/// One emulator with `count` Outposts racked in [`REGION`], answering the router
+/// and the Outposts' ARNs in the order they were racked.
+///
+/// A Resolver on an Outpost can only be created on an Outpost the account has,
+/// so every case that creates one starts here.
+async fn emulator_on_outposts(count: usize) -> (MultiServiceRouter, Vec<String>) {
+    let router = emulator_with_outposts();
+    let mut outposts = Vec::with_capacity(count);
+    for index in 0..count {
+        outposts.push(rack_outpost(&router, REGION, &format!("outpost-{index}")).await);
+    }
+    (router, outposts)
 }
 
-/// A `CreateOutpostResolver` body on [`default_outpost`].
-fn create_body(creator: &str, name: &str) -> Value {
+/// The same, for the one Outpost a case that does not care which Outpost it is
+/// on puts its Resolvers on.
+async fn emulator_on_one_outpost() -> (MultiServiceRouter, String) {
+    let (router, outposts) = emulator_on_outposts(1).await;
+    let outpost = outposts
+        .into_iter()
+        .next()
+        .expect("one Outpost was racked above");
+    (router, outpost)
+}
+
+/// A `CreateOutpostResolver` body on `outpost_arn`.
+fn create_body(creator: &str, name: &str, outpost_arn: &str) -> Value {
     json!({
         "CreatorRequestId": creator,
         "Name": name,
         "PreferredInstanceType": "m5.large",
-        "OutpostArn": default_outpost(),
+        "OutpostArn": outpost_arn,
     })
 }
 
@@ -68,8 +92,11 @@ async fn seed_resolvers(
 ) -> Vec<String> {
     let mut ids = Vec::with_capacity(count);
     for index in 0..count {
-        let mut body = create_body(&format!("req-seed-{index}"), &format!("seed-{index}"));
-        body["OutpostArn"] = json!(outposts[index % outposts.len()]);
+        let body = create_body(
+            &format!("req-seed-{index}"),
+            &format!("seed-{index}"),
+            &outposts[index % outposts.len()],
+        );
         let created = ok(router, "CreateOutpostResolver", body).await;
         ids.push(string_member(resolver(&created), "Id"));
     }
@@ -98,12 +125,14 @@ fn i64_member(value: &Value, member: &str) -> i64 {
         .unwrap_or_else(|| panic!("{member} must be an integer, got {value}"))
 }
 
-/// One row of the create table: the request, and the `InstanceCount` the stored
-/// Resolver must then report.
+/// One row of the create table: the request (without its `OutpostArn`, which is
+/// the Outpost minted for the row), which of the account's Outposts the Resolver
+/// goes on, and the `InstanceCount` the stored Resolver must then report.
 #[derive(Debug)]
 struct CreateCase {
     case: &'static str,
     body: Value,
+    on_outpost: usize,
     instance_count: i64,
 }
 
@@ -113,14 +142,19 @@ struct CreateCase {
 ///
 /// The table spans what the rule generalises over: `InstanceCount` absent (the
 /// documented default), at its documented minimum and well above it; `Name` and
-/// `PreferredInstanceType` at both ends of their modelled 1..255 length; an
-/// Outpost in another partition and region; and `Tags` present or absent.
+/// `PreferredInstanceType` at both ends of their modelled 1..255 length; either
+/// of the two Outposts the account has; and `Tags` present or absent.
 #[tokio::test]
 async fn a_created_resolver_on_an_outpost_is_read_back_from_state() {
     let cases = vec![
         CreateCase {
             case: "InstanceCount omitted, so the documented default applies",
-            body: create_body("req-default", "default-count"),
+            body: json!({
+                "CreatorRequestId": "req-default",
+                "Name": "default-count",
+                "PreferredInstanceType": "m5.large",
+            }),
+            on_outpost: 0,
             instance_count: i64::from(OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT),
         },
         CreateCase {
@@ -130,9 +164,9 @@ async fn a_created_resolver_on_an_outpost_is_read_back_from_state() {
                 "Name": "r",
                 "InstanceCount": OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT,
                 "PreferredInstanceType": "m",
-                "OutpostArn": default_outpost(),
                 "Tags": [{ "Key": "team", "Value": "networking" }],
             }),
+            on_outpost: 0,
             instance_count: i64::from(OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT),
         },
         CreateCase {
@@ -142,19 +176,19 @@ async fn a_created_resolver_on_an_outpost_is_read_back_from_state() {
                 "Name": "eight-instances",
                 "InstanceCount": 8,
                 "PreferredInstanceType": "c5.xlarge",
-                "OutpostArn": default_outpost(),
             }),
+            on_outpost: 0,
             instance_count: 8,
         },
         CreateCase {
-            case: "a Resolver on an Outpost in another partition and region",
+            case: "a Resolver on the second Outpost the account has",
             body: json!({
-                "CreatorRequestId": "req-govcloud",
-                "Name": "gov-resolver",
+                "CreatorRequestId": "req-second-outpost",
+                "Name": "second-outpost-resolver",
                 "InstanceCount": 64,
                 "PreferredInstanceType": "m5.4xlarge",
-                "OutpostArn": outpost_arn("aws-us-gov", "us-gov-west-1", "abcdef01234567890"),
             }),
+            on_outpost: 1,
             instance_count: 64,
         },
         CreateCase {
@@ -164,8 +198,8 @@ async fn a_created_resolver_on_an_outpost_is_read_back_from_state() {
                 "Name": "n".repeat(255),
                 "InstanceCount": 16,
                 "PreferredInstanceType": "t".repeat(255),
-                "OutpostArn": default_outpost(),
             }),
+            on_outpost: 0,
             instance_count: 16,
         },
     ];
@@ -173,11 +207,14 @@ async fn a_created_resolver_on_an_outpost_is_read_back_from_state() {
     for CreateCase {
         case,
         body,
+        on_outpost,
         instance_count,
     } in cases
     {
         // Each row gets its own emulator, so the store holds exactly this row.
-        let router = emulator();
+        let (router, outposts) = emulator_on_outposts(2).await;
+        let mut body = body;
+        body["OutpostArn"] = json!(outposts[on_outpost]);
         let requested = body.clone();
 
         let created = ok(&router, "CreateOutpostResolver", body).await;
@@ -259,7 +296,7 @@ async fn a_created_resolver_on_an_outpost_is_read_back_from_state() {
             vec![id.clone()],
             "case {case:?}: ListOutpostResolvers must report the Resolver on the Outpost it sits on"
         );
-        let other_outpost = outpost_arn("aws", "eu-west-1", "99999999999999999");
+        let other_outpost = unracked_outpost_arn("aws", "eu-west-1", "99999999999999999");
         assert!(
             listed_ids(&router, json!({ "OutpostArn": other_outpost }))
                 .await
@@ -273,12 +310,7 @@ async fn a_created_resolver_on_an_outpost_is_read_back_from_state() {
 /// creation order whether or not it is filtered.
 #[tokio::test]
 async fn listing_selects_the_resolvers_on_the_requested_outpost() {
-    let outposts = [
-        outpost_arn("aws", "us-west-2", "0123456789abcdef0"),
-        outpost_arn("aws", "us-west-2", "1111111111111111a"),
-        outpost_arn("aws-cn", "cn-north-1", "22222222222222222"),
-    ];
-    let router = emulator();
+    let (router, outposts) = emulator_on_outposts(3).await;
     // Seven Resolvers round-robin over three Outposts, so the three selections
     // have different lengths and none of them is the whole store.
     let all = seed_resolvers(&router, 7, &outposts).await;
@@ -309,8 +341,8 @@ async fn listing_selects_the_resolvers_on_the_requested_outpost() {
 /// carries none.
 #[tokio::test]
 async fn paging_walks_every_resolver_exactly_once() {
-    let router = emulator();
-    let expected = seed_resolvers(&router, 5, &[default_outpost()]).await;
+    let (router, outpost) = emulator_on_one_outpost().await;
+    let expected = seed_resolvers(&router, 5, &[outpost]).await;
 
     // Page sizes spanning the modelled MaxResults range (1..100): both published
     // bounds, sizes that do and do not divide the collection, exactly the
@@ -373,8 +405,8 @@ async fn paging_walks_every_resolver_exactly_once() {
 /// they render (see `crate::scaffolded`).
 #[tokio::test]
 async fn a_max_results_outside_the_modelled_range_is_refused() {
-    let router = emulator();
-    seed_resolvers(&router, 2, &[default_outpost()]).await;
+    let (router, outpost) = emulator_on_one_outpost().await;
+    seed_resolvers(&router, 2, &[outpost]).await;
 
     for (case, max_results, accepted) in [
         ("one below the published minimum", 0, false),
@@ -408,11 +440,7 @@ async fn a_max_results_outside_the_modelled_range_is_refused() {
 /// "start over".
 #[tokio::test]
 async fn a_next_token_this_query_did_not_mint_is_refused() {
-    let outposts = [
-        outpost_arn("aws", "us-west-2", "0123456789abcdef0"),
-        outpost_arn("aws", "us-west-2", "1111111111111111a"),
-    ];
-    let router = emulator();
+    let (router, outposts) = emulator_on_outposts(2).await;
     seed_resolvers(&router, 4, &outposts).await;
 
     // A cursor minted for the endpoint list is not one this list accepts, and a
@@ -496,8 +524,8 @@ async fn a_next_token_this_query_did_not_mint_is_refused() {
 /// retried without the risk of running the operation twice."
 #[tokio::test]
 async fn a_repeated_creator_request_id_does_not_create_a_second_resolver() {
-    let router = emulator();
-    let body = create_body("req-retried", "once-only");
+    let (router, outpost) = emulator_on_one_outpost().await;
+    let body = create_body("req-retried", "once-only", &outpost);
 
     let first = ok(&router, "CreateOutpostResolver", body.clone()).await;
     let second = ok(&router, "CreateOutpostResolver", body).await;
@@ -520,11 +548,11 @@ async fn a_repeated_creator_request_id_does_not_create_a_second_resolver() {
 /// agrees on it.
 #[tokio::test]
 async fn the_creating_status_settles_without_anyone_asking() {
-    let router = emulator();
+    let (router, outpost) = emulator_on_one_outpost().await;
     let created = ok(
         &router,
         "CreateOutpostResolver",
-        create_body("req-settles", "settling"),
+        create_body("req-settles", "settling", &outpost),
     )
     .await;
     let id = string_member(resolver(&created), "Id");
@@ -609,11 +637,11 @@ async fn an_update_writes_only_the_members_the_request_carries() {
         writes,
     } in cases
     {
-        let router = emulator();
+        let (router, outpost) = emulator_on_one_outpost().await;
         let created = ok(
             &router,
             "CreateOutpostResolver",
-            create_body("req-update", "before-update"),
+            create_body("req-update", "before-update", &outpost),
         )
         .await;
         let created = resolver(&created).clone();
@@ -712,11 +740,11 @@ async fn an_update_writes_only_the_members_the_request_carries() {
 /// rejecting every update.
 #[tokio::test]
 async fn an_unsettled_resolver_cannot_be_updated() {
-    let router = emulator();
+    let (router, outpost) = emulator_on_one_outpost().await;
     let created = ok(
         &router,
         "CreateOutpostResolver",
-        create_body("req-conflict", "conflicting"),
+        create_body("req-conflict", "conflicting", &outpost),
     )
     .await;
     let id = string_member(resolver(&created), "Id");
@@ -776,8 +804,8 @@ async fn an_instance_count_below_the_documented_minimum_is_refused() {
         ("exactly the minimum", minimum, true),
         ("above the minimum", minimum + 1, true),
     ] {
-        let router = emulator();
-        let mut body = create_body("req-count", "counted");
+        let (router, outpost) = emulator_on_one_outpost().await;
+        let mut body = create_body("req-count", "counted", &outpost);
         body["InstanceCount"] = json!(instance_count);
 
         if !accepted {
@@ -872,13 +900,13 @@ async fn an_instance_count_below_the_minimum_is_refused_with_its_rslvr_error_cod
         r#"[{RSLVR_CODE_INSTANCE_COUNT}] The instance count must be equal to or greater than "{minimum}"."#
     );
 
-    let router = emulator();
+    let (router, outpost) = emulator_on_one_outpost().await;
     // One settled Resolver, so an update case is refused for its count and not
     // for a missing record or an unsettled status.
     let created = ok(
         &router,
         "CreateOutpostResolver",
-        create_body("req-rslvr-code", "coded"),
+        create_body("req-rslvr-code", "coded", &outpost),
     )
     .await;
     let id = string_member(resolver(&created), "Id");
@@ -891,7 +919,7 @@ async fn an_instance_count_below_the_minimum_is_refused_with_its_rslvr_error_cod
         ("a negative count", -7),
         ("the smallest Integer on the wire", i32::MIN),
     ] {
-        let mut create = create_body(&format!("req-{count}"), "coded");
+        let mut create = create_body(&format!("req-{count}"), "coded", &outpost);
         create["InstanceCount"] = json!(count);
         let requests = [
             ("CreateOutpostResolver", create),
@@ -950,11 +978,12 @@ async fn an_instance_count_below_the_minimum_is_refused_with_its_rslvr_error_cod
     }
 
     // The code is a per-fault discriminator, so another fault of the same
-    // resource does not answer with this one.
+    // resource does not answer with this one: an update addressed to an id the
+    // account holds no Resolver under is refused for the missing Resolver.
     let (_, parsed) = call(
         &router,
-        "GetOutpostResolver",
-        json!({ "Id": "rslvr-op-0000000000000000" }),
+        "UpdateOutpostResolver",
+        json!({ "Id": "rslvr-op-0000000000000000", "Name": "nowhere" }),
     )
     .await;
     let message = string_member(&parsed, "Message");
@@ -965,15 +994,16 @@ async fn an_instance_count_below_the_minimum_is_refused_with_its_rslvr_error_cod
 }
 
 /// A delete removes the record: it reports the Resolver as `DELETING`, and for
-/// the next caller the Resolver is gone — from the reader, from the list and
-/// from a second delete. Its `CreatorRequestId` is released with it.
+/// the next caller the Resolver is gone — the reader reports no Resolver, the
+/// list no longer carries it, a second delete has nothing left to remove, and an
+/// update of it is refused. Its `CreatorRequestId` is released with it.
 #[tokio::test]
 async fn a_deleted_resolver_is_gone_for_the_next_caller() {
-    let router = emulator();
+    let (router, outpost) = emulator_on_one_outpost().await;
     let created = ok(
         &router,
         "CreateOutpostResolver",
-        create_body("req-deleted", "going-away"),
+        create_body("req-deleted", "going-away", &outpost),
     )
     .await;
     let created = resolver(&created).clone();
@@ -992,32 +1022,29 @@ async fn a_deleted_resolver_is_gone_for_the_next_caller() {
         "a deleted Resolver is on its way out, so it reports DELETING, got {deleted}"
     );
 
-    for (case, operation, body) in [
-        (
-            "the reader",
-            "GetOutpostResolver",
-            json!({ "Id": id.clone() }),
-        ),
-        (
-            "a second delete",
-            "DeleteOutpostResolver",
-            json!({ "Id": id.clone() }),
-        ),
-        (
-            "an update",
-            "UpdateOutpostResolver",
-            json!({ "Id": id.clone(), "Name": "ghost" }),
-        ),
+    // The reader and a repeat of the delete are satisfied by the absence: each
+    // answers HTTP 200 with no `OutpostResolver` at all, because there is none
+    // to describe.
+    for (case, operation) in [
+        ("the reader", "GetOutpostResolver"),
+        ("a second delete", "DeleteOutpostResolver"),
     ] {
-        expect_error(
-            &router,
-            operation,
-            body,
-            case,
-            "ResourceNotFoundException",
-        )
-        .await;
+        let answered = ok(&router, operation, json!({ "Id": id.clone() })).await;
+        assert_eq!(
+            answered.get("OutpostResolver"),
+            None,
+            "case {case:?}: {operation} must report no Resolver once the record is gone, got {answered}"
+        );
     }
+    // An update has nothing to apply, so it is refused.
+    expect_error(
+        &router,
+        "UpdateOutpostResolver",
+        json!({ "Id": id.clone(), "Name": "ghost" }),
+        "an update",
+        "ResourceNotFoundException",
+    )
+    .await;
     assert!(
         listed_ids(&router, json!({})).await.is_empty(),
         "a deleted Resolver must be gone from the list"
@@ -1028,7 +1055,7 @@ async fn a_deleted_resolver_is_gone_for_the_next_caller() {
     let recreated = ok(
         &router,
         "CreateOutpostResolver",
-        create_body("req-deleted", "back-again"),
+        create_body("req-deleted", "back-again", &outpost),
     )
     .await;
     let recreated_id = string_member(resolver(&recreated), "Id");
@@ -1043,14 +1070,18 @@ async fn a_deleted_resolver_is_gone_for_the_next_caller() {
     );
 }
 
-/// An `Id` the store holds no Resolver under is `ResourceNotFoundException` on
-/// every operation that resolves one, whatever the id looks like.
+/// An `Id` the store holds no Resolver under: the reporting and the removing
+/// operation are satisfied by that absence and answer HTTP 200 with no
+/// `OutpostResolver` member, while an update — which has a change to apply and
+/// nothing to apply it to — is refused with the `ResourceNotFoundException` it
+/// models. The rows walk the forms a wrong id takes, so the answer is about the
+/// absence and not about the shape of the id.
 #[tokio::test]
-async fn an_unknown_id_is_not_found_everywhere() {
-    let router = emulator();
-    // One stored Resolver, so a not-found answer is about the id asked for and
+async fn an_unknown_id_reports_no_resolver_and_refuses_an_update() {
+    let (router, outpost) = emulator_on_one_outpost().await;
+    // One stored Resolver, so the answers below are about the id asked for and
     // not about an empty store.
-    seed_resolvers(&router, 1, &[default_outpost()]).await;
+    let stored = seed_resolvers(&router, 1, &[outpost]).await;
 
     for unknown in [
         "rslvr-op-0000000000000000",
@@ -1058,24 +1089,31 @@ async fn an_unknown_id_is_not_found_everywhere() {
         "not-a-resolver-id",
         "r",
     ] {
-        for (operation, body) in [
-            ("GetOutpostResolver", json!({ "Id": unknown })),
-            ("DeleteOutpostResolver", json!({ "Id": unknown })),
-            (
-                "UpdateOutpostResolver",
-                json!({ "Id": unknown, "Name": "nowhere" }),
-            ),
-        ] {
-            expect_error(
-                &router,
-                operation,
-                body,
-                unknown,
-                "ResourceNotFoundException",
-            )
-            .await;
+        for operation in ["GetOutpostResolver", "DeleteOutpostResolver"] {
+            let answered = ok(&router, operation, json!({ "Id": unknown })).await;
+            assert_eq!(
+                answered.get("OutpostResolver"),
+                None,
+                "case {unknown:?}: {operation} must report no Resolver for an id the account holds none under, got {answered}"
+            );
         }
+        expect_error(
+            &router,
+            "UpdateOutpostResolver",
+            json!({ "Id": unknown, "Name": "nowhere" }),
+            unknown,
+            "ResourceNotFoundException",
+        )
+        .await;
     }
+
+    // None of those calls touched the stored Resolver, and none of those ids is
+    // listed.
+    assert_eq!(
+        listed_ids(&router, json!({})).await,
+        stored,
+        "the calls above must leave the store holding exactly the stored Resolver"
+    );
 }
 
 /// The store is bounded: once it holds `MAX_STORED_OUTPOST_RESOLVERS` Resolvers a
@@ -1083,13 +1121,17 @@ async fn an_unknown_id_is_not_found_everywhere() {
 /// frees a slot again.
 #[tokio::test]
 async fn the_outpost_resolver_store_is_bounded() {
-    let router = emulator();
+    let (router, outpost) = emulator_on_one_outpost().await;
     let mut first_id = String::new();
     for index in 0..MAX_STORED_OUTPOST_RESOLVERS {
         let created = ok(
             &router,
             "CreateOutpostResolver",
-            create_body(&format!("req-bound-{index}"), &format!("bound-{index}")),
+            create_body(
+                &format!("req-bound-{index}"),
+                &format!("bound-{index}"),
+                &outpost,
+            ),
         )
         .await;
         if index == 0 {
@@ -1100,7 +1142,7 @@ async fn the_outpost_resolver_store_is_bounded() {
     expect_error(
         &router,
         "CreateOutpostResolver",
-        create_body("req-one-too-many", "one-too-many"),
+        create_body("req-one-too-many", "one-too-many", &outpost),
         "one past the store bound",
         "ServiceQuotaExceededException",
     )
@@ -1111,7 +1153,7 @@ async fn the_outpost_resolver_store_is_bounded() {
     ok(
         &router,
         "CreateOutpostResolver",
-        create_body("req-bound-0", "bound-0"),
+        create_body("req-bound-0", "bound-0", &outpost),
     )
     .await;
 
@@ -1124,7 +1166,7 @@ async fn the_outpost_resolver_store_is_bounded() {
     let created = ok(
         &router,
         "CreateOutpostResolver",
-        create_body("req-after-delete", "after-delete"),
+        create_body("req-after-delete", "after-delete", &outpost),
     )
     .await;
     assert_ne!(

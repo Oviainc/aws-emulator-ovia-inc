@@ -192,20 +192,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .firewall_domain_lists
             .remove(&input.firewall_domain_list_id)
         else {
-            // A list DNS Firewall publishes itself belongs to the service, not
-            // to the account reading it, so a delete that names one is refused
-            // rather than reported as missing — the same rule
-            // `UpdateFirewallDomains` applies to a write against a managed list.
-            if crate::state::managed_firewall_domain_list(&input.firewall_domain_list_id).is_some()
-            {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Firewall domain list with ID \"{}\" is managed by {} and cannot be deleted",
-                    input.firewall_domain_list_id,
-                    crate::state::MANAGED_FIREWALL_DOMAIN_LIST_OWNER
-                )));
-            }
             // Nothing is stored under that id — including a second delete of
-            // the same list, which the first one already removed.
+            // the same list, which the first one already removed, and a list
+            // DNS Firewall publishes itself, which belongs to the service and
+            // not to the account reading it: a published list is not visible as
+            // a writable resource, so a delete naming one is answered exactly
+            // as a delete naming a list that does not exist (see
+            // `crate::state::firewall_domain_list_not_found`).
             return Err(
                 DeleteFirewallDomainListErrorModeled::ResourceNotFoundException(
                     crate::state::firewall_domain_list_not_found(&input.firewall_domain_list_id),
