@@ -14,17 +14,17 @@
 //! public key) is answered with the scaffold's 501: the capability is not
 //! implemented, and no response here may carry a plaintext in its place.
 //!
-//! One deliberate divergence: `GrantTokens`. A request that presents one is treated as
-//! drawing its permission FROM the grant the token names, so the grant must be on the
-//! key that sealed the ciphertext, permit this operation, and have its
-//! encryption-context constraints met, otherwise the request is denied. In the real
-//! service a grant token is ADDITIVE — a caller already permitted by the key policy or
-//! an IAM policy succeeds even when the token it presents grants nothing relevant — but
-//! a handler here has no caller identity to evaluate a policy against
-//! (`emulator_server::sigv4_credential_scope` yields only an access key id), so a
-//! presented grant token is the only permission there is to judge. The effect is
-//! narrower than AWS: an otherwise-permitted call that carries an unrelated or stale
-//! grant token is refused here.
+//! Permission is the service's one authorization decision
+//! ([`crate::state::authorization`]): a request that presents NO `GrantTokens` is judged
+//! against the key policy of the key that sealed the ciphertext, the calling principal's
+//! identity-based policies and the grants on that key issued to that principal, and is
+//! refused when none of them allows it.
+//!
+//! One deliberate divergence, the same one `Encrypt` carries and which
+//! [`crate::state::authorization::authorize`] states once for every handler that shares
+//! it: a request that DOES present a grant token draws its permission from the grants
+//! those tokens name, so an otherwise-permitted call carrying an unrelated or stale token
+//! is refused here, where the real service treats a grant token as additive.
 //!
 //! ## `KeyOrigin`
 //!
@@ -401,6 +401,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_ciphertext());
         };
 
+        // Who the request speaks for, resolved BEFORE this service's store is locked, so
+        // the IAM and STS stores the resolution reads are never reached while this
+        // service's guard is held.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
 
@@ -462,38 +466,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A grant token is handed out by `CreateGrant` and names the grant it was
         // minted for. A token that is not one this service minted names no grant at
-        // all, so the TOKEN "is not valid". Otherwise the permission a request draws
-        // from a grant is exactly what that grant carries: the grant is on THIS key,
-        // it permits this operation, and the request's encryption context satisfies
-        // its constraints. A request presenting no grant token is not asking to be
-        // authorized by a grant, and is not judged here: evaluating a key policy or an
-        // IAM policy needs a caller identity, which this emulator does not model, so a
-        // grant token is the only permission it can judge.
-        if !tokens.is_empty() {
-            let named = match state.grants_for_tokens(&region, &tokens) {
-                Ok(named) => named,
-                Err(crate::state::GrantRefusal::MalformedToken) => {
-                    return Err(DecryptErrorModeled::InvalidGrantTokenException(
-                        InvalidGrantTokenException {
-                            message: Some("The specified grant token is not valid.".to_string()),
-                        },
-                    )
-                    .into());
-                }
-                Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
-            };
-            let permitted = named.iter().any(|grant| {
-                grant.permits(
-                    &key.key_id,
-                    Self::NAME,
-                    input.encryption_context.as_ref(),
+        // all, so the TOKEN "is not valid".
+        //
+        // Everything else about permission is the service's one authorization decision
+        // (`crate::state::authorization`): the key's own key policy, the calling
+        // principal's identity policies, and the grants on this key the caller holds or
+        // presented a token for, judged together. A request presenting no token is
+        // judged too — a grant propagates to its grantee principal without one, and a
+        // caller the key policy does not reach has no permission whether or not it
+        // presents a token.
+        let named = match state.grants_for_tokens(&region, &tokens) {
+            Ok(named) => named,
+            Err(crate::state::GrantRefusal::MalformedToken) => {
+                return Err(DecryptErrorModeled::InvalidGrantTokenException(
+                    InvalidGrantTokenException {
+                        message: Some("The specified grant token is not valid.".to_string()),
+                    },
                 )
-            });
-            if !permitted {
-                return Err(crate::scaffolded::Scaffolded::access_denied(
-                    crate::state::grant_access_denied_message(Self::NAME, &key.arn),
-                ));
+                .into());
             }
+            // Every token is well formed but names a grant the store no longer holds,
+            // which carries no permission; what else the caller holds is judged below.
+            Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
+        };
+        let presented = (!tokens.is_empty()).then_some(named.as_slice());
+        if let Err(message) = crate::state::authorization::authorize(
+            &caller,
+            &state,
+            &region,
+            key,
+            Self::NAME,
+            input.encryption_context.as_ref(),
+            presented,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(message));
         }
 
         let algorithm = input

@@ -23,7 +23,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
     b64, call, contains, create_alias, create_key, describe, error_code, failure, is_lower_hex, ok,
-    router, text, unb64, REGION,
+    rotate_on_demand, router, text, unb64, REGION,
 };
 
 /// The operation under test.
@@ -395,7 +395,7 @@ async fn re_encrypt_to_the_same_key_moves_the_ciphertext_onto_the_current_materi
             let sealed = encrypt(&router, &case, &key_id, &bytes, &[]).await;
 
             for _ in 0..rotations {
-                ok(&router, "RotateKeyOnDemand", &json!({"KeyId": key_id})).await;
+                rotate_on_demand(&router, &case, &key_id).await;
             }
             let current_material = text(&case, &describe(&router, &key_id).await, "CurrentKeyMaterialId");
             assert_ne!(

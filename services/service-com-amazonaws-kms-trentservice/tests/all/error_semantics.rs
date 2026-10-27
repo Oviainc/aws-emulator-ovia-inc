@@ -45,7 +45,8 @@ use service_com_amazonaws_kms_trentservice::state::{
 };
 
 use super::harness::{
-    b64, create_key, describe, ok, refused, router, router_with_engine, text, unb64, wrap, REGION,
+    b64, create_key, describe, ok, refused, rotate_on_demand, router, router_with_engine, text,
+    unb64, wrap, REGION,
 };
 
 /// The Region a row belongs to when the row is about regional scoping.
@@ -1828,7 +1829,8 @@ async fn an_on_demand_rotation_is_reported_by_the_rotation_reader() {
     // and only the newest material is the one the key encrypts under.
     let mut expected_rotations = 0usize;
     for round in 1..=3usize {
-        ok(&router, "RotateKeyOnDemand", &json!({"KeyId": key_id})).await;
+        let case = format!("round {round}");
+        rotate_on_demand(&router, &case, &key_id).await;
         expected_rotations += 1;
         let listed = ok(&router, "ListKeyRotations", &json!({"KeyId": key_id})).await;
         let entries = listed["Rotations"].as_array().cloned().unwrap_or_default();
@@ -2040,27 +2042,34 @@ async fn list_key_policies_reports_the_one_policy_name_a_key_carries() {
         }
     }
 
-    // Rows: identifiers that name no key, and the refusal each meets — the same
-    // judgement `GetKeyPolicy` makes, since the two resolve a `KeyId` the same way.
-    let refusals: Vec<(&str, String, &str)> = vec![
+    // Rows: identifiers that name no key, the refusal `ListKeyPolicies` meets and the
+    // refusal `GetKeyPolicy` meets. The two differ on ONE row: an ARN scoped to this
+    // account that resolves to no KMS key is reported by `ListKeyPolicies` as a resource
+    // that does not exist, which is the refusal the recording of that operation carries.
+    let refusals: Vec<(&str, String, &str, &str)> = vec![
         (
             "an unknown key id",
             "00000000-0000-0000-0000-000000000000".to_string(),
+            "NotFoundException",
             "NotFoundException",
         ),
         (
             "an ARN that is not a KMS key ARN",
             format!("arn:aws:kms:{REGION}:{account}:thing/abc"),
+            "NotFoundException",
             "InvalidArnException",
         ),
         (
             "an ARN whose account is not an account id",
             format!("arn:aws:kms:{REGION}:notanumericaccount:key/abc"),
             "AccessDeniedException",
+            "AccessDeniedException",
         ),
     ];
-    for (case, identifier, expected_code) in refusals {
-        for operation in ["ListKeyPolicies", "GetKeyPolicy"] {
+    for (case, identifier, listing_code, read_code) in refusals {
+        for (operation, expected_code) in
+            [("ListKeyPolicies", listing_code), ("GetKeyPolicy", read_code)]
+        {
             let (status, code, _message) =
                 refused(&router, REGION, operation, &json!({"KeyId": identifier})).await;
             assert_eq!(

@@ -333,7 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 key_state: key.reported_key_state().to_string(),
                 state_message: crate::state::invalid_state_message(key),
                 key_spec: key.key_spec.clone(),
-                held_material_id: key.current_key_material_id.clone(),
+                held_material_id: key.reported_key_material_id(),
                 holds_material: key.has_key_material(),
                 symmetric_encryption: key.is_symmetric_encryption(),
             },
