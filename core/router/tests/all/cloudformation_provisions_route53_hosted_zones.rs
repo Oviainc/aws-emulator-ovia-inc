@@ -15,18 +15,25 @@
 //! Route 53 serves them and mints the ids), so the suite lives here rather than in either
 //! crate.
 //!
-//! The rows differ along what the rule generalises over: how many labels the zone name has
-//! and whether the template writes the trailing dot, whether the template is JSON or YAML,
-//! which intrinsic each output reads the zone with (`Ref`, `Fn::GetAtt` of the conventional
-//! `Id` and of the type's own `HostedZoneId`, `Fn::Sub`), how the record set names its zone
-//! (`Ref` to the declared zone, or the zone's DNS name through `HostedZoneName`), the record
-//! type and how many values it carries, and whether the zone declares a comment and tags.
+//! The rows differ along what the rule generalises over: how many labels the zone name has,
+//! how LONG it is — whether it fits inside the 32-character `ResourceId` bound at all —
+//! whether the template states it literally or through a parameter, whether it writes the
+//! trailing dot, whether the template is JSON or YAML, which intrinsic each output reads the
+//! zone with (`Ref`, `Fn::GetAtt` of the conventional `Id` and of the type's own
+//! `HostedZoneId`, `Fn::Sub`, `Fn::Join`), how the record set names its zone (`Ref` to the
+//! declared zone, or the zone's DNS name through `HostedZoneName`), the record type and how
+//! many values it carries, and whether the zone declares a comment and tags.
 //!
 //! Every expected value is computed here from what the row declares, except the hosted zone
 //! id itself, which is Route 53's to mint: what is checked about THAT is that one value
 //! appears everywhere the stack reports the zone's identity, that it has the published form
 //! (and so satisfies the modelled 32-character bound), and that Route 53's own
 //! `GetHostedZone`, `TestDNSAnswer` and `ListResourceRecordSets` all resolve it.
+//!
+//! The other half of the same rule is checked too: the zone's DNS NAME is not an identifier
+//! Route 53 answers to, so handing it to `GetHostedZone` or `TestDNSAnswer` is refused —
+//! past the `ResourceId` bound with `InvalidInput` (400), and inside it with
+//! `NoSuchHostedZone` (404), the two modelled errors both operations declare.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -303,6 +310,109 @@ const ROWS: &[Row] = &[
         zone_id_outputs: &["ZoneId"],
         derived_outputs: &[],
     },
+    Row {
+        case: "a zone whose name is longer than the ResourceId bound, named through a \
+               parameter, a two-value AAAA record, JSON",
+        region: "us-west-2",
+        template: || {
+            json!({
+                "AWSTemplateFormatVersion": "2010-09-09",
+                "Parameters": {
+                    "ZoneName": {
+                        "Type": "String",
+                        "Default": "cfn-zone-four-beyond-the-id-bound.example."
+                    }
+                },
+                "Resources": {
+                    "Zone": {
+                        "Type": "AWS::Route53::HostedZone",
+                        "Properties": { "Name": { "Ref": "ZoneName" } }
+                    },
+                    "Record": {
+                        "Type": "AWS::Route53::RecordSet",
+                        "Properties": {
+                            "HostedZoneId": { "Ref": "Zone" },
+                            "Name": { "Fn::Sub": "ipv6.${ZoneName}" },
+                            "Type": "AAAA",
+                            "TTL": "120",
+                            "ResourceRecords": ["2001:db8::1", "2001:db8::2"]
+                        }
+                    }
+                },
+                "Outputs": {
+                    "ZoneId": { "Value": { "Ref": "Zone" } },
+                    "ZoneIdAttribute": { "Value": { "Fn::GetAtt": ["Zone", "Id"] } },
+                    "ZoneIdPath": {
+                        "Value": {
+                            "Fn::Join": ["", ["/hostedzone/", { "Ref": "Zone" }]]
+                        }
+                    }
+                }
+            })
+            .to_string()
+        },
+        zone_logical_id: "Zone",
+        record_logical_id: "Record",
+        expected_zone_name: "cfn-zone-four-beyond-the-id-bound.example.",
+        expected_comment: None,
+        declared_record_name: "ipv6.cfn-zone-four-beyond-the-id-bound.example.",
+        expected_record_name: "ipv6.cfn-zone-four-beyond-the-id-bound.example.",
+        expected_record_type: "AAAA",
+        expected_ttl: "120",
+        expected_record_data: &["2001:db8::1", "2001:db8::2"],
+        zone_id_outputs: &["ZoneId", "ZoneIdAttribute"],
+        derived_outputs: &[("ZoneIdPath", |id| format!("/hostedzone/{id}"))],
+    },
+    Row {
+        case: "a zone past that bound declaring a comment and two tags, a three-value A \
+               record, YAML",
+        region: "ap-south-1",
+        template: || {
+            [
+                "Resources:",
+                "  Zone:",
+                "    Type: AWS::Route53::HostedZone",
+                "    Properties:",
+                "      Name: shard.cfn-zone-five-long.example.",
+                "      HostedZoneConfig:",
+                "        Comment: the fifth zone",
+                "      HostedZoneTags:",
+                "        - Key: Environment",
+                "          Value: test",
+                "        - Key: Owner",
+                "          Value: dns",
+                "  Record:",
+                "    Type: AWS::Route53::RecordSet",
+                "    Properties:",
+                "      HostedZoneId: !Ref Zone",
+                "      Name: api.shard.cfn-zone-five-long.example.",
+                "      Type: A",
+                "      TTL: 30",
+                "      ResourceRecords:",
+                "        - 192.0.2.30",
+                "        - 192.0.2.31",
+                "        - 192.0.2.32",
+                "Outputs:",
+                "  ZoneId:",
+                "    Value: !Ref Zone",
+                "  ZoneHostedZoneId:",
+                "    Value: !GetAtt Zone.HostedZoneId",
+                "",
+            ]
+            .join("\n")
+        },
+        zone_logical_id: "Zone",
+        record_logical_id: "Record",
+        expected_zone_name: "shard.cfn-zone-five-long.example.",
+        expected_comment: Some("the fifth zone"),
+        declared_record_name: "api.shard.cfn-zone-five-long.example.",
+        expected_record_name: "api.shard.cfn-zone-five-long.example.",
+        expected_record_type: "A",
+        expected_ttl: "30",
+        expected_record_data: &["192.0.2.30", "192.0.2.31", "192.0.2.32"],
+        zone_id_outputs: &["ZoneId", "ZoneHostedZoneId"],
+        derived_outputs: &[],
+    },
 ];
 
 /// Every row: the value the stack reports for its hosted zone is the id Route 53 minted,
@@ -500,6 +610,61 @@ async fn a_stack_publishes_the_hosted_zone_id_route53_minted() {
             "case {case:?}: expected the declared record values {:?} in the DNS answer, got \
              {answer}",
             row.expected_record_data
+        );
+
+        // The other half of the rule: the zone's DNS NAME is not an identifier either
+        // operation answers to. Which refusal it draws follows from the modelled bound
+        // alone — a name past `ResourceId`'s 32 characters cannot be a legal value at all
+        // (`InvalidInput`, 400), and one inside it names no zone (`NoSuchHostedZone`, 404) —
+        // so both classes are exercised by the rows above.
+        let (expected_status, expected_code) =
+            if row.expected_zone_name.len() > MAX_RESOURCE_ID_CHARS {
+                (400, "InvalidInput")
+            } else {
+                (404, "NoSuchHostedZone")
+            };
+        let (status, refused) = route53(
+            &router,
+            region,
+            "GET",
+            &format!("/2013-04-01/hostedzone/{}", row.expected_zone_name),
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status} from GetHostedZone on the zone's \
+             DNS name {:?}, got {status} with body {refused}",
+            row.expected_zone_name
+        );
+        assert_eq!(
+            element(&refused, "Code"),
+            expected_code,
+            "case {case:?}: expected {expected_code} from GetHostedZone on the zone's DNS \
+             name, got {refused}"
+        );
+        let (status, refused) = route53(
+            &router,
+            region,
+            "GET",
+            &format!(
+                "/2013-04-01/testdnsanswer?hostedzoneid={}&recordname={}&recordtype={}",
+                form_encode(row.expected_zone_name),
+                form_encode(row.expected_record_name),
+                row.expected_record_type
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status} from TestDNSAnswer on the zone's \
+             DNS name {:?}, got {status} with body {refused}",
+            row.expected_zone_name
+        );
+        assert_eq!(
+            element(&refused, "Code"),
+            expected_code,
+            "case {case:?}: expected {expected_code} from TestDNSAnswer on the zone's DNS \
+             name, got {refused}"
         );
 
         // Deleting the stack deletes the record set and then the zone in Route 53.

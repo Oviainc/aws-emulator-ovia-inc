@@ -511,7 +511,7 @@ pub async fn unresolvable_recording_bucket(
     let Some(bucket) = bucket_name_of(&recording.bucket_arn) else {
         return Some(refusal());
     };
-    let answer = recording_bucket_client(ctx, region)
+    let answer = s3_client(ctx, region, ctx.callback().aws_credentials_provider())
         .head_bucket()
         .bucket(bucket)
         .send()
@@ -533,16 +533,24 @@ pub async fn unresolvable_recording_bucket(
     }
 }
 
-/// The S3 client this service resolves a recording bucket through: the AWS SDK driven
-/// over the emulator's own in-process transport.
-fn recording_bucket_client(
+/// The S3 client this service reaches object storage through: the AWS SDK driven over the
+/// emulator's own in-process transport, signing in the name of `credentials`.
+///
+/// Whose name that is differs by caller, which is why it is a parameter. A bucket this
+/// service RESOLVES is read in the emulator's own name
+/// ([`unresolvable_recording_bucket`]), while an upload URL this service hands a caller is
+/// signed with the credential minted for that one upload
+/// ([`presign_agent_task_response_upload`]), so the URL carries that credential's id and
+/// nothing else.
+fn s3_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    credentials: ::aws_sdk_s3::config::SharedCredentialsProvider,
 ) -> ::aws_sdk_s3::Client {
     let config = ::aws_sdk_s3::Config::builder()
         .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
         .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .credentials_provider(credentials)
         .region(::aws_sdk_s3::config::Region::new(region.to_string()))
         .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
         // The emulator serves one endpoint for every service, so the bucket travels in
@@ -572,6 +580,242 @@ fn bucket_reported_absent(
     error
         .as_service_error()
         .is_some_and(::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found)
+}
+
+/// How long an upload URL `GetAgentTaskResponseUrl` hands out stays signed for.
+///
+/// CHOSEN span: AWS documents no validity for the agent task response URL (the model says
+/// only that it is "a presigned URL for uploading agent task response logs" —
+/// `smithy_query(query="doc", shape="GetAgentTaskResponseUrlResponse",
+/// member="presignedLogUrl")`), so the emulator signs it for the quarter of an hour an
+/// agent needs to finish a pass and hand its log over. It is also how long the credential
+/// that signed it lives: the credential is withdrawn when the URL it signed stops being
+/// accepted.
+pub const AGENT_TASK_RESPONSE_URL_VALIDITY: Duration = Duration::from_secs(15 * 60);
+
+/// The credential's name in the upload URL's provider, for diagnostics only.
+const AGENT_LOG_UPLOAD_SIGNER: &str = "GroundStationAgentTaskResponse";
+
+/// The one region an Amazon S3 `CreateBucket` names by naming nothing: a request with no
+/// `LocationConstraint` places the bucket in `us-east-1`, and S3 refuses that constraint
+/// spelled out.
+const UNCONSTRAINED_BUCKET_REGION: &str = "us-east-1";
+
+/// The HTTP status Amazon S3 answers a `CreateBucket` for a bucket that is already there
+/// with (`BucketAlreadyOwnedByYou` / `BucketAlreadyExists`).
+const BUCKET_EXISTS_STATUS: u16 = 409;
+
+/// The Amazon S3 bucket AWS Ground Station takes an account's agent task response logs in,
+/// in `region`: one bucket per account per region, so the name is DERIVED from the account
+/// and the region rather than generated and stored.
+///
+/// The name and the layout under it are this emulator's own — AWS documents only that the
+/// upload URL is presigned, never where the object lands — but the bucket has to BE
+/// somewhere a client can reach, so it is a bucket of this emulator's own object storage.
+pub fn agent_log_bucket_name(region: &str) -> String {
+    format!(
+        "{ARN_SERVICE}-agent-logs-{region}-{}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The Amazon S3 key one agent task's response log is uploaded at: the agent that ran the
+/// task, then the task, so two tasks of one agent and one task of two agents each upload
+/// to their own object and no upload overwrites another's log.
+pub fn agent_task_response_log_key(agent_id: &str, task_id: &str) -> String {
+    format!("agent/{agent_id}/task/{task_id}/agent-task-response.log")
+}
+
+/// One upload URL an agent holds, for one of its tasks: the URL itself, the credential it
+/// is signed with and the instant that signature stops being accepted.
+///
+/// Held so that the URL reported for a task is reported again while it is still valid — a
+/// reader hands every caller the SAME upload rather than a fresh one per call — and so the
+/// credential behind a URL whose validity has run out is withdrawn instead of accumulating
+/// in the credential store. A URL that is still valid is never withdrawn: an agent holding
+/// one goes on uploading with it whatever else is read.
+#[derive(Debug, Clone)]
+pub struct AgentLogUpload {
+    pub presigned_log_url: String,
+    pub credential_id: String,
+    pub expires_at: SystemTime,
+}
+
+impl AgentLogUpload {
+    /// Whether this URL is still signed for at `now`.
+    pub fn is_live(&self, now: SystemTime) -> bool {
+        now < self.expires_at
+    }
+}
+
+/// Withdraw `credential_id` from the emulator's credential store: the credential that
+/// signed an upload URL whose validity has run out, so a key that can no longer sign
+/// anything does not stay in the store.
+pub fn withdraw_credential(ctx: &smithy_server_runtime::OperationContext<'_>, credential_id: &str) {
+    if let Err(why) = ctx.credential_store().delete(credential_id) {
+        ::tracing::warn!(
+            reason = ?why,
+            "the credential that signed an agent task response upload URL could not be \
+             withdrawn",
+        );
+    }
+}
+
+/// Sign the upload of `agent_id`'s response log for `task_id`, and answer the URL with the
+/// credential it is signed with — `None` when nothing could be signed.
+///
+/// The URL is a presigned Amazon S3 `PutObject` of the object [`agent_task_response_log_key`]
+/// names in the bucket [`agent_log_bucket_name`] names, so an agent that PUTs its log to
+/// the URL stores it in the emulator's OWN object storage and a URL this service reports
+/// names a destination that accepts the upload. Object storage is reached the way the
+/// framework documents a handler reaching another emulated service
+/// ([`smithy_server_runtime::OperationContext::callback`]), so the bucket is created in
+/// this same emulator and nothing leaves the process.
+///
+/// It is signed with a credential the emulator's credential store MINTS for it, never with
+/// the emulator's own: a presigned URL carries the signer's key id, and this one carries a
+/// credential that can sign exactly the one upload the URL names, for
+/// [`AGENT_TASK_RESPONSE_URL_VALIDITY`].
+pub async fn presign_agent_task_response_upload(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    agent_id: &str,
+    task_id: &str,
+) -> Option<AgentLogUpload> {
+    use ::emulator_server::aws_credentials::{AWS_ACCESS_KEY, SECRET_ACCESS_KEY};
+
+    let bucket = agent_log_bucket_name(region);
+    let key = agent_task_response_log_key(agent_id, task_id);
+    // The destination the URL names has to be there before the URL is handed out,
+    // otherwise the upload it authorises has nowhere to land and the caller would hold a
+    // URL nothing serves. One bucket per account per region, so this is a create only the
+    // first time; an object storage that does not hold the bucket afterwards is answered
+    // as the failed dependency it is.
+    if !create_agent_log_bucket(ctx, region, &bucket).await {
+        return None;
+    }
+
+    let credentials = ctx.credential_store();
+    let minted = credentials.create(&AWS_ACCESS_KEY);
+    let signed = match minted.secret(SECRET_ACCESS_KEY) {
+        Some(secret) => presigned_upload(ctx, region, &bucket, &key, &minted.id, secret).await,
+        // A credential without its secret cannot sign anything.
+        None => None,
+    };
+    match signed {
+        Some(presigned_log_url) => Some(AgentLogUpload {
+            presigned_log_url,
+            credential_id: minted.id,
+            expires_at: SystemTime::now() + AGENT_TASK_RESPONSE_URL_VALIDITY,
+        }),
+        // A credential that signed no URL is of no use to anyone, so it does not stay in
+        // the store either.
+        None => {
+            let _ = credentials.delete(&minted.id);
+            None
+        }
+    }
+}
+
+/// The presigned `PutObject` URL of `bucket`/`key`, signed in the name of the minted
+/// credential, or `None` when the URL could not be signed.
+async fn presigned_upload(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+    key: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> Option<String> {
+    let expires = match ::aws_sdk_s3::presigning::PresigningConfig::expires_in(
+        AGENT_TASK_RESPONSE_URL_VALIDITY,
+    ) {
+        Ok(expires) => expires,
+        Err(failure) => {
+            ::tracing::warn!(
+                detail = %failure,
+                "the agent task response URL's validity is not a presignable span"
+            );
+            return None;
+        }
+    };
+    // The client sends no request — presigning only signs — but it is given the same
+    // in-process transport anyway, so the URL it signs addresses the endpoint the
+    // emulator's own object storage answers on.
+    let signer = ::aws_sdk_s3::config::SharedCredentialsProvider::new(
+        ::aws_sdk_s3::config::Credentials::new(
+            access_key_id,
+            secret_access_key,
+            None,
+            None,
+            AGENT_LOG_UPLOAD_SIGNER,
+        ),
+    );
+    match s3_client(ctx, region, signer)
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .presigned(expires)
+        .await
+    {
+        Ok(request) => Some(request.uri().to_string()),
+        Err(failure) => {
+            ::tracing::warn!(
+                bucket,
+                key,
+                detail = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                "the agent task response log's upload URL could not be signed",
+            );
+            None
+        }
+    }
+}
+
+/// Create the bucket agent task response logs are uploaded to, unless object storage
+/// already holds it, and answer whether object storage holds it now.
+///
+/// A bucket that was already there is what this call is for and counts as held. Every
+/// OTHER answer — an emulator assembled without object storage, a transport failure, a
+/// refused create — means nothing would take the upload a URL signed now would authorise,
+/// so it is logged and reported as not held, and the read answers with the modelled
+/// dependency failure rather than with a URL nothing serves.
+async fn create_agent_log_bucket(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+) -> bool {
+    let mut create = s3_client(ctx, region, ctx.callback().aws_credentials_provider())
+        .create_bucket()
+        .bucket(bucket);
+    // One bucket per region, so it is placed in the request's own region — which on
+    // `CreateBucket` is said with the location constraint rather than with the signing
+    // region. See [`UNCONSTRAINED_BUCKET_REGION`] for the one region said by saying
+    // nothing.
+    if region != UNCONSTRAINED_BUCKET_REGION {
+        create = create.create_bucket_configuration(
+            ::aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .location_constraint(::aws_sdk_s3::types::BucketLocationConstraint::from(region))
+                .build(),
+        );
+    }
+    let Err(failure) = create.send().await else {
+        return true;
+    };
+    let status = failure
+        .raw_response()
+        .map(|response| response.status().as_u16());
+    if status == Some(BUCKET_EXISTS_STATUS) {
+        return true;
+    }
+    ::tracing::warn!(
+        bucket,
+        region,
+        status = ?status,
+        detail = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+        "object storage did not stand up the bucket agent task response logs are uploaded \
+         to, so no upload URL could be handed out",
+    );
+    false
 }
 
 /// The capability's name as this service spells it in user-facing text: the
@@ -2416,6 +2660,16 @@ pub struct Agent {
     pub component_statuses: Vec<ComponentStatusData>,
     /// The agent task the last report was about; `None` before the first report.
     pub task_id: Option<String>,
+    /// The upload URLs this agent holds, keyed by the agent task each takes the response
+    /// log of (`GetAgentTaskResponseUrl`).
+    ///
+    /// No modelled read reports them: they are held so that the URL handed out for a task
+    /// is handed out again while it is still valid, so an agent uploading with one is not
+    /// handed a second. The map is bounded by the validity of its own entries — each is
+    /// released, and the credential behind it withdrawn, once the clock has run out on it
+    /// ([`Agent::take_expired_log_uploads`], called by every read of an upload URL) — so it
+    /// holds only what is still signed for.
+    pub log_uploads: HashMap<String, AgentLogUpload>,
     /// The tasking document `GetAgentConfiguration` hands the agent.
     ///
     /// `None` until the service has tasked the agent: the document describes the
@@ -2429,6 +2683,28 @@ pub struct Agent {
     /// When the agent last reported its status, equal to [`Agent::registered`] until it
     /// has reported once.
     pub last_updated: DateTime,
+}
+
+impl Agent {
+    /// Drop every upload URL of this agent whose validity the clock has run out on, and
+    /// answer the credentials behind them, for [`withdraw_credential`].
+    ///
+    /// This materialises the expiry that was due at this instant whether or not anybody
+    /// called: a presigned URL stops being accepted when its validity runs out, and the
+    /// credential that signed it can then sign nothing. A URL that is STILL signed for is
+    /// left exactly as it is, whichever task is being read about, so a caller holding one
+    /// goes on uploading with it.
+    pub fn take_expired_log_uploads(&mut self, now: SystemTime) -> Vec<String> {
+        let mut expired = Vec::new();
+        self.log_uploads.retain(|_, upload| {
+            let live = upload.is_live(now);
+            if !live {
+                expired.push(upload.credential_id.clone());
+            }
+            live
+        });
+        expired
+    }
 }
 
 /// What this service answers when an `{agentId}` label names no registered agent.

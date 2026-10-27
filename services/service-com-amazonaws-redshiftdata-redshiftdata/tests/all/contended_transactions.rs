@@ -21,7 +21,10 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use super::emulator::{error_code, id_of, list, wait_for_terminal, Emulator, SLOW_SQL, WAIT_SECONDS};
+use super::emulator::{
+    error_code, id_of, list, wait_for_terminal, Emulator, SLOW_SQL, TERMINAL_STATUSES,
+    WAIT_SECONDS,
+};
 
 use service_com_amazonaws_redshiftdata_redshiftdata::state::MAX_ACTIVE_STATEMENTS;
 
@@ -307,8 +310,7 @@ async fn the_submissions_in_flight_are_bounded_and_a_refusal_takes_no_turn() {
         );
         let described = wait_for_terminal(&emulator, "the cancelled queue", id).await;
         assert!(
-            ["ABORTED", "FINISHED", "FAILED"]
-                .contains(&described["Status"].as_str().unwrap_or_default()),
+            TERMINAL_STATUSES.contains(&described["Status"].as_str().unwrap_or_default()),
             "a cancelled submission must reach a terminal status, got {described}"
         );
     }

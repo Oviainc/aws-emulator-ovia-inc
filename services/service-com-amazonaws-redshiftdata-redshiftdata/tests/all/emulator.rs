@@ -67,6 +67,81 @@ const _: () = assert!(
     "the wait a waiting test asks for must outlast the engine's own execution bound"
 );
 
+/// The shortest wait the model admits (`WaitTimeSeconds`, range 1..30).
+pub const SHORTEST_MODELLED_WAIT_SECONDS: i32 = 1;
+
+/// A statement the engine runs to completion as soon as it picks it up.
+pub const QUICK_SQL: &str = "SELECT 1";
+
+/// What the engine decides for a submission, whatever its caller waited for.
+#[derive(Clone, Copy, Debug)]
+pub enum Verdict {
+    /// Every statement of the submission ran to completion.
+    Finished,
+    /// One of the engine's execution bounds stopped it, so it failed carrying
+    /// the engine's own interruption message.
+    Interrupted,
+}
+
+/// One row of a caller-patience table: the statements submitted, the patience
+/// the submit asks for, the statuses that submit's own response may report, and
+/// the verdict the engine must reach for it.
+///
+/// Shared by every suite that asserts what `WaitTimeSeconds` decides, so the
+/// submit operations that carry it are driven from one shape rather than a copy
+/// of it each.
+pub struct PatienceRow {
+    pub label: &'static str,
+    /// The statements submitted: exactly one for `ExecuteStatement`, one or more
+    /// for `BatchExecuteStatement`.
+    pub sqls: &'static [&'static str],
+    /// The `WaitTimeSeconds` the submit carries, or `None` for a submit that
+    /// names no wait at all.
+    pub wait: Option<i32>,
+    /// The statuses the submit's own response may report. A submit that names no
+    /// wait reports the status the submission has at that instant; a wait
+    /// SHORTER than the service's whole execution bound reports whatever it has
+    /// reached by the time that wait expires; only a wait that covers the
+    /// service's execution bound is sure to carry the verdict.
+    pub answered: &'static [&'static str],
+    pub verdict: Verdict,
+}
+
+/// The verdict the engine reached, asserted on the record read back: the status
+/// it settled at, and the engine's own reason when one of its execution bounds
+/// stopped it.
+pub fn assert_verdict(row: &PatienceRow, described: &Value) {
+    match row.verdict {
+        Verdict::Finished => {
+            assert_eq!(
+                described["Status"], "FINISHED",
+                "case {}: a submission the engine completed must report FINISHED, got \
+                 {described}",
+                row.label
+            );
+            assert!(
+                described["Error"].is_null(),
+                "case {}: a submission that ran reports no error, got {described}",
+                row.label
+            );
+        }
+        Verdict::Interrupted => {
+            assert_eq!(
+                described["Status"], "FAILED",
+                "case {}: a submission the engine's bound stopped must report FAILED, got \
+                 {described}",
+                row.label
+            );
+            let error = described["Error"].as_str().unwrap_or_default();
+            assert!(
+                error.to_ascii_lowercase().contains("interrupt"),
+                "case {}: the engine's own interruption must say why it stopped, got {described}",
+                row.label
+            );
+        }
+    }
+}
+
 /// A lower bound, in seconds, on how long a statement that produced a result
 /// ran for: its `UpdatedAt` is the instant its execution finished, so it is at
 /// or after the instant it was submitted.
@@ -142,10 +217,10 @@ impl Emulator {
     /// Submit one statement and wait for it, so the response already reports the
     /// terminal status. `WaitTimeSeconds` is what asks for that.
     ///
-    /// The wait is asked generously (well inside the modelled 1..30 range) so
-    /// that what decides a statement's recorded outcome is the ENGINE's own
-    /// deadline and never this request's patience, however loaded the machine
-    /// running the test is.
+    /// The wait asked for is [`WAIT_SECONDS`], the modelled ceiling, which
+    /// OUTLASTS the engine's own execution bound — so what decides a statement's
+    /// recorded outcome is the ENGINE's deadline and never this request's
+    /// patience, however loaded the machine running the test is.
     pub async fn execute_and_wait(&self, request: &Value) -> Value {
         let mut request = request.clone();
         request["WaitTimeSeconds"] = json!(WAIT_SECONDS);
@@ -175,6 +250,33 @@ impl Emulator {
         let mut request = request.clone();
         request["WaitTimeSeconds"] = json!(WAIT_SECONDS);
         self.ok("BatchExecuteStatement", &request).await
+    }
+
+    /// Submit `request` — which carries the connection and the statements — with
+    /// the patience `row` asks for, check the submit's OWN answer against the
+    /// statuses that row admits, and answer the `Id` the service recorded it
+    /// under.
+    pub async fn submit_with_patience(
+        &self,
+        operation: &str,
+        request: &Value,
+        row: &PatienceRow,
+    ) -> String {
+        let mut request = request.clone();
+        if let Some(wait) = row.wait {
+            request["WaitTimeSeconds"] = json!(wait);
+        }
+        let response = self.ok(operation, &request).await;
+        let answered = response["Status"].as_str().unwrap_or_default().to_string();
+        assert!(
+            row.answered.contains(&answered.as_str()),
+            "case {}: a submit asking to wait {:?} must be answered with one of {:?}, got \
+             {response}",
+            row.label,
+            row.wait,
+            row.answered
+        );
+        id_of(&response)
     }
 }
 

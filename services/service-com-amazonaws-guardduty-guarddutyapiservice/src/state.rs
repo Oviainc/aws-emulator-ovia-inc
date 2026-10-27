@@ -5699,6 +5699,53 @@ pub fn apply_member_feature_configurations(
     }
 }
 
+/// Write the organization's auto-enable settings onto one member account's stored
+/// configuration.
+///
+/// A feature the organization auto-enables — any `OrgFeatureStatus` other than
+/// [`AUTO_ENABLE_NONE`], which is the same "is this an auto-enablement" reading
+/// [`org_status_flag`] gives the deprecated boolean view — is ENABLED for the
+/// account, together with every additional configuration that feature auto-enables.
+/// A feature the organization auto-enables for no account keeps whatever the
+/// member's configuration already said, because then "the administrator must manage
+/// the feature for each account individually"
+/// (`smithy_query(query="doc",shape="OrganizationFeatureConfiguration",member="AutoEnable")`)
+/// — so nothing here switches a feature OFF.
+///
+/// Only the features a member request can configure ([`MEMBER_FEATURES`]) can be
+/// auto-enabled, which is exactly the set an organization configuration holds
+/// ([`ORG_FEATURES`]): the foundational sources are on for every account anyway and
+/// no organization setting names them.
+pub fn apply_organization_auto_enable(
+    member: &mut MemberRecord,
+    organization: &OrganizationConfiguration,
+    now: i64,
+) {
+    for name in MEMBER_FEATURES {
+        if !org_status_flag(organization.feature_auto_enable(name)) {
+            continue;
+        }
+        member.set_feature(name, ENABLED, now);
+        let auto_enabled: Vec<&str> = organization
+            .features
+            .iter()
+            .filter(|feature| feature.name == *name)
+            .flat_map(|feature| feature.additional_configuration.iter())
+            .filter(|additional| org_status_flag(&additional.auto_enable))
+            .map(|additional| additional.name.as_str())
+            .collect();
+        for additional in auto_enabled {
+            set_additional_configuration_status_in(
+                &mut member.features,
+                name,
+                additional,
+                ENABLED,
+                now,
+            );
+        }
+    }
+}
+
 /// Set one feature's status in a stored feature list, recording `now` as its
 /// `UpdatedAt`, and adding the feature when the list does not carry it yet.
 ///
@@ -5766,6 +5813,50 @@ fn set_additional_configuration_in(
     if let Some(record) = features.iter_mut().find(|f| f.name == name) {
         record.additional_configuration = configured;
     }
+}
+
+/// Set ONE of a feature's additional configurations in a stored feature list,
+/// leaving that feature's other additional configurations where they are — the
+/// single-switch counterpart of [`set_additional_configuration_in`].
+///
+/// Follows [`set_feature_in`]'s rule for the instant: re-applying the status a
+/// configuration already has changes nothing, `UpdatedAt` included. A configuration
+/// the feature does not carry yet is inserted at its place in the stored order,
+/// which is by NAME — the order [`additional_configuration_records`] builds a
+/// request's set in — so one read reports the set in a total order however it was
+/// written.
+fn set_additional_configuration_status_in(
+    features: &mut [FeatureRecord],
+    feature: &str,
+    name: &str,
+    status: &str,
+    now: i64,
+) {
+    let Some(record) = features.iter_mut().find(|f| f.name == feature) else {
+        return;
+    };
+    if let Some(existing) = record
+        .additional_configuration
+        .iter_mut()
+        .find(|configured| configured.name == name)
+    {
+        if existing.status != status {
+            existing.status = status.to_string();
+            existing.updated_at_millis = now;
+        }
+        return;
+    }
+    let at = record
+        .additional_configuration
+        .partition_point(|configured| configured.name.as_str() < name);
+    record.additional_configuration.insert(
+        at,
+        AdditionalConfigRecord {
+            name: name.to_string(),
+            status: status.to_string(),
+            updated_at_millis: now,
+        },
+    );
 }
 
 /// What one data source reports, read off the feature that governs it: that

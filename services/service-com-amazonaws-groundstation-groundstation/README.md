@@ -167,3 +167,15 @@ in-process callback), so a bucket created through the emulator's S3 is accepted 
 to create new S3 endpoint config - unable to get location of bucket. Ensure that Ground
 Station has s3:GetBucketLocation permissions on the bucket."). With no S3 mounted to ask,
 nothing is known about the bucket and the config is created.
+
+An agent's task response log needs no setting either: `GetAgentTaskResponseUrl` hands the
+agent a presigned Amazon S3 `PutObject` URL of the object that holds its response log for
+one task (`groundstation-agent-logs-<region>-<account>`, keyed
+`agent/<agentId>/task/<taskId>/agent-task-response.log`), created in the emulator's own S3
+over the in-process callback, so an agent that follows the URL really stores its log; with
+no S3 to take the upload the read answers the modelled `DependencyException` rather than a
+URL nothing serves. Each URL is signed with a credential the emulator's credential store
+mints for that one upload and is valid for `state::AGENT_TASK_RESPONSE_URL_VALIDITY`; the
+URL held for a task is reported again while it is still valid, and a credential is
+withdrawn only once the clock has run out on the URL it signed
+(`state::Agent::take_expired_log_uploads`).

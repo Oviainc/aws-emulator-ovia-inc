@@ -17,50 +17,19 @@
 //! patience the submit asks for (none at all, the shortest the model admits, the
 //! longest it admits) and along how long the statement itself runs (one the
 //! engine finishes at once, one that runs until the engine's own bound stops
-//! it).
+//! it). The table's shape, and the verdict assertion it drives, are the
+//! harness's ([`super::emulator::PatienceRow`]), so the same rule is asserted
+//! for `BatchExecuteStatement` in [`super::statement_wait`] from one shape
+//! rather than a second copy of it.
 
 use serde_json::json;
 
 use service_com_amazonaws_redshiftdata_redshiftdata::state::MAX_ENGINE_DEADLINE;
 
-use super::emulator::{id_of, number, wait_for_terminal, Emulator, UNBOUNDED_SQL, WAIT_SECONDS};
-
-/// The shortest wait the model admits (`WaitTimeSeconds`, range 1..30).
-const SHORTEST_MODELLED_WAIT_SECONDS: i32 = 1;
-
-/// A statement the engine runs to completion as soon as it picks it up.
-const QUICK_SQL: &str = "SELECT 1";
-
-/// What the engine decides for a row's statement, whatever its caller waited
-/// for.
-#[derive(Clone, Copy, Debug)]
-enum Verdict {
-    /// The statement ran to completion.
-    Finished,
-    /// One of the engine's execution bounds stopped it, so it failed carrying
-    /// the engine's own interruption message.
-    Interrupted,
-}
-
-/// One row of the table: a statement, the patience its submit asks for, the
-/// statuses that submit's own response may report, and the verdict the engine
-/// must reach for it.
-struct Row {
-    label: &'static str,
-    sql: &'static str,
-    /// The `WaitTimeSeconds` the submit carries, or `None` for a submit that
-    /// names no wait at all.
-    wait: Option<i32>,
-    /// The statuses the submit's own response may report. A submit that names
-    /// no wait reports the status the statement has at that instant; a wait
-    /// SHORTER than the service's whole execution bound reports whatever the
-    /// statement has reached by the time it expires, which is the non-terminal
-    /// status or — if a bound of the engine stopped the statement inside that
-    /// wait — the verdict; only a wait that covers the service's execution
-    /// bound is sure to carry the verdict.
-    answered: &'static [&'static str],
-    verdict: Verdict,
-}
+use super::emulator::{
+    assert_verdict, number, wait_for_terminal, Emulator, PatienceRow, Verdict, QUICK_SQL,
+    SHORTEST_MODELLED_WAIT_SECONDS, UNBOUNDED_SQL, WAIT_SECONDS,
+};
 
 /// A caller's `WaitTimeSeconds` bounds its own response and nothing else: the
 /// statement still reaches the verdict its execution produced, and a later read
@@ -73,9 +42,9 @@ async fn a_callers_wait_bounds_its_own_response_and_not_the_execution() {
     // rows before them are already in flight while those requests wait rather
     // than being started one after another.
     let rows = [
-        Row {
+        PatienceRow {
             label: "no wait at all, for a statement the engine's bound stops",
-            sql: UNBOUNDED_SQL,
+            sqls: &[UNBOUNDED_SQL],
             wait: None,
             // Nothing waited for this execution, and the execution runs until a
             // bound of the engine stops it, so the response reports the status
@@ -83,9 +52,9 @@ async fn a_callers_wait_bounds_its_own_response_and_not_the_execution() {
             answered: &["SUBMITTED"],
             verdict: Verdict::Interrupted,
         },
-        Row {
+        PatienceRow {
             label: "the shortest wait the model admits, for a statement the engine's bound stops",
-            sql: UNBOUNDED_SQL,
+            sqls: &[UNBOUNDED_SQL],
             wait: Some(SHORTEST_MODELLED_WAIT_SECONDS),
             // This wait does not cover the service's execution bound, so what
             // it reports is the status reached by the time it expires: the
@@ -96,25 +65,25 @@ async fn a_callers_wait_bounds_its_own_response_and_not_the_execution() {
             answered: &["SUBMITTED", "FAILED"],
             verdict: Verdict::Interrupted,
         },
-        Row {
+        PatienceRow {
             label: "no wait at all, for a statement that finishes at once",
-            sql: QUICK_SQL,
+            sqls: &[QUICK_SQL],
             wait: None,
             // Nobody waited, so whether this statement's execution has already
             // reported when the response is written is the engine's business.
             answered: &["SUBMITTED", "FINISHED"],
             verdict: Verdict::Finished,
         },
-        Row {
+        PatienceRow {
             label: "the shortest wait the model admits, for a statement that finishes at once",
-            sql: QUICK_SQL,
+            sqls: &[QUICK_SQL],
             wait: Some(SHORTEST_MODELLED_WAIT_SECONDS),
             answered: &["SUBMITTED", "FINISHED"],
             verdict: Verdict::Finished,
         },
-        Row {
+        PatienceRow {
             label: "a wait that outlasts the service's own execution bound",
-            sql: UNBOUNDED_SQL,
+            sqls: &[UNBOUNDED_SQL],
             wait: Some(WAIT_SECONDS),
             // This wait covers the engine's bound, so the verdict is in this
             // very response.
@@ -123,82 +92,48 @@ async fn a_callers_wait_bounds_its_own_response_and_not_the_execution() {
         },
     ];
 
-    let mut submitted: Vec<(&Row, String)> = Vec::new();
+    let mut submitted: Vec<(&PatienceRow, String)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
+        // `ExecuteStatement` carries ONE statement, which is the contract every
+        // row above states, enforced here rather than assumed.
+        let sql = single_statement(row);
         // Each row runs on a database of its own: the submissions of ONE
         // database run one at a time, so rows sharing one would queue behind
         // each other instead of running side by side.
-        let mut request = json!({
+        let request = json!({
             "ClusterIdentifier": "my-cluster",
             "Database": format!("dev{index}"),
             "DbUser": "awsuser",
-            "Sql": row.sql,
+            "Sql": sql,
         });
-        if let Some(wait) = row.wait {
-            request["WaitTimeSeconds"] = json!(wait);
-        }
-        let response = emulator.ok("ExecuteStatement", &request).await;
-        let answered = response["Status"].as_str().unwrap_or_default().to_string();
-        assert!(
-            row.answered.contains(&answered.as_str()),
-            "case {}: a submit asking to wait {:?} must be answered with one of {:?}, got \
-             {response}",
-            row.label,
-            row.wait,
-            row.answered
-        );
-        submitted.push((row, id_of(&response)));
+        let id = emulator
+            .submit_with_patience("ExecuteStatement", &request, row)
+            .await;
+        submitted.push((row, id));
     }
 
     for (row, id) in submitted {
         let described = wait_for_terminal(&emulator, row.label, &id).await;
         assert_eq!(
-            described["QueryString"], row.sql,
+            described["QueryString"], single_statement(row),
             "case {}: the record read back must be this row's own statement, got {described}",
             row.label
         );
-        match row.verdict {
-            Verdict::Finished => {
-                assert_eq!(
-                    described["Status"], "FINISHED",
-                    "case {}: a statement the engine completed must report FINISHED, got \
-                     {described}",
-                    row.label
-                );
-                assert!(
-                    described["Error"].is_null(),
-                    "case {}: a statement that ran reports no error, got {described}",
-                    row.label
-                );
-            }
-            Verdict::Interrupted => {
-                assert_eq!(
-                    described["Status"], "FAILED",
-                    "case {}: a statement the engine's bound stopped must report FAILED, got \
-                     {described}",
-                    row.label
-                );
-                let error = described["Error"].as_str().unwrap_or_default();
-                assert!(
-                    error.to_ascii_lowercase().contains("interrupt"),
-                    "case {}: the engine's own interruption must say why it stopped, got \
-                     {described}",
-                    row.label
-                );
-                // `Duration` is the engine's measured run, in nanoseconds: what
-                // ended this statement is the service's own execution bound, so
-                // its run is that bound and not the caller's patience (with the
-                // same span again as slack, for the gap a loaded machine leaves
-                // between two of the engine's progress callbacks).
-                let duration = number(&described, "Duration");
-                assert!(
-                    duration <= bounded_run_nanos(),
-                    "case {}: the span reported must be the engine's bounded run, got \
-                     {duration} against {}: {described}",
-                    row.label,
-                    bounded_run_nanos()
-                );
-            }
+        assert_verdict(row, &described);
+        if matches!(row.verdict, Verdict::Interrupted) {
+            // `Duration` is the engine's measured run, in nanoseconds: what
+            // ended this statement is the service's own execution bound, so
+            // its run is that bound and not the caller's patience (with the
+            // same span again as slack, for the gap a loaded machine leaves
+            // between two of the engine's progress callbacks).
+            let duration = number(&described, "Duration");
+            assert!(
+                duration <= bounded_run_nanos(),
+                "case {}: the span reported must be the engine's bounded run, got {duration} \
+                 against {}: {described}",
+                row.label,
+                bounded_run_nanos()
+            );
         }
         assert!(
             number(&described, "Duration") > 0,
@@ -216,6 +151,18 @@ async fn a_callers_wait_bounds_its_own_response_and_not_the_execution() {
         described["Status"], "FINISHED",
         "a statement submitted after the rows above must still run, got {described}"
     );
+}
+
+/// The one statement a single-statement row submits.
+fn single_statement(row: &PatienceRow) -> &'static str {
+    assert_eq!(
+        row.sqls.len(),
+        1,
+        "case {}: an ExecuteStatement row carries exactly one statement, got {:?}",
+        row.label,
+        row.sqls
+    );
+    row.sqls.first().copied().unwrap_or_default()
 }
 
 /// The longest run, in nanoseconds, a statement the service's own execution
