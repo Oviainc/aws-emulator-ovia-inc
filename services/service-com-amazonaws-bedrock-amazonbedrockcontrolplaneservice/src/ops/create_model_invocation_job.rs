@@ -2,15 +2,17 @@
 
 //! @op CreateModelInvocationJob
 //! Submits a batch inference job: the job is minted `Submitted` — "this job has been
-//! submitted to a queue for validation" — and the clock owes it its move to `InProgress`
-//! and then to `Completed`. The record this operation writes is the one
-//! `ops/get_model_invocation_job.rs` reads back and `ops/list_model_invocation_jobs.rs`
-//! reports, so the job this call submits is the job every later request sees.
+//! submitted to a queue for validation" — and the submission arms the whole clock the job
+//! runs on (`state::ModelInvocationJobClock`), so it is owed `Validating`, then
+//! `Scheduled`, then `InProgress`, and only then `Completed`. The record this operation
+//! writes is the one `ops/get_model_invocation_job.rs` reads back and
+//! `ops/list_model_invocation_jobs.rs` reports, so the job this call submits is the job
+//! every later request sees.
 //!
 //! `timeoutDurationInHours` is reported as the instant the job WOULD time out
 //! (`jobExpirationTime`) and nothing more: the member is modelled `range 24..168`, so the
 //! earliest timeout a request can ask for stands a day after the submission, while a job
-//! here is owed its completion within a second of it — no request can reach its own
+//! here begins seconds after it and ends a minute later — no request can reach its own
 //! expiration instant, so no timeout transition is ever due.
 //!
 //! ## Shape of an operation
@@ -289,6 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let job_id = store.mint_model_invocation_job_id(now);
         let arn = crate::state::model_invocation_job_arn(&region, &job_id);
+        let clock = crate::state::ModelInvocationJobClock::armed_at(now);
         let job = crate::state::ModelInvocationJobRecord {
             arn: arn.clone(),
             name: input.job_name,
@@ -315,10 +318,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             model_invocation_type,
             tags: input.tags.unwrap_or_default(),
             // The inference runs after this call returns, so the job is reported as queued
-            // for validation now and is owed its start once the span has passed.
+            // for validation now and the submission arms every later transition at once:
+            // each stage of the progression is owed at an instant fixed here, so the job
+            // dwells in each of them and no single later call both arms a move and spends it.
             status: crate::state::MODEL_INVOCATION_JOB_STATUS_SUBMITTED,
-            in_progress_due_at: Some(now + crate::state::MODEL_INVOCATION_JOB_BEGINS_AFTER),
-            completed_due_at: None,
+            validating_due_at: Some(clock.validating_at),
+            scheduled_due_at: Some(clock.scheduled_at),
+            in_progress_due_at: Some(clock.in_progress_at),
+            completed_due_at: Some(clock.completed_at),
+            // No stop has been asked for, so nothing owes the job its wind-down.
             stopped_due_at: None,
             submit_time: now,
             last_modified_at: now,

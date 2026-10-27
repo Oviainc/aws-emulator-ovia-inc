@@ -69,9 +69,15 @@ fn whole_second(secs: i64) -> String {
         .unwrap_or_else(|error| panic!("unformattable instant {secs}: {error}"))
 }
 
-/// `secs`.`micros` — the finest fraction this service RENDERS when it names an instant
-/// in a message (what `Format::DateTime` emits), so a bound spelled this way reads back
-/// from a refusal exactly as the request carried it.
+/// `secs`.`millis` — the fraction this service's documented ISO 8601 form RENDERS when it
+/// names an instant in a message (a fixed, zero-padded 3-digit millisecond field), so a
+/// bound spelled this way reads back from a refusal exactly as the request carried it.
+fn at_millis(secs: i64, millis: u32) -> String {
+    with_fraction(secs, &format!("{millis:03}"))
+}
+
+/// `secs`.`micros` — a fraction spelled FINER than that field, which the message names at
+/// the millisecond it falls in.
 fn at_micros(secs: i64, micros: u32) -> String {
     with_fraction(secs, &format!("{micros:06}"))
 }
@@ -202,24 +208,38 @@ async fn a_refusal_names_the_bounds_the_request_carried() {
     crate::interval_validation::create_group(&harness, GROUP).await;
 
     // A bound whose sub-second part must survive into the message: the refusal states the
-    // instants the request carried, not a whole-second rounding of them.
+    // instants the request carried, not a whole-second rounding of them. The first form is
+    // spelled at the width the documented form renders — a 3-digit millisecond field — so
+    // it reads back character for character; the second is spelled finer than that field,
+    // so it is named at the millisecond it falls in.
     for (_, secs) in BASES {
-        let instant = at_micros(secs, 123_456);
+        let at_the_field = at_millis(secs, 123);
         assert_eq!(
-            canonical(&instant),
-            instant,
-            "case {instant:?}: the ISO 8601 form a row sends must be the canonical one"
+            canonical(&at_the_field),
+            at_the_field,
+            "case {at_the_field:?}: the ISO 8601 form a row sends must be the canonical one"
         );
-        for operation in operations() {
-            let answer = call_bounds(&harness, &operation, GROUP, &instant, &instant).await;
-            let expected = expected_refusal(&instant, &instant);
-            assert_eq!(
-                answer.error_message(),
-                expected,
-                "case {} {instant:?}: expected {expected:?}, got {:?}",
-                operation.name,
-                answer.error_message()
-            );
+        let finer_than_the_field = at_micros(secs, 123_456);
+        assert_eq!(
+            canonical(&finer_than_the_field),
+            at_the_field,
+            "case {finer_than_the_field:?}: a fraction finer than the rendered millisecond \
+             field must be named at that field's resolution, expected {at_the_field:?}, \
+             got {:?}",
+            canonical(&finer_than_the_field)
+        );
+        for instant in [at_the_field.clone(), finer_than_the_field] {
+            for operation in operations() {
+                let answer = call_bounds(&harness, &operation, GROUP, &instant, &instant).await;
+                let expected = expected_refusal(&instant, &instant);
+                assert_eq!(
+                    answer.error_message(),
+                    expected,
+                    "case {} {instant:?}: expected {expected:?}, got {:?}",
+                    operation.name,
+                    answer.error_message()
+                );
+            }
         }
     }
 }

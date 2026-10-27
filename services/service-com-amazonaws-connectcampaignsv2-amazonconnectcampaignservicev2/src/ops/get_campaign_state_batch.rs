@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCampaignStateBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCampaignStateBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCampaignStateBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports, for each campaign id the request names, the lifecycle state the store
+//! leaves that campaign at — the same projection `GetCampaignState` serves for one id
+//! ([`crate::state::StoredCampaign::state_at`]), answered per id rather than as a
+//! whole-batch refusal: an id the region holds no campaign under is reported in
+//! `failedRequests` with the `ResourceNotFound` failure code, never as an error on the
+//! call. A pure read — every id is resolved against the store and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +107,15 @@ impl From<GetCampaignStateBatchErrorModeled> for GetCampaignStateBatchError {
     }
 }
 
+/// The `GetCampaignStateBatchFailureCode` this operation reports for a requested id
+/// the region holds no campaign under.
+///
+/// Source: the model's own `GetCampaignStateBatchFailureCode` catalog, as
+/// `GET_CAMPAIGN_STATE_BATCH_FAILURE_CODE_VALUES` in [`super::types`] lists it — the
+/// code that says the id named no resource, as against the `UnknownError` beside it,
+/// which reports a failure the batch could not attribute.
+const RESOURCE_NOT_FOUND_FAILURE_CODE: &str = "ResourceNotFound";
+
 /// The `GetCampaignStateBatch` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -146,18 +152,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCampaignStateBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCampaignStateBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCampaignStateBatch"))
+        // An id outside `CampaignId`'s modelled `@length` or `@pattern`, and a list
+        // outside `campaignIds`' own `@length`, are refused as HTTP 400
+        // `ValidationException` by the centralized constraint walk BEFORE this handler
+        // runs — that walk reaches a list's scalar elements — so every id reaching here
+        // is one the shape admits, and the batch is bounded by the list's maximum.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetCampaignStateBatchErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the ConnectCampaignsV2 campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // One instant for the whole batch, so every id of it is reported as of the
+        // same clock reading and two ids of one call cannot disagree about how far
+        // their schedules have got.
+        let now = ::std::time::SystemTime::now();
+
+        // A campaign is reachable only through the endpoint of the region it was
+        // created in, so every id is resolved in the region this request was signed
+        // for: an id another region holds a campaign under is not this endpoint's to
+        // answer for, and is reported as not found like any other unknown id.
+        let region = crate::state::request_region(ctx);
+        let store = state.lock();
+
+        // One entry per id the request carried, in the order it carried them: the
+        // caller reads the outcome of each id it sent, so an id sent twice is answered
+        // twice and neither list is a set.
+        let mut successful_requests = Vec::new();
+        let mut failed_requests = Vec::new();
+        for id in &input.campaign_ids {
+            match store.campaign(&region, id) {
+                // The state the clock leaves the stored record at, exactly as
+                // `GetCampaignState` reports it for one id: derived from the stored
+                // schedule, so reporting a batch of them writes nothing.
+                Some(stored) => successful_requests.push(SuccessfulCampaignStateResponse {
+                    campaign_id: Some(id.clone()),
+                    state: Some(stored.state_at(now).as_wire().to_string()),
+                }),
+                // An id this region holds no campaign under is a per-id failure of the
+                // batch rather than a failure of the call, carrying the failure code
+                // the model's own catalog names for it.
+                None => failed_requests.push(FailedCampaignStateResponse {
+                    campaign_id: Some(id.clone()),
+                    failure_code: Some(RESOURCE_NOT_FOUND_FAILURE_CODE.to_string()),
+                }),
+            }
+        }
+
+        // Both lists are always present, including when one is empty: a client reads
+        // the outcome of every id it sent out of them.
+        Ok(GetCampaignStateBatchOutput {
+            successful_requests: Some(successful_requests),
+            failed_requests: Some(failed_requests),
+        })
     }
 }

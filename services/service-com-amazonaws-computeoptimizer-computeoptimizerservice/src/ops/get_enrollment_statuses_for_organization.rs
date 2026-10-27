@@ -223,12 +223,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same bound plus a `nextToken` to walk the rest. `0` carries no documented meaning,
         // so it reads as "no size asked for" rather than as an empty page a walk could never
         // advance through.
-        let page_size = input
-            .max_results
-            .and_then(|requested| usize::try_from(requested).ok())
-            .filter(|requested| *requested > 0)
-            .unwrap_or(crate::state::ENROLLMENT_STATUSES_MAX_PAGE_SIZE)
-            .min(crate::state::ENROLLMENT_STATUSES_MAX_PAGE_SIZE);
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::ENROLLMENT_STATUSES_MAX_PAGE_SIZE,
+            crate::state::ENROLLMENT_STATUSES_MAX_PAGE_SIZE,
+        );
 
         // The member accounts the request selects, in the store's own account-id order, each
         // reporting the status its enrollment has reached at this instant, under ONE guard
@@ -262,19 +261,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // sequence continues past this page, and it resumes exactly where this page stopped:
         // "This value is null when there are no more pages of account enrollment statuses to
         // return."
-        let page: Vec<AccountEnrollmentStatus> = selected
-            .into_iter()
-            .skip(offset)
-            .take(page_size.saturating_add(1))
-            .collect();
-        let has_more = page.len() > page_size;
-        let page: Vec<AccountEnrollmentStatus> = page.into_iter().take(page_size).collect();
-        let next_token = has_more.then(|| {
-            crate::state::encode_offset_page_token(&crate::state::PageCursor {
-                offset: offset.saturating_add(page.len()),
-                selection_fingerprint,
-            })
-        });
+        let (page, next_token) =
+            crate::state::offset_page(selected, offset, page_size, selection_fingerprint);
 
         Ok(GetEnrollmentStatusesForOrganizationOutput {
             account_enrollment_statuses: Some(page),

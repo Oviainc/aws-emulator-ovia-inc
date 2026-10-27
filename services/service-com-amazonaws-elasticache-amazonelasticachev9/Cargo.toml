@@ -29,9 +29,18 @@ hex = { workspace = true }
 # (src/state.rs), and mints the per-response correlation id the awsQuery error
 # envelope carries (src/service/query_error_envelope.rs).
 sha2 = { workspace = true }
+# The KMS client a `KmsKeyId` is resolved to its key's ARN through, over the
+# in-process callback into this same emulator (src/state/kms_key.rs); no network
+# client feature is enabled, because the transport is the emulator's own.
+aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The encryption suite mounts KMS beside ElastiCache on one engine, because
+# resolving the key a resource names is a call into it.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [lints]
 workspace = true

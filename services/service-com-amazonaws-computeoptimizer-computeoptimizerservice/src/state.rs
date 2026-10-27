@@ -8,7 +8,10 @@
 //! than one operation applies to them — scope well-formedness, the preference upsert, the
 //! scope precedence `GetEffectiveRecommendationPreferences` resolves with, and the opaque
 //! page token `GetRecommendationPreferences` round-trips — so no two handlers can drift
-//! from each other's view of the same record. The ORGANIZATION's member accounts live here
+//! from each other's view of the same record. The two rules EVERY paginated reader of this
+//! service applies live here for the same reason: how large a page a request asks for
+//! ([`page_size`]) and which items that page carries, with the token that resumes the walk
+//! after it ([`offset_page`]). The ORGANIZATION's member accounts live here
 //! too ([`OrganizationMemberStore`]): AWS Organizations records which accounts an
 //! organization holds, so no operation of this API creates one, while an
 //! `UpdateEnrollmentStatus` call that includes them writes their enrollment — which
@@ -3052,6 +3055,57 @@ pub fn decode_offset_page_token(token: &str) -> Option<PageCursor> {
         offset: offset.parse().ok()?,
         selection_fingerprint: selection_fingerprint.to_string(),
     })
+}
+
+/// How large a page a paginated reader of this service builds for a request.
+///
+/// The rule every one of them follows, stated once: `max_results` sizes the page when it asks
+/// for a size, `default` sizes it when the request asks for none — an absent member, or the
+/// value `0`, the lower bound of the modelled range, which the service documents no meaning
+/// for, so it reads as "no size asked for" rather than as an empty page a walk could never
+/// advance through — and the result is never larger than `cap`, so no number a request
+/// carries can size a response or the allocation that builds it. A reader passes its OWN
+/// default and its own ceiling, which differ between operations ([`DEFAULT_PAGE_SIZE`] and
+/// [`MAX_PAGE_SIZE`] for a reader the model bounds at 1000, [`IDLE_MAX_PAGE_SIZE`] and
+/// [`ENROLLMENT_STATUSES_MAX_PAGE_SIZE`] for the two the service bounds lower); the rule
+/// applied to them does not.
+pub fn page_size(max_results: Option<i32>, default: usize, cap: usize) -> usize {
+    max_results
+        .and_then(|requested| usize::try_from(requested).ok())
+        .filter(|requested| *requested > 0)
+        .unwrap_or(default)
+        .min(cap)
+}
+
+/// One page of `selected` and the `nextToken` that resumes the walk after it.
+///
+/// The tail every offset-paged reader of this service ends with, stated once: the page is the
+/// `page_size` items of the selected sequence that follow `offset`, and a token is handed out
+/// only when the sequence CONTINUES past the page — decided by reading one item further than
+/// the page reports — resuming at exactly the item the page stopped before, under the
+/// selection the page was taken with ([`PageCursor`], [`encode_offset_page_token`]). So the
+/// last page of a walk carries no token, and no two readers can disagree about when a walk
+/// has ended or where it resumes.
+pub fn offset_page<T>(
+    selected: Vec<T>,
+    offset: usize,
+    page_size: usize,
+    selection_fingerprint: String,
+) -> (Vec<T>, Option<String>) {
+    let mut page: Vec<T> = selected
+        .into_iter()
+        .skip(offset)
+        .take(page_size.saturating_add(1))
+        .collect();
+    let has_more = page.len() > page_size;
+    page.truncate(page_size);
+    let next_token = has_more.then(|| {
+        encode_offset_page_token(&PageCursor {
+            offset: offset.saturating_add(page.len()),
+            selection_fingerprint,
+        })
+    });
+    (page, next_token)
 }
 
 // ---------------------------------------------------------------------------

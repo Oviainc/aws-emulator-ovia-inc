@@ -181,3 +181,10 @@ mod default_user_required_wording;
 // Appended for the same reason: the `ModifyServerlessCache` suite.
 #[path = "all/serverless_cache_modify.rs"]
 mod serverless_cache_modify;
+
+// Appended for the same reason: the read-and-validate fidelity suite (the engine
+// filter of the version catalog, the order the event log is reported in, the key
+// an encrypted resource stores, a blank description, the maintenance-window rule
+// and the refusal templates).
+#[path = "all/read_validate_fidelity.rs"]
+mod read_validate_fidelity;

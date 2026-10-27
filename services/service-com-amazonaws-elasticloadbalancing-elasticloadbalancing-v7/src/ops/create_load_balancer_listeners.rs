@@ -154,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Bound the caller-driven work before any of it runs: one load balancer holds at
         // most this many listeners, so a longer list cannot be satisfied anyway.
         if input.listeners.len() > crate::state::MAX_LISTENERS_PER_LOAD_BALANCER {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "Listeners must carry at most {} listeners; got {}",
                 crate::state::MAX_LISTENERS_PER_LOAD_BALANCER,
                 input.listeners.len()
@@ -227,19 +227,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .find(|held| held.load_balancer_port == entry.load_balancer_port)
             {
                 Some(held) if held.configures_the_same(&entry) => {}
-                Some(held) => {
+                Some(_) => {
                     return Err(
                         CreateLoadBalancerListenersErrorModeled::DuplicateListenerException(
                             DuplicateListenerException {
-                                message: Some(format!(
-                                    "A listener already exists for {} on LoadBalancerPort {}, \
-                                     but with Protocol {}, InstanceProtocol {} and \
-                                     InstancePort {}",
-                                    input.load_balancer_name,
-                                    held.load_balancer_port,
-                                    held.protocol,
-                                    held.instance_protocol,
-                                    held.instance_port,
+                                message: Some(crate::state::duplicate_listener_message(
+                                    &input.load_balancer_name,
+                                    entry.load_balancer_port,
                                 )),
                             },
                         )
@@ -252,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if record.listeners.len() + additions.len()
             > crate::state::MAX_LISTENERS_PER_LOAD_BALANCER
         {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "a load balancer holds at most {} listeners; {} already configured and {} \
                  more were requested",
                 crate::state::MAX_LISTENERS_PER_LOAD_BALANCER,

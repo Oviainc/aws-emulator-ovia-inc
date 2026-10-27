@@ -299,6 +299,8 @@ mod hierarchies_etags_and_refusals;
 mod list_asset_model_composite_models;
 #[path = "all/list_asset_models.rs"]
 mod list_asset_models;
+#[path = "all/list_dashboards.rs"]
+mod list_dashboards;
 #[path = "all/list_pipelines.rs"]
 mod list_pipelines;
 #[path = "all/logging_options.rs"]

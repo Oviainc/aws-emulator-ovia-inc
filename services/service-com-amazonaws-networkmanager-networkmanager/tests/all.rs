@@ -111,6 +111,8 @@ mod list_attachments;
 mod list_tags_for_resource;
 #[path = "all/network_resource_counts.rs"]
 mod network_resource_counts;
+#[path = "all/network_resource_metadata.rs"]
+mod network_resource_metadata;
 #[path = "all/network_resource_regions.rs"]
 mod network_resource_regions;
 #[path = "all/network_resource_relationships.rs"]

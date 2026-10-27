@@ -243,6 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // `KmsKeyId` is "the ID of the KMS key used to encrypt the target
+        // snapshot", which the copy reports for the rest of its life, so the
+        // identifier the request named is resolved to the key's own ARN before it
+        // is stored (`crate::state::kms_key`) — before the store is locked,
+        // because resolving it is a call into KMS.
+        let kms_key_id = crate::state::kms_key::stored_key_id(ctx, &region, input.kms_key_id).await;
         let mut store = state.lock();
 
         // The copy is derived from the SOURCE record, with the status change the
@@ -299,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             source.copy_to(crate::state::SnapshotCopy {
                 target_snapshot_name: target_snapshot_name.clone(),
                 region,
-                kms_key_id: input.kms_key_id,
+                kms_key_id,
                 tags,
                 now,
             })
@@ -313,10 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.snapshots.contains_key(&target_snapshot_name) {
             return Err(CopySnapshotErrorModeled::SnapshotAlreadyExistsFault(
                 SnapshotAlreadyExistsFault {
-                    message: Some(format!(
-                        "Snapshot {} already exists.",
-                        input.target_snapshot_name
-                    )),
+                    message: Some(crate::state::SNAPSHOT_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());

@@ -5,9 +5,10 @@
 //! Reports the metadata form type the request's `Identifier` names: the records
 //! `PutFormType` keeps in
 //! [`crate::state::ComAmazonawsGlueAwsglueState::form_types`] are addressed by the
-//! identifier a client holds for one — the `FormTypeId` a put minted (`Identifier` targets
-//! the same `FormTypeId` shape the put's `Id` carries) or the name it was registered under
-//! — and an identifier this account holds no form type under is a miss.
+//! identifier a client holds for one, which is the form type's own name
+//! (`Identifier` targets the same `FormTypeId` shape the put's `Id` carries, and that `Id`
+//! is the name — [`crate::state::FormTypeEntry::id`]), and an identifier this account
+//! holds no form type under is a miss.
 //!
 //! ## Shape of an operation
 //!
@@ -160,11 +161,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(entry) = store.form_type_by_reference(&input.identifier) else {
             return Err(GetFormTypeErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    // Wording for this slice is pinned by no recording or doc, so the
-                    // refusal is derived from the request: it names the member that
-                    // resolved to nothing. What is pinned is the behaviour — 400 with
-                    // `EntityNotFoundException`.
-                    message: Some(format!("Form type {} not found", input.identifier)),
+                    // The catalog's refusal for a metadata form type it holds nothing
+                    // under: 400 `EntityNotFoundException`, whose message is the form type
+                    // surface's own wording, carrying the identifier from the request as
+                    // its one variable part.
+                    message: Some(crate::state::form_type_not_found_message(
+                        &input.identifier,
+                    )),
                     from_federation_source: None,
                 },
             )

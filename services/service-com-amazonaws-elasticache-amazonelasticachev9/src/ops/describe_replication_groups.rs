@@ -226,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DescribeReplicationGroupsErrorModeled::ReplicationGroupNotFoundFault(
                         ReplicationGroupNotFoundFault {
-                            message: Some(format!("Replication group {id} not found.")),
+                            message: Some(crate::state::replication_group_not_found_message(id)),
                         },
                     )
                     .into(),
