@@ -29,7 +29,7 @@ use service_com_amazonaws_medialive_medialive::state::MAX_LIST_PAGE_SIZE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
-use crate::support::member;
+use crate::support::{member, resolved_network_ids};
 use crate::wire::{call, error_code, medialive, ACCOUNT, DEFAULT_REGION};
 
 /// The cluster collection URI `CreateCluster` and `ListClusters` are bound to
@@ -368,7 +368,9 @@ async fn every_listed_cluster_is_the_stored_cluster_describe_reports() {
 
     for Stored { case, body } in table {
         let router = medialive();
-        let body = body();
+        // The networks the row's mappings name are put in the account first: a
+        // mapping may only name a network this account holds.
+        let body = resolved_network_ids(&router, body()).await;
         let cluster = created(&router, case, body.clone()).await;
         let id = id_of(case, &cluster);
 

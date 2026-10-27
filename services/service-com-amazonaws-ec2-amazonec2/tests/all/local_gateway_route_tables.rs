@@ -709,3 +709,247 @@ async fn a_dry_run_reports_that_the_request_would_have_succeeded() {
         "a dry run: reports no route table, got {body}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The ids and the filters together, and the size of the request itself
+// ---------------------------------------------------------------------------
+
+/// One row of the ids-and-filters table: the indices of the ids to name, the filter sent
+/// alongside them with its values, and the indices of the route tables that must come back.
+type IdsAndFilterCase<'a> = (Vec<usize>, &'a str, Vec<String>, Vec<usize>);
+
+/// The two narrowings are JOINED: a route table is reported only when it is both named by
+/// `LocalGatewayRouteTableIds` and matched by every filter, so neither can widen what the
+/// other selected. And a `NextToken` is a cursor into that same selection, so walking a
+/// filtered report with its filter re-sent covers exactly the selected tables, once each, in
+/// store order — the pages of a narrowed report, not of the whole store.
+#[tokio::test]
+async fn the_ids_and_the_filters_are_joined_and_a_token_walks_only_the_selection() {
+    let (router, engine) = super::ec2_query::emulator();
+    let seeded = seed(&engine);
+    let rows = seeded_rows();
+    let account = engine::emulator_account_id().to_string();
+
+    // Rows differ in which narrowing is the stricter one, in how many ids are named, in the
+    // attribute the filter selects on, and in the order the ids are asked for.
+    let cases: Vec<IdsAndFilterCase<'_>> = vec![
+        // The filter narrows the named ids further.
+        (
+            vec![0, 1, 2],
+            "state",
+            vec![rows[0].state.to_string()],
+            vec![0, 1],
+        ),
+        // A named table the filter excludes: naming it does not report it.
+        (vec![2], "state", vec![rows[0].state.to_string()], vec![]),
+        (
+            vec![3, 4, 5, 6],
+            "local-gateway-id",
+            vec![rows[3].local_gateway_id.to_string()],
+            vec![3, 4],
+        ),
+        // The ids narrow a filter that would otherwise match more.
+        (
+            (0..seeded.len()).collect(),
+            "outpost-arn",
+            vec![outpost_arn(rows[0].outpost)],
+            vec![0, 1],
+        ),
+        (vec![6], "owner-id", vec![account], vec![6]),
+        // Asked for in an order of its own, under a filter every table matches: the report is
+        // still in store order.
+        (
+            vec![4, 0],
+            "local-gateway-id",
+            vec!["lgw-*".to_string()],
+            vec![0, 4],
+        ),
+    ];
+
+    for (asked, name, values, expected_indices) in cases {
+        let ids = ids_at(&seeded, &asked);
+        let borrowed_ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let borrowed_values: Vec<&str> = values.iter().map(String::as_str).collect();
+        let case = format!("ids={borrowed_ids:?} {name}={borrowed_values:?}");
+        let mut params = indexed("LocalGatewayRouteTableId", &borrowed_ids);
+        params.extend(filters(&[(name, &borrowed_values)]));
+        let reported = described_ids(&router, &case, &params).await;
+        let expected = ids_at(&seeded, &expected_indices);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {expected:?}, got {reported:?}"
+        );
+    }
+
+    // Paging a FILTERED report: three local gateways select six of the seven stored tables,
+    // so the model's smallest page size (`LocalGatewayMaxResults`, `range 5..1000`) cuts the
+    // SELECTION into a full page and a remainder.
+    let gateways = [
+        rows[0].local_gateway_id.to_string(),
+        rows[3].local_gateway_id.to_string(),
+        rows[5].local_gateway_id.to_string(),
+    ];
+    let borrowed_gateways: Vec<&str> = gateways.iter().map(String::as_str).collect();
+    let page_size = 5;
+    let filtered_params = || {
+        let mut params = max_results_param(page_size);
+        params.extend(filters(&[("local-gateway-id", &borrowed_gateways)]));
+        params
+    };
+    let selection = ids_at(&seeded, &[0, 1, 2, 3, 4, 5]);
+    let mut params = filtered_params();
+    let mut walked: Vec<String> = Vec::new();
+    let mut page_sizes: Vec<usize> = Vec::new();
+    loop {
+        let (status, body) = describe(&router, &params).await;
+        assert_eq!(
+            status, 200,
+            "a filtered walk: expected HTTP 200, got {status} with body {body}"
+        );
+        let page = elements(&body, ID_ELEMENT);
+        page_sizes.push(page.len());
+        walked.extend(page);
+        assert!(
+            page_sizes.len() <= selection.len() + 1,
+            "a filtered walk: paging did not terminate, walked {walked:?}"
+        );
+        match element(&body, "nextToken") {
+            Some(token) => {
+                params = filtered_params();
+                params.push(("NextToken".to_string(), token));
+            }
+            None => break,
+        }
+    }
+    assert_eq!(
+        walked, selection,
+        "a filtered walk: expected the selected tables once each in store order, got {walked:?}"
+    );
+    assert_eq!(
+        page_sizes,
+        vec![5, 1],
+        "a filtered walk: expected a full page then the remainder, got {page_sizes:?}"
+    );
+}
+
+/// How big the REQUEST is, is read before the work it would cost: at each cap the request is
+/// evaluated as usual, and one past it the size itself is refused with EC2's
+/// `InvalidParameterValue` rather than evaluated.
+#[tokio::test]
+async fn a_request_past_a_published_cap_is_refused_rather_than_evaluated() {
+    let (router, engine) = super::ec2_query::emulator();
+    let seeded = seed(&engine);
+    let rows = seeded_rows();
+
+    // A well-formed local gateway route table id this account holds no table for:
+    // `lgw-rtb-` and 17 lowercase hex digits.
+    let unheld_id = |index: usize| format!("lgw-rtb-{index:017x}");
+
+    // The id list AT its cap is read, so the answer is about what the ids NAME — no table
+    // here — and not about how many there are; one past the cap, the count is the answer.
+    let ids: Vec<String> = (0..ec2::state::MAX_RESOURCE_IDS).map(unheld_id).collect();
+    let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let (status, body) = describe(&router, &indexed("LocalGatewayRouteTableId", &borrowed)).await;
+    assert_eq!(
+        status, 400,
+        "ids at the cap: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidLocalGatewayRouteTableID.NotFound",
+        "ids at the cap: the ids are read, so expected the answer for an id naming no table, \
+         got {body}"
+    );
+
+    let ids: Vec<String> = (0..=ec2::state::MAX_RESOURCE_IDS).map(unheld_id).collect();
+    let borrowed: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let (status, body) = describe(&router, &indexed("LocalGatewayRouteTableId", &borrowed)).await;
+    assert_eq!(
+        status, 400,
+        "ids past the cap: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidParameterValue",
+        "ids past the cap: expected InvalidParameterValue, got {body}"
+    );
+
+    // The number of filters, at the cap and one past it. Every filter here is documented and
+    // carries no value, so at the cap the request is evaluated and selects nothing.
+    let valueless: (&str, &[&str]) = ("state", &[]);
+    let at_cap = vec![valueless; ec2::state::MAX_FILTERS];
+    let reported = described_ids(&router, "filters at the cap", &filters(&at_cap)).await;
+    assert!(
+        reported.is_empty(),
+        "filters at the cap: a valueless filter selects nothing, got {reported:?}"
+    );
+
+    let past_cap = vec![valueless; ec2::state::MAX_FILTERS + 1];
+    let (status, body) = describe(&router, &filters(&past_cap)).await;
+    assert_eq!(
+        status, 400,
+        "filters past the cap: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidParameterValue",
+        "filters past the cap: expected InvalidParameterValue, got {body}"
+    );
+
+    // The number of values on ONE filter, at the cap and one past it. At the cap the values
+    // are compared, so the one value a table carries still selects it.
+    let mut values = vec![rows[0].state.to_string()];
+    values.extend((1..ec2::state::MAX_FILTER_VALUES).map(|index| format!("state-{index}")));
+    let borrowed: Vec<&str> = values.iter().map(String::as_str).collect();
+    let reported = described_ids(
+        &router,
+        "filter values at the cap",
+        &filters(&[("state", &borrowed)]),
+    )
+    .await;
+    assert_eq!(
+        reported,
+        ids_at(&seeded, &[0, 1, 3, 6]),
+        "filter values at the cap: the values are compared, got {reported:?}"
+    );
+
+    values.push("state-past-the-cap".to_string());
+    let borrowed: Vec<&str> = values.iter().map(String::as_str).collect();
+    let (status, body) = describe(&router, &filters(&[("state", &borrowed)])).await;
+    assert_eq!(
+        status, 400,
+        "filter values past the cap: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidParameterValue",
+        "filter values past the cap: expected InvalidParameterValue, got {body}"
+    );
+
+    // The SIZE of one value, at the cap and one past it: a capped number of comparisons is
+    // not capped work, the matcher's cost being the product of the two lengths.
+    let at_cap_value = "a".repeat(ec2::state::MAX_FILTER_VALUE_BYTES);
+    let reported = described_ids(
+        &router,
+        "a value at the byte cap",
+        &filters(&[("state", &[at_cap_value.as_str()])]),
+    )
+    .await;
+    assert!(
+        reported.is_empty(),
+        "a value at the byte cap: it is compared and matches no table, got {reported:?}"
+    );
+
+    let past_cap_value = "a".repeat(ec2::state::MAX_FILTER_VALUE_BYTES + 1);
+    let (status, body) =
+        describe(&router, &filters(&[("state", &[past_cap_value.as_str()])])).await;
+    assert_eq!(
+        status, 400,
+        "a value past the byte cap: expected HTTP 400, got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidParameterValue",
+        "a value past the byte cap: expected InvalidParameterValue, got {body}"
+    );
+}

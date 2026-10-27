@@ -40,7 +40,7 @@ use crate::channel_lifecycle::wait_for_the_clock;
 use crate::channel_placement_groups::{
     create_channel, create_cluster, create_nodes, deregister_node, group_uri, groups_uri,
 };
-use crate::support::percent_encoded;
+use crate::support::{percent_encoded, resolved_network_ids};
 use crate::wire::{call, error_code, error_message, medialive, ACCOUNT};
 
 /// The cluster collection URI `CreateCluster` and `ListClusters` are bound to
@@ -263,7 +263,10 @@ async fn a_deleted_cluster_moves_through_deleting_to_the_terminal_deleted() {
     } in table
     {
         let router = medialive();
-        let cluster = created(&router, case, body()).await;
+        // The networks the row's mappings name are put in the account first: a
+        // mapping may only name a network this account holds.
+        let body = resolved_network_ids(&router, body()).await;
+        let cluster = created(&router, case, body).await;
         let id = id_of(case, &cluster);
 
         if settle_before_delete {

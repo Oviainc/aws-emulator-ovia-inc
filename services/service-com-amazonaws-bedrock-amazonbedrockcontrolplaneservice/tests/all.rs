@@ -67,6 +67,8 @@ mod marketplace_endpoint_deregistration;
 mod marketplace_model_endpoints;
 #[path = "all/model_customization_jobs.rs"]
 mod model_customization_jobs;
+#[path = "all/model_customization_pass_role.rs"]
+mod model_customization_pass_role;
 #[path = "all/model_import_jobs.rs"]
 mod model_import_jobs;
 #[path = "all/model_invocation_jobs.rs"]

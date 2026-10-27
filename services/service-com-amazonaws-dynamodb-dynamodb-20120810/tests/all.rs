@@ -142,6 +142,9 @@ mod tag_read_propagation;
 #[path = "all/time_to_live.rs"]
 mod time_to_live;
 
+#[path = "all/update_contributor_insights_writes.rs"]
+mod update_contributor_insights_writes;
+
 #[path = "all/validation_message_wording.rs"]
 mod validation_message_wording;
 

@@ -121,14 +121,25 @@ pub async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> 
     call_in(router, REGION, operation, body).await
 }
 
-/// [`call`] for an operation that must succeed, returning its parsed body.
-pub async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
-    let (status, parsed) = call(router, operation, body.clone()).await;
+/// [`call_in`] for an operation that must succeed in `region`, returning its parsed body
+/// — for a suite whose calls are signed for more than one region.
+pub async fn ok_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> Value {
+    let (status, parsed) = call_in(router, region, operation, body.clone()).await;
     assert_eq!(
         status, 200,
-        "case {operation} {body}: expected HTTP 200, got {status} with {parsed}"
+        "case {operation} in {region} {body}: expected HTTP 200, got {status} with {parsed}"
     );
     parsed
+}
+
+/// [`ok_in`] in [`REGION`], for a suite that is not about regions.
+pub async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+    ok_in(router, REGION, operation, body).await
 }
 
 /// How long a poll for the documented `CREATING` -> `ACTIVE` transition may take before

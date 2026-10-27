@@ -16,6 +16,7 @@ use service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::{
     Policy, PolicyVersion, Role, User,
 };
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
+use service_com_amazonaws_transfer_transferservice::state as st;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test signs for. It is read back out of ARNs, so it must not be the
@@ -25,8 +26,26 @@ pub(crate) const REGION: &str = "us-east-1";
 /// The canonical emulator account id every ARN carries.
 pub(crate) const ACCOUNT: &str = "000000000000";
 
-/// `SERVER_START_SPAN` in `src/state.rs` is 500 ms; wait past it.
-pub(crate) const PAST_START_SPAN: Duration = Duration::from_millis(900);
+/// The slack a suite waits on top of a span before reading the state the clock owes.
+///
+/// The span is measured from an instant the HANDLER took, before the response reached
+/// the test, so a sleep of exactly the span already ends past the due instant; this
+/// only keeps a suite off the boundary.
+pub(crate) const SETTLE_MARGIN: Duration = Duration::from_millis(400);
+
+/// Wait out the span a server spends `STARTING`, whatever `src/state.rs` sets it to:
+/// the span is read from the crate under test rather than copied, so a suite cannot
+/// wait out a span the service no longer has.
+pub(crate) const PAST_START_SPAN: Duration = st::SERVER_START_SPAN.saturating_add(SETTLE_MARGIN);
+
+/// Wait out the span a server spends `STOPPING`, on the same basis as
+/// [`PAST_START_SPAN`].
+pub(crate) const PAST_STOP_SPAN: Duration = st::SERVER_STOP_SPAN.saturating_add(SETTLE_MARGIN);
+
+/// Wait out the window a web app spends applying an `UpdateWebApp`, on the same basis
+/// as [`PAST_START_SPAN`].
+pub(crate) const PAST_WEB_APP_UPDATE_SPAN: Duration =
+    st::WEB_APP_UPDATE_SPAN.saturating_add(SETTLE_MARGIN);
 
 /// An SSH public key whose body satisfies `SshPublicKeyBody`'s modelled pattern
 /// `^\s*(ssh|ecdsa)-[a-z0-9-]+[ \t]+(([A-Za-z0-9+/]{4})*...)$`.

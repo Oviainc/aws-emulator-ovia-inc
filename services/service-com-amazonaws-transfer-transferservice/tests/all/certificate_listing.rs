@@ -47,7 +47,7 @@ use service_com_amazonaws_transfer_transferservice::state::{
 
 use crate::harness::{
     drain_pages, is_modelled_certificate_id, member_of, unix_seconds, Answer, Emulator, ACCOUNT,
-    REGION,
+    REGION, SETTLE_MARGIN,
 };
 
 /// `CertificateUsageType`'s whole modelled value set
@@ -572,14 +572,20 @@ async fn listed_status(emulator: &Emulator) -> String {
         .to_string()
 }
 
+/// How far in the future the window the clock-transition test opens its certificate's
+/// window: the span a caller's first observation has to land inside, and what the test
+/// then waits out. Long enough that a loaded host cannot carry the first read past the
+/// window it is meant to precede.
+const WINDOW_OPENS_IN: Duration = Duration::from_secs(3);
+
 /// RULE (the clock, not a caller, moves `Status`): a certificate whose window opens in
 /// the future lists as `PENDING_ROTATION` and becomes `ACTIVE` once the clock is inside
 /// the window, with no call in between that touches the record.
 ///
-/// One transition over the wire, with a window that opens 500 ms from now and never
-/// closes, so the observation before it has 500 ms of margin and the one after it
-/// 500 ms, and the whole test is done in about a second. The exact window bounds, and
-/// the `INACTIVE` phase, are pinned without sleeping by
+/// One transition over the wire, with a window that opens [`WINDOW_OPENS_IN`] from now
+/// and never closes, so the observation before it has that whole span of margin and the
+/// one after it the same. The exact window bounds, and the `INACTIVE` phase, are pinned
+/// without sleeping by
 /// [`the_status_rule_is_a_half_open_window`]; that every phase reaches the WIRE is
 /// pinned by the projection table above, which lists records in all three statuses.
 #[tokio::test]
@@ -596,7 +602,7 @@ async fn a_certificates_status_follows_the_clock_into_its_window() {
             arn: certificate_arn(REGION, &certificate_id),
             usage: USAGES[2].to_string(),
             certificate_type: CERTIFICATE_TYPE_CERTIFICATE.to_string(),
-            active_date: Some(now + Duration::from_millis(500)),
+            active_date: Some(now + WINDOW_OPENS_IN),
             inactive_date: None,
             description: None,
         };
@@ -610,7 +616,7 @@ async fn a_certificates_status_follows_the_clock_into_its_window() {
          got {before_the_window:?}"
     );
 
-    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    tokio::time::sleep(WINDOW_OPENS_IN + SETTLE_MARGIN).await;
     let inside_the_window = listed_status(&emulator).await;
     assert_eq!(
         inside_the_window, CERTIFICATE_STATUS_ACTIVE,

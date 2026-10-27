@@ -192,29 +192,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // takes the store to read it and writes nothing at all.
         let state = state.lock();
 
-        // `listBy` chooses BOTH which presets are listed and how they are ordered: its
-        // `SYSTEM` value selects the built-in presets, which `Preset$Type` describes as
-        // the ones that "can't be modified or deleted by the user", while `NAME` and
-        // `CREATION_DATE` list the account's own presets on that key.
+        // `listBy` chooses BOTH which presets are listed and how they are ordered, and
+        // `category` narrows the set it chose: which presets that leaves is
+        // `records_listed_by`'s, the one place this service states it for a `listBy`
+        // listing, and the order and the page they come back in is `page_of_presets`'.
         let list_by = input.list_by.as_deref();
-        let wanted_type = if list_by == Some(crate::state::LIST_BY_SYSTEM) {
-            crate::state::TYPE_SYSTEM
-        } else {
-            crate::state::TYPE_CUSTOM
-        };
-
-        // `category`: "specify a preset category to limit responses to only presets from
-        // that category" — so a preset with no category matches no category the caller can
-        // name.
-        let category = input.category.as_deref();
         let page = crate::state::page_of_presets(
-            state
-                .presets
-                .values()
-                .filter(|record| record.preset_type == wanted_type)
-                .filter(|record| {
-                    category.is_none_or(|want| record.category.as_deref() == Some(want))
-                }),
+            crate::state::records_listed_by(
+                state.presets.values(),
+                list_by,
+                input.category.as_deref(),
+            ),
             list_by,
             input.order.as_deref(),
             resume_from.as_ref(),
