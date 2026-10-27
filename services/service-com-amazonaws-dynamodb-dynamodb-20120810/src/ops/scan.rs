@@ -17,10 +17,17 @@
 //! items, so the segments together evaluate every item exactly once
 //! ([`Segmentation`]).
 //!
-//! Secondary indexes (`IndexName`), result filters (`FilterExpression`, the legacy
-//! `ScanFilter`/`ConditionalOperator`) and projections (`ProjectionExpression`,
-//! the legacy `AttributesToGet`) are refused with the scaffold's 501 and are their
-//! own gap issues — exactly as `Query` refuses the same members. `ConsistentRead`
+//! `FilterExpression` is applied AFTER the page has been read — "a filter
+//! expression is applied after a Scan finishes but before the results are returned"
+//! — so the items it removes are still scanned and still charged for, and
+//! `ScannedCount` therefore counts what the page evaluated while `Count` counts what
+//! it answered. The expression is the `ConditionExpression` language, parsed by the
+//! one parser this crate has for it ([`crate::state::ParsedCondition`]).
+//!
+//! Secondary indexes (`IndexName`), the legacy filters (`ScanFilter`,
+//! `ConditionalOperator`) and projections (`ProjectionExpression`, the legacy
+//! `AttributesToGet`) are refused with the scaffold's 501 and are their own gap
+//! issues. `ConsistentRead`
 //! needs no handling beyond its effect on `ConsumedCapacity`: this store holds one
 //! copy of each item, so a scan of it always sees every completed write.
 //!
@@ -342,24 +349,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
 
-        // A `FilterExpression` the request sends is VALIDATED whether or not the
-        // filtering itself is served: whether the expression is one this service's
+        // A request may not state its filter twice: the legacy `ScanFilter` and
+        // `ConditionalOperator` are what `FilterExpression` replaces ("This is a
+        // legacy parameter. Use FilterExpression instead"), so a request carrying
+        // both is refused the way the service refuses it, before either is read.
+        if input.filter_expression.is_some() {
+            if input.scan_filter.as_ref().is_some_and(|map| !map.is_empty()) {
+                return Err(lift(crate::state::expression_conflict(
+                    "ScanFilter",
+                    "FilterExpression",
+                )));
+            }
+            if input.conditional_operator.is_some() {
+                return Err(lift(crate::state::expression_conflict(
+                    "ConditionalOperator",
+                    "FilterExpression",
+                )));
+            }
+        }
+        // A `ProjectionExpression` the request sends is VALIDATED whether or not the
+        // projection itself is served: whether the expression is one this service's
         // language accepts — a bare reserved word, an undefined `#name`, a syntax
         // error — is a fact of the request, and refusing it as unwritten would answer
         // "nobody implemented this" for a request no implementation could serve.
-        if let Some(expression) = input.filter_expression.as_deref() {
-            crate::state::ParsedCondition::parse(
-                "FilterExpression",
-                expression,
-                crate::state::Substitutions::new(
-                    input.expression_attribute_names.as_ref(),
-                    input.expression_attribute_values.as_ref(),
-                ),
-            )
-            .map_err(lift)?;
-        }
-        // A `ProjectionExpression` the request sends is validated the same way, and for
-        // the same reason.
         if let Some(expression) = input.projection_expression.as_deref() {
             crate::state::projection_expression_attributes(
                 "ProjectionExpression",
@@ -388,13 +400,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         // A substitution token has nothing to substitute into unless the request
-        // carries an expression, and this slice serves none, so one supplied here is
+        // carries an expression, so one supplied beside no expression at all is
         // refused rather than silently ignored.
         if let Some(member) = substitution_without_expression(&input) {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "{member} can only be specified when using expressions"
             )));
         }
+        // "A filter expression is applied after a Scan finishes but before the
+        // results are returned" (`Scan$FilterExpression`): it is the
+        // `ConditionExpression` language — one grammar, parsed in one place — judged
+        // against each item the scan read rather than against a key. It is parsed
+        // BEFORE the store is read, so an expression the service would refuse is
+        // refused without reading anything.
+        let filter = match input.filter_expression.as_deref() {
+            Some(expression) => Some(
+                crate::state::ParsedCondition::parse(
+                    "FilterExpression",
+                    expression,
+                    crate::state::Substitutions::new(
+                        input.expression_attribute_names.as_ref(),
+                        input.expression_attribute_values.as_ref(),
+                    ),
+                )
+                .map_err(lift)?,
+            ),
+            None => None,
+        };
         let segmentation = Segmentation::resolve(input.segment, input.total_segments)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
@@ -467,20 +499,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             None
         };
-        // Nothing is filtered out after the walk (no filter is served here), so every
-        // item evaluated is an item returned: "If you did not use a FilterExpression
-        // in the scan request, then Count is the same as ScannedCount".
-        let count = i32::try_from(page.len()).unwrap_or(i32::MAX);
+        // "A filter expression is applied after a Scan finishes": every item the page
+        // READ is scanned — and charged for — and the ones the filter does not match
+        // are left out of the response. "ScannedCount [is] the number of items
+        // evaluated, before any ScanFilter is applied"; with no filter, "Count is the
+        // same as ScannedCount".
+        let scanned_count = i32::try_from(page.len()).unwrap_or(i32::MAX);
+        let mut matched: Vec<&crate::state::Item> = Vec::with_capacity(page.len());
+        for (_, item) in &page {
+            let keep = match &filter {
+                Some(filter) => filter.evaluate(Some(item)).map_err(lift)?,
+                None => true,
+            };
+            if keep {
+                matched.push(item);
+            }
+        }
+        let count = i32::try_from(matched.len()).unwrap_or(i32::MAX);
         let items = if count_only {
             None
         } else {
-            Some(page.iter().map(|(_, item)| (*item).clone()).collect())
+            Some(matched.iter().map(|item| (*item).clone()).collect())
         };
 
         Ok(ScanOutput {
             items,
             count,
-            scanned_count: count,
+            scanned_count,
             last_evaluated_key,
             consumed_capacity: crate::state::consumed_capacity(
                 input.return_consumed_capacity.as_deref(),
@@ -523,9 +568,6 @@ fn unsupported_member(input: &ScanInput) -> Option<&'static str> {
     if input.index_name.is_some() {
         return Some("IndexName");
     }
-    if input.filter_expression.is_some() {
-        return Some("FilterExpression");
-    }
     if input.scan_filter.as_ref().is_some_and(|map| !map.is_empty()) {
         return Some("ScanFilter");
     }
@@ -550,6 +592,9 @@ fn unsupported_member(input: &ScanInput) -> Option<&'static str> {
 /// expression" and `ExpressionAttributeValues` "values that can be substituted in an
 /// expression" (those members' docs), so neither has a meaning on its own.
 fn substitution_without_expression(input: &ScanInput) -> Option<&'static str> {
+    if input.filter_expression.is_some() {
+        return None;
+    }
     if input
         .expression_attribute_names
         .as_ref()

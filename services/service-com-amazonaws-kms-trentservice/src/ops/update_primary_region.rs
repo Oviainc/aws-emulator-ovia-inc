@@ -278,10 +278,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The key the designation moves within, named as every refusal of this
-        // operation names it, read before the store is written through again.
+        // The key the designation moves within, by the key id every key of its
+        // multi-Region set shares, read before the store is written through again.
         let key_id = key.key_id.clone();
-        let key_arn = key.arn.clone();
 
         // "The key ID and primary Region that you specify uniquely identify the
         // replica key that will become the primary key. The primary Region must
@@ -290,17 +289,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // replica of this key set identifies no key this call can promote. It is a
         // bad value for that parameter rather than a missing resource, and this
         // operation models no error for one, so it is refused as a validation
-        // failure naming the member and what is wrong with it; nothing is
-        // persisted. The Region that already holds the primary key holds no replica
-        // of the set either, so it is refused the same way.
+        // failure; the message names the KEY that has no replica there, which is the
+        // operand the request got wrong, and nothing is persisted. The Region that
+        // already holds the primary key holds no replica of the set either, so it is
+        // refused the same way.
         //
         // Which key of the set is its primary is a property every key of the set
         // shares, so the move is written through all of them.
         if !state.promote_primary_region(&key_id, &input.primary_region) {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "PrimaryRegion {} has no replica key of {key_arn}. The primary Region must \
-                 already have a replica key.",
-                input.primary_region
+                "{key_id} does not have a replica key in the specified Region."
             )));
         }
 

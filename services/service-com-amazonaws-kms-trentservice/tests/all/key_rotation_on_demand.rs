@@ -21,8 +21,8 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    b64, call, create_alias, create_key, describe, error_code, is_lower_hex, ok, router, text,
-    unb64,
+    b64, call, create_alias, create_key, describe, error_code, is_lower_hex, ok, rotate_on_demand,
+    router, text, unb64,
 };
 
 /// The members of `KeyMetadata` that a key-material rotation must leave exactly as
@@ -80,8 +80,7 @@ async fn every_rotation_makes_a_new_key_material_version_current() {
 
                 let mut seen = vec![text(&case, &created, "CurrentKeyMaterialId")];
                 for round in 1..=rotations {
-                    let answer =
-                        ok(&router, "RotateKeyOnDemand", &json!({"KeyId": identifier})).await;
+                    let answer = rotate_on_demand(&router, &case, &identifier).await;
                     let answered = text(&case, &answer, "KeyId");
                     assert_eq!(
                         answered, arn,
@@ -174,7 +173,7 @@ async fn a_ciphertext_decrypts_under_the_material_version_that_sealed_it() {
     // so each version is exercised with one, two and three rotations behind it.
     for round in 0..=3usize {
         if round > 0 {
-            ok(&router, "RotateKeyOnDemand", &json!({"KeyId": key_id})).await;
+            rotate_on_demand(&router, "retained material", &key_id).await;
         }
         let current = text("current material", &describe(&router, &key_id).await, "CurrentKeyMaterialId");
 
@@ -423,7 +422,7 @@ async fn on_demand_rotation_is_bounded_per_key() {
     let mut seen = vec![text("setup", &created, "CurrentKeyMaterialId")];
     for round in 1..=QUOTA {
         let case = format!("rotation {round} of {QUOTA}");
-        ok(&router, "RotateKeyOnDemand", &json!({"KeyId": key_id})).await;
+        rotate_on_demand(&router, &case, &key_id).await;
         let material = text(
             &case,
             &describe(&router, &key_id).await,

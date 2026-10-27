@@ -227,6 +227,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // An on-demand rotation the CLOCK has already completed is materialised before
+        // the material this call deletes is chosen, so it deletes the version every
+        // reader already reports as current — a write owed at that instant whether or
+        // not anybody called.
+        key.settle_on_demand_rotation();
+
         // "The Origin of the KMS key must be EXTERNAL" (the `KeyId` member's
         // documentation): a key whose key material KMS generated holds no IMPORTED
         // material, so it is "a specified resource [that] is not valid for this
@@ -253,7 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one waiting for a rotation — identifies nothing to delete, which is the modelled
         // `NotFoundException`.
         let requested = input.key_material_id.as_deref();
-        let current = key.current_key_material_id.clone();
+        let current = key.reported_key_material_id();
         let names_current = requested.is_none() || requested == current.as_deref();
         // "Key material in PENDING_ROTATION state is not permanently associated with the
         // KMS key. You can delete this key material and import different key material in

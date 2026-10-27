@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUserPoolReplica
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUserPoolReplica`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUserPoolReplica::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -177,20 +168,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUserPoolReplica` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserPoolReplicaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUserPoolReplica"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // The pool to replicate is resolved FIRST: a request naming a pool that
+        // does not exist names nothing to replicate, whatever else it carries.
+        let Some(pool) = guard.pool(&input.user_pool_id) else {
+            return Err(user_pool_not_found(&input.user_pool_id));
+        };
+
+        // Replicating a user pool to another Region is a feature-plan feature,
+        // so a pool on the plan that does not include it is refused the way
+        // every other tier refusal of this service is.
+        if pool.user_pool_tier == crate::state::LITE_USER_POOL_TIER {
+            return Err(feature_unavailable_in_tier(
+                crate::state::feature_unavailable_in_tier_message(
+                    &pool.user_pool_tier,
+                    crate::state::REPLICATION_FEATURE,
+                ),
+            ));
+        }
+
+        // A replica lives in a Region OTHER than the pool's own: the pool
+        // already is the PRIMARY replica there, and this operation creates a
+        // secondary one.
+        if input.region_name == pool.region {
+            return Err(invalid_parameter(format!(
+                "User pool {} is the primary replica in Region {}, so it can't be replicated there.",
+                pool.id, pool.region
+            )));
+        }
+
+        // One Region holds at most one replica of a pool, so a Region this pool
+        // is already replicated to is not free.
+        if pool.replicas.contains_key(&input.region_name) {
+            return Err(invalid_parameter(format!(
+                "User pool {} already has a replica in Region {}.",
+                pool.id, input.region_name
+            )));
+        }
+
+        // This state lives in the emulator's memory, so the replicas one pool
+        // holds are bounded: repeated creates must not grow the process without
+        // limit.
+        if pool.replicas.len() >= crate::state::MAX_REPLICAS_PER_POOL {
+            return Err(limit_exceeded(format!(
+                "User pool {} holds at most {} replicas.",
+                pool.id,
+                crate::state::MAX_REPLICAS_PER_POOL
+            )));
+        }
+
+        // The record to store, built from the pool this create read, before the
+        // pool is borrowed mutably.
+        let record = crate::state::UserPoolReplica::new(
+            input.region_name.clone(),
+            pool.arn_in_region(&input.region_name),
+            input.user_pool_tags.clone().unwrap_or_default(),
+            now,
+        );
+
+        let Some(pool) = guard.pool_mut(&input.user_pool_id) else {
+            return Err(user_pool_not_found(&input.user_pool_id));
+        };
+        pool.replicas.insert(input.region_name.clone(), record);
+        pool.last_modified_date = now;
+
+        // Rendered from the STORED replica, so the response is what a
+        // `ListUserPoolReplicas` at the same instant reports.
+        let stored = pool
+            .to_replica_in(&input.region_name, now)
+            .ok_or_else(internal_error)?;
+        Ok(CreateUserPoolReplicaOutput {
+            user_pool_replica: Some(stored),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> CreateUserPoolReplicaError {
+    CreateUserPoolReplicaErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, which names what the request
+/// has to fix.
+fn invalid_parameter(message: String) -> CreateUserPoolReplicaError {
+    CreateUserPoolReplicaErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `ReasonCode` is an optional machine code AWS fills in for a few
+        // specific refusals only, so none is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `FeatureUnavailableInTierException` for a pool whose
+/// feature plan does not include replication.
+fn feature_unavailable_in_tier(message: String) -> CreateUserPoolReplicaError {
+    CreateUserPoolReplicaErrorModeled::FeatureUnavailableInTierException(
+        FeatureUnavailableInTierException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// This operation's `LimitExceededException` for a pool that already holds as
+/// many replicas as this emulator bounds it to.
+fn limit_exceeded(message: String) -> CreateUserPoolReplicaError {
+    CreateUserPoolReplicaErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> CreateUserPoolReplicaError {
+    CreateUserPoolReplicaErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

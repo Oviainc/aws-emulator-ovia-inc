@@ -38,6 +38,9 @@ use service_com_amazonaws_glue_awsglue::state::{
     COLUMN_STATISTICS_TASK_RUN_STATE_STARTING, MAX_COLUMN_STATISTICS_TASK_RUNS,
     TERMINAL_COLUMN_STATISTICS_TASK_RUN_STATES,
 };
+// The fixed sentence the in-flight refusal carries, read from the crate rather than
+// spelled a second time here.
+use service_com_amazonaws_glue_awsglue::state::messages::COLUMN_STATISTICS_TASK_RUN_ALREADY_STARTED;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{call, emulator_on, error_code, error_message, ok, ACCOUNT_ID};
@@ -590,10 +593,14 @@ async fn a_start_is_refused_while_that_table_has_a_run_in_flight() {
             "case {case:?}: expected ColumnStatisticsTaskRunningException, got {}",
             error_code(&parsed)
         );
-        let message = error_message(&parsed);
-        assert!(
-            message.contains("busy_db") && message.contains("busy_table"),
-            "case {case:?}: the refusal names the table the request addressed, got {message:?}"
+        // The refusal's wording is this error class's own fixed sentence: it names
+        // neither the table the request addressed nor the run in flight, so every row
+        // above is refused with the very same text.
+        assert_eq!(
+            error_message(&parsed),
+            COLUMN_STATISTICS_TASK_RUN_ALREADY_STARTED,
+            "case {case:?}: the refusal carries this error class's fixed message, got {:?}",
+            error_message(&parsed)
         );
     }
 

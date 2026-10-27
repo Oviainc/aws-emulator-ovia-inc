@@ -11,8 +11,12 @@
 //! The table spans the class the rule generalises over: the FORM of the instance ARN
 //! (partition, the optional `sso` prefix of the id, the character classes the id allows,
 //! letter case) and the instance's region (the caller's, another one, a Region in
-//! another partition, none at all). Where it names a published bound a comment names
-//! the modelled member it comes from.
+//! another partition). Where it names a published bound a comment names the modelled
+//! member it comes from.
+//!
+//! Every row's Region names an Amazon Web Services Region, which is what
+//! `CreateIdentitySource` accepts: `identity_source_region.rs` spans the values it
+//! refuses.
 
 use std::time::Duration;
 
@@ -44,7 +48,7 @@ struct PortalCase {
 
 /// The table: rows differ along the partition, the `ins-`/`ssoins-` forms of the
 /// instance id, the dots, dashes and letter case the id's `[a-zA-Z0-9-.]` class allows,
-/// and the instance's region (including none).
+/// and the instance's region.
 fn portal_cases() -> Vec<PortalCase> {
     vec![
         PortalCase {
@@ -85,11 +89,9 @@ fn portal_cases() -> Vec<PortalCase> {
             dns_suffix: "amazonaws.com.cn",
         },
         PortalCase {
-            // `IamIdentityCenter$Region` is `length(max: 1000)` with no pattern, so an
-            // empty Region is a request the constraint boundary admits.
-            case: "an instance that names no region",
+            case: "an instance in a Region of its own",
             instance_arn: "arn:aws:sso:::instance/ins-99887766554433aa",
-            instance_region: "",
+            instance_region: "ap-northeast-3",
             dns_suffix: "amazonaws.com",
         },
     ]
@@ -200,11 +202,7 @@ fn assert_portal(case: &PortalCase, entry: &Value) -> String {
         "case {:?}: expected the instance's own id as the leading label, got {reported:?}",
         case.case
     );
-    let expected_domain = if case.instance_region.is_empty() {
-        format!("mpa.{}", case.dns_suffix)
-    } else {
-        format!("mpa.{}.{}", case.instance_region, case.dns_suffix)
-    };
+    let expected_domain = format!("mpa.{}.{}", case.instance_region, case.dns_suffix);
     assert_eq!(
         domain, expected_domain,
         "case {:?}: expected the portal under {expected_domain:?}, got {reported:?}",

@@ -262,10 +262,10 @@ pub fn export_columns(requested: Option<&[String]>, modelled: &[&str]) -> Vec<St
 //
 // Every `Export*Recommendations` operation of this service admits a request by the SAME
 // rules — the mutually exclusive `accountIds`/`includeMemberAccounts` pair, the account ids
-// themselves, the surface's own filter vocabulary, a destination bucket that is named and
-// that the object store holds, the enrollment gate, the one-job-in-progress-per-Region limit
-// and how many jobs this store may hold — and then records the same job against the same
-// derived keys. So that whole rule lives HERE once, and each export operation supplies only
+// themselves, the organization an `includeMemberAccounts` asks to cover, the surface's own
+// filter vocabulary, a destination bucket that is named and that the object store holds, the
+// enrollment gate, the one-job-in-progress-per-Region limit and how many jobs this store may
+// hold — and then records the same job against the same derived keys. So that whole rule lives HERE once, and each export operation supplies only
 // what its own surface settles: the resource type it exports, its filter vocabulary, its
 // `Exportable*Field` set and the sentence it documents the one-job limit with.
 // ---------------------------------------------------------------------------
@@ -282,7 +282,10 @@ pub struct ExportRequest<'a, F: ExportFilter> {
     /// the file, not where it is written, so an id naming an account this service cannot
     /// answer about ([`super::is_foreign_account`]) is refused rather than exported under.
     pub account_ids: Option<Vec<String>>,
-    /// See [`ExportRequest::account_ids`].
+    /// See [`ExportRequest::account_ids`]. Asking for the member accounts is asking for the
+    /// resources of "all member accounts of the organization", which only a management account
+    /// or delegated administrator has, so a caller that manages none is refused
+    /// ([`super::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::include_member_accounts_rejection`]).
     pub include_member_accounts: bool,
     /// The request's filters, in this surface's own filter shape: "an array of objects to
     /// specify a filter that exports a more specific set of ... recommendations".
@@ -355,7 +358,10 @@ pub struct CreatedExport {
 /// precedence over the enrollment gate, as it does in every other operation of this service.
 /// An `accountIds` naming another account is such a request: it asks for an export of an
 /// account this service answers nothing about, and is refused with the crate's one
-/// cross-account refusal ([`super::CROSS_ACCOUNT_MESSAGE`]) exactly as a reader refuses it.
+/// cross-account refusal ([`super::CROSS_ACCOUNT_MESSAGE`]) exactly as a reader refuses it. So
+/// is an `includeMemberAccounts` asking to cover the organization's member accounts from a
+/// caller that manages no organization, which is refused before the enrollment gate and
+/// before any job is recorded.
 /// Creating a job is a write, so this is also where the jobs the seven-day reporting window
 /// has dropped are let go of — a reader never writes. The export job belongs to the Region
 /// whose endpoint created it, and so does the one-job-in-progress limit each export operation
@@ -441,6 +447,17 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
     let now = super::now_secs();
 
     let mut guard = state.lock();
+    // `includeMemberAccounts` asks for "recommendations for resources in all member accounts
+    // of the organization", which only an organization's management account or delegated
+    // administrator has, so a caller that manages none is refused rather than handed a job
+    // claiming to cover an organization this service records nothing about
+    // ([`super::include_member_accounts_rejection`]). Refused BEFORE the enrollment gate: it
+    // is about what the request asks for, not about what the store holds for the caller, as
+    // every other invalid parameter of this rule is.
+    if let Some(message) = guard.include_member_accounts_rejection(request.include_member_accounts)
+    {
+        return Err(ExportRefusal::InvalidParameter(message.to_string()));
+    }
     if !guard.enrollment.is_opted_in() {
         return Err(ExportRefusal::OptInRequired);
     }

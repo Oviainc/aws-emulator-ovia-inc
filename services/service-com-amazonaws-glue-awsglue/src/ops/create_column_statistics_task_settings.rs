@@ -11,9 +11,13 @@
 //! table the addressed catalog does not hold is the operation's modelled
 //! `EntityNotFoundException`, and a second create for a table that already carries
 //! settings is its `AlreadyExistsException` rather than an overwrite — the update path is
-//! `UpdateColumnStatisticsTaskSettings`'s. A `Schedule` is stored only when it is the
-//! cron expression the service documents; anything else is refused as invalid input, the
-//! same way every other operation that writes a schedule refuses it.
+//! `UpdateColumnStatisticsTaskSettings`'s. While a column statistics task run of that
+//! table is in flight the create is refused with the operation's modelled
+//! `ColumnStatisticsTaskRunningException` and persists nothing: the settings a run uses
+//! are not rewritten under a run that is already generating that table's statistics. A
+//! `Schedule` is stored only when it is the cron expression the service documents;
+//! anything else is refused as invalid input, the same way every other operation that
+//! writes a schedule refuses it.
 //!
 //! ## Shape of an operation
 //!
@@ -213,11 +217,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // Everything the clock already owed the stored runs is materialised before they
+        // are consulted, so a run the clock has already finished does not block this
+        // create.
+        store.settle_due_column_statistics_task_runs(now);
+
+        // "An exception thrown when you try to start another job while running a column
+        // stats generation job" (`ColumnStatisticsTaskRunningException`, which this
+        // operation models too): the settings of a table are the configuration its
+        // statistics runs use, so they are not rewritten under a run that is already
+        // generating statistics for that table. Read before the catalog is borrowed
+        // mutably, and answered AFTER the entity lookup below: a create addressed at no
+        // stored table is a miss, whatever is running.
+        let run_in_flight = store
+            .running_column_statistics_task_run(&catalog_id, &input.database_name, &input.table_name)
+            .is_some();
+
         // `DatabaseName`, `TableName` and `Role` are `@required` with `length 1..255`, and
         // `SampleSize`'s `range 0..100` is refused at the boundary — so reaching here, the
-        // only questions are whether the catalog holds that table and whether it already
-        // carries settings.
+        // only questions are whether the catalog holds that table, whether a statistics
+        // run of it is in flight and whether it already carries settings.
         let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
             return Err(not_found(crate::state::messages::database_not_found(
                 &input.database_name,
@@ -231,6 +252,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.table_name,
             )));
         };
+        // Decided before anything is persisted, so a refused create leaves the table
+        // carrying exactly the settings it carried — none, if no create has succeeded for
+        // it.
+        if run_in_flight {
+            return Err(
+                CreateColumnStatisticsTaskSettingsErrorModeled::ColumnStatisticsTaskRunningException(
+                    ColumnStatisticsTaskRunningException {
+                        message: Some(
+                            crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_RUN_ALREADY_STARTED
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
         // One settings record per table: a second create for the same table is a
         // duplicate, not an overwrite, so what is stored stays exactly as the first create
         // left it.

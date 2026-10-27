@@ -329,7 +329,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // supplied it, in which case the material waiting on the key IS the replacement
         // and nothing is generated.
         if rotates_pending_material {
-            if !key.rotate_to_pending_material(crate::state::ROTATION_TYPE_ON_DEMAND) {
+            if !key.rotate_to_pending_material() {
                 return Err(unsupported());
             }
             return Ok(RotateKeyOnDemandOutput {
@@ -357,12 +357,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "Immediately initiates rotation of the key material": the new material
-        // becomes the one the key encrypts under, the version it replaces is retained
-        // so ciphertext sealed under it still decrypts, and the rotation is recorded
-        // with the instant it happened. "On-demand rotations do not change existing
-        // automatic rotation schedules", so nothing else about the key is touched.
-        key.rotate_material(material, crate::state::ROTATION_TYPE_ON_DEMAND);
+        // "Immediately initiates rotation of the key material": the new material is
+        // what the key encrypts under once the rotation COMPLETES, the version it
+        // replaces is retained so ciphertext sealed under it still decrypts, and the
+        // rotation is recorded with the instant it was initiated. "On-demand rotations
+        // do not change existing automatic rotation schedules", so nothing else about
+        // the key is touched.
+        key.start_on_demand_rotation(material, None);
 
         Ok(RotateKeyOnDemandOutput {
             // KMS answers with the key ARN, not the identifier the request used — the

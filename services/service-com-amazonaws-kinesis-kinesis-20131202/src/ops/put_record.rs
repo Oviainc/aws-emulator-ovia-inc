@@ -334,10 +334,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The stream's own maximum record size is a bound on the LENGTH of this request's
+        // `Data`, so a blob past it is refused the way a modelled `@length` is: the
+        // validation envelope, naming the member and the bound it failed. This operation
+        // models no `ValidationException`, so that refusal travels through the error
+        // channel's own validation variant, which answers that code with HTTP 400.
+        let maximum = stream.max_record_size_bytes();
+        if input.data.len() > maximum {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::data_too_long_message(
+                    &[crate::state::put_record_data_path()],
+                    maximum,
+                ),
+            ));
+        }
+
         // "When the data blob (the payload before base64-encoding) is added to the
         // partition key size, the total size must not exceed the maximum record size"
-        // (`PutRecordInput$Data`).
-        let maximum = stream.max_record_size_bytes();
+        // (`PutRecordInput$Data`): a bound on the TOTAL of two members, which no single
+        // member's length states, so it is the modelled "parameter ... can't be used"
+        // refusal rather than a length violation.
         let size = input.data.len()
             + input
                 .partition_key
