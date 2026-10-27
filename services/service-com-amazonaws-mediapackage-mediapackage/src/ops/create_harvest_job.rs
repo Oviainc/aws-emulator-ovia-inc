@@ -39,6 +39,15 @@
 //! period is NOT decided here: nothing published states that bound for this service in a
 //! form this emulator can apply, so guessing it would refuse submissions AWS accepts.
 //!
+//! The three are decided in the order listed, which is the order a submission failing
+//! several of them is told to fix them in: a precondition read off the STORED endpoint the
+//! request acts on is reported before a refusal about a role the service would have to
+//! assume, because the role is not what such a caller has to fix. The role verdict is
+//! computed against the IAM store BEFORE this service's guard is taken (so the two stores
+//! are only ever locked in one order) and HELD until the endpoint has been resolved and its
+//! precondition decided — exactly as `UpdateOriginEndpoint` holds the same verdict until it
+//! has resolved the endpoint its request addresses.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -239,18 +248,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // MediaPackage writes the harvested content to the caller's bucket AS the role the
-        // destination names, so a submission it could never carry out is refused here
-        // instead of producing a job id for a harvest that cannot happen. The role has to
-        // BE an IAM role ARN first — a value that is not one names no role to assume, which
-        // is a value in the request the caller has to fix — and then one this emulator has
-        // no reason to think the service could not assume. The IAM store is a different
-        // store in the same engine, and no IAM handler reads this one; its guard is taken
-        // and released BEFORE this service's, so no two orders of the same two locks exist.
+        // destination names, so a submission it could never carry out is refused instead of
+        // producing a job id for a harvest that cannot happen. The role has to BE an IAM
+        // role ARN — a value that is not one names no role to assume, which is a value in
+        // the request and nothing to do with any stored resource, so it is judged here with
+        // the request's other members.
         crate::state::check_arn_member(
             crate::state::HARVEST_ROLE_MEMBER,
             &input.s3_destination.role_arn,
             crate::state::IAM_ROLE_ARN,
         )?;
+        // Whether the service could ACT AS that role is decided against the account's IAM
+        // records — a different store in the same engine, and no IAM handler reads this one;
+        // its guard is taken and released BEFORE this service's, so no two orders of the
+        // same two locks exist. The ANSWER is held and reported below, after the endpoint
+        // the submission harvests has been resolved and its own precondition decided, so a
+        // submission failing both is told to fix the endpoint rather than the role.
         let iam = crate::state::iam_state(&*self.engine).ok_or_else(|| {
             CreateHarvestJobErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -260,9 +273,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let role_refusal =
             crate::state::harvest_role_refusal(&input.s3_destination.role_arn, &iam.lock());
-        if let Some(refusal) = role_refusal {
-            return Err(refusal.into());
-        }
 
         let mut state = state.lock();
         // MediaPackage is regional: this job belongs to the Region this request is served
@@ -291,6 +301,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // written, so nothing is persisted and no later read reports a phantom job.
         if !endpoint.startover_enabled() {
             return Err(crate::state::startover_required("originEndpointId").into());
+        }
+        // The endpoint being harvested holds up its end, so the destination role is now the
+        // thing the caller has to fix, and the verdict read off the IAM store above is
+        // reported.
+        if let Some(refusal) = role_refusal {
+            return Err(refusal.into());
         }
         // The channel harvested is the one the STORED endpoint packages; the request does
         // not carry it and the response must not invent it.
