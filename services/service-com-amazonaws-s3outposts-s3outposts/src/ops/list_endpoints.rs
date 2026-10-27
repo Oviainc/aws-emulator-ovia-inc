@@ -160,6 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let caller = crate::state::caller_account();
         let mut store = state.lock();
+        let inventory = crate::state::outpost_inventory(&*self.engine, &store);
 
         // The walk, the page bound, the cursor and the Region a listing serves are
         // the one listing rule this service's listings follow, so they live in
@@ -169,6 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Outpost.
         let page = crate::state::endpoint_page(
             &mut store,
+            &inventory,
             now,
             &region,
             input.max_results,

@@ -653,6 +653,9 @@ pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_SNAPSHOT: &str =
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_RELATIONAL_DATABASE: &str = "DeleteRelationalDatabase";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DELETE_RELATIONAL_DATABASE_SNAPSHOT: &str =
+    "DeleteRelationalDatabaseSnapshot";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_FROM_SNAPSHOT: &str =
     "CreateRelationalDatabaseFromSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -12988,6 +12991,23 @@ impl ComAmazonawsLightsailLightsail20161128State {
     ) {
         self.relational_database_snapshots
             .insert(snapshot.name.clone(), snapshot);
+    }
+
+    /// Remove the managed relational database snapshot `name` names, answering
+    /// it. `None` when nothing matched.
+    ///
+    /// Nothing else in the store points AT a database snapshot: a database
+    /// restored from one copies everything it needs out of the snapshot record
+    /// as it is created ([`Self::snapshot_relational_database`] captures the
+    /// source the same way), so each snapshot is an independent point-in-time
+    /// copy and removing its record is the whole deletion — the clock-owed
+    /// transition it was still carrying goes with it, and the database it was
+    /// taken of, and every other snapshot of that database, are untouched.
+    pub fn remove_relational_database_snapshot(
+        &mut self,
+        name: &str,
+    ) -> Option<StoredRelationalDatabaseSnapshot> {
+        self.relational_database_snapshots.remove(name)
     }
 
     /// Take a point-in-time copy of `source` under the snapshot name `name`,

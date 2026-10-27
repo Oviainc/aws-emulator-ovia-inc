@@ -187,6 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let caller = crate::state::caller_account();
         let mut store = state.lock();
+        let inventory = crate::state::outpost_inventory(&*self.engine, &store);
 
         // Everything the clock already owes is materialised first, so this
         // create resolves against the endpoints that exist at `now`: an
@@ -200,8 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // since that is the only Region an Outpost and its endpoints are reached
         // through. An id that names neither is the modelled 404, carrying the
         // one service constant for an Outpost that does not resolve.
-        let Some(home_region) = store
-            .outpost_in(&region, &input.outpost_id)
+        let Some(home_region) = crate::state::outpost_in(&inventory, &region, &input.outpost_id)
             .map(|outpost| outpost.region.clone())
         else {
             return Err(CreateEndpointErrorModeled::ResourceNotFoundException(

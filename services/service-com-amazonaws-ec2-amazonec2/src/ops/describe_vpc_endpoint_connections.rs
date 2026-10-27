@@ -241,10 +241,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The one write a read may make: a connection `AcceptVpcEndpointConnections` left
-        // `Pending` is `Available` once its due instant has passed, whether or not anybody
+        // `pending` is `available` once its due instant has passed, whether or not anybody
         // called, so applying it here changes nothing a later caller would not have seen
         // anyway. Until the owner accepts or rejects it, a connection stays
-        // `PendingAcceptance` — that is an action and not an instant, so nothing is owed on
+        // `pendingAcceptance` — that is an action and not an instant, so nothing is owed on
         // a connection nobody has acted on.
         store.materialize_due_transitions();
 
@@ -368,33 +368,15 @@ fn filter_values<'a>(
             }
             values
         }
-        // The state is stored as the model's `State` enum spells it, while the filter
-        // documents its own spelling of the same state, so BOTH spellings are what the
-        // filter compares against — see [`crate::state::VPC_ENDPOINT_STATE_FILTER_VALUES`].
-        "vpc-endpoint-state" => {
-            let state = connection.vpc_endpoint_state.as_deref();
-            let mut values = text(state);
-            if let Some(documented) = state.and_then(documented_state_value) {
-                values.push(Cow::Borrowed(documented));
-            }
-            values
-        }
+        // The state the connection reports is the state of the endpoint, in the spelling
+        // the filter's own doc list publishes — see
+        // [`crate::state::VPC_ENDPOINT_STATE_VALUES`].
+        "vpc-endpoint-state" => text(connection.vpc_endpoint_state.as_deref()),
         // Unreachable: the handler has already refused every other name. An undefined name
         // compares against nothing, so it could never widen a result even if that check
         // were bypassed.
         _ => Vec::new(),
     }
-}
-
-/// How the `vpc-endpoint-state` filter spells the modelled state `state`, when that
-/// spelling differs from the modelled one; `None` for a state the filter documents no
-/// value for (the `State` enum's `Expired` and `Partial`, which name states of other
-/// resources).
-fn documented_state_value(state: &str) -> Option<&'static str> {
-    crate::state::VPC_ENDPOINT_STATE_FILTER_VALUES
-        .iter()
-        .find(|(documented, modelled)| *modelled == state && *documented != state)
-        .map(|(documented, _)| *documented)
 }
 
 /// Does `connection` satisfy every filter?

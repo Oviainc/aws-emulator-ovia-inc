@@ -559,13 +559,13 @@
 //! [`ComAmazonawsEc2Amazonec2State::has_vpc_endpoint_connection_capacity`] first and
 //! refuses with EC2's own quota code) and every record costs at least
 //! [`STORED_RECORD_OVERHEAD_BYTES`] against the byte budget, so repeated writes
-//! cannot grow the store for free. A connection sits in `PendingAcceptance` until the
+//! cannot grow the store for free. A connection sits in `pendingAcceptance` until the
 //! SERVICE OWNER accepts or rejects it (`AcceptVpcEndpointConnections` /
 //! `RejectVpcEndpointConnections`), which is an action rather than an instant, so —
 //! unlike a `pending` VPC — nothing beside it records a clock-owed transition until the
-//! owner acts: once `AcceptVpcEndpointConnections` has, the connection is `Pending` and
+//! owner acts: once `AcceptVpcEndpointConnections` has, the connection is `pending` and
 //! [`ComAmazonawsEc2Amazonec2State::vpc_endpoint_connection_moves`] holds the instant the
-//! clock owes it `Available`.
+//! clock owes it `available`.
 //!
 //! ## VPC endpoint associations
 //!
@@ -3163,8 +3163,8 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// The state move an acceptance owes a VPC endpoint connection, by `VpcEndpointId` —
     /// the connection counterpart of [`Self::vpc_available_at`], beside the connection
     /// store rather than inside it because that store holds the modelled shape itself.
-    /// `AcceptVpcEndpointConnections` leaves the connection in the non-terminal `Pending`
-    /// state, so the clock owes it `Available` [`TRANSITION_DELAY`] later; a connection
+    /// `AcceptVpcEndpointConnections` leaves the connection in the non-terminal `pending`
+    /// state, so the clock owes it `available` [`TRANSITION_DELAY`] later; a connection
     /// nothing has accepted has no entry here.
     pub vpc_endpoint_connection_moves: BTreeMap<String, PendingStateMove>,
     /// Every VPC endpoint service configuration the account owns, by `ServiceId`, as the
@@ -3179,8 +3179,8 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// The state move the clock owes a VPC endpoint, by `VpcEndpointId` — the endpoint's
     /// counterpart of [`Self::vpc_endpoint_connection_moves`], beside the endpoint store
     /// rather than inside it because that store holds the modelled shape itself.
-    /// `CreateVpcEndpoint` answers an endpoint in the non-terminal `Pending` state, so the
-    /// clock owes it `Available` [`TRANSITION_DELAY`] later whether or not anybody calls
+    /// `CreateVpcEndpoint` answers an endpoint in the non-terminal `pending` state, so the
+    /// clock owes it `available` [`TRANSITION_DELAY`] later whether or not anybody calls
     /// again; an endpoint nothing owes a move has no entry here.
     pub vpc_endpoint_moves: BTreeMap<String, PendingStateMove>,
     /// A `CreateVpcEndpoint` `ClientToken` and the `VpcEndpointId` it minted, so a repeat
@@ -7082,7 +7082,7 @@ impl ComAmazonawsEc2Amazonec2State {
             // The move is applied once; nothing is owed on this connection any more.
             false
         });
-        // The end of the `Pending` a `CreateVpcEndpoint` answers with: the endpoint is in
+        // The end of the `pending` a `CreateVpcEndpoint` answers with: the endpoint is in
         // service once its instant has passed, whether or not anybody called again — the
         // same contract, on the same clock, as the connection move above.
         let endpoints = &mut self.vpc_endpoints;
@@ -24240,33 +24240,30 @@ pub const VPC_ENDPOINT_ID_PREFIX: &str = "vpce";
 /// [`vpc_endpoint_id_is_well_formed`].
 pub const VPC_ENDPOINT_SERVICE_ID_PREFIX: &str = "vpce-svc";
 
-/// Every state a VPC endpoint connection can be in, as the `vpc-endpoint-state` FILTER
-/// spells it paired with the member of the model's `State` enum that names the same state.
+/// Every state a VPC endpoint can be in, as EC2 REPORTS it.
 ///
-/// Two sources spell one state two ways, and both are part of the contract: the filter
-/// documents "`vpc-endpoint-state` - The state of the endpoint (`pendingAcceptance` |
-/// `pending` | `available` | `deleting` | `deleted` | `rejected` | `failed`)"
-/// (`DescribeVpcEndpointConnectionsRequest$Filters`), while `VpcEndpointConnection$VpcEndpointState`
-/// targets the `State` enum, whose values are `PendingAcceptance`, `Pending`, `Available`,
-/// `Deleting`, `Deleted`, `Rejected`, `Failed`, `Expired` and `Partial`
-/// (`crate::ops::types::STATE_VALUES`). A stored connection therefore carries the MODELLED
-/// value, and this table is what lets the documented filter value select it. `Expired` and
-/// `Partial` are states of other resources the enum also serves — the filter documents no
-/// value for either — so they are not here.
-pub const VPC_ENDPOINT_STATE_FILTER_VALUES: [(&str, &str); 7] = [
-    ("pendingAcceptance", "PendingAcceptance"),
-    ("pending", "Pending"),
-    ("available", "Available"),
-    ("deleting", "Deleting"),
-    ("deleted", "Deleted"),
-    ("rejected", "Rejected"),
-    ("failed", "Failed"),
+/// The model enumerates them on the filter that selects on this very state:
+/// "`vpc-endpoint-state` - The state of the endpoint (`pendingAcceptance` | `pending` |
+/// `available` | `deleting` | `deleted` | `rejected` | `failed`)"
+/// (`DescribeVpcEndpointsRequest$Filters`, `DescribeVpcEndpointConnectionsRequest$Filters`),
+/// and a filter's values are the values the attribute it selects on carries — so this is
+/// the spelling `VpcEndpoint$State` and `VpcEndpointConnection$VpcEndpointState` are
+/// reported in. Both members target the `State` enum, whose MEMBER NAMES are capitalized
+/// (`crate::ops::types::STATE_VALUES`) and also serve states of other resources (`Expired`,
+/// `Partial`); the member names are not what this attribute reports.
+pub const VPC_ENDPOINT_STATE_VALUES: [&str; 7] = [
+    "pendingAcceptance",
+    "pending",
+    "available",
+    "deleting",
+    "deleted",
+    "rejected",
+    "failed",
 ];
 
-/// A connection whose endpoint is waiting for the service owner to accept it: the `State`
-/// enum's `PendingAcceptance` member, which is the state an endpoint to a service with
-/// `AcceptanceRequired` enters.
-pub const VPC_ENDPOINT_STATE_PENDING_ACCEPTANCE: &str = "PendingAcceptance";
+/// An endpoint waiting for the service owner to accept it, which is the state an endpoint to
+/// a service with `AcceptanceRequired` enters — as [`VPC_ENDPOINT_STATE_VALUES`] spells it.
+pub const VPC_ENDPOINT_STATE_PENDING_ACCEPTANCE: &str = "pendingAcceptance";
 
 /// "The type of endpoint … Default: Gateway" (`CreateVpcEndpointRequest$VpcEndpointType`):
 /// the `VpcEndpointType` enum's `Gateway` member
@@ -24813,12 +24810,13 @@ pub fn account_endpoint_service_record(
     })
 }
 
-/// A connection whose endpoint is in service: the `State` enum's `Available` member.
-pub const VPC_ENDPOINT_STATE_AVAILABLE: &str = "Available";
+/// An endpoint that is in service, as [`VPC_ENDPOINT_STATE_VALUES`] spells it.
+pub const VPC_ENDPOINT_STATE_AVAILABLE: &str = "available";
 
-/// A connection the service owner has accepted and that is not in service yet: the `State`
-/// enum's `Pending` member, the non-terminal state an acceptance leaves it in.
-pub const VPC_ENDPOINT_STATE_PENDING: &str = "Pending";
+/// An endpoint that has been created, or accepted, and is not in service yet: the
+/// non-terminal state the clock owes [`VPC_ENDPOINT_STATE_AVAILABLE`], as
+/// [`VPC_ENDPOINT_STATE_VALUES`] spells it.
+pub const VPC_ENDPOINT_STATE_PENDING: &str = "pending";
 
 /// What one stored VPC endpoint connection is created with, beside the connection id the
 /// store mints itself.
@@ -24836,8 +24834,7 @@ pub struct VpcEndpointConnectionSpec {
     pub vpc_endpoint_id: String,
     /// The account that owns the endpoint (`VpcEndpointConnection$VpcEndpointOwner`).
     pub vpc_endpoint_owner: String,
-    /// The endpoint's state, as the model's `State` enum spells it — see
-    /// [`VPC_ENDPOINT_STATE_FILTER_VALUES`].
+    /// The endpoint's state, as EC2 reports it — see [`VPC_ENDPOINT_STATE_VALUES`].
     pub vpc_endpoint_state: String,
     /// When the endpoint was created.
     pub creation_timestamp: SystemTime,
@@ -25032,9 +25029,8 @@ pub const ASSOCIATED_RESOURCE_FAILED: &str = "FAILED";
 /// FILTER spells it paired with the value
 /// `VpcEndpointAssociation$AssociatedResourceAccessibility` carries for it.
 ///
-/// Two sources spell one state two ways and both are part of the contract, exactly as
-/// [`VPC_ENDPOINT_STATE_FILTER_VALUES`] holds for an endpoint's state: the filter documents
-/// "`associated-resource-accessibility` - The association state. When the state is
+/// Two sources spell one state two ways and both are part of the contract: the filter
+/// documents "`associated-resource-accessibility` - The association state. When the state is
 /// `accessible`, it returns `AVAILABLE`. When the state is `inaccessible`, it returns
 /// `PENDING` or `FAILED`" (`DescribeVpcEndpointAssociationsRequest$Filters`), while the
 /// reported member carries the accessibility of the resource configuration itself. A stored

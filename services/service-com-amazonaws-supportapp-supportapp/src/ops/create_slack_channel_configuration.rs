@@ -211,24 +211,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The documented default for the three notification flags: "If you don't
-        // specify these parameters in your request, they default to false."
-        // (`notifyOnCaseSeverity`). The configuration therefore HOLDS a boolean for
-        // each of them, which is what every later read reports.
-        let notify_on_create_or_reopen_case = input.notify_on_create_or_reopen_case.unwrap_or(false);
-        let notify_on_add_correspondence_to_case =
-            input.notify_on_add_correspondence_to_case.unwrap_or(false);
-        let notify_on_resolve_case = input.notify_on_resolve_case.unwrap_or(false);
-
-        // The severity/flag combination rule documented on `notifyOnCaseSeverity`. The
-        // model cannot express it, so the boundary validator passed it. Both clauses
-        // read the same set of values here: this request carries the WHOLE
-        // configuration, and a flag it does not carry is created `false`, which is what
-        // the `none` clause admits as "null or false".
+        // The three notification flags this request asks for, read through
+        // [`crate::state::NotificationFlags::new`], which owns the documented default:
+        // "If you don't specify these parameters in your request, they default to
+        // false." (`notifyOnCaseSeverity`). The configuration therefore HOLDS a boolean
+        // for each of them — the ones read back off `flags` for the record below, which
+        // is what every later read reports.
+        //
+        // The same values are what the severity/flag combination rule documented on
+        // `notifyOnCaseSeverity` is evaluated over. The model cannot express that rule,
+        // so the boundary validator passed it. Both clauses read the same set of values
+        // here: this request carries the WHOLE configuration, and a flag it does not
+        // carry is created `false`, which is what the `none` clause admits as "null or
+        // false".
         let flags = crate::state::NotificationFlags::new(
-            Some(notify_on_create_or_reopen_case),
-            Some(notify_on_add_correspondence_to_case),
-            Some(notify_on_resolve_case),
+            input.notify_on_create_or_reopen_case,
+            input.notify_on_add_correspondence_to_case,
+            input.notify_on_resolve_case,
         );
         if let Some(message) = crate::state::notification_rule_violation(
             Self::NAME,
@@ -304,9 +303,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 team_id: input.team_id,
                 channel_id: input.channel_id,
                 channel_name: input.channel_name,
-                notify_on_create_or_reopen_case: Some(notify_on_create_or_reopen_case),
-                notify_on_add_correspondence_to_case: Some(notify_on_add_correspondence_to_case),
-                notify_on_resolve_case: Some(notify_on_resolve_case),
+                notify_on_create_or_reopen_case: Some(flags.notify_on_create_or_reopen_case),
+                notify_on_add_correspondence_to_case: Some(
+                    flags.notify_on_add_correspondence_to_case,
+                ),
+                notify_on_resolve_case: Some(flags.notify_on_resolve_case),
                 notify_on_case_severity: input.notify_on_case_severity,
                 channel_role_arn: input.channel_role_arn,
             },

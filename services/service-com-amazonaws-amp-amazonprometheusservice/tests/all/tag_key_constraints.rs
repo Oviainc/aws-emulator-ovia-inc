@@ -148,10 +148,10 @@ async fn a_scraper_create_carrying_a_tag_key_outside_the_key_shape_is_refused() 
             "case {case:?}: a refused create must mint nothing, got {reply:?}"
         );
         assert_eq!(
-            amp.store().lock().scrapers.len(),
+            amp.store().lock().region(region).scrapers.len(),
             0,
             "case {case:?}: a refused create must persist no scraper, got {} held",
-            amp.store().lock().scrapers.len()
+            amp.store().lock().region(region).scrapers.len()
         );
     }
 

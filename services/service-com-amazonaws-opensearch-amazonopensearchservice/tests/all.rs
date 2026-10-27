@@ -75,6 +75,8 @@ mod instance_type_limits;
 mod package_association_listings;
 #[path = "all/package_associations.rs"]
 mod package_associations;
+#[path = "all/package_deletion.rs"]
+mod package_deletion;
 #[path = "all/package_dependency_lifecycle.rs"]
 mod package_dependency_lifecycle;
 #[path = "all/package_dissociation.rs"]

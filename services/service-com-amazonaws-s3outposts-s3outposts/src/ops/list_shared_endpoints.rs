@@ -163,11 +163,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
+        let inventory = crate::state::outpost_inventory(&*self.engine, &store);
 
         // The Outpost the request named, as this Region reaches it: an Outpost
         // installed in another Region is not one this Region's endpoint serves,
         // so it resolves to the modelled 404 like one that does not exist.
-        if store.outpost_in(&region, &input.outpost_id).is_none() {
+        if crate::state::outpost_in(&inventory, &region, &input.outpost_id).is_none() {
             return Err(ListSharedEndpointsErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(),
             )
@@ -184,6 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // related actions and they operate on exactly those.
         let page = crate::state::endpoint_page(
             &mut store,
+            &inventory,
             now,
             &region,
             input.max_results,

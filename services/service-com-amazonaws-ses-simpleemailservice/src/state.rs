@@ -154,12 +154,13 @@ pub const PRODUCTION_ACCESS_AT_ACCOUNT_START: bool = false;
 
 /// The bytes one sending-authorization policy document may carry.
 ///
-/// `PutIdentityPolicyRequest$Policy` states the ceiling: "The text of the policy
-/// in JSON format. The policy cannot exceed 4 KB." The model carries only the
-/// member's lower bound (`length 1..`), so the documented ceiling is the
-/// handler's to enforce — and it is also what bounds one entry of the policy
-/// store.
-pub const MAX_POLICY_BYTES: usize = 4 * 1024;
+/// `PutIdentityPolicyRequest$Policy` states the ceiling in prose — "The text of
+/// the policy in JSON format. The policy cannot exceed 4 KB." — and the service
+/// enforces that 4 KB as a round 4,000 bytes, which is also the number its
+/// refusal names. The model carries only the member's lower bound (`length
+/// 1..`), so this ceiling is the handler's to enforce; it is also what bounds one
+/// entry of the policy store.
+pub const MAX_POLICY_BYTES: usize = 4_000;
 
 /// The sending-authorization policies ONE identity may hold at once, and so the
 /// ceiling on an identity's policy map.

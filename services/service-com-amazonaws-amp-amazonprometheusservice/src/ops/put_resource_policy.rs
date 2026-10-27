@@ -184,8 +184,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a workspace created in another Region is not
+        // reachable from this endpoint and is not found here. The id counter is the whole
+        // store's, so no two Regions mint the same revision id.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.materialize_due(now);
+        let (store, next_id) = match store.held_region_and_ids_mut(&region) {
+            Some(held) => held,
+            // A Region this account holds nothing in holds no workspace either, so it
+            // answers the same not-found the missing workspace does, below.
+            None => {
+                return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into())
+            }
+        };
 
         // The policy hangs off the workspace at `/workspaces/{workspaceId}/policy`, so
         // an unknown workspace is the missing resource — ResourceNotFoundException (404).
@@ -254,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Accepted: mint the next revision. A workspace that held no policy is CREATING
         // one; one that held a policy is UPDATING it (`WorkspacePolicyStatusCode`), and
         // either way the clock owes the move to ACTIVE at `transition_due`.
-        let revision_id = crate::state::mint_revision_id(&mut store.next_id);
+        let revision_id = crate::state::mint_revision_id(next_id);
         let policy = crate::state::ResourcePolicy {
             policy_document: input.policy_document,
             status_code: if existing.is_some() {

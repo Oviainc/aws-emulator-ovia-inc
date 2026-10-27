@@ -161,15 +161,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
+        // The inventory this account reaches: the Outposts its AWS Outposts control
+        // plane has S3 capacity provisioned on, plus any shared with it.
+        let inventory = crate::state::outpost_inventory(&*self.engine, &store);
 
         // The walk, the page bound, the cursor and the Region a listing serves are
         // the one listing rule this service's listings follow, so they live in
         // `crate::state`; what is this operation's own is the inventory it walks
         // and the `Outpost` shape it projects each record into.
-        let page = crate::state::outpost_page(&store, &region, input.max_results, resume);
+        let page = crate::state::outpost_page(&inventory, &region, input.max_results, resume);
 
         // An account with no S3 on Outposts capacity provisioned in this Region
-        // holds no Outpost records it reaches, so the page above is empty — and
+        // reaches no Outpost there, so the page above is empty — and
         // the cursor is minted only where the walk found a record BEYOND the page
         // it served, so the last page of any listing, an empty one included,
         // carries no token at all.

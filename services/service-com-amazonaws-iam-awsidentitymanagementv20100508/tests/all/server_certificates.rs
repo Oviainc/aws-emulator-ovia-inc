@@ -34,11 +34,11 @@ use crate::role_lifecycle::{borrowed, optional, param, reported_tags};
 use crate::user_lifecycle::{account_id, call, element, elements, error_code, router};
 
 /// One generated key pair with the self-signed certificate it belongs to.
-struct Material {
+pub(crate) struct Material {
     /// The PEM handed to `UploadServerCertificate` as `CertificateBody`.
-    certificate: String,
+    pub(crate) certificate: String,
     /// The PEM handed to it as `PrivateKey`.
-    private_key: String,
+    pub(crate) private_key: String,
     /// The certificate's own `notAfter` (RFC 5280 section 4.1.2.5), in whole epoch
     /// seconds — read out of the generated DER, not out of the service.
     not_after: i64,
@@ -46,7 +46,7 @@ struct Material {
 
 /// Generate a real key pair and a self-signed certificate for it, valid from 1 January
 /// `validity.0` to 1 January `validity.1`.
-fn material(
+pub(crate) fn material(
     algorithm: &'static rcgen::SignatureAlgorithm,
     validity: (i32, i32),
     common_name: &str,

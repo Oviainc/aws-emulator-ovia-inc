@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePackage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePackage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePackage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes one stored [`crate::state::Package`] out of this account, and answers it
+//! through the same `PackageDetails` projection the create and the reads report it
+//! through — so what this call reports and a read made before the removal lands
+//! cannot disagree.
+//!
+//! A package that is still in place on a domain is not one this call can remove: the
+//! request's own documentation states that the package "can't be associated with any
+//! OpenSearch Service domain", so such a call is refused and the package, the domains
+//! holding it and their links are left exactly as they were.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +78,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::{package_in_use, package_not_found};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -151,18 +156,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePackage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePackageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+
+        // Whatever the clock already owed the records this call reads is materialised
+        // first, so the call decides on the state of the store at `now`: a package whose
+        // copy has landed, one whose own removal has already fallen due, and a link a
+        // dissociation has taken off a domain are each judged as they stand then rather
+        // than as the call that started the move left them.
+        store.settle_packages(now);
+        for domain in store.domains.values_mut() {
+            domain.settle_package_associations(now);
+        }
+
+        // The package "can't be associated with any OpenSearch Service domain": its
+        // content is in place on every domain holding it, so removing the package would
+        // leave those domains pointing at content that is gone. A package any domain
+        // still holds — whatever status that link is in, the link being on the domain
+        // until the clock takes it off — is therefore refused, and the caller has to take
+        // it off those domains first.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePackage"))
+        // Judged BEFORE the package is resolved, which the set of links lets it be: a
+        // link exists only for a package the account holds, so an id naming no package is
+        // held by no domain and falls through to the refusal below.
+        if store.package_is_associated(&input.package_id) {
+            return Err(DeletePackageErrorModeled::ValidationException(package_in_use()).into());
+        }
+
+        // `PackageID` is "the internal ID of the package you want to delete": an id that
+        // names no package of this account addresses nothing this call can remove, which
+        // is the modelled missing-resource refusal — and that is also what a repeat of a
+        // delete whose removal has landed gets, the record being gone.
+        let package = store.packages.get_mut(&input.package_id).ok_or_else(|| {
+            DeletePackageErrorModeled::ResourceNotFoundException(package_not_found(
+                &input.package_id,
+            ))
+        })?;
+
+        // The content is not gone the instant this call returns: the package is being
+        // deleted, so the record rests in its deleting status and the clock owes its
+        // removal — at which point no read reports the package again.
+        package.begin_deletion(now);
+
+        // "Information about the deleted package", answered from the STORED record
+        // through the projection every read path reports a package with.
+        Ok(DeletePackageOutput {
+            package_details: Some(package.to_details()),
+        })
     }
 }

@@ -7,8 +7,9 @@
 //! of the call — the target carries the `TargetStatus` the deployment's own
 //! clock-owed progress gives it and, as its `lifecycleEvents`, the lifecycle
 //! event hook results that were reported against that deployment, in the order
-//! its compute platform runs those hooks; a deployment the clock has not started
-//! yet has no target state to report at all.
+//! its compute platform runs those hooks; a deployment that has not resolved its
+//! targets yet holds no per-target record to answer under any id, so the read is
+//! refused with the one code an unreadable id gets.
 //!
 //! What a target reads back as across the compute platforms, the ordering the
 //! batch reader answers in and the refusals both readers share are pinned in
@@ -143,9 +144,10 @@ fn assert_events(case: &str, target: &Value, expected: &[(&str, &str)]) {
 // ---------------------------------------------------------------------------
 
 /// RULE: a target's reported state is its deployment's own clock-owed progress —
-/// before the deployment starts there is no target state to report
-/// (`DeploymentNotStartedException`), then the target is being deployed to, then
-/// it finished with the deployment — and the instant the target last changed is
+/// before the deployment has resolved its targets there is no record to answer
+/// under the id at all (`DeploymentTargetDoesNotExistException`, the one code
+/// this read is refused with), then the target is being deployed to, then it
+/// finished with the deployment — and the instant the target last changed is
 /// the instant the deployment last moved, so it is stable across reads of one
 /// state and advances when the state does.
 #[tokio::test]
@@ -160,7 +162,7 @@ async fn a_targets_state_walks_its_deployments_clock_owed_progress() {
     // the CLOCK and not by the poll, so a poll sees a prefix-consistent walk of
     // this order however fast the machine is — and never a step backwards.
     let walk = [
-        Observed::Refused("DeploymentNotStartedException".to_string()),
+        Observed::Refused("DeploymentTargetDoesNotExistException".to_string()),
         Observed::Status("InProgress".to_string()),
         Observed::Status("Succeeded".to_string()),
     ];

@@ -89,6 +89,8 @@ mod edge_data_plane;
 mod error_envelope;
 #[path = "all/field_level_encryption_config_lifecycle.rs"]
 mod field_level_encryption_config_lifecycle;
+#[path = "all/field_level_encryption_config_list.rs"]
+mod field_level_encryption_config_list;
 #[path = "all/field_level_encryption_profile_lifecycle.rs"]
 mod field_level_encryption_profile_lifecycle;
 #[path = "all/field_level_encryption_profile_list.rs"]

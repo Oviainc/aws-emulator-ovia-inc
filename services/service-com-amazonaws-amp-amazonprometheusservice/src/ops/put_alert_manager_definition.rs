@@ -188,13 +188,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        store.materialize_due(now);
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a workspace created in another Region is not
+        // reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
+        let mut guard = state.lock();
+        guard.materialize_due(now);
 
         // The workspace the URI names is resolved next, so a call on a workspace that
         // does not exist is answered as the missing resource it is — with the one constant
-        // sentence every per-workspace refusal in this crate reports.
-        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+        // sentence every per-workspace refusal in this crate reports, and a Region this
+        // account holds nothing in holds no workspace either.
+        let Some(workspace) = guard
+            .held_region_mut(&region)
+            .and_then(|store| store.workspaces.get_mut(&input.workspace_id))
+        else {
             return Err(PutAlertManagerDefinitionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
@@ -284,7 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         definition.transition_due = Some(now + crate::state::TRANSITION_DELAY);
         definition.change_token = input.client_token;
         let response = response_for(definition);
-        drop(store);
+        drop(guard);
 
         // The call changed stored state, so it leaves an access record naming the
         // operation, the resource and the key id the request presented — nothing of the

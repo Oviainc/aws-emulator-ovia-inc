@@ -201,6 +201,8 @@ struct Row {
     /// The first two octets of the row's address space: the VPC is `<base>.0.0/16`.
     base: &'static str,
     /// The prefix length of each VLAN subnet block, across the published /24../28 range.
+    /// A PUBLIC HCX VLAN subnet is the one exception: it "Must have a /28 netmask"
+    /// (`InitialVlans$hcx` doc), so [`Row::vlan_prefix_len`] gives that member its /28.
     prefix_len: u8,
     /// The host part the row sets in each requested block's last octet. Non-zero makes
     /// the request's blocks NON-canonical (`10.9.3.5/28`), which EC2 stores in canonical
@@ -225,19 +227,32 @@ impl Row {
         format!("{}.200.0/24", self.base)
     }
 
+    /// The prefix length of the `index`-th VLAN's block: the row's own, except for an
+    /// HCX VLAN the row provisions PUBLIC, which "Must have a /28 netmask"
+    /// (`InitialVlans$hcx` doc).
+    fn vlan_prefix_len(&self, index: usize) -> u8 {
+        if self.public_hcx && VLAN_MEMBERS[index] == "hcx" {
+            28
+        } else {
+            self.prefix_len
+        }
+    }
+
     /// The CIDR block the row REQUESTS for the `index`-th VLAN. Each sits in its own
     /// `/24`, so the blocks never overlap whatever prefix length the row uses.
     fn requested_vlan_cidr(&self, index: usize) -> String {
         format!(
             "{}.{index}.{}/{}",
-            self.base, self.host_part, self.prefix_len
+            self.base,
+            self.host_part,
+            self.vlan_prefix_len(index)
         )
     }
 
     /// That block as a subnet of the VPC holds it: the canonical form, which is what
     /// both `Vlan$cidr` and the subnet's `CidrBlock` must report.
     fn stored_vlan_cidr(&self, index: usize) -> String {
-        format!("{}.{index}.0/{}", self.base, self.prefix_len)
+        format!("{}.{index}.0/{}", self.base, self.vlan_prefix_len(index))
     }
 
     /// The row's `initialVlans`.
@@ -278,7 +293,7 @@ fn rows() -> Vec<Row> {
             public_hcx: false,
         },
         Row {
-            case: "ten /26 blocks in another Region, with a public HCX VLAN",
+            case: "/26 blocks in another Region, with a public HCX VLAN on its own /28",
             region: "eu-west-1",
             zone: "eu-west-1b",
             base: "192.168",

@@ -79,7 +79,7 @@ use crate::ops::types::{
     OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
     ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy, SourceCodeRepository,
     StrategyOption, StrategySummary, SystemInfo, TransformationTool, ValidationException,
-    GROUP_NAME_VALUES,
+    GROUP_NAME_VALUES, STRATEGY_VALUES, TARGET_DESTINATION_VALUES, TRANSFORMATION_TOOL_NAME_VALUES,
 };
 
 /// The Region partitioning of this store: the per-service state struct itself, the Region
@@ -2604,6 +2604,34 @@ pub fn check_enum(value: Option<&str>, declared: &[&str]) -> Result<(), Validati
         Some(named) if !declared.contains(&named) => Err(invalid_request_body()),
         _ => Ok(()),
     }
+}
+
+/// The strategy option a config update stores against the resource it names, or `None`
+/// when the request names none to store.
+///
+/// One rule for every `strategyOption` this service accepts, whichever resource the
+/// preference is held against: each of the shape's three enum-targeting members
+/// (`strategy`, `targetDestination`, `toolName`) is held to its own catalog by
+/// [`check_enum`], and an option whose every one of those three is absent selects no
+/// strategy, no destination and no tool, so there is nothing to store — a config update
+/// writes the members the request names, and that request names none. `isPreferred`
+/// carries no selection of its own, so an option bearing only it is that case.
+///
+/// Refused with the service's one `ValidationException`; each operation lifts it into its
+/// own error channel.
+pub fn preferred_strategy_option(
+    option: Option<StrategyOption>,
+) -> Result<Option<StrategyOption>, ValidationException> {
+    let Some(option) = option else {
+        return Ok(None);
+    };
+    check_enum(option.strategy.as_deref(), STRATEGY_VALUES)?;
+    check_enum(option.target_destination.as_deref(), TARGET_DESTINATION_VALUES)?;
+    check_enum(option.tool_name.as_deref(), TRANSFORMATION_TOOL_NAME_VALUES)?;
+    let names_a_strategy = option.strategy.is_some()
+        || option.target_destination.is_some()
+        || option.tool_name.is_some();
+    Ok(names_a_strategy.then_some(option))
 }
 
 /// Hold every entry of an import-group list to the `GroupName` catalog.
