@@ -33,6 +33,8 @@ mod connection_state_progression;
 mod create_connection_attach_point_validation;
 #[path = "all/create_connection_client_token_replay.rs"]
 mod create_connection_client_token_replay;
+#[path = "all/create_connection_remote_account.rs"]
+mod create_connection_remote_account;
 #[path = "all/emulator.rs"]
 mod emulator;
 #[path = "all/list_tags_for_resource.rs"]
