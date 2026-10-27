@@ -113,6 +113,19 @@ impl From<PutIdentityPolicyErrorModeled> for PutIdentityPolicyError {
 /// words.
 const NOT_A_POLICY: &str = "Unable to parse policy.";
 
+/// What the service answers for a document larger than the policy ceiling.
+///
+/// Its own sentence, because the size rule is not the parse rule, and it REPORTS
+/// the two numbers the caller needs: `size`, the submitted document's size in
+/// bytes, and the ceiling it passed ([`crate::state::MAX_POLICY_BYTES`]). The
+/// trailing space after the final stop is part of the service's text.
+fn policy_too_large(size: usize) -> String {
+    format!(
+        "The policy size, {size}, is larger than the max policy size, {}. ",
+        crate::state::MAX_POLICY_BYTES
+    )
+}
+
 /// The operation's own modeled refusal: the document is not a policy this
 /// service can hold.
 ///
@@ -186,15 +199,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The document's ceiling: "The policy cannot exceed 4 KB." The model
-        // bounds `Policy` only below, so a longer document reaches this handler,
-        // and an invalid policy is what it is — the operation's own modeled
-        // error. Its own message, because the size rule is not the parse rule.
+        // The document's ceiling ("the policy cannot exceed 4 KB", enforced as
+        // `MAX_POLICY_BYTES`). The model bounds `Policy` only below, so a longer
+        // document reaches this handler, and an invalid policy is what it is —
+        // the operation's own modeled error. The size rule is not the parse
+        // rule, so it carries the service's own sentence about size: the
+        // document's measured size, then the ceiling it passed.
         if input.policy.len() > crate::state::MAX_POLICY_BYTES {
-            return Err(invalid_policy(format!(
-                "Policy exceeds the maximum size of {} bytes.",
-                crate::state::MAX_POLICY_BYTES
-            )));
+            return Err(invalid_policy(policy_too_large(input.policy.len())));
         }
 
         // A sending authorization policy IS an IAM resource-based policy
