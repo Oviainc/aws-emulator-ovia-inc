@@ -16,6 +16,9 @@
 //!   the FORM of that id is checked before anything is resolved, and the update it accepts
 //!   is owed by the CLOCK: the instance reports the first stage now and the terminal one
 //!   once the span has passed.
+//! * `DiscoverPollEndpoint` answers the agent with the endpoints of the REGION the request
+//!   was signed for, once the cluster and (when the request names one) the container
+//!   instance it is called for resolve to records this store holds.
 //! * `SubmitContainerStateChange` is a report the agent RETRIES, so what is stored is the
 //!   furthest stage the container has been reported at: a report of a stage it has already
 //!   passed is acknowledged and changes nothing.
@@ -179,6 +182,140 @@ fn instance_id_of(instance_arn: &str) -> String {
         .next()
         .expect("a container-instance ARN ends in its id")
         .to_string()
+}
+
+#[tokio::test]
+async fn discover_poll_endpoint_answers_the_region_endpoints_for_a_registered_instance() {
+    let router = fixture().await;
+    let instance_arn = register_agent(&router, CLUSTER, "i-0dpe0dpe0dpe0dpe0", None, "fixture")
+        .await;
+    let instance_id = instance_id_of(&instance_arn);
+    let elsewhere =
+        register_agent(&router, OTHER_CLUSTER, "i-0e1e2e3e4e5e6e7e8", None, "fixture").await;
+
+    // The endpoints are hosts of this service in the Region the request was signed for.
+    let expected = [
+        ("endpoint", format!("https://ecs-a-1.{SIGNED_REGION}.amazonaws.com/")),
+        (
+            "telemetryEndpoint",
+            format!("https://ecs-t-1.{SIGNED_REGION}.amazonaws.com/"),
+        ),
+        (
+            "serviceConnectEndpoint",
+            format!("https://ecs-sc.{SIGNED_REGION}.amazonaws.com/"),
+        ),
+    ];
+
+    // The rows span the ways an agent may ask: naming its instance by id, by full ARN, and
+    // naming no instance at all; with the cluster by name, by ARN, and left to the default.
+    let accepted = [
+        (
+            "the instance by id",
+            json!({ "cluster": CLUSTER, "containerInstance": instance_id.clone() }),
+        ),
+        (
+            "the instance by ARN",
+            json!({ "cluster": CLUSTER, "containerInstance": instance_arn.clone() }),
+        ),
+        (
+            "the cluster by ARN",
+            json!({
+                "cluster": format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:cluster/{CLUSTER}"),
+                "containerInstance": instance_id.clone(),
+            }),
+        ),
+        ("no instance named", json!({ "cluster": CLUSTER })),
+    ];
+    for (case, request) in accepted {
+        let body = ok(&router, "DiscoverPollEndpoint", request, case).await;
+        for (member, value) in &expected {
+            assert_eq!(
+                string(&body, member, case),
+                *value,
+                "case {case:?}: expected {member} to be the Region's own endpoint, got {body}"
+            );
+        }
+    }
+
+    // A `containerInstance` that is not a container-instance id at all names no instance in
+    // any cluster, so the FORM is what the refusal states — whatever else the request
+    // names.
+    let malformed = [
+        ("a value with spaces", "not a valid identifier".to_string()),
+        ("a value outside the alphabet", "ZZZZ".to_string()),
+        ("punctuation", "@@@".to_string()),
+        ("one character past the length", "a".repeat(37)),
+        (
+            "an ARN whose id segment is no id",
+            format!(
+                "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:container-instance/{CLUSTER}/not an id"
+            ),
+        ),
+    ];
+    for (case, reference) in &malformed {
+        let (code, message) = refusal(
+            &router,
+            "DiscoverPollEndpoint",
+            json!({ "cluster": CLUSTER, "containerInstance": reference }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("ClientException", INSTANCE_ID_PATTERN_MESSAGE),
+            "case {case:?}: expected the id-form refusal for {reference:?}, got {code} with \
+             {message:?}"
+        );
+    }
+
+    // A well-formed id that names no instance OF THAT CLUSTER — never registered, or
+    // registered elsewhere — is the not-found refusal, naming the instance referred to.
+    let unknown = [
+        (
+            "an id nothing registered",
+            "0".repeat(32),
+            "0".repeat(32),
+        ),
+        (
+            "an instance of another cluster",
+            instance_id_of(&elsewhere),
+            instance_id_of(&elsewhere),
+        ),
+    ];
+    for (case, reference, named) in &unknown {
+        let (code, message) = refusal(
+            &router,
+            "DiscoverPollEndpoint",
+            json!({ "cluster": CLUSTER, "containerInstance": reference }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (
+                "ClientException",
+                format!("Referenced container instance {named} not found.").as_str()
+            ),
+            "case {case:?}: expected the not-found refusal, got {code} with {message:?}"
+        );
+    }
+
+    // And a cluster this account does not hold: this operation models no cluster-specific
+    // error, so it is the client error, with the sentence every cluster-resolving call
+    // answers.
+    let case = "a cluster that was never created";
+    let (code, message) = refusal(
+        &router,
+        "DiscoverPollEndpoint",
+        json!({ "cluster": "ghost-cluster", "containerInstance": instance_id }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("ClientException", "Cluster not found."),
+        "case {case:?}: expected the cluster-not-found refusal, got {code} with {message:?}"
+    );
 }
 
 #[tokio::test]

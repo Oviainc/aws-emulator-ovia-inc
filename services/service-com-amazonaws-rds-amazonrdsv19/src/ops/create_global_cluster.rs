@@ -327,8 +327,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(cluster) = store.resolve_db_cluster(&region, source) else {
                 return Err(CreateGlobalClusterErrorModeled::DBClusterNotFoundFault(
                     DBClusterNotFoundFault {
-                        message: Some(format!(
-                            "The source cluster could not be found or cannot be accessed: {source}"
+                        message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                            source,
                         )),
                     },
                 )
@@ -452,9 +452,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             else {
                 return Err(CreateGlobalClusterErrorModeled::DBClusterNotFoundFault(
                     DBClusterNotFoundFault {
-                        message: Some(format!(
-                            "The source cluster could not be found or cannot be accessed: {}",
-                            source.identifier
+                        message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                            &source.identifier,
                         )),
                     },
                 )

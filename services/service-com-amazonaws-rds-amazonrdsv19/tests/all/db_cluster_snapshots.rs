@@ -15,11 +15,11 @@
 //!
 //! Every call goes over the wire, through the same `MultiServiceRouter` the production
 //! router uses (`crate::db_instances::emulator`). The records the reads run against are
-//! SEEDED through this service's own state API: the operations that take a snapshot OF a
-//! cluster — `CreateDBClusterSnapshot` and the final snapshot `DeleteDBCluster` takes —
-//! are still scaffolded in this crate (their own stub issues), so the seed writes exactly
-//! the records they will write and the five implemented operations are exercised against
-//! real stored state rather than an empty map.
+//! SEEDED through this service's own state API, so each row starts from exactly the stored
+//! state it describes and the five implemented operations are exercised against real
+//! stored state rather than an empty map. The snapshot a caller TAKES of a cluster is
+//! driven through `CreateDBClusterSnapshot` over the wire instead, in
+//! `crate::db_cluster_subject_operations`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -77,8 +77,9 @@ fn snapshot_arn(region: &str, identifier: &str) -> String {
     format!("arn:aws:rds:{region}:{ACCOUNT}:cluster-snapshot:{identifier}")
 }
 
-/// A complete, `available` cluster snapshot record of `cluster` — what
-/// `CreateDBClusterSnapshot` will write once it is implemented.
+/// A complete, `available` cluster snapshot record of `cluster` — a snapshot that has
+/// finished, which is what `CreateDBClusterSnapshot` leaves behind once the clock has
+/// settled it.
 fn stored_snapshot(region: &str, identifier: &str, cluster: &str) -> DbClusterSnapshotRecord {
     DbClusterSnapshotRecord {
         snapshot_identifier: identifier.to_string(),

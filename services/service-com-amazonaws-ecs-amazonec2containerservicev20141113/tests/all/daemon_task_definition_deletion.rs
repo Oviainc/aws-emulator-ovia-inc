@@ -362,21 +362,32 @@ async fn a_reference_that_names_no_one_stored_revision_is_refused_and_deletes_no
 
     // The rows span the ways a reference can fail to name ONE stored daemon revision:
     // a family with no revision at all, a family that names every revision, a revision
-    // outside the family, a value that is no reference, and the other resource's ARN.
+    // outside the family, a value that identifies no daemon task definition at all, and
+    // the other resource's ARN. A value that is no reference of this resource is invalid
+    // INPUT; the rest are well-formed references this call cannot act on.
     let rows = [
-        ("a family nothing was registered under", "neverregistered".to_string()),
-        ("the family on its own", FAMILY.to_string()),
-        ("the family naming every revision", format!("{FAMILY}:*")),
-        ("a revision the family never minted", format!("{FAMILY}:9")),
-        ("revision zero", format!("{FAMILY}:0")),
-        ("not a reference at all", "not a reference".to_string()),
-        ("the daemon ARN of another family", daemon_arn("neverregistered", 1)),
+        ("a family nothing was registered under", "neverregistered".to_string(), "ClientException"),
+        ("the family on its own", FAMILY.to_string(), "ClientException"),
+        ("the family naming every revision", format!("{FAMILY}:*"), "ClientException"),
+        ("a revision the family never minted", format!("{FAMILY}:9"), "ClientException"),
+        ("revision zero", format!("{FAMILY}:0"), "InvalidParameterException"),
+        (
+            "not a reference at all",
+            "not a reference".to_string(),
+            "InvalidParameterException",
+        ),
+        (
+            "the daemon ARN of another family",
+            daemon_arn("neverregistered", 1),
+            "ClientException",
+        ),
         (
             "the ARN of the plain revision of the same family",
             plain_arn(FAMILY, 1),
+            "InvalidParameterException",
         ),
     ];
-    for (case, reference) in rows {
+    for (case, reference, expected_code) in rows {
         let (code, message) = refusal(
             &router,
             "DeleteDaemonTaskDefinition",
@@ -385,8 +396,8 @@ async fn a_reference_that_names_no_one_stored_revision_is_refused_and_deletes_no
         )
         .await;
         assert_eq!(
-            code, "ClientException",
-            "case {case:?}: expected a ClientException for {reference:?}, got {code} with \
+            code, expected_code,
+            "case {case:?}: expected a {expected_code} for {reference:?}, got {code} with \
              {message:?}"
         );
         assert!(

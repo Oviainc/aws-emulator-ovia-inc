@@ -513,7 +513,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(current) = store.db_clusters.get(&key) else {
             return Err(ModifyDBClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(format!("DBCluster {identifier} not found.")),
+                    message: Some(crate::state::db_cluster_not_found_message(
+                        &input.db_cluster_identifier,
+                    )),
                 },
             )
             .into());

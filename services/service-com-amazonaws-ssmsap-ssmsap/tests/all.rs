@@ -69,6 +69,8 @@ mod region_partition_reclamation;
 mod region_scoping;
 #[path = "all/registration_derived_state.rs"]
 mod registration_derived_state;
+#[path = "all/registration_tag_ceiling.rs"]
+mod registration_tag_ceiling;
 #[path = "all/resource_permission_reads.rs"]
 mod resource_permission_reads;
 #[path = "all/resource_permissions.rs"]

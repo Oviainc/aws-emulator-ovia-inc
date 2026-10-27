@@ -155,6 +155,103 @@ const ADD_ON_STATES: &[(Option<&str>, bool)] = &[
     (None, false),
 ];
 
+/// Put the pool `user_pool_id` names into the add-on mode `mode` names — or into
+/// holding no `UserPoolAddOns` member at all when `mode` is `None` — through
+/// `UpdateUserPool`, which REPLACES that member with what the request carries, and
+/// confirm through `DescribeUserPool` that the pool now holds it.
+///
+/// This is how a pool's threat protection is changed after it is created: "to
+/// change threat protection to audit-only or off, update the value of
+/// UserPoolAddOns in an UpdateUserPool request" (`SetRiskConfiguration`).
+async fn set_add_on_mode(
+    router: &MultiServiceRouter,
+    case: &str,
+    user_pool_id: &str,
+    mode: Option<&str>,
+) {
+    let mut body = json!({ "UserPoolId": user_pool_id });
+    let target = body
+        .as_object_mut()
+        .expect("a request body is a JSON object");
+    if let Some(mode) = mode {
+        target.insert(
+            "UserPoolAddOns".to_string(),
+            json!({ "AdvancedSecurityMode": mode }),
+        );
+    }
+    ok(router, "UpdateUserPool", &body).await;
+
+    let described = ok(
+        router,
+        "DescribeUserPool",
+        &json!({ "UserPoolId": user_pool_id }),
+    )
+    .await;
+    let stored = described["UserPool"]["UserPoolAddOns"]["AdvancedSecurityMode"].as_str();
+    assert_eq!(
+        stored, mode,
+        "case {case:?}: the update must leave the pool in add-on mode {mode:?}, got {described}"
+    );
+}
+
+/// Which writes the pool's threat-protection add-on is a precondition of, beside
+/// the settings each carries: a write needs the add-on on exactly when it carries
+/// the compromised-credentials setting, whatever else it carries beside it.
+fn gate_cases() -> Vec<(bool, Value)> {
+    vec![
+        (
+            true,
+            json!({
+                "CompromisedCredentialsRiskConfiguration": {
+                    "EventFilter": ["SIGN_IN"],
+                    "Actions": { "EventAction": "BLOCK" }
+                }
+            }),
+        ),
+        (
+            true,
+            json!({
+                "CompromisedCredentialsRiskConfiguration": {
+                    "Actions": { "EventAction": "NO_ACTION" }
+                },
+                "AccountTakeoverRiskConfiguration": {
+                    "Actions": {
+                        "LowAction": { "Notify": false, "EventAction": "NO_ACTION" }
+                    }
+                }
+            }),
+        ),
+        (
+            false,
+            json!({
+                "AccountTakeoverRiskConfiguration": {
+                    "Actions": {
+                        "LowAction": { "Notify": false, "EventAction": "NO_ACTION" },
+                        "MediumAction": { "Notify": false, "EventAction": "NO_ACTION" },
+                        "HighAction": { "Notify": false, "EventAction": "NO_ACTION" }
+                    }
+                }
+            }),
+        ),
+        (
+            false,
+            json!({
+                "AccountTakeoverRiskConfiguration": {
+                    "NotifyConfiguration": { "SourceArn": SOURCE_ARN },
+                    "Actions": {
+                        "HighAction": { "Notify": true, "EventAction": "MFA_REQUIRED" }
+                    }
+                },
+                "RiskExceptionConfiguration": {
+                    "BlockedIPRangeList": ip_ranges(2),
+                    "SkippedIPRangeList": ip_ranges(1)
+                }
+            }),
+        ),
+        (false, json!({})),
+    ]
+}
+
 /// An app client of `user_pool_id`, and its minted id.
 async fn app_client(router: &MultiServiceRouter, case: &str, user_pool_id: &str) -> String {
     let created = ok(
@@ -944,5 +1041,158 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
             "case {label:?}: a bad request is never answered with the scaffold's 501, got \
              {payload}"
         );
+    }
+}
+
+#[tokio::test]
+async fn the_add_on_gate_follows_the_pools_current_add_on_state() {
+    // The add-on precondition is a property of the WRITE and of the pool's add-on
+    // state WHEN IT RUNS, not of how the pool was created: every pair of add-on
+    // states — created in one, updated into the other — is driven, and at each
+    // level, a write is served exactly when it carries no compromised-credentials
+    // setting or the pool's add-ons are on at that moment.
+    for (created_in, _) in ADD_ON_STATES {
+        for (now_in, add_ons_on) in ADD_ON_STATES {
+            let router = router();
+            let case =
+                format!("a pool created in add-on mode {created_in:?}, now in {now_in:?}");
+            let user_pool_id = pool_in_mode(&router, &case, *created_in).await;
+            let client_id = app_client(&router, &case, &user_pool_id).await;
+            set_add_on_mode(&router, &case, &user_pool_id, *now_in).await;
+
+            for (gated, settings) in gate_cases() {
+                for level in [None, Some(client_id.as_str())] {
+                    let case = format!(
+                        "{case}, carrying {settings} at {}",
+                        if level.is_some() {
+                            "its app client"
+                        } else {
+                            "the pool"
+                        }
+                    );
+                    let request = with_level(&user_pool_id, level, &settings);
+                    let (status, payload) = call(&router, "SetRiskConfiguration", &request).await;
+
+                    if gated && !*add_ons_on {
+                        assert_eq!(
+                            (status, error_code(&payload)),
+                            (400, "UserPoolAddOnNotEnabledException"),
+                            "case {case:?}: a compromised-credentials write is refused while \
+                             the pool's add-ons are off, got {status} with {payload}"
+                        );
+                        assert_eq!(
+                            error_message(&payload),
+                            ADD_ONS_NOT_ENABLED_MESSAGE,
+                            "case {case:?}: the refusal reports that the add-ons are not \
+                             enabled, got {payload}"
+                        );
+                        continue;
+                    }
+
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?}: this write is served at this add-on state, got {status} \
+                         with {payload}"
+                    );
+                    assert_eq!(
+                        without_last_modified(&configuration(&payload)),
+                        request,
+                        "case {case:?}: the response renders the settings the request carried, \
+                         got {payload}"
+                    );
+
+                    let described = configuration(
+                        &ok(
+                            &router,
+                            "DescribeRiskConfiguration",
+                            &with_level(&user_pool_id, level, &json!({})),
+                        )
+                        .await,
+                    );
+                    assert_eq!(
+                        described,
+                        configuration(&payload),
+                        "case {case:?}: the read reports the stored configuration the write \
+                         answered, got {described}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_refused_write_leaves_the_stored_configuration_untouched() {
+    // The gate is asked before anything is stored, so a refused write stores
+    // nothing: the level keeps the configuration an earlier accepted write put
+    // there, down to the instant that write ran.
+    for (mode, add_ons_on) in ADD_ON_STATES {
+        if *add_ons_on {
+            continue;
+        }
+        for (gated, settings) in gate_cases() {
+            if gated {
+                continue;
+            }
+            let router = router();
+            let case = format!("{settings} stored while the pool is in add-on mode {mode:?}");
+            let user_pool_id = pool_in_mode(&router, &case, *mode).await;
+            let client_id = app_client(&router, &case, &user_pool_id).await;
+
+            for level in [None, Some(client_id.as_str())] {
+                let case = format!(
+                    "{case} at {}",
+                    if level.is_some() {
+                        "its app client"
+                    } else {
+                        "the pool"
+                    }
+                );
+                let stored = configuration(
+                    &ok(
+                        &router,
+                        "SetRiskConfiguration",
+                        &with_level(&user_pool_id, level, &settings),
+                    )
+                    .await,
+                );
+                assert!(
+                    last_modified(&stored).is_some(),
+                    "case {case:?}: an accepted write records when it ran, got {stored}"
+                );
+
+                for (gated, refused) in gate_cases() {
+                    if !gated {
+                        continue;
+                    }
+                    let (status, payload) = call(
+                        &router,
+                        "SetRiskConfiguration",
+                        &with_level(&user_pool_id, level, &refused),
+                    )
+                    .await;
+                    assert_eq!(
+                        (status, error_code(&payload)),
+                        (400, "UserPoolAddOnNotEnabledException"),
+                        "case {case:?}: the write carrying {refused} is refused, got {status} \
+                         with {payload}"
+                    );
+
+                    let described = configuration(
+                        &ok(
+                            &router,
+                            "DescribeRiskConfiguration",
+                            &with_level(&user_pool_id, level, &json!({})),
+                        )
+                        .await,
+                    );
+                    assert_eq!(
+                        described, stored,
+                        "case {case:?}: the refused write carrying {refused} must leave the \
+                         stored configuration alone, got {described}"
+                    );
+                }
+            }
+        }
     }
 }

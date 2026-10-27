@@ -484,9 +484,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(CreateDBInstanceErrorModeled::DBClusterNotFoundFault(
                         DBClusterNotFoundFault {
-                            message: Some(format!(
-                                "The source cluster could not be found or cannot be \
-                                 accessed: {named}"
+                            message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                                named,
                             )),
                         },
                     )

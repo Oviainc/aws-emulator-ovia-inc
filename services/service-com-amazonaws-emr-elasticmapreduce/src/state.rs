@@ -514,6 +514,86 @@ pub fn merge_tags(held: &mut Vec<Tag>, submitted: &[Tag]) -> Result<(), String> 
     Ok(())
 }
 
+/// Take every tag whose key is one of `keys` off the tag set `held` a resource carries.
+///
+/// `TagKeys` is "a list of tag keys to remove from the resource" (`RemoveTags$TagKeys`
+/// doc, Smithy model), so a key names the resource's tag of that key whatever value it
+/// holds, the tags beside the named ones keep their place and their values, and a key the
+/// resource carries no tag for takes nothing off — which is what makes removing the same
+/// key twice leave the resource exactly as the first call did.
+pub fn remove_tag_keys(held: &mut Vec<Tag>, keys: &[String]) {
+    held.retain(|tag| {
+        tag.key
+            .as_deref()
+            .is_none_or(|key| !keys.iter().any(|named| named == key))
+    });
+}
+
+/// The tag set of ONE Amazon EMR resource, for an operation that changes it.
+///
+/// A record holds its tags in one of two ways: a record the wire shapes are PROJECTED
+/// from ([`ClusterRecord`]) always holds the list, while a record held AS its wire shape
+/// (a Studio, a session) reports `Tags` only when the resource carries some. A tag
+/// operation reads the set the resource holds and stores the set it computed through
+/// here, so it never has to know which kind of record its request reached.
+#[derive(Debug)]
+pub enum TagSetMut<'a> {
+    /// A record that always holds its tag list.
+    List(&'a mut Vec<Tag>),
+    /// A record that reports its tags only when it carries some.
+    Optional(&'a mut Option<Vec<Tag>>),
+}
+
+impl TagSetMut<'_> {
+    /// The tags the resource carries now.
+    pub fn held(&self) -> Vec<Tag> {
+        match self {
+            Self::List(held) => held.to_vec(),
+            Self::Optional(Some(held)) => held.to_vec(),
+            Self::Optional(None) => Vec::new(),
+        }
+    }
+
+    /// Store `tags` as the resource's WHOLE tag set. A resource left carrying none
+    /// reports no tags at all, the way one created without any does.
+    pub fn store(&mut self, tags: Vec<Tag>) {
+        match self {
+            Self::List(held) => **held = tags,
+            Self::Optional(held) => **held = (!tags.is_empty()).then_some(tags),
+        }
+    }
+}
+
+/// Why a tag operation could not reach the resource its request named.
+///
+/// The resolution is the same for every tag operation, so it fails the same way whichever
+/// of them asked, while the client error each one models is its own: the class travels out
+/// of the resolution and is lifted into that error at the call site
+/// ([`TagTargetRefusal::into_invalid_request`]).
+#[derive(Debug)]
+pub enum TagTargetRefusal {
+    /// A value naming no resource this service holds, worded the way the surface that
+    /// owns an id of that form words it: a rejected identifier, which carries no
+    /// discriminator.
+    NotValid(String),
+    /// A named resource the service holds none of, which carries the absent-resource
+    /// discriminator ([`resource_not_found`]).
+    Absent(String),
+}
+
+impl TagTargetRefusal {
+    /// This refusal as the client error every tag operation models.
+    pub fn into_invalid_request(self) -> InvalidRequestException {
+        match self {
+            Self::NotValid(message) => InvalidRequestException {
+                error_code: None,
+                message: Some(message),
+            },
+            Self::Absent(message) => resource_not_found(message),
+        }
+    }
+}
+
 /// The configurations one instance group may hold, counted over the whole nested tree.
 ///
 /// CHOSEN, not documented: every entry is retained on the group's record and reported on
@@ -969,6 +1049,67 @@ impl ComAmazonawsEmrElasticmapreduceState {
         let record = self.clusters.get_mut(id)?;
         record.advance_to(now);
         Some(record)
+    }
+
+    /// The tag set of the resource a tag operation's `ResourceId` names, scoped by the
+    /// `ClusterId` the request carries, or why no resource of this account answers to it.
+    ///
+    /// Resolving the resource is the SAME for every tag operation — the pair of members
+    /// says which resource the call is about, not what it does to it — so `AddTags` and
+    /// `RemoveTags` reach their target through here:
+    ///
+    /// * a request carrying a `ClusterId` is about "the cluster that scopes the tag
+    ///   operation" (`AddTags$ClusterId` / `RemoveTags$ClusterId` doc), so the
+    ///   `ResourceId` is resolved against that cluster alone — the cluster itself, or a
+    ///   session of it. `ClusterId` is `len 0..256`, so the empty string reaches a
+    ///   handler, and it scopes nothing.
+    /// * otherwise the id alone says which resource it names — "a cluster identifier or
+    ///   an Amazon EMR Studio ID" — so it is resolved against the resources this service
+    ///   holds a tag set for.
+    pub fn tag_target_mut(
+        &mut self,
+        cluster_id: Option<&str>,
+        resource_id: &str,
+        now: SystemTime,
+    ) -> Result<TagSetMut<'_>, TagTargetRefusal> {
+        if let Some(cluster_id) = cluster_id.filter(|id| !id.is_empty()) {
+            let Some(cluster) = self.clusters.get_mut(cluster_id) else {
+                return Err(TagTargetRefusal::NotValid(unknown_cluster_message(
+                    cluster_id,
+                )));
+            };
+            // Materialises the transitions the clock already made due, which were owed
+            // at this instant whether or not anybody asked about a tag.
+            cluster.advance_to(now);
+            if cluster.id == resource_id {
+                return Ok(TagSetMut::List(&mut cluster.tags));
+            }
+            return match cluster.session_mut(resource_id) {
+                Some(session) => Ok(TagSetMut::Optional(&mut session.tags)),
+                None => Err(TagTargetRefusal::NotValid(unknown_session_message(
+                    resource_id,
+                    cluster_id,
+                ))),
+            };
+        }
+
+        if let Some(cluster) = self.clusters.get_mut(resource_id) {
+            cluster.advance_to(now);
+            return Ok(TagSetMut::List(&mut cluster.tags));
+        }
+        if let Some(studio) = self.studios.get_mut(resource_id) {
+            return Ok(TagSetMut::Optional(&mut studio.tags));
+        }
+
+        // Nothing resolved: the refusal is the one the surface that owns an id of this
+        // form answers, so a caller reads here the same sentence a read of the resource
+        // it asked about answers.
+        if resource_id.starts_with(STUDIO_ID_PREFIX) {
+            return Err(TagTargetRefusal::Absent(unknown_studio_message()));
+        }
+        Err(TagTargetRefusal::NotValid(unknown_cluster_message(
+            resource_id,
+        )))
     }
 
     /// Apply the clock to every cluster. Called by the listings, which filter on state.

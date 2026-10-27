@@ -329,7 +329,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateBlueGreenDeploymentErrorModeled::DBClusterNotFoundFault(
                         DBClusterNotFoundFault {
-                            message: Some(format!("DBCluster {source_named} not found.")),
+                            message: Some(crate::state::db_cluster_not_found_message(
+                                &source_named,
+                            )),
                         },
                     )
                     .into(),

@@ -4807,6 +4807,30 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|config| config.config.caller_reference == caller_reference)
     }
 
+    /// The distribution that uses the field-level encryption configuration `id` names for
+    /// one of its cache behaviours, or `None` when no stored distribution does.
+    ///
+    /// A cache behaviour names the configuration its matching fields are encrypted under
+    /// through its `FieldLevelEncryptionId` — "the value of `ID` for the field-level
+    /// encryption configuration that you want CloudFront to use for encrypting specific
+    /// fields of data for this cache behavior" — so what puts a configuration in use is a
+    /// stored behaviour naming it, which is the rule
+    /// [`references_field_level_encryption_config`] states for the whole configuration. The
+    /// SAME rule
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_cache_policy`]
+    /// states for a policy a cache behaviour attaches. The scan reads the STORED
+    /// configurations rather than a second index beside them, so it cannot drift out of step
+    /// with what a read of those distributions reports, and both collections are bounded
+    /// ([`MAX_DISTRIBUTIONS`] distributions, each with a bounded behaviour list).
+    pub fn distribution_using_field_level_encryption_config(
+        &self,
+        id: &str,
+    ) -> Option<&StoredDistribution> {
+        self.distributions
+            .values()
+            .find(|distribution| references_field_level_encryption_config(&distribution.config, id))
+    }
+
     /// The cache policy whose STORED configuration carries `name`, or `None`.
     ///
     /// `CachePolicyConfig$Name` is "A unique name to identify the cache policy", and the
@@ -6338,6 +6362,27 @@ pub fn references_response_headers_policy(
         |behavior| behavior.response_headers_policy_id.as_deref(),
     )
     .any(|id| id == response_headers_policy_id)
+}
+
+/// Whether `config` references the field-level encryption configuration
+/// `field_level_encryption_id` names in any of its cache behaviours.
+///
+/// A field-level encryption configuration is used by a distribution through a cache
+/// behaviour's `FieldLevelEncryptionId`, and a distribution's behaviours are its DEFAULT
+/// cache behaviour together with its ordered ones — both declare the member, so both are
+/// walked here and a distribution uses the configuration as soon as ONE of them names it.
+/// The SAME rule [`references_cache_policy`] states for the policies a cache behaviour
+/// attaches, over the same walk.
+pub fn references_field_level_encryption_config(
+    config: &DistributionConfig,
+    field_level_encryption_id: &str,
+) -> bool {
+    behavior_attachments(
+        config,
+        |behavior| behavior.field_level_encryption_id.as_deref(),
+        |behavior| behavior.field_level_encryption_id.as_deref(),
+    )
+    .any(|id| id == field_level_encryption_id)
 }
 
 /// Whether `config` references the key group `key_group_id` names in any of its cache
@@ -9823,9 +9868,9 @@ pub const MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT: usize = MAX_ORIGIN_ACCESS_I
 /// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) for a configuration id the
 /// store does not hold.
 ///
-/// The sentence is the one the model states on the shape itself — "The specified
-/// configuration for field-level encryption doesn't exist." — a property of the store rather
-/// than of the request, so nothing from the request belongs in the text.
+/// The sentence states a property of the store rather than of the request — the id names no
+/// configuration — so nothing from the request belongs in the text and every refusal of this
+/// condition reads the same.
 pub fn no_such_field_level_encryption_config() -> crate::ops::types::NoSuchFieldLevelEncryptionConfig
 {
     crate::ops::types::NoSuchFieldLevelEncryptionConfig {
@@ -9833,9 +9878,38 @@ pub fn no_such_field_level_encryption_config() -> crate::ops::types::NoSuchField
     }
 }
 
-/// `NoSuchFieldLevelEncryptionConfig`'s message, as the model documents the shape.
+/// `NoSuchFieldLevelEncryptionConfig`'s message, as CloudFront sends it on the wire — observed
+/// in a recorded CloudFront response to this refusal, which is the source this wording comes
+/// from. The service words it "config does not exist" rather than in the model's documentation
+/// prose ("The specified configuration for field-level encryption doesn't exist."), and the
+/// wire wording is what a client reads.
 pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE: &str =
-    "The specified configuration for field-level encryption doesn't exist.";
+    "The specified field level encryption config does not exist.";
+
+/// The modelled `FieldLevelEncryptionConfigInUse` (HTTP 409) for a delete of a configuration
+/// a cache behaviour still names.
+///
+/// The SAME rule [`cache_policy_in_use`] states for a policy a cache behaviour attaches: the
+/// sentence is a property of the CONDITION rather than of the request — the configuration is
+/// associated with a cache behaviour, and the caller is told to disassociate it first — so
+/// nothing from the request or from the store belongs in it, and every refusal of this
+/// condition reads the same.
+pub fn field_level_encryption_config_in_use(
+) -> crate::ops::types::FieldLevelEncryptionConfigInUse {
+    crate::ops::types::FieldLevelEncryptionConfigInUse {
+        message: Some(FIELD_LEVEL_ENCRYPTION_CONFIG_IN_USE_MESSAGE.to_string()),
+    }
+}
+
+/// `FieldLevelEncryptionConfigInUse`'s message, as CloudFront sends it on the wire — observed
+/// in a recorded CloudFront response to this refusal, which is the source this wording comes
+/// from: the configuration is associated with a cache behaviour and the caller is told to
+/// disassociate it before deleting, worded as [`CACHE_POLICY_IN_USE_MESSAGE`] words the same
+/// condition for a policy a cache behaviour attaches, rather than in the model's documentation
+/// prose ("The specified configuration for field-level encryption is in use.").
+pub const FIELD_LEVEL_ENCRYPTION_CONFIG_IN_USE_MESSAGE: &str =
+    "The field level encryption config is currently associated with a cache behavior. Please \
+     disassociate the config before deleting.";
 
 /// The sentence `FieldLevelEncryptionConfigAlreadyExists` carries — "The specified
 /// configuration for field-level encryption already exists." — up to the configuration the

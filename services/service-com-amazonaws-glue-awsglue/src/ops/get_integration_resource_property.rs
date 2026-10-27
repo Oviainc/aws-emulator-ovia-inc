@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetIntegrationResourcePropertyErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
                         message: Some(
-                            crate::state::messages::integration_resource_property_not_found(
+                            crate::state::messages::target_resource_not_found(
                                 &input.resource_arn,
                             ),
                         ),

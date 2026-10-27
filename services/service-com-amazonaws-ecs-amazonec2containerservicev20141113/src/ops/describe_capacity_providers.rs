@@ -198,8 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size =
             i32::try_from(crate::state::DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE).unwrap_or(i32::MAX);
         if let Some(message) = input.max_results.and_then(|max_results| {
-            crate::state::integer_bound_message(
-                "maxResults",
+            crate::state::page_size_violation(
                 max_results,
                 crate::state::MIN_LIST_PAGE_SIZE,
                 page_size,

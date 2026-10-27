@@ -1,15 +1,45 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GenerateDataKeyPair
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GenerateDataKeyPair`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: generates a fresh asymmetric key pair of the requested `KeyPairSpec`
+//! and answers BOTH halves in the clear — the public key and the plaintext private
+//! key — together with a copy of that same private key sealed under the key material
+//! of the symmetric encryption KMS key a `KeyId` names. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GenerateDataKeyPair::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is `GenerateDataKeyPairWithoutPlaintext` plus the plaintext private key: the
+//! two operations judge the request identically and generate the pair the same way,
+//! and the ONE difference is that this one also answers
+//! `PrivateKeyPlaintext`, "the plaintext copy of the private key" (the operation doc
+//! below). The sealed copy and the plaintext copy are the SAME private key, so a
+//! caller that keeps only the blob recovers exactly these bytes later with `Decrypt`.
+//!
+//! "The public key is a DER-encoded X.509 SubjectPublicKeyInfo, as specified in RFC
+//! 5280. The private key is a DER-encoded PKCS8 PrivateKeyInfo, as specified in RFC
+//! 5958" (same doc), which are the two encodings
+//! [`crate::state::generate_key_pair`] produces — the ONE generator every key pair in
+//! this service is drawn from, which draws each pair from the maintained library that
+//! implements its algorithm. Both halves come from that one pair, so the public key is
+//! the public half of the private key the answer carries. Every `DataKeyPairSpec` is
+//! offered in every Region, including `SM2`: that is how this service already treats
+//! the SM2 `KeySpec` ([`crate::state::key_spec_profile`]), and nothing in this crate
+//! distinguishes one partition from another.
+//!
+//! The pair is NOT persisted: a data key pair is "for use outside of KMS", so nothing
+//! about it is kept beyond the answer — the private key is dropped when `handle`
+//! returns, and the only durable record is that the KMS key was used, which
+//! `GetKeyLastUsage` reports.
+//!
+//! "To generate a data key pair, you must specify a symmetric encryption KMS key to
+//! encrypt the private key in a data key pair. You cannot use an asymmetric KMS key or
+//! a KMS key in a custom key store" (same doc), so a `KeyId` naming a key whose
+//! material is not a symmetric encryption key is refused with the modelled
+//! `InvalidKeyUsageException` and nothing is generated.
+//!
+//! Permission is judged through the service's one authorization decision
+//! ([`crate::state::authorization`]): the key policy, the calling principal's identity
+//! policies and the grants in force, with the presented-token divergence
+//! [`crate::state::authorization::authorize`] records.
 //!
 //! ## Shape of an operation
 //!
@@ -276,18 +306,269 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GenerateDataKeyPair` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GenerateDataKeyPairErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal("the KMS state store is unavailable"));
+        };
+
+        // Who the request speaks for, resolved BEFORE this service's store is locked, so
+        // the IAM and STS stores the resolution reads are never reached while this
+        // service's guard is held.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+        let region = crate::state::request_region(ctx);
+
+        // Permission a request draws from a grant is judged below, once the key is
+        // known and its key state has been judged.
+        let tokens = input.grant_tokens.clone().unwrap_or_default();
+
+        // Everything about the request is judged BEFORE anything is generated, and the
+        // state lock is held only for the reads that judgment needs — never across the
+        // generation below.
+        {
+            let state = state.lock();
+            let key = sealing_key(&state, &region, &input.key_id)?;
+
+            // A token that is not one this service minted names no grant at all, so
+            // the TOKEN "is not valid". Everything else about permission is the
+            // service's one authorization decision (`crate::state::authorization`):
+            // the key's own key policy, the calling principal's identity policies, and
+            // the grants on this key the caller holds or presented a token for, judged
+            // together — see this file's module doc.
+            let named = match state.grants_for_tokens(&region, &tokens) {
+                Ok(named) => named,
+                Err(crate::state::GrantRefusal::MalformedToken) => {
+                    return Err(GenerateDataKeyPairErrorModeled::InvalidGrantTokenException(
+                        InvalidGrantTokenException {
+                            message: Some("The specified grant token is not valid.".to_string()),
+                        },
+                    )
+                    .into());
+                }
+                // Every token is well formed but names a grant the store no longer
+                // holds, which carries no permission; what else the caller holds is
+                // judged below.
+                Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
+            };
+            let presented = (!tokens.is_empty()).then_some(named.as_slice());
+            if let Err(message) = crate::state::authorization::authorize(
+                &caller,
+                &state,
+                &region,
+                key,
+                Self::NAME,
+                input.encryption_context.as_ref(),
+                presented,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(message));
+            }
+
+            // `KeyPairSpec` "determines the type of data key pair that is generated",
+            // so a value that is not a `DataKeyPairSpec` names no key pair to
+            // generate. That is not modelled as an error of this operation, so it is
+            // refused as an invalid request rather than answered with a pair of some
+            // other type.
+            if !DATA_KEY_PAIR_SPEC_VALUES.contains(&input.key_pair_spec.as_str()) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "KeyPairSpec {} is not a supported data key pair spec; it must be one \
+                     of {}.",
+                    input.key_pair_spec,
+                    DATA_KEY_PAIR_SPEC_VALUES.join(", ")
+                )));
+            }
+
+            // `Recipient` asks KMS to return the private key encrypted under the public
+            // key in a Nitro enclave's attestation document, in place of
+            // `PrivateKeyPlaintext`. Nothing here can verify an attestation, so that
+            // capability is reported as not implemented rather than answered with a
+            // `CiphertextForRecipient` no enclave produced.
+            if input.recipient.is_some() {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "GenerateDataKeyPair with a Recipient (enclave attestation)",
+                ));
+            }
+
+            // "The request was rejected because the DryRun parameter was specified"
+            // (`smithy_query(query="doc",shape="DryRunOperationException")`): a dry run
+            // checks the request and then always fails, so it is answered AFTER every
+            // check above and BEFORE anything is generated.
+            if input.dry_run == Some(true) {
+                return Err(GenerateDataKeyPairErrorModeled::DryRunOperationException(
+                    DryRunOperationException {
+                        message: Some(crate::state::DRY_RUN_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "GenerateDataKeyPair returns a unique data key pair for each request. The
+        // bytes in the keys are random; they are not related to the caller or the KMS
+        // key that is used to encrypt the private key" (the operation doc), so the pair
+        // is generated per request and every call yields a different one.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GenerateDataKeyPair"))
+        // Generating one is CPU work — bounded by the `DataKeyPairSpec` catalog, whose
+        // largest entry is a 4096-bit modulus, but still hundreds of milliseconds of
+        // it — so it runs on the blocking pool with the state lock RELEASED:
+        // `spawn_blocking(..).await` is a real await point, so one key pair cannot
+        // starve the worker that serves health checks and every other request, and no
+        // other request waits on the store while it runs.
+        let key_pair_spec = input.key_pair_spec.clone();
+        let generated =
+            ::tokio::task::spawn_blocking(move || crate::state::generate_key_pair(&key_pair_spec))
+                .await;
+        let pair = match generated {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return Err(internal("a data key pair could not be generated")),
+            // A panic or a cancellation on the pool says nothing about the request, so
+            // it is reported as the server fault it is rather than as a pair nothing
+            // generated.
+            Err(error) => {
+                ::tracing::error!(
+                    operation = Self::NAME,
+                    error = %error,
+                    "the data key pair did not complete"
+                );
+                return Err(internal("a data key pair could not be generated"));
+            }
+        };
+
+        // The key is judged again under the lock that seals: the key state and the key
+        // material are the store's, and another request may have moved either while the
+        // pair was being generated. The answer is therefore built from the key as it is
+        // at the instant it seals, or not built at all.
+        let mut state = state.lock();
+        let key = sealing_key(&state, &region, &input.key_id)?;
+        // "A copy of the private key that is encrypted under the symmetric encryption
+        // KMS key you specify": the SAME bytes the answer carries in the clear, sealed
+        // in the AES-256-GCM envelope `Encrypt` builds, so `Decrypt` recovers exactly
+        // the plaintext private key this response returns.
+        let Some(private_key_ciphertext_blob) = crate::state::seal(
+            key,
+            &pair.private_key_pkcs8,
+            input.encryption_context.as_ref(),
+        ) else {
+            return Err(internal("the private key could not be encrypted"));
+        };
+        // "The Amazon Resource Name (key ARN) of the KMS key that encrypted the private
+        // key" — the key ARN, not the identifier the request used — and "the identifier
+        // of the key material used to encrypt the private key": the version of the key's
+        // material that sealed it, which is the current one.
+        let key_arn = key.arn.clone();
+        let key_material_id = key.reported_key_material_id();
+        let key_id = key.key_id.clone();
+
+        // The key was just used in a successful cryptographic operation, which is what
+        // `GetKeyLastUsage` reports.
+        state.record_last_usage(&region, &key_id, Self::NAME);
+
+        Ok(GenerateDataKeyPairOutput {
+            private_key_ciphertext_blob: Some(private_key_ciphertext_blob),
+            // "The plaintext copy of the private key", which is the private half of the
+            // public key below.
+            private_key_plaintext: Some(pair.private_key_pkcs8),
+            public_key: Some(pair.public_key_spki),
+            key_id: Some(key_arn),
+            // "The type of data key pair that was generated", which is the type the
+            // request asked for.
+            key_pair_spec: Some(input.key_pair_spec.clone()),
+            key_material_id,
+            // "This field is included in the response only when the Recipient parameter
+            // in the request includes a valid attestation document", and a request with
+            // a `Recipient` is refused above.
+            ciphertext_for_recipient: None,
+        })
     }
+}
+
+/// The IAM action this operation's authorization refusal names. It is the same value
+/// the `impl Operation` carries as `NAME`, needed here because the judgment below is a
+/// free function rather than a method on it.
+const OPERATION_NAME: &str = "GenerateDataKeyPair";
+
+/// The key `identifier` names, provided it can encrypt the private key in a data key
+/// pair — the whole of what this operation requires of the store.
+///
+/// One function for every judgment of the key, so the request is judged the same way
+/// before a pair is generated and again under the lock that seals it.
+fn sealing_key<'a>(
+    state: &'a crate::state::ComAmazonawsKmsTrentserviceState,
+    region: &str,
+    identifier: &str,
+) -> Result<&'a crate::state::Cmk, GenerateDataKeyPairError> {
+    // This operation models no `InvalidArnException`, so a malformed ARN is reported
+    // the same way as an identifier that names nothing: the key is not found.
+    let key = match state.resolve(region, identifier) {
+        crate::state::KeyRef::Found(key) => key,
+        crate::state::KeyRef::UnauthorizedAccount => {
+            return Err(crate::state::unauthorized_account(OPERATION_NAME));
+        }
+        crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
+            return Err(GenerateDataKeyPairErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::key_not_found_message(region, identifier)),
+            })
+            .into());
+        }
+    };
+
+    // "The KMS key that you use for this operation must be in a compatible key state"
+    // (the operation doc): a disabled key answers `DisabledException`, and any other
+    // unusable state answers `KMSInvalidStateException`, which names the state the key
+    // is actually in. Judged BEFORE the grant tokens, so a key that cannot be used at
+    // all reports why rather than reporting an authorization failure.
+    if !key.is_usable() {
+        if key.key_state == crate::state::KEY_STATE_DISABLED {
+            return Err(GenerateDataKeyPairErrorModeled::DisabledException(DisabledException {
+                message: Some(crate::state::invalid_state_message(key)),
+            })
+            .into());
+        }
+        return Err(GenerateDataKeyPairErrorModeled::KMSInvalidStateException(
+            KMSInvalidStateException {
+                message: Some(crate::state::invalid_state_message(key)),
+            },
+        )
+        .into());
+    }
+
+    // "For encrypting, decrypting, re-encrypting, and generating data keys, the
+    // KeyUsage must be ENCRYPT_DECRYPT"
+    // (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
+    if key.key_usage != crate::state::KEY_USAGE_ENCRYPT_DECRYPT {
+        return Err(invalid_key_usage(format!(
+            "{} has KeyUsage {}, which cannot be used to generate a data key pair; it must \
+             be {}.",
+            key.arn,
+            key.key_usage,
+            crate::state::KEY_USAGE_ENCRYPT_DECRYPT
+        )));
+    }
+    // "To generate a data key pair, you must specify a symmetric encryption KMS key to
+    // encrypt the private key in a data key pair. You cannot use an asymmetric KMS key
+    // or a KMS key in a custom key store" (the operation doc), so an asymmetric
+    // ENCRYPT_DECRYPT key is refused by the modelled error rather than sealing a
+    // private key under material it does not have.
+    if !key.is_symmetric_encryption() {
+        return Err(invalid_key_usage(format!(
+            "{} has KeySpec {}, which is not a symmetric encryption key spec and so cannot \
+             encrypt the private key in a data key pair.",
+            key.arn, key.key_spec
+        )));
+    }
+
+    Ok(key)
+}
+
+/// Refuse a key that cannot perform this operation.
+fn invalid_key_usage(message: impl Into<String>) -> GenerateDataKeyPairError {
+    GenerateDataKeyPairErrorModeled::InvalidKeyUsageException(InvalidKeyUsageException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// Answer a failure of this emulator itself, never a malformed request.
+fn internal(message: impl Into<String>) -> GenerateDataKeyPairError {
+    GenerateDataKeyPairErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some(message.into()),
+    })
+    .into()
 }

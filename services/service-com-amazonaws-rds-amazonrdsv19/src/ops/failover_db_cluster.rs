@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op FailoverDBCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `FailoverDBCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`FailoverDBCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Forces a failover of a stored DB cluster: the member the request names — or, where it
+//! names none, the cluster's first reader — becomes the cluster writer, the cluster reports
+//! `failing-over` from this call onwards and the clock owes it `available`. The promoted
+//! member is what `DBClusterMembers` reports `IsClusterWriter` for from here on, so the
+//! effect of the failover is observable through the cluster's own describe.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +165,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `FailoverDBCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(FailoverDBClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region =
+            crate::state::request_region(ctx).map_err(FailoverDBClusterError::validation)?;
+        // "The identifier of the DB cluster to force a failover for. This parameter isn't
+        // case-sensitive", and every member that names a DB cluster also accepts its ARN,
+        // so the lookup folds the way the stored key does.
+        let identifier = crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
+            .to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a failover nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due, so the failover is judged against the
+        // state the cluster is really in.
+        store.settle_due_transitions(&region);
+
+        // The cluster this call ADDRESSES is resolved FIRST: the operation models
+        // `DBClusterNotFoundFault` for exactly this, and a cluster that does not exist has
+        // no primary to move. RDS is regional, so only the region the request was signed
+        // for is in scope.
+        let key = (region.clone(), identifier.clone());
+        let Some(cluster) = store.db_clusters.get(&key) else {
+            return Err(FailoverDBClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                        &input.db_cluster_identifier,
+                    )),
+                },
+            )
+            .into());
+        };
+        // A failover moves the writer of a RUNNING cluster, so a cluster still coming up,
+        // stopped, already failing over, modifying or on its way out cannot take one: the
+        // modelled cluster state fault. The status the clock has yet to settle is real.
+        if cluster.status != crate::state::DB_CLUSTER_STATUS_AVAILABLE {
+            let status = cluster.status.clone();
+            return Err(FailoverDBClusterErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(format!(
+                        "DB cluster {identifier} is not available for a failover (status \
+                         {status})"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The cluster's members, writer first ([`crate::state::ComAmazonawsRdsAmazonrdsv19State::cluster_members`]),
+        // which is the same order its own describe reports them in.
+        let members: Vec<(String, String)> = store
+            .cluster_members(cluster)
+            .into_iter()
+            .map(|instance| (instance.identifier.clone(), instance.status.clone()))
+            .collect();
+        // A failover promotes a replica "to be the primary DB instance (the cluster
+        // writer)", so there has to be an instance in the cluster to promote. A cluster
+        // holding none — one created with no DB instance in it — has no writer to move, and
+        // the state fault says so rather than reporting a failover nothing performed.
+        let Some((current_writer, _)) = members.first().cloned() else {
+            return Err(FailoverDBClusterErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(format!(
+                        "DB cluster {identifier} has no DB instance to promote to primary"
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `TargetDBInstanceIdentifier`: "the name of the DB instance to promote to the
+        // primary DB instance. Specify the DB instance identifier for an Aurora Replica or
+        // a Multi-AZ readable standby IN THE DB CLUSTER" — so a value naming an instance
+        // this cluster has no member of cannot be promoted, which is the modelled instance
+        // state fault (the operation models no instance-not-found). A member that is not
+        // available cannot take over either.
+        let promoted = match &input.target_db_instance_identifier {
+            Some(target) => {
+                let wanted = crate::state::db_instance_identifier_of(target).to_ascii_lowercase();
+                let member = members
+                    .iter()
+                    .find(|(member, _)| member.eq_ignore_ascii_case(&wanted));
+                let Some((member, status)) = member else {
+                    return Err(FailoverDBClusterErrorModeled::InvalidDBInstanceStateFault(
+                        InvalidDBInstanceStateFault {
+                            message: Some(format!(
+                                "DB instance {target} is not a member of DB cluster {identifier}"
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                if status != crate::state::DB_INSTANCE_STATUS_AVAILABLE {
+                    return Err(FailoverDBClusterErrorModeled::InvalidDBInstanceStateFault(
+                        InvalidDBInstanceStateFault {
+                            message: Some(format!(
+                                "DB instance {member} is not available to be promoted (status \
+                                 {status})"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                member.clone()
+            }
+            // No target: the failover promotes one of the cluster's replicas, which is the
+            // first reader — the member after the writer in the cluster's own order. A
+            // single-instance cluster has no replica to promote to, so its one instance
+            // stays the writer, which is what a forced failover of such a cluster leaves
+            // behind.
+            None => members
+                .iter()
+                .map(|(member, _)| member)
+                .find(|member| !member.eq_ignore_ascii_case(&current_writer))
+                .cloned()
+                .unwrap_or(current_writer),
+        };
+
+        // The failover is accepted: the promoted member is the cluster writer from now on,
+        // the cluster reports `failing-over` and the clock owes it `available` — so a
+        // caller that polls straight after the call sees the failover in progress, as it
+        // would against the real service.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("FailoverDBCluster"))
+        // A key this handler resolved and a lookup under it can only disagree if the record
+        // is not where the resolve said it was, which answers the same modelled 404 as a
+        // cluster that was never there: a disagreement is a "not found", never a panic that
+        // would take the whole emulator down with it.
+        let accepted = {
+            let Some(record) = store.db_clusters.get_mut(&key) else {
+                return Err(FailoverDBClusterErrorModeled::DBClusterNotFoundFault(
+                    DBClusterNotFoundFault {
+                        message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                            &input.db_cluster_identifier,
+                        )),
+                    },
+                )
+                .into());
+            };
+            record.writer_identifier = Some(promoted);
+            record.status = crate::state::DB_CLUSTER_STATUS_FAILING_OVER.to_string();
+            record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+            ));
+            record.clone()
+        };
+
+        // The answer is the cluster this call changed, projected the one way every
+        // operation of this service projects one.
+        Ok(FailoverDBClusterOutput {
+            db_cluster: Some(store.cluster_to_wire(&accepted)),
+        })
     }
 }

@@ -750,10 +750,10 @@ async fn the_final_snapshot_members_are_refused_as_the_api_documents_them() {
         );
     }
 
-    // A well-formed request for a final DB cluster snapshot asks for a resource this
-    // emulator has no store for — `CreateDBClusterSnapshot` and
-    // `DescribeDBClusterSnapshots` are still scaffolded — so it is answered through the
-    // 501 channel rather than accepted with the snapshot quietly dropped.
+    // A well-formed request for a final DB cluster snapshot asks for a snapshot this
+    // operation does not take yet — that path is its own stub, while the snapshot a caller
+    // asks for directly is served by `CreateDBClusterSnapshot` — so it is answered through
+    // the 501 channel rather than accepted with the snapshot quietly dropped.
     expect_error(
         "a well-formed final DB cluster snapshot",
         call(

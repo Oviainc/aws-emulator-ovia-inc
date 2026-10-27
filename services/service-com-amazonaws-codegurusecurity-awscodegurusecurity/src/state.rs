@@ -1001,6 +1001,30 @@ pub fn interval_order_refusal(
     })
 }
 
+/// What a tagging call's scan lookup says when it cannot answer.
+///
+/// A server fault carries nothing of the request — the caller cannot fix it — so the
+/// text is fixed, as every answer of this class is.
+pub const SCAN_LOOKUP_FAULT_MESSAGE: &str = "Internal server error";
+
+/// How the ARN-addressed tagging surface (`TagResource`, `UntagResource` and
+/// `ListTagsForResource`, the three operations that take a [`SCAN_NAME_ARN_PATTERN`]
+/// label) answers a `resourceArn` that is a well-formed scan ARN but names no scan.
+///
+/// CodeGuru Security resolves such a label through a scan lookup that FAILS instead of
+/// reporting the scan absent, so the call is answered with the retryable server fault
+/// (HTTP 500, wire code `InternalServerErrorException`) and not with a 404: this surface
+/// cannot confirm that a scan does not exist. The modelled `ResourceNotFoundException`
+/// stays the answer of the operations that name a scan by its `scanName`, which resolve
+/// it directly.
+///
+/// The ONE place the three handlers compose that answer, so they cannot drift apart; a
+/// label that is not an ARN at all never reaches it (`crate::service` answers the
+/// parser's own HTTP 400 `BadRequestException` at the boundary).
+pub fn scan_arn_lookup_fault<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::internal_server_error(SCAN_LOOKUP_FAULT_MESSAGE)
+}
+
 /// The bucket of `FindingMetricsValuePerSeverity` a finding's `severity` is counted in,
 /// or `None` when the finding records no modelled `Severity` value.
 ///

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopDBCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopDBCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopDBCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops a stored DB cluster: the cluster reports `stopping` from this call onwards and
+//! the clock owes it `stopped`, so a caller polling straight after the stop sees it in
+//! progress. Nothing else about the cluster changes — "Aurora retains the DB cluster's
+//! metadata, including its endpoints and DB parameter groups" — so a stopped cluster reads
+//! back exactly as it was, bar its status.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +153,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopDBCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopDBClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopDBCluster"))
+        let region = crate::state::request_region(ctx).map_err(StopDBClusterError::validation)?;
+        // "The DB cluster identifier … This parameter is stored as a lowercase string",
+        // and every member that names a DB cluster also accepts its ARN, so the lookup
+        // folds the way the stored key does.
+        let identifier = crate::state::db_cluster_identifier_of(&input.db_cluster_identifier)
+            .to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a stop nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — so the state this stop is judged against is the current one.
+        store.settle_due_transitions(&region);
+
+        // The cluster this call ADDRESSES is resolved FIRST: the operation models
+        // `DBClusterNotFoundFault` for exactly this, and a cluster that does not exist has
+        // no running state to stop. RDS is regional, so only the region the request was
+        // signed for is in scope.
+        let key = (region.clone(), identifier.clone());
+        let Some(cluster) = store.db_clusters.get(&key) else {
+            return Err(StopDBClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(crate::state::db_cluster_not_found_message(
+                        &input.db_cluster_identifier,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Stopping shuts the cluster's database engine down, so there has to be one
+        // running: a cluster still coming up, already stopping or stopped, failing over,
+        // taking a modification or on its way out cannot take a stop, which is the
+        // modelled cluster state fault. The status the clock has yet to settle is real, so
+        // a stop issued immediately after the create sees `creating` and is refused.
+        if cluster.status != crate::state::DB_CLUSTER_STATUS_AVAILABLE {
+            let status = cluster.status.clone();
+            return Err(StopDBClusterErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(format!(
+                        "DB cluster {identifier} is not available for a stop (status {status})"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The stop is accepted: the cluster reports `stopping` now and the clock owes it
+        // `stopped`. A key this handler resolved and a lookup under it can only disagree if
+        // the record is not where the resolve said it was, which answers the same modelled
+        // 404 as a cluster that was never there: a disagreement is a "not found", never a
+        // panic that would take the whole emulator down with it.
+        let accepted = {
+            let Some(record) = store.db_clusters.get_mut(&key) else {
+                return Err(StopDBClusterErrorModeled::DBClusterNotFoundFault(
+                    DBClusterNotFoundFault {
+                        message: Some(crate::state::db_cluster_not_found_message(
+                            &input.db_cluster_identifier,
+                        )),
+                    },
+                )
+                .into());
+            };
+            record.status = crate::state::DB_CLUSTER_STATUS_STOPPING.to_string();
+            record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::DB_CLUSTER_STATUS_STOPPED,
+            ));
+            record.clone()
+        };
+        // The member instances of a stopped cluster are stopped with it: "when you stop a
+        // DB cluster, its DB instances are also stopped", and a member left reporting
+        // `available` would claim a database a client can still connect to. Only a member
+        // that IS available is stopped: one the clock still owes a transition — an instance
+        // still coming up, or one whose own delete is already running — keeps what it owes,
+        // because a stop must not discard another call's accepted change.
+        let members: Vec<(String, String)> = store
+            .instances_in(&region)
+            .into_iter()
+            .filter(|instance| {
+                instance
+                    .db_cluster_identifier
+                    .as_ref()
+                    .is_some_and(|named| named.eq_ignore_ascii_case(&identifier))
+                    && instance.status == crate::state::DB_INSTANCE_STATUS_AVAILABLE
+            })
+            .map(|instance| (instance.region.clone(), instance.identifier.clone()))
+            .collect();
+        for member in members {
+            if let Some(instance) = store.db_instances.get_mut(&member) {
+                instance.status = crate::state::DB_INSTANCE_STATUS_STOPPING.to_string();
+                instance.pending_status = Some(crate::state::PendingStatus::in_a_moment(
+                    crate::state::DB_INSTANCE_STATUS_STOPPED,
+                ));
+            }
+        }
+
+        // The answer is the cluster this call changed, projected the one way every
+        // operation of this service projects one, so the stop a caller is told about is
+        // the stop a following describe reports.
+        Ok(StopDBClusterOutput {
+            db_cluster: Some(store.cluster_to_wire(&accepted)),
+        })
     }
 }

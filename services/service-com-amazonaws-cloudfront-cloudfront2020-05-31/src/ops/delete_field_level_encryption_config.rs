@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFieldLevelEncryptionConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFieldLevelEncryptionConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFieldLevelEncryptionConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a stored field-level encryption configuration under its version token: the
+//! configuration a later read answered from is REMOVED, so the id names nothing afterwards
+//! and the caller reference it held is free again. A configuration a stored cache behaviour
+//! still names is refused with `FieldLevelEncryptionConfigInUse` (HTTP 409) and stays
+//! readable.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +165,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFieldLevelEncryptionConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFieldLevelEncryptionConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFieldLevelEncryptionConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this call
+        // reads it, as every handler here does: whether a cache behaviour still names this
+        // configuration is decided against the distributions as they stand at this instant.
+        store.settle(::std::time::SystemTime::now());
+
+        // "The ID of the configuration you want to delete from CloudFront": an id no stored
+        // configuration carries names no configuration to remove, whatever shape it has, so
+        // nothing is removed and the delete says so rather than reporting a removal it never
+        // performed.
+        let Some(current_etag) = store
+            .field_level_encryption_config(&input.id)
+            .map(|stored| stored.etag.clone())
+        else {
+            return Err(
+                DeleteFieldLevelEncryptionConfigErrorModeled::NoSuchFieldLevelEncryptionConfig(
+                    crate::state::no_such_field_level_encryption_config(),
+                )
+                .into(),
+            );
+        };
+
+        // "The value of the ETag header that you received when retrieving the configuration
+        // identity to delete": the precondition is checked first, the way HTTP evaluates one,
+        // so a caller holding a version that is no longer current is told that before
+        // anything about what the configuration is used by.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            crate::state::IfMatch::Current => {}
+            crate::state::IfMatch::Invalid => {
+                return Err(
+                    DeleteFieldLevelEncryptionConfigErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            crate::state::IfMatch::Stale => {
+                return Err(
+                    DeleteFieldLevelEncryptionConfigErrorModeled::PreconditionFailed(
+                        crate::state::precondition_failed(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A cache behaviour names the configuration whose fields it encrypts through its
+        // `FieldLevelEncryptionId`, so a configuration any stored behaviour — the default one
+        // or any ordered one — still names is IN USE: the delete is refused and the
+        // configuration stays readable, and the same delete lands once every behaviour has
+        // let go of it.
+        if store
+            .distribution_using_field_level_encryption_config(&input.id)
+            .is_some()
+        {
+            return Err(
+                DeleteFieldLevelEncryptionConfigErrorModeled::FieldLevelEncryptionConfigInUse(
+                    crate::state::field_level_encryption_config_in_use(),
+                )
+                .into(),
+            );
+        }
+
+        // Gone means gone: the record a read answered from is removed, so the id names no
+        // configuration and the caller reference it held is free for a later create to claim.
+        store.field_level_encryption_configs.remove(&input.id);
+
+        Ok(DeleteFieldLevelEncryptionConfigOutput)
     }
 }

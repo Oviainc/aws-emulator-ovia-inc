@@ -600,6 +600,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             output_bucket_name: input.output_bucket_name,
             output_key: input.output_key,
+            // The output encryption the request asked for is part of what it asked
+            // for, so the record keeps it even though the `TranscriptionJob` shape
+            // projects neither member and nothing here writes (let alone encrypts) a
+            // transcript — exactly as every other job family of this service records
+            // them.
+            output_encryption_kms_key_id: input.output_encryption_kms_key_id,
+            kms_encryption_context: input.kms_encryption_context,
             region: region.clone(),
             settings: input.settings,
             model_settings: input.model_settings,

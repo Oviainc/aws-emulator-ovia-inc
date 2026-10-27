@@ -93,6 +93,8 @@ mod inline_policy_independence;
 mod instance_create;
 #[path = "all/instance_create_client_token_fold.rs"]
 mod instance_create_client_token_fold;
+#[path = "all/instance_create_in_progress_writes.rs"]
+mod instance_create_in_progress_writes;
 #[path = "all/instance_delete.rs"]
 mod instance_delete;
 #[path = "all/instance_describe.rs"]

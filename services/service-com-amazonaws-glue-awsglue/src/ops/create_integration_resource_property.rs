@@ -9,6 +9,10 @@
 //! that already has one writes THAT record, keeping the `ResourcePropertyArn` the first
 //! create minted. `GetIntegrationResourceProperty` reads the record back.
 //!
+//! A create that states NEITHER side — no `SourceProcessingProperties` and no
+//! `TargetProcessingProperties` — carries no property to write, so it is refused with the
+//! operation's modelled `ValidationException` and persists nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -181,6 +185,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx.parts());
+
+        // What this call writes is a side of the integration: the source's processing
+        // properties or the target's. The model marks each side optional on its own, so a
+        // request that states NEITHER is refused here as the service's own requirement —
+        // it asks for no property at all. Decided on the request alone, before anything it
+        // addresses is resolved and before any write, so nothing is persisted for it and a
+        // later read of that resource still reports no record.
+        if input.source_processing_properties.is_none()
+            && input.target_processing_properties.is_none()
+        {
+            return Err(
+                CreateIntegrationResourcePropertyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::messages::INTEGRATION_PROCESSING_PROPERTIES_REQUIRED
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // "The connection ARN of the source, or the database ARN of the target": a value
         // that is neither names no resource whose properties this call could set.

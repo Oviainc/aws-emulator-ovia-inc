@@ -5,7 +5,9 @@
 //! Persists the whole Auto Scaling group under its name — sizes, zones, health
 //! check, launch source, tags, ARN and creation time — and launches the group's
 //! initial `DesiredCapacity` instances, each reported `Pending` until the
-//! lifecycle transition the clock owes comes due.
+//! lifecycle transition the clock owes comes due. Those instances are the account's own
+//! Amazon EC2 instances, launched from the group's launch source into the account's
+//! Amazon EC2 store ([`crate::state::ec2_instances`]).
 //!
 //! A group that names only `VPCZoneIdentifier` carries zones too: the zones of the
 //! subnets it names, resolved against the account's own Amazon EC2 subnets
@@ -506,7 +508,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
-        state.materialize_due(now);
+        state.materialize_due(&*self.engine, now);
 
         if state.groups.contains_key(&name) {
             return Err(CreateAutoScalingGroupErrorModeled::AlreadyExistsFault(
@@ -562,6 +564,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group = crate::state::StoredGroup {
             name: name.clone(),
             arn,
+            // The Region the request was signed for: where this group's resources,
+            // and the instances it launches, live.
+            region: region.clone(),
             launch_configuration_name: input.launch_configuration_name,
             launch_template: input.launch_template,
             mixed_instances_policy: input.mixed_instances_policy,
@@ -621,7 +626,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             0,
             desired_capacity,
         );
-        state.apply_capacity(&name, desired_capacity, &cause, now);
+        state.apply_capacity(&*self.engine, &name, desired_capacity, &cause, now);
 
         crate::state::audit(ctx.parts(), "CreateAutoScalingGroup", &name, "created");
         Ok(CreateAutoScalingGroupOutput)

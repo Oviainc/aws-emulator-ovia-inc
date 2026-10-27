@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBackupSelection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBackupSelection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBackupSelection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a resource selection into the backup plan the request names and
+//! answers from it: the `SelectionId` this service mints, the plan the selection
+//! belongs to and the creation instant it records. Every later read of the
+//! selection reports the body stored here.
 //!
+//! A selection is identified by the (`BackupPlanId`, `SelectionId`) pair AWS
+//! Backup addresses one by, so the body is stored verbatim under that pair. A
+//! create that repeats a `CreatorRequestId` answers with the selection that
+//! token made; any OTHER create naming a selection the plan already holds is
+//! refused with `AlreadyExistsException`. A `BackupPlanId` naming no live plan
+//! of this account is a bad parameter value — this operation models no
+//! not-found error — so nothing is stored for a plan that does not exist.
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -159,18 +162,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBackupSelection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBackupSelectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBackupSelection"))
+        let _ = ctx;
+        // `BackupSelection` is `@required`, as are its `SelectionName` (which
+        // targets a patterned shape) and `IamRoleArn`: an absent or malformed one
+        // is refused before this handler runs, and `crate::service` words that
+        // refusal as this service's own `MissingParameterValueException` /
+        // `InvalidParameterValueException`.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBackupSelectionErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let selection = input.backup_selection;
+
+        // The model types `IamRoleArn` and every entry of `Resources` and
+        // `NotResources` as an ARN with no pattern, so the framework cannot
+        // refuse a malformed one; AWS does, rather than storing a selection whose
+        // role or resources no ARN resolves to.
+        let arns = [("IamRoleArn", selection.iam_role_arn.as_str())]
+            .into_iter()
+            .chain(
+                selection
+                    .resources
+                    .iter()
+                    .flatten()
+                    .map(|arn| ("Resources", arn.as_str())),
+            )
+            .chain(
+                selection
+                    .not_resources
+                    .iter()
+                    .flatten()
+                    .map(|arn| ("NotResources", arn.as_str())),
+            );
+        for (member, arn) in arns {
+            if let Some(refusal) = crate::state::rejected_arn(member, arn) {
+                return Err(
+                    CreateBackupSelectionErrorModeled::InvalidParameterValueException(refusal)
+                        .into(),
+                );
+            }
+        }
+
+        let mut store = state.lock();
+
+        // A repeated `CreatorRequestId` replays the selection that token created:
+        // no second selection, and the same identifiers the first call answered
+        // with. Resolved BEFORE the name check, since a replay necessarily
+        // repeats the name of the selection it created.
+        if let Some(existing) = input.creator_request_id.as_deref().and_then(|token| {
+            store.backup_selection_by_creator_request_id(&input.backup_plan_id, token)
+        }) {
+            return Ok(selection_created(existing));
+        }
+
+        // A selection is assigned TO a backup plan, so a request naming a plan
+        // this account does not hold — or one whose deletion is recorded —
+        // assigns resources to nothing. This operation models no not-found
+        // error, so the refusal is the one that names the parameter at fault.
+        if store.live_backup_plan(&input.backup_plan_id).is_none() {
+            return Err(
+                CreateBackupSelectionErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "BackupPlanId {} does not name a backup plan of this account",
+                            input.backup_plan_id
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A selection is displayed by its name within its plan, so a create that
+        // is not the replay above and names one the plan already holds is
+        // refused, and the refusal discloses nothing about the stored selection.
+        if store.holds_backup_selection_named(&input.backup_plan_id, &selection.selection_name) {
+            return Err(CreateBackupSelectionErrorModeled::AlreadyExistsException(
+                crate::state::selection_already_exists(),
+            )
+            .into());
+        }
+
+        // The store is in memory and every request can add to it, so the number
+        // of selections one plan keeps is bounded. AWS answers the same modelled
+        // error once a plan reaches its own selection quota.
+        if store.backup_selections_of(&input.backup_plan_id).len()
+            >= crate::state::MAX_SELECTIONS_PER_PLAN
+        {
+            return Err(CreateBackupSelectionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "a backup plan may hold at most {} resource selections",
+                        crate::state::MAX_SELECTIONS_PER_PLAN
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let selection_id = store.next_id(now);
+        let record = crate::state::BackupSelectionRecord {
+            selection_id: selection_id.clone(),
+            plan_id: input.backup_plan_id.clone(),
+            selection,
+            creator_request_id: input.creator_request_id,
+            creation_date: now,
+        };
+        let output = selection_created(&record);
+        store
+            .backup_selections
+            .insert((input.backup_plan_id, selection_id), record);
+        Ok(output)
+    }
+}
+
+/// What this operation answers for the selection it stored — the same answer a
+/// replayed `CreatorRequestId` gets, so a retry cannot report identifiers that
+/// differ from the ones the first call reported.
+fn selection_created(record: &crate::state::BackupSelectionRecord) -> CreateBackupSelectionOutput {
+    CreateBackupSelectionOutput {
+        selection_id: Some(record.selection_id.clone()),
+        backup_plan_id: Some(record.plan_id.clone()),
+        creation_date: Some(::aws_smithy_types::DateTime::from(record.creation_date)),
     }
 }
