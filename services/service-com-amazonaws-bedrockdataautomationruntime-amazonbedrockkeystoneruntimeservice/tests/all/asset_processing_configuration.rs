@@ -58,8 +58,14 @@ type ScopeCase = (&'static str, Value, bool, Option<(i64, i64)>);
 
 /// A router serving only this service, plus the engine it shares with it — the engine is
 /// kept so a test can read the record a submission persisted.
+///
+/// [`PROJECT_ARN`] is arranged in the store of the service that OWNS data-automation
+/// projects first: a submission's project reference is resolved against it, so a
+/// submission naming a project nobody created is refused before any rule this suite is
+/// about can be reached.
 fn service() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    crate::support::seed_project(&engine, PROJECT_ARN, "asset-processing-clips");
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(bda::EmulatedService::new(Arc::clone(&engine)));
