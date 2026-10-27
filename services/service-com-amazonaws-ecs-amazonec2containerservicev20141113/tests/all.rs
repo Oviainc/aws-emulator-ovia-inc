@@ -33,6 +33,10 @@ mod cluster_tombstone;
 mod container_instance_not_found;
 #[path = "all/container_instances.rs"]
 mod container_instances;
+#[path = "all/container_reservation_refusals.rs"]
+mod container_reservation_refusals;
+#[path = "all/daemon_reference_family_refusals.rs"]
+mod daemon_reference_family_refusals;
 #[path = "all/daemon_task_definition_deletion.rs"]
 mod daemon_task_definition_deletion;
 #[path = "all/daemon_task_definitions.rs"]
@@ -101,6 +105,8 @@ mod service_projection;
 mod service_run_state;
 #[path = "all/service_validation.rs"]
 mod service_validation;
+#[path = "all/services_by_namespace.rs"]
+mod services_by_namespace;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_set_reads.rs"]

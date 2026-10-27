@@ -4,12 +4,12 @@
 //! end over the shared wire harness in [`crate::ecs_wire`].
 //!
 //! The rule under test: a value outside that range is refused with the operation's
-//! `InvalidParameterException`, whose message names the member and the ONE bound the value
-//! crossed — `<member> must be at least <min>` below the range, `<member> must be at most
-//! <max>` above it — while every value inside the range, each published bound included, is
-//! accepted and acted on. The refusal is a property of the BOUND, not of the operation or
-//! of how far past it the value is, so the table below varies the member, the operation,
-//! the bound crossed and the distance past it.
+//! `InvalidParameterException`, whose message states the rule the value broke — the member
+//! and the ONE bound it crossed for a member bounding a period or a count, and the whole
+//! page-size range for a `maxResults` — while every value inside the range, each published
+//! bound included, is accepted and acted on. The refusal is a property of the BOUND, not of
+//! the operation or of how far past it the value is, so the table below varies the member,
+//! the operation, the bound crossed and the distance past it.
 //!
 //! The bounds and their sentences come from the members' own docs
 //! (`smithy_query(query="doc",shape="<Request>",member="<member>")`):
@@ -17,8 +17,8 @@
 //! * `UpdateTaskProtection$expiresInMinutes` — "You can specify a value from 1 minute to up
 //!   to 2,880 minutes (48 hours)."
 //! * `RunTask$count` — "You can specify up to 10 tasks for each call."
-//! * `ListClusters$maxResults`, `ListTasks$maxResults` — "This value can be between 1 and
-//!   100."
+//! * `ListClusters$maxResults`, `ListTasks$maxResults`, `ListDaemonTaskDefinitions$maxResults`,
+//!   `ListTaskDefinitionFamilies$maxResults` — "This value can be between 1 and 100."
 //! * `ListAccountSettings$maxResults`, `DescribeCapacityProviders$maxResults` — "This value
 //!   can be between 1 and 10."
 //!
@@ -174,25 +174,43 @@ async fn an_integer_outside_its_documented_range_is_refused_naming_the_bound_it_
             "a list page below the range",
             "ListClusters",
             json!({ "maxResults": 0 }),
-            "maxResults must be at least 1",
+            "MaxResults must be a positive number between 1-100.",
         ),
         (
             "a list page above the range",
             "ListTasks",
             json!({ "cluster": CLUSTER, "maxResults": 101 }),
-            "maxResults must be at most 100",
+            "MaxResults must be a positive number between 1-100.",
         ),
         (
             "a narrower page above its own range",
             "ListAccountSettings",
             json!({ "maxResults": 11 }),
-            "maxResults must be at most 10",
+            "MaxResults must be a positive number between 1-10.",
         ),
         (
             "a narrower page below its own range",
             "DescribeCapacityProviders",
             json!({ "maxResults": -2 }),
-            "maxResults must be at least 1",
+            "MaxResults must be a positive number between 1-10.",
+        ),
+        (
+            "a daemon list page below the range",
+            "ListDaemonTaskDefinitions",
+            json!({ "maxResults": 0 }),
+            "MaxResults must be a positive number between 1-100.",
+        ),
+        (
+            "a daemon list page far above the range",
+            "ListDaemonTaskDefinitions",
+            json!({ "maxResults": 1_000 }),
+            "MaxResults must be a positive number between 1-100.",
+        ),
+        (
+            "a family list page one above the range",
+            "ListTaskDefinitionFamilies",
+            json!({ "maxResults": 101 }),
+            "MaxResults must be a positive number between 1-100.",
         ),
     ];
 
