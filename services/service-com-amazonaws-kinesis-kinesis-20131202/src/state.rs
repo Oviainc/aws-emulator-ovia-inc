@@ -8,12 +8,19 @@
 //! where the `CREATING` -> `ACTIVE`, `UPDATING` -> `ACTIVE` and `DELETING` -> gone
 //! transitions the clock owes a stream are decided ([`Stream::status`],
 //! [`Stream::is_held`]).
+//!
+//! It owns the channel records the same way ([`Channel`]): the destination, logging and
+//! encryption configuration `CreateChannel` resolves every documented default into, the ARN
+//! and id a channel is addressed by, and the `CREATING` -> `ACTIVE` transition the clock
+//! owes it ([`Channel::status`]).
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    ChildShard, EnhancedMetrics, HashKeyRange, Record, SequenceNumberRange, Shard,
+    ChannelDescription, ChannelEncryptionConfiguration, ChannelLoggingConfiguration,
+    ChannelStreamDescription, ChildShard, EnhancedMetrics, HashKeyRange, Record,
+    S3DestinationDescription, S3TablesDestinationDescription, SequenceNumberRange, Shard,
     StreamDescription, StreamDescriptionSummary, StreamModeDetails, StreamSummary, Tag,
     WarmThroughputObject,
 };
@@ -263,6 +270,96 @@ pub const MAX_RECORDS_PER_SHARD: usize = 10_000;
 /// [`MAX_SHARDS_TOTAL`] bounding how many shards exist at all, the two together bound what
 /// every stream of every region holds. The emulator's OWN ceiling, not a modelled limit.
 pub const MAX_RECORD_BYTES_PER_SHARD: usize = 16 * 1024 * 1024;
+
+/// A channel that is still being provisioned: "CREATING - The channel is being created"
+/// (`ChannelSummary$ChannelStatus`).
+pub const CHANNEL_CREATING: &str = "CREATING";
+
+/// A channel that is ready to deliver records: "ACTIVE - The channel is ready to deliver
+/// records" (`ChannelSummary$ChannelStatus`).
+pub const CHANNEL_ACTIVE: &str = "ACTIVE";
+
+/// How long after the `CreateChannel` call a channel's `CREATING` -> `ACTIVE` transition
+/// falls due. A CHOSEN span, not an AWS-documented duration ("Creating a channel is an
+/// asynchronous operation. Upon receiving the request, Amazon Kinesis Data Streams returns
+/// immediately with the channel in the CREATING state. After provisioning is complete,
+/// Amazon Kinesis Data Streams sets the state to ACTIVE" names no value): it only has to be
+/// non-zero, so a caller that describes the channel straight after creating it still
+/// observes `CREATING`. The instant it falls due is stored on the record and never slept on.
+pub const CHANNEL_ACTIVATION_DELAY: Duration = Duration::from_secs(3);
+
+/// A channel that delivers to a general purpose bucket: "S3 - Delivery to a general purpose
+/// Amazon S3 bucket" (`ChannelSummary$ChannelDestinationType`).
+pub const CHANNEL_DESTINATION_S3: &str = "S3";
+
+/// A channel that delivers to streaming tables: "S3_TABLES - Delivery to streaming tables
+/// on Apache Iceberg" (`ChannelSummary$ChannelDestinationType`).
+pub const CHANNEL_DESTINATION_S3_TABLES: &str = "S3_TABLES";
+
+/// The record formats a general purpose bucket destination admits: "JSON - Supported for
+/// both general purpose Amazon S3 and streaming table destinations", "STRING - Supported
+/// only for general purpose Amazon S3 destinations", "BYTE_ARRAY - Supported only for
+/// general purpose Amazon S3 destinations" (`RecordConfiguration$RecordFormatType`).
+pub const S3_RECORD_FORMAT_TYPES: &[&str] = &["JSON", "STRING", "BYTE_ARRAY"];
+
+/// The record formats a streaming table destination admits: "GSR_JSON - Supported only for
+/// streaming table (Amazon S3 Tables) destinations" and the `JSON` both destinations admit
+/// (`RecordConfiguration$RecordFormatType`).
+pub const S3_TABLES_RECORD_FORMAT_TYPES: &[&str] = &["GSR_JSON", "JSON"];
+
+/// How many source streams one channel carries: "Currently, one stream is supported per
+/// channel" (`CreateChannelInput$StreamConfigurationList`), narrower than that member's
+/// modelled `@length` of 1..10000, which the boundary validator enforces.
+pub const MAX_STREAMS_PER_CHANNEL: usize = 1;
+
+/// The maximum age of undelivered data a destination gets when the request names none: "The
+/// maximum age, in seconds, of undelivered data before the channel delivers it to the
+/// destination. The default value is 300 seconds"
+/// (`S3DestinationConfiguration$DataFreshnessInSeconds`).
+pub const DEFAULT_DATA_FRESHNESS_SECONDS: i32 = 300;
+
+/// The storage class delivered objects get when the request names none: "STANDARD - The
+/// default storage class, for frequently accessed data"
+/// (`S3StorageConfiguration$StorageClass`).
+pub const DEFAULT_S3_STORAGE_CLASS: &str = "STANDARD";
+
+/// The log stream a channel's CloudWatch logging uses when the request names none:
+/// "Defaults to DestinationDelivery" (`CloudWatchLogs$LogStreamName`).
+pub const DEFAULT_CHANNEL_LOG_STREAM_NAME: &str = "DestinationDelivery";
+
+/// The key prefix the dead-letter queue a general purpose destination gets by default
+/// writes error records under: that queue "defaults to the destination bucket with an error
+/// prefix" (`S3DestinationConfiguration$DeadLetterQueueS3Configuration`), which names the
+/// bucket and the prefix's purpose but no text, so this prefix is CHOSEN, inside the
+/// modelled `S3ErrorOutputPrefix` pattern.
+pub const DEFAULT_ERROR_OUTPUT_PREFIX: &str = "errors/";
+
+/// The alias of the KMS key this service owns, which a channel cannot be encrypted with:
+/// "You cannot use the Amazon Kinesis Data Streams service key (aws/kinesis)"
+/// (`ChannelEncryptionConfiguration$KeyId`).
+pub const KINESIS_SERVICE_KEY_ALIAS: &str = "alias/aws/kinesis";
+
+/// The prefix of the `alias/<name>` form a KMS key identifier may take: "Alias name
+/// example: alias/MyAliasName" (`StartStreamEncryptionInput$KeyId`).
+const KMS_ALIAS_PREFIX: &str = "alias/";
+
+/// The prefix of the `key/<id>` resource an ARN-form KMS key identifier names: "Key ARN
+/// example: arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012"
+/// (`StartStreamEncryptionInput$KeyId`).
+const KMS_KEY_RESOURCE_PREFIX: &str = "key/";
+
+/// What every ARN starts with, which is what tells an ARN-form identifier from a bare one.
+const ARN_PREFIX: &str = "arn:";
+
+/// How many channels one region's endpoint holds. The emulator's OWN ceiling, not a
+/// modelled limit: the store grows by one record per accepted create, so the creates one
+/// caller can make are bounded.
+pub const MAX_CHANNELS_PER_REGION: usize = 50;
+
+/// How many channels this emulator holds across every region — the ceiling no request can
+/// partition, since the region a create is counted against is the caller's to choose. The
+/// emulator's OWN ceiling, not a modelled limit.
+pub const MAX_CHANNELS_TOTAL: usize = 100;
 
 /// How many seconds an hour of a retention window holds, so the window a stream reports in
 /// hours can be measured against stored instants.
@@ -1249,11 +1346,90 @@ impl Stream {
     }
 }
 
+/// One stored Kinesis channel: the authoritative record every channel operation reads.
+/// `CreateChannel` inserts it and `DescribeChannel` projects it onto its output shape.
+///
+/// The destinations and the logging configuration are stored as the DESCRIPTION shapes,
+/// with every documented default already resolved, so what a create accepted is exactly
+/// what every later read reports.
+#[derive(Debug, Clone)]
+pub struct Channel {
+    /// The `ChannelName` the create carried, which is half of this record's key.
+    pub name: String,
+    /// The region the creating request was signed for.
+    pub region: String,
+    /// The `ChannelARN`, as [`channel_arn`] builds it.
+    pub arn: String,
+    /// The `ChannelId`, as [`channel_id`] derives it.
+    pub id: String,
+    /// When `CreateChannel` minted the channel.
+    pub created_at: SystemTime,
+    /// When the channel's `CREATING` -> `ACTIVE` transition falls due: "Upon receiving the
+    /// request, Amazon Kinesis Data Streams returns immediately with the channel in the
+    /// CREATING state. After provisioning is complete, Amazon Kinesis Data Streams sets the
+    /// state to ACTIVE" (`CreateChannel`).
+    pub active_at: SystemTime,
+    /// The `ServiceExecutionRoleARN` the create carried.
+    pub service_execution_role_arn: String,
+    /// The channel's source streams, each carrying the stored stream's own creation instant.
+    pub streams: Vec<ChannelStreamDescription>,
+    /// The general purpose bucket destination, when the create named one.
+    pub s3_destination: Option<S3DestinationDescription>,
+    /// The streaming table destination, when the create named one.
+    pub s3_tables_destination: Option<S3TablesDestinationDescription>,
+    /// The server-side encryption configuration, when the create named one.
+    pub encryption_configuration: Option<ChannelEncryptionConfiguration>,
+    /// The CloudWatch Logs configuration, with the documented default names resolved.
+    pub logging_configuration: ChannelLoggingConfiguration,
+    /// The tags the create carried.
+    pub tags: HashMap<String, String>,
+}
+
+impl Channel {
+    /// The channel's status at `now`: `CREATING` until the transition the create armed falls
+    /// due, `ACTIVE` from then on. Derived from the stored instant, so two reads at the same
+    /// instant agree and no read has to write.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.active_at {
+            CHANNEL_CREATING
+        } else {
+            CHANNEL_ACTIVE
+        }
+    }
+
+    /// The stored record projected onto `ChannelDescription`, which is what `CreateChannel`
+    /// and `DescribeChannel` both answer with: "The configuration and current status of the
+    /// channel, including its ARN, destination configuration, and lifecycle state".
+    pub fn to_description(&self, now: SystemTime) -> ChannelDescription {
+        ChannelDescription {
+            channel_name: self.name.clone(),
+            channel_arn: self.arn.clone(),
+            channel_id: self.id.clone(),
+            channel_status: self.status(now).to_string(),
+            // "A message describing the reason for a FAILED status"
+            // (`ChannelDescription$ChannelStatusReason`) — a channel this emulator holds
+            // provisions, so none of them is `FAILED` and none carries a reason.
+            channel_status_reason: None,
+            channel_creation_timestamp: timestamp(self.created_at),
+            service_execution_role_arn: self.service_execution_role_arn.clone(),
+            stream_configuration_list: self.streams.clone(),
+            s3_destination_configuration: self.s3_destination.clone(),
+            s3_tables_destination_configuration: self.s3_tables_destination.clone(),
+            encryption_configuration: self.encryption_configuration.clone(),
+            logging_configuration: self.logging_configuration.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-kinesis-kinesis-20131202. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKinesisKinesis20131202State {
     /// Every stream this emulator holds, keyed by region and name.
     pub streams: HashMap<RegionalName, Stream>,
+    /// Every channel this emulator holds, keyed by region and name: "The name is unique
+    /// within your Amazon Web Services account and Amazon Web Services Region"
+    /// (`CreateChannelInput$ChannelName`).
+    pub channels: HashMap<RegionalName, Channel>,
 }
 
 impl ComAmazonawsKinesisKinesis20131202State {
@@ -1430,6 +1606,35 @@ impl ComAmazonawsKinesisKinesis20131202State {
             .fold(0u32, |held, stream| {
                 held.saturating_add(u32::try_from(stream.shards.len()).unwrap_or(u32::MAX))
             })
+    }
+
+    /// The channel `region`'s endpoint holds under `name`, if any — the lookup a create
+    /// makes to tell a second record from a conflict.
+    pub fn channel_in(&self, region: &str, name: &str) -> Option<&Channel> {
+        self.channels.get(&RegionalName::new(region, name))
+    }
+
+    /// The channel `region`'s endpoint holds under `arn`, if any: `ChannelARN` is the only
+    /// member every channel read and write addresses a channel by.
+    pub fn channel_by_arn(&self, region: &str, arn: &str) -> Option<&Channel> {
+        self.channels
+            .values()
+            .find(|channel| channel.region == region && channel.arn == arn)
+    }
+
+    /// How many channels `region`'s endpoint holds, which is what
+    /// [`MAX_CHANNELS_PER_REGION`] bounds.
+    pub fn channels_held_in(&self, region: &str) -> usize {
+        self.channels
+            .keys()
+            .filter(|key| key.region == region)
+            .count()
+    }
+
+    /// How many channels this emulator holds across every region, which is what
+    /// [`MAX_CHANNELS_TOTAL`] bounds: the ceiling no request can partition.
+    pub fn channels_held(&self) -> usize {
+        self.channels.len()
     }
 }
 
@@ -1730,6 +1935,119 @@ pub fn tag_ceiling_exceeded_message(resulting: usize) -> String {
     )
 }
 
+/// How a create refuses a request that names no destination, or names both: "You must
+/// specify either S3DestinationConfiguration or S3TablesDestinationConfiguration, but not
+/// both" (`CreateChannel`). FIXED text for the one rule both halves break — it names no
+/// request- or state-derived value.
+pub const CHANNEL_DESTINATION_REQUIRED_MESSAGE: &str =
+    "You must specify either S3DestinationConfiguration or S3TablesDestinationConfiguration, \
+     but not both.";
+
+/// How a read states that this account and region hold no channel under the ARN the request
+/// named. Built FROM the request, so the identifier at fault is what names it.
+pub fn channel_not_found_message(identifier: &str) -> String {
+    format!(
+        "channel {identifier} not found under account {}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How a create states that this account and region already hold a channel under the name
+/// the request named: "The name is unique within your Amazon Web Services account and
+/// Amazon Web Services Region" (`CreateChannelInput$ChannelName`). Built FROM the request,
+/// so the name at fault names it.
+pub fn channel_already_exists_message(channel_name: &str) -> String {
+    format!(
+        "channel {channel_name} already exists in this account and region; a channel name \
+         is unique within your account and region"
+    )
+}
+
+/// How a create refuses a `StreamConfigurationList` naming more source streams than one
+/// channel carries: "Currently, one stream is supported per channel"
+/// (`CreateChannelInput$StreamConfigurationList`). Built FROM the request, so the count at
+/// fault names it.
+pub fn one_stream_per_channel_message(requested: usize) -> String {
+    format!(
+        "StreamConfigurationList names {requested} source streams; currently \
+         {MAX_STREAMS_PER_CHANNEL} stream is supported per channel"
+    )
+}
+
+/// How a create refuses a source stream whose capacity the caller provisions: "This
+/// operation is only supported for data streams with the on-demand capacity mode"
+/// (`CreateChannel`). Built FROM the request and the stored record, so the stream and the
+/// mode at fault name it.
+pub fn stream_not_on_demand_message(identifier: &str, stream_mode: &str) -> String {
+    format!(
+        "stream {identifier} is in {stream_mode} mode; a channel is only supported for data \
+         streams with the {STREAM_MODE_ON_DEMAND} capacity mode"
+    )
+}
+
+/// How a create refuses a record format the channel's destination does not admit: the
+/// catalog `RecordConfiguration$RecordFormatType` publishes per destination
+/// ([`S3_RECORD_FORMAT_TYPES`], [`S3_TABLES_RECORD_FORMAT_TYPES`]). Built FROM the request
+/// and the destination it named, so the pair at fault names it.
+pub fn record_format_unsupported_message(
+    record_format_type: &str,
+    destination_type: &str,
+) -> String {
+    format!(
+        "RecordFormatType {record_format_type} is not supported for a {destination_type} \
+         destination; the supported values are {}",
+        record_format_types_for(destination_type).join(" | ")
+    )
+}
+
+/// The record formats `destination_type` admits, which is what a create checks a source
+/// stream's `RecordFormatType` against.
+pub fn record_format_types_for(destination_type: &str) -> &'static [&'static str] {
+    if destination_type == CHANNEL_DESTINATION_S3_TABLES {
+        S3_TABLES_RECORD_FORMAT_TYPES
+    } else {
+        S3_RECORD_FORMAT_TYPES
+    }
+}
+
+/// How a create refuses a streaming table destination whose source stream names no schema:
+/// `GSRSchemaARN` is "Required when the channel destination is a streaming table"
+/// (`RecordConfiguration$GSRSchemaARN`). FIXED text for this refusal — it carries no
+/// request- or state-derived value.
+pub const GSR_SCHEMA_REQUIRED_MESSAGE: &str =
+    "RecordConfiguration.GSRSchemaARN is required when the channel destination is a \
+     streaming table.";
+
+/// How a create refuses a `KeyId` that is shaped like no KMS key identifier: the forms one
+/// may take are "a globally unique identifier, a fully specified ARN to either an alias or
+/// a key, or an alias name prefixed by 'alias/'" (`StartStreamEncryptionInput$KeyId`).
+/// Built FROM the request, so the value at fault names it.
+pub fn invalid_kms_key_message(key_id: &str) -> String {
+    format!(
+        "Invalid KMS key identifier {key_id}; the KMS key must be a key ARN, an alias ARN, \
+         a globally unique key ID or an alias name prefixed by {KMS_ALIAS_PREFIX}"
+    )
+}
+
+/// How a create refuses the KMS key this service owns: "You cannot use the Amazon Kinesis
+/// Data Streams service key (aws/kinesis)" (`ChannelEncryptionConfiguration$KeyId`). FIXED
+/// text for this refusal — the key it names is the one key no channel may use.
+pub const SERVICE_KMS_KEY_MESSAGE: &str =
+    "You cannot use the Amazon Kinesis Data Streams service key (aws/kinesis); the KMS key \
+     must be a customer managed key.";
+
+/// How a create refuses a channel this emulator has no room for: the ceilings
+/// ([`MAX_CHANNELS_PER_REGION`], [`MAX_CHANNELS_TOTAL`]) are on what the store holds once
+/// the request is served, so the refusal states what it already holds.
+pub fn channel_ceiling_exceeded_message(held_in_region: usize, held: usize) -> String {
+    format!(
+        "this region holds {held_in_region} channels and this emulator {held}, and another \
+         would exceed the {MAX_CHANNELS_PER_REGION} channels one region and the \
+         {MAX_CHANNELS_TOTAL} channels this emulator may hold; delete one before creating \
+         another"
+    )
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -1780,6 +2098,115 @@ pub fn stream_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(SERVICE_ARN_NAMESPACE, region, &format!("stream/{name}"))
 }
 
+/// The ARN a channel named `name` in `region` is addressed by, built through the same
+/// shared `engine` helper, inside the `ChannelARN` pattern
+/// (`^arn:aws.*:kinesis:.*:\d{12}:channel/\S+$`).
+pub fn channel_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(SERVICE_ARN_NAMESPACE, region, &format!("channel/{name}"))
+}
+
+/// The `ChannelId` of the channel `region` holds under `name`, created at `created_at`:
+/// "The unique identifier of the channel" (`ChannelDescription$ChannelId`), inside its
+/// modelled `@length` of 1..64.
+///
+/// An id is opaque to a client, so this one is DERIVED from what identifies the channel —
+/// its region, its name and the instant it was created at — through a digest crate: two
+/// channels differ, a name re-created after a delete differs from the channel it replaces,
+/// and the value a read reports never changes. Nothing here authenticates or protects
+/// anything; the digest is only how the three parts are folded into one short id.
+pub fn channel_id(region: &str, name: &str, created_at: SystemTime) -> String {
+    let seed = format!("{region}/{name}/{}", epoch_millis(created_at));
+    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(seed.as_bytes());
+    // Half the digest, which is inside the modelled `ChannelId` `@length` of 1..64 and
+    // still far past the collision range of the channels one emulator holds.
+    ::hex::encode(&digest[..CHANNEL_ID_DIGEST_BYTES])
+}
+
+/// How many bytes of the digest a `ChannelId` carries, hex-encoded — 32 characters, inside
+/// the member's modelled `@length` of 1..64.
+const CHANNEL_ID_DIGEST_BYTES: usize = 16;
+
+/// The CloudWatch Logs log group a channel logs to when the request names none: "Defaults
+/// to /aws/kinesis/{channelName}/{channelId}" (`CloudWatchLogs$LogGroupName`).
+pub fn channel_log_group_name(channel_name: &str, channel_id: &str) -> String {
+    format!("/aws/kinesis/{channel_name}/{channel_id}")
+}
+
+/// Whether `key_id` is shaped like a KMS key identifier at all.
+///
+/// The forms one may take are the ones this service publishes for every member that names a
+/// KMS key: "a globally unique identifier, a fully specified ARN to either an alias or a
+/// key, or an alias name prefixed by 'alias/'"
+/// (`StartStreamEncryptionInput$KeyId`) — so a key ARN, an alias ARN, a globally unique key
+/// id, or an alias name. A value outside all four names no key that could exist, which is a
+/// malformed request rather than a key lookup.
+pub fn is_kms_key_identifier(key_id: &str) -> bool {
+    if let Some(arn_fields) = key_id.strip_prefix(ARN_PREFIX) {
+        return is_kms_arn(arn_fields);
+    }
+    if let Some(alias) = key_id.strip_prefix(KMS_ALIAS_PREFIX) {
+        return !alias.is_empty();
+    }
+    is_kms_key_uuid(key_id)
+}
+
+/// Whether the fields after an ARN's `arn:` prefix spell a KMS key or alias ARN: the
+/// partition, the `kms` service, a region, this account's twelve digits, and a `key/<id>`
+/// or `alias/<name>` resource.
+fn is_kms_arn(arn_fields: &str) -> bool {
+    let mut fields = arn_fields.split(':');
+    let partition = fields.next().unwrap_or_default();
+    let service = fields.next().unwrap_or_default();
+    let region = fields.next().unwrap_or_default();
+    let account = fields.next().unwrap_or_default();
+    let resource = fields.next().unwrap_or_default();
+    // A KMS ARN has exactly these six fields, so anything past the resource is not one.
+    if fields.next().is_some() {
+        return false;
+    }
+    let names_a_key = resource
+        .strip_prefix(KMS_KEY_RESOURCE_PREFIX)
+        .is_some_and(is_kms_key_uuid);
+    let names_an_alias = resource
+        .strip_prefix(KMS_ALIAS_PREFIX)
+        .is_some_and(|alias| !alias.is_empty());
+    partition.starts_with("aws")
+        && service == "kms"
+        && is_region_name(region)
+        && account.len() == ACCOUNT_ID_DIGITS
+        && account.bytes().all(|byte| byte.is_ascii_digit())
+        && (names_a_key || names_an_alias)
+}
+
+/// How many digits an account id segment of an ARN carries, which every ARN pattern of this
+/// model spells `\d{12}`.
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The groups of hexadecimal digits a globally unique key id is written in: "Globally
+/// unique key ID example: 12345678-1234-1234-1234-123456789012"
+/// (`StartStreamEncryptionInput$KeyId`).
+const KMS_KEY_UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// Whether `value` is written as a globally unique key id, in the groups
+/// [`KMS_KEY_UUID_GROUPS`] names.
+fn is_kms_key_uuid(value: &str) -> bool {
+    let mut groups = value.split('-');
+    KMS_KEY_UUID_GROUPS.iter().all(|width| {
+        groups.next().is_some_and(|group| {
+            group.len() == *width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    }) && groups.next().is_none()
+}
+
+/// Whether `key_id` names the KMS key this service owns rather than a customer managed one,
+/// by its alias or by the alias ARN that resolves to it: "Master key owned by Kinesis Data
+/// Streams: alias/aws/kinesis" (`StartStreamEncryptionInput$KeyId`).
+pub fn names_the_service_key(key_id: &str) -> bool {
+    key_id == KINESIS_SERVICE_KEY_ALIAS
+        || (key_id.starts_with(ARN_PREFIX)
+            && key_id.split(':').next_back() == Some(KINESIS_SERVICE_KEY_ALIAS))
+}
+
 /// The id of the `index`th shard of a stream: `shardId-` and the index in twelve digits,
 /// inside the `ShardId` pattern `^[a-zA-Z0-9_.-]+$`.
 pub fn shard_id(index: u32) -> String {
@@ -1792,8 +2219,20 @@ pub fn shard_id(index: u32) -> String {
 /// uniquely identified groups of data records in a stream" (`CreateStream`): a stream's
 /// shards partition the 128-bit hash key space into contiguous, equal, non-overlapping
 /// slices, so the ranges run from 0 to 2^128-1 without a gap.
+///
+/// The map is one entry per shard, so the count is bounded HERE, at the allocation, and not
+/// only by the callers: every operation that lays down or re-tiles a shard map refuses a
+/// count past [`MAX_SHARDS_PER_STREAM`] with a modelled error before it reaches this
+/// function, and the clamp below keeps the allocation bounded whatever asks for it.
 pub fn hash_key_ranges(shard_count: u32) -> Vec<(String, String)> {
-    let shards = u128::from(shard_count.max(1));
+    // Every caller refuses a larger count with a modelled error, so reaching here with one
+    // is a caller bug rather than a request this function may answer: it is caught in a
+    // debug build, and the clamp keeps the allocation bounded in a release build.
+    debug_assert!(
+        shard_count <= MAX_SHARDS_PER_STREAM,
+        "a shard map is laid down for at most {MAX_SHARDS_PER_STREAM} shards"
+    );
+    let shards = u128::from(shard_count.clamp(1, MAX_SHARDS_PER_STREAM));
     // 2^128 is one past `u128::MAX`, so the quotient and remainder of the division by the
     // shard count are taken against `u128::MAX` and the remainder carried back by one.
     let quotient = u128::MAX / shards;

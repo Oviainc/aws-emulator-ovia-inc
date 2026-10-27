@@ -166,7 +166,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // An update that names a resource is built from that resource, exactly as the
+        // create is, and the resources it names in another service's account are resolved
+        // against that service the same way (`crate::state::named_resources`). Awaited
+        // before this service's store is locked, so no lock is held across the in-process
+        // calls it makes.
+        if let Some(refusal) = crate::state::named_resources::first_unresolvable(
+            ctx,
+            Self::NAME,
+            crate::state::named_resources::NamedResources {
+                role_arn: input.role_arn.as_deref(),
+                // `UpdateClusterRequest` models no `KmsKeyARN`: the key a cluster's data is
+                // encrypted under is the one it was created with.
+                kms_key_arn: None,
+                resources: input.resources.as_ref(),
+                notification: input.notification.as_ref(),
+            },
+        )
+        .await
+        {
+            return Err(match refusal {
+                crate::state::named_resources::NamedResourceRefusal::InvalidResource(error) => {
+                    UpdateClusterErrorModeled::InvalidResourceException(error)
+                }
+                crate::state::named_resources::NamedResourceRefusal::KmsRequestFailed(error) => {
+                    UpdateClusterErrorModeled::KMSRequestFailedException(error)
+                }
+                crate::state::named_resources::NamedResourceRefusal::Ec2RequestFailed(error) => {
+                    UpdateClusterErrorModeled::Ec2RequestFailedException(error)
+                }
+            }
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STATE_UNAVAILABLE,

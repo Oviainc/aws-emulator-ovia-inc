@@ -27,6 +27,9 @@ hex = { workspace = true }
 # partition keys to 128-bit integer values and to map associated data records to shards"
 # (`PutRecordInput$PartitionKey`).
 md-5 = "0.10"
+# Folds a channel's region, name and creation instant into the short opaque `ChannelId` a
+# read reports (`crate::state::channel_id`).
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
