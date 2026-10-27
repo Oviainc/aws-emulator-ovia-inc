@@ -1797,6 +1797,45 @@ pub(super) fn xml_element(document: &str, tag: &str) -> Option<String> {
     }
 }
 
+/// The text of EVERY `<tag>` element of an XML document, in document order, with their
+/// entities decoded.
+///
+/// [`xml_element`] reads the first one; a LIST member of an awsQuery answer repeats its
+/// element once per entry (`<Tags><member><Key/><Value/></member>…`), so a reader of one
+/// such member reads them all. Two members of the same list are read as PARALLEL lists and
+/// zipped, which is sound exactly where the answering service reports both on every entry.
+pub(super) fn xml_elements(document: &str, tag: &str) -> Vec<String> {
+    use ::quick_xml::events::Event;
+
+    let mut reader = ::quick_xml::Reader::from_str(document);
+    reader.config_mut().trim_text(false);
+    let mut found = Vec::new();
+    let mut reading: Option<String> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(start)) if start.local_name().as_ref() == tag.as_bytes() => {
+                reading = Some(String::new());
+            }
+            Ok(Event::Text(text)) => {
+                if let Some(held) = reading.as_mut() {
+                    held.push_str(&text.xml10_content().unwrap_or_default());
+                }
+            }
+            Ok(Event::End(end)) if end.local_name().as_ref() == tag.as_bytes() => {
+                if let Some(held) = reading.take() {
+                    found.push(held);
+                }
+            }
+            // An empty element (`<Value/>`) is the empty value of that element.
+            Ok(Event::Empty(empty)) if empty.local_name().as_ref() == tag.as_bytes() => {
+                found.push(String::new());
+            }
+            Ok(Event::Eof) | Err(_) => return found,
+            Ok(_) => {}
+        }
+    }
+}
+
 /// The map an awsQuery answer carries under `parent`, as the JSON object the rest of this
 /// module compares: one entry per `<entry><key>…</key><value>…</value></entry>`, which is
 /// how the query protocol serializes a map member (`Attributes` on

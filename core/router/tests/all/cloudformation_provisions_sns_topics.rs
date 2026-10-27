@@ -27,7 +27,9 @@
 //!
 //! The deletion half and the refusal half are rows of the same rule: deleting the stack
 //! deletes the topics it created, and a topic SNS REFUSES to create leaves the stack
-//! `ROLLBACK_COMPLETE` naming the resource rather than publishing a dangling ARN. Drift
+//! `ROLLBACK_COMPLETE` naming the resource rather than publishing a dangling ARN. An UPDATE
+//! is that rule read forwards: a changed declaration reaches the topic through the call SNS
+//! publishes for it, so the stack completes and the topic keeps its ARN. Drift
 //! detection is the same rule read the other way: it asks SNS what the topic IS now, so a
 //! topic changed out of band is `MODIFIED` and an untouched one `IN_SYNC`.
 //!
@@ -913,11 +915,13 @@ async fn a_subscription_sns_refuses_fails_the_stack_and_leaves_no_topic() {
 }
 
 /// The other side of the same rule: a resource this emulator really created is never
-/// reported as reconfigured by something that did not reconfigure it. An update that
-/// changes a created topic's properties IN PLACE leaves the stack `UPDATE_FAILED` naming
-/// the resource, and the topic keeps the configuration it was created with.
+/// reported as reconfigured by something that did not reconfigure it — and a changed
+/// declaration of one is reconfigured THROUGH the service that owns it. An update that
+/// changes a created topic's mutable properties is applied to that topic in place: the
+/// stack reaches `UPDATE_COMPLETE`, the topic keeps the ARN its `Ref` resolves to, and
+/// Amazon SNS reports the property the new declaration states.
 #[tokio::test]
-async fn an_update_that_would_change_a_created_topic_in_place_fails_the_stack() {
+async fn an_update_of_a_created_topic_is_applied_to_it_in_place() {
     let router = build_router();
     let case = "a declared DisplayName changed by an update";
     let stack_name = "updated-topic-stack";
@@ -932,6 +936,18 @@ async fn an_update_that_would_change_a_created_topic_in_place_fails_the_stack() 
         Some("CREATE_COMPLETE"),
         "case {case:?}: expected the stack to complete, got {body}"
     );
+    let (status, created) = cloudformation(
+        &router,
+        "DescribeStackResource",
+        &[("StackName", stack_name), ("LogicalResourceId", "Topic")],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DescribeStackResource, got {status} with \
+         {created}"
+    );
+    let arn = xml_text(&created, "PhysicalResourceId").unwrap_or_default();
 
     let (status, body) = cloudformation(
         &router,
@@ -952,13 +968,31 @@ async fn an_update_that_would_change_a_created_topic_in_place_fails_the_stack() 
     );
     assert_eq!(
         xml_text(&body, "StackStatus").as_deref(),
-        Some("UPDATE_FAILED"),
-        "case {case:?}: expected the update to fail rather than report a topic nothing \
-         reconfigured, got {body}"
+        Some("UPDATE_COMPLETE"),
+        "case {case:?}: expected the in-place update to complete, got {body}"
     );
 
-    // The topic is still the one the create made, with the display name it was created
-    // with: a failed update changed nothing in SNS.
+    // The topic was UPDATED, not replaced: "Ref returns the topic ARN", and it is the ARN
+    // the create published.
+    let (status, updated) = cloudformation(
+        &router,
+        "DescribeStackResource",
+        &[("StackName", stack_name), ("LogicalResourceId", "Topic")],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DescribeStackResource, got {status} with \
+         {updated}"
+    );
+    assert_eq!(
+        xml_text(&updated, "PhysicalResourceId").unwrap_or_default(),
+        arn,
+        "case {case:?}: expected the topic to keep its ARN, got {updated}"
+    );
+
+    // …and the change really reached Amazon SNS, which is where the topic lives: the
+    // property the stack reports is the one that service reports.
     let read = sns_ok(
         &router,
         case,
@@ -968,7 +1002,7 @@ async fn an_update_that_would_change_a_created_topic_in_place_fails_the_stack() 
     .await;
     assert_eq!(
         attributes_of(&read).get("DisplayName").map(String::as_str),
-        Some("before"),
-        "case {case:?}: expected the created topic's own DisplayName, got {read}"
+        Some("after"),
+        "case {case:?}: expected SNS to report the declaration's new DisplayName, got {read}"
     );
 }
