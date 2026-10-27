@@ -159,7 +159,10 @@ const SPECIAL_KEY: &str = "cost.center:unit/01=a+b-c@d e";
 
 /// The message `NoSuchResource` carries: the wording this error class answers with,
 /// which names no part of the request.
-const NO_SUCH_RESOURCE_MESSAGE: &str =
+///
+/// Written out here rather than imported from the crate, so the SENTENCE is what every
+/// suite asserting this refusal is held to; `pub(crate)` so there is one such reading.
+pub(crate) const NO_SUCH_RESOURCE_MESSAGE: &str =
     "The specified resource doesn't exist. Update your request and try again.";
 
 /// The table every removal assertion runs over.

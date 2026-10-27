@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMedicalVocabulary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMedicalVocabulary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMedicalVocabulary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a stored custom MEDICAL vocabulary, refusing one whose build has not
+//! finished and refusing a name this Region holds no medical vocabulary under (see
+//! [`DeleteMedicalVocabulary::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +168,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMedicalVocabulary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMedicalVocabularyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMedicalVocabulary"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteMedicalVocabularyErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The Region this request is served in: only the medical vocabularies created
+        // through this Region's endpoint are this call's to delete.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The clock-owed transition is materialised FIRST, so a medical vocabulary
+        // whose build was already due is deleted rather than refused for a state it had
+        // left. The stored state is copied out of the lookup so the removal below does
+        // not hold the borrow the lookup took.
+        let stored_state = store
+            .medical_vocabulary_mut(&region, &input.vocabulary_name, now)
+            .map(|record| record.state.clone());
+
+        match stored_state {
+            // "Your request didn't pass one or more validation tests. This can occur
+            // when the entity you're trying to delete doesn't exist or if it's in a
+            // non-terminal state (such as IN PROGRESS)" (`BadRequestException`'s own
+            // documentation): a resource the service is still processing is not
+            // deletable, exactly as the non-medical family's delete refuses it.
+            Some(vocabulary_state)
+                if vocabulary_state == crate::state::VOCABULARY_STATE_PENDING =>
+            {
+                return Err(DeleteMedicalVocabularyErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "The custom medical vocabulary {name} is in the \
+                             {vocabulary_state} state and can't be deleted. Wait until \
+                             it is no longer being processed and try your request again.",
+                            name = input.vocabulary_name,
+                        )),
+                    },
+                )
+                .into());
+            }
+            Some(_) => {
+                store
+                    .medical_vocabularies
+                    .remove(&region, &input.vocabulary_name);
+                ::tracing::info!(
+                    operation = "DeleteMedicalVocabulary",
+                    vocabulary = %input.vocabulary_name,
+                    "custom medical vocabulary deleted"
+                );
+            }
+            // A DELETE IS NOT IDEMPOTENT: the entity has to be there. The same
+            // `BadRequestException` sentence covers it — "This can occur when the
+            // entity you're trying to delete doesn't exist OR if it's in a non-terminal
+            // state" — so a name this Region holds no medical vocabulary under is
+            // refused with this service's own absent-resource text
+            // (`crate::state::not_found_message`), exactly as this family's reader
+            // answers it, and nothing is stored or removed.
+            None => {
+                ::tracing::info!(
+                    operation = "DeleteMedicalVocabulary",
+                    vocabulary = %input.vocabulary_name,
+                    "no custom medical vocabulary of that name; the delete is refused"
+                );
+                return Err(DeleteMedicalVocabularyErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::not_found_message(
+                            crate::state::KIND_MEDICAL_VOCABULARY,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        Ok(DeleteMedicalVocabularyOutput)
     }
 }
+
