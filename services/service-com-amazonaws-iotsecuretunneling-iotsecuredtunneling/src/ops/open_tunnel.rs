@@ -14,8 +14,10 @@
 //! tunnel is multiplexed over ([`crate::state::MAX_SERVICES_PER_TUNNEL`]) is
 //! refused with HTTP 400 `ValidationException` before anything is minted,
 //! stored or handed out. A request past an exhausted limit — the tunnels this
-//! account holds ([`crate::state::MAX_TUNNELS`]) or the tags one tunnel would
-//! carry ([`crate::state::MAX_TAGS_PER_TUNNEL`]) — is refused with the modelled
+//! account holds OPEN in this Region ([`crate::state::MAX_CONCURRENT_TUNNELS`]),
+//! the records the store keeps at all
+//! ([`crate::state::MAX_RETAINED_TUNNELS`]) or the tags one tunnel would carry
+//! ([`crate::state::MAX_TAGS_PER_TUNNEL`]) — is refused with the modelled
 //! `LimitExceededException` (HTTP 403), equally before anything is minted.
 //!
 //! ## Shape of an operation
@@ -183,14 +185,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let mut store = state.lock();
-        // The store holds at most `MAX_TUNNELS` records, which is the limit the
-        // modelled `LimitExceededException` ("Thrown when a tunnel limit is
-        // exceeded", HTTP 403) exists to report. Refused before anything is minted,
-        // so a refused open neither stores a record nor hands out a token.
-        if store.is_at_tunnel_limit() {
+        // A tunnel whose lifetime has run out is CLOSED as of the instant the
+        // transition came due, whether or not anybody called, so its slot is
+        // already free before this open is counted against the quota.
+        store.materialize_expired_tunnels(now);
+
+        // The quota is on the tunnels this account holds OPEN in this Region
+        // (`MAX_CONCURRENT_TUNNELS`), which is what the modelled
+        // `LimitExceededException` ("Thrown when a tunnel limit is exceeded",
+        // HTTP 403) exists to report: a closed tunnel holds no slot, so closing
+        // one — with or without `delete` — makes room for this open. Refused
+        // before anything is minted, so a refused open neither stores a record
+        // nor hands out a token.
+        let open_tunnels = store.open_tunnel_count(&region);
+        if open_tunnels >= crate::state::MAX_CONCURRENT_TUNNELS {
             return Err(OpenTunnelErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(crate::state::tunnel_limit_message()),
+                    message: Some(crate::state::tunnel_limit_message(open_tunnels)),
                 },
             )
             .into());
@@ -246,6 +257,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             ));
         };
+
+        // The store keeps at most `MAX_RETAINED_TUNNELS` records across every
+        // Region — the Region a record belongs to comes from the request, so the
+        // bound is on the store and not on one Region's share of it — and this
+        // is the one site the store grows at, so the bound is applied here,
+        // under the same lock the insert below holds: the records closed longest
+        // ago are evicted to make room, and when every record is open, so
+        // nothing can be evicted, there is no room for this tunnel and the
+        // request is refused with the same modelled error rather than stored.
+        // An open tunnel is never evicted. Last of the refusals, so a request
+        // the checks above turn away reclaims nothing either.
+        if !store.make_room_for_tunnel() {
+            return Err(OpenTunnelErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::tunnel_record_limit_message()),
+                },
+            )
+            .into());
+        }
 
         // Two independently minted tokens: the source and destination proxies each
         // authenticate with their own.

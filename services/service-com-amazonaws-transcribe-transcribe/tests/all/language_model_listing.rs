@@ -292,25 +292,25 @@ async fn the_listing_is_every_stored_model_newest_first_paged_and_filtered() {
         "the three statuses together must cover every model, got {covered:?}"
     );
 
-    // Nothing this emulator records trains, so no model is ever `COMPLETED`: every
-    // record ends in the service's own modelled `FAILED` state once its transition
-    // falls due.
-    let completed = list(
+    // No object store is mounted beside Transcribe here, so nothing is known about the
+    // locations these rows name and nothing grounds a failure: every record settles in
+    // the status that makes a model usable once its transition falls due.
+    let failed = list(
         &transcribe,
-        json!({"StatusEquals": "COMPLETED", "MaxResults": 100}),
+        json!({"StatusEquals": "FAILED", "MaxResults": 100}),
     )
     .await;
     assert_eq!(
-        completed.ok("StatusEquals=COMPLETED")["Models"],
+        failed.ok("StatusEquals=FAILED")["Models"],
         json!([]),
-        "nothing trains a model here, so none is COMPLETED, got {:?}",
-        completed.body["Models"]
+        "nothing grounds a failure here, so no model is FAILED, got {:?}",
+        failed.body["Models"]
     );
 
     // The two filters compose, and so do a filter and a page.
     let composed = list(
         &transcribe,
-        json!({"NameContains": "ALPHA", "StatusEquals": "FAILED", "MaxResults": 2}),
+        json!({"NameContains": "ALPHA", "StatusEquals": "COMPLETED", "MaxResults": 2}),
     )
     .await;
     let body = composed.ok("NameContains and StatusEquals together, paged");

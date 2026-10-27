@@ -225,35 +225,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `nextToken` is this enumeration's resume point: the key of the first summary
-        // of the next page, hex-encoded so the token matches the modelled
-        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration is
-        // refused rather than answered with an empty page, which would report absence
-        // as success.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                summaries
-                    .iter()
-                    .position(|summary| page_key(summary) == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime validates
-        // BEFORE this handler runs, so a value that arrives here is already in range
-        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
-        // total. The default is the one AWS documents for this operation.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(summaries.len());
-
-        let next_token = summaries
-            .get(end)
-            .map(|summary| ::hex::encode(page_key(summary)));
+        // This enumeration's resume point is a summary's [`page_key`], and the page
+        // walk every paginated listing of this service shares takes it from there: it
+        // resumes at the token's summary, refusing a token whose resume point is not in
+        // this enumeration rather than answering an empty page, which would report
+        // absence as success; it cuts the page at `maxResults`, defaulting to the size
+        // AWS documents for this operation; and it mints the next token from the
+        // summary that follows the page.
+        let page = crate::state::page_of(
+            &summaries,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            page_key,
+        )
+        .ok_or_else(invalid_token)?;
 
         Ok(ListAssetPropertiesOutput {
-            asset_property_summaries: summaries[start..end].to_vec(),
-            next_token,
+            asset_property_summaries: summaries[page.start..page.end].to_vec(),
+            next_token: page.next_token,
         })
     }
 }
@@ -324,14 +314,6 @@ fn page_key(summary: &AssetPropertySummary) -> String {
             .unwrap_or_default(),
         summary.id
     )
-}
-
-/// Decode a `nextToken` back into the resume key it names.
-fn decode_token(token: &str) -> Result<String, ListAssetPropertiesError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
 }
 
 /// HTTP 500 `InternalFailureException`: this service's store is not reachable.

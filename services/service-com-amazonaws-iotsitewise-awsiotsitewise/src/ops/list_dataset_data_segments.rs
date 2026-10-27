@@ -207,36 +207,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same key a deletion addresses one by — so ordering on that key is total.
         segments.sort_by(|left, right| segment_key(left).cmp(&segment_key(right)));
 
-        // `nextToken` is this enumeration's resume point: the identity of the first
-        // segment of the next page, hex-encoded so the token matches the modelled
-        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration
-        // is refused rather than answered with an empty page.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                segments
-                    .iter()
-                    .position(|summary| resume_key(summary) == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime validates
-        // BEFORE this handler runs, so a value that arrives here is already in range
-        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic
-        // below total.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(segments.len());
-
-        // "The token for the next set of results, or null if there are no additional
-        // results": issued only when a segment follows this page.
-        let next_token = segments
-            .get(end)
-            .map(|summary| ::hex::encode(resume_key(summary).as_bytes()));
+        // This enumeration's resume point is a segment's identity, and the page walk
+        // every paginated listing of this service shares takes it from there: it
+        // resumes at the token's segment, refusing a token whose resume point is not
+        // in this enumeration rather than answering an empty page; it cuts the page at
+        // `maxResults`, defaulting to the size AWS documents for this operation; and it
+        // mints "the token for the next set of results, or null if there are no
+        // additional results" from the segment that follows the page.
+        let page = crate::state::page_of(
+            &segments,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            resume_key,
+        )
+        .ok_or_else(invalid_token)?;
 
         Ok(ListDatasetDataSegmentsOutput {
-            data_segments: segments[start..end].to_vec(),
-            next_token,
+            data_segments: segments[page.start..page.end].to_vec(),
+            next_token: page.next_token,
         })
     }
 }
@@ -301,14 +290,6 @@ fn segment_key(summary: &DataSegmentSummary) -> (&str, (i64, i32), (i64, i32)) {
 fn resume_key(summary: &DataSegmentSummary) -> String {
     let (time_series_id, start, end) = segment_key(summary);
     format!("{time_series_id}|{}.{}|{}.{}", start.0, start.1, end.0, end.1)
-}
-
-/// Decode a `nextToken` back into the segment identity it resumes from.
-fn decode_token(token: &str) -> Result<String, ListDatasetDataSegmentsError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.

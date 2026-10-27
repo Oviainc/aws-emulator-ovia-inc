@@ -22,7 +22,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::dashboard_lifecycle::{call, error_code, graph_config, ok_call, router};
+use super::dashboard_lifecycle::{
+    call, error_code, graph_config, ok_call, router, with_managed_catalog,
+};
 
 /// The names this suite spans. Rows differ in length (both published bounds of
 /// `DashboardName`, 2..50), in which of the admitted character classes they use (letters,
@@ -61,10 +63,12 @@ async fn create(router: &MultiServiceRouter, request: &Value) -> String {
         .to_string()
 }
 
-/// Every ARN `ListDashboards` reports, paired with the name it carries.
+/// Every ARN `ListDashboards` reports, paired with the name it carries, sorted — so a row
+/// states the account's dashboards as a set, beside the AWS-managed catalog every account
+/// already holds ([`with_managed_catalog`]).
 async fn listed(router: &MultiServiceRouter) -> Vec<(String, String)> {
     let page = ok_call(router, "ListDashboards", &json!({"maxResults": 100})).await;
-    page["dashboards"]
+    let mut listed: Vec<(String, String)> = page["dashboards"]
         .as_array()
         .unwrap_or_else(|| panic!("ListDashboards must answer a list: {page}"))
         .iter()
@@ -74,7 +78,9 @@ async fn listed(router: &MultiServiceRouter) -> Vec<(String, String)> {
                 item["name"].as_str().unwrap_or("<none>").to_string(),
             )
         })
-        .collect()
+        .collect();
+    listed.sort();
+    listed
 }
 
 /// A create naming a dashboard the account already holds is refused with
@@ -115,11 +121,12 @@ async fn a_create_under_a_stored_name_is_refused() {
             "case {label}: the refusal must name the member and the value it refused, got {message:?}"
         );
 
-        // Nothing was stored: one dashboard, the first one, unchanged.
+        // Nothing was stored: the account's one dashboard, the first one, unchanged —
+        // beside the AWS-managed catalog a fresh account already holds.
         let stored = listed(&router).await;
         assert_eq!(
             stored,
-            vec![(first.clone(), name.clone())],
+            with_managed_catalog([(first.clone(), name.clone())]),
             "case {label}: the refused create must have stored nothing, got {stored:?}"
         );
         let fetched = ok_call(&router, "GetDashboard", &json!({"arn": first})).await;
@@ -158,11 +165,10 @@ async fn names_that_differ_are_each_accepted_once() {
         minted.push((arn, name));
     }
 
-    let mut stored = listed(&router).await;
-    stored.sort();
-    minted.sort();
+    let stored = listed(&router).await;
     assert_eq!(
-        stored, minted,
+        stored,
+        with_managed_catalog(minted),
         "every distinct name must be stored exactly once, got {stored:?}"
     );
 }
@@ -190,7 +196,7 @@ async fn a_name_a_delete_freed_can_be_taken_again() {
         let stored = listed(&router).await;
         assert_eq!(
             stored,
-            vec![(second, name.clone())],
+            with_managed_catalog([(second, name.clone())]),
             "case {label}: the account must hold exactly the re-created dashboard, got {stored:?}"
         );
     }
@@ -373,13 +379,11 @@ async fn a_refused_rename_leaves_the_whole_record_untouched() {
         );
 
         // And the account still holds exactly the two dashboards, each under its own name.
-        let mut stored = listed(&router).await;
-        stored.sort();
-        let mut expected = vec![
+        let stored = listed(&router).await;
+        let expected = with_managed_catalog([
             (holder, held_name.clone()),
             (subject, "Subject Dashboard".to_string()),
-        ];
-        expected.sort();
+        ]);
         assert_eq!(
             stored, expected,
             "case {label}: the account must still hold one dashboard per name, got {stored:?}"

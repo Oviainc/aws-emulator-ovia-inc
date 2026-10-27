@@ -30,7 +30,9 @@
 use serde_json::json;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::dashboard_lifecycle::{call, error_code, graph_config, ok_call, router};
+use super::dashboard_lifecycle::{
+    arns_with_managed_catalog, call, error_code, graph_config, ok_call, router,
+};
 
 /// The fixed part of every `DashboardArn`: `arn:aws` + the (here empty) partition suffix,
 /// the service, the empty region segment, the 12-digit account id and the resource type.
@@ -146,15 +148,15 @@ async fn deleting_an_absent_dashboard_is_an_idempotent_no_op() {
 
         // The no-op changed nothing a later caller can see.
         let listed = ok_call(&router, "ListDashboards", &json!({})).await;
-        let remaining: Vec<&str> = listed["dashboards"]
+        let remaining: Vec<String> = listed["dashboards"]
             .as_array()
             .expect("dashboards")
             .iter()
-            .map(|item| item["arn"].as_str().unwrap_or("<none>"))
+            .map(|item| item["arn"].as_str().unwrap_or("<none>").to_string())
             .collect();
         assert_eq!(
             remaining,
-            vec![survivor.as_str()],
+            arns_with_managed_catalog([survivor.clone()]),
             "case {}: the no-op must leave the stored dashboards untouched: {listed}",
             case.label
         );
@@ -206,15 +208,15 @@ async fn repeating_a_delete_answers_the_same_200() {
         }
 
         let listed = ok_call(&router, "ListDashboards", &json!({})).await;
-        let remaining: Vec<&str> = listed["dashboards"]
+        let remaining: Vec<String> = listed["dashboards"]
             .as_array()
             .expect("dashboards")
             .iter()
-            .map(|item| item["arn"].as_str().unwrap_or("<none>"))
+            .map(|item| item["arn"].as_str().unwrap_or("<none>").to_string())
             .collect();
         assert_eq!(
             remaining,
-            vec![survivor.as_str()],
+            arns_with_managed_catalog([survivor.clone()]),
             "case {repeats} repeats: only the surviving dashboard must be listed: {listed}"
         );
     }

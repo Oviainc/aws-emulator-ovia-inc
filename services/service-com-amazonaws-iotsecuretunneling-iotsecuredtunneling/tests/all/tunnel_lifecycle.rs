@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iotsecuretunneling_iotsecuredtunneling::state::{
-    StoredTunnel, MAX_TAGS_PER_TUNNEL, MAX_TUNNELS,
+    StoredTunnel, MAX_CONCURRENT_TUNNELS, MAX_TAGS_PER_TUNNEL,
 };
 use service_com_amazonaws_iotsecuretunneling_iotsecuredtunneling::{
     ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState as TunnelState, EmulatedService,
@@ -1083,12 +1083,12 @@ async fn a_tunnel_closes_once_its_max_lifetime_has_elapsed() {
 }
 
 #[tokio::test]
-async fn open_tunnel_refuses_once_the_store_holds_its_limit_of_tunnels() {
+async fn open_tunnel_refuses_once_the_account_holds_its_quota_of_open_tunnels() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = mount(&engine);
 
-    // One real tunnel, then the store filled to its documented record limit with
-    // copies of it, so the refusal below is about the record COUNT and nothing else.
+    // One real tunnel, then the account filled to its concurrency quota with OPEN
+    // copies of it, so the refusal below is about the OPEN count and nothing else.
     let (status, opened) = call(
         &router,
         "OpenTunnel",
@@ -1106,7 +1106,7 @@ async fn open_tunnel_refuses_once_the_store_holds_its_limit_of_tunnels() {
             .cloned()
             .expect("the opened tunnel was not persisted");
         let mut filler = 0_usize;
-        while store.tunnels.len() < MAX_TUNNELS {
+        while store.open_tunnel_count(REGION) < MAX_CONCURRENT_TUNNELS {
             let tunnel_id = format!("filler-{filler}");
             let tunnel_arn = format!("arn:aws:iot:{REGION}:{ACCOUNT}:tunnel/{tunnel_id}");
             let mut tunnel = seed.clone();
@@ -1118,6 +1118,7 @@ async fn open_tunnel_refuses_once_the_store_holds_its_limit_of_tunnels() {
     }
 
     // The limit is the modelled LimitExceededException, HTTP 403.
+    let stored_before = engine.state::<TunnelState>().lock().tunnels.len();
     let (status, refused) = call(
         &router,
         "OpenTunnel",
@@ -1126,12 +1127,12 @@ async fn open_tunnel_refuses_once_the_store_holds_its_limit_of_tunnels() {
     .await;
     assert_eq!(
         status, 403,
-        "a full store must refuse OpenTunnel, answered {status} {refused:?}"
+        "an account at its open-tunnel quota must refuse OpenTunnel, answered {status} {refused:?}"
     );
     assert_eq!(
         refused["__type"].as_str(),
         Some("LimitExceededException"),
-        "a full store answered {refused:?}"
+        "an account at its open-tunnel quota answered {refused:?}"
     );
     for field in ["tunnelId", "sourceAccessToken", "destinationAccessToken"] {
         assert!(
@@ -1142,19 +1143,21 @@ async fn open_tunnel_refuses_once_the_store_holds_its_limit_of_tunnels() {
     }
     assert_eq!(
         engine.state::<TunnelState>().lock().tunnels.len(),
-        MAX_TUNNELS,
+        stored_before,
         "a refused open must not store a record"
     );
 
-    // Deleting a tunnel makes room again, so the limit is a live count and not a
-    // one-way latch.
-    let (status, closed) = call(
-        &router,
-        "CloseTunnel",
-        &json!({"tunnelId": seed_id, "delete": true}),
-    )
-    .await;
+    // A plain close — `delete` absent, so the record stays describable — frees a
+    // slot, because the quota counts tunnels that are concurrently OPEN.
+    let (status, closed) = call(&router, "CloseTunnel", &json!({"tunnelId": seed_id})).await;
     assert_eq!(status, 200, "CloseTunnel answered {closed:?}");
+    let (status, described) = call(&router, "DescribeTunnel", &json!({"tunnelId": seed_id})).await;
+    assert_eq!(status, 200, "DescribeTunnel answered {described:?}");
+    assert_eq!(
+        described["tunnel"]["status"].as_str(),
+        Some("CLOSED"),
+        "the closed record must stay readable, answered {described:?}"
+    );
     let (status, reopened) = call(
         &router,
         "OpenTunnel",
@@ -1163,7 +1166,7 @@ async fn open_tunnel_refuses_once_the_store_holds_its_limit_of_tunnels() {
     .await;
     assert_eq!(
         status, 200,
-        "an open must succeed once a record was released, answered {reopened:?}"
+        "an open must succeed once a slot was released, answered {reopened:?}"
     );
     assert!(
         reopened["tunnelId"].as_str().is_some(),

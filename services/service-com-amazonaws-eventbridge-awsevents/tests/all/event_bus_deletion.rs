@@ -119,7 +119,7 @@ fn stored_buses(emulator: &Emulator) -> Vec<String> {
         .lock()
         .buses
         .keys()
-        .cloned()
+        .map(|key| key.name.clone())
         .collect()
 }
 

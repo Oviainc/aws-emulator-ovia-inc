@@ -313,39 +313,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.job_id.cmp(&right.job_id))
         });
 
-        // `nextToken` is this enumeration's resume point: the id of the first job of
-        // the next page, hex-encoded so the token stays opaque to the caller and
-        // keeps the form the member models. A token whose resume point is not in this
-        // enumeration is refused rather than answered with an empty page.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                selected
-                    .iter()
-                    .position(|record| record.job_id == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
+        // This enumeration's resume point is a job's `jobId`, and the page walk every
+        // paginated listing of this service shares takes it from there: it resumes at
+        // the token's job, refusing a token whose resume point is not in this
+        // enumeration rather than answering an empty page; it cuts the page at
         // "Maximum number of jobs to return per page. Defaults to 50 if not
-        // specified." `maxResults` carries the modelled range 1..250, which the
-        // runtime validates BEFORE this handler runs, so a value that arrives here is
-        // already in range and nothing is being coerced; `max(1)` only keeps the
-        // slice arithmetic below total.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(selected.len());
-        let next_token = selected
-            .get(end)
-            .map(|record| ::hex::encode(record.job_id.as_bytes()));
+        // specified."; and it mints the next token off the job that follows the page.
+        let page = crate::state::page_of(
+            &selected,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |record| record.job_id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
 
         // `get` rather than a slice index: the bounds above are derived from the
         // request, so the page is taken in a form that cannot panic whatever they
         // resolve to.
-        let page = selected.get(start..end).unwrap_or_default();
+        let jobs = selected.get(page.start..page.end).unwrap_or_default();
 
         Ok(ListEnrichmentJobsOutput {
-            jobs: page.iter().map(|record| record.summary(now)).collect(),
-            next_token,
+            jobs: jobs.iter().map(|record| record.summary(now)).collect(),
+            next_token: page.next_token,
         })
     }
 }
@@ -358,14 +348,6 @@ const DEFAULT_MAX_RESULTS: i32 = 50;
 /// instant and a modelled `Timestamp` bound compare at one precision.
 fn created_nanos(record: &crate::state::EnrichmentJobRecord) -> i128 {
     crate::state::date_time_nanos(&crate::state::to_date_time(record.created_at))
-}
-
-/// Decode a `nextToken` back into the `jobId` it resumes from.
-fn decode_token(token: &str) -> Result<String, ListEnrichmentJobsError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never

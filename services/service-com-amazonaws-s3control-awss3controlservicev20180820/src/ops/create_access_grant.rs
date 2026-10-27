@@ -228,9 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &input.access_grants_location_id,
         ) else {
-            return Err(crate::state::no_such_access_grants_location(
-                &input.access_grants_location_id,
-            ));
+            return Err(crate::state::no_such_access_grants_location());
         };
         let location_scope = location.location_scope.clone();
 

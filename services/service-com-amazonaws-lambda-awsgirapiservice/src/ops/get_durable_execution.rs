@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDurableExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDurableExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDurableExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the ONE durable execution its `DurableExecutionArn` names, out of the
+//! function's own durable-execution state in [`crate::state`] — the state `Invoke`
+//! registers an execution in — so every member comes from the stored record: the ARN it
+//! is addressed by, its name, the function version it runs under, its status and the
+//! instants it started and (once it has one) ended, the input payload the call that
+//! started it carried, and the function's `DurableConfig`.
+//!
+//! `Result` and `Error` are withheld: a result is reported "only when the execution status
+//! is SUCCEEDED" and an error only for an execution that ended in one, and this emulator
+//! has no in-process runtime that can run a deployment package, so no execution here has
+//! produced either. Nothing is invented for work nothing ran.
 //!
 //! ## Shape of an operation
 //!
@@ -203,18 +206,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDurableExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDurableExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDurableExecution"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDurableExecutionErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The execution is addressed by the ARN `Invoke` answered, which carries the
+        // function, the version and the execution's name and id; resolving it is also what
+        // brings the record up to whatever the clock already made due, so an execution
+        // whose `ExecutionTimeout` has fallen due reports the status that timeout owed.
+        let (record, name) = crate::state::resolve_durable_execution(
+            &mut store,
+            &input.durable_execution_arn,
+            &region,
+            now,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                GetDurableExecutionErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                GetDurableExecutionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+        let record = &*record;
+        let Some(execution) = record.durable_executions.get(&name) else {
+            return Err(GetDurableExecutionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(crate::state::durable_execution_not_found_message(
+                        &input.durable_execution_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Specifies whether to include execution data such as input payload, result, and
+        // error information in the response. Set to false for a more compact response that
+        // includes only execution metadata." The member carries the documented default of
+        // `true`, so a request that names it not at all asks for the data.
+        let include_execution_data = input.include_execution_data;
+        Ok(GetDurableExecutionOutput {
+            durable_execution_arn: record.durable_execution_arn(execution),
+            durable_execution_name: execution.name.clone(),
+            function_arn: record.versioned_arn(&execution.version),
+            // "The JSON input payload that was provided when the durable execution was
+            // started": the payload the start stored, reported only as text it really is.
+            input_payload: include_execution_data
+                .then(|| String::from_utf8(execution.input_payload.clone()).ok())
+                .flatten()
+                .filter(|payload| !payload.is_empty()),
+            // "The JSON result returned by the durable execution if it completed
+            // successfully" and the error of one that did not: no in-process runtime here
+            // ran the function's deployment package, so there is neither a result nor an
+            // error to report, and none is invented.
+            result: None,
+            error: None,
+            start_timestamp: ::aws_smithy_types::DateTime::from(execution.started),
+            status: execution.status.clone(),
+            end_timestamp: execution.ended.map(::aws_smithy_types::DateTime::from),
+            // "The version of the Lambda function that was invoked for this durable
+            // execution", which the execution runs under for its whole life.
+            version: Some(execution.version.clone()),
+            // "The trace headers associated with the durable execution": this emulator
+            // traces nothing, so there is no header to report.
+            trace_header: None,
+            execution_data_included: Some(include_execution_data),
+            durable_config: record
+                .config_of(&execution.version)
+                .and_then(|config| config.durable_config.clone()),
+        })
     }
 }

@@ -5,7 +5,7 @@
 //! Reports the access grant `CreateAccessGrant` recorded under this id, in the
 //! account's S3 Access Grants instance in the Region the request was signed for
 //! — its grantee, permission, registered location, location configuration and
-//! the grant scope the two produced. Refuses with `AccessGrantNotExistsError`
+//! the grant scope the two produced. Refuses with `NoSuchAccessGrantError`
 //! when that instance has no such grant. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(record) = store.access_grant(&input.account_id, &region, &input.access_grant_id)
         else {
-            return Err(crate::state::no_such_access_grant(&input.access_grant_id));
+            return Err(crate::state::no_such_access_grant());
         };
 
         Ok(GetAccessGrantOutput {

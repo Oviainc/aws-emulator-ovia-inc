@@ -134,7 +134,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         let resume_after = match input.next_token.as_deref() {
             None => None,
@@ -154,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A rule belongs to a bus, so a bus that does not exist is a missing
         // resource rather than a filter that matches nothing — which is why
         // this operation declares ResourceNotFoundException.
-        let Some(bus) = store.bus(&bus_name) else {
+        let Some(bus) = store.bus(&region, &bus_name) else {
             return Err(ListRulesErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_event_bus(&bus_name)),

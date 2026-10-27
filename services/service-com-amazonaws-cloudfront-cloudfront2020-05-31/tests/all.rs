@@ -47,6 +47,8 @@ mod connection_group_update;
 mod connection_groups;
 #[path = "all/continuous_deployment_policies.rs"]
 mod continuous_deployment_policies;
+#[path = "all/continuous_deployment_policy_delete.rs"]
+mod continuous_deployment_policy_delete;
 #[path = "all/create_location_header.rs"]
 mod create_location_header;
 #[path = "all/distribution_config_defaults.rs"]
@@ -61,6 +63,8 @@ mod distribution_delete_gate;
 mod distribution_lifecycle;
 #[path = "all/distribution_tags.rs"]
 mod distribution_tags;
+#[path = "all/distribution_tenant_delete.rs"]
+mod distribution_tenant_delete;
 #[path = "all/distribution_tenant_filter_matches_nothing.rs"]
 mod distribution_tenant_filter_matches_nothing;
 #[path = "all/distribution_tenant_lifecycle.rs"]
@@ -169,6 +173,8 @@ mod origin_request_policy_list;
 mod origin_request_policy_update;
 #[path = "all/public_key_lifecycle.rs"]
 mod public_key_lifecycle;
+#[path = "all/public_key_update.rs"]
+mod public_key_update;
 #[path = "all/realtime_log_config_lifecycle.rs"]
 mod realtime_log_config_lifecycle;
 #[path = "all/realtime_log_config_list.rs"]
@@ -197,6 +203,8 @@ mod tagging_resource_types;
 mod tenant_distribution_and_method_order;
 #[path = "all/tenant_domain_admission.rs"]
 mod tenant_domain_admission;
+#[path = "all/tenant_domain_certificate_gate.rs"]
+mod tenant_domain_certificate_gate;
 #[path = "all/tenant_invalidations.rs"]
 mod tenant_invalidations;
 #[path = "all/tenant_web_acl_association.rs"]

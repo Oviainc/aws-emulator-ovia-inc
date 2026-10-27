@@ -208,38 +208,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // `nextToken` is this enumeration's resume point: the key of the first
-        // summary of the next page, hex-encoded so the token matches the modelled
-        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration
-        // is refused rather than answered with an empty page.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                summaries
-                    .iter()
-                    .position(|(key, _)| *key == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime validates
-        // BEFORE this handler runs, so a value that arrives here is already in range
-        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
-        // total.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(summaries.len());
+        // This enumeration's resume point is a summary's binding key, and the page
+        // walk every paginated listing of this service shares takes it from there: it
+        // resumes at the token's summary, refusing a token whose resume point is not in
+        // this enumeration rather than answering an empty page; it cuts the page at
+        // `maxResults`, defaulting to this service's page size; and it mints "the token
+        // for the next set of paginated results, or null if there are no additional
+        // results" off the summary that follows the page, so a page that leaves nothing
+        // to resume from reports no token at all.
+        let page = crate::state::page_of(
+            &summaries,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |(key, _)| key.clone(),
+        )
+        .ok_or_else(invalid_token)?;
 
         Ok(ListComputationModelDataBindingUsagesOutput {
-            data_binding_usage_summaries: summaries[start..end]
+            data_binding_usage_summaries: summaries[page.start..page.end]
                 .iter()
                 .map(|(_, summary)| summary.clone())
                 .collect(),
-            // "The token for the next set of paginated results, or null if there are
-            // no additional results": a page that leaves nothing to resume from
-            // reports no token at all.
-            next_token: summaries
-                .get(end)
-                .map(|(key, _)| ::hex::encode(key.as_bytes())),
+            next_token: page.next_token,
         })
     }
 }
@@ -418,14 +409,6 @@ fn binding_key(value: &DataBindingValue) -> String {
         // [`collect_matched_leaves`].
         (None, None) => String::new(),
     }
-}
-
-/// Decode a `nextToken` back into the [`binding_key`] it resumes from.
-fn decode_token(token: &str) -> Result<String, ListComputationModelDataBindingUsagesError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never

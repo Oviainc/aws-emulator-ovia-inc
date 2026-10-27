@@ -235,7 +235,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // selects. Only the pattern changes — the rule's ARN was minted when the
         // archive was created and is not re-minted here.
         let rule_name = crate::state::archive_rule_name(&updated.name);
-        if let Some(rule) = store.rule_mut(&updated.event_bus_name, &rule_name) {
+        // The bus that rule sits on is the one in the archive's OWN Region, which
+        // its ARN carries ([`crate::state::archive_arn`]).
+        let bus_region =
+            crate::state::arn_region(&updated.arn).unwrap_or(crate::state::FALLBACK_REGION);
+        if let Some(rule) = store.rule_mut(bus_region, &updated.event_bus_name, &rule_name) {
             if rule.managed_by.is_some() {
                 rule.event_pattern = Some(crate::state::archive_rule_pattern(
                     updated.event_pattern.as_deref(),

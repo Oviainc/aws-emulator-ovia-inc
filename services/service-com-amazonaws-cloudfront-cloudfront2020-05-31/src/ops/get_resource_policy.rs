@@ -8,9 +8,13 @@
 //! caller sees is exactly what it would have seen had this call never happened.
 //!
 //! The surface attaches policies to ONE resource type
-//! ([`crate::state::RESOURCE_POLICY_RESOURCE_TYPE`]), so an ARN naming anything else — a
-//! string that is no ARN, an ARN of another service, an ARN of another CloudFront resource
-//! type — is a bad PARAMETER, refused 400 `InvalidArgument` before any policy is looked up.
+//! ([`crate::state::RESOURCE_POLICY_RESOURCE_TYPE`]), so a `ResourceArn` naming anything
+//! else is a bad PARAMETER, refused 400 `InvalidArgument` before any policy is looked up
+//! ([`crate::state::resource_policy_arn_refusal`]): a value that is no ARN at all is
+//! refused on its form, and an ARN of another service or of another CloudFront resource
+//! type on the resource type it names — which this READ words as the demand for a usable
+//! ARN that CloudFront answers it with
+//! ([`crate::state::INVALID_RESOURCE_POLICY_ARN_MESSAGE`]).
 //! An ARN the surface does accept, carrying no policy, is 404 `EntityNotFound`.
 //!
 //! ## Shape of an operation
@@ -152,13 +156,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        // The PARAMETER gate, decided before any lookup: the surface attaches policies to
-        // one resource type, so an ARN naming any other resource is refused whether or not
-        // a policy is attached to anything.
-        if crate::state::resource_policy_resource(&input.resource_arn).is_none() {
-            return Err(GetResourcePolicyErrorModeled::InvalidArgument(
-                crate::state::invalid_resource_policy_resource_type(),
-            )
+        // The PARAMETER gate, decided before any lookup: a value that is no ARN at all is
+        // refused on its form and an ARN naming any other resource on the type it names,
+        // each with the sentence this operation words that condition in, whether or not a
+        // policy is attached to anything.
+        if let Some(refusal) = crate::state::resource_policy_arn_refusal(&input.resource_arn) {
+            return Err(GetResourcePolicyErrorModeled::InvalidArgument(match refusal {
+                crate::state::ResourceArnRefusal::Malformed => crate::state::malformed_arn(),
+                crate::state::ResourceArnRefusal::WrongType => {
+                    crate::state::invalid_resource_policy_arn()
+                }
+            })
             .into());
         }
 

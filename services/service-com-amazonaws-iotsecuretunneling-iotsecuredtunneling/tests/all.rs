@@ -25,6 +25,8 @@ mod rotate_refusal_error_contract;
 mod state_roundtrip;
 #[path = "all/tag_key_count.rs"]
 mod tag_key_count;
+#[path = "all/tunnel_concurrency_quota.rs"]
+mod tunnel_concurrency_quota;
 #[path = "all/tunnel_lifecycle.rs"]
 mod tunnel_lifecycle;
 #[path = "all/tunnel_refusal_rules.rs"]

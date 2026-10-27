@@ -211,38 +211,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cursor = parent;
         }
 
-        // `nextToken` is this enumeration's resume point: the child asset id of the
-        // first relationship of the next page, hex-encoded so the token matches the
-        // modelled `^[A-Za-z0-9+/=]+$`. An asset has at most one parent, so a child id
-        // names exactly one edge of this path. A token whose resume point is not on
-        // this path is refused rather than answered with an empty page, which would
-        // report absence as success.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                relationships
-                    .iter()
-                    .position(|summary| child_asset_id(summary) == Some(resume.as_str()))
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime validates
-        // BEFORE this handler runs, so a value that arrives here is already in range
-        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
-        // total. The default is the one AWS documents for this operation.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(relationships.len());
+        // This enumeration's resume point is a relationship's child asset id, and the
+        // page walk every paginated listing of this service shares takes it from there:
+        // an asset has at most one parent, so a child id names exactly one edge of this
+        // path. It resumes at the token's edge, refusing a token whose resume point is
+        // not on this path rather than answering an empty page, which would report
+        // absence as success; it cuts the page at `maxResults`, defaulting to the size
+        // AWS documents for this operation; and it mints the next token from the edge
+        // that follows the page.
+        let page = crate::state::page_of(
+            &relationships,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |summary| child_asset_id(summary).unwrap_or_default().to_string(),
+        )
+        .ok_or_else(invalid_token)?;
 
-        let next_token = relationships
-            .get(end)
-            .and_then(child_asset_id)
-            .map(|child| ::hex::encode(child.as_bytes()));
-        let asset_relationship_summaries = relationships[start..end].to_vec();
+        let asset_relationship_summaries = relationships[page.start..page.end].to_vec();
 
         Ok(ListAssetRelationshipsOutput {
             asset_relationship_summaries,
-            next_token,
+            next_token: page.next_token,
         })
     }
 }
@@ -270,20 +260,12 @@ const _: () = assert!(ASSET_RELATIONSHIP_TYPE_VALUES.len() == 1);
 const DEFAULT_MAX_RESULTS: i32 = 50;
 
 /// The child asset of a relationship this operation built, which is the key its
-/// `nextToken` resumes from.
+/// `nextToken` resumes from. Every summary this handler builds carries one.
 fn child_asset_id(summary: &AssetRelationshipSummary) -> Option<&str> {
     summary
         .hierarchy_info
         .as_ref()
         .and_then(|info| info.child_asset_id.as_deref())
-}
-
-/// Decode a `nextToken` back into the child asset id it resumes from.
-fn decode_token(token: &str) -> Result<String, ListAssetRelationshipsError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.

@@ -141,7 +141,7 @@ fn stored_buses(emulator: &Emulator) -> Vec<String> {
         .lock()
         .buses
         .keys()
-        .cloned()
+        .map(|key| key.name.clone())
         .collect()
 }
 
@@ -547,9 +547,9 @@ async fn a_request_no_bus_can_be_built_from_is_refused() {
 #[tokio::test]
 async fn the_account_bus_quota_is_enforced() {
     let emulator = emulator();
-    // The store comes up holding the account's `default` bus, so that many more
-    // creates reach the quota exactly.
-    let room = MAX_EVENT_BUSES - stored_buses(&emulator).len();
+    // Every Region holds the account's `default` bus, which counts toward the
+    // quota, so that many more creates reach it exactly.
+    let room = MAX_EVENT_BUSES - 1;
     for index in 0..room {
         let request = json!({ "Name": format!("bus-{index}") });
         let (status, body) = call(&emulator, "CreateEventBus", &request).await;

@@ -45,16 +45,20 @@ const CONFLICT: (u16, &str) = (409, "ConflictException");
 
 /// One custom domain name record, as a request addresses it: its name and the
 /// `domainNameId` a private record is told apart by (`None` for a record that has none).
+///
+/// `pub(crate)` with the creates and calls below, because the `delete_base_path_mapping`
+/// suite addresses a mapping's record by the very same pair rather than spelling the pair
+/// a second way.
 #[derive(Clone, Debug)]
-struct DomainRef {
-    name: String,
-    id: Option<String>,
+pub(crate) struct DomainRef {
+    pub(crate) name: String,
+    pub(crate) id: Option<String>,
 }
 
 impl DomainRef {
     /// The `domainNameId` query string this record is addressed by, empty for a record
     /// addressed by its name alone.
-    fn query(&self) -> String {
+    pub(crate) fn query(&self) -> String {
         match &self.id {
             Some(id) => format!("?domainNameId={id}"),
             None => String::new(),
@@ -63,7 +67,7 @@ impl DomainRef {
 }
 
 /// `CreateBasePathMapping` under the domain name `domain` addresses, with `body` as given.
-async fn create_mapping(gateway: &Gateway, domain: &DomainRef, body: Value) -> Answer {
+pub(crate) async fn create_mapping(gateway: &Gateway, domain: &DomainRef, body: Value) -> Answer {
     let uri = format!(
         "/domainnames/{}/basepathmappings{}",
         domain.name,
@@ -73,7 +77,7 @@ async fn create_mapping(gateway: &Gateway, domain: &DomainRef, body: Value) -> A
 }
 
 /// `GetBasePathMapping` for `base_path` of the domain name `domain` addresses.
-async fn get_mapping(gateway: &Gateway, domain: &DomainRef, base_path: &str) -> Answer {
+pub(crate) async fn get_mapping(gateway: &Gateway, domain: &DomainRef, base_path: &str) -> Answer {
     let uri = format!(
         "/domainnames/{}/basepathmappings/{base_path}{}",
         domain.name,
@@ -95,7 +99,7 @@ fn assert_refusal(answer: &Answer, expected: (u16, &str), message: &str, case: &
 
 /// The `basePath`, `restApiId` and `stage` a body reports, with an absent member as
 /// `None`.
-fn mapping_of(body: &Value, case: &str) -> (String, String, Option<String>) {
+pub(crate) fn mapping_of(body: &Value, case: &str) -> (String, String, Option<String>) {
     (
         string_member(body, "basePath", case),
         string_member(body, "restApiId", case),
@@ -106,7 +110,11 @@ fn mapping_of(body: &Value, case: &str) -> (String, String, Option<String>) {
 /// A PRIVATE custom domain name called `name`, answering the record's identifier pair. A
 /// `domainNameId` is supported only for a private record, and AWS lets several private
 /// records carry one name, so this is the create the identifier pair is observable through.
-async fn created_private_domain(gateway: &Gateway, name: &str, case: &str) -> DomainRef {
+pub(crate) async fn created_private_domain(
+    gateway: &Gateway,
+    name: &str,
+    case: &str,
+) -> DomainRef {
     let created = created_domain(
         gateway,
         name,
@@ -121,7 +129,7 @@ async fn created_private_domain(gateway: &Gateway, name: &str, case: &str) -> Do
 
 /// A REGIONAL custom domain name called `name`: a record addressed by its name alone,
 /// because only a private one carries a `domainNameId`.
-async fn created_regional_domain(gateway: &Gateway, name: &str) -> DomainRef {
+pub(crate) async fn created_regional_domain(gateway: &Gateway, name: &str) -> DomainRef {
     let created = created_domain(
         gateway,
         name,
@@ -141,7 +149,7 @@ async fn created_regional_domain(gateway: &Gateway, name: &str) -> DomainRef {
 
 /// An API with one deployed stage, answering `(restApiId, stageName)` — what a mapping
 /// points at.
-async fn deployed_api(gateway: &Gateway, name: &str, stage: &str) -> (String, String) {
+pub(crate) async fn deployed_api(gateway: &Gateway, name: &str, stage: &str) -> (String, String) {
     let (api, _root) = create_api(gateway, name).await;
     create_deployed_stage(gateway, &api, stage).await;
     (api, stage.to_string())

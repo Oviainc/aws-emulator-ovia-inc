@@ -21,18 +21,42 @@
 //! service reaches another: over the in-process callback, so nothing is dialled and this
 //! crate names no other service crate.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
+use ::aws_smithy_schema_server::{envelope, Violation, ViolationKind};
+
 use crate::ops::types::{
-    DashboardReference, DateTimeRange, HealthStatus, ResourceTag, ScheduleConfig, ScheduledReport,
-    ScheduledReportInput, ScheduledReportSummary, Widget,
+    CostAndUsageQuery, DashboardReference, DateTimeRange, DateTimeValue, DisplayConfig,
+    GraphDisplayConfig, GroupDefinition, HealthStatus, QueryParameters, ReservationUtilizationQuery,
+    ResourceTag, SavingsPlansCoverageQuery, ScheduleConfig, ScheduledReport, ScheduledReportInput,
+    ScheduledReportSummary, TableDisplayConfigStruct, Widget, WidgetConfig,
 };
 
 /// The only `DashboardType` the model declares (`DASHBOARD_TYPE_VALUES`), and the
 /// type every dashboard a client creates through this API carries.
 pub const DASHBOARD_TYPE_CUSTOM: &str = "CUSTOM";
+
+/// The `DashboardType` the dashboards Amazon Web Services publishes itself carry.
+///
+/// The model's `DashboardType` enum lists `CUSTOM` alone
+/// (`smithy_query(query="shape",shape="DashboardType")`), while every reference in the
+/// AWS-managed catalog this service answers a brand-new account with carries
+/// `AWS_MANAGED`. A dashboard's `type` travels as a string on the wire, so the value is
+/// representable: it is stored on the record and projected like any other, rather than
+/// derived per request.
+pub const DASHBOARD_TYPE_AWS_MANAGED: &str = "AWS_MANAGED";
+
+/// The `policyDocument` a dashboard with no resource-based policy attached reads back:
+/// the empty JSON document.
+///
+/// `GetResourcePolicy$policyDocument` is @required and reports a policy DOCUMENT, which
+/// a caller feeds straight to a JSON parser — so "no policy" is the document that holds
+/// no statement, which parses to an empty policy. The empty STRING is not a JSON document
+/// at all and fails that parse, even though `GenericString`'s modelled length (0..1024)
+/// would admit it.
+pub const EMPTY_RESOURCE_POLICY_DOCUMENT: &str = "{}";
 
 /// The `ScheduleState` (`SCHEDULE_STATE_VALUES`) a schedule carries when the request
 /// left `scheduleConfig.state` unset: a report whose state nobody chose runs on its
@@ -156,10 +180,10 @@ pub struct Dashboard {
     ///
     /// This service's model declares no operation that attaches a policy (there is
     /// no `PutResourcePolicy` among its 15 operations), so a dashboard created
-    /// through this API keeps `None` and reads back the empty document the modelled
-    /// `policyDocument` length (0..1024) admits. The field is the single place a
-    /// policy would live once an operation can write one, so the reader needs no
-    /// second map beside the dashboards.
+    /// through this API keeps `None` and reads back
+    /// [`EMPTY_RESOURCE_POLICY_DOCUMENT`]. The field is the single place a policy
+    /// would live once an operation can write one, so the reader needs no second map
+    /// beside the dashboards.
     pub resource_policy: Option<String>,
 }
 
@@ -176,6 +200,289 @@ impl Dashboard {
             updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
         }
     }
+}
+
+/// The resource-id prefix of every AWS-managed dashboard's ARN, which is what tells one
+/// apart from a dashboard a caller created: the catalog's ARNs are
+/// `arn:aws:bcm-dashboards::<account>:dashboard/managed-<32 hex>`, while
+/// [`ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::mint_dashboard_arn`] mints a
+/// bare 32-hex resource id. Both spellings satisfy `DashboardArn`'s `[-a-z0-9]+` resource
+/// segment.
+const MANAGED_DASHBOARD_ID_PREFIX: &str = "managed-";
+
+/// When the AWS-managed catalog this service seeds was published, and when it was last
+/// revised, as seconds since the Unix epoch.
+///
+/// The catalog is Amazon Web Services' own data, not the account's: its dashboards exist
+/// before a caller writes anything, so their `createdAt`/`updatedAt` are the instants AWS
+/// published and last revised the catalog rather than anything this emulator's clock
+/// produced — which is why they are stored constants and are stable across reads and
+/// across restarts. A dashboard a CALLER creates is stamped from the clock
+/// (`CreateDashboard`), as its own record's instants.
+const MANAGED_CATALOG_CREATED_AT: u64 = 1_786_644_000;
+const MANAGED_CATALOG_UPDATED_AT: u64 = 1_787_079_600;
+
+/// The `DateTimeType` (`DATE_TIME_TYPE_VALUES`) a widget's time range uses when its
+/// bounds are offsets from the instant the widget is rendered rather than fixed dates.
+const DATE_TIME_TYPE_RELATIVE: &str = "RELATIVE";
+
+/// The `Granularity` (`GRANULARITY_VALUES`) every widget in the AWS-managed catalog
+/// aggregates at: a month, which is the period a bill covers.
+const GRANULARITY_MONTHLY: &str = "MONTHLY";
+
+/// The `GroupDefinitionType` (`GROUP_DEFINITION_TYPE_VALUES`) a grouping by a cost
+/// dimension carries — also the member's modelled `@default`.
+const GROUP_DEFINITION_TYPE_DIMENSION: &str = "DIMENSION";
+
+/// A widget time range running from `start` to `end`, both relative offsets (ISO 8601
+/// durations, as `DateTimeValue$value` carries them for a `RELATIVE` bound).
+fn relative_range(start: &str, end: &str) -> DateTimeRange {
+    DateTimeRange {
+        start_time: DateTimeValue {
+            r#type: DATE_TIME_TYPE_RELATIVE.to_string(),
+            value: start.to_string(),
+        },
+        end_time: DateTimeValue {
+            r#type: DATE_TIME_TYPE_RELATIVE.to_string(),
+            value: end.to_string(),
+        },
+    }
+}
+
+/// A `DisplayConfig` drawing one metric as `visual_type` (a `VisualType`:
+/// `VISUAL_TYPE_VALUES` are `LINE`, `BAR`, `STACK`).
+fn graph_display(metric: &str, visual_type: &str) -> DisplayConfig {
+    DisplayConfig::Graph(HashMap::from([(
+        metric.to_string(),
+        GraphDisplayConfig {
+            visual_type: visual_type.to_string(),
+        },
+    )]))
+}
+
+/// A `DisplayConfig` drawing the query's result as a table.
+fn table_display() -> DisplayConfig {
+    DisplayConfig::Table(TableDisplayConfigStruct {})
+}
+
+/// One widget of the AWS-managed catalog: the members a caller's widget carries too,
+/// with the model's declared `width`/`height`/`horizontalOffset` defaults (4, 7, 0)
+/// unless the catalog entry states its own.
+struct ManagedWidget {
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+    width: i32,
+    height: i32,
+    configs: Vec<WidgetConfig>,
+}
+
+impl ManagedWidget {
+    /// This catalog widget as the modelled [`Widget`] every reader projects.
+    fn widget(self) -> Widget {
+        Widget {
+            id: Some(self.id.to_string()),
+            title: self.title.to_string(),
+            description: Some(self.description.to_string()),
+            width: self.width,
+            height: self.height,
+            horizontal_offset: 0,
+            configs: self.configs,
+        }
+    }
+}
+
+/// The widgets of the `Cost Overview and Trends` catalog entry.
+fn cost_overview_widgets() -> Vec<Widget> {
+    vec![ManagedWidget {
+        id: "a18b58807f3934dbcfebd21ad359afaa",
+        title: "Total Current And Forecasted Cost",
+        description: "Historical monthly unblended cost with forecasted cost.",
+        width: 2,
+        height: 4,
+        configs: vec![WidgetConfig {
+            query_parameters: QueryParameters::costAndUsage(CostAndUsageQuery {
+                metrics: vec!["UnblendedCost".to_string()],
+                time_range: relative_range("-P12M", "P4M"),
+                granularity: GRANULARITY_MONTHLY.to_string(),
+                group_by: Some(Vec::new()),
+                filter: None,
+            }),
+            display_config: graph_display("UnblendedCost", "BAR"),
+        }],
+    }
+    .widget()]
+}
+
+/// The widgets of a catalog entry that reports cost and usage grouped by one
+/// `Dimension` (`DIMENSION_VALUES`) — the shape the `Compute` and `Database` entries
+/// take, each over its own dimension.
+fn cost_by_dimension_widgets(
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+    dimension: &'static str,
+) -> Vec<Widget> {
+    vec![ManagedWidget {
+        id,
+        title,
+        description,
+        width: 4,
+        height: 7,
+        configs: vec![WidgetConfig {
+            query_parameters: QueryParameters::costAndUsage(CostAndUsageQuery {
+                metrics: vec!["UnblendedCost".to_string()],
+                time_range: relative_range("-P6M", "P1M"),
+                granularity: GRANULARITY_MONTHLY.to_string(),
+                group_by: Some(vec![GroupDefinition {
+                    key: dimension.to_string(),
+                    r#type: GROUP_DEFINITION_TYPE_DIMENSION.to_string(),
+                }]),
+                filter: None,
+            }),
+            display_config: graph_display("UnblendedCost", "STACK"),
+        }],
+    }
+    .widget()]
+}
+
+/// The widgets of the `Reservations` catalog entry: how much of the account's
+/// reservations were used.
+fn reservation_widgets() -> Vec<Widget> {
+    vec![ManagedWidget {
+        id: "c5a7d0b3e19f4c82a6d4b8e01f3c7a95",
+        title: "Reservation Utilization",
+        description: "Monthly utilization of your Reserved Instances.",
+        width: 4,
+        height: 7,
+        configs: vec![WidgetConfig {
+            query_parameters: QueryParameters::reservationUtilization(
+                ReservationUtilizationQuery {
+                    time_range: relative_range("-P6M", "P0M"),
+                    group_by: None,
+                    granularity: Some(GRANULARITY_MONTHLY.to_string()),
+                    filter: None,
+                },
+            ),
+            display_config: table_display(),
+        }],
+    }
+    .widget()]
+}
+
+/// The widgets of the `Savings Plans` catalog entry: how much of the account's eligible
+/// spend the Savings Plans it holds covered.
+fn savings_plans_widgets() -> Vec<Widget> {
+    vec![ManagedWidget {
+        id: "d6b8e1c4f20a5d93b7e5c9f12a4d8b06",
+        title: "Savings Plans Coverage",
+        description: "Monthly share of eligible spend covered by your Savings Plans.",
+        width: 4,
+        height: 7,
+        configs: vec![WidgetConfig {
+            query_parameters: QueryParameters::savingsPlansCoverage(SavingsPlansCoverageQuery {
+                time_range: relative_range("-P6M", "P0M"),
+                metrics: Some(vec!["SpendCoveredBySavingsPlans".to_string()]),
+                granularity: Some(GRANULARITY_MONTHLY.to_string()),
+                group_by: None,
+                filter: None,
+            }),
+            display_config: table_display(),
+        }],
+    }
+    .widget()]
+}
+
+/// One stored dashboard of the AWS-managed catalog, built the same way a created one is:
+/// the record carries its own ARN, name, description, type and widgets, and every reader
+/// projects it from the store.
+fn managed_dashboard(
+    resource_id: &str,
+    name: &str,
+    description: &str,
+    widgets: Vec<Widget>,
+) -> Dashboard {
+    Dashboard {
+        arn: ::engine::emulator_arn(
+            ARN_NAMESPACE,
+            "",
+            &format!("{DASHBOARD_RESOURCE_TYPE}/{MANAGED_DASHBOARD_ID_PREFIX}{resource_id}"),
+        ),
+        name: name.to_string(),
+        description: Some(description.to_string()),
+        dashboard_type: DASHBOARD_TYPE_AWS_MANAGED.to_string(),
+        widgets,
+        created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(MANAGED_CATALOG_CREATED_AT),
+        updated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(MANAGED_CATALOG_UPDATED_AT),
+        // The catalog carries no tags and no resource-based policy: a tag is an
+        // account's own metadata, and this model declares no operation that attaches a
+        // policy at all.
+        resource_tags: Vec::new(),
+        resource_policy: None,
+    }
+}
+
+/// The AWS-managed dashboard catalog every account already holds, keyed by ARN exactly
+/// as a created dashboard is.
+///
+/// These dashboards are the service's OWN data rather than the account's: an account that
+/// has created nothing still lists them, and `GetDashboard` reads one back with its
+/// widgets, which is the first call a console-like client makes. They are therefore
+/// SEEDED into the store ([`ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::default`])
+/// and read back through the same map, the same projection and the same pagination as a
+/// dashboard a caller created — no handler branches on whether a dashboard is managed, and
+/// nothing about the catalog is derived from a request.
+///
+/// `pub` so a test can state the catalog a listing must report alongside its own
+/// dashboards from the one place that defines it.
+pub fn managed_dashboard_catalog() -> BTreeMap<String, Dashboard> {
+    [
+        managed_dashboard(
+            "4dc5619130f2463687fc45e003e4b930",
+            "Cost Overview and Trends",
+            "High-level view of your AWS costs, usage trends, and forecasts",
+            cost_overview_widgets(),
+        ),
+        managed_dashboard(
+            "6b1f0c5d2a8e4f3b9c7d1e0a5f8b2c4d",
+            "Compute",
+            "Cost and usage of your compute services, including Amazon EC2, AWS Lambda and \
+             AWS Fargate",
+            cost_by_dimension_widgets(
+                "b29c69918a0f45e3d7fce32be46a0bb6",
+                "Compute Cost By Instance Type",
+                "Monthly unblended cost of your compute usage, grouped by instance type.",
+                "INSTANCE_TYPE",
+            ),
+        ),
+        managed_dashboard(
+            "7c2a1d4e9b0f5a3c8d6e2f1b4a7c9d0e",
+            "Database",
+            "Cost and usage of your database services, including Amazon RDS, Amazon DynamoDB \
+             and Amazon ElastiCache",
+            cost_by_dimension_widgets(
+                "e7c9f2a5b38d4e06c1a9f7b2d5e8c304",
+                "Database Cost By Engine",
+                "Monthly unblended cost of your database usage, grouped by database engine.",
+                "DATABASE_ENGINE",
+            ),
+        ),
+        managed_dashboard(
+            "8d3b2e5f0c1a6b4d9e7f3a2c5b8d0e1f",
+            "Reservations",
+            "Utilization and coverage of the Reserved Instances in your account",
+            reservation_widgets(),
+        ),
+        managed_dashboard(
+            "9e4c3f6a1d2b7c5e0f8a4b3d6c9e1f2a",
+            "Savings Plans",
+            "Utilization and coverage of the Savings Plans in your account",
+            savings_plans_widgets(),
+        ),
+    ]
+    .into_iter()
+    .map(|dashboard| (dashboard.arn.clone(), dashboard))
+    .collect()
 }
 
 /// The most scheduled reports this emulator stores for the account before
@@ -505,7 +812,7 @@ pub struct ScheduledReportExecution {
 }
 
 /// Per-service state for com-amazonaws-bcmdashboards-awsbcmdashboardsservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     /// Every stored dashboard, keyed by its ARN. A `BTreeMap` so `ListDashboards`
     /// walks the dashboards in one stable order and a cursor taken on one page
@@ -542,6 +849,26 @@ pub struct ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     /// ([`Self::expire_execution_tokens`]), so the map a caller can grow stays bounded by
     /// the calls of one minute.
     pub scheduled_report_executions: BTreeMap<(String, String), ScheduledReportExecution>,
+}
+
+/// A fresh store already holds the AWS-managed dashboard catalog
+/// ([`managed_dashboard_catalog`]) and nothing else: those dashboards are the service's
+/// own, so they exist before any caller writes anything, which is what `ListDashboards`
+/// reports on a brand-new account and what `GetDashboard` reads back. Everything else
+/// starts empty — an account owns no custom dashboard and no scheduled report until it
+/// creates one.
+impl Default for ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
+    fn default() -> Self {
+        Self {
+            dashboards: managed_dashboard_catalog(),
+            next_dashboard_seq: 0,
+            next_widget_seq: 0,
+            scheduled_reports: BTreeMap::new(),
+            next_scheduled_report_seq: 0,
+            scheduled_report_client_tokens: BTreeMap::new(),
+            scheduled_report_executions: BTreeMap::new(),
+        }
+    }
 }
 
 /// The ARN namespace this service's ARNs carry, as the model's `aws.api#service`
@@ -649,13 +976,20 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     /// names, or `None` when this service holds no dashboard under that ARN (the
     /// caller answers that with `crate::scaffolded::Scaffolded::resource_not_found`).
     ///
-    /// A dashboard with no policy attached resolves to the empty document, which is
-    /// what the modelled `policyDocument` member's 0-character minimum admits: a
-    /// missing policy is not a missing resource.
+    /// A dashboard with no policy attached resolves to
+    /// [`EMPTY_RESOURCE_POLICY_DOCUMENT`]: a missing policy is not a missing resource,
+    /// and `policyDocument` reports a POLICY DOCUMENT, so the absence of one is the
+    /// document that grants nothing rather than a value that is not a document at all.
+    /// A stored document that holds no characters says the same thing, so it resolves
+    /// the same way.
     pub fn dashboard_resource_policy(&self, resource_arn: &str) -> Option<&str> {
-        self.dashboards
-            .get(resource_arn)
-            .map(|dashboard| dashboard.resource_policy.as_deref().unwrap_or_default())
+        self.dashboards.get(resource_arn).map(|dashboard| {
+            dashboard
+                .resource_policy
+                .as_deref()
+                .filter(|document| !document.is_empty())
+                .unwrap_or(EMPTY_RESOURCE_POLICY_DOCUMENT)
+        })
     }
 
     /// Mint a fresh widget id: the same [`next_resource_id`] rendering the ARN minters
@@ -928,6 +1262,249 @@ pub fn resolve_schedule_config(mut config: ScheduleConfig) -> ScheduleConfig {
         config.state = Some(SCHEDULE_STATE_ENABLED.to_string());
     }
     config
+}
+
+/// The `@pattern` of `DashboardName` and `ScheduledReportName`, as the model writes it
+/// (`smithy_query(query="shape",shape="DashboardName,ScheduledReportName")`): both shapes
+/// declare this one expression.
+pub const RESOURCE_NAME_PATTERN: &str = r"^(?!.* {2})[a-zA-Z][a-zA-Z0-9 _-]{0,48}[a-zA-Z0-9_-]$";
+
+/// The `@pattern` of `Description`, as the model writes it
+/// (`smithy_query(query="shape",shape="Description")`) — the shape every `description`
+/// member of this service targets, on a dashboard, a widget and a scheduled report alike.
+pub const DESCRIPTION_PATTERN: &str = r"^(?!.* {2})[ a-zA-Z0-9.,!?;:@#$%&\-_/\\]*$";
+
+/// The `@pattern` of `WidgetTitle`, as the model writes it
+/// (`smithy_query(query="shape",shape="WidgetTitle")`).
+pub const WIDGET_TITLE_PATTERN: &str =
+    r"^(?!.* {2})[a-zA-Z0-9_-][ a-zA-Z0-9_-]*[a-zA-Z0-9_-]$";
+
+/// A constrained string of this service whose modelled `@pattern` the boundary validator
+/// does NOT apply, so the request reaches a handler unchecked against it.
+///
+/// Each of these expressions opens with the negative lookahead `(?!.* {2})` — no two
+/// consecutive spaces anywhere in the value — and the boundary's regex engine compiles no
+/// lookahead; a pattern it cannot compile is treated as matching
+/// (`aws_smithy_schema_server::constraints`'s pattern check). So the three grammars are
+/// applied HERE, by the same clause and envelope the boundary states for a pattern it can
+/// compile ([`text_pattern_refusal`]), before the handler writes anything. The `@length`
+/// bounds on the same members compile and are already enforced at the boundary, so they
+/// are not repeated — which is also what bounds the value a clause echoes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstrainedText {
+    /// A resource name: [`RESOURCE_NAME_PATTERN`].
+    ResourceName,
+    /// A description: [`DESCRIPTION_PATTERN`].
+    Description,
+    /// A widget title: [`WIDGET_TITLE_PATTERN`].
+    WidgetTitle,
+}
+
+/// The characters `[a-zA-Z0-9_-]`, which every one of the three grammars admits in the
+/// interior of a value and two of them require at its end.
+fn is_word_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_' || character == '-'
+}
+
+/// The characters [`DESCRIPTION_PATTERN`]'s one class lists.
+fn is_description_character(character: char) -> bool {
+    matches!(
+        character,
+        ' ' | 'a'..='z'
+            | 'A'..='Z'
+            | '0'..='9'
+            | '.'
+            | ','
+            | '!'
+            | '?'
+            | ';'
+            | ':'
+            | '@'
+            | '#'
+            | '$'
+            | '%'
+            | '&'
+            | '-'
+            | '_'
+            | '/'
+            | '\\'
+    )
+}
+
+/// Whether `value` satisfies a grammar of the form "one character the `first` class
+/// admits, then at most `max_interior` characters the `interior` class admits, then one
+/// the `last` class admits" — the shape both of the two-ended grammars here take, so the
+/// reading of their quantifiers lives in one place.
+fn admits_bounded_run(
+    value: &str,
+    first: fn(char) -> bool,
+    interior: fn(char) -> bool,
+    last: fn(char) -> bool,
+    max_interior: Option<usize>,
+) -> bool {
+    let characters: Vec<char> = value.chars().collect();
+    // Two characters at least: the expression spells a first and a last one.
+    let Some((first_character, rest)) = characters.split_first() else {
+        return false;
+    };
+    let Some((last_character, interior_characters)) = rest.split_last() else {
+        return false;
+    };
+    first(*first_character)
+        && last(*last_character)
+        && interior_characters.iter().copied().all(interior)
+        && max_interior.is_none_or(|max| interior_characters.len() <= max)
+}
+
+impl ConstrainedText {
+    /// The modelled `@pattern` this grammar is, anchors included.
+    pub fn pattern(self) -> &'static str {
+        match self {
+            Self::ResourceName => RESOURCE_NAME_PATTERN,
+            Self::Description => DESCRIPTION_PATTERN,
+            Self::WidgetTitle => WIDGET_TITLE_PATTERN,
+        }
+    }
+
+    /// Whether `value` satisfies this grammar — the whole expression, lookahead included.
+    pub fn admits(self, value: &str) -> bool {
+        // The lookahead `(?!.* {2})`, which is what the boundary cannot apply: two
+        // consecutive spaces anywhere in the value, wherever the rest of the expression
+        // would otherwise admit them.
+        if value.contains("  ") {
+            return false;
+        }
+        match self {
+            // `[a-zA-Z][a-zA-Z0-9 _-]{0,48}[a-zA-Z0-9_-]`.
+            Self::ResourceName => admits_bounded_run(
+                value,
+                |character| character.is_ascii_alphabetic(),
+                |character| character == ' ' || is_word_character(character),
+                is_word_character,
+                Some(48),
+            ),
+            // `[ a-zA-Z0-9.,!?;:@#$%&\-_/\\]*` — one class, any number of characters.
+            Self::Description => value.chars().all(is_description_character),
+            // `[a-zA-Z0-9_-][ a-zA-Z0-9_-]*[a-zA-Z0-9_-]`: the same two-ended shape as a
+            // resource name, with a digit or `_`/`-` admitted at the start and no bound
+            // on the interior of its own (`@length` 2..50 bounds it).
+            Self::WidgetTitle => admits_bounded_run(
+                value,
+                is_word_character,
+                |character| character == ' ' || is_word_character(character),
+                is_word_character,
+                None,
+            ),
+        }
+    }
+}
+
+/// One text member of a request, by the path a refusal states it at, the value submitted
+/// and the grammar it has to satisfy.
+pub type TextMember<'a> = (String, &'a str, ConstrainedText);
+
+/// How this service refuses the text members of `members` that break their modelled
+/// `@pattern`, or `None` when every one of them satisfies it.
+///
+/// The refusal is the boundary's own: one clause per member that broke its pattern,
+/// quoting the expression the service publishes — the model's text without the `^`/`$`
+/// Smithy wraps it in, exactly as [`crate::service`]'s refusal seam quotes it — under the
+/// framework's `N validation error(s) detected` envelope. So a value refused here is
+/// refused in the same words as one the boundary could judge itself, and the caller
+/// cannot tell which layer applied the pattern.
+pub fn text_pattern_refusal<'a>(members: impl IntoIterator<Item = TextMember<'a>>) -> Option<String> {
+    let violations: Vec<Violation> = members
+        .into_iter()
+        .filter(|(_, value, text)| !text.admits(value))
+        .map(|(path, value, text)| Violation {
+            path,
+            kind: ViolationKind::Pattern(::service_common::validation::unanchored(text.pattern())),
+            // The value the caller submitted, which a constraint clause echoes. Bounded
+            // by the member's own `@length` maximum (50 for a name or a title, 200 for a
+            // description), which the boundary already enforced.
+            value: Some(value.to_string()),
+        })
+        .collect();
+    envelope(&violations)
+}
+
+/// The text members a write of a DASHBOARD submits, for [`text_pattern_refusal`]: the
+/// dashboard's own name and description, and the title and description of every widget it
+/// carries.
+///
+/// One list for both writes, so `CreateDashboard` and `UpdateDashboard` apply the same
+/// grammars at the same member paths. A widget names its 1-based position the way the
+/// framework spells a list element's path.
+pub fn dashboard_text_members<'a>(
+    name: Option<&'a str>,
+    description: Option<&'a str>,
+    widgets: &'a [Widget],
+) -> Vec<TextMember<'a>> {
+    let mut members: Vec<TextMember<'a>> = Vec::new();
+    if let Some(name) = name {
+        members.push(("name".to_string(), name, ConstrainedText::ResourceName));
+    }
+    if let Some(description) = description {
+        members.push((
+            "description".to_string(),
+            description,
+            ConstrainedText::Description,
+        ));
+    }
+    for (index, widget) in widgets.iter().enumerate() {
+        let position = ::aws_smithy_schema_server::constraints::path::element(index + 1);
+        members.push((
+            ::aws_smithy_schema_server::constraints::path::join(&[
+                "widgets".to_string(),
+                position.clone(),
+                "title".to_string(),
+            ]),
+            widget.title.as_str(),
+            ConstrainedText::WidgetTitle,
+        ));
+        if let Some(widget_description) = widget.description.as_deref() {
+            members.push((
+                ::aws_smithy_schema_server::constraints::path::join(&[
+                    "widgets".to_string(),
+                    position,
+                    "description".to_string(),
+                ]),
+                widget_description,
+                ConstrainedText::Description,
+            ));
+        }
+    }
+    members
+}
+
+/// The text members a write of a SCHEDULED REPORT submits, for [`text_pattern_refusal`]:
+/// the report's name and description.
+///
+/// `prefix` is the member the two are nested under, or `None` when the request carries
+/// them at its top level — `CreateScheduledReport` submits them inside `scheduledReport`
+/// while `UpdateScheduledReport` carries them directly, and a clause states the path the
+/// request used.
+pub fn report_text_members<'a>(
+    prefix: Option<&str>,
+    name: Option<&'a str>,
+    description: Option<&'a str>,
+) -> Vec<TextMember<'a>> {
+    let path = |member: &str| match prefix {
+        Some(prefix) => format!("{prefix}.{member}"),
+        None => member.to_string(),
+    };
+    let mut members: Vec<TextMember<'a>> = Vec::new();
+    if let Some(name) = name {
+        members.push((path("name"), name, ConstrainedText::ResourceName));
+    }
+    if let Some(description) = description {
+        members.push((
+            path("description"),
+            description,
+            ConstrainedText::Description,
+        ));
+    }
+    members
 }
 
 /// Encode the ARN a listing page resumes at as an opaque `nextToken`.

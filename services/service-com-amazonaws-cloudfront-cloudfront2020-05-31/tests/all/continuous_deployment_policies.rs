@@ -99,8 +99,12 @@ async fn list_policies(router: &MultiServiceRouter, query: &str) -> Answer {
 
 /// The traffic configuration a policy carries: `TrafficConfig` is optional, and its
 /// `Type` selects which of the two inner configurations applies.
+///
+/// `pub(crate)` for the reason [`create_policy`] is: a sibling suite that submits a
+/// continuous deployment policy configuration writes it with this one writer rather than a
+/// copy of it.
 #[derive(Debug, Clone)]
-enum Traffic {
+pub(crate) enum Traffic {
     /// No `TrafficConfig` element at all.
     None,
     /// `Type` `SingleWeight`, with `(IdleTTL, MaximumTTL)` when the row names session
@@ -115,17 +119,17 @@ enum Traffic {
 
 /// One `ContinuousDeploymentPolicyConfig` a client submits.
 #[derive(Debug, Clone)]
-struct Policy {
-    case: &'static str,
+pub(crate) struct Policy {
+    pub(crate) case: &'static str,
     /// `StagingDistributionDnsNames.Items`, in order.
-    dns_names: Vec<String>,
-    enabled: bool,
-    traffic: Traffic,
+    pub(crate) dns_names: Vec<String>,
+    pub(crate) enabled: bool,
+    pub(crate) traffic: Traffic,
 }
 
 impl Policy {
     /// The `ContinuousDeploymentPolicyConfig` XML a client sends for this policy.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         self.xml_with_quantity(i32::try_from(self.dns_names.len()).expect("a small table"))
     }
 
@@ -173,7 +177,7 @@ impl Policy {
 
     /// Assert that `config` — a `ContinuousDeploymentPolicyConfig` element the emulator
     /// answered with — is the configuration this row submitted.
-    fn assert_matches(&self, config: &Node, context: &str) {
+    pub(crate) fn assert_matches(&self, config: &Node, context: &str) {
         let case = self.case;
         let names = config
             .at("StagingDistributionDnsNames")
@@ -291,7 +295,7 @@ impl Policy {
 /// each of the two the `Type` enum admits (`ContinuousDeploymentPolicyType` is
 /// `SingleHeader | SingleWeight`, from `smithy_query`), a weight at each published bound
 /// of "between 0 and 0.15", and session stickiness at the bounds of "300–3600 seconds".
-fn policy_table() -> Vec<Policy> {
+pub(crate) fn policy_table() -> Vec<Policy> {
     vec![
         Policy {
             case: "one staging domain, no traffic configuration",

@@ -193,17 +193,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A provider the clock still owes a removal for is on its way out, and there is
         // nothing left to reconfigure: "another operation is in progress" is what
-        // `ResourceConflictException` covers beside an already existing resource.
+        // `ResourceConflictException` covers beside an already existing resource. The
+        // sentence tells the caller what to do about it — wait for the operation under
+        // way and try again — and names no internal lifecycle value, which is not part
+        // of this refusal's contract.
         if record.is_deleting() {
             return Err(
                 UpdateCapacityProviderErrorModeled::ResourceConflictException(
                     ResourceConflictException {
                         r#type: None,
-                        message: Some(format!(
-                            "The operation cannot be performed at this time. The capacity \
-                             provider is currently in the following state: {}",
-                            record.state
-                        )),
+                        message: Some(
+                            "The capacity provider can't be updated because it's currently \
+                             processing another operation. Wait for the current operation to \
+                             complete and try again."
+                                .to_string(),
+                        ),
                     },
                 )
                 .into(),

@@ -33,6 +33,10 @@ mod delete_scheduled_report;
 mod execution_token_scope;
 #[path = "all/listing_pagination.rs"]
 mod listing_pagination;
+#[path = "all/managed_dashboard_catalog.rs"]
+mod managed_dashboard_catalog;
+#[path = "all/name_pattern_enforcement.rs"]
+mod name_pattern_enforcement;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_not_found.rs"]

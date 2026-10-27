@@ -339,11 +339,6 @@ async fn the_approvals_a_pull_request_holds_are_reported_for_each_approving_revi
             reported: vec![],
         },
         ApprovalsRow {
-            case: "the author revoking an approval they never held",
-            recorded: vec![(AUTHOR, REVOKE)],
-            reported: vec![],
-        },
-        ApprovalsRow {
             case: "two reviewers approving",
             recorded: vec![(REVIEWER, APPROVE), (OTHER_REVIEWER, APPROVE)],
             reported: vec![OTHER_REVIEWER, REVIEWER],

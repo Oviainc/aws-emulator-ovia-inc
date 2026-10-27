@@ -222,39 +222,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        // `nextToken` is this enumeration's resume point: the id of the first dataset
-        // of the next page, hex-encoded so the token matches the modelled
-        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration
-        // is refused rather than answered with an empty page.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                matching
-                    .iter()
-                    .position(|record| record.id == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime validates
-        // BEFORE this handler runs, so a value that arrives here is already in range
-        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic
-        // below total.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(matching.len());
-
-        // "The token for the next set of results, or null if there are no additional
-        // results": issued only when a dataset follows this page.
-        let next_token = matching
-            .get(end)
-            .map(|record| ::hex::encode(record.id.as_bytes()));
+        // This enumeration's resume point is a dataset's id, and the page walk every
+        // paginated listing of this service shares takes it from there: it resumes at
+        // the token's dataset, refusing a token whose resume point is not in this
+        // enumeration rather than answering an empty page; it cuts the page at
+        // `maxResults`, defaulting to this crate's page size; and it mints "the token
+        // for the next set of results, or null if there are no additional results"
+        // from the dataset that follows the page.
+        let page = crate::state::page_of(
+            &matching,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |record| record.id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
 
         Ok(ListDatasetsOutput {
-            dataset_summaries: matching[start..end]
+            dataset_summaries: matching[page.start..page.end]
                 .iter()
                 .map(|record| summary(record, now))
                 .collect(),
-            next_token,
+            next_token: page.next_token,
             // The workspace this listing was scoped to, for a request that named
             // one; a listing that was not scoped to a workspace reports none.
             workspace_name: input.workspace_name.clone(),
@@ -294,14 +283,6 @@ fn summary(record: &crate::state::DatasetRecord, now: ::std::time::SystemTime) -
         // reported; `DescribeDataset` answers the same way.
         enrichment_status: None,
     }
-}
-
-/// Decode a `nextToken` back into the dataset id it resumes from.
-fn decode_token(token: &str) -> Result<String, ListDatasetsError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.

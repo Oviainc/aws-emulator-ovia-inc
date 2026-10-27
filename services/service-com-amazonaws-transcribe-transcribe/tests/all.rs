@@ -55,6 +55,8 @@ mod language_model_delete_requires_the_model;
 mod language_model_listing;
 #[path = "all/language_model_quota.rs"]
 mod language_model_quota;
+#[path = "all/language_model_training_data.rs"]
+mod language_model_training_data;
 #[path = "all/language_models.rs"]
 mod language_models;
 #[path = "all/list_cursor_rule.rs"]

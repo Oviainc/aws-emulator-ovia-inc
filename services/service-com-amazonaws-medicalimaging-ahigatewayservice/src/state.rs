@@ -1583,7 +1583,8 @@ impl ComAmazonawsMedicalimagingAhigatewayserviceState {
     /// tagging operations agree on what exists — tags live ON the resource record rather
     /// than in a map beside it — and a record that is reportable still reports the tags
     /// it holds, a retired image set among them. A write goes through
-    /// [`Self::writable_resource_tags_mut`], which admits less.
+    /// [`Self::writable_resource_tags_mut`], which admits the same records minus the
+    /// tombstones.
     /// The ARN must be the resource's OWN: a data store is reached by its id in the
     /// region the request addressed, and then only when the ARN it was named by is the
     /// one the data store reports.
@@ -1610,35 +1611,31 @@ impl ComAmazonawsMedicalimagingAhigatewayserviceState {
         }
     }
 
-    /// [`Self::resource_tags`], for a WRITER — so it resolves only a resource that can
-    /// still take part in work, and says why it cannot otherwise.
+    /// [`Self::resource_tags`], for a WRITER — the tag map of a resource record this
+    /// emulator still holds, or which resource KIND it holds none of.
     ///
-    /// The same lookup as the reader, plus the two lifecycle guards every other write in
-    /// this crate applies before it changes a record:
+    /// A tag map is METADATA ON THE RECORD: writing it neither reads nor changes anything
+    /// the resource serves, so it is admitted for as long as the record exists, whatever
+    /// status change the clock still owes it. Existence is the one thing it answers to:
     ///
-    /// * the data store has to have settled into `ACTIVE` ([`Datastore::is_active`]).
-    ///   A change admitted while a transition the service has already promised is
-    ///   mid-flight would leave the transition and the write disagreeing about the
-    ///   resource — and a write onto a store whose deletion is in flight is one whose
-    ///   whole effect the clock throws away with the record.
+    /// * the data store has to be one work can still reach ([`Self::datastore_in_mut`]):
+    ///   a record whose deletion has LANDED holds nothing a caller can reach, so it is
+    ///   absent to a writer even while it is still reportable.
     /// * an image set the ARN names has to be one that is not retired
     ///   ([`ImageSet::is_deleted`]). A tombstone still REPORTS what it held, but it takes
     ///   part in no further work, so nothing more is written onto it.
     ///
-    /// A guard refuses BEFORE the map is handed out, so a refused write leaves the tag
-    /// map exactly as it was.
+    /// The refusal resolves BEFORE the map is handed out, so a refused write leaves the
+    /// tag map exactly as it was.
     pub fn writable_resource_tags_mut(
         &mut self,
         region: &str,
         arn: &ResourceArn,
-    ) -> Result<&mut HashMap<String, String>, UnwritableResource> {
+    ) -> Result<&mut HashMap<String, String>, MissingResource> {
         let datastore = self
             .datastore_in_mut(region, &arn.datastore_id)
             .filter(|datastore| datastore.datastore_arn == arn.datastore_arn)
-            .ok_or(UnwritableResource::Missing(MissingResource::Datastore))?;
-        if !datastore.is_active() {
-            return Err(UnwritableResource::DatastoreNotActive);
-        }
+            .ok_or(MissingResource::Datastore)?;
         match &arn.image_set_id {
             None => Ok(&mut datastore.tags),
             Some(image_set_id) => datastore
@@ -1646,7 +1643,7 @@ impl ComAmazonawsMedicalimagingAhigatewayserviceState {
                 .get_mut(image_set_id)
                 .filter(|image_set| !image_set.is_deleted())
                 .map(|image_set| &mut image_set.tags)
-                .ok_or(UnwritableResource::Missing(MissingResource::ImageSet)),
+                .ok_or(MissingResource::ImageSet),
         }
     }
 
@@ -1754,24 +1751,6 @@ impl MissingResource {
             Self::ImageSet => IMAGE_SET_NOT_FOUND_MESSAGE,
         }
     }
-}
-
-/// Why a WRITE against the resource a [`ResourceArn`] names is refused —
-/// the outcomes of
-/// [`ComAmazonawsMedicalimagingAhigatewayserviceState::writable_resource_tags_mut`].
-///
-/// Two kinds, because the two states a write is refused in are two different refusals:
-/// a resource this emulator does not hold is absent (HTTP 404), while a data store that
-/// exists but has not settled is a resource whose transition the write would disagree
-/// with (HTTP 409) — the same split every other write path in this crate makes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnwritableResource {
-    /// This emulator holds no such resource in the region the request addressed — a
-    /// retired image set among them, because a tombstone takes part in no further work.
-    Missing(MissingResource),
-    /// The data store the ARN names is held, but a status change the clock still owes it
-    /// is in flight: `CREATING` on the way to `ACTIVE`, or `DELETING` on the way to gone.
-    DatastoreNotActive,
 }
 
 /// Parse a medical-imaging resource ARN, or `None` when the string is not one.

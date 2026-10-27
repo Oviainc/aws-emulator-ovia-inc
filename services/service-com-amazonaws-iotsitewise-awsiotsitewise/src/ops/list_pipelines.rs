@@ -200,42 +200,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.name.cmp(&right.name))
         });
 
-        // `nextToken` is this enumeration's resume point: the name of the first pipeline
-        // of the next page, hex-encoded so the token is one wire-safe string inside the
-        // modelled length rather than a raw name. A token whose resume point is not in
-        // this enumeration is refused rather than answered with an empty page.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                selected
-                    .iter()
-                    .position(|record| record.name == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250 and the declared default of 50,
-        // both applied BEFORE this handler runs — an absent member arrives as that
-        // default and a value out of range never arrives at all — so nothing is being
-        // coerced here; `max(1)` only keeps the slice arithmetic below total.
-        let max_results = input.max_results.max(1) as usize;
-        let end = start.saturating_add(max_results).min(selected.len());
-
-        // "The token to be used for the next set of paginated results": issued only when
-        // a pipeline follows this page.
-        let next_token = selected
-            .get(end)
-            .map(|record| ::hex::encode(record.name.as_bytes()));
+        // This enumeration's resume point is a pipeline's name, and the page walk every
+        // paginated listing of this service shares takes it from there: it resumes at
+        // the token's pipeline, refusing a token whose resume point is not in this
+        // enumeration rather than answering an empty page; it cuts the page at
+        // `maxResults`, which this operation's model declares a default for, so the
+        // member arrives carrying one and the walk's own fallback never applies; and it
+        // mints "the token to be used for the next set of paginated results" off the
+        // pipeline that follows the page.
+        let page = crate::state::page_of(
+            &selected,
+            input.next_token.as_deref(),
+            Some(input.max_results),
+            DEFAULT_MAX_RESULTS,
+            |record| record.name.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
 
         Ok(ListPipelinesOutput {
-            pipeline_summaries: selected[start..end]
+            pipeline_summaries: selected[page.start..page.end]
                 .iter()
                 .map(|record| summary(record, now))
                 .collect(),
-            next_token,
+            next_token: page.next_token,
         })
     }
 }
+
+/// The page size this operation's `maxResults` declares as its default, which the
+/// runtime applies before this handler runs.
+const DEFAULT_MAX_RESULTS: i32 = 50;
 
 /// One stored pipeline as the summary this operation reports, read straight off the
 /// record `CreatePipeline` persisted and `UpdatePipeline` versions — so a listed
@@ -257,14 +251,6 @@ fn summary(
         created_at: crate::state::to_date_time(record.created_at),
         updated_at: crate::state::to_date_time(record.updated_at()),
     }
-}
-
-/// Decode a `nextToken` back into the pipeline name it resumes from.
-fn decode_token(token: &str) -> Result<String, ListPipelinesError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.

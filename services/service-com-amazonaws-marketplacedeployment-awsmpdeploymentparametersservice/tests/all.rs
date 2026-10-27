@@ -47,6 +47,8 @@ mod state_roundtrip;
 mod support;
 #[path = "all/tag_input_judged_before_lookup.rs"]
 mod tag_input_judged_before_lookup;
+#[path = "all/tagging_resolution_sequence.rs"]
+mod tagging_resolution_sequence;
 #[path = "all/unconstrained_tag_characters.rs"]
 mod unconstrained_tag_characters;
 #[path = "all/validation_messages.rs"]

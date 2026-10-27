@@ -222,38 +222,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        // `nextToken` is this enumeration's resume point: the id of the first asset of
-        // the next page, hex-encoded so the token matches the modelled `^[A-Za-z0-9+/=]+$`.
-        // A token whose resume point is not in this enumeration is refused rather than
-        // answered with an empty page, which would report absence as success.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                matching
-                    .iter()
-                    .position(|asset| asset.id == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime validates
-        // BEFORE this handler runs, so a value that arrives here is already in range
-        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
-        // total. The default is the one AWS documents for this operation.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(matching.len());
+        // This enumeration's resume point is an asset's id, and the page walk every
+        // paginated listing of this service shares takes it from there: it resumes at
+        // the token's asset, refusing a token whose resume point is not in this
+        // enumeration rather than answering an empty page, which would report absence
+        // as success; it cuts the page at `maxResults`, defaulting to the size AWS
+        // documents for this operation; and it mints the next token from the asset that
+        // follows the page.
+        let page = crate::state::page_of(
+            &matching,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |asset| asset.id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
 
-        let next_token = matching
-            .get(end)
-            .map(|asset| ::hex::encode(asset.id.as_bytes()));
-        let asset_summaries = matching[start..end]
+        let asset_summaries = matching[page.start..page.end]
             .iter()
             .map(|asset| asset.summary(now))
             .collect();
 
         Ok(ListAssetsOutput {
             asset_summaries,
-            next_token,
+            next_token: page.next_token,
         })
     }
 }
@@ -261,14 +253,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The page size AWS documents for this operation when the caller gives no
 /// `maxResults`.
 const DEFAULT_MAX_RESULTS: i32 = 50;
-
-/// Decode a `nextToken` back into the asset id it resumes from.
-fn decode_token(token: &str) -> Result<String, ListAssetsError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
-}
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
 fn invalid_token() -> ListAssetsError {

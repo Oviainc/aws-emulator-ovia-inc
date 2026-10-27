@@ -9,9 +9,9 @@
 //! `ListDurableExecutionsByFunction` still reports the oldest execution after the
 //! refusal.
 //!
-//! No modelled operation starts a durable execution yet (`Invoke` minting one is its own
-//! open issue), so the executions are started through the service's own state, which is
-//! where that handler registers them — exactly as `durable_execution_listing.rs` does.
+//! The executions are started through the service's own state, which is where the
+//! `Invoke` handler registers them — exactly as `durable_execution_listing.rs` does, and
+//! `durable_execution_start.rs` drives that handler end to end.
 //! What each start answered, and what the listing reports afterwards, is asserted over
 //! real HTTP requests through the router.
 
@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime};
 use base64::Engine as _;
 use serde_json::{json, Value};
 use service_com_amazonaws_lambda_awsgirapiservice::state::{
-    ComAmazonawsLambdaAwsgirapiserviceState, MAX_DURABLE_EXECUTIONS,
+    ComAmazonawsLambdaAwsgirapiserviceState, DurableExecutionStart, MAX_DURABLE_EXECUTIONS,
 };
 use service_com_amazonaws_lambda_awsgirapiservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -160,19 +160,19 @@ async fn create_function(engine: &Arc<engine::InMemoryEngine>, router: &MultiSer
 }
 
 /// Start one durable execution named `name`, through the state the `Invoke` handler
-/// registers one in, answering the ARN it was addressed by when it was started at all.
+/// registers one in, reporting what became of the start.
 fn start_execution(
     engine: &Arc<engine::InMemoryEngine>,
     name: &str,
     started: SystemTime,
-) -> Option<String> {
+) -> DurableExecutionStart {
     let state = engine.state::<ComAmazonawsLambdaAwsgirapiserviceState>();
     let mut store = state.lock();
     let record = store
         .functions
         .get_mut(FUNCTION)
         .unwrap_or_else(|| panic!("case {name}: the store must hold the function {FUNCTION}"));
-    record.start_durable_execution(name, VERSION_LATEST, started)
+    record.start_durable_execution(name, VERSION_LATEST, &[], started)
 }
 
 /// How many executions the function holds.
@@ -218,9 +218,12 @@ async fn a_function_holds_at_most_the_bounded_number_of_durable_executions() {
         let name = execution_name(index);
         let offset = Duration::from_millis(u64::try_from(index).unwrap_or(0));
         let started = start_execution(&engine, &name, base + offset);
-        let arn = started.unwrap_or_else(|| {
-            panic!("case {name:?}: the start inside the ceiling must answer the execution's ARN")
-        });
+        let DurableExecutionStart::Started(arn) = started else {
+            panic!(
+                "case {name:?}: the start inside the ceiling must answer the execution's ARN, \
+                 got {started:?}"
+            )
+        };
         let infix = format!("/durable-execution/{name}/");
         let id = arn.rsplit('/').next().unwrap_or_default();
         assert!(
@@ -238,8 +241,9 @@ async fn a_function_holds_at_most_the_bounded_number_of_durable_executions() {
     // the slice is bounded rather than growing with every call.
     for name in ["one-past-the-ceiling", "another-past-the-ceiling"] {
         let refused = start_execution(&engine, name, base + Duration::from_secs(1));
-        assert!(
-            refused.is_none(),
+        assert_eq!(
+            refused,
+            DurableExecutionStart::LimitExceeded,
             "case {name:?}: a start past the ceiling must be refused, got {refused:?}"
         );
         assert_eq!(
@@ -269,13 +273,14 @@ async fn a_function_holds_at_most_the_bounded_number_of_durable_executions() {
         listed.text()
     );
 
-    // And a name already held is still refused for its own reason, with the record it
-    // names left exactly as it was.
+    // And a name already held answers the execution it names, with the record left
+    // exactly as it was.
     let repeat = start_execution(&engine, &oldest, base + Duration::from_secs(2));
     assert!(
-        repeat.is_none(),
+        matches!(repeat, DurableExecutionStart::AlreadyStarted(_)),
         "case {oldest:?}: an execution name is unique within the function, so a second \
-         start must not replace it, got {repeat:?}"
+         start must answer the execution already started rather than replace it, got \
+         {repeat:?}"
     );
     let after = list(&router, &format!("?DurableExecutionName={oldest}")).await;
     assert_eq!(

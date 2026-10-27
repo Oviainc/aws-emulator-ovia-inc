@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReportGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateReportGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Changes the settings of a report group held in [`crate::state`]: this is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateReportGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each optional member of the input is the REPLACEMENT for the report-group setting it
+//! names, so a member the request carries overwrites the stored setting whole and a
+//! member it omits leaves the stored setting exactly as it was; the group's name, its
+//! `type`, its ARN, its read-only `status` and its `created` instant are never touched
+//! here. A successful update moves `lastModified` and a refused one persists nothing at
+//! all, so the record a later read reports is the one this call stored.
+//!
+//! An `arn` that is not a report-group ARN of this service addresses no report group in
+//! any account or region and is refused with the modelled `InvalidInputException`; a
+//! well-formed one this account does not hold is refused with the modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +148,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateReportGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateReportGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateReportGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this operation models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateReportGroup (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let now = crate::state::now_millis();
+        let arn = input.arn.clone();
+
+        // `arn` is typed `NonEmptyString`, so any non-empty text reaches this handler. A
+        // value that is not a report group ARN of this service addresses no report group
+        // at all — there is no account or region in which it could name one — so the
+        // call is refused with the operation's own input error rather than reported as a
+        // group that merely is not held, which is what the not-found error below means.
+        // This is the split every report-group-addressing operation makes.
+        if crate::state::report_group_name_from_arn(&arn).is_none() {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&arn),
+            );
+            return Err(UpdateReportGroupErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INVALID_REPORT_GROUP_ARN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut guard = state.lock();
+        // The ARN is the group's whole identity, resolved the way every reader resolves
+        // it: one minted in another partition, region, account or resource type
+        // addresses no local record and so has nothing to update.
+        let Some(stored) = guard.report_group_by_arn_mut(&arn) else {
+            // Each refusal is audited like the successful write, and the lock is dropped
+            // first, so a log consumer never waits on this request's critical section —
+            // the discipline `UpdateProject` and `UpdateFleet` follow.
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::NotFound,
+                Some(&arn),
+            );
+            return Err(UpdateReportGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::REPORT_GROUP_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The merge runs on a COPY of the stored record, written back only once every
+        // check below has passed: a refused update leaves the report group it named
+        // exactly as it was, `lastModified` included.
+        let mut report_group = stored.report_group.clone();
+        let stored_modified_millis = stored.last_modified_millis;
+        apply_update(&mut report_group, input);
+
+        // The RESULTING configuration, not the request alone, is what has to be an
+        // exportable one, so the one rule `crate::state` states for an export
+        // configuration is asked about the merged record — the same rule
+        // `CreateReportGroup` asks about the group it mints.
+        if let Some(message) = report_group
+            .export_config
+            .as_ref()
+            .and_then(crate::state::report_export_config_violation)
+        {
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&arn),
+            );
+            return Err(UpdateReportGroupErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // `lastModified` reports when the report group was last changed, so a successful
+        // update has to move it. The service clock is millisecond-resolution, so two
+        // updates landing inside one millisecond would otherwise report the same instant
+        // for one record: the stamp is the later of now and one millisecond past the
+        // stored stamp, which keeps it strictly increasing per report group without ever
+        // running behind the clock — the rule `UpdateProject` states.
+        let last_modified_millis = now.max(stored_modified_millis + 1);
+        report_group.last_modified = Some(crate::state::datetime(last_modified_millis));
+
+        // `created` and the creation instant behind it are untouched: this call changes
+        // a report group's settings, it does not re-create it.
+        stored.report_group = report_group.clone();
+        stored.last_modified_millis = last_modified_millis;
+        // The lock is dropped before the audit record is written, so a log consumer can
+        // never hold this service's state.
+        drop(guard);
+
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::ReportGroupUpdated,
+            Some(&arn),
+        );
+
+        Ok(UpdateReportGroupOutput {
+            report_group: Some(report_group),
+        })
+    }
+}
+
+/// Apply one `UpdateReportGroup` request's members to the stored report group.
+///
+/// AWS describes each optional member as the replacement for the setting it names
+/// ("Used to specify an updated export type", "An updated list of tag key and value
+/// pairs associated with this report group"), so a member the request carries replaces
+/// the stored setting WHOLE — a structure member is not merged field by field — and a
+/// member it omits leaves the stored setting alone.
+///
+/// The input is DESTRUCTURED rather than read member by member, so a member the model
+/// gains later fails to compile here instead of being silently dropped.
+fn apply_update(report_group: &mut ReportGroup, input: UpdateReportGroupInput) {
+    let UpdateReportGroupInput {
+        // The report group is identified by this ARN, which addresses the record being
+        // changed and is not itself a setting of it.
+        arn: _,
+        export_config,
+        tags,
+    } = input;
+
+    replace(&mut report_group.export_config, export_config);
+    replace(&mut report_group.tags, tags);
+}
+
+/// Overwrite `held` with `update` when the request carried that member, and leave it
+/// alone when it did not: an absent member means "unchanged", never "clear it" — the
+/// rule [`crate::ops::update_project`] states for every CodeBuild update.
+fn replace<T>(held: &mut Option<T>, update: Option<T>) {
+    if update.is_some() {
+        *held = update;
     }
 }

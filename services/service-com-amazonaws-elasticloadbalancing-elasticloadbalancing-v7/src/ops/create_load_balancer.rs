@@ -210,11 +210,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 value.to_string()
             }
-            Some(other) => {
+            Some(_) => {
                 return Err(CreateLoadBalancerErrorModeled::InvalidSchemeException(
                     InvalidSchemeException {
                         message: Some(format!(
-                            "Scheme must be one of '{}' or '{}'; got '{other}'",
+                            "Scheme can either be {} or {}.",
                             crate::state::SCHEME_INTERNET_FACING,
                             crate::state::SCHEME_INTERNAL,
                         )),
@@ -252,18 +252,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let security_groups = input.security_groups.unwrap_or_default();
         if security_groups.len() > crate::state::MAX_SECURITY_GROUPS_PER_LOAD_BALANCER {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "SecurityGroups must carry at most {} entries; got {}",
-                crate::state::MAX_SECURITY_GROUPS_PER_LOAD_BALANCER,
-                security_groups.len()
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::security_groups_quota_message(security_groups.len()),
+            ));
         }
 
         // The subnets a load balancer is placed in are EC2's resources, and they are what
         // say which Availability Zones — and which VPC — the load balancer is in, so they
-        // are resolved against EC2 before anything is written. Nothing is held across that
-        // call: the store is locked only once the answer is in.
-        let placement = crate::state::resolve_subnet_placement(ctx, &region, &subnets).await;
+        // are resolved against EC2 before anything is written. A subnet the account does
+        // not hold is a placement EC2 itself refuses, and THIS operation reports the code
+        // EC2 answered as its message — the recorded refusal of a create naming such a
+        // subnet carries exactly that code, which is why the code is surfaced here while
+        // the other two operations that resolve the same lookup state the sentence their
+        // own error shape is documented with. Nothing is held across that call: the store
+        // is locked only once the answer is in.
+        let placement = match crate::state::resolve_subnet_placement(ctx, &region, &subnets).await {
+            Ok(placement) => placement,
+            Err(code) => {
+                return Err(CreateLoadBalancerErrorModeled::SubnetNotFoundException(
+                    SubnetNotFoundException {
+                        message: Some(code),
+                    },
+                )
+                .into());
+            }
+        };
+        // A security group is EC2's resource too, and the same rule holds for it: one the
+        // account does not hold cannot govern this load balancer's traffic, and what EC2
+        // reports for the ones it does hold is what the load balancer reports as its
+        // source security group. The refusal states the sentence the model itself gives
+        // `InvalidSecurityGroupException` — "One or more of the specified security groups
+        // do not exist."
+        let source_security_group =
+            match crate::state::resolve_source_security_group(ctx, &region, &security_groups).await
+            {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    return Err(
+                        CreateLoadBalancerErrorModeled::InvalidSecurityGroupException(
+                            InvalidSecurityGroupException {
+                                message: Some(
+                                    "One or more of the specified security groups do not \
+                                     exist."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            };
 
         let listeners = build_listeners(&input.listeners)?;
         if listeners.is_empty() {
@@ -331,6 +369,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // asked about contributes none.
             subnet_zones: placement.zones,
             security_groups,
+            // What EC2 reports for the first of those groups, which is what
+            // `DescribeLoadBalancers` reports as the load balancer's source security
+            // group; left unreported when there was no EC2 to ask.
+            source_security_group,
             // The VPC those same subnets belong to, as EC2 reports it — left unreported
             // when there is no EC2 to ask, rather than invented for a VPC nothing created.
             vpc_id: placement.vpc_id,
@@ -412,21 +454,16 @@ fn build_listeners(
     Ok(entries)
 }
 
-/// This operation's wording for a listener the model's own rules rule out: the protocol
-/// set is `UnsupportedProtocolException` (400) and the front-end/back-end pairing is
-/// `InvalidConfigurationRequestException` (409), both of which this operation declares.
+/// This operation's wording for a listener the model's own rules rule out: a protocol
+/// member outside the documented set is a VALUE this service cannot accept, so it answers
+/// under the code every such value answers under, while the front-end/back-end pairing is
+/// the `InvalidConfigurationRequestException` (409) this operation declares.
 fn rejected(rejection: crate::state::ListenerRejection) -> CreateLoadBalancerError {
     match rejection {
-        crate::state::ListenerRejection::UnsupportedProtocol { protocol } => {
-            CreateLoadBalancerErrorModeled::UnsupportedProtocolException(
-                UnsupportedProtocolException {
-                    message: Some(format!(
-                        "Protocol must be one of {:?}; got '{protocol}'",
-                        crate::state::LISTENER_PROTOCOLS
-                    )),
-                },
+        crate::state::ListenerRejection::UnsupportedProtocol { member } => {
+            crate::scaffolded::Scaffolded::validation_error(
+                crate::state::listener_protocol_message(member),
             )
-            .into()
         }
         crate::state::ListenerRejection::IncompatibleProtocols {
             protocol,

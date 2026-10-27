@@ -141,7 +141,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalException(InternalException {
@@ -154,7 +154,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // EventBridge rule or event bus reaches here: a bad request, refused before
         // the store is touched, and a different answer from a well-formed ARN naming
         // a resource that does not exist.
-        let resource = crate::state::parse_tagged_resource(&input.resource_arn)
+        let region = crate::state::request_region(ctx.parts());
+        let resource = crate::state::parse_tagged_resource(&input.resource_arn, &region)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let mut store = state.lock();

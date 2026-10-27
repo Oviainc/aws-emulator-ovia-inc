@@ -152,8 +152,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the default event bus is displayed" — both resolved by the one helper
         // every operation of this service addresses a bus through.
         let bus_name = crate::state::effective_bus_name(input.name.as_deref());
+        // A pure read: the Region's `default` bus is resolved without writing
+        // anything, so the store is left exactly as it was found.
         let store = state.lock();
-        let Some(bus) = store.bus(&bus_name) else {
+        let Some(bus) = store.bus(&region, &bus_name) else {
             return Err(DescribeEventBusErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_event_bus(&bus_name)),

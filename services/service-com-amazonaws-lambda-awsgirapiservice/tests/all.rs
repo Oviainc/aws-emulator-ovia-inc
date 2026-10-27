@@ -39,8 +39,12 @@ mod async_invocation;
 mod capacity_provider_bounds;
 #[path = "all/capacity_provider_listing.rs"]
 mod capacity_provider_listing;
+#[path = "all/capacity_provider_managed_function_state.rs"]
+mod capacity_provider_managed_function_state;
 #[path = "all/capacity_provider_naming.rs"]
 mod capacity_provider_naming;
+#[path = "all/capacity_provider_refusal_messages.rs"]
+mod capacity_provider_refusal_messages;
 #[path = "all/capacity_provider_update.rs"]
 mod capacity_provider_update;
 #[path = "all/capacity_providers.rs"]
@@ -59,6 +63,8 @@ mod concurrency_quota_refusal_rules;
 mod durable_execution_bound;
 #[path = "all/durable_execution_listing.rs"]
 mod durable_execution_listing;
+#[path = "all/durable_execution_start.rs"]
+mod durable_execution_start;
 #[path = "all/event_source_mapping_delete_in_use.rs"]
 mod event_source_mapping_delete_in_use;
 #[path = "all/event_source_mapping_deletion.rs"]

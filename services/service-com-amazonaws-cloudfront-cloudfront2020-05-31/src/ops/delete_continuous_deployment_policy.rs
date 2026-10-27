@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteContinuousDeploymentPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteContinuousDeploymentPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteContinuousDeploymentPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the continuous deployment policy an id names from [`crate::state`]'s policy
+//! slice, so the id afterwards names no policy and the staging distribution domain names it
+//! held are free for another policy to claim. Answers 204 with no body: the record is gone,
+//! so there is nothing to report.
+//!
+//! The refusals, in the order they are checked — each one BEFORE anything is removed, so a
+//! refused delete leaves the policy readable at the version it already had:
+//!
+//! * an `If-Match` that is absent, is not a version token at all, or is not THIS policy's
+//!   current version — `InvalidIfMatchVersion` (HTTP 400): the modelled sentence is "the
+//!   If-Match version is missing or not valid", and recorded behaviour refuses a stale
+//!   version of this resource with it too, so what the header has to carry is the policy's
+//!   current token. The form of the header is a property of the request, so a header no
+//!   version could make valid is answered before the id is resolved
+//!   ([`crate::state::if_match_version`]);
+//! * an id no stored policy holds — `NoSuchContinuousDeploymentPolicy` (HTTP 404);
+//! * a policy a stored distribution still attaches — `ContinuousDeploymentPolicyInUse`
+//!   (HTTP 409), "You cannot delete a continuous deployment policy that is associated with
+//!   a primary distribution. First update your distribution to remove the continuous
+//!   deployment policy, then you can delete the policy"
+//!   ([`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_continuous_deployment_policy`]).
+//!
+//! `PreconditionFailed` is modelled but not reachable here: the one precondition this
+//! operation evaluates is the `If-Match` version, which recorded behaviour refuses with
+//! `InvalidIfMatchVersion` whether it is unusable or merely out of date.
+//! `InvalidArgument` is not reachable either: the only parameter beside the header is the
+//! `{Id}` label, and an id this store does not hold is the modelled 404 rather than a bad
+//! argument. `AccessDenied` is unreachable here, as it is from every other operation in
+//! this service: the emulator authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +193,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteContinuousDeploymentPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteContinuousDeploymentPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteContinuousDeploymentPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // The FORM of the `If-Match` header: "missing or not valid" is a property of the
+        // request alone, so it is decided before the id is resolved — no version of any
+        // policy could make an absent or malformed header valid.
+        let Some(submitted_version) = crate::state::if_match_version(input.if_match.as_deref())
+        else {
+            return Err(
+                DeleteContinuousDeploymentPolicyErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this
+        // call reads it: whether a distribution still attaches this policy is decided
+        // against the distributions as they stand at this instant.
+        store.settle(::std::time::SystemTime::now());
+
+        let Some(current_etag) = store
+            .continuous_deployment_policy(&input.id)
+            .map(|stored| stored.etag.clone())
+        else {
+            return Err(
+                DeleteContinuousDeploymentPolicyErrorModeled::NoSuchContinuousDeploymentPolicy(
+                    crate::state::no_such_continuous_deployment_policy(),
+                )
+                .into(),
+            );
+        };
+
+        // The precondition is checked against the STORED version: a delete only lands on
+        // the version its caller actually read. "The If-Match version is missing or not
+        // valid" covers a version that is not this resource's, which is what recorded
+        // behaviour answers a stale token with.
+        if submitted_version != current_etag {
+            return Err(
+                DeleteContinuousDeploymentPolicyErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into(),
+            );
+        }
+
+        // "You cannot delete a continuous deployment policy that's attached to a primary
+        // distribution. First update your distribution to remove the continuous deployment
+        // policy, then you can delete the policy." So a policy any stored distribution
+        // still attaches is refused here and stays readable.
+        if store
+            .distribution_using_continuous_deployment_policy(&input.id)
+            .is_some()
+        {
+            return Err(
+                DeleteContinuousDeploymentPolicyErrorModeled::ContinuousDeploymentPolicyInUse(
+                    crate::state::continuous_deployment_policy_in_use(),
+                )
+                .into(),
+            );
+        }
+
+        // Gone means gone: the record a read answered from is removed, so the id names no
+        // policy and the staging distribution domain names it held are free for a later
+        // create to claim.
+        store.continuous_deployment_policies.remove(&input.id);
+
+        Ok(DeleteContinuousDeploymentPolicyOutput)
     }
 }

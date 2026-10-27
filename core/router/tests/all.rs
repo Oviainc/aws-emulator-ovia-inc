@@ -258,6 +258,10 @@ mod elbv2_subnet_vpc_membership;
 // landing router suite puts its line.
 #[path = "all/elb_classic_zone_membership_follows_its_subnets.rs"]
 mod elb_classic_zone_membership_follows_its_subnets;
+// Declared beside its sibling Classic suite above, in this span of the sorted list rather
+// than in the appended tail, for the same reason the notes above give.
+#[path = "all/elb_classic_network_resources_resolve_in_ec2.rs"]
+mod elb_classic_network_resources_resolve_in_ec2;
 // Alphabetically between the `elbv2_` and `es_` suites, rather than appended at the end
 // of this file, which is where every new suite lands and therefore where two changes
 // collide.

@@ -313,7 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .unwrap_or_default();
 
-            let Some(bus) = store.bus(&destination_bus) else {
+            let Some(bus) = store.bus(&region, &destination_bus) else {
                 return Err(StartReplayErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(crate::state::no_such_event_bus(&destination_bus)),

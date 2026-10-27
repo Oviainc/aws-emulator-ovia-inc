@@ -47,6 +47,8 @@ mod policy_catalog;
 mod policy_version_detail;
 #[path = "all/policy_versions.rs"]
 mod policy_versions;
+#[path = "all/refusal_message_bound.rs"]
+mod refusal_message_bound;
 #[path = "all/refused_write_mints_nothing.rs"]
 mod refused_write_mints_nothing;
 #[path = "all/rejection_wording.rs"]

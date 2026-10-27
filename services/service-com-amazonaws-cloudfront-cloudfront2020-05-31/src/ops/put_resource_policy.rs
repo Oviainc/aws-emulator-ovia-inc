@@ -8,9 +8,11 @@
 //! the first rather than adding a second policy beside it.
 //!
 //! The surface attaches policies to ONE resource type
-//! ([`crate::state::RESOURCE_POLICY_RESOURCE_TYPE`]), so an ARN naming anything else — a
-//! string that is no ARN, an ARN of another service, an ARN of another CloudFront resource
-//! type — is a bad PARAMETER, refused 400 `InvalidArgument` before anything is written.
+//! ([`crate::state::RESOURCE_POLICY_RESOURCE_TYPE`]), so a `ResourceArn` naming anything
+//! else is a bad PARAMETER, refused 400 `InvalidArgument` before anything is written
+//! ([`crate::state::resource_policy_arn_refusal`]): a value that is no ARN at all is
+//! refused on its form, and an ARN of another service or of another CloudFront resource
+//! type on the resource type it names.
 //!
 //! ## Shape of an operation
 //!
@@ -155,13 +157,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        // The PARAMETER gate, decided before anything is written: the surface attaches
-        // policies to one resource type, so an ARN naming any other resource is refused
-        // and the store is left exactly as it was.
-        if crate::state::resource_policy_resource(&input.resource_arn).is_none() {
-            return Err(PutResourcePolicyErrorModeled::InvalidArgument(
-                crate::state::invalid_resource_policy_resource_type(),
-            )
+        // The PARAMETER gate, decided before anything is written: a value that is no ARN
+        // at all is refused on its form and an ARN naming any other resource on the type it
+        // names, each with the sentence this operation words that condition in, and the
+        // store is left exactly as it was.
+        if let Some(refusal) = crate::state::resource_policy_arn_refusal(&input.resource_arn) {
+            return Err(PutResourcePolicyErrorModeled::InvalidArgument(match refusal {
+                crate::state::ResourceArnRefusal::Malformed => crate::state::malformed_arn(),
+                crate::state::ResourceArnRefusal::WrongType => {
+                    crate::state::invalid_resource_policy_resource_type()
+                }
+            })
             .into());
         }
 
