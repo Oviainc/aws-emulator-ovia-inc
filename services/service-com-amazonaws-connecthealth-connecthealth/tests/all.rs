@@ -23,6 +23,8 @@ mod domain_response_projection;
 mod domain_subscription_lifecycle;
 #[path = "all/domain_web_app_identity.rs"]
 mod domain_web_app_identity;
+#[path = "all/encryption_context_projection.rs"]
+mod encryption_context_projection;
 #[path = "all/error_detail_member.rs"]
 mod error_detail_member;
 #[path = "all/list_tags_for_resource.rs"]
