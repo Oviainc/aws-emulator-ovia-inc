@@ -218,13 +218,46 @@ enum ControlArnRef<'a> {
 impl<'a> ControlArnRef<'a> {
     /// Read an ARN as the control it names, or `None` when it names none.
     fn parse(arn: &'a str) -> Option<Self> {
+        let parsed = AccountlessArn::parse(arn)?;
+        let identifier = parsed.resource.strip_prefix("control/")?;
+        if identifier.is_empty() {
+            return None;
+        }
+        match parsed.service {
+            // The global catalog form carries no Region segment.
+            "controlcatalog" if parsed.region.is_empty() => Some(Self::Catalog(identifier)),
+            "controltower" => Some(Self::ControlTower(identifier)),
+            _ => None,
+        }
+    }
+}
+
+/// The segments that carry meaning in an ARN this service accepts: none of the forms
+/// its modeled ARN patterns admit carries an account id, so each is
+/// `arn:{PARTITION}:{SERVICE}:{REGION}::{RESOURCE}`.
+///
+/// Parsing drops the partition because no modeled ARN pattern here distinguishes one:
+/// every pattern restricts that segment to the `aws` family (`aws(?:[-a-z]*)?`) and
+/// says nothing more about it, so the segment is checked for membership of the family
+/// and then carries no information about which resource the ARN names.
+#[derive(Debug)]
+struct AccountlessArn<'a> {
+    service: &'a str,
+    region: &'a str,
+    resource: &'a str,
+}
+
+impl<'a> AccountlessArn<'a> {
+    /// Split an ARN into its meaningful segments, or `None` when it is not an ARN of
+    /// this shape at all.
+    fn parse(arn: &'a str) -> Option<Self> {
         let mut fields = arn.splitn(6, ':');
         let (
             Some("arn"),
             Some(partition),
             Some(service),
             Some(region),
-            // Neither accepted form carries an account id.
+            // No accepted form carries an account id.
             Some(""),
             Some(resource),
         ) = (
@@ -238,21 +271,14 @@ impl<'a> ControlArnRef<'a> {
         else {
             return None;
         };
-        // The modeled `ControlArn` pattern admits the `aws` partition family only:
-        // ^arn:(aws(?:[-a-z]*)?):(controlcatalog|controltower):[a-zA-Z0-9-]*::control/…
         if !partition.starts_with("aws") {
             return None;
         }
-        let identifier = resource.strip_prefix("control/")?;
-        if identifier.is_empty() {
-            return None;
-        }
-        match service {
-            // The global catalog form carries no Region segment.
-            "controlcatalog" if region.is_empty() => Some(Self::Catalog(identifier)),
-            "controltower" => Some(Self::ControlTower(identifier)),
-            _ => None,
-        }
+        Some(Self {
+            service,
+            region,
+            resource,
+        })
     }
 }
 
@@ -281,6 +307,41 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// model's own.
 fn catalog_arn(kind: &str, id: &str) -> String {
     format!("arn:aws:controlcatalog:::{kind}/{id}")
+}
+
+/// The ARN this catalog stores for the resource of `kind` that `requested_arn` names.
+///
+/// What names a catalog resource is its kind and the opaque identifier after
+/// `{kind}/`, exactly as it is what names a control (see
+/// [`ComAmazonawsControlcatalogControlcatalogState::resolve_control`]): the
+/// `{PARTITION}` segment says which partition the caller writes the ARN in, and the
+/// catalog is global, publishing one resource per kind and identifier. So every ARN
+/// of that kind the modeled patterns admit — any partition of the `aws` family —
+/// names the same resource, and a caller's ARN is read through here before it is
+/// compared with a stored one.
+///
+/// An ARN that names no resource of `kind` is returned unchanged, so it goes on
+/// matching nothing: the modeled pattern on each member that accepts one refuses such
+/// an ARN at the boundary anyway.
+pub fn canonical_catalog_arn(kind: &str, requested_arn: &str) -> String {
+    catalog_identifier(kind, requested_arn)
+        .map(|identifier| catalog_arn(kind, identifier))
+        .unwrap_or_else(|| requested_arn.to_string())
+}
+
+/// The opaque identifier a `controlcatalog` ARN of `kind` carries, or `None` when the
+/// ARN names no resource of that kind.
+fn catalog_identifier<'a>(kind: &str, arn: &'a str) -> Option<&'a str> {
+    let parsed = AccountlessArn::parse(arn)?;
+    // The catalog is global, so its own ARNs carry no Region segment.
+    if parsed.service != "controlcatalog" || !parsed.region.is_empty() {
+        return None;
+    }
+    let identifier = parsed
+        .resource
+        .strip_prefix(kind)
+        .and_then(|rest| rest.strip_prefix('/'))?;
+    (!identifier.is_empty()).then_some(identifier)
 }
 
 /// Length of the opaque identifier at the end of a catalog ARN. The modeled ARN
