@@ -1841,18 +1841,35 @@ pub fn alias_name_message(name: &str) -> String {
     pattern_violation_message("name", name, ALIAS_NAME_PATTERN)
 }
 
-/// The message an operation addressing an alias refuses with when the function holds no
-/// alias of that name: `ResourceNotFoundException`'s own sentence, naming the alias by
-/// the fully-qualified ARN the request asked about.
+/// The message the READ of an alias refuses with when the function holds no alias of that
+/// name: `ResourceNotFoundException`'s own sentence, naming the alias by the
+/// fully-qualified ARN the request asked about.
 ///
 /// `alias_arn` is the function's unqualified ARN qualified by the alias name
 /// ([`FunctionRecord::versioned_arn`]), so the whole sentence is built from the request:
 /// the caller recovers the ARN it asked for by stripping the fixed prefix, which is how
 /// every Lambda resource-shaped refusal states the resource it could not find (compare
 /// the `Function not found: <arn>` [`resolve_function`] builds).
+///
+/// Lambda words this absence per operation rather than once for the resource kind, so the
+/// WRITE of an alias states the same ARN after its own prefix
+/// ([`alias_update_not_found_message`]), exactly as a layer version addressed through its
+/// policy states a sentence the read of that version does not.
 #[must_use]
 pub fn alias_not_found_message(alias_arn: &str) -> String {
     format!("Cannot find alias arn: {alias_arn}")
+}
+
+/// The message an operation that UPDATES an alias refuses with when the function holds no
+/// alias of that name, which is a different sentence from the one the read answers
+/// ([`alias_not_found_message`]).
+///
+/// `alias_arn` is the same fully-qualified alias ARN
+/// ([`FunctionRecord::versioned_arn`]), so both sentences name the alias the request asked
+/// about and only the fixed lead-in tells them apart.
+#[must_use]
+pub fn alias_update_not_found_message(alias_arn: &str) -> String {
+    format!("Alias not found: {alias_arn}")
 }
 
 /// One alias of a function: "a function identifier that you can update to invoke a

@@ -326,8 +326,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The binding, and with it the samples the stream holds: `set_property_alias`
         // moves them onto the property's series, so the history the alias ingested and
-        // the history written through the pair are one history from here on.
-        store.set_property_alias(&asset_id, &property_id, Some(input.alias.clone()));
+        // the history written through the pair are one history from here on. The asset
+        // carries the property whose alias just changed, so that same helper moves its
+        // last-update instant to this call's — the write every operation that binds or
+        // unbinds a property's alias owes.
+        store.set_property_alias(&asset_id, &property_id, Some(input.alias.clone()), now);
 
         // The token is spent only now that the binding has been made: a refused
         // request bound nothing, so the caller may send its token again. The resource

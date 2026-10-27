@@ -171,7 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(crate::state::INVALID_DOMAIN_NAME_IDENTIFIER));
         };
         if domain.api_mappings.remove(&input.api_mapping_id).is_none() {
-            return Err(not_found(crate::state::INVALID_API_MAPPING_IDENTIFIER));
+            return Err(not_found(&crate::state::api_mapping_not_found_message(
+                &input.api_mapping_id,
+            )));
         }
 
         Ok(DeleteApiMappingOutput)

@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApiMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApiMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApiMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -152,18 +142,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApiMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApiMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApiMapping"))
+        let _ = ctx;
+        // The mapping key is the base path requests are matched on, so a key the request
+        // carries is checked for its form before anything is looked up: the rule is the
+        // key's alone and does not depend on the store. A request that carries no key
+        // changes no base path, so there is nothing of this rule to check for it.
+        if let Some(message) = input
+            .api_mapping_key
+            .as_deref()
+            .and_then(|key| crate::state::validate_api_mapping_key(key).err())
+        {
+            return Err(bad_request(&message));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateApiMapping",
+            ));
+        };
+        let mut store = state.lock();
+        // Split the guard into field borrows, so the domain name that owns the mapping
+        // can be held mutably while the api it would route to is read: the two stores are
+        // disjoint fields of one state struct.
+        let store = &mut *store;
+
+        // Both resources the path addresses are resolved first, outermost one first — the
+        // same order every other reader and writer of a single mapping resolves the pair
+        // in — because a mapping exists only under the domain name that owns it.
+        let Some(domain) = store.domain_names.get_mut(&input.domain_name) else {
+            return Err(not_found(crate::state::INVALID_DOMAIN_NAME_IDENTIFIER));
+        };
+        let Some(current) = domain.api_mappings.get(&input.api_mapping_id) else {
+            return Err(not_found(&crate::state::api_mapping_not_found_message(
+                &input.api_mapping_id,
+            )));
+        };
+
+        // A PATCH (`PATCH /v2/domainnames/{DomainName}/apimappings/{ApiMappingId}`): the
+        // record this request would leave behind is every member the request carries,
+        // over the members it omits. `ApiId` is required, so a patch always names the api;
+        // `ApiMappingKey` and `Stage` are optional and an omitted one keeps the value the
+        // mapping already routes on. The whole record is resolved BEFORE anything is
+        // written, so a refused patch leaves the mapping exactly as it was.
+        let api_id = input.api_id;
+        let api_mapping_key = input
+            .api_mapping_key
+            .or_else(|| current.api_mapping_key.clone());
+        let stage = input.stage.unwrap_or_else(|| current.stage.clone());
+
+        // A stored mapping always routes to a stage of an api the account holds, so the
+        // PAIR the patch would leave behind is weighed against the store — not only the
+        // members the request happened to carry: moving a mapping to another api is
+        // refused unless that api holds the stage the mapping would still route to.
+        let Some(api) = store.apis.get(&api_id) else {
+            return Err(not_found(&crate::state::invalid_api_identifier_message(
+                &api_id,
+            )));
+        };
+        if !api.stages.contains_key(&stage) {
+            return Err(bad_request(crate::state::INVALID_STAGE_IDENTIFIER));
+        }
+
+        // One base path of one domain name resolves to exactly one api stage, so a patch
+        // that would move this mapping onto a base path ANOTHER mapping of the same domain
+        // name already occupies would make routing on it ambiguous: that is a conflict
+        // with the current state of a resource the request is associated with. A patch
+        // that leaves the mapping on the base path it already occupies conflicts with
+        // nothing.
+        let base_path = api_mapping_key.as_deref().unwrap_or("");
+        if domain
+            .api_mapping_for_key(base_path, Some(&input.api_mapping_id))
+            .is_some()
+        {
+            return Err(UpdateApiMappingErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::API_MAPPING_KEY_CONFLICT.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Write the patched members onto the record under the id it was minted with: an
+        // update moves no mapping to a new identifier, and nothing else about the domain
+        // name changes. The patch was weighed against the domain name's other mappings,
+        // which the record could not be held mutably across, so the id is resolved once
+        // more — under the same lock, and answering the same refusal as above rather than
+        // minting anything, because this operation mints no mapping.
+        let Some(record) = domain.api_mappings.get_mut(&input.api_mapping_id) else {
+            return Err(not_found(&crate::state::api_mapping_not_found_message(
+                &input.api_mapping_id,
+            )));
+        };
+        record.api_id = api_id;
+        record.api_mapping_key = api_mapping_key;
+        record.stage = stage;
+
+        // Project the STORED record, so what this caller is told is what a later
+        // GetApiMapping reports.
+        let stored = record.to_wire();
+        Ok(UpdateApiMappingOutput {
+            api_id: Some(stored.api_id),
+            api_mapping_id: stored.api_mapping_id,
+            api_mapping_key: stored.api_mapping_key,
+            stage: Some(stored.stage),
+        })
     }
+}
+
+/// This operation's refusal of a request it models no more specific error for: the
+/// modelled `BadRequestException` ("The request is not valid, for example, the input is
+/// incomplete or incorrect"), whose message names the constraint that was not met.
+fn bad_request(message: &str) -> UpdateApiMappingError {
+    UpdateApiMappingErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's refusal of a request naming a resource the account does not hold:
+/// the modelled `NotFoundException` ("The resource specified in the request was not
+/// found").
+fn not_found(message: &str) -> UpdateApiMappingError {
+    UpdateApiMappingErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
 }

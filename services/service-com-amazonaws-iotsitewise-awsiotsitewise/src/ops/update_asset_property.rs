@@ -360,7 +360,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this same lock, so a miss here would mean the store changed under it:
         // reported as the modelled server failure rather than answered 200 after a
         // partial write.
-        if !store.set_property_alias(&asset_id, &property_id, input.property_alias.clone()) {
+        if !store.set_property_alias(&asset_id, &property_id, input.property_alias.clone(), now) {
             return Err(store_moved(&asset_id, &property_id));
         }
         let Some(asset) = store.assets.get_mut(&asset_id) else {
@@ -376,7 +376,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
         property.unit = unit;
         // The asset carries the property that just changed, so its last-update
-        // instant moves with it.
+        // instant moves with it. Written here as well as inside the alias helper,
+        // because the members above change whether or not the alias binding does.
         asset.last_update_date = now;
 
         // The token is spent only now that the update has succeeded: a refused

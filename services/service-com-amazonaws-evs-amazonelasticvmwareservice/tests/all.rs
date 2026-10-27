@@ -21,6 +21,8 @@ mod connector_deletion;
 mod connector_health_checks;
 #[path = "all/connector_secret_arn.rs"]
 mod connector_secret_arn;
+#[path = "all/connector_update_while_deleting.rs"]
+mod connector_update_while_deleting;
 #[path = "all/connectors.rs"]
 mod connectors;
 // SUPERSEDED and empty: mainline's `connectors.rs` replaced its connector half and

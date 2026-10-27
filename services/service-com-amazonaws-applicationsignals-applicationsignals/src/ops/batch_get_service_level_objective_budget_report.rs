@@ -341,14 +341,22 @@ fn stepped_months(
 /// (`smithy_query(query="doc", shape="ServiceLevelObjectiveBudgetReport",
 /// member="BudgetStatus")`). An SLO monitors its entity only from the moment it is created,
 /// which is the same window rule this service's topology reads apply.
+///
+/// The three instants are ordered on the module's one instant key
+/// (`crate::state::instant_nanos`), the same key those reads apply, so a creation a fraction
+/// of a microsecond after the window ends leaves the window empty here exactly as it leaves
+/// the entity undiscovered there.
 fn evaluated(
     interval_start: i64,
     slo: &ServiceLevelObjective,
     at: &::aws_smithy_types::DateTime,
     now: &::aws_smithy_types::DateTime,
 ) -> bool {
-    let window_start = (interval_start as f64).max(slo.created_time.as_secs_f64());
-    let window_end = at.as_secs_f64().min(now.as_secs_f64());
+    let interval_start = crate::state::instant_nanos(&::aws_smithy_types::DateTime::from_secs(
+        interval_start,
+    ));
+    let window_start = interval_start.max(crate::state::instant_nanos(&slo.created_time));
+    let window_end = crate::state::instant_nanos(at).min(crate::state::instant_nanos(now));
     window_start < window_end
 }
 

@@ -174,6 +174,89 @@ pub async fn create_stack(
     call(router, "CreateStack", &members).await
 }
 
+/// The inner text of every non-nested `<tag …>…</tag>` BLOCK, in document order, left
+/// exactly as the serializer wrote it.
+///
+/// [`xml_texts`] is the leaf form of this scan: it unescapes what it finds, which is right
+/// for a value and wrong for a block that carries more elements. A caller reading a nested
+/// list (the `<member>`s inside one `<Details>`) takes the block first and scans INSIDE it,
+/// so a sibling list's members cannot be swept up with it.
+///
+/// The open tag may carry ATTRIBUTES — the query serializer puts an `xmlns` on the first
+/// member of a list it renders — so the element NAME is matched and whatever follows it up
+/// to the `>` is skipped. A longer element name that merely starts with `tag` is not that
+/// element (`<Tagging>` is not a `<Tag>`), so the scan moves past it.
+pub fn xml_blocks(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut found = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        if !after.starts_with('>') && !after.starts_with(char::is_whitespace) {
+            rest = &rest[start + 1..];
+            continue;
+        }
+        let Some(open_end) = after.find('>') else { break };
+        let inner = &after[open_end + 1..];
+        let Some(end) = inner.find(&close) else { break };
+        found.push(inner[..end].to_string());
+        rest = &inner[end + close.len()..];
+    }
+    found
+}
+
+/// One `ListImports` read: the HTTP status, the XML body, the stack names the page reports
+/// in wire order, and the `NextToken` that resumes the read just past them.
+///
+/// The ONE `ListImports` reader of this crate's suites — `cross_stack_imports.rs` asserts
+/// WHICH stacks the import index holds and `list_imports_pages.rs` how that index is paged —
+/// so neither can drift about how the response is read. The status and the body come back
+/// rather than being asserted here, because a case that sends a cursor the service never
+/// issued is asserting the REFUSAL.
+pub async fn list_imports_page(
+    router: &MultiServiceRouter,
+    region: &str,
+    export_name: &str,
+    token: Option<&str>,
+) -> (u16, String, Vec<String>, Option<String>) {
+    let mut members = vec![member("ExportName", export_name)];
+    if let Some(token) = token {
+        members.push(member("NextToken", token));
+    }
+    let (status_code, body) = call_in(router, region, "ListImports", &members).await;
+    // The `Imports` list is read INSIDE its own block, so a `<member>` of another list the
+    // envelope carries cannot be swept up with it.
+    let names = match xml_blocks(&body, "Imports").into_iter().next() {
+        Some(block) => xml_texts(&block, "member"),
+        None => Vec::new(),
+    };
+    let next_token = xml_text(&body, "NextToken");
+    (status_code, body, names, next_token)
+}
+
+/// [`list_imports_page`] for a case that expects the read to SUCCEED: the page's stack names
+/// and its `NextToken`.
+///
+/// `ListImports` models no error, so every well-formed read of it is a 200 — including a read
+/// of an export name nothing publishes — and that one sentence is asserted here rather than
+/// in each suite that reads the index.
+pub async fn list_imports_ok(
+    case: &str,
+    router: &MultiServiceRouter,
+    region: &str,
+    export_name: &str,
+    token: Option<&str>,
+) -> (Vec<String>, Option<String>) {
+    let (status_code, body, names, next_token) =
+        list_imports_page(router, region, export_name, token).await;
+    assert_eq!(
+        status_code, 200,
+        "case {case:?}: expected ListImports to succeed, got {status_code} {body}"
+    );
+    (names, next_token)
+}
+
 /// `GetTemplate` at one stage, or at the service's default when `stage` is `None`.
 pub async fn get_template(
     router: &MultiServiceRouter,

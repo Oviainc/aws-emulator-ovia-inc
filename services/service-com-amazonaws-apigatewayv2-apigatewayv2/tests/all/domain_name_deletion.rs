@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
-    INVALID_API_MAPPING_IDENTIFIER, INVALID_DOMAIN_NAME_IDENTIFIER,
+    api_mapping_not_found_message, INVALID_DOMAIN_NAME_IDENTIFIER,
 };
 
 use crate::api_lifecycle::{as_str, emulator, error_code};
@@ -214,7 +214,7 @@ async fn deleting_an_api_mapping_removes_only_that_mapping() {
         // The mapping is gone from its own reader and from the collection; every sibling
         // is still there.
         let (status, body) = get_mapping(&emulator, &domain, &deleted).await;
-        assert_not_found(case, status, &body, INVALID_API_MAPPING_IDENTIFIER);
+        assert_not_found(case, status, &body, &api_mapping_not_found_message(&deleted));
         let listed = listed_mappings(&emulator, case, &domain).await;
         assert!(
             !listed.contains(&deleted),
@@ -250,7 +250,7 @@ async fn deleting_an_api_mapping_removes_only_that_mapping() {
             None,
         )
         .await;
-        assert_not_found(case, status, &body, INVALID_API_MAPPING_IDENTIFIER);
+        assert_not_found(case, status, &body, &api_mapping_not_found_message(&deleted));
     }
 }
 
@@ -351,7 +351,12 @@ async fn an_api_mapping_is_deleted_only_under_its_own_domain() {
         None,
     )
     .await;
-    assert_not_found(case, status, &body, INVALID_API_MAPPING_IDENTIFIER);
+    assert_not_found(
+        case,
+        status,
+        &body,
+        &api_mapping_not_found_message(&mapping_id),
+    );
     let (status, body) = call(
         &emulator,
         "DELETE",

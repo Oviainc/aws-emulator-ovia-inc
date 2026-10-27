@@ -151,7 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(crate::state::INVALID_DOMAIN_NAME_IDENTIFIER));
         };
         let Some(record) = domain.api_mappings.get(&input.api_mapping_id) else {
-            return Err(not_found(crate::state::INVALID_API_MAPPING_IDENTIFIER));
+            return Err(not_found(&crate::state::api_mapping_not_found_message(
+                &input.api_mapping_id,
+            )));
         };
 
         let stored = record.to_wire();

@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    ConflictException, ExportFilter, ImportOptions, ResourceNotFoundException,
-    VectorSearchConfiguration,
+    AccessDeniedException, ConflictException, ExportFilter, ImportOptions,
+    ResourceNotFoundException, VectorSearchConfiguration,
 };
 
 /// The ARN namespace (and SigV4 signing name) of this service, from the model's
@@ -2600,6 +2600,129 @@ pub fn private_endpoint_not_found(graph_identifier: &str, vpc_id: &str) -> Resou
 /// the only place either fact can go.
 pub fn resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
     resource_not_found_for_caller("resource", "arn", resource_arn)
+}
+
+// ---------------------------------------------------------------------------
+// Passing an IAM role
+//
+// Three operations take a `roleArn` this service has to ASSUME to reach the caller's
+// data (`StartImportTask`, `CreateGraphUsingImportTask`, `StartExportTask`). Whether
+// the caller may hand that role over is an authorization decision about the caller and
+// that one member, so it is stated once here and reached by every one of them — and by
+// the gate in `crate::service::pass_role`, which settles it ahead of the boundary's
+// model-constraint walk.
+// ---------------------------------------------------------------------------
+
+/// The most characters an AWS access key id carries, which is what the caller-supplied
+/// credential is reduced to before it names a principal.
+const MAX_ACCESS_KEY_ID_CHARS: usize = 128;
+
+/// The IAM principal this request was signed by, as an authorization refusal names it.
+///
+/// Derived from the request's OWN SigV4 access key id, so a denial names the caller that
+/// made the call rather than a fabricated identity; this emulator sees an access key id
+/// and no role session, so the id is rendered as the IAM user that holds it. That id is
+/// caller-controlled text, so it is first reduced to the characters an access key id may
+/// hold, and a request carrying no usable credential falls back to the account root —
+/// which keeps the value an ARN whatever the header said.
+pub fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    let holder: String = ::engine::extract_akid(&ctx.parts().headers)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(MAX_ACCESS_KEY_ID_CHARS)
+        .collect();
+    if holder.is_empty() {
+        ::engine::emulator_arn("iam", "", "root")
+    } else {
+        ::engine::emulator_arn("iam", "", &format!("user/{holder}"))
+    }
+}
+
+/// The resource prefix of an IAM role ARN, which is what tells a role apart from every
+/// other IAM identity an ARN can name (a user, a group, an instance profile).
+const IAM_ROLE_RESOURCE_PREFIX: &str = "role/";
+
+/// The account an IAM role ARN names, or `None` when the value names no IAM role at all.
+///
+/// The acceptance set is the one the model fixes for a pass-role member — `RoleArn`'s
+/// `@pattern` `^arn:aws[^:]*:iam::\d{12}:(role|role/service-role)(/[\w+=,.@-]+)+$`
+/// (`smithy_query(query="shape",shape="RoleArn")`): an `arn` of some `aws` partition, the
+/// `iam` service with no Region (IAM is global), a twelve-digit account, and a `role/`
+/// resource carrying at least one path segment. Read here rather than left to the
+/// boundary validator because the authorization decision below is reached BEFORE that
+/// walk, so it cannot assume the value has any particular form.
+fn iam_role_account(value: &str) -> Option<&str> {
+    let mut fields = value.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some("iam"),
+        Some(""),
+        Some(account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return None;
+    };
+    if !partition.starts_with("aws") {
+        return None;
+    }
+    if account.len() != 12 || !account.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let name = resource.strip_prefix(IAM_ROLE_RESOURCE_PREFIX)?;
+    let names_a_role = !name.is_empty()
+        && name.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_+=,.@-".contains(c))
+        });
+    names_a_role.then_some(account)
+}
+
+/// The denial for a role in an account other than the caller's: the service would have
+/// to assume a role it holds no trust relationship with, and nothing about the request
+/// can establish one.
+const CROSS_ACCOUNT_PASS_ROLE_DENIED: &str = "Cross-account pass role is not allowed.";
+
+/// The authorization decision on a role the request asks this service to pass: the
+/// `AccessDeniedException` (HTTP 403) that refuses it, or `None` when the caller may
+/// pass it.
+///
+/// A role is passable only when it belongs to the account the call was made by — there
+/// is one such account in this emulator ([`caller_account_id`]) — so the decision is the
+/// account the value names. The two refusals differ in what the caller can do about
+/// them: a role of another account is a role this service cannot assume however the
+/// request is spelled, while a value that names no role at all is simply an
+/// authorization the caller does not hold, which is the principal's own failure and
+/// names it.
+///
+/// Taken before anything else an operation does, so neither reaches the store: an
+/// authorization failure leaves no record behind.
+pub fn pass_role_denial(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    role_arn: &str,
+) -> Option<AccessDeniedException> {
+    match iam_role_account(role_arn) {
+        Some(account) if account == caller_account_id() => None,
+        Some(_) => Some(AccessDeniedException {
+            message: CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string(),
+        }),
+        None => Some(AccessDeniedException {
+            message: format!(
+                "User: {} is not authorized to perform: null",
+                caller_principal(ctx)
+            ),
+        }),
+    }
 }
 
 /// The modelled `ConflictException` for a create call whose requested name is already
