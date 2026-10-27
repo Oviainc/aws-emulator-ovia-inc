@@ -11,7 +11,12 @@
 //! (`expirationDate`), and that date is enforced here: every operation that
 //! resolves a deployment parameter first materialises the deletion the clock has
 //! made due ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::purge_expired`]),
-//! so no caller ever sees a parameter past its expiration date.
+//! so no caller ever sees a parameter past its expiration date. For the
+//! operations that resolve a parameter by the `resourceArn` the CALLER supplied,
+//! that whole sequence — judge the ARN as an input, take the store, materialise
+//! the due expiry, then resolve the record or answer the service's not-found
+//! failure — is this module's [`with_tagged_parameter`], so the rule is stated
+//! and applied in one place rather than re-derived per handler.
 //!
 //! The AGREEMENTS a deployment parameter is written against are held here too
 //! ([`ProvisionedAgreement`]). This API models no operation that creates a
@@ -33,8 +38,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    ConflictException, ResourceNotFoundException, ServiceQuotaExceededException,
-    ValidationException,
+    ConflictException, InternalServerException, ResourceNotFoundException,
+    ServiceQuotaExceededException, ValidationException,
 };
 
 /// This service's ARN namespace and sigv4 signing name
@@ -996,6 +1001,71 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState>)
+}
+
+/// The modelled `InternalServerException` (HTTP 500) for a request that could not
+/// reach this service's store at all ([`service_state`] answering `None`).
+///
+/// ONE sentence for every operation: the condition is the same one wherever it is
+/// met — the engine a handler holds is not the shared store — so the answer carries
+/// nothing from the request that happened to meet it.
+pub fn store_unavailable() -> InternalServerException {
+    InternalServerException {
+        message: "the deployment-parameter store is unavailable".to_string(),
+    }
+}
+
+/// Resolve the deployment parameter a caller-supplied `resource_arn` names, and run
+/// `resolved` on it — the whole sequence an operation that addresses a parameter BY
+/// ARN runs, in one place.
+///
+/// The sequence, in the order the service applies it:
+///
+/// 1. judge the ARN as an INPUT ([`validate_resource_arn`]): a value that is not a
+///    resource ARN of this service's vendor names nothing this API can address, so
+///    it is the front-end's bad request and the store is never consulted for it;
+/// 2. the rest of the operation's request-only judgement (`judge_request`), still
+///    ahead of the store, so a refusal the request earns on its own content does not
+///    depend on what the store holds;
+/// 3. take this service's store ([`service_state`]), or answer the modelled server
+///    error ([`store_unavailable`]) through the operation's own variant —
+///    `store_unavailable_as` is that variant's constructor;
+/// 4. materialise the deletion the clock has already made due, from ONE clock sample
+///    taken under the lock
+///    ([`ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState::purge_expired`]),
+///    so a parameter past its `expirationDate` is gone before the ARN is resolved;
+/// 5. resolve the record, or answer the service's not-found failure
+///    ([`parameter_not_found`]).
+///
+/// `resolved` therefore sees a record that EXISTS, still inside the store lock, and
+/// may read it or write it; what it answers is what the operation answers. Generic
+/// over the operation's modelled error enum and over what the operation reports, so
+/// one implementation of the sequence serves a reporting operation and a mutating
+/// one alike — and a change to any step is a change to all of them.
+pub fn with_tagged_parameter<Eng, E, T>(
+    engine: &Eng,
+    resource_arn: &str,
+    store_unavailable_as: impl FnOnce(InternalServerException) -> E,
+    judge_request: impl FnOnce() -> Result<(), E>,
+    resolved: impl FnOnce(&mut DeploymentParameterRecord) -> Result<T, E>,
+) -> Result<T, crate::scaffolded::Scaffolded<E>>
+where
+    Eng: Send + Sync + 'static,
+{
+    validate_resource_arn(resource_arn)?;
+    judge_request().map_err(crate::scaffolded::Scaffolded::Modeled)?;
+    let Some(state) = service_state(engine) else {
+        return Err(crate::scaffolded::Scaffolded::Modeled(store_unavailable_as(
+            store_unavailable(),
+        )));
+    };
+    let now = SystemTime::now();
+    let mut store = state.lock();
+    store.purge_expired(now);
+    let Some(record) = store.parameters.get_mut(resource_arn) else {
+        return Err(parameter_not_found());
+    };
+    resolved(record).map_err(crate::scaffolded::Scaffolded::Modeled)
 }
 
 /// Record the agreements this account holds ahead of any request.

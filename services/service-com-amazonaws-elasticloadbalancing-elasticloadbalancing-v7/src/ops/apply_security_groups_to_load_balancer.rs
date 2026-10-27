@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ApplySecurityGroupsToLoadBalancer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ApplySecurityGroupsToLoadBalancer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ApplySecurityGroupsToLoadBalancer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replaces the security groups the named load balancer carries with the
+//! ones the request names, after EC2 — which owns them — resolves every one of them. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +141,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ApplySecurityGroupsToLoadBalancer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ApplySecurityGroupsToLoadBalancerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ApplySecurityGroupsToLoadBalancer"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service's model declares no server-fault error, and a 501 would claim
+            // "not implemented", so an unreachable store is refused instead.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+        let region = crate::state::region_from_request(ctx.parts());
+
+        // "The specified security groups override the previously associated security
+        // groups": an association that names none would leave the load balancer with no
+        // group at all, which is why the model makes the member required — and the quota
+        // the list is bounded by is the one a load balancer's groups are bounded by
+        // wherever they are set, so the sentence lives once in `crate::state`.
+        if input.security_groups.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "SecurityGroups must name at least one security group",
+            ));
+        }
+        if input.security_groups.len() > crate::state::MAX_SECURITY_GROUPS_PER_LOAD_BALANCER {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::security_groups_quota_message(input.security_groups.len()),
+            ));
+        }
+
+        // The load balancer is resolved BEFORE the EC2 read, so a request naming one this
+        // region does not hold is refused for THAT whatever EC2 would have said about the
+        // groups — the refusal a caller gets does not depend on which of the two answers
+        // came back first. The lock is released again for the read.
+        let held = {
+            let guard = state.lock();
+            guard
+                .load_balancers_in(&region)
+                .is_some_and(|records| records.contains_key(&input.load_balancer_name))
+        };
+        if !held {
+            return Err(
+                ApplySecurityGroupsToLoadBalancerErrorModeled::AccessPointNotFoundException(
+                    AccessPointNotFoundException {
+                        message: Some(format!(
+                            "There is no ACTIVE Load Balancer named '{}'",
+                            input.load_balancer_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A security group is EC2's resource, so whether one exists is EC2's to say: the
+        // groups are resolved against EC2 while the store's lock is released, and a group the
+        // account does not hold is an association EC2 itself refuses, so the modelled
+        // `InvalidSecurityGroup` carries the code EC2 answered rather than a sentence
+        // restating it — the same refusal `CreateLoadBalancer` answers for a load balancer
+        // started with such a group. What EC2 reports for the groups it does hold is also
+        // what the load balancer reports as its source security group.
+        let source_security_group = match crate::state::resolve_source_security_group(
+            ctx,
+            &region,
+            &input.security_groups,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(_) => {
+                // The sentence the model itself gives `InvalidSecurityGroupException`:
+                // "One or more of the specified security groups do not exist."
+                // (`smithy_query(query="shape", shape="InvalidSecurityGroupException")`).
+                return Err(
+                    ApplySecurityGroupsToLoadBalancerErrorModeled::InvalidSecurityGroupException(
+                        InvalidSecurityGroupException {
+                            message: Some(
+                                "One or more of the specified security groups do not exist."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        let mut guard = state.lock();
+        // Looked up again because the lock was released for the EC2 read: the load balancer
+        // may have been deleted while it ran.
+        let Some(record) = guard
+            .load_balancers_in_mut(&region)
+            .and_then(|records| records.get_mut(&input.load_balancer_name))
+        else {
+            return Err(
+                ApplySecurityGroupsToLoadBalancerErrorModeled::AccessPointNotFoundException(
+                    AccessPointNotFoundException {
+                        message: Some(format!(
+                            "There is no ACTIVE Load Balancer named '{}'",
+                            input.load_balancer_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        record.security_groups = input.security_groups.clone();
+        // The source security group follows the groups: it is what EC2 reports for the
+        // first of the ones now associated, and unreported when there was no EC2 to ask —
+        // never the group a previous association resolved, which these groups replaced.
+        record.source_security_group = source_security_group;
+
+        // "The IDs of the security groups associated with the load balancer" — read back
+        // off the record that now holds them, so the answer is what a later
+        // `DescribeLoadBalancers` reports.
+        Ok(ApplySecurityGroupsToLoadBalancerOutput {
+            security_groups: Some(record.security_groups.clone()),
+        })
     }
 }

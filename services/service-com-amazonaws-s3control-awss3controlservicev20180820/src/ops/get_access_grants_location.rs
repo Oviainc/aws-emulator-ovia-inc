@@ -4,7 +4,7 @@
 //!
 //! Reports the registered S3 Access Grants location `CreateAccessGrantsLocation`
 //! recorded under this id, in the account's instance in the Region the request
-//! was signed for. Refuses with `AccessGrantsLocationNotExistsError` when that
+//! was signed for. Refuses with `NoSuchAccessGrantsLocationError` when that
 //! instance has no such location. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
@@ -164,9 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &input.access_grants_location_id,
         ) else {
-            return Err(crate::state::no_such_access_grants_location(
-                &input.access_grants_location_id,
-            ));
+            return Err(crate::state::no_such_access_grants_location());
         };
 
         Ok(GetAccessGrantsLocationOutput {

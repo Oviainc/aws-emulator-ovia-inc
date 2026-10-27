@@ -8,6 +8,11 @@
 //! cursor helper — the same entries `GetOrganizationRecommendation` resolves,
 //! so every ARN this list reports resolves and every stored one is listed.
 //!
+//! The store holds an organization recommendation only for a PRIORITIZED
+//! recommendation ([`crate::state::RECOMMENDATION_TYPE_PRIORITY`]), which is
+//! what makes this list prioritized-only: no filter here has to exclude
+//! anything, and `?type=standard` selects nothing.
+//!
 //! `resourcesAggregates` and `pillarSpecificAggregates` are AGGREGATED on every
 //! read over the member accounts' recommendations the organization
 //! recommendation covers

@@ -18,9 +18,14 @@
 //!   nothing does;
 //! * `nextToken` walks every entry exactly once at any page size, and a token
 //!   this read did not issue is refused with 400 `ValidationException`;
-//! * an exclusion a member account makes through
-//!   `BatchUpdateRecommendationResourceExclusion` is what this list reports for
-//!   that resource on the next read, and it moves no other resource;
+//! * the exclusion state a member resource carries is what this list reports
+//!   for that resource on the next read, and it moves no other resource; an
+//!   exclusion attempted through
+//!   `BatchUpdateRecommendationResourceExclusion` is refused per entry, because
+//!   an organization recommendation aggregates prioritized recommendations and
+//!   that operation does not support their resources;
+//! * only a prioritized recommendation has an organization recommendation at
+//!   all, a rule pinned in `tests/all/organization_prioritized_only.rs`;
 //! * a well-formed identifier that names no organization recommendation is 404
 //!   `ResourceNotFoundException`, and an input outside a modelled constraint is
 //!   400 `ValidationException`.
@@ -61,9 +66,15 @@ struct SeededResource {
     exclusion_status: &'static str,
 }
 
-/// One seeded check, when its recommendation and resources were last updated,
-/// and the resources themselves. Source: the `SEED` table in `src/state.rs`
-/// (one day apart in SEED order, which is not check-id order).
+/// One seeded check with an organization recommendation, when its
+/// recommendation and resources were last updated, and the resources
+/// themselves. Source: the `SEED` table in `src/state.rs` (one day apart in
+/// SEED order, which is not check-id order).
+///
+/// Only a check whose recommendation is prioritized has an organization
+/// recommendation — every organization operation supports only prioritized
+/// recommendations, a rule pinned in
+/// `tests/all/organization_prioritized_only.rs`.
 struct Seeded {
     check_id: &'static str,
     last_updated_at: &'static str,
@@ -71,37 +82,6 @@ struct Seeded {
 }
 
 const SEEDED: &[Seeded] = &[
-    Seeded {
-        check_id: "amazon-ebs-snapshots",
-        last_updated_at: "2024-01-03T00:00:00Z",
-        resources: &[
-            SeededResource {
-                id: "res-ebs-0001",
-                aws_resource_id: "vol-0ea1b2c3d4e5f6789",
-                region_code: "us-east-1",
-                status: "error",
-                exclusion_status: "included",
-            },
-            SeededResource {
-                id: "res-ebs-0002",
-                aws_resource_id: "vol-0ea2b2c3d4e5f6789",
-                region_code: "ap-southeast-1",
-                status: "ok",
-                exclusion_status: "excluded",
-            },
-        ],
-    },
-    Seeded {
-        check_id: "iam-access-key-rotation",
-        last_updated_at: "2024-01-04T00:00:00Z",
-        resources: &[SeededResource {
-            id: "res-iam-0001",
-            aws_resource_id: "AKIAIOSFODNN7EXAMPLE",
-            region_code: "us-east-1",
-            status: "ok",
-            exclusion_status: "included",
-        }],
-    },
     Seeded {
         check_id: "low-utilization-ec2-instances",
         last_updated_at: "2024-01-02T00:00:00Z",
@@ -711,7 +691,7 @@ async fn a_next_token_this_read_did_not_issue_is_refused() {
             "its own token on another organization recommendation's resources",
             format!(
                 "{}?nextToken={}",
-                resources_path("amazon-ebs-snapshots"),
+                resources_path("rds-idle-db-instances"),
                 label(&own_token)
             ),
         ),
@@ -751,73 +731,82 @@ async fn a_next_token_this_read_did_not_issue_is_refused() {
     );
 }
 
+/// The exclusion state a member resource carries is what the organization list
+/// reports for it, and what the organization recommendation's own
+/// `excludedCount` counts.
+///
+/// An organization recommendation aggregates PRIORITIZED recommendations, and
+/// `BatchUpdateRecommendationResourceExclusion` "currently doesn't support
+/// prioritized recommendation resources", so the rows write the state in
+/// process — and one row attempts it over the wire and asserts the refusal
+/// moves nothing.
 #[tokio::test]
-async fn an_exclusion_made_through_the_api_is_what_the_next_read_reports() {
-    let (router, _engine) = emulator();
-    let check = "amazon-ebs-snapshots";
-    let first = resource_arn(check, "res-ebs-0001");
-    let second = resource_arn(check, "res-ebs-0002");
+async fn the_exclusion_state_of_a_member_resource_is_what_the_next_read_reports() {
+    let (router, engine) = emulator();
+    let check = "rds-idle-db-instances";
 
-    /// One row: the `BatchUpdateRecommendationResourceExclusion` entries to
-    /// write first (none, for the seeded store), and the exclusion state the
-    /// list must then report for `res-ebs-0001` and `res-ebs-0002`.
+    /// One row: the exclusion state to write on each of `res-rds-0001` and
+    /// `res-rds-0002` (`None` leaves it as it is), and the exclusion state the
+    /// list must then report for the two.
     struct Row {
         case: &'static str,
-        entries: Vec<(String, bool)>,
+        write: [Option<&'static str>; 2],
         expected: [&'static str; 2],
     }
 
-    // Rows: each exclusion state written on each resource, one entry at a time
-    // and both in one call, so the expectation differs along which resource
-    // carries which state. The seed leaves `res-ebs-0001` included and
-    // `res-ebs-0002` excluded.
+    // Rows: each exclusion state written on each resource, one at a time and
+    // both at once, so the expectation differs along which resource carries
+    // which state. The seed leaves both resources included.
     let rows = vec![
         Row {
             case: "the seeded store",
-            entries: Vec::new(),
-            expected: ["included", "excluded"],
+            write: [None, None],
+            expected: ["included", "included"],
         },
         Row {
             case: "the first resource excluded",
-            entries: vec![(first.clone(), true)],
+            write: [Some("excluded"), None],
+            expected: ["excluded", "included"],
+        },
+        Row {
+            case: "both resources excluded",
+            write: [Some("excluded"), Some("excluded")],
             expected: ["excluded", "excluded"],
         },
         Row {
-            case: "both resources included in one call",
-            entries: vec![(first.clone(), false), (second.clone(), false)],
+            case: "both resources included again",
+            write: [Some("included"), Some("included")],
             expected: ["included", "included"],
         },
         Row {
             case: "the second resource excluded again",
-            entries: vec![(second.clone(), true)],
+            write: [None, Some("excluded")],
             expected: ["included", "excluded"],
         },
     ];
 
     for Row {
         case,
-        entries,
+        write,
         expected,
     } in rows
     {
-        if !entries.is_empty() {
-            let payload = json!({
-                "recommendationResourceExclusions": entries
-                    .iter()
-                    .map(|(arn, is_excluded)| json!({ "arn": arn, "isExcluded": is_excluded }))
-                    .collect::<Vec<Value>>(),
-            });
-            let (status, body) = call(
-                &router,
-                "PUT",
-                "/v1/batch-update-recommendation-resource-exclusion",
-                Some(payload),
-            )
-            .await;
-            assert_eq!(
-                status, 200,
-                "case {case}: expected 200 from the exclusion batch, got {status} with {body}"
-            );
+        {
+            let state =
+                service_state(&*engine).expect("the in-memory engine carries this service's state");
+            let mut state = state.lock();
+            for (resource_id, exclusion_status) in ["res-rds-0001", "res-rds-0002"].iter().zip(write)
+            {
+                let Some(exclusion_status) = exclusion_status else {
+                    continue;
+                };
+                let resource = state
+                    .recommendation_resources
+                    .values_mut()
+                    .find(|resource| resource.id == *resource_id)
+                    .unwrap_or_else(|| panic!("case {case}: no seeded resource {resource_id}"));
+                resource.exclusion_status = exclusion_status.to_string();
+            }
         }
 
         let reported = listed(&router, case, &resources_path(check)).await;
@@ -867,6 +856,47 @@ async fn an_exclusion_made_through_the_api_is_what_the_next_read_reports() {
              {excluded:?}"
         );
     }
+
+    // And an exclusion attempted over the wire on one of these resources is
+    // refused per entry and changes nothing a later read sees: the resource
+    // belongs to a prioritized recommendation, which the exclusion batch does
+    // not support.
+    let case = "an exclusion attempted through the API";
+    let before = listed(&router, case, &resources_path(check)).await;
+    let (status, body) = call(
+        &router,
+        "PUT",
+        "/v1/batch-update-recommendation-resource-exclusion",
+        Some(json!({
+            "recommendationResourceExclusions": [
+                { "arn": resource_arn(check, "res-rds-0001"), "isExcluded": true },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case}: expected 200 from the exclusion batch, got {status} with {body}"
+    );
+    let errors = body["batchUpdateRecommendationResourceExclusionErrors"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: no per-entry error list in {body}"));
+    assert_eq!(
+        errors.len(),
+        1,
+        "case {case}: expected one per-entry error, got {errors:?}"
+    );
+    assert_eq!(
+        errors[0]["errorCode"].as_str(),
+        Some("ConflictException"),
+        "case {case}: expected a ConflictException entry, got {:?}",
+        errors[0]
+    );
+    let after = listed(&router, case, &resources_path(check)).await;
+    assert_eq!(
+        after, before,
+        "case {case}: expected the refused exclusion to change nothing, got {after:?}"
+    );
 }
 
 #[tokio::test]

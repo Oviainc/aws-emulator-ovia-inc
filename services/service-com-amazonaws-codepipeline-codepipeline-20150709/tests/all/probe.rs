@@ -160,9 +160,86 @@ async fn a_completed_execution_gives_its_slot_back() {
     }
 }
 
-/// RULE: an execution whose action WAITS holds its slot, so the triggers fill the
-/// pipeline's slots and the one past the bound is refused with the error the model
-/// declares for exactly that condition — whichever call sent it.
+/// RULE: an execution whose source action the engine CAN perform is not finished by
+/// performing it — it carries on to the action that waits, so it keeps its slot — and
+/// what the slots hold is what makes the ceiling reachable through a revision report:
+/// the report past the bound is refused and records nothing.
+///
+/// The pipeline here is the one a revision report reaches in anger: an `AWS`-owned S3
+/// source action whose object IS in the bucket, followed by a manual approval nobody
+/// answers. The revisions reported for it carry ids no S3 object version matches, which
+/// is what a caller reporting its own revision sends.
+#[tokio::test]
+async fn reported_revisions_fill_the_slots_of_a_pipeline_whose_source_is_readable() {
+    let emulator = Emulator::new();
+    // The source the declaration points at, and the artifact store it writes to, both
+    // really there — so the source action's work is performed rather than failing.
+    emulator.bucket("sources").await;
+    emulator.bucket("artifacts").await;
+    emulator
+        .put_object("sources", "app.zip", b"the application bytes")
+        .await;
+    emulator
+        .ok(
+            "CreatePipeline",
+            &json!({"pipeline": pipeline("holding", "AWS", "S3")}),
+        )
+        .await;
+
+    for index in 0..MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE {
+        let (status, answered) = put_revision(&emulator, "holding", &format!("rev-{index}")).await;
+        assert_eq!(
+            (status, answered["newRevision"].clone()),
+            (200, json!(true)),
+            "revision {index} is inside the bound of {MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE}, \
+             got {status} with {answered}"
+        );
+    }
+
+    // Past every step the clock owes: the source actions have run and each execution is
+    // held at its approval, so every slot is still taken.
+    tokio::time::sleep(BEYOND_THE_STEPS).await;
+    let held = statuses(&emulator, "holding").await;
+    let in_flight = held
+        .iter()
+        .filter(|status| NON_TERMINAL.contains(&status.as_str()))
+        .count();
+    assert_eq!(
+        in_flight, MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE,
+        "the reported revision names no object version, so no execution failed over one \
+         and every one of them is held at its approval, got {held:?}"
+    );
+
+    let (status, response) = put_revision(&emulator, "holding", "one-too-many").await;
+    assert_eq!(
+        (
+            status,
+            response["__type"].as_str(),
+            response["message"].as_str()
+        ),
+        (
+            400,
+            Some("ConcurrentPipelineExecutionsLimitExceededException"),
+            Some(AT_THE_LIMIT)
+        ),
+        "a revision report past the bound is refused, got {status} with {response}"
+    );
+    let retained = statuses(&emulator, "holding").await;
+    assert_eq!(
+        retained.len(),
+        MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE,
+        "a refused report records no execution, got {retained:?}"
+    );
+    // And the refusal is not a one-off state: the pipeline is still at its ceiling, so
+    // the next report is refused the same way.
+    let (status, response) = put_revision(&emulator, "holding", "one-more").await;
+    assert_eq!(
+        (status, response["__type"].as_str()),
+        (400, Some("ConcurrentPipelineExecutionsLimitExceededException")),
+        "the pipeline is still at its ceiling, got {status} with {response}"
+    );
+}
+
 #[tokio::test]
 async fn executions_that_wait_fill_the_pipelines_slots() {
     let emulator = Emulator::new();

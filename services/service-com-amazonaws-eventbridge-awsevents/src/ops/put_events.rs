@@ -254,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     continue;
                 };
                 if !routing.contains_key(&accepted.bus) {
-                    let compiled = store.bus(&accepted.bus).map(|bus| {
+                    let compiled = store.bus(&region, &accepted.bus).map(|bus| {
                         bus.rules
                             .values()
                             .filter_map(|rule| CompiledRule::of(rule, &store))
@@ -1553,38 +1553,6 @@ const API_DESTINATION_USER_AGENT: &str = "Amazon/EventBridge/ApiDestinations";
 /// message beside it.
 const API_DESTINATION_NOT_DELIVERED: &str = "ApiDestinationInvocationFailed";
 
-/// The error types that are the TRANSPORT's own refusal rather than an answer
-/// from an endpoint: this emulator serves nothing at that URL, or more than one
-/// of its services claims it. Either way the attempt reached no endpoint.
-const TRANSPORT_REFUSALS: [&str; 2] = ["UnknownService", "AmbiguousService"];
-
-/// How much of a non-2xx answer is read to tell the transport's own refusal from
-/// an endpoint's answer. The envelope is two short fields; anything larger is an
-/// answer from something that served the request, so it is not read at all.
-const MAX_REFUSAL_ENVELOPE_BYTES: usize = 4 * 1024;
-
-/// Whether `body` is the in-process transport's OWN refusal of the request —
-/// this emulator serves nothing at the endpoint the destination names — rather
-/// than an answer from an endpoint that served it.
-///
-/// The refusal is told by the error type its envelope carries
-/// ([`TRANSPORT_REFUSALS`]); the bridge the request crosses keeps the body but
-/// not the headers, so the envelope is where that type can be read at all.
-fn is_transport_refusal(body: &[u8]) -> bool {
-    if body.len() > MAX_REFUSAL_ENVELOPE_BYTES {
-        return false;
-    }
-    let Ok(envelope) = ::serde_json::from_slice::<::serde_json::Value>(body) else {
-        return false;
-    };
-    let Some(error_type) = envelope.get("__type").and_then(::serde_json::Value::as_str) else {
-        return false;
-    };
-    // The type may carry a shape namespace; the code is its last segment.
-    let code = error_type.rsplit('#').next().unwrap_or(error_type);
-    TRANSPORT_REFUSALS.contains(&code)
-}
-
 /// Invoke an API destination target: an HTTP request to the endpoint the stored
 /// destination holds, carrying the event, retried within the target's
 /// `RetryPolicy`.
@@ -1797,7 +1765,7 @@ async fn attempt_api_destination(
             if response
                 .body()
                 .bytes()
-                .is_some_and(is_transport_refusal)
+                .is_some_and(crate::state::is_transport_refusal)
             {
                 return Attempt::Retryable(
                     "no endpoint answered: this emulator serves nothing at that invocation \

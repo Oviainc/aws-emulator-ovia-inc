@@ -353,6 +353,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 revision_summary: None,
                 revision_url: None,
             }],
+            // A reported revision is not a source-revision OVERRIDE: it says which
+            // revision the caller observed, not which object or version an action is to
+            // read, so this execution's actions read the sources their configuration
+            // declares (only `StartPipelineExecution$sourceRevisions` pins one).
+            source_overrides: Vec::new(),
             // The stage/action plan this execution runs, and the state the engine moves
             // through it (`crate::state::driver`).
             stages: crate::state::plan_stages(&declaration, now),

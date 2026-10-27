@@ -144,7 +144,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DisableRuleErrorModeled::InternalException(InternalException {
@@ -153,12 +153,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx.parts());
         // "The name or ARN of the event bus associated with the rule. If you omit
         // this, the default event bus is used": a rule that lives on a custom bus
         // is therefore NOT found by a call that names no bus.
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
         let mut store = state.lock();
-        let Some(rule) = store.rule_mut(&bus_name, &input.name) else {
+        let Some(rule) = store.rule_mut(&region, &bus_name, &input.name) else {
             return Err(DisableRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_rule(&bus_name, &input.name)),

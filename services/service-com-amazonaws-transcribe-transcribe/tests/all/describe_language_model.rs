@@ -10,9 +10,10 @@
 //! the only write it performs is the status transition the CLOCK already owed the
 //! record, which falls due at its stored instant whether or not anybody calls.
 //!
-//! The lifecycle facts a describe reports (`IN_PROGRESS`, then the modelled `FAILED`
-//! with a reason naming the Amazon S3 location this emulator reads nothing from) are
-//! asserted by `crate::language_models`; this suite is about the READ itself, so its
+//! The lifecycle facts a describe reports (`IN_PROGRESS`, then the status the object
+//! store's answer about the model's training data settles it in) are
+//! asserted by `crate::language_models` and `crate::language_model_training_data`; this
+//! suite is about the READ itself, so its
 //! rows repeat the read and compare answers with each other.
 //!
 //! Every call goes through the same `MultiServiceRouter` the production router
@@ -180,7 +181,7 @@ async fn describing_a_model_changes_nothing_a_later_caller_sees() {
 
     // A model nobody describes before its transition falls due: its answer must still
     // report the transition as having happened when it was OWED.
-    let unread = language_model_request("never-read-until-failed", "en-AU", "NarrowBand");
+    let unread = language_model_request("never-read-until-settled", "en-AU", "NarrowBand");
     create(&transcribe, "the model nobody reads yet", &unread).await;
 
     // Three reads of a record the service is still working on answer the identical
@@ -230,7 +231,7 @@ async fn describing_a_model_changes_nothing_a_later_caller_sees() {
         let after = describe(&transcribe, case, name).await;
         assert_eq!(
             after["ModelStatus"],
-            json!("FAILED"),
+            json!("COMPLETED"),
             "case {case:?}: the transition the clock owed this record must be \
              materialised, got {after:?}"
         );
@@ -276,10 +277,10 @@ async fn describing_a_model_changes_nothing_a_later_caller_sees() {
     // when this first read happened, which is what makes the read a report and not the
     // thing that failed the model.
     let case = "the model nobody read until after its transition";
-    let model = describe(&transcribe, case, "never-read-until-failed").await;
+    let model = describe(&transcribe, case, "never-read-until-settled").await;
     assert_eq!(
         model["ModelStatus"],
-        json!("FAILED"),
+        json!("COMPLETED"),
         "case {case:?}: the clock, not a read, is what makes the transition due, got \
          {model:?}"
     );

@@ -84,7 +84,7 @@ fn query_escape(value: &str) -> String {
 }
 
 /// Create the account's Access Grants instance in `region`.
-async fn create_instance(emulator: &Emulator, account_id: &str, region: &str) -> Reply {
+pub(crate) async fn create_instance(emulator: &Emulator, account_id: &str, region: &str) -> Reply {
     call_in_region(
         &emulator.router,
         region,
@@ -97,7 +97,7 @@ async fn create_instance(emulator: &Emulator, account_id: &str, region: &str) ->
 }
 
 /// Register `location_scope` in the account's instance in `region`.
-async fn create_location(
+pub(crate) async fn create_location(
     emulator: &Emulator,
     account_id: &str,
     region: &str,
@@ -122,7 +122,7 @@ async fn create_location(
 }
 
 /// Read the registered location `location_id` names.
-async fn get_location(
+pub(crate) async fn get_location(
     emulator: &Emulator,
     account_id: &str,
     region: &str,
@@ -140,7 +140,7 @@ async fn get_location(
 }
 
 /// Create a grant on `location_id`, narrowed by `sub_prefix` when there is one.
-async fn create_grant(
+pub(crate) async fn create_grant(
     emulator: &Emulator,
     account_id: &str,
     region: &str,
@@ -178,7 +178,12 @@ async fn create_grant(
 }
 
 /// Read the grant `grant_id` names.
-async fn get_grant(emulator: &Emulator, account_id: &str, region: &str, grant_id: &str) -> Reply {
+pub(crate) async fn get_grant(
+    emulator: &Emulator,
+    account_id: &str,
+    region: &str,
+    grant_id: &str,
+) -> Reply {
     call_in_region(
         &emulator.router,
         region,
@@ -1018,7 +1023,7 @@ async fn the_chain_refuses_what_it_cannot_carry_out() {
     );
     assert_eq!(
         unknown_location.code(),
-        "AccessGrantsLocationNotExistsError",
+        "NoSuchAccessGrantsLocationError",
         "expected the missing-location code, got body {}",
         unknown_location.body
     );
@@ -1073,7 +1078,7 @@ async fn the_chain_refuses_what_it_cannot_carry_out() {
     );
     assert_eq!(
         unknown_grant.code(),
-        "AccessGrantNotExistsError",
+        "NoSuchAccessGrantError",
         "expected the missing-grant code, got body {}",
         unknown_grant.body
     );

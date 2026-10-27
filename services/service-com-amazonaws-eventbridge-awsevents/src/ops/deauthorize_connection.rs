@@ -177,8 +177,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         stored.last_modified = now;
         stored.pending = Some(crate::state::PendingTransition {
             due: now + crate::state::CONNECTION_TRANSITION,
-            to: crate::state::ConnectionTransition::To(
-                crate::state::CONNECTION_STATE_DEAUTHORIZED.to_string(),
+            to: crate::state::ConnectionTransition::to(
+                crate::state::CONNECTION_STATE_DEAUTHORIZED,
             ),
         });
         Ok(DeauthorizeConnectionOutput {

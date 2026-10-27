@@ -19,6 +19,8 @@ mod elbv2_listener_chain_on_the_shared_endpoint;
 mod listeners_health_check_and_attributes;
 #[path = "all/load_balancer_lifecycle.rs"]
 mod load_balancer_lifecycle;
+#[path = "all/modeled_refusal_envelopes.rs"]
+mod modeled_refusal_envelopes;
 #[path = "all/shared_endpoint_api_version_dispatch.rs"]
 mod shared_endpoint_api_version_dispatch;
 #[path = "all/shared_endpoint_api_versions.rs"]

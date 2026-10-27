@@ -11,8 +11,8 @@
 //! `StartSandbox` writes a [`StoredSandbox`] and `StopSandbox` ends one,
 //! `StartCommandExecution` writes a [`StoredCommandExecution`],
 //! `StartSandboxConnection` writes a [`StoredSandboxConnection`],
-//! `CreateReportGroup` writes a [`StoredReportGroup`] and `DeleteReportGroup`
-//! removes one,
+//! `CreateReportGroup` writes a [`StoredReportGroup`], `UpdateReportGroup`
+//! rewrites one and `DeleteReportGroup` removes one,
 //! `ImportSourceCredentials` writes a [`StoredSourceCredentials`],
 //! `BatchDeleteBuilds` removes a build, and the reporting operations
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
@@ -36,8 +36,8 @@ use std::collections::BTreeMap;
 use crate::ops::types::{
     Build, BuildArtifacts, BuildBatch, BuildBatchPhase, BuildPhase, CommandExecution,
     EnvironmentVariable, Fleet, FleetStatus, PhaseContext, Project, ProjectArtifacts, ProjectCache,
-    ProjectEnvironment, ProjectSource, Report, ReportGroup, SSMSession, Sandbox, SandboxSession,
-    SandboxSessionPhase, SourceCredentialsInfo,
+    ProjectEnvironment, ProjectSource, Report, ReportExportConfig, ReportGroup, SSMSession, Sandbox,
+    SandboxSession, SandboxSessionPhase, SourceCredentialsInfo,
 };
 
 /// The ARN service segment for this service, as `emulator_arn`'s first argument
@@ -240,6 +240,41 @@ pub fn fleet_configuration_violation(
         }
         _ => None,
     }
+}
+
+/// The `ReportExportConfigType` that exports a report group's raw results to a
+/// bucket: "S3: The report results are exported to an S3 bucket"
+/// (`ReportExportConfig$exportConfigType`). The other value, `NO_EXPORT`, exports
+/// nothing and so names no destination.
+pub const REPORT_EXPORT_TYPE_S3: &str = "S3";
+
+/// Why this export configuration is not one CodeBuild can export a report group's
+/// results with, as the modelled `InvalidInputException` words it — or `None` when
+/// it is valid.
+///
+/// The configuration is the one the report group CARRIES once the request has been
+/// applied, so `CreateReportGroup` asks about the group it would mint and
+/// `UpdateReportGroup` about the merge of the request onto the stored group: one
+/// rule, one wording, whichever call arrived.
+///
+/// The rule: an `S3` export has to name the bucket the raw data is exported to
+/// (`S3ReportExportConfig$bucket` — "The name of the S3 bucket where the raw data of
+/// a report are exported"). The model leaves `s3Destination` and its `bucket`
+/// optional because the same structure also describes a `NO_EXPORT` configuration,
+/// so the combination passes the boundary validator and is refused here.
+pub fn report_export_config_violation(config: &ReportExportConfig) -> Option<String> {
+    let exports_to_bucket = config.export_config_type.as_deref() == Some(REPORT_EXPORT_TYPE_S3);
+    let names_a_bucket = config
+        .s3_destination
+        .as_ref()
+        .and_then(|destination| destination.bucket.as_deref())
+        .is_some_and(|bucket| !bucket.is_empty());
+    (exports_to_bucket && !names_a_bucket).then(|| {
+        format!(
+            "exportConfig.s3Destination.bucket must be set when \
+             exportConfig.exportConfigType is {REPORT_EXPORT_TYPE_S3}"
+        )
+    })
 }
 
 /// Report groups this emulator holds for the account.
@@ -1521,6 +1556,16 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         (stored.report_group.arn.as_deref() == Some(arn)).then_some(stored)
     }
 
+    /// [`Self::report_group_by_arn`], for the operation that goes on to CHANGE the
+    /// report group it read: `UpdateReportGroup` merges its request onto the stored
+    /// record in place, so it resolves the ARN exactly as every reader does rather
+    /// than growing a second resolver of its own.
+    pub fn report_group_by_arn_mut(&mut self, arn: &str) -> Option<&mut StoredReportGroup> {
+        let name = report_group_name_from_arn(arn)?;
+        let stored = self.report_groups.get_mut(name)?;
+        (stored.report_group.arn.as_deref() == Some(arn)).then_some(stored)
+    }
+
     /// Drop the report group `arn` names, reporting whether this account held
     /// one. Resolved exactly as [`Self::report_group_by_arn`] resolves a read,
     /// so an ARN for another partition, region, account or resource type removes
@@ -2739,6 +2784,8 @@ fn audit_field(value: &str) -> String {
 pub enum AuditOutcome {
     /// A report group was minted and stored.
     ReportGroupCreated,
+    /// A report group's settings were changed and stored.
+    ReportGroupUpdated,
     /// A report group was removed from the store.
     ReportGroupDeleted,
     /// A compute fleet was minted and stored.
@@ -2774,6 +2821,7 @@ impl AuditOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReportGroupCreated => "report-group-created",
+            Self::ReportGroupUpdated => "report-group-updated",
             Self::ReportGroupDeleted => "report-group-deleted",
             Self::FleetCreated => "fleet-created",
             Self::FleetUpdated => "fleet-updated",

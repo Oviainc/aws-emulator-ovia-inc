@@ -52,8 +52,16 @@ pub const MAX_LOAD_BALANCER_NAMES_PER_REQUEST: usize = MAX_LOAD_BALANCERS_PER_RE
 
 /// The listener protocols the model documents for `Listener$Protocol` /
 /// `Listener$InstanceProtocol`: "The load balancer transport protocol to use for
-/// routing: HTTP, HTTPS, TCP, or SSL."
-pub const LISTENER_PROTOCOLS: &[&str] = &["HTTP", "HTTPS", "TCP", "SSL"];
+/// routing: HTTP, HTTPS, TCP, or SSL." Listed in the order this service's own refusal
+/// names them, which is what [`listener_protocol_message`] states.
+pub const LISTENER_PROTOCOLS: &[&str] = &["HTTP", "TCP", "HTTPS", "SSL"];
+
+/// The refusal a listener protocol member carrying something outside
+/// [`LISTENER_PROTOCOLS`] earns, stated over the protocols that member may carry: the
+/// caller fixes the value from the set, and the sentence names which member it has to fix.
+pub fn listener_protocol_message(member: &str) -> String {
+    format!("{member} must be one of {}", LISTENER_PROTOCOLS.join(", "))
+}
 
 /// Published Classic Load Balancer quotas, from the "Elastic Load Balancing endpoints
 /// and quotas" page of the AWS General Reference. Each one bounds a collection a
@@ -71,6 +79,16 @@ pub const MAX_TAGS_PER_LOAD_BALANCER: usize = 10;
 
 /// "Security groups per load balancer: 5".
 pub const MAX_SECURITY_GROUPS_PER_LOAD_BALANCER: usize = 5;
+
+/// The refusal a `SecurityGroups` list past that quota earns, stated over the quota: the
+/// caller fixes the list from the number, and it is the same quota wherever a load
+/// balancer's groups are set, so both operations that take the member state it this way.
+pub fn security_groups_quota_message(count: usize) -> String {
+    format!(
+        "SecurityGroups must carry at most {MAX_SECURITY_GROUPS_PER_LOAD_BALANCER} entries; \
+         got {count}"
+    )
+}
 
 /// The largest `AvailabilityZones` or `Subnets` list a create accepts.
 ///
@@ -181,8 +199,9 @@ impl ListenerEntry {
 /// two operations that create listeners declare different error sets.
 #[derive(Debug, Clone)]
 pub enum ListenerRejection {
-    /// A `Protocol`/`InstanceProtocol` outside [`LISTENER_PROTOCOLS`].
-    UnsupportedProtocol { protocol: String },
+    /// A `Protocol`/`InstanceProtocol` outside [`LISTENER_PROTOCOLS`], naming the member
+    /// that carried it — which is what the caller has to fix.
+    UnsupportedProtocol { member: &'static str },
     /// A back-end protocol from the other transport family than the front-end one.
     IncompatibleProtocols {
         protocol: String,
@@ -208,11 +227,10 @@ pub fn listener_entry(
     let instance_protocol =
         instance_protocol.map_or_else(|| protocol.clone(), str::to_ascii_uppercase);
 
-    for candidate in [&protocol, &instance_protocol] {
+    for (member, candidate) in [("Protocol", &protocol), ("InstanceProtocol", &instance_protocol)]
+    {
         if !LISTENER_PROTOCOLS.contains(&candidate.as_str()) {
-            return Err(ListenerRejection::UnsupportedProtocol {
-                protocol: candidate.clone(),
-            });
+            return Err(ListenerRejection::UnsupportedProtocol { member });
         }
     }
     // From `Listener$InstanceProtocol`: "If the front-end protocol is TCP or SSL, the
@@ -363,6 +381,15 @@ pub const DEFAULT_CONNECTION_DRAINING_TIMEOUT_SECONDS: i32 = 300;
 /// seconds").
 pub const CONNECTION_DRAINING_TIMEOUT_SECONDS: (i32, i32) = (1, 3600);
 
+/// The refusal a connection timeout outside its bounds earns, stated over the BOUND rather
+/// than over the value the request carried: the caller fixes the value from the bound, and
+/// the two timeout attributes of a load balancer ([`IDLE_TIMEOUT_SECONDS`] and
+/// [`CONNECTION_DRAINING_TIMEOUT_SECONDS`]) carry the same one, so one sentence states it
+/// for either.
+pub fn timeout_bound_message((low, high): (i32, i32)) -> String {
+    format!("Time out must be at least {low} second and no more than {high} seconds")
+}
+
 /// The access-log publishing interval, in minutes, of a load balancer nobody has
 /// modified. From `AccessLog$EmitInterval`: "Default: 60 minutes".
 pub const DEFAULT_ACCESS_LOG_EMIT_INTERVAL_MINUTES: i32 = 60;
@@ -470,6 +497,16 @@ pub struct LoadBalancer {
     /// left unreported rather than invented.
     pub subnet_zones: BTreeMap<String, String>,
     pub security_groups: Vec<String>,
+    /// The security group `DescribeLoadBalancers` reports as this load balancer's SOURCE
+    /// security group, as EC2 described the first group the load balancer was given.
+    ///
+    /// A security group is EC2's resource, so the name and the owner a load balancer
+    /// reports it under are EC2's to say: they are resolved when the groups are associated
+    /// and persisted here beside the ids that produced them, so a later read reports the
+    /// same facts without asking again. `None` where there was no EC2 to ask, or where the
+    /// load balancer carries no security group — the member is left unreported rather than
+    /// invented.
+    pub source_security_group: Option<SourceSecurityGroup>,
     pub vpc_id: Option<String>,
     /// Registered `InstanceId`s, deduplicated, in registration order, bounded by
     /// [`MAX_INSTANCES_PER_LOAD_BALANCER`].
@@ -619,6 +656,18 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsElasticloadbalancingElasticloadbalancingV7State>)
 }
 
+/// The message a detach that would leave a load balancer attached to no subnet at all is
+/// refused with.
+///
+/// The sentence is the one the model itself gives
+/// `InvalidConfigurationRequestException` — "The requested configuration change is not
+/// valid." (`smithy_query(query="shape", shape="InvalidConfigurationRequestException")`) —
+/// so this refusal states the error class in Elastic Load Balancing's own words rather than
+/// in a sentence this emulator wrote for it.
+pub fn detached_every_subnet_message() -> String {
+    "The requested configuration change is not valid.".to_string()
+}
+
 /// The message `CreateLoadBalancer` answers a `DuplicateLoadBalancerName` with.
 ///
 /// A load balancer name is unique "within your set of load balancers for the region"
@@ -648,6 +697,20 @@ pub fn duplicate_listener_message(load_balancer_name: &str, load_balancer_port: 
     )
 }
 
+/// The security group a load balancer reports as its source security group: the group's
+/// own name, and the account that owns it.
+///
+/// `SourceSecurityGroup` is documented as "Information about a source security group" with
+/// `OwnerAlias` ("The owner of the security group") and `GroupName` ("The name of the
+/// security group"), neither of which is the group ID a request names — so both are read
+/// off what EC2 reports for that group, and a member EC2 reported nothing for stays
+/// unreported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSecurityGroup {
+    pub owner_alias: Option<String>,
+    pub group_name: Option<String>,
+}
+
 /// What EC2 says about the subnets a request named: the Availability Zone of each subnet
 /// it reported one for, and the VPC they all belong to.
 #[derive(Debug, Clone, Default)]
@@ -661,21 +724,24 @@ pub struct SubnetPlacement {
 }
 
 /// Resolve `subnet_ids` against EC2, which owns them, and answer the placement facts a
-/// load balancer attached to them reports.
+/// load balancer attached to them reports — or the EC2 refusal they ran into.
 ///
-/// A subnet is not this service's resource: which zone it is in and which VPC it belongs
-/// to are EC2's to say, so they are read from EC2 through the in-process callback. An
-/// emulator with no EC2 mounted, and an id EC2 holds no subnet for, say NOTHING: the
-/// placement comes back empty and the members it would have filled are left unreported
-/// rather than invented — and nothing is refused on that silence, because this service
-/// never learned anything to refuse it on.
+/// A subnet is not this service's resource: whether it exists at all, which zone it is in
+/// and which VPC it belongs to are EC2's to say, so they are read from EC2 through the
+/// in-process callback. `Err` carries the error CODE EC2 answered for an id the account
+/// holds no subnet for, which the caller states in the refusal ITS model declares. An
+/// emulator with no EC2 mounted says NOTHING: the placement comes back empty and the
+/// members it would have filled are left unreported rather than invented — and nothing is
+/// refused on that silence, because this service never learned anything to refuse it on.
 pub async fn resolve_subnet_placement(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     subnet_ids: &[String],
-) -> SubnetPlacement {
-    let Some(resolved) = elbv2::state::network::subnets_by_id(ctx, region, subnet_ids).await else {
-        return SubnetPlacement::default();
+) -> Result<SubnetPlacement, String> {
+    let resolved = match elbv2::state::network::resolve_subnets(ctx, region, subnet_ids).await {
+        elbv2::state::network::SubnetLookup::Resolved(resolved) => resolved,
+        elbv2::state::network::SubnetLookup::Absent(code) => return Err(code),
+        elbv2::state::network::SubnetLookup::Unknown => return Ok(SubnetPlacement::default()),
     };
     let zones = resolved
         .iter()
@@ -690,7 +756,43 @@ pub async fn resolve_subnet_placement(
             .iter()
             .all(|subnet| subnet.vpc_id.as_deref() == Some(vpc_id.as_str()))
     });
-    SubnetPlacement { zones, vpc_id }
+    Ok(SubnetPlacement { zones, vpc_id })
+}
+
+/// Resolve the security groups a request associates with a load balancer against EC2,
+/// which owns them, and answer the source security group the load balancer then reports —
+/// or the EC2 refusal they ran into.
+///
+/// A security group is EC2's resource, so whether one exists is EC2's to say: `Err` carries
+/// the error CODE EC2 answered for an id the account holds no group for, which the caller
+/// states in the refusal its model declares. `Ok(None)` is silence — a request that
+/// associates no group, or an emulator with no EC2 to ask — on which nothing is refused and
+/// nothing is reported.
+///
+/// The source security group is the FIRST group the request names:
+/// `LoadBalancerDescription$SourceSecurityGroup` is a single structure, while a load
+/// balancer may carry several groups, so it is the one the association names first.
+pub async fn resolve_source_security_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    security_groups: &[String],
+) -> Result<Option<SourceSecurityGroup>, String> {
+    let resolved =
+        match elbv2::state::network::resolve_security_groups(ctx, region, security_groups).await {
+            elbv2::state::network::SecurityGroupLookup::Resolved(resolved) => resolved,
+            elbv2::state::network::SecurityGroupLookup::Absent(code) => return Err(code),
+            elbv2::state::network::SecurityGroupLookup::Unknown => return Ok(None),
+        };
+    let Some(first) = security_groups.first() else {
+        return Ok(None);
+    };
+    Ok(resolved
+        .iter()
+        .find(|group| &group.group_id == first)
+        .map(|group| SourceSecurityGroup {
+            owner_alias: group.owner_id.clone(),
+            group_name: group.group_name.clone(),
+        }))
 }
 
 /// The region this request is attributed to: the region field of its SigV4 credential
