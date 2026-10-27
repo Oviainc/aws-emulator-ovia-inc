@@ -43,10 +43,10 @@ const BUDGET: Duration = Duration::from_secs(20);
 /// How long an assertion that NOTHING arrives watches for. A pipe that was going to
 /// deliver would have: it is longer than the poll interval and than every batching
 /// window below.
-const QUIET: Duration = Duration::from_secs(2);
+pub(crate) const QUIET: Duration = Duration::from_secs(2);
 
 /// How long between two looks at a queue while waiting.
-const LOOK_AGAIN: Duration = Duration::from_millis(25);
+pub(crate) const LOOK_AGAIN: Duration = Duration::from_millis(25);
 
 /// An enrichment that collapses the whole batch it was handed into ONE event: how many
 /// records it saw, and their text. `States.ArrayLength` and `States.JsonToString` are
@@ -110,7 +110,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One `awsJson` RPC call against the service whose signing name is `signing_name`.
-async fn rpc(
+pub(crate) async fn rpc(
     router: &MultiServiceRouter,
     signing_name: &str,
     target_prefix: &str,
@@ -148,7 +148,7 @@ async fn rpc(
     (status, parsed)
 }
 
-async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     rpc(router, "sqs", "AmazonSQS", operation, body).await
 }
 
@@ -157,7 +157,7 @@ async fn sfn(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16
 }
 
 /// A queue called `name`; answers its url and the ARN a pipe names it by.
-async fn given_queue(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn given_queue(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let (status, body) = sqs(router, "CreateQueue", &json!({ "QueueName": name })).await;
     assert_eq!(
         status, 200,
@@ -185,7 +185,7 @@ async fn given_queue(router: &MultiServiceRouter, name: &str) -> (String, String
 }
 
 /// An Express state machine called `name` running `definition`; answers its ARN.
-async fn given_express_workflow(
+pub(crate) async fn given_express_workflow(
     router: &MultiServiceRouter,
     name: &str,
     definition: &str,
@@ -212,7 +212,7 @@ async fn given_express_workflow(
 }
 
 /// Send `markers` to the queue at `url`, one message each.
-async fn send(router: &MultiServiceRouter, url: &str, markers: &[String]) {
+pub(crate) async fn send(router: &MultiServiceRouter, url: &str, markers: &[String]) {
     for marker in markers {
         let (status, body) = sqs(
             router,
@@ -235,7 +235,7 @@ fn markers(case: &str, count: usize) -> Vec<String> {
 
 /// Every message body waiting on the queue at `url`, collected until there are at least
 /// `want` of them or `budget` has elapsed.
-async fn collect_at_least(
+pub(crate) async fn collect_at_least(
     router: &MultiServiceRouter,
     url: &str,
     want: usize,
@@ -253,7 +253,7 @@ async fn collect_at_least(
 }
 
 /// Every message body that arrives at `url` during the whole of `budget`.
-async fn collect_during(
+pub(crate) async fn collect_during(
     router: &MultiServiceRouter,
     url: &str,
     budget: Duration,
@@ -268,7 +268,7 @@ async fn collect_during(
 }
 
 /// One `ReceiveMessage` of up to ten messages, as bodies.
-async fn receive_now(router: &MultiServiceRouter, url: &str) -> Vec<String> {
+pub(crate) async fn receive_now(router: &MultiServiceRouter, url: &str) -> Vec<String> {
     let (status, body) = sqs(
         router,
         "ReceiveMessage",
