@@ -19,6 +19,8 @@ mod activation_token_resource;
 mod email_contact_timestamp_wire_form;
 #[path = "all/email_contacts.rs"]
 mod email_contacts;
+#[path = "all/list_email_contacts_page_token.rs"]
+mod list_email_contacts_page_token;
 #[path = "all/resource_tag_writes.rs"]
 mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]
