@@ -1120,6 +1120,15 @@
 //! clock and the same [`TRANSITION_DELAY`] as an instance's [`PendingTransition`], and
 //! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies them.
 //!
+//! Capacity also moves BETWEEN two of these records, with no new resource created and no
+//! clock-owed move at either end: `MoveCapacityReservationInstances` takes a number of
+//! available instances out of one `active` reservation and adds them to another, so each
+//! side's `TotalInstanceCount` and `AvailableInstanceCount` change together and the sum of
+//! the two is conserved. The move is held against the `ClientToken` it was asked under in
+//! [`ComAmazonawsEc2Amazonec2State::capacity_reservation_move_client_tokens`]
+//! ([`CapacityReservationInstanceMove`]), so a replay reports it rather than moving the
+//! capacity a second time.
+//!
 //! A FUTURE-DATED reservation is one of these records too: it carries the `StartDate` the
 //! request asked for, the [`CapacityReservationCommitment`] it committed to and its
 //! `DeliveryPreference`, and it starts in `assessing` — "Amazon EC2 is assessing your
@@ -3003,6 +3012,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// and the same token signed for ANOTHER Region is a different request rather than a
     /// replay of this one, an idempotency key being scoped to one Region.
     pub capacity_reservation_client_tokens: HashMap<(String, String), String>,
+    /// A `MoveCapacityReservationInstances` `ClientToken` and the move it made
+    /// ([`CapacityReservationInstanceMove`]), keyed by the Region the move was signed for
+    /// and that token, so a repeat of the same request reports that move instead of moving
+    /// the capacity twice: "Unique, case-sensitive identifier that you provide to ensure
+    /// the idempotency of the request"
+    /// (`MoveCapacityReservationInstancesRequest$ClientToken`). Region-scoped like the
+    /// create's own token map above, an idempotency key belonging to one Region.
+    pub capacity_reservation_move_client_tokens:
+        HashMap<(String, String), CapacityReservationInstanceMove>,
     /// What each instance's application health status is derived from, by `InstanceId` —
     /// see [`InstanceApplicationStatusRecord`] and the module docs. An instance with no
     /// entry has had no application status check reported for it, which is exactly the
@@ -3690,6 +3708,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             capacity_reservations: BTreeMap::new(),
             interruptible_allocation_client_tokens: HashMap::new(),
             capacity_reservation_client_tokens: HashMap::new(),
+            capacity_reservation_move_client_tokens: HashMap::new(),
             application_status: BTreeMap::new(),
             instance_status_reports: BTreeMap::new(),
             application_status_checks: BTreeMap::new(),
@@ -20370,10 +20389,10 @@ pub struct CapacityBlockPurchaseSpec {
 /// Refuse a request that named a Capacity Reservation id no reservation of the account
 /// has: HTTP 400 `InvalidCapacityReservationId.NotFound`.
 ///
-/// The model publishes no pattern for `CapacityReservationId`
-/// (`smithy_query(query="shape",shape="CapacityReservationId")`), so there is no shape to
-/// call malformed ahead of the lookup the way a volume id has one: an id this store cannot
-/// resolve is reported not found whatever it looks like.
+/// The not-found half of the pair [`require_known_capacity_reservation`] answers: a
+/// well-formed id ([`capacity_reservation_id_is_well_formed`]) this store holds no
+/// reservation under. A value OUTSIDE that form is answered
+/// [`invalid_capacity_reservation_id_malformed`] instead, before any lookup.
 pub fn invalid_capacity_reservation_id_not_found<E>(
     capacity_reservation_id: &str,
 ) -> crate::scaffolded::Scaffolded<E> {
@@ -20384,16 +20403,91 @@ pub fn invalid_capacity_reservation_id_not_found<E>(
     )
 }
 
+/// The code EC2 answers for a value that is not a Capacity Reservation id at all, so there
+/// is nothing to look it up as, in the `Invalid<Resource>Id.Malformed` family this service
+/// refuses an unissuable id of any other kind with
+/// ([`INVALID_LAUNCH_TEMPLATE_ID_MALFORMED`], [`INVALID_SECONDARY_NETWORK_ID_MALFORMED`]).
+pub const INVALID_CAPACITY_RESERVATION_ID_MALFORMED: &str =
+    "InvalidCapacityReservationId.Malformed";
+
+/// Whether `id` is a well-formed Capacity Reservation id — one EC2 could have ISSUED.
+///
+/// The model publishes no pattern for `CapacityReservationId`
+/// (`smithy_query(query="shape",shape="CapacityReservationId")`), so the form is the one
+/// EC2 issues: the LONG resource-id reading ([`issued_long_id_is_well_formed`]) under this
+/// resource's own [`CAPACITY_RESERVATION_ID_PREFIX`] — seventeen lowercase hexadecimal
+/// digits whose leading digit is `0` and which are not all `0`, which is also what
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints. The same reading an instance id and a
+/// Capacity Reservation Fleet id get, and for the same reason: EC2 answers
+/// `Invalid<Kind>.Malformed` for an id of this kind that merely LOOKS hexadecimal, rather
+/// than reporting it not found, so a caller can tell a typo from a reservation its account
+/// does not hold — a recorded `MoveCapacityReservationInstances` call naming a `cr-` id
+/// whose leading digit is above zero is answered
+/// [`INVALID_CAPACITY_RESERVATION_ID_MALFORMED`], where a well-formed id nothing was
+/// reserved under is answered [`INVALID_CAPACITY_RESERVATION_ID_NOT_FOUND`].
+pub fn capacity_reservation_id_is_well_formed(id: &str) -> bool {
+    issued_long_id_is_well_formed(CAPACITY_RESERVATION_ID_PREFIX, id)
+}
+
+/// Refuse a value that is not a Capacity Reservation id at all: HTTP 400
+/// [`INVALID_CAPACITY_RESERVATION_ID_MALFORMED`], worded the way AWS words a malformed id
+/// of this resource kind and built from the value the request sent.
+pub fn invalid_capacity_reservation_id_malformed<E>(
+    capacity_reservation_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_CAPACITY_RESERVATION_ID_MALFORMED,
+        400,
+        format!("Capacity Reservation ID '{capacity_reservation_id}' is malformed"),
+    )
+}
+
+/// Refuse a value outside the Capacity Reservation id form before any lookup, for a caller
+/// that checks an id it does not need the record behind — a destination it is about to
+/// resolve separately, or an id named beside another.
+pub fn require_well_formed_capacity_reservation_id<E>(
+    capacity_reservation_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if capacity_reservation_id_is_well_formed(capacity_reservation_id) {
+        return Ok(());
+    }
+    Err(invalid_capacity_reservation_id_malformed(
+        capacity_reservation_id,
+    ))
+}
+
 /// The record of the Capacity Reservation `capacity_reservation_id` names, or the refusal
-/// for an id the account holds no reservation for.
+/// for an id this service cannot resolve: a malformed one before an unknown one, the way
+/// the service orders the two.
 pub fn require_known_capacity_reservation<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     capacity_reservation_id: &str,
 ) -> Result<&'store CapacityReservationRecord, crate::scaffolded::Scaffolded<E>> {
+    require_well_formed_capacity_reservation_id(capacity_reservation_id)?;
     store
         .capacity_reservations
         .get(capacity_reservation_id)
         .ok_or_else(|| invalid_capacity_reservation_id_not_found(capacity_reservation_id))
+}
+
+/// One move of capacity between two Capacity Reservations, as
+/// `MoveCapacityReservationInstances` made it.
+///
+/// Held against the `ClientToken` the move was asked under
+/// ([`ComAmazonawsEc2Amazonec2State::capacity_reservation_move_client_tokens`]) so a repeat
+/// of the same request reports the same move instead of moving the capacity twice, and a
+/// DIFFERENT request under a token already in use is told so rather than served.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityReservationInstanceMove {
+    /// "The ID of the Capacity Reservation from which you want to move capacity"
+    /// (`MoveCapacityReservationInstancesRequest$SourceCapacityReservationId`).
+    pub source_capacity_reservation_id: String,
+    /// "The ID of the Capacity Reservation that you want to move capacity into"
+    /// (`$DestinationCapacityReservationId`).
+    pub destination_capacity_reservation_id: String,
+    /// "The number of instances that you want to move from the source Capacity Reservation"
+    /// (`$InstanceCount`).
+    pub instance_count: i32,
 }
 
 // =============================================================================
@@ -35394,12 +35488,15 @@ pub fn capacity_reservation_is_in_region(
 ///
 /// Region-scoped on purpose, where [`require_known_capacity_reservation`] resolves an id
 /// whatever Region it was created in: a reservation of another Region is not one this
-/// request can name, so it is reported not found rather than resolved across Regions.
+/// request can name, so it is reported not found rather than resolved across Regions. A
+/// value outside the id form is refused as malformed first, exactly as that reader orders
+/// the two.
 pub fn require_capacity_reservation_in_region<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     zones: &[AvailabilityZoneRecord],
     capacity_reservation_id: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    require_well_formed_capacity_reservation_id(capacity_reservation_id)?;
     if store
         .capacity_reservations
         .get(capacity_reservation_id)
