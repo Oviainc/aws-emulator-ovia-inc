@@ -195,6 +195,8 @@ mod template_summary;
 mod template_validation;
 #[path = "all/type_deactivation.rs"]
 mod type_deactivation;
+#[path = "all/type_deregistration.rs"]
+mod type_deregistration;
 #[path = "all/type_testing.rs"]
 mod type_testing;
 #[path = "all/unprovisioned_resources.rs"]

@@ -1,40 +1,64 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deregisters ONE record of this account and Region's extension registry
+//! ([`crate::state::registry`]), or one version of it: what the request identifies is
+//! marked `DEPRECATED` and leaves active use.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What the operation does
 //!
-//! ## Shape of an operation
+//! "Marks an extension or extension version as DEPRECATED in the CloudFormation registry,
+//! removing it from active use. Deprecated extensions or extension versions cannot be used
+//! in CloudFormation operations." So the call does two things, and this handler keeps them
+//! separate:
 //!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `DeregisterType::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! 1. it IDENTIFIES a registration — by `Arn`, the ARN of the extension (a `PrivateTypeArn`,
+//!    which carries this account's id, so it addresses a record this account registered),
+//!    or by `Type` and `TypeName` ("Conditional: You must specify either TypeName and Type,
+//!    or Arn"), in the Region the request was served in: the registry is regional, so an ARN
+//!    minted for another Region names nothing here. `VersionId` — or the version segment an
+//!    extension-version ARN carries — narrows the call to ONE version of that record;
+//! 2. it DEPRECATES what was identified
+//!    ([`crate::state::registry::StoredTypeVersion::deprecate`] for one version,
+//!    [`crate::state::registry::StoredExtension::deprecate_every_version`] for the extension
+//!    itself). A request that names no version deregisters the extension, which is every
+//!    version of it: "to deregister an entire extension, you must individually deregister all
+//!    active versions of that extension", and a record with none left in active use is the
+//!    extension "itself being deregistered and marked as deprecated in the registry" — so
+//!    deregistering the LAST active version deregisters the extension with it, without a
+//!    second write.
+//!
+//! One rule gates the version form: "you can't deregister the default version of an extension
+//! if there are other active version of that extension" — the default version is the one
+//! "used when the extension version isn't specified", so taking it out of use while other
+//! versions are still in it would leave the record with no version to resolve to. That is the
+//! registry's own modelled `CFNRegistryException` (400), writing nothing. ("If you do
+//! deregister the default version of an extension, the extension type itself is deregistered
+//! as well": the version form is allowed on the default version exactly when it is the last
+//! one in active use, and then it deprecates the whole record.)
+//!
+//! What this operation can name is exactly the records that are PRIVATE registrations of this
+//! account and Region still in active use
+//! ([`crate::state::registry::StoredExtension::is_live`]): a public extension — whether Amazon
+//! Web Services published it or a third party published and this account activated it, which
+//! `DeactivateType` is what removes from use — a record another Region's registry holds, a
+//! registration every version of which is already deprecated, and a name or an ARN no record
+//! carries are all outside it, and each is the modelled `TypeNotFoundException` (404, "the
+//! specified extension doesn't exist in the CloudFormation registry"); so is a version id the
+//! resolved record holds no version in active use under. A request that identifies no
+//! extension at all is refused with `CFNRegistryException` (400), writing nothing.
 //!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
 //! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
-//!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
+//! [`crate::state::service_state`] and read and write it through the guard it hands back.
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
-//! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
+//! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`; the
+//! Region a request is served in comes from there ([`crate::state::request_region`]).
 //! The engine is NOT reached through `ctx`.
 //!
-//! @generated by the emulator core scaffold op-stub generator.
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -155,18 +179,233 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // What the request identifies, and which version of it it names. A combination of
+        // members that cannot hold together is refused with the registry's own modelled 400
+        // before any state is touched.
+        let (identifier, wanted) = read_request(&input).map_err(registry_exception)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no registry to deregister an
+            // extension from, so this answers 501 rather than a deprecation nothing recorded.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterType"));
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+        // The settle walk every operation makes first, so this call reads and writes a
+        // registry in which every transition the clock had already made due is installed.
+        store.settle(::std::time::SystemTime::now());
+
+        // The REGISTRATION the request names, in the Region the request was served in. Only
+        // a private record of this account and Region still in active use can be
+        // deregistered, so both predicates are part of resolving the record rather than a
+        // second refusal after it: anything else is not an extension this operation can name.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterType"))
+        // The name form resolves the registration directly, so a name a publication has also
+        // written a public record for still resolves to the record this account registered.
+        let arn = match identifier {
+            Identifier::Arn { extension, .. } => store.extension_by_arn(&region, extension),
+            Identifier::Name {
+                type_kind,
+                type_name,
+            } => store.registered_extension_by_name(&region, type_kind, type_name),
+        }
+        .filter(|extension| extension.is_private() && extension.is_live())
+        .map(|extension| extension.arn.clone())
+        .ok_or_else(|| type_not_found(identifier.named()))?;
+
+        let Some(extension) = store.extension_by_arn_mut(&region, &arn) else {
+            // Unreachable: the record was resolved just above, under the same lock. Answered
+            // as the modelled 404 rather than with a panic, which would leave the shared
+            // store poisoned for every other caller.
+            return Err(type_not_found(identifier.named()));
+        };
+
+        let version_id = match wanted {
+            // "To deregister an entire extension, you must individually deregister all active
+            // versions of that extension": a request that names no version is the whole
+            // extension, so every version of it leaves active use at once.
+            Wanted::Extension => {
+                extension.deprecate_every_version();
+                return Ok(DeregisterTypeOutput {});
+            }
+            Wanted::Version(version_id) => version_id,
+        };
+
+        // The version the request names, which has to be one the record holds in active use:
+        // a version already deprecated is already out of use, so there is none of it left to
+        // deregister.
+        let version = extension
+            .version(version_id)
+            .filter(|version| version.is_live())
+            .ok_or_else(|| type_not_found(&wanted.named_under(identifier.named())))?;
+        let version_arn = version.arn.clone();
+        // "You can't deregister the default version of an extension if there are other
+        // active version of that extension."
+        if extension.is_default_version(version_id)
+            && extension
+                .live_versions()
+                .any(|live| live.version_id != version_id)
+        {
+            return Err(registry_exception(cannot_deregister_default_version(
+                &version_arn,
+            )));
+        }
+
+        let Some(version) = extension.version_mut(version_id) else {
+            // Unreachable for the same reason as above: resolved under this lock.
+            return Err(type_not_found(&wanted.named_under(identifier.named())));
+        };
+        // "If an extension has only a single active version, deregistering that version
+        // results in the extension itself being deregistered and marked as deprecated in the
+        // registry": the record's deprecation IS every version of it being deprecated, so
+        // taking the last active version out of use leaves the extension deregistered without
+        // a second write.
+        version.deprecate();
+
+        Ok(DeregisterTypeOutput {})
     }
+}
+
+/// How a request identifies the extension to deregister.
+///
+/// The model states the constraint across three members at once — "Conditional: You must
+/// specify either TypeName and Type, or Arn" — so a request carries one form or the other,
+/// never a mix and never neither.
+#[derive(Debug, Clone, Copy)]
+enum Identifier<'a> {
+    /// `Arn`, "the Amazon Resource Name (ARN) of the extension", which addresses the record
+    /// on its own; an extension-version ARN pins the version too.
+    Arn {
+        extension: &'a str,
+        version_id: Option<&'a str>,
+    },
+    /// `Type` and `TypeName`, resolved in the Region the request was served in.
+    Name {
+        type_kind: &'a str,
+        type_name: &'a str,
+    },
+}
+
+impl Identifier<'_> {
+    /// What the request named the extension by, for the not-found message.
+    fn named(&self) -> &str {
+        match self {
+            Self::Arn { extension, .. } => extension,
+            Self::Name { type_name, .. } => type_name,
+        }
+    }
+}
+
+/// What the request deregisters: the extension, or one version of it.
+#[derive(Debug, Clone, Copy)]
+enum Wanted<'a> {
+    /// The extension itself, which a request naming no version deregisters.
+    Extension,
+    /// The version `VersionId`, or the version an extension-version ARN, names: "the ID of a
+    /// specific version of the extension".
+    Version(&'a str),
+}
+
+impl Wanted<'_> {
+    /// What the not-found message names when the extension was found but this version was
+    /// not: the version, under the extension the request named.
+    fn named_under(&self, extension: &str) -> String {
+        match self {
+            Self::Extension => extension.to_string(),
+            Self::Version(version_id) => format!("{extension}/{version_id}"),
+        }
+    }
+}
+
+/// Read what the request identifies and which version it names, or `Err(message)` for a
+/// combination of members that cannot hold together.
+///
+/// Every modelled constraint (each member's length and pattern, and `Type`'s enum) is
+/// already enforced before the handler runs; what is left are the CONDITIONAL rules the
+/// model states in prose — the same ones `DescribeType` reads, since the two identify an
+/// extension and select a version of it by the same members.
+fn read_request(input: &DeregisterTypeInput) -> Result<(Identifier<'_>, Wanted<'_>), String> {
+    let identifier = match (
+        input.arn.as_deref(),
+        input.r#type.as_deref(),
+        input.type_name.as_deref(),
+    ) {
+        (Some(arn), None, None) => {
+            let (extension, version_id) = crate::state::registry::split_version_arn(arn);
+            Identifier::Arn {
+                extension,
+                version_id,
+            }
+        }
+        (None, Some(type_kind), Some(type_name)) => Identifier::Name {
+            type_kind,
+            type_name,
+        },
+        // Both forms at once: the two identify the extension independently, so a request
+        // carrying both states two identities for one deregistration.
+        (Some(_), _, _) => {
+            return Err(
+                "Specify either Arn, or Type and TypeName, but not both: an extension is \
+                 identified by its ARN or by its kind and name"
+                    .to_string(),
+            )
+        }
+        // Neither form, or half of the name form.
+        (None, _, _) => {
+            return Err(
+                "Either Arn, or both Type and TypeName, must be specified to identify an \
+                 extension"
+                    .to_string(),
+            )
+        }
+    };
+
+    let pinned_by_arn = match identifier {
+        Identifier::Arn { version_id, .. } => version_id,
+        Identifier::Name { .. } => None,
+    };
+    // A version ARN already names a version, so a `VersionId` beside it must be that same
+    // version: two different ones name two different versions for one deregistration.
+    let wanted = match (input.version_id.as_deref(), pinned_by_arn) {
+        (Some(named), Some(pinned)) if named != pinned => {
+            return Err(format!(
+                "VersionId {named} does not name the extension version the Arn does \
+                 ({pinned})"
+            ))
+        }
+        (named, pinned) => match named.or(pinned) {
+            Some(version_id) => Wanted::Version(version_id),
+            None => Wanted::Extension,
+        },
+    };
+    Ok((identifier, wanted))
+}
+
+/// The registry's own modelled refusal: HTTP 400 `CFNRegistryException`, "an error occurred
+/// during a CloudFormation registry operation".
+fn registry_exception(message: String) -> DeregisterTypeError {
+    DeregisterTypeErrorModeled::CFNRegistryException(CFNRegistryException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The message answered a request that would take the record's DEFAULT version out of active
+/// use while other versions are still in it, which is the rule `DeregisterType` states: the
+/// default version is the one a request naming none resolves to, so it is the last version of
+/// the record to leave use.
+fn cannot_deregister_default_version(version_arn: &str) -> String {
+    format!(
+        "Cannot deregister {version_arn}: you can't deregister the default version of an \
+         extension if there are other active versions of that extension"
+    )
+}
+
+/// The modelled 404: "The specified extension doesn't exist in the CloudFormation
+/// registry."
+fn type_not_found(identifier: &str) -> DeregisterTypeError {
+    DeregisterTypeErrorModeled::TypeNotFoundException(TypeNotFoundException {
+        message: Some(crate::state::extension_does_not_exist(identifier)),
+    })
+    .into()
 }
