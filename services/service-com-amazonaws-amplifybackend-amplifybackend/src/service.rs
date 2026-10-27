@@ -313,10 +313,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // modelled shape instead of the framework's generic `ValidationException`.
             // Both the code and the message are replaced together; the status stays
             // with the protocol, which already answers 400 for this refusal.
+            //
+            // The message carries this service's fixed prefix, as every message it
+            // renders does: the prefix belongs to the channel the client reads, so a
+            // refusal raised before a handler ran is worded like one raised inside it.
+            // `Refused` is not a modelled payload, so it cannot come from one of the
+            // crate's error builders — it goes through the one place the prefix is
+            // written instead (`crate::state::prefixed`).
             Refusal::Invalid(violations) => Some(Refused {
                 code: "BadRequestException".to_string(),
-                message: aws_smithy_schema_server::constraints::envelope(violations)
-                    .unwrap_or_else(|| "the request is not formed properly".to_string()),
+                message: crate::state::prefixed(
+                    aws_smithy_schema_server::constraints::envelope(violations)
+                        .unwrap_or_else(|| "The request is not formed properly.".to_string()),
+                ),
             }),
             // Everything else keeps this crate's default wording: an unauthenticated
             // caller is the emulator's refusal, not this service's. `Refusal` is

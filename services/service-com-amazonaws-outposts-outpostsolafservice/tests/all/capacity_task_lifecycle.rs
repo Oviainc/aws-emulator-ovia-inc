@@ -31,7 +31,8 @@
 //! 6. The store a task lands in is bounded: at the emulator's entry ceiling a start
 //!    is refused and nothing is stored.
 //! 7. The two optional references a task carries name OTHER resources, each resolved
-//!    in the scope the model gives it: an `OrderId` is an order the account placed,
+//!    in the scope the model gives it: an `OrderId` is an order of this region's
+//!    inventory (which region that is, is [`crate::capacity_task_order_region`]'s),
 //!    an `AssetId` is hardware installed on the Outpost the task runs on. One that
 //!    resolves to nothing is 404 `NotFoundException` with the identifier echo of the
 //!    member it arrived in, and no task is created.
@@ -571,7 +572,8 @@ async fn one_active_capacity_task_per_outpost_and_per_order() {
     let first_outpost = outpost(&outposts, "conflict-first").await;
     let second_outpost = outpost(&outposts, "conflict-second").await;
     // Two orders the account actually placed (rule 7), one per Outpost: an order is
-    // a resource of the account, so a task on either Outpost may name either one.
+    // a resource of this region's inventory, so a task on either Outpost of it may
+    // name either one.
     let order_id = an_order(&outposts, &first_outpost).await;
     let other_order_id = an_order(&outposts, &second_outpost).await;
     let request = json!({ "InstancePools": [pool("m5.4xlarge", 1)], "OrderId": order_id });

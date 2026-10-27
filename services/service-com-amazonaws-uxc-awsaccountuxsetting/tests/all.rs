@@ -23,6 +23,8 @@ mod list_setting_order;
 mod list_setting_reset;
 #[path = "all/member_constraint_field_list.rs"]
 mod member_constraint_field_list;
+#[path = "all/one_constraint_refusal_path.rs"]
+mod one_constraint_refusal_path;
 #[path = "all/pattern_refusal_rendering.rs"]
 mod pattern_refusal_rendering;
 #[path = "all/reported_account_color.rs"]

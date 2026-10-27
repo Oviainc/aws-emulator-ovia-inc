@@ -43,7 +43,9 @@
 //! resource of every live stack of that Region
 //! ([`crate::state::ComAmazonawsCloudformationCloudformationState::scannable_resources`]).
 //! Each one is therefore managed by a CloudFormation stack, which is what `ScannedResource`'s
-//! `ManagedByStack` reports of it, and the stack that manages it is recorded on the row.
+//! `ManagedByStack` reports of it, and the stack that manages it is recorded on the row — the
+//! record of which resources belong TOGETHER, which is what
+//! [`StoredResourceScan::related_resources`] answers `ListResourceScanRelatedResources` from.
 //!
 //! A scan is a POINT-IN-TIME read: the rows are taken when the scan starts and nothing
 //! recomputes them afterwards, so a resource created after that instant belongs to the next
@@ -56,6 +58,7 @@
 //! [`StoredResourceScan::is_in_flight`] answers true for, in the Region the request was
 //! signed for, so the refusal LIFTS on its own as the scan it counted completes.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 /// How many scans this store keeps, oldest reclaimed first.
@@ -97,6 +100,16 @@ pub const DEFAULT_MAX_RESULTS: usize = 10;
 /// "The maximum value is 100."
 pub const MAX_RESULTS_CEILING: usize = 100;
 
+/// How many related resources one response carries when the request names no `MaxResults`:
+/// "By default the ListResourceScanRelatedResources API action will return up to 100 results
+/// in each response. The maximum value is 100."
+pub const DEFAULT_RELATED_MAX_RESULTS: usize = 100;
+
+/// How many resources one `ListResourceScanRelatedResources` request may ask about: "Up to 100
+/// resources can be provided" (`ListResourceScanRelatedResourcesInput$Resources`), a bound the
+/// model carries no `@length` for.
+pub const MAX_REQUESTED_RESOURCES: usize = 100;
+
 /// How long after the call that starts it a scan's completion becomes due.
 ///
 /// Chosen (nothing documents how long scanning an account's resources takes): non-zero, so
@@ -120,9 +133,8 @@ pub const TYPE_FILTER_WILDCARD: char = '*';
 /// One resource a scan FOUND: what identifies it, and the stack that manages it.
 ///
 /// `DescribeResourceScan` reports the COUNT of these rows and the distinct types among them;
-/// the per-resource members are what a row IS, and `ListResourceScanResources` — still a
-/// scaffold stub with its own issue — is the read that reports each one, so no implemented
-/// read names them yet.
+/// the per-resource members are what a row IS, and `ListResourceScanRelatedResources` is the
+/// read that reports each one as a `ScannedResource`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoundResource {
     /// "The type of the resource, such as `AWS::DynamoDB::Table`"
@@ -137,6 +149,85 @@ pub struct FoundResource {
     /// `ScannedResource$ManagedByStack` reports the presence of ("if `true`, the resource is
     /// managed by a CloudFormation stack").
     pub stack_id: String,
+    /// `ScannedResource$ResourceIdentifier`: "the key is the name of one of the primary
+    /// identifiers for the resource … the value is the value of that primary identifier" —
+    /// which is also what a request ADDRESSES one of these rows by
+    /// (`ScannedResourceIdentifier`). Derived from the resource the scan read
+    /// ([`primary_identifier`]) when the row is taken, so a read reports it rather than
+    /// recomputing it.
+    pub resource_identifier: BTreeMap<String, String>,
+}
+
+impl FoundResource {
+    /// Whether `resource_type` and `identifier` ADDRESS this resource: a
+    /// `ScannedResourceIdentifier` names the type of the resource it identifies and the
+    /// primary-identifier pairs that pick it out, so the type must be this row's and every
+    /// pair the caller supplied must be one this row carries. An identifier naming no pair at
+    /// all picks out nothing rather than everything.
+    pub fn is_addressed_by(
+        &self,
+        resource_type: &str,
+        identifier: &BTreeMap<String, String>,
+    ) -> bool {
+        !identifier.is_empty()
+            && self.resource_type == resource_type
+            && identifier
+                .iter()
+                .all(|(key, value)| self.resource_identifier.get(key) == Some(value))
+    }
+
+    /// `ScannedResource$ManagedByStack`: "if `true`, the resource is managed by a
+    /// CloudFormation stack" — which is whether this row records the stack that manages it.
+    pub fn is_managed_by_stack(&self) -> bool {
+        !self.stack_id.is_empty()
+    }
+}
+
+/// The primary identifier of one resource a scan read, as `ScannedResource$ResourceIdentifier`
+/// reports it: "the key is the name of one of the primary identifiers for the resource …  the
+/// value is the value of that primary identifier".
+///
+/// The VALUE is the resource's physical id, which is what identifies it in the service that
+/// owns it. The KEY is the member that id is the value of, taken from what this service already
+/// knows about the type, most specific first:
+///
+/// 1. the PUBLISHED return value that is the physical id — a type whose `Ref` returns an ARN or
+///    a URL is identified by that member (`AWS::SNS::Topic`'s `TopicArn`, `AWS::SQS::Queue`'s
+///    `QueueUrl`), which is the published attribute
+///    ([`crate::state::template::published_attribute_names`]) carrying that same value;
+/// 2. otherwise the property the declaration NAMED the resource under
+///    ([`crate::state::template::name_property`]), since a physical id that is the resource's
+///    name is the value of that property;
+/// 3. otherwise the name property CloudFormation's convention gives the type
+///    ([`crate::state::template::name_property_candidates`]), for a resource whose name the
+///    template left CloudFormation to generate.
+///
+/// Only the PUBLISHED attribute names are considered in the first step: a resource's stored
+/// attribute map also carries the aliases a template may read an attribute under, and an alias
+/// is not a name the owning service identifies the resource by.
+///
+/// The third step always answers, since the conventional candidates are built from the type's
+/// own name, so every row carries one pair — never an empty identifier, which would be a row no
+/// request could address.
+pub fn primary_identifier(resource: &crate::state::StoredResource) -> BTreeMap<String, String> {
+    let published = crate::state::template::published_attribute_names(&resource.resource_type)
+        .iter()
+        .find(|name| {
+            resource.attributes.get(**name) == Some(&resource.physical_resource_id)
+        })
+        .map(|name| (*name).to_string());
+    let key = published
+        .or_else(|| {
+            crate::state::template::name_property(&resource.resource_type, &resource.properties)
+        })
+        .or_else(|| {
+            crate::state::template::name_property_candidates(&resource.resource_type)
+                .into_iter()
+                .next()
+        });
+    key.into_iter()
+        .map(|key| (key, resource.physical_resource_id.clone()))
+        .collect()
 }
 
 /// The terminal status a scan is headed for, and the instant it is due.
@@ -296,6 +387,49 @@ impl StoredResourceScan {
     pub fn types_are_available(&self) -> bool {
         matches!(self.status.as_str(), status::COMPLETE | status::FAILED)
     }
+
+    /// The resources this scan listed that are RELATED to the ones `requested` addresses,
+    /// each `(resource type, primary identifier)` as a `ScannedResourceIdentifier` names one.
+    ///
+    /// A resource's related resources are the OTHER resources of the scan that the same
+    /// CloudFormation stack manages: a stack is the record this service holds of which
+    /// resources belong together, so the resources it deployed from one template are the ones
+    /// related to each other. A requested resource this scan did not list contributes nothing,
+    /// and a requested resource is never related to itself.
+    ///
+    /// The order is the order the scan found the rows in, so paging through the result walks
+    /// it once; a row is reported once however many of the requested resources it is related
+    /// to.
+    pub fn related_resources(
+        &self,
+        requested: &[(String, BTreeMap<String, String>)],
+    ) -> Vec<&FoundResource> {
+        let addressed: Vec<bool> = self
+            .resources
+            .iter()
+            .map(|found| {
+                requested.iter().any(|(resource_type, identifier)| {
+                    found.is_addressed_by(resource_type, identifier)
+                })
+            })
+            .collect();
+        let stacks: BTreeSet<&str> = self
+            .resources
+            .iter()
+            .zip(&addressed)
+            .filter(|(_, addressed)| **addressed)
+            .map(|(found, _)| found.stack_id.as_str())
+            .filter(|stack_id| !stack_id.is_empty())
+            .collect();
+        self.resources
+            .iter()
+            .zip(&addressed)
+            .filter(|(found, addressed)| {
+                !**addressed && stacks.contains(found.stack_id.as_str())
+            })
+            .map(|(found, _)| found)
+            .collect()
+    }
 }
 
 /// Whether a scan given `filters` lists a resource of `resource_type`.
@@ -358,14 +492,29 @@ pub fn invalid_type_filter(filter: &str) -> String {
     )
 }
 
-/// The message answered when a request names a resource scan this account and Region holds no
-/// record of, built from what the request named.
+/// The `ResourceScanNotFoundException` message CloudFormation answers when a request names a
+/// resource scan this account and Region holds no record of — an ARN no scan was started
+/// under, one another Region holds, or one this store no longer retains.
 ///
-/// Shaped like the other "cannot be found" messages of this service
-/// ([`crate::state::generated_template::does_not_exist`]): no recorded refusal of this request
-/// is available to take the service's own wording from.
-pub fn does_not_exist(resource_scan_id: &str) -> String {
-    format!("Resource scan {resource_scan_id} cannot be found")
+/// This is the sentence the service's OWN refusal of such a request carries, which is what
+/// replaced the stand-in wording this module previously built from the id the request named:
+/// the real refusal names nothing of the request, so there is no member to interpolate — a
+/// FIXED sentence, the way [`crate::state::HOOK_RESULT_NOT_FOUND`] is. It belongs to the error
+/// SHAPE rather than to one operation, so every read of a scan answers it.
+pub const NOT_FOUND: &str = "There is no ResourceScan found for the ResourceScanId.";
+
+/// The message answered when a request asks about more resources than one call may carry,
+/// built from how many it supplied and the documented bound.
+///
+/// The rule is the model's own (`ListResourceScanRelatedResourcesInput$Resources`: "Up to 100
+/// resources can be provided"); the sentence that states it back to the caller is this
+/// emulator's, since neither the model nor a recorded refusal of this request carries the
+/// service's own wording for it — the same position [`invalid_type_filter`] is in.
+pub fn too_many_requested_resources(requested: usize) -> String {
+    format!(
+        "Resources can carry at most {MAX_REQUESTED_RESOURCES} resources, but {requested} \
+         were provided"
+    )
 }
 
 /// The message answered when a scan of this account and Region is already running, which is

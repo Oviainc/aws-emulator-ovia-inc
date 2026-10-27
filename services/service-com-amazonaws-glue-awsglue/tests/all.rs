@@ -87,6 +87,8 @@ mod get_mapping;
 mod get_table_entity_not_found;
 #[path = "all/glossaries.rs"]
 mod glossaries;
+#[path = "all/glossary_term_listing.rs"]
+mod glossary_term_listing;
 #[path = "all/glossary_terms.rs"]
 mod glossary_terms;
 #[path = "all/job_listing.rs"]

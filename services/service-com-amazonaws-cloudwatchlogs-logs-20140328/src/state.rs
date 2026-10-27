@@ -666,6 +666,13 @@ pub const EXPORT_TASK_STATUS_CANCELLED: &str = "CANCELLED";
 /// moves it on and a cancel of it has no execution left to stop.
 pub const EXPORT_TASK_STATUS_FAILED: &str = "FAILED";
 
+/// The status message a cancelled export task reports beside that status code
+/// ([`ExportTaskRecord::status_message`]): `ExportTaskStatus$message` is "the status message
+/// related to the status code", and what there is to say about a task in this status is that
+/// it stopped because a caller cancelled it rather than because the export itself ended. The
+/// text is fixed for the status: it interpolates neither the task nor the instant.
+pub const EXPORT_TASK_CANCELLED_STATUS_MESSAGE: &str = "Export task cancelled by user";
+
 /// How long after it is created an export task moves `PENDING` -> `RUNNING`, and how long
 /// after that it reaches `COMPLETED`.
 ///
@@ -1772,6 +1779,10 @@ pub struct ExportTaskRecord {
     pub log_stream_name_prefix: Option<String>,
     /// `ExportTaskStatus$code`, one of the [`EXPORT_TASK_STATUS_PENDING`] family.
     pub status_code: String,
+    /// `ExportTaskStatus$message` — "The status message related to the status code" — set
+    /// only for a status the service has something to say about, which is the one a CALLER
+    /// put the task in rather than one the export reached on its own.
+    pub status_message: Option<String>,
     /// `ExportTaskExecutionInfo$creationTime`, in epoch milliseconds.
     pub creation_time_ms: i64,
     /// `ExportTaskExecutionInfo$completionTime`, in epoch milliseconds — set only once the
@@ -1817,6 +1828,7 @@ impl ExportTaskRecord {
             destination_prefix: DEFAULT_EXPORT_DESTINATION_PREFIX.to_string(),
             log_stream_name_prefix: None,
             status_code: EXPORT_TASK_STATUS_PENDING.to_string(),
+            status_message: None,
             creation_time_ms,
             completion_time_ms: None,
             running_due_ms: Some(running_due_ms),
@@ -1835,11 +1847,13 @@ impl ExportTaskRecord {
 
     /// Cancel this export task: it reaches [`EXPORT_TASK_STATUS_CANCELLED`] at `now_ms` and
     /// owes the clock no further transition, so the start and the completion it was armed for
-    /// are DISCARDED rather than materialised later over the cancellation. Only a task that
-    /// [`Self::is_active`] has an export left to cancel — "The task must be in the PENDING or
-    /// RUNNING state."
+    /// are DISCARDED rather than materialised later over the cancellation. The status message
+    /// that status carries is stamped with it, because a cancelled export stopped for a reason
+    /// this service can state. Only a task that [`Self::is_active`] has an export left to
+    /// cancel — "The task must be in the PENDING or RUNNING state."
     pub fn cancel(&mut self, now_ms: i64) {
         self.status_code = EXPORT_TASK_STATUS_CANCELLED.to_string();
+        self.status_message = Some(EXPORT_TASK_CANCELLED_STATUS_MESSAGE.to_string());
         self.completion_time_ms = Some(now_ms);
         self.running_due_ms = None;
         self.completion_due_ms = None;
@@ -1881,7 +1895,7 @@ impl ExportTaskRecord {
             destination_prefix: Some(self.destination_prefix.clone()),
             status: Some(crate::ops::types::ExportTaskStatus {
                 code: Some(self.status_code.clone()),
-                message: None,
+                message: self.status_message.clone(),
             }),
             execution_info: Some(crate::ops::types::ExportTaskExecutionInfo {
                 creation_time: Some(self.creation_time_ms),

@@ -53,6 +53,8 @@ mod connect_instance_integration_deletion;
 mod connect_instance_integration_list_paging;
 #[path = "all/connect_instance_integrations.rs"]
 mod connect_instance_integrations;
+#[path = "all/cursor_paging_is_one_rule.rs"]
+mod cursor_paging_is_one_rule;
 #[path = "all/instance_communication_limits.rs"]
 mod instance_communication_limits;
 #[path = "all/instance_communication_limits_isolation.rs"]

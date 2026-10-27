@@ -413,6 +413,9 @@ const INVALID_ACCESS_TOKEN: &str = "Invalid Access Token";
 fn token_rejected(rejection: crate::state::TokenRejection) -> StartWebAuthnRegistrationError {
     match rejection {
         crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::MissingRequiredScopes => {
+            not_authorized(crate::state::MISSING_REQUIRED_SCOPES_MESSAGE)
+        }
         crate::state::TokenRejection::NotAnAccessToken
         | crate::state::TokenRejection::PoolGone
         | crate::state::TokenRejection::UserGone => not_authorized(INVALID_ACCESS_TOKEN),
