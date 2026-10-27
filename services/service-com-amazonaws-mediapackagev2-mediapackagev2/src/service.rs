@@ -616,7 +616,9 @@ fn serve_egress<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> Rt
 /// SigV4 credential reaches this function only through [`CredentialedDataPlane`], i.e.
 /// only once the emulator's authenticator accepted that credential, and is recorded
 /// against the channel, bounded by [`crate::state::MAX_INGESTED_OBJECTS_PER_CHANNEL`] and
-/// [`crate::state::MAX_INGESTED_OBJECT_BYTES`].
+/// [`crate::state::MAX_INGESTED_OBJECT_BYTES`]. A path under a channel that publishes no
+/// ingest endpoint is not a path this service published, so it resolves to nothing (`404`)
+/// however the push is credentialed.
 fn serve_ingest<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
     if !matches!(req.method(), "PUT" | "POST") {
         return error_response(

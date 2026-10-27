@@ -1087,12 +1087,19 @@ type PassThroughCase<'a> = (
 #[tokio::test]
 async fn the_change_set_carries_what_the_deployment_asked_for() {
     let deploy = Deploy::new();
-    let template = sam_template(json!({
-        "Queue": {
-            "Type": "AWS::SQS::Queue",
-            "Properties": { "QueueName": { "Ref": "QueueName" } }
+    // The queue's name comes from a template PARAMETER the application declares, so the
+    // parameter overrides below have something to override — a `Ref` to a name the template
+    // does not declare is a template CloudFormation refuses.
+    let template = json!({
+        "Transform": SAM_TRANSFORM,
+        "Parameters": { "QueueName": { "Type": "String", "Default": "passthrough" } },
+        "Resources": {
+            "Queue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": { "QueueName": { "Ref": "QueueName" } }
+            }
         }
-    }));
+    });
     let application_id = deploy
         .given_application("passthrough-app", &[("1.0.0", template)])
         .await;

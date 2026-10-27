@@ -311,7 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let written_at = crate::state::now_epoch_millis();
-        let policy_version = store.next_policy_version(written_at);
+        let policy_version = crate::state::mint_policy_version();
         let write = PolicyWrite {
             description: input.description,
             policy,

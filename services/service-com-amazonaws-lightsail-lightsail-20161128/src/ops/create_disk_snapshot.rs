@@ -304,6 +304,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state: crate::state::DISK_SNAPSHOT_STATE_PENDING,
                 due: Some(due),
                 source: stored_source,
+                // An explicit snapshot the caller asked for, so it is not one
+                // created from a copy the `AutoSnapshot` add-on took.
+                is_from_auto_snapshot: false,
             });
             // `operations` is a list because other Lightsail creates act on
             // several resources at once; `CreateDiskSnapshot` creates exactly one

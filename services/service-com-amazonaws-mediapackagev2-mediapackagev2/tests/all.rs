@@ -86,3 +86,5 @@ mod shared_page_size;
 mod pagination_token_refusal;
 #[path = "all/harvest_job_idempotency.rs"]
 mod harvest_job_idempotency;
+#[path = "all/multiview_channel_ingest.rs"]
+mod multiview_channel_ingest;

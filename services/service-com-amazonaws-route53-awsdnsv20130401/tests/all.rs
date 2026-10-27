@@ -79,6 +79,8 @@ mod reusable_delegation_sets;
 mod state_roundtrip;
 #[path = "all/traffic_policies.rs"]
 mod traffic_policies;
+#[path = "all/traffic_policy_comment_updates.rs"]
+mod traffic_policy_comment_updates;
 #[path = "all/traffic_policy_instances.rs"]
 mod traffic_policy_instances;
 #[path = "all/traffic_policy_listing.rs"]

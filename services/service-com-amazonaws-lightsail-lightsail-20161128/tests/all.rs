@@ -253,6 +253,8 @@ mod resource_tagging;
 mod resource_tags;
 #[path = "all/setup_history_reporting.rs"]
 mod setup_history_reporting;
+#[path = "all/snapshot_copy.rs"]
+mod snapshot_copy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_ip_allocation.rs"]

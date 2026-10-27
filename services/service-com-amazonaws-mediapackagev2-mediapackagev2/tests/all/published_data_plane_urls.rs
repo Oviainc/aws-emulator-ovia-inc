@@ -248,8 +248,10 @@ async fn every_published_manifest_url_is_gated_by_the_endpoints_resource_policy(
     }
 }
 
-/// The channels the ingest rows push to, each with an input type from the model's
-/// `InputType` enum (`CMAF | HLS | MULTIVIEW`).
+/// The channels the ingest rows push to: the input types from the model's `InputType` enum
+/// that receive ingest of their own (`CMAF | HLS`). `MULTIVIEW` publishes no ingest URL at
+/// all — the model's `InputType` doc says such a channel "receives no ingest of its own" —
+/// so it has no row here; `multiview_channel_ingest.rs` covers it.
 const INGEST_CHANNELS: &[(&str, &str)] = &[("in-cmaf", "CMAF"), ("in-hls", "HLS")];
 
 /// The methods the ingest data plane serves: a contributing encoder writes a segment with

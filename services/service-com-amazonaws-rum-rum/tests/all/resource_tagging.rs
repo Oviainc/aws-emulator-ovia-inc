@@ -22,6 +22,10 @@
 //! * the refusal tables walk a catalog of keys `TagResource` must reject (the modelled
 //!   `TagKey` pattern) and a catalog of ARNs naming no app monitor, the latter across all
 //!   three tagging operations;
+//! * the `UntagResource` key table walks that same catalog of rejected keys, plus
+//!   `TagKey`'s `@length` bounds and one past each of them, with the offending key at
+//!   either end of the list and one row naming two of them — the constraints a NAMED key
+//!   is subject to are the ones a written key is subject to;
 //! * the tag-count table tests the documented ceiling at the bound and one past it.
 
 use std::collections::BTreeMap;
@@ -30,7 +34,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::multi_service_router::MultiServiceRouter;
 
 use crate::support::{
-    call, create, emulator, get_app_monitor, percent_encoded, Reply, ACCOUNT, REGION,
+    call, create, emulator, get_app_monitor, message, percent_encoded, Reply, ACCOUNT, REGION,
 };
 
 /// The status a successful `TagResource`/`UntagResource` answers with: 204 No Content,
@@ -507,6 +511,220 @@ async fn a_tag_key_outside_the_modelled_pattern_is_refused_and_writes_nothing() 
         assert_eq!(
             listed, start,
             "case {case:?}: a refused TagResource must write nothing, got {listed:?}"
+        );
+    }
+}
+
+/// `TagKey` is `@length(min: 1, max: 128)`.
+/// Source: `smithy_query(query="shape", shape="TagKey")`.
+const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// One row of the tag-key constraint table for `UntagResource`: the tags the resource
+/// starts with, the keys the removal NAMES, and which of those keys the modelled `TagKey`
+/// rejects.
+struct UntagKeyCase {
+    case: String,
+    name: String,
+    start: BTreeMap<String, String>,
+    named: Vec<String>,
+    /// The 0-based positions in `named` holding a key `TagKey` rejects — empty for a row
+    /// every key of which the shape admits.
+    offending: Vec<usize>,
+}
+
+impl UntagKeyCase {
+    /// The map the resource must hold once the call has been answered: a row naming only
+    /// admitted keys removes exactly those of them the resource carries, and a row naming
+    /// a key the shape rejects removes nothing at all.
+    fn expected(&self) -> BTreeMap<String, String> {
+        let mut left = self.start.clone();
+        if self.offending.is_empty() {
+            for key in &self.named {
+                left.remove(key);
+            }
+        }
+        left
+    }
+
+    /// The clause the refusal states for each key the shape rejects: the value, the
+    /// position that key holds in the list that carried it — the path the framework's walk
+    /// spells a list element as — and the opening of the requirement sentence.
+    fn clauses(&self) -> Vec<String> {
+        self.offending
+            .iter()
+            .map(|position| {
+                format!(
+                    "Value '{}' at 'tagKeys.{}.member' failed to satisfy constraint:",
+                    self.named[*position],
+                    position + 1
+                )
+            })
+            .collect()
+    }
+}
+
+/// The tag-key constraint table for `UntagResource`. Rows differ along every way a named
+/// key can fall outside the constraints the modelled `TagKey` declares, and along how many
+/// of the named keys do: the reserved `aws:` prefix the pattern's lookahead excludes,
+/// characters outside its class in two scripts, the `@length` bounds and one past each of
+/// them, the position the offending key holds in the list, and the admitted catalog, which
+/// must still be removed.
+fn untag_key_cases() -> Vec<UntagKeyCase> {
+    let held = || map_of(&[("Env", "dev"), ("Team", "web")]);
+    let at_max = "k".repeat(MAX_TAG_KEY_LENGTH);
+    let past_max = "k".repeat(MAX_TAG_KEY_LENGTH + 1);
+    let mut cases: Vec<UntagKeyCase> = Vec::new();
+
+    // Every key the modelled pattern rejects, each named beside a key the resource holds
+    // and the shape admits — so a refusal cannot be read as "the request named nothing
+    // removable".
+    for key in REJECTED_TAG_KEYS {
+        cases.push(UntagKeyCase {
+            case: format!("rejected key {key:?} beside an admitted one"),
+            name: format!("untag-key-{}", cases.len()),
+            start: held(),
+            named: vec![key.to_string(), "Env".to_string()],
+            offending: vec![0],
+        });
+    }
+    cases.push(UntagKeyCase {
+        case: "the offending key is the last one named".to_string(),
+        name: format!("untag-key-{}", cases.len()),
+        start: held(),
+        named: vec!["Env".to_string(), "key#hash".to_string()],
+        offending: vec![1],
+    });
+    cases.push(UntagKeyCase {
+        case: "two keys outside the pattern are both stated".to_string(),
+        name: format!("untag-key-{}", cases.len()),
+        start: held(),
+        named: vec![
+            "aws:owner".to_string(),
+            "key with space".to_string(),
+            "Env".to_string(),
+        ],
+        offending: vec![0, 1],
+    });
+    cases.push(UntagKeyCase {
+        case: "a key at TagKey's 128-character maximum is admitted".to_string(),
+        name: format!("untag-key-{}", cases.len()),
+        start: {
+            let mut start = held();
+            start.insert(at_max.clone(), "long".to_string());
+            start
+        },
+        named: vec![at_max.clone()],
+        offending: Vec::new(),
+    });
+    cases.push(UntagKeyCase {
+        case: "a key one character past that maximum is refused".to_string(),
+        name: format!("untag-key-{}", cases.len()),
+        start: held(),
+        named: vec![past_max],
+        offending: vec![0],
+    });
+    cases.push(UntagKeyCase {
+        case: "the empty key is shorter than TagKey's minimum".to_string(),
+        name: format!("untag-key-{}", cases.len()),
+        start: held(),
+        named: vec![String::new()],
+        offending: vec![0],
+    });
+    cases.push(UntagKeyCase {
+        case: "every character class TagKey admits is removable".to_string(),
+        name: format!("untag-key-{}", cases.len()),
+        start: ADMITTED_TAG_KEYS
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.to_string(), format!("value-{index}")))
+            .collect(),
+        named: ADMITTED_TAG_KEYS
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect(),
+        offending: Vec::new(),
+    });
+    cases.push(UntagKeyCase {
+        case: "an admitted key the resource does not hold stays a no-op".to_string(),
+        name: format!("untag-key-{}", cases.len()),
+        start: held(),
+        named: vec!["never-set".to_string()],
+        offending: Vec::new(),
+    });
+    cases
+}
+
+#[tokio::test]
+async fn untag_resource_applies_the_modelled_tag_key_constraints_to_every_key_it_names() {
+    let (router, _engine) = emulator();
+    for case in untag_key_cases() {
+        let created: Value = case
+            .start
+            .iter()
+            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+            .collect::<serde_json::Map<String, Value>>()
+            .into();
+        let arn = create_monitor(&router, &case.case, &case.name, created).await;
+
+        let named: Vec<&str> = case.named.iter().map(String::as_str).collect();
+        let reply = untag_resource(&router, &arn, &named).await;
+        let expected = case.expected();
+        if case.offending.is_empty() {
+            assert_eq!(
+                reply.status,
+                NO_CONTENT,
+                "case {:?}: expected UntagResource to answer {NO_CONTENT}, got {} {:?}",
+                case.case,
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            );
+        } else {
+            assert_eq!(
+                reply.status,
+                400,
+                "case {:?}: expected HTTP 400, got {} {:?}",
+                case.case,
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            );
+            assert_eq!(
+                reply.error_code(&case.case),
+                BAD_REQUEST_CODE,
+                "case {:?}: expected {BAD_REQUEST_CODE}, got {:?}",
+                case.case,
+                String::from_utf8_lossy(&reply.body)
+            );
+            let body = reply.json(&case.case);
+            let stated = message(&body).unwrap_or_else(|| {
+                panic!("case {:?}: the refusal carries no message: {body}", case.case)
+            });
+            let errors = case.offending.len();
+            let plural = if errors == 1 { "error" } else { "errors" };
+            assert!(
+                stated.starts_with(&format!("{errors} validation {plural} detected: ")),
+                "case {:?}: expected an envelope over {errors} clause(s), got {stated:?}",
+                case.case
+            );
+            for clause in case.clauses() {
+                assert!(
+                    stated.contains(&clause),
+                    "case {:?}: expected the refusal to state {clause:?}, got {stated:?}",
+                    case.case
+                );
+            }
+        }
+
+        let listed = listed_tags(&router, &case.case, &arn).await;
+        assert_eq!(
+            listed, expected,
+            "case {:?}: expected {expected:?} to be left, got {listed:?}",
+            case.case
+        );
+        let reported = monitor_tags(&router, &case.case, &case.name).await;
+        assert_eq!(
+            reported, expected,
+            "case {:?}: GetAppMonitor must report the same map {expected:?}, got {reported:?}",
+            case.case
         );
     }
 }

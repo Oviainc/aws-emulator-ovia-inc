@@ -1850,7 +1850,10 @@ struct UnprocessableCase {
 /// The class: the processed stage exists only when every directive could be applied within
 /// the expander's stated bounds. The rows span the ways that fails — a malformed directive,
 /// one whose argument is not resolvable from the template alone, a document deeper than the
-/// expander descends, and loops whose cross-product passes the expansion ceiling.
+/// expander descends, and loops whose cross-product passes the expansion ceiling. (A
+/// directive whose ARGUMENT could never be what it takes is refused when the template is
+/// submitted instead, so it has no stack to report a stage for: see
+/// `template_validation.rs`.)
 fn unprocessable_cases() -> Vec<UnprocessableCase> {
     let rows: Vec<(&'static str, &'static str, String)> = vec![
         (
@@ -1872,16 +1875,6 @@ fn unprocessable_cases() -> Vec<UnprocessableCase> {
             "a ForEach whose output map is not a map",
             "bad-output",
             r#"{"Transform":"AWS::LanguageExtensions","Resources":{"Fn::ForEach::Params":["Name",["one"],"not-a-map"]}}"#.to_string(),
-        ),
-        (
-            "Fn::Length of something that is not a list",
-            "bad-length",
-            r#"{"Transform":"AWS::LanguageExtensions","Outputs":{"Count":{"Value":{"Fn::Length":{"a":1}}}}}"#.to_string(),
-        ),
-        (
-            "Fn::ToJsonString of a document that still holds an intrinsic",
-            "bad-tojson",
-            r#"{"Transform":"AWS::LanguageExtensions","Outputs":{"Rendered":{"Value":{"Fn::ToJsonString":{"v":{"Ref":"Other"}}}}}}"#.to_string(),
         ),
         (
             "a document nested deeper than the expander descends",

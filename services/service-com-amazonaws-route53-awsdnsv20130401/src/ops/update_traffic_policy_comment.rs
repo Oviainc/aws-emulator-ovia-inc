@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTrafficPolicyComment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTrafficPolicyComment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTrafficPolicyComment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +65,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::no_such_traffic_policy;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +138,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTrafficPolicyComment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTrafficPolicyCommentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTrafficPolicyComment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`; `InvalidInput` is the only error this
+            // operation models that can carry the reason at all.
+            UpdateTrafficPolicyCommentErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // The comment belongs to ONE VERSION of the policy, so the request
+        // addresses both halves of `(Id, Version)`: a policy the account does
+        // not hold and a version that policy does not hold are the same refusal,
+        // worded through the ONE place this service words it.
+        let policy = store.traffic_policies.get_mut(&input.id).ok_or_else(|| {
+            UpdateTrafficPolicyCommentErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
+        })?;
+        let stored = policy.versions.get_mut(&input.version).ok_or_else(|| {
+            UpdateTrafficPolicyCommentErrorModeled::NoSuchTrafficPolicy(no_such_traffic_policy())
+        })?;
+
+        // The write this operation exists for: the comment the request carries
+        // REPLACES the one that version held. `Comment` is required here, so
+        // there is no "leave it as it was" request — unlike the hosted-zone
+        // comment update, whose optional element clears the value when absent.
+        // Nothing else about the version moves: its document is its definition,
+        // and the policy's id and name belong to every version of it.
+        stored.comment = Some(input.comment);
+
+        // Read the response back out of the store, so what the caller is told is
+        // what a later GetTrafficPolicy will tell it.
+        let traffic_policy = policy
+            .to_traffic_policy(input.version)
+            .expect("the traffic policy version just updated must be present");
+        Ok(UpdateTrafficPolicyCommentOutput { traffic_policy })
     }
 }
