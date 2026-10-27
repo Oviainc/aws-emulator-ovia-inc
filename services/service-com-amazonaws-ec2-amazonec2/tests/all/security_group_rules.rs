@@ -44,6 +44,15 @@ const SEEDED_PREFIX_LIST: &str = "pl-0123456789abcdef0";
 /// A second prefix list, so a prefix-list permission can name more than one.
 const OTHER_PREFIX_LIST: &str = "pl-0abcdef0123456789";
 
+/// The VPC peering connection a referenced-group grant below names: a well-formed
+/// `VpcPeeringConnectionId` (`UserIdGroupPair$VpcPeeringConnectionId`), so the string the
+/// stored rule retains for it is one a request could really carry.
+const REFERENCED_PEERING_CONNECTION: &str = "pcx-0123456789abcdef0";
+
+/// The peering status that grant names — one of the values `UserIdGroupPair$PeeringStatus`
+/// accepts.
+const REFERENCED_PEERING_STATUS: &str = "active";
+
 /// One `DescribeSecurityGroupRules` call carrying `params`, as its HTTP status and XML
 /// body.
 async fn describe(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
@@ -305,6 +314,39 @@ fn group_permission(protocol: &str, ports: Option<(i32, i32)>, groups: &[&str]) 
                 })
                 .collect(),
         ),
+        ..empty_permission()
+    }
+}
+
+/// `protocol` on `ports` from or to the security group `group_id`, with EVERY member of the
+/// referenced-group grant set: the account that owns it, the VPC it is in, the peering
+/// connection reaching it and that peering's status.
+///
+/// A row of the byte-budget table below uses it, because every one of those members is a
+/// request-chosen string the stored rule RETAINS
+/// (`SecurityGroupRule$ReferencedGroupInfo`) and so has to be charged against the store's
+/// budget; a permission naming only the group's id would not notice one left out.
+fn fully_described_group_permission(
+    protocol: &str,
+    ports: Option<(i32, i32)>,
+    group_id: &str,
+    vpc_id: &str,
+    vpc_peering_connection_id: &str,
+    peering_status: &str,
+) -> IpPermission {
+    IpPermission {
+        ip_protocol: Some(protocol.to_string()),
+        from_port: ports.map(|(from, _)| from),
+        to_port: ports.map(|(_, to)| to),
+        user_id_group_pairs: Some(vec![UserIdGroupPair {
+            group_id: Some(group_id.to_string()),
+            user_id: Some(account_id()),
+            group_name: None,
+            description: None,
+            vpc_id: Some(vpc_id.to_string()),
+            vpc_peering_connection_id: Some(vpc_peering_connection_id.to_string()),
+            peering_status: Some(peering_status.to_string()),
+        }]),
         ..empty_permission()
     }
 }
@@ -1217,6 +1259,25 @@ async fn a_rule_a_request_named_is_charged_and_the_delete_gives_it_back() {
             ),
             SEEDED_PREFIX_LIST.len() + OTHER_PREFIX_LIST.len(),
         ),
+        (
+            "a referenced group with every member of the reference set",
+            fully_described_group_permission(
+                "tcp",
+                Some((8082, 8082)),
+                &group_id,
+                &vpc_id,
+                REFERENCED_PEERING_CONNECTION,
+                REFERENCED_PEERING_STATUS,
+            ),
+            // Every string the stored rule keeps from the grant: the group it references,
+            // the account owning it, the VPC it is in, the peering connection reaching it
+            // and that peering's status.
+            group_id.len()
+                + account_id().len()
+                + vpc_id.len()
+                + REFERENCED_PEERING_CONNECTION.len()
+                + REFERENCED_PEERING_STATUS.len(),
+        ),
     ];
 
     for (case, permission, expected) in cases {
@@ -1232,13 +1293,25 @@ async fn a_rule_a_request_named_is_charged_and_the_delete_gives_it_back() {
         );
         let after = budget();
         // Each minted rule costs the fixed per-record overhead every store of this crate
-        // charges, on top of the caller-chosen bytes of the grant it names.
-        let expected = expected + STORED_RECORD_OVERHEAD_BYTES * minted.len();
+        // charges, on top of the caller-chosen bytes of the grant it names and of the
+        // protocol every rule of the permission keeps a copy of.
+        let protocol_bytes = permission.ip_protocol.as_deref().map_or(0, str::len);
+        let expected = expected + (STORED_RECORD_OVERHEAD_BYTES + protocol_bytes) * minted.len();
         assert_eq!(
             after - before,
             expected,
             "case {case:?}: expected the store to charge {expected} caller-chosen bytes, \
              it went from {before} to {after}"
+        );
+        // What the store CHARGED is what the pre-admission estimate weighed, so a request
+        // cannot be admitted under one arithmetic and charged under another — and neither
+        // may leave a string the record retains uncounted.
+        let estimated =
+            ec2::state::security_group_rules_charge(::std::slice::from_ref(&permission), &[]);
+        assert_eq!(
+            estimated, expected,
+            "case {case:?}: expected the pre-admission estimate to weigh the {expected} bytes \
+             the store charged, got {estimated}"
         );
         // And the minted rules are what the operation reports for the group.
         let reported_ids: Vec<String> = rules_of(&router, case, &group_id)
@@ -1355,6 +1428,9 @@ async fn a_rule_referencing_a_group_is_charged_for_every_member_it_retains() {
 
     for (index, (case, pair)) in cases.into_iter().enumerate() {
         let text = |value: &Option<String>| value.as_deref().map_or(0, str::len);
+        // The protocol is a string of the permission that every rule it describes keeps a
+        // copy of, so it is charged per rule beside the members of the grant itself.
+        let protocol = "tcp";
         let expected = text(&pair.group_id)
             + text(&pair.user_id)
             + text(&pair.group_name)
@@ -1362,9 +1438,10 @@ async fn a_rule_referencing_a_group_is_charged_for_every_member_it_retains() {
             + text(&pair.vpc_id)
             + text(&pair.vpc_peering_connection_id)
             + text(&pair.peering_status)
+            + protocol.len()
             + STORED_RECORD_OVERHEAD_BYTES;
         let permission = IpPermission {
-            ip_protocol: Some("tcp".to_string()),
+            ip_protocol: Some(protocol.to_string()),
             from_port: Some(7000 + index as i32),
             to_port: Some(7000 + index as i32),
             user_id_group_pairs: Some(vec![pair]),
