@@ -28,9 +28,9 @@ use std::collections::BTreeMap;
 use std::thread::sleep;
 use std::time::Duration;
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
-use crate::api_lifecycle::{as_str, call, emulator, error_code, instant};
+use crate::api_lifecycle::{as_str, call, emulator, error_code, instant, strip_nulls};
 
 /// The portal-products collection URI (`CreatePortalProduct`'s modelled
 /// `POST /v2/portalproducts`); one product hangs off it as `{COLLECTION}/{id}`, the URI
@@ -194,26 +194,10 @@ fn rows() -> Vec<Row> {
 }
 
 /// One member of a document, with an absent member read as `null` — so "absent" and
-/// "reported as null" are not asserted as two different things.
+/// "reported as null" are not asserted as two different things. The normalizer is the
+/// crate-wide one in `api_lifecycle`, shared with every other suite.
 fn member(document: &Value, name: &str) -> Value {
     strip_nulls(document.get(name).unwrap_or(&Value::Null))
-}
-
-/// `value` with every null object entry dropped, recursively: the request and the two
-/// readers are compared through this ONE normalizer, so a structure member a reader
-/// omits and one it reports as null compare equal.
-fn strip_nulls(value: &Value) -> Value {
-    match value {
-        Value::Object(entries) => Value::Object(
-            entries
-                .iter()
-                .filter(|(_, entry)| !entry.is_null())
-                .map(|(key, entry)| (key.clone(), strip_nulls(entry)))
-                .collect::<Map<String, Value>>(),
-        ),
-        Value::Array(entries) => Value::Array(entries.iter().map(strip_nulls).collect()),
-        other => other.clone(),
-    }
 }
 
 /// The `tags` member of one document, with an absent member read as an empty collection.

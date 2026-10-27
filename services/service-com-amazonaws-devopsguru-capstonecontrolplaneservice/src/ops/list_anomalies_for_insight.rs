@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAnomaliesForInsight
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAnomaliesForInsight`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the anomalies the store holds that BELONG to the insight the request names —
+//! "the anomalies that belong to an insight that you specify using its ID" — each
+//! rendered into the response list its kind selects: a proactive anomaly on
+//! `ProactiveAnomalies`, a reactive one on `ReactiveAnomalies`, exactly as
+//! `DescribeAnomaly` splits one anomaly across its two response members.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAnomaliesForInsight::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation: it only reads, so the store is identical after the call,
+//! however often it is made.
+//!
+//! An `InsightId` the store holds no insight under names no insight, and is refused with
+//! `ResourceNotFoundException` (HTTP 404) — the answer `DescribeInsight`,
+//! `ListAnomalousLogGroups` and `ListRecommendations` give that id, rather than an empty
+//! page that would claim the insight exists and simply has no anomalies. An `AccountId`
+//! the caller cannot reach is an authorization refusal (`AccessDeniedException`, HTTP
+//! 403), decided BEFORE any lookup so a refusal cannot report whether the insight
+//! exists; an absent `AccountId` means the caller's own account.
+//!
+//! `StartTimeRange` and `Filters.ServiceCollection.ServiceNames` narrow that set —
+//! `crate::state::AnomalySelector` is what they select — and a page carries at most the
+//! `MaxResults` the caller asked for, across BOTH lists together: the two lists are the
+//! two kinds of one reported set, and `MaxResults` is "the maximum number of results to
+//! return with a single call".
+//!
+//! Anomalies live in
+//! [`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::anomalies`] —
+//! see `crate::state` for why that map is empty on a fresh emulator: DevOps Guru detects
+//! an anomaly through its own analysis, never through a client call, so this read reports
+//! nothing rather than inventing one.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +187,135 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAnomaliesForInsight` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAnomaliesForInsightErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAnomaliesForInsight"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAnomaliesForInsightErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the DevOps Guru anomaly store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        // `AccountId` names the member account whose anomalies to read. This emulator
+        // serves one account and is in no organization, so no other account is
+        // accessible to the caller: that is an authorization refusal, decided BEFORE
+        // any lookup so a refusal cannot report whether the insight exists.
+        let account_id = crate::state::requested_account_id(input.account_id.as_deref());
+        if !crate::state::account_is_accessible(&account_id) {
+            return Err(ListAnomaliesForInsightErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: format!(
+                        "Access denied when accessing the anomalies of insight {} in account {account_id}",
+                        input.insight_id
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // What the request's time range and filters select, with a service name outside
+        // its modelled enum, or a time bound this service cannot represent, refused as a
+        // 400 rather than answered with a silently empty page.
+        let selector = crate::state::AnomalySelector::of(
+            input.start_time_range.as_ref(),
+            input
+                .filters
+                .as_ref()
+                .and_then(|filters| filters.service_collection.as_ref()),
+        )
+        .map_err(|rejection| -> ListAnomaliesForInsightError {
+            ListAnomaliesForInsightErrorModeled::ValidationException(
+                rejection.validation_exception(),
+            )
+            .into()
+        })?;
+
+        // `MaxResults` is "the maximum number of results to return with a single call",
+        // so a page carries at most what the caller asked for, and the service's own page
+        // size when it asked for nothing. The modelled range already bounds a request, so
+        // the clamp only keeps a value that reached here anyway inside it.
+        let page_size = input.max_results.map_or(crate::state::PAGE_SIZE, |requested| {
+            requested.clamp(1, crate::state::LIST_ANOMALIES_FOR_INSIGHT_MAX_RESULTS) as usize
+        });
+
+        let store = state.lock();
+        // The anomalies are reported FOR an insight, so an id the store holds no insight
+        // under names no insight at all — the same refusal `DescribeInsight` gives for
+        // that id, rather than an empty page that would claim the insight exists and
+        // simply has no anomalies.
+        if !store.insights.contains_key(&input.insight_id) {
+            return Err(ListAnomaliesForInsightErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no insight with id {} exists", input.insight_id),
+                    resource_id: input.insight_id.clone(),
+                    resource_type: crate::state::INSIGHT_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Select, then page: the anomalies of this insight that the request's range and
+        // filters admit, in the store's stable key order, so a cursor into them keeps
+        // naming the same place in the walk.
+        let selected: Vec<crate::state::AnomalyRecord> = store
+            .anomalies
+            .values()
+            .filter(|anomaly| {
+                anomaly.associated_insight_id.as_deref() == Some(input.insight_id.as_str())
+                    && selector.matches(anomaly)
+            })
+            .cloned()
+            .collect();
+
+        // One page spans BOTH kinds, because `MaxResults` bounds the results of the call
+        // rather than either list, and the one `NextToken` names the next offset into
+        // that single walk. The token is scoped to the insight AND to what the filters
+        // select, so a cursor issued for one selection does not resolve against another.
+        let (page, next_token) = crate::state::page_sized(
+            &selected,
+            &format!(
+                "ListAnomaliesForInsight/{}/{}",
+                input.insight_id,
+                selector.page_scope()
+            ),
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .ok_or_else(|| -> ListAnomaliesForInsightError {
+            ListAnomaliesForInsightErrorModeled::ValidationException(
+                crate::state::FilterRejection::stale_cursor(
+                    "ListAnomaliesForInsight",
+                    "the anomalies of this insight these filters select",
+                    "InsightId and Filters",
+                )
+                .validation_exception(),
+            )
+            .into()
+        })?;
+
+        // The two response lists are the two kinds of anomaly: a proactive anomaly
+        // predicts a problem, a reactive one reports behaviour that already went wrong,
+        // and one anomaly is exactly one of them — so each reported anomaly lands on
+        // exactly one list, and an insight with none of a kind reports that list empty.
+        let proactive_anomalies: Vec<ProactiveAnomalySummary> = page
+            .iter()
+            .filter(|anomaly| anomaly.is_proactive())
+            .map(crate::state::AnomalyRecord::to_proactive_anomaly_summary)
+            .collect();
+        let reactive_anomalies: Vec<ReactiveAnomalySummary> = page
+            .iter()
+            .filter(|anomaly| !anomaly.is_proactive())
+            .map(crate::state::AnomalyRecord::to_reactive_anomaly_summary)
+            .collect();
+
+        // An insight whose analysis detected no matching anomaly is not an error: the
+        // lists are simply empty.
+        Ok(ListAnomaliesForInsightOutput {
+            proactive_anomalies: Some(proactive_anomalies),
+            reactive_anomalies: Some(reactive_anomalies),
+            next_token,
+        })
     }
 }

@@ -483,13 +483,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // The retry is served only "if none of the messages have been
                     // modified (deleted or had their visibility changes)". The refusal
                     // carries the sender fault Amazon SQS answers a refused parameter
-                    // with, worded in that fault's own fixed text with the token this
-                    // request supplied.
+                    // with, in that fault's own template — the token this request
+                    // supplied, the parameter it was supplied for, and the `Reason:`
+                    // clause stating the rule, which is what tells the caller to
+                    // re-receive instead of retrying this token.
                     if queue.receive_attempt_was_modified(&attempt) {
                         return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                            format!(
-                                "Value {attempt_id} for parameter ReceiveRequestAttemptId is \
-                                 invalid."
+                            sqs::invalid_parameter_message(
+                                attempt_id,
+                                "ReceiveRequestAttemptId",
+                                sqs::RECEIVE_ATTEMPT_NOT_RETRYABLE,
                             ),
                         ));
                     }

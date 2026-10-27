@@ -260,6 +260,25 @@ pub(crate) fn carries_nothing(body: &Value, member: &str) -> bool {
     })
 }
 
+/// `value` with every null object entry dropped, recursively.
+///
+/// The ONE normalizer every suite compares a request against a reader's answer through,
+/// so a structure member a reader omits and one it reports as null compare equal rather
+/// than being asserted as two different things.
+pub(crate) fn strip_nulls(value: &Value) -> Value {
+    match value {
+        Value::Object(entries) => Value::Object(
+            entries
+                .iter()
+                .filter(|(_, entry)| !entry.is_null())
+                .map(|(key, entry)| (key.clone(), strip_nulls(entry)))
+                .collect::<serde_json::Map<String, Value>>(),
+        ),
+        Value::Array(entries) => Value::Array(entries.iter().map(strip_nulls).collect()),
+        other => other.clone(),
+    }
+}
+
 /// A minted id is ten lowercase alphanumerics.
 pub(crate) fn assert_minted_id(case: &str, member: &str, id: &str) {
     assert_eq!(

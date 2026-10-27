@@ -41,6 +41,18 @@ pub const PROVISIONING_SPAN: Duration = Duration::from_millis(500);
 /// it — the due instant is stored and compared on read.
 pub const DELETION_SPAN: Duration = Duration::from_millis(500);
 
+/// How long after the `DeleteGraphSnapshot` that accepts it a snapshot's removal is
+/// owed: the snapshot answers `DELETING` — and stays listed, with its name still
+/// reserved — until this span has passed, after which the next read finds the record
+/// gone.
+///
+/// The real service takes minutes to discard a snapshot's data; this emulator picks a
+/// span inside the emulator-wide 250ms..750ms band for a transition the clock owes, so a
+/// caller that reads the snapshot straight after `DeleteGraphSnapshot` still observes the
+/// transient `DELETING` status (and the state errors that go with it). No handler ever
+/// sleeps for it — the due instant is stored and compared on read.
+pub const SNAPSHOT_DELETION_SPAN: Duration = Duration::from_millis(500);
+
 /// How long after the call that accepts it a cancellation is owed: the cancelled
 /// record answers `CANCELLING` until this span has passed, then the next read sees the
 /// cancellation through — a query is terminated and no longer reported, and an export
@@ -494,15 +506,18 @@ impl From<&Graph> for GraphConfiguration {
 /// The lifecycle statuses this slice of the emulator puts a graph snapshot into.
 ///
 /// Every variant's wire form is one of the modelled `SnapshotStatus` values
-/// (`crate::ops::types::SNAPSHOT_STATUS_VALUES`). The statuses this slice never
-/// produces (`DELETING`, `FAILED`) belong to operations that are still scaffolded
-/// (`DeleteGraphSnapshot`), and are added with them.
+/// (`crate::ops::types::SNAPSHOT_STATUS_VALUES`). `FAILED` is deliberately never
+/// produced: nothing here can fail to capture a stored graph's data, so no snapshot may
+/// report a failure that did not happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotStatus {
     /// `CreateGraphSnapshot` has accepted the snapshot; it is not restorable yet.
     Creating,
     /// The snapshot is complete and restorable.
     Available,
+    /// `DeleteGraphSnapshot` has accepted the deletion; the snapshot is on its way out
+    /// and is reclaimed once the clock makes its removal due.
+    Deleting,
 }
 
 impl SnapshotStatus {
@@ -511,6 +526,7 @@ impl SnapshotStatus {
         match self {
             Self::Creating => "CREATING",
             Self::Available => "AVAILABLE",
+            Self::Deleting => "DELETING",
         }
     }
 }
@@ -539,8 +555,9 @@ pub struct Snapshot {
     /// [`Graph::kms_key_identifier`] is.
     pub kms_key_identifier: String,
     pub tags: BTreeMap<String, String>,
-    /// When the pending `CREATING` -> `AVAILABLE` transition falls due. `None` once
-    /// there is nothing outstanding.
+    /// When the transition the clock owes this snapshot falls due: the move from
+    /// `CREATING` to `AVAILABLE`, or the removal of a `DELETING` snapshot. `None` once
+    /// the snapshot rests `AVAILABLE`, which is the only status nothing is owed out of.
     pub settles_at: Option<Instant>,
     /// The configuration of the source graph AS IT WAS when the snapshot was taken:
     /// what a graph restored from this snapshot is provisioned with, member by
@@ -571,12 +588,32 @@ impl Snapshot {
     /// The same one write a reporting operation may make as [`Graph::settle`]: the
     /// snapshot would have become `AVAILABLE` at `settles_at` whether or not anybody
     /// called, so applying it on read is bookkeeping rather than a state change
-    /// caused by the read.
+    /// caused by the read. A `DELETING` snapshot is not settled here — it is RECLAIMED,
+    /// by [`ComAmazonawsNeptunegraphAmazonneptunegraphState::materialise_snapshots`],
+    /// since the record itself goes away.
     pub fn settle(&mut self, now: Instant) {
-        if self.settles_at.is_some_and(|due| now >= due) {
+        if self.status == SnapshotStatus::Creating && self.settles_at.is_some_and(|due| now >= due)
+        {
             self.status = SnapshotStatus::Available;
             self.settles_at = None;
         }
+    }
+
+    /// Whether the accepted deletion of this snapshot has fallen due, so the record is
+    /// gone and no read may still report it.
+    pub fn is_reclaimed(&self, now: Instant) -> bool {
+        self.status == SnapshotStatus::Deleting && self.settles_at.is_some_and(|due| now >= due)
+    }
+
+    /// Accept this snapshot's deletion: it answers `DELETING` until
+    /// [`SNAPSHOT_DELETION_SPAN`] has passed, after which it is reclaimed.
+    ///
+    /// Any transition that was still outstanding is dropped: the snapshot is on its way
+    /// out, so nothing it was heading for can fall due any more — the same rule
+    /// [`Graph::begin_deletion`] follows.
+    pub fn begin_deletion(&mut self, now: Instant) {
+        self.status = SnapshotStatus::Deleting;
+        self.settles_at = Some(now + SNAPSHOT_DELETION_SPAN);
     }
 }
 
@@ -1740,9 +1777,7 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         for graph in self.graphs.values_mut() {
             graph.settle(now);
         }
-        for snapshot in self.snapshots.values_mut() {
-            snapshot.settle(now);
-        }
+        self.materialise_snapshots(now);
         for task in self.import_tasks.values_mut() {
             task.settle(now);
         }
@@ -1798,14 +1833,41 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
             })
     }
 
+    /// Materialise every snapshot transition the clock has already made due: each
+    /// accepted deletion whose span has passed is reclaimed, and each snapshot whose
+    /// creation has come due settles to `AVAILABLE`.
+    ///
+    /// The same one write a reporting operation may make as [`Graph::settle`]: each of
+    /// these was owed at that instant whether or not anybody called. Each snapshot is
+    /// reclaimed whatever Region it belongs to — the clock owes it in every Region at
+    /// once, exactly as [`Self::reap_deleted_graphs`] reclaims a graph.
+    pub fn materialise_snapshots(&mut self, now: Instant) {
+        self.snapshots.retain(|_, snapshot| !snapshot.is_reclaimed(now));
+        for snapshot in self.snapshots.values_mut() {
+            snapshot.settle(now);
+        }
+    }
+
     /// Apply the snapshot transition the clock has made due, then borrow the snapshot
     /// `id` names IN `region` — `None` when this Region holds no such snapshot.
     pub fn settled_snapshot(&mut self, id: &str, region: &str, now: Instant) -> Option<&Snapshot> {
+        self.settled_snapshot_mut(id, region, now)
+            .map(|snapshot| &*snapshot)
+    }
+
+    /// [`Self::settled_snapshot`], mutably: what `DeleteGraphSnapshot` writes the
+    /// accepted deletion through.
+    pub fn settled_snapshot_mut(
+        &mut self,
+        id: &str,
+        region: &str,
+        now: Instant,
+    ) -> Option<&mut Snapshot> {
+        self.materialise_snapshots(now);
         let snapshot = self.snapshots.get_mut(id)?;
         if !snapshot.is_in(region) {
             return None;
         }
-        snapshot.settle(now);
         Some(snapshot)
     }
 
@@ -2534,6 +2596,29 @@ pub fn graph_state_conflict(action: &str, status: GraphStatus) -> ConflictExcept
     }
 }
 
+/// The modelled `ConflictException` for a call on a GRAPH SNAPSHOT (`DeleteGraphSnapshot`,
+/// `RestoreGraphFromSnapshot`) whose current status does not permit what was asked.
+///
+/// `action` is the verb of the operation ("delete", "restore"), and `status` is the
+/// status that held the request back. Worded by the same template
+/// [`graph_state_conflict`] words the graph's half of this rule with, and for the same
+/// reasons: the snapshot was addressed by an identifier the caller sent, so the refusal
+/// does not front it, and the current status is the one fact the caller does not already
+/// hold. Written once here and reached by every snapshot state gate, so no two of them
+/// word the same refusal differently.
+pub fn snapshot_state_conflict(action: &str, status: SnapshotStatus) -> ConflictException {
+    ConflictException {
+        message: format!(
+            "Unable to {action} the graph snapshot because it is in the {} state.",
+            status.as_wire()
+        ),
+        // The modelled `reason` enum carries one value, `CONCURRENT_MODIFICATION`, and a
+        // status that simply does not permit the call is not a concurrent modification
+        // of the snapshot, so the member is left absent.
+        reason: None,
+    }
+}
+
 /// Refuse more tag entries on one resource than it may hold ([`MAX_TAGS`]).
 ///
 /// `total` is the number of entries the record would hold AFTER the call, so
@@ -2789,6 +2874,7 @@ macro_rules! snapshot_record_output {
 snapshot_record_output!(
     CreateGraphSnapshotOutput,
     GetGraphSnapshotOutput,
+    DeleteGraphSnapshotOutput,
     GraphSnapshotSummary,
 );
 

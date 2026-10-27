@@ -76,8 +76,8 @@ pub const MAX_ROUTING_CONTROLS: usize = 10_000;
 /// The most `ClientToken` records the idempotency ledger remembers at once — CHOSEN,
 /// for the same reason: a caller must not be able to grow the ledger without limit.
 ///
-/// A forgotten token simply has no memory left: a replayed create then meets the
-/// name-uniqueness check instead of returning the first resource.
+/// A forgotten token simply has no memory left: a replayed create then performs the
+/// create again instead of returning the first resource.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = 10_000;
 
 /// The Regions Route 53 ARC publishes a cluster data-plane endpoint in — "an array of
@@ -546,6 +546,67 @@ pub const ROUTING_CONTROL_NOUN: &str = "routing control";
 /// own.
 pub fn not_found_message(noun: &str, arn: &str) -> String {
     format!("No record corresponding to {noun} Arn({arn})")
+}
+
+/// The name a cluster is named by where a request REFERENCES one it must attach to
+/// ([`does_not_exist_message`]) or owns dependents of ([`cannot_delete_message`]).
+///
+/// Route 53 ARC names the KIND of resource in those sentences, in the title case it
+/// writes them with (`Cannot delete a Cluster with non-default Control Panels.`), rather
+/// than the lower-case prose noun a 404 uses.
+pub const CLUSTER_RESOURCE: &str = "Cluster";
+
+/// The name a control panel is named by in those same refusals.
+pub const CONTROL_PANEL_RESOURCE: &str = "Control Panel";
+
+/// The name a routing control is named by in those same refusals.
+pub const ROUTING_CONTROL_RESOURCE: &str = "Routing Control";
+
+/// The `ValidationException$Message` for a create request that names a resource it would
+/// attach to and that this service does not hold.
+///
+/// Such a request never resolves to a resource of its own, so it is refused by its
+/// INPUT, naming the kind of resource it referenced and the ARN it sent:
+/// `<Resource> <arn> does not exist.`
+pub fn does_not_exist_message(resource: &str, arn: &str) -> String {
+    format!("{resource} {arn} does not exist.")
+}
+
+/// The `ValidationException$Message` for a delete request against a resource that still
+/// owns the dependents named by `dependents`.
+///
+/// `Cannot delete a <Resource> with <dependents>.` — the kind of resource the request
+/// addressed, and the kind of children that keep it alive.
+pub fn cannot_delete_message(resource: &str, dependents: &str) -> String {
+    format!("Cannot delete a {resource} with {dependents}.")
+}
+
+/// The dependents a cluster cannot be deleted while it still owns: the control panels a
+/// caller created in it, as opposed to the default panel that lives and dies with it.
+pub const NON_DEFAULT_CONTROL_PANEL_DEPENDENTS: &str = "non-default Control Panels";
+
+/// The dependents a cluster or a control panel cannot be deleted while it still owns.
+pub const ROUTING_CONTROL_DEPENDENTS: &str = "Routing Controls";
+
+/// The `ValidationException$Message` for a create request whose name is already taken
+/// inside the parent that scopes it.
+///
+/// `<Resource> <name> already exists in <Parent> <parent arn>.` — the kind of resource
+/// being created and the name the request asked for, then the parent the name is scoped
+/// to, both as the request named them. Worded in the same voice as the two sentences the
+/// recordings carry ([`does_not_exist_message`], [`cannot_delete_message`]): the kind of
+/// resource in title case, the request's own values, one full stop.
+pub fn already_exists_message(resource: &str, name: &str, parent: &str, parent_arn: &str) -> String {
+    format!("{resource} {name} already exists in {parent} {parent_arn}.")
+}
+
+/// The `ValidationException$Message` for a delete request against the resource a parent
+/// is created with and deleted with.
+///
+/// `Cannot delete a default <Resource>.` — the [`cannot_delete_message`] family, for the
+/// refusal whose reason is what the resource IS rather than what it still owns.
+pub fn cannot_delete_default_message(resource: &str) -> String {
+    format!("Cannot delete a default {resource}.")
 }
 
 /// A request's `Tags` map as a deterministic string, for an idempotency fingerprint.
