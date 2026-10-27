@@ -229,16 +229,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(min_acu) = input.min_acu {
             crate::state::check_capacity_units("MinACU", min_acu)
                 .map_err(CreateDBShardGroupError::invalid_parameter_value)?;
-            if min_acu > input.max_acu {
-                return Err(CreateDBShardGroupError::invalid_parameter_combination(
-                    format!(
-                        "MinACU ({min_acu}) must not exceed MaxACU ({}): the minimum \
-                         capacity of a DB shard group cannot be above its maximum",
-                        input.max_acu
-                    ),
-                ));
-            }
         }
+        crate::state::check_capacity_range(input.min_acu, input.max_acu)
+            .map_err(CreateDBShardGroupError::invalid_parameter_combination)?;
         // The tags are stored request data, so the list and each entry are bounded before
         // any of it is kept.
         let tags = input.tags.unwrap_or_default();

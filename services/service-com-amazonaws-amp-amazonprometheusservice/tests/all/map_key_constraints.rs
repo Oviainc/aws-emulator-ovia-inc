@@ -44,7 +44,7 @@ use service_com_amazonaws_amp_amazonprometheusservice::state::{
 const LABEL_KEY_MAX_LENGTH: usize = 7168;
 
 /// `TagKey`'s modelled maximum length.
-const TAG_KEY_MAX_LENGTH: usize = 128;
+pub(crate) const TAG_KEY_MAX_LENGTH: usize = 128;
 
 const LABEL_KEY_PATTERN_REQUIREMENT: &str =
     "Member must satisfy regular expression pattern: (?!__)[a-zA-Z_][a-zA-Z0-9_]*";
@@ -52,15 +52,17 @@ const LABEL_KEY_PATTERN_REQUIREMENT: &str =
 const LABEL_NAME_PATTERN_REQUIREMENT: &str =
     "Member must satisfy regular expression pattern: [a-zA-Z_][a-zA-Z0-9_]*";
 
-const TAG_KEY_PATTERN_REQUIREMENT: &str =
+pub(crate) const TAG_KEY_PATTERN_REQUIREMENT: &str =
     r"Member must satisfy regular expression pattern: ([\p{L}\p{Z}\p{N}_.:/=+\-@]*)";
 
-const MIN_LENGTH_REQUIREMENT: &str = "Member must have length greater than or equal to 1";
+pub(crate) const MIN_LENGTH_REQUIREMENT: &str =
+    "Member must have length greater than or equal to 1";
 
 const LABEL_KEY_MAX_LENGTH_REQUIREMENT: &str =
     "Member must have length less than or equal to 7168";
 
-const TAG_KEY_MAX_LENGTH_REQUIREMENT: &str = "Member must have length less than or equal to 128";
+pub(crate) const TAG_KEY_MAX_LENGTH_REQUIREMENT: &str =
+    "Member must have length less than or equal to 128";
 
 /// One row of a table that submits a map and expects a refusal: the case name, the map's
 /// entries in source order, and the requirement the refusal must report (empty where the
@@ -79,7 +81,7 @@ fn detector_configuration() -> Value {
 
 /// A map on the wire, built from keys a `json!` literal cannot carry (an empty key, a key
 /// 7,169 characters long, a key holding a control character).
-fn wire_map(entries: &[(&str, &str)]) -> Value {
+pub(crate) fn wire_map(entries: &[(&str, &str)]) -> Value {
     Value::Object(
         entries
             .iter()
@@ -125,7 +127,7 @@ async fn update_configuration(amp: &Amp, region: &str, workspace_id: &str, body:
 /// `ValidationException`, `reason` set, exactly ONE `fieldList` entry naming the MAP
 /// member and the requirement its key failed, the same requirement in `message`, and
 /// nothing from the request anywhere in the body.
-fn assert_member_refusal(case: &str, reply: &Reply, member: &str, requirement: &str) {
+pub(crate) fn assert_member_refusal(case: &str, reply: &Reply, member: &str, requirement: &str) {
     assert_eq!(
         reply.status, 400,
         "case {case:?}: a key outside the key shape's constraints must be refused 400, \
@@ -363,16 +365,18 @@ async fn a_refused_create_persists_nothing_and_keeps_no_token() {
 
 /// One request carrying a `tags` map: the operation it names and its HTTP binding, with
 /// the map spliced into the body each operation carries it in.
-struct TagSink {
-    operation: &'static str,
-    method: &'static str,
-    path: String,
-    body: fn(Value) -> Value,
+pub(crate) struct TagSink {
+    pub(crate) operation: &'static str,
+    pub(crate) method: &'static str,
+    pub(crate) path: String,
+    pub(crate) body: fn(Value) -> Value,
 }
 
-/// Every implemented operation that accepts a `TagMap`, so the rule is asserted over the
-/// whole class rather than over one of them.
-fn tag_sinks(workspace_id: &str, workspace_arn: &str) -> Vec<TagSink> {
+/// Every operation that accepts a `TagMap` and whose request this suite can state in one
+/// body literal, so the rule is asserted over the whole class rather than over one of
+/// them. `CreateScraper` — the fifth — needs a source, a destination and a scrape
+/// configuration beside its `tags`, and is driven in `tests/all/tag_key_constraints.rs`.
+pub(crate) fn tag_sinks(workspace_id: &str, workspace_arn: &str) -> Vec<TagSink> {
     vec![
         TagSink {
             operation: "CreateWorkspace",

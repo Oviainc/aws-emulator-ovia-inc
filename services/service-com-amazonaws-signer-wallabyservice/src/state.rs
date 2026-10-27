@@ -1133,6 +1133,10 @@ pub struct SigningPlatformEntry {
     pub revocation_supported: bool,
     /// Whether a profile on this platform must name the ACM certificate its
     /// signatures are issued under (`signingMaterial`).
+    ///
+    /// True for a platform the CALLER supplies the signing certificate for, and
+    /// false for one AWS Signer issues the certificate for itself — see the note
+    /// on [`SIGNING_PLATFORM_CATALOG`] for which published platforms are which.
     pub requires_signing_material: bool,
     /// Which signing workflow a profile on this platform is signed through, and
     /// therefore which signing operation its profiles accept (see
@@ -1232,10 +1236,15 @@ fn default_value(values: &[&'static str]) -> String {
 /// ([`crate::ops::types::HASH_ALGORITHM_VALUES`]) predates it and cannot name it.
 ///
 /// `requires_signing_material` is a SEPARATE fact from publishing a platform,
-/// stated per entry rather than inferred from membership: for the four
-/// code-signing platforms the recorded `PutSigningProfile` accepts a profile
-/// created with no `signingMaterial`, while the container-image platform is
-/// refused ("signing material cannot be null.").
+/// stated per entry rather than inferred from membership: a profile is signed
+/// under a certificate, and whether the CALLER supplies that certificate is a
+/// property of the platform. The device-signing platforms (AWS IoT Device
+/// Management and the two FreeRTOS ones) sign with a certificate the caller
+/// brings in AWS Certificate Manager, so a profile on them must name it and a
+/// create that omits it is refused ("signing material cannot be null."); the
+/// platforms AWS Signer issues the certificate for — AWS Lambda code signing and
+/// the container-image platform — take none, and the recorded `PutSigningProfile`
+/// for each of those two accepts a profile created with no `signingMaterial`.
 ///
 /// [`SigningPlatformEntry::workflow`] is stated per entry for the same reason:
 /// the code-signing platforms are signed through the S3 signing-job workflow and
@@ -1258,7 +1267,7 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
         image_formats: &["JSONDetached"],
         max_size_in_mb: 2048,
         revocation_supported: true,
-        requires_signing_material: false,
+        requires_signing_material: true,
         workflow: SigningWorkflow::CodeSigningJob,
     },
     SigningPlatformEntry {
@@ -1284,7 +1293,7 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
         image_formats: &["JSON"],
         max_size_in_mb: 16,
         revocation_supported: false,
-        requires_signing_material: false,
+        requires_signing_material: true,
         workflow: SigningWorkflow::CodeSigningJob,
     },
     SigningPlatformEntry {
@@ -1297,7 +1306,7 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
         image_formats: &["JSON"],
         max_size_in_mb: 16,
         revocation_supported: false,
-        requires_signing_material: false,
+        requires_signing_material: true,
         workflow: SigningWorkflow::CodeSigningJob,
     },
     SigningPlatformEntry {
@@ -1310,7 +1319,7 @@ pub const SIGNING_PLATFORM_CATALOG: &[SigningPlatformEntry] = &[
         image_formats: &["JSONDetached"],
         max_size_in_mb: 16,
         revocation_supported: true,
-        requires_signing_material: true,
+        requires_signing_material: false,
         workflow: SigningWorkflow::ContainerImage,
     },
 ];
@@ -1712,26 +1721,29 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The caller a signing job records as having requested it.
+/// The IAM user this emulator's credentials speak for.
 ///
-/// AWS reports the IAM principal, which needs an IAM directory this emulator
-/// does not model; the SigV4 access key id the request was signed with is the
-/// caller identity the request itself carried, and it is `None` for an unsigned
-/// one.
-pub fn request_principal(parts: &::http::request::Parts) -> Option<String> {
-    ::emulator_server::sigv4_credential_scope(&parts.headers).map(|scope| scope.access_key_id)
-}
+/// This emulator publishes ONE long-term credential, and it belongs to this IAM
+/// user: `sts:GetCallerIdentity` answers
+/// `arn:aws:iam::<account>:user/emulator` for every request signed with it, so
+/// that is the identity the emulator resolves for a caller and the identity
+/// every service here reports for one.
+const CALLER_USER_NAME: &str = "emulator";
 
-/// The caller as an IAM principal ARN — the form AWS reports a revoker in.
+/// The IAM principal the request's credentials resolve to — the identity AWS
+/// reports as the caller of an operation (a job's `requestedBy`, a revocation's
+/// `revokedBy`).
 ///
-/// The identity is still the one [`request_principal`] reads off the request (no
-/// IAM directory exists to resolve a friendly name against), rendered as the
-/// `arn:aws:iam::<account>:user/<identity>` an AWS caller is named by, so a
-/// client that parses the revoker as an ARN still works. `None` for an unsigned
-/// request, which carries no identity at all.
-pub fn request_principal_arn(parts: &::http::request::Parts) -> Option<String> {
-    request_principal(parts)
-        .map(|identity| ::engine::emulator_arn("iam", "", &format!("user/{identity}")))
+/// An access key id is the NAME OF A CREDENTIAL, not of a principal, so it is
+/// not what such a member carries: the principal is the IAM identity the
+/// credential belongs to, which for every credential this emulator accepts is
+/// the one user it publishes ([`CALLER_USER_NAME`]) — the same identity STS
+/// answers a caller-identity question with, and therefore stable across calls
+/// and across runs. `None` for an unsigned request, which presents no credential
+/// to resolve and so names no principal at all.
+pub fn caller_principal_arn(parts: &::http::request::Parts) -> Option<String> {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|_| ::engine::emulator_arn("iam", "", &format!("user/{CALLER_USER_NAME}")))
 }
 
 /// `time` as the wire timestamp.

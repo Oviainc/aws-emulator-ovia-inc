@@ -169,9 +169,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let caller = crate::state::caller_account();
         let mut store = state.lock();
+
+        // Everything the clock already owes is materialised first, so this
+        // delete resolves against the endpoints that exist at `now`: one whose
+        // own teardown has completed is gone, and naming it is the modelled 404.
+        // Each of those changes was owed at this instant whether or not this
+        // call happened.
+        store.settle_all(now);
 
         // The Outpost is resolved FIRST: an endpoint is named by the (Outpost,
         // endpoint) pair, so an Outpost that resolves to nothing this caller has
@@ -188,26 +196,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only the endpoint's own account can delete it: a pair that names no
         // endpoint of this caller's on that Outpost is the modelled 404 — which
-        // is also what a repeated delete answers, the first one having removed
-        // the record. The message is the same service constant the Outpost's
-        // own failure carries: the service does not report which half of the
-        // pair failed to resolve.
+        // is what a repeated delete answers once the teardown the first one
+        // started has completed and the record is gone. The message is the same
+        // service constant the Outpost's own failure carries: the service does
+        // not report which half of the pair failed to resolve.
         let key = (input.outpost_id.clone(), input.endpoint_id.clone());
-        let owned = store
+        let Some(endpoint) = store
             .endpoints
-            .get(&key)
-            .is_some_and(|endpoint| endpoint.owner_account == caller);
-        if !owned {
+            .get_mut(&key)
+            .filter(|endpoint| endpoint.owner_account == caller)
+        else {
             return Err(DeleteEndpointErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(),
             )
             .into());
-        }
+        };
 
-        // Removing the record releases what it held: its committed CIDR is
-        // offered again, and the VPC mapping for its subnet goes with the last
-        // endpoint in that subnet, so neither side table outlives the endpoints.
-        store.remove_endpoint(&key);
+        // The deletion is ACCEPTED here, not performed: "it can take up to 5
+        // minutes for this action to finish", so the endpoint reports the
+        // modelled `Deleting` and keeps what it committed until the clock
+        // completes the teardown, at which point the next call that resolves
+        // against it removes the record. A delete of an endpoint already
+        // tearing down is that same accepted state, so it answers success
+        // again — the operation models no conflict error, and the record it
+        // names does resolve — without moving the completion of the first one.
+        endpoint.begin_deletion(now);
 
         Ok(DeleteEndpointOutput)
     }

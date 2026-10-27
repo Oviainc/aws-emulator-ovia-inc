@@ -2,9 +2,10 @@
 
 //! @op UpdateScraper
 //! IMPLEMENTED: replaces, on one stored scraper, exactly the members this request
-//! carries — leaving every member it omits as it was — then moves the record to
-//! `UPDATING` (which this operation reports) and lets the clock settle it back to
-//! `ACTIVE` ([`crate::state::TRANSITION_DELAY`]).
+//! carries — leaving every member it omits as it was, and resolving a `destination` it
+//! carries before storing it — then moves the record to `UPDATING` (which this operation
+//! reports) and lets the clock settle it back to `ACTIVE`
+//! ([`crate::state::TRANSITION_DELAY`]).
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -189,6 +190,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(now);
 
+        // The destination this call would persist is a REFERENCE to another resource, so
+        // it is resolved against the store before anything is written, exactly as it is
+        // on the create path — one rule, shared in
+        // `crate::state::ComAmazonawsAmpAmazonprometheusserviceState::unresolved_destination_workspace`,
+        // so a reference this service refuses to store is never reachable by changing a
+        // scraper it already stored. Resolved HERE, before the record is borrowed to be
+        // written, because resolving a reference searches the whole store.
+        let unresolved_destination = input
+            .destination
+            .as_ref()
+            .and_then(|destination| store.unresolved_destination_workspace(destination));
+
         let Some(scraper) = store.scrapers.get_mut(&input.scraper_id) else {
             return Err(UpdateScraperErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -229,6 +242,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if !replays_pending_update {
+            // A reference that does not resolve is refused with the modelled
+            // `ResourceNotFoundException` (404) — "The request references a resources
+            // that doesn't exist." — rather than persisted onto the stored scraper,
+            // which would leave the scraper's readers reporting a workspace that does
+            // not exist. A replay of the pending update writes nothing, so it has no
+            // reference to store: the call it replays resolved this one already.
+            if let Some(not_found) = unresolved_destination {
+                return Err(
+                    UpdateScraperErrorModeled::ResourceNotFoundException(not_found).into(),
+                );
+            }
+
             // Every updatable member is OPTIONAL, and `exporters` states what that means
             // for all of them: "If you don't specify a value, the existing exporter
             // configuration remains unchanged." So a member the request carries replaces

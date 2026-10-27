@@ -181,28 +181,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
         // The lookup settles the transitions the clock has already made due first, so a
-        // graph whose provisioning has come due is resettable.
-        let Some(graph) = store.settled_graph(&input.graph_identifier, &region, now) else {
+        // graph whose provisioning has come due is resettable. The record it finds is
+        // taken as a COPY, so the decisions below and the writes they drive never hold a
+        // borrow of one graph across a change to the store.
+        let Some(graph) = store
+            .settled_graph(&input.graph_identifier, &region, now)
+            .cloned()
+        else {
             return Err(ResetGraphErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),
             )
             .into());
         };
-        // The facts the rest of this handler needs, read off the record before the store
-        // is written to, so the decisions below and the writes they drive never hold a
-        // borrow of one graph across a change to the store.
         let graph_id = graph.id.clone();
-        let graph_name = graph.name.clone();
         let graph_status = graph.status;
-        // A snapshot of an encrypted graph is encrypted with the graph's own key: the
-        // key belongs to the data being snapshotted, not to this request, which carries
-        // no key member at all.
-        let kms_key_identifier = graph.kms_key_identifier.clone();
-        // A final snapshot captures the graph it is taken of the same way an explicitly
-        // named one does: the data it holds and the configuration it is provisioned
-        // with, so a restore of it reproduces the graph as this call found it.
-        let source_configuration = crate::state::GraphConfiguration::from(graph);
-        let graph_data = graph.data.clone();
 
         // Emptying a graph's data is a write to its data plane, and that plane serves
         // only while the graph is serving: a graph that is provisioning, reconfiguring,
@@ -218,65 +210,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `skipSnapshot` is required, and `false` asks for a FINAL snapshot of the
-        // graph, taken before the reset carries its data away — the same final-snapshot
-        // rule `DeleteGraph` states. The request carries no name for it, so the service
-        // names it (`free_final_snapshot_name`), the way it mints the id.
-        let final_snapshot = if input.skip_snapshot {
-            None
-        } else {
-            // The name a snapshot reserves is released, and the room it takes given
-            // back, when its deletion completes, so the removals the clock has already
-            // made due are materialised before the ceiling and the name are checked
-            // against what the store holds.
-            store.materialise_snapshots(now);
-            // The snapshot store grows by one entry per final snapshot, so it has the
-            // same ceiling `CreateGraphSnapshot` enforces. This operation models no
-            // quota error, so a store with no room for the snapshot the caller asked
-            // for is reported as the conflict it is: the request cannot be carried out
-            // against what the store already holds.
-            if store.snapshots.len() >= crate::state::MAX_SNAPSHOTS {
-                return Err(ResetGraphErrorModeled::ConflictException(ConflictException {
-                    message: format!(
-                        "a final snapshot of graph {graph_id} cannot be taken because this \
-                         emulator holds at most {} graph snapshots; delete a snapshot or pass \
-                         skipSnapshot=true",
-                        crate::state::MAX_SNAPSHOTS
-                    ),
-                    reason: None,
-                })
-                .into());
-            }
-            let id = store.next_snapshot_id();
-            let name = store.free_final_snapshot_name(&graph_name, &id, &region);
-            Some(crate::state::Snapshot {
-                arn: ::engine::emulator_arn(
-                    crate::state::ARN_NAMESPACE,
-                    &region,
-                    &format!("graph-snapshot/{id}"),
-                ),
-                id,
-                name,
-                // The final snapshot lives in the Region of the graph it was taken of,
-                // which is the Region this request was signed for.
-                region: region.clone(),
-                source_graph_id: graph_id.clone(),
-                // Not restorable when the call returns; the clock owes the move to
-                // AVAILABLE a fixed span later, exactly as for an explicitly named
-                // snapshot.
-                status: crate::state::SnapshotStatus::Creating,
-                settles_at: Some(now + crate::state::PROVISIONING_SPAN),
-                snapshot_create_time: ::std::time::SystemTime::now(),
-                kms_key_identifier,
-                // The request carries no tags, and a snapshot's tags are its own: the
-                // graph's tag set is not copied onto it.
-                tags: ::std::collections::BTreeMap::new(),
-                source_configuration,
-                data: graph_data,
-            })
-        };
-
-        if let Some(snapshot) = final_snapshot {
-            store.insert_snapshot(snapshot);
+        // graph, taken before the reset carries its data away. What that snapshot
+        // captures, the span it settles over and the refusal when the store has no room
+        // for it are the ONE final-snapshot rule `crate::state` states for every
+        // operation that takes one; this handler is left only the error channel it
+        // reports a refusal through, and this operation models no quota error, so no
+        // room is the conflict it is.
+        if !input.skip_snapshot {
+            store
+                .mint_final_snapshot(&graph, &region, now)
+                .map_err(|no_room| {
+                    ResetGraphErrorModeled::ConflictException(ConflictException {
+                        message: no_room,
+                        reason: None,
+                    })
+                })?;
         }
 
         let Some(resetting) = store.settled_graph_mut(&graph_id, &region, now) else {

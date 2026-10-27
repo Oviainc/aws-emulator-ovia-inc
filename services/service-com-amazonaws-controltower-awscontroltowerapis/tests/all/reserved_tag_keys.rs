@@ -41,7 +41,7 @@ use crate::resource_tags::{apply_tags, read_tags, reported_tags, resources, tags
 ///
 /// Every row satisfies `TagKey`'s `@length(1..128)`, so the front door passes it and the
 /// handler is what refuses it.
-fn reserved_keys() -> Vec<(&'static str, String)> {
+pub(crate) fn reserved_keys() -> Vec<(&'static str, String)> {
     let prefix = RESERVED_TAG_KEY_PREFIX;
     vec![
         ("the reserved prefix alone", prefix.to_string()),

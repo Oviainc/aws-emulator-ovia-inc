@@ -19,9 +19,11 @@
 //!   `KEY_REUSE` "Verifies that the VCF license key is not used by another Amazon EVS
 //!   environment", `KEY_COVERAGE` "Verifies that the VCF license key allocates
 //!   sufficient vCPU cores for all deployed hosts", `HOST_COUNT` "Verifies that the
-//!   environment meets the minimum host count". The other ten types probe SDDC Manager,
-//!   vCenter Server, Operations Manager or a connector's appliance — nothing this
-//!   emulator runs — so no check of those types is reported.
+//!   environment meets the minimum host count", and `CONNECTOR_HEALTH` "Aggregate health
+//!   across all connectors in the environment" (whose own rule
+//!   `tests/all/environment_connector_health.rs` owns). The other nine types probe SDDC
+//!   Manager, vCenter Server, Operations Manager or one connector's appliance — nothing
+//!   this emulator runs — so no check of those types is reported here.
 //! * "The time when environment health began to be impaired." (`Check$impairedSince`.)
 //! * "Reports impaired functionality that stems from issues internal to the
 //!   environment." (`Environment$environmentStatus`, a `CheckResult`.)
@@ -69,6 +71,7 @@ fn reported_check_types() -> Vec<&'static str> {
         evs::CHECK_TYPE_KEY_REUSE,
         evs::CHECK_TYPE_KEY_COVERAGE,
         evs::CHECK_TYPE_HOST_COUNT,
+        evs::CHECK_TYPE_CONNECTOR_HEALTH,
     ]
 }
 

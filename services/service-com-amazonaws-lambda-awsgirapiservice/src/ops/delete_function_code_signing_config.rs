@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFunctionCodeSigningConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFunctionCodeSigningConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFunctionCodeSigningConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The code signing configuration of a function is ONE value on that function's record
+//! ([`crate::state::FunctionRecord::code_signing_config_arn`]): this call removes it, so
+//! `GetFunctionCodeSigningConfig` reports the function as holding none afterwards and the
+//! configuration it named is no longer one that function uses.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +171,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFunctionCodeSigningConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFunctionCodeSigningConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFunctionCodeSigningConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteFunctionCodeSigningConfigErrorModeled::ServiceException(ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                })
+                .into(),
+            );
+        };
+
+        let reference =
+            crate::state::parse_function_reference(&input.function_name).ok_or_else(|| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{}' at 'functionName' failed to \
+                     satisfy constraint: Member must satisfy one of the documented name \
+                     formats (name, partial ARN or function ARN)",
+                    input.function_name
+                ))
+            })?;
+
+        // The association belongs to the function as a whole, exactly as the calls that
+        // set and report it do, so a qualified name names no resource that carries one.
+        if let Some(qualifier) = reference
+            .qualifier
+            .as_deref()
+            .filter(|qualifier| *qualifier != crate::state::VERSION_LATEST)
+        {
+            return Err(invalid_parameter(format!(
+                "The qualifier '{qualifier}' in 'functionName' names a version or alias, and \
+                 a code signing configuration applies to the function as a whole, which is \
+                 what a code package is deployed to"
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The function has to exist before anything can be removed from it, and resolution
+        // is what brings the record up to whatever the clock already made due.
+        let (record, _version) =
+            crate::state::resolve_function(&mut store, &input.function_name, None, &region, now)
+                .map_err(|failure| match failure {
+                    crate::state::ResolveFailure::Malformed(message) => invalid_parameter(message),
+                    crate::state::ResolveFailure::NotFound(message) => {
+                        DeleteFunctionCodeSigningConfigErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                r#type: None,
+                                message: Some(message),
+                            },
+                        )
+                        .into()
+                    }
+                })?;
+
+        // "When the code is Creating, you can't invoke or modify the function" (the
+        // model's own `StateReasonCode` documentation), and removing the association is
+        // such a modification, so a function still being provisioned refuses it exactly as
+        // it refuses the call that sets one.
+        if record.state == crate::state::STATE_PENDING {
+            return Err(
+                DeleteFunctionCodeSigningConfigErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The operation cannot be performed at this time. The function is \
+                             currently in the following state: {}",
+                            record.state
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Removing the one value is the whole effect: the function then holds no
+        // configuration, so every reader of it reports none and no configuration counts
+        // this function as a user. A function that already held none is in the state this
+        // call asks for, so it is answered the same way and nothing else changes.
+        record.code_signing_config_arn = None;
+
+        // A successful removal carries no body; the modelled 204 is `SUCCESS_STATUS`.
+        Ok(DeleteFunctionCodeSigningConfigOutput)
     }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> DeleteFunctionCodeSigningConfigError {
+    DeleteFunctionCodeSigningConfigErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }

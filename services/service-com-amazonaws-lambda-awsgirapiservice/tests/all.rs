@@ -65,6 +65,8 @@ mod event_source_mappings;
 mod function_aliases;
 #[path = "all/function_code_signing_association.rs"]
 mod function_code_signing_association;
+#[path = "all/function_code_signing_removal.rs"]
+mod function_code_signing_removal;
 #[path = "all/function_code_update.rs"]
 mod function_code_update;
 #[path = "all/function_concurrency.rs"]

@@ -18,8 +18,10 @@
 //! serialization.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use serde_json::Value;
+use service_com_amazonaws_s3outposts_s3outposts::state::ENDPOINT_TRANSITION;
 
 use crate::endpoint_lifecycle::{
     create_in, delete_endpoint_in, emulator_holding, emulator_in_region, endpoint_id_of,
@@ -236,13 +238,15 @@ async fn a_resource_is_reached_only_through_the_region_it_lives_in() {
             after.body
         );
 
-        // The Region it lives in is the one that can remove it.
+        // The Region it lives in is the one that can remove it. The teardown that starts
+        // is the clock's to complete, so the record goes when the span has passed.
         let deleted = delete_endpoint_in(&router, home, &outpost_id, &endpoint_id).await;
         assert_eq!(
             deleted.status, 200,
             "case {case:?}: DeleteEndpoint in {home} must answer 200, got {} with {:?}",
             deleted.status, deleted.body
         );
+        std::thread::sleep(ENDPOINT_TRANSITION + Duration::from_millis(200));
         assert_eq!(
             reported_arns(&list_endpoints_in(&router, home, "?maxResults=100").await),
             Vec::<String>::new(),

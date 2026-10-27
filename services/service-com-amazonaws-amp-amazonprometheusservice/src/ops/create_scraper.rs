@@ -204,6 +204,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 
+        // A map's KEYS carry the key shape's own modelled constraints, which nothing in
+        // the request walk applies (see the map-keys section of `crate::state`). Checked
+        // BEFORE the rule this handler adds, so a key that misses both is refused by the
+        // modelled constraint the request boundary stands for.
+        crate::state::check_map_keys(
+            "tags",
+            input.tags.iter().flat_map(|tags| tags.keys()),
+            &crate::state::TAG_KEY,
+        )
+        .map_err(CreateScraperErrorModeled::ValidationException)?;
+
         // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
         // its own tag keys, so it holds for the tags a scraper is created with too.
         // Stated in the one form every aps refusal takes, which names the member and the
@@ -218,15 +229,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-
-        // A map's KEYS carry the key shape's own modelled constraints, which nothing in
-        // the request walk applies (see the map-keys section of `crate::state`).
-        crate::state::check_map_keys(
-            "tags",
-            input.tags.iter().flat_map(|tags| tags.keys()),
-            &crate::state::TAG_KEY,
-        )
-        .map_err(CreateScraperErrorModeled::ValidationException)?;
 
         let mut store = state.lock();
         store.materialize_due(now);
@@ -247,33 +249,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(response_for(existing));
         }
 
-        // A scraper's destination is a REFERENCE to another resource, and
-        // `ResourceNotFoundException` is modelled here for exactly that: "The request
-        // references a resources that doesn't exist." The reference this service can
-        // resolve is a workspace of its own in the account the emulator serves, so one
-        // that names no workspace this store holds is refused rather than persisted —
-        // answered the way every other unresolved workspace is, with the constant
-        // sentence in `message`, the id in `resourceId` and the parent's AWS type in
-        // `resourceType`. A destination in another account (which `roleConfiguration`
-        // exists to enable) or in another service names a resource no local state speaks
-        // for, so it is taken as given.
-        if let Some(workspace_arn) = destination_workspace_arn(&input.destination) {
-            if crate::state::names_this_account(workspace_arn)
-                && !matches!(
-                    store.taggable_of_arn(workspace_arn),
-                    Some(crate::state::TaggedResource::Workspace(_))
-                )
-            {
-                return Err(CreateScraperErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::WORKSPACE_NOT_FOUND_MESSAGE.to_string(),
-                        resource_id: crate::state::workspace_id_of_arn(workspace_arn)
-                            .to_string(),
-                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
-                    },
-                )
-                .into());
-            }
+        // The destination this call would persist is a REFERENCE to another resource, so
+        // it is resolved before it is stored and a reference that does not resolve is
+        // refused with the modelled `ResourceNotFoundException` — one rule, shared with
+        // every other operation that stores a destination, in
+        // `crate::state::ComAmazonawsAmpAmazonprometheusserviceState::unresolved_destination_workspace`.
+        if let Some(not_found) = store.unresolved_destination_workspace(&input.destination) {
+            return Err(
+                CreateScraperErrorModeled::ResourceNotFoundException(not_found).into(),
+            );
         }
 
         // The store is BOUNDED: past its quota a create is refused rather than adding
@@ -344,19 +328,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::record_state_change`.
         crate::state::record_state_change(Self::NAME, &response.arn, ctx.parts());
         Ok(response)
-    }
-}
-
-/// The workspace ARN a destination names, when it names one.
-///
-/// `Destination` is a union: `ampConfiguration` sends the metrics to an Amazon Managed
-/// Service for Prometheus workspace, named by ARN, while `cloudWatchConfiguration` names a
-/// CloudWatch dataset — a resource of another service, which this store holds nothing
-/// about.
-fn destination_workspace_arn(destination: &Destination) -> Option<&str> {
-    match destination {
-        Destination::ampConfiguration(amp) => Some(amp.workspace_arn.as_str()),
-        Destination::cloudWatchConfiguration(_) => None,
     }
 }
 

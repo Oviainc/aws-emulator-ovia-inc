@@ -30,6 +30,9 @@ hex = { workspace = true }
 # generated client is needed — the emulator supplies the transport, so the SDK's own
 # HTTPS stack and runtime are left out.
 aws-sdk-eventbridge = { version = "1", default-features = false }
+# `Service::override_refusal`: the wording AWS states a boundary constraint refusal
+# with on the JSON protocols, which every service on one shares.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

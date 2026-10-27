@@ -194,11 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        // AWS reports the identity of the revoker; the identity this request
-        // carried is the SigV4 access key id it was signed with, reported in the
-        // IAM principal ARN form AWS names a caller by (`None` for an unsigned
-        // request).
-        let revoked_by = crate::state::request_principal_arn(ctx.parts());
+        // AWS reports the identity of the revoker: the IAM principal the
+        // request's credentials resolve to, which is the one identity this
+        // emulator resolves a caller as (`None` for an unsigned request).
+        let revoked_by = crate::state::caller_principal_arn(ctx.parts());
         // Signer is regional: the revocation lands on the job held by the region
         // whose endpoint it was signed for, and on no other region's.
         let region = crate::state::request_region(ctx.parts());

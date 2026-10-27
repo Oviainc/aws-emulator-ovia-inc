@@ -61,6 +61,8 @@ mod rule_groups_namespace_update;
 mod scraper_creation;
 #[path = "all/scraper_deletion.rs"]
 mod scraper_deletion;
+#[path = "all/scraper_destination_resolution.rs"]
+mod scraper_destination_resolution;
 #[path = "all/scraper_listing.rs"]
 mod scraper_listing;
 #[path = "all/scraper_logging_configuration_deletion.rs"]
@@ -71,6 +73,8 @@ mod scraper_logging_configuration_describe;
 mod scraper_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_key_constraints.rs"]
+mod tag_key_constraints;
 #[path = "all/taggable_resource_kinds.rs"]
 mod taggable_resource_kinds;
 #[path = "all/tagging_api_arn_resolution.rs"]

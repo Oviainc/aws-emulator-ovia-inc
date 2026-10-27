@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayRouteTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayRouteTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates an ADDITIONAL route table of the transit gateway the request names,
+//! stores it as the modelled [`TransitGatewayRouteTable`] shape with the request's tags, and
+//! answers it in `pending` with the instant the clock owes it `available` recorded beside it
+//! (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::transit_gateway_route_table_available_at`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayRouteTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +134,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayRouteTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayRouteTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayRouteTable"))
+        // `ctx` carries request metadata only; this operation reads none of it — the table
+        // is a resource of the gateway the request names, and carries no Region of its own.
+        // The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+        use std::time::SystemTime;
+
+        // "The tags to apply to the transit gateway route table" (`TagSpecifications`) —
+        // "you must specify the resource type to tag, otherwise the request will fail"
+        // (`TagSpecification`), and the only type this action tags is the route table it
+        // creates. The tag payload's own bounds (the count per resource, each key and
+        // value's length, no key twice, nothing in the reserved namespace) are applied by
+        // the one shared reader every create holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_TRANSIT_GATEWAY_ROUTE_TABLE,
+            Self::NAME,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // gateway the request names, so it is answered before anything is resolved or
+        // written, and every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: whether this table can be created is asked of the state its
+        // gateway is ACTUALLY in rather than the one it was left in.
+        store.materialize_due_transitions();
+
+        // "The ID of the transit gateway" (`TransitGatewayId`) the table is created for: a
+        // route table is a resource OF a transit gateway, so an id this account holds no
+        // gateway for has nothing to add a route table to. The id is resolved against the
+        // store alone — the one refusal `DescribeTransitGateways` answers for a
+        // `TransitGatewayId` it cannot resolve, so one resource family reads one way.
+        if !store.transit_gateways.contains_key(&input.transit_gateway_id) {
+            return Err(state::invalid_transit_gateway_id_not_found(
+                &input.transit_gateway_id,
+            ));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // tags of any length, and a byte budget on its own admits records without end. The
+        // insert below asks the same predicate and answers `None` for it, so this is the
+        // refusal the caller sees rather than a second rule.
+        if !store.has_transit_gateway_route_table_capacity() {
+            return Err(store_is_full(store.transit_gateway_route_tables.len()));
+        }
+        // The bytes this table would add to the store, charged against the crate's one byte
+        // budget BEFORE the write: the tags are the record's only caller-chosen bytes, which
+        // is exactly what [`crate::state::transit_gateway_route_table_payload_bytes`] charges
+        // for the stored record, so the pre-check and the charge cannot drift apart.
+        let payload_bytes = state::tag_list_bytes(&tags);
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store another transit gateway route table",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The record itself, built the one way this crate builds a transit gateway route
+        // table — the id, the `pending` state, the creation time, the two default-role flags
+        // and the clock-owed `available` move all come from the store, never from the
+        // request.
+        let Some(route_table) =
+            store.insert_transit_gateway_route_table(&input.transit_gateway_id, SystemTime::now(), tags)
+        else {
+            // Unreachable: the ceiling was asked above, and the store is locked throughout.
+            // Kept as the backstop that keeps a full store from reading as a 501 or a 200,
+            // worded by the ONE definition of that refusal so the two cannot drift apart.
+            return Err(store_is_full(store.transit_gateway_route_tables.len()));
+        };
+
+        // The answer is the record as it was stored, so this create and every later reader
+        // of the route table cannot drift apart.
+        Ok(CreateTransitGatewayRouteTableOutput {
+            transit_gateway_route_table: Some(route_table),
+        })
     }
+}
+
+/// The refusal a store that holds as many route tables as it can answers: HTTP 400
+/// `ResourceLimitExceeded`, naming how many it holds.
+///
+/// The ONE definition of that wording, so the pre-check and the writer's backstop below it
+/// cannot drift apart.
+fn store_is_full(held: usize) -> CreateTransitGatewayRouteTableError {
+    crate::state::resource_limit_exceeded(format!(
+        "This emulator holds {held} transit gateway route tables, which is as many as it \
+         stores"
+    ))
 }

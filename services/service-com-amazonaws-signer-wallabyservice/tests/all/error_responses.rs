@@ -12,7 +12,7 @@
 //!   are issued under, so a `PutSigningProfile` on a platform whose profile holds
 //!   that certificate and that supplies no `signingMaterial` is refused 400 and
 //!   stores nothing — while a platform AWS Signer issues the certificate for
-//!   itself takes none;
+//!   takes none;
 //! * a refusal uses one of the shapes the refusing OPERATION's own model
 //!   declares, so the condition of a stored resource is never answered with a
 //!   shape borrowed from another operation's error set — and where no modelled
@@ -39,9 +39,13 @@ const SIGNED_FOR_US_WEST_2: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-west-2/signer/aws4_request, \
      SignedHeaders=host, Signature=abc";
 
-/// The access key id [`SIGNED_FOR_US_WEST_2`] carries — the caller identity a
-/// revocation records as the revoker.
-const ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+/// The IAM principal the emulator resolves every signed request as: the one IAM
+/// user whose credentials it publishes, which is the identity
+/// `sts:GetCallerIdentity` answers with. Spelled out here rather than imported so
+/// a revoker invented from the request fails this suite.
+fn caller_principal() -> String {
+    format!("arn:aws:iam::{ACCOUNT_ID}:user/emulator")
+}
 
 /// The account id every generated emulator presents, spelled out here rather than
 /// imported so a wrong account in the handlers fails this suite.
@@ -54,19 +58,18 @@ const CERTIFICATE_ARN: &str = "arn:aws:acm:us-west-2:000000000000:certificate/ab
 /// each one must carry `signingMaterial`.
 ///
 /// These are the signing platforms this emulator publishes (the ids of
-/// `crate::state::SIGNING_PLATFORM_CATALOG`): the four code-signing platforms
-/// AWS Signer issues the certificate for itself, plus the container-image
-/// platform, whose profile holds the certificate its signatures are issued
-/// under. Source: the recorded wire behaviour of `PutSigningProfile` (see the
-/// published `requires_signing_material` of each catalog entry). A `platformId`
-/// the catalog does not publish is refused outright, which
-/// `put_profile_platform_validation.rs` covers.
+/// `crate::state::SIGNING_PLATFORM_CATALOG`): the three device-signing platforms,
+/// whose profiles hold the certificate the caller brought in ACM, plus the two
+/// AWS Signer issues the certificate for itself — Lambda code signing and the
+/// container-image platform. Source: the published `requires_signing_material` of
+/// each catalog entry. A `platformId` the catalog does not publish is refused
+/// outright, which `put_profile_platform_validation.rs` covers.
 const PLATFORM_CASES: &[(&str, bool)] = &[
     ("AWSLambda-SHA384-ECDSA", false),
-    ("AWSIoTDeviceManagement-SHA256-ECDSA", false),
-    ("AmazonFreeRTOS-Default", false),
-    ("AmazonFreeRTOS-TI-CC3220SF", false),
-    ("Notation-OCI-SHA384-ECDSA", true),
+    ("AWSIoTDeviceManagement-SHA256-ECDSA", true),
+    ("AmazonFreeRTOS-Default", true),
+    ("AmazonFreeRTOS-TI-CC3220SF", true),
+    ("Notation-OCI-SHA384-ECDSA", false),
 ];
 
 /// One emulator: a router carrying only this service, over one shared engine.
@@ -347,7 +350,7 @@ async fn every_refusal_names_its_condition_in_the_modelled_code_member() {
             case: "PutSigningProfile with no signing material",
             method: "PUT",
             uri: "/signing-profiles/No_Material_Profile".to_string(),
-            body: Some(json!({ "platformId": "Notation-OCI-SHA384-ECDSA" })),
+            body: Some(json!({ "platformId": "AWSIoTDeviceManagement-SHA256-ECDSA" })),
             status: 400,
             shape: "ValidationException",
             code: ERROR_CODE_VALIDATION.to_string(),
@@ -646,8 +649,8 @@ async fn revoking_a_profile_records_the_reason_and_the_effective_time() {
         );
         assert_eq!(
             record["revokedBy"].as_str(),
-            Some(format!("arn:aws:iam::{ACCOUNT_ID}:user/{ACCESS_KEY_ID}").as_str()),
-            "case {name}: expected revokedBy to name the calling principal, got {record:?}"
+            Some(caller_principal().as_str()),
+            "case {name}: expected revokedBy to name the resolved caller principal, got {record:?}"
         );
 
         // The record is a read, not a write: a second reader sees the same one.

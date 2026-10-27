@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatasetDataSegments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatasetDataSegments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatasetDataSegments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a READ that reports, one page at a time, the data segments the
+//! store holds for the dataset the request names in the workspace it names. Each
+//! summary names the dataset the segment's data came from, the time series it
+//! covers and the half-open span it covers of it, plus the alias and the data
+//! type the store holds for that time series — so a listed segment and the
+//! segment a deletion addresses are the same record. Nothing is written here:
+//! two readers of one dataset cannot disagree, and a listing moves no dataset on.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +159,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatasetDataSegments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatasetDataSegmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatasetDataSegments"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable".to_string()))?;
+        let _ = ctx;
+
+        // A read: every member reported below is read off the stored segment, or off
+        // the stored time series it covers, so this listing writes nothing and the
+        // segments a later deletion addresses are exactly the ones reported here.
+        let store = state.lock();
+
+        // The dataset this request addresses, scoped the way every other
+        // dataset-addressed operation of this service scopes it: `workspaceName`
+        // names "the workspace that contains the dataset", so a dataset held by
+        // another workspace, or by none at all, is not the dataset this request
+        // names; and `datasetVersion` asks for ONE version of it, of which this
+        // store keeps only the one its last accepted write produced, so a request
+        // for any other version names something it does not hold. Resolved BEFORE
+        // the page is cut, so an absent dataset is the modelled not-found refusal
+        // rather than an empty page, which would report absence as success.
+        let dataset = store
+            .datasets
+            .get(&input.dataset_id)
+            .filter(|dataset| dataset.workspace_name.as_deref() == Some(&input.workspace_name))
+            .filter(|dataset| {
+                input
+                    .dataset_version
+                    .as_ref()
+                    .is_none_or(|version| *version == dataset.version_label())
+            })
+            .ok_or_else(|| not_found(&input.dataset_id))?;
+        let dataset_id = dataset.id.clone();
+
+        // Every segment the dataset holds, each one summarised from the record plus
+        // the time series it covers. A dataset holding no segment at all lists none,
+        // which is the empty page a dataset that exists answers with.
+        let mut segments: Vec<DataSegmentSummary> = store
+            .dataset_data_segments
+            .get(&dataset_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|record| summary(&store, record))
+            .collect();
+
+        // A stable total order is what makes `nextToken` resumable, and a segment's
+        // time series and its own span are its identity inside the dataset — the
+        // same key a deletion addresses one by — so ordering on that key is total.
+        segments.sort_by(|left, right| segment_key(left).cmp(&segment_key(right)));
+
+        // `nextToken` is this enumeration's resume point: the identity of the first
+        // segment of the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration
+        // is refused rather than answered with an empty page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                segments
+                    .iter()
+                    .position(|summary| resume_key(summary) == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic
+        // below total.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(segments.len());
+
+        // "The token for the next set of results, or null if there are no additional
+        // results": issued only when a segment follows this page.
+        let next_token = segments
+            .get(end)
+            .map(|summary| ::hex::encode(resume_key(summary).as_bytes()));
+
+        Ok(ListDatasetDataSegmentsOutput {
+            data_segments: segments[start..end].to_vec(),
+            next_token,
+        })
     }
+}
+
+/// The page size AWS documents for this operation when the caller gives no
+/// `maxResults`: "Default: 50".
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// One stored data segment as the summary this operation reports.
+///
+/// The dataset the data came from and the span of the time series it covers are
+/// read straight off the record, so a listed segment and the segment a deletion
+/// addresses are the same record. The alias and the data type belong to the TIME
+/// SERIES the segment covers rather than to the segment, so they are read off the
+/// stored stream — the same values `ListTimeSeries` and `DescribeTimeSeries`
+/// report for it. The model makes both required while the stream they come from
+/// need not carry either (an asset property can own a series under no alias, and a
+/// stream this store no longer holds carries nothing at all), so an unknown one
+/// reports the empty string rather than a value the store was never given,
+/// exactly as the dataset reads report a description nobody gave.
+fn summary(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    record: &crate::state::DataSegmentRecord,
+) -> DataSegmentSummary {
+    let series = store.series_by_time_series_id(&record.time_series_id);
+    let alias = series
+        .as_ref()
+        .and_then(|key| store.series_alias(key))
+        .unwrap_or_default()
+        .to_string();
+    let data_type = series
+        .as_ref()
+        .and_then(|key| store.series_data_type(key))
+        .unwrap_or_default()
+        .to_string();
+    DataSegmentSummary {
+        source_dataset_id: record.source_dataset_id.clone(),
+        time_series_id: record.time_series_id.clone(),
+        start_timestamp: record.start_timestamp.clone(),
+        end_timestamp: record.end_timestamp.clone(),
+        alias,
+        data_type,
+        // Nothing in this emulator enriches a data segment: `CreateEnrichmentJob`
+        // records the job and the lifecycle the clock owes it, but no data is
+        // analysed, so no enrichment is reported — the same way `DescribeDataset`
+        // and `ListDatasets` report no dataset enrichment status.
+        enrichment: None,
+    }
+}
+
+/// A segment's identity inside its dataset — its time series and its own
+/// half-open span — as the total order this enumeration is cut into pages on.
+fn segment_key(summary: &DataSegmentSummary) -> (&str, (i64, i32), (i64, i32)) {
+    (
+        summary.time_series_id.as_str(),
+        crate::state::timestamp_key(&summary.start_timestamp),
+        crate::state::timestamp_key(&summary.end_timestamp),
+    )
+}
+
+/// The same identity as the text a `nextToken` resumes from.
+fn resume_key(summary: &DataSegmentSummary) -> String {
+    let (time_series_id, start, end) = segment_key(summary);
+    format!("{time_series_id}|{}.{}|{}.{}", start.0, start.1, end.0, end.1)
+}
+
+/// Decode a `nextToken` back into the segment identity it resumes from.
+fn decode_token(token: &str) -> Result<String, ListDatasetDataSegmentsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListDatasetDataSegmentsError {
+    ListDatasetDataSegmentsErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: "The nextToken is not a token this operation issued.".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the dataset id that resolved to
+/// nothing in the workspace, and at the version, the request named.
+fn not_found(dataset_id: &str) -> ListDatasetDataSegmentsError {
+    ListDatasetDataSegmentsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::not_found_message(crate::state::RESOURCE_DATASET, dataset_id),
+    })
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> ListDatasetDataSegmentsError {
+    ListDatasetDataSegmentsErrorModeled::InternalFailureException(InternalFailureException {
+        message,
+    })
+    .into()
 }
