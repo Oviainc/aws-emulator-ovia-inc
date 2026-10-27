@@ -419,14 +419,59 @@ pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
 }
 
+// ---------------------------------------------------------------------------
+// Identity keys built out of caller-supplied text
+//
+// Two rules of this service are decided on the identity of a composite value — the
+// application a scaling plan covers, and the metric a target tracking configuration
+// tracks — and each identity is rendered as one flat string, so it can be compared and
+// held in a set. The parts those strings are built from are the caller's own text,
+// whose modelled constraints admit every punctuation character a separator could be, so
+// a part reaches a key only through [`escape_key_part`]: inside a part, a separator of
+// the composite is spelled as a literal, which is what keeps two composites that differ
+// in their parts apart in their keys.
+// ---------------------------------------------------------------------------
+
+/// The characters an identity key in this module uses to separate the parts a
+/// composite value is built from.
+const KEY_SEPARATORS: [char; 6] = ['=', ',', ';', '/', '[', ']'];
+
+/// The character that takes the separator meaning away from the one after it.
+const KEY_ESCAPE: char = '\\';
+
+/// One part of an identity key, with every [`KEY_SEPARATORS`] character it contains —
+/// and every [`KEY_ESCAPE`] — prefixed by [`KEY_ESCAPE`].
+///
+/// So no separator a composite key relies on occurs unescaped inside a part, the parts
+/// of a key can always be told apart again, and a part that holds no separator is
+/// written out as it came in.
+fn escape_key_part(part: &str) -> String {
+    let mut escaped = String::with_capacity(part.len());
+    for character in part.chars() {
+        if character == KEY_ESCAPE || KEY_SEPARATORS.contains(&character) {
+            escaped.push(KEY_ESCAPE);
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 /// The identity of an `ApplicationSource`, used to enforce "You can create one
 /// scaling plan per application source" (`ApplicationSource` member doc).
+///
+/// A tag-filter source is identified by the SET of tags it names, so the filters and
+/// each filter's values are ordered before they are rendered — two spellings of one set
+/// are one source — and each of them is escaped, so a tag key or tag value that itself
+/// contains a separator stays distinguishable from the separator (`TagFilter$Key` and
+/// `TagValues`' member admit every character in `\u0020-\uD7FF…`, punctuation included).
 ///
 /// `None` when the source names neither a stack nor a tag filter, so it identifies no
 /// application at all. A source that names BOTH is refused before this is reached —
 /// see [`validate_application_source`].
 pub fn application_source_key(source: &ApplicationSource) -> Option<String> {
     if let Some(arn) = named_stack_arn(source) {
+        // A stack is named by ONE part, and no tag-filter key starts with this prefix,
+        // so there is no separator to confuse here.
         return Some(format!("stack:{arn}"));
     }
     let filters = source.tag_filters.as_ref()?;
@@ -436,8 +481,15 @@ pub fn application_source_key(source: &ApplicationSource) -> Option<String> {
     let mut rendered: Vec<String> = filters
         .iter()
         .map(|filter| {
-            let key = filter.key.clone().unwrap_or_default();
-            let mut values = filter.values.clone().unwrap_or_default();
+            let key = escape_key_part(filter.key.as_deref().unwrap_or_default());
+            let mut values: Vec<String> = filter
+                .values
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .map(escape_key_part)
+                .collect();
             values.sort();
             format!("{key}={}", values.join(","))
         })
@@ -831,6 +883,13 @@ fn resource_identity(instruction: &ScalingInstruction) -> ResourceIdentity<'_> {
 /// metric type, or the namespace, name, statistic and dimensions of a customized
 /// metric. `None` for a configuration naming neither metric — which both write paths
 /// refuse before it can be stored.
+///
+/// A customized metric's parts are caller-supplied text under no modelled pattern at
+/// all (`MetricNamespace`, `MetricName`, `MetricDimensionName` and
+/// `MetricDimensionValue` are plain strings), so each is escaped on the way into the
+/// key and two different metrics cannot render one identity. The dimensions are a set,
+/// so they are ordered first; a predefined metric type is one part, and one the model
+/// constrains to its own value list.
 pub fn target_metric_identity(configuration: &TargetTrackingConfiguration) -> Option<String> {
     if let Some(predefined) = &configuration.predefined_scaling_metric_specification {
         return Some(predefined.predefined_scaling_metric_type.clone());
@@ -843,14 +902,20 @@ pub fn target_metric_identity(configuration: &TargetTrackingConfiguration) -> Op
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|dimension| format!("{}={}", dimension.name, dimension.value))
+        .map(|dimension| {
+            format!(
+                "{}={}",
+                escape_key_part(&dimension.name),
+                escape_key_part(&dimension.value)
+            )
+        })
         .collect();
     dimensions.sort();
     Some(format!(
         "{}/{}/{}[{}]",
-        customized.namespace,
-        customized.metric_name,
-        customized.statistic,
+        escape_key_part(&customized.namespace),
+        escape_key_part(&customized.metric_name),
+        escape_key_part(&customized.statistic),
         dimensions.join(",")
     ))
 }
