@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChannels
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChannels`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChannels::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the channels this account and region hold, projected onto `ChannelSummary` from
+//! the records `CreateChannel` persisted, ordered by name and paged by `MaxResults` with an
+//! opaque cursor ([`crate::state::RegionalPageToken`]). A read: it computes its answer from
+//! the stored records and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -101,7 +97,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `ListChannelsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#ListChannels")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#ListChannels",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models
+    // it ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer
+    // for a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum ListChannelsErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -109,6 +112,7 @@ pub enum ListChannelsErrorModeled {
     InvalidArgumentException(InvalidArgumentException),
     LimitExceededException(LimitExceededException),
     ValidationException(ValidationException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -134,6 +138,22 @@ impl From<ListChannelsErrorModeled> for ListChannelsError {
 /// concrete engine where it mounts the service, not here.
 pub struct ListChannels<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Whether the channel is one the request's `StreamFilter` admits: "Filters the results to
+/// channels associated with the specified streams"
+/// (`ListChannelsInput$StreamFilter`) — a channel passes when one of its source streams is
+/// one of the filtered streams, and a request that names no filter has every channel pass.
+fn passes_stream_filter(
+    channel: &crate::state::Channel,
+    filter: Option<&[StreamFilter]>,
+) -> bool {
+    let Some(filters) = filter.filter(|filters| !filters.is_empty()) else {
+        return true;
+    };
+    filters
+        .iter()
+        .any(|stream| channel.sources_stream(&stream.stream_arn, stream.stream_creation_timestamp))
 }
 
 impl<Eng> ListChannels<Eng> {
@@ -162,18 +182,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChannels` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChannelsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChannels"))
+        // "Lists the channels in your account... or to audit the channels configured in an
+        // Amazon Web Services Region" (`ListChannels`), and a channel name "is unique within
+        // your Amazon Web Services account and Amazon Web Services Region" — so a listing
+        // reports the channels of the region the request was signed for.
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListChannelsError::from(ListChannelsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the channel store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // "The maximum number of channels to return in a single call. The default value is
+        // 100. If you specify a value greater than 100, at most 100 results are returned"
+        // (`ListChannelsInput$MaxResults`) — a caller-chosen page size is clamped
+        // server-side before it sizes anything.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_LIST_CHANNELS_LIMIT)
+                .clamp(1, crate::state::MAX_LIST_CHANNELS_LIMIT),
+        )
+        .unwrap_or(1);
+
+        let now = ::std::time::SystemTime::now();
+
+        // "The pagination token returned by a previous call. Specify this token to retrieve
+        // the next page of results" (`ListChannelsInput$NextToken`): a token this service
+        // never issued, one past its lifetime or one minted for another region names no page
+        // of this listing. The filter is NOT carried in the token — a paginating client
+        // resends it — so it is applied to every page from the request itself.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let resume = crate::state::RegionalPageToken::decode(
+                    crate::state::RegionalListing::Channels,
+                    token,
+                )
+                .filter(|resume| !resume.is_expired(now) && resume.region == region)
+                .ok_or_else(|| {
+                    ListChannelsError::from(ListChannelsErrorModeled::ExpiredNextTokenException(
+                        ExpiredNextTokenException {
+                            message: Some(crate::state::next_token_expired_message()),
+                        },
+                    ))
+                })?;
+                // The token names the first channel the earlier page did NOT return, so the
+                // page that resumes it starts AT that channel.
+                Some(resume.next_name)
+            }
+        };
+
+        let store = state.lock();
+        let mut beyond_cursor = store
+            .channels_ordered_in(&region)
+            .into_iter()
+            .filter(|channel| passes_stream_filter(channel, input.stream_filter.as_deref()))
+            .filter(|channel| {
+                resume_at
+                    .as_deref()
+                    .is_none_or(|start| channel.name.as_str() >= start)
+            });
+        let page: Vec<&crate::state::Channel> = beyond_cursor.by_ref().take(page_size).collect();
+        let next = beyond_cursor.next();
+
+        Ok(ListChannelsOutput {
+            channel_summaries: page.iter().map(|channel| channel.to_summary(now)).collect(),
+            // "This value is null when there are no more results to return"
+            // (`ListChannelsOutput$NextToken`): a cursor is handed back exactly when this
+            // region holds a channel past this page.
+            next_token: next.map(|channel| {
+                crate::state::RegionalPageToken::new(
+                    crate::state::RegionalListing::Channels,
+                    &region,
+                    &channel.name,
+                    now,
+                )
+                .encode()
+            }),
+        })
     }
 }

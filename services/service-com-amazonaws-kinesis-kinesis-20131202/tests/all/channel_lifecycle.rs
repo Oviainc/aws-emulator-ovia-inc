@@ -79,25 +79,25 @@ const SERVICE_KEY_ALIAS: &str = "alias/aws/kinesis";
 
 /// How long a case waits before treating a freshly created channel as ready: past the instant
 /// the create armed the `CREATING` -> `ACTIVE` transition for.
-fn past_channel_activation() -> Duration {
+pub(crate) fn past_channel_activation() -> Duration {
     CHANNEL_ACTIVATION_DELAY + Duration::from_millis(400)
 }
 
 /// The ARN of an IAM role inside the `RoleARN` pattern
 /// (`^arn:aws[-a-z0-9]*:iam::\d{12}:role/[a-zA-Z_0-9+=,.@\-_/]+$`).
-fn role_arn(role: &str) -> String {
+pub(crate) fn role_arn(role: &str) -> String {
     format!("arn:aws:iam::{}:role/{role}", engine::EMULATOR_ACCOUNT_ID)
 }
 
 /// The ARN of a general purpose bucket inside the `BucketARN` pattern
 /// (`^arn:aws[-a-z0-9]*:s3:::[a-z0-9._-]{3,63}$`).
-fn bucket_arn(bucket: &str) -> String {
+pub(crate) fn bucket_arn(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}")
 }
 
 /// The ARN of a table bucket inside the `TableBucketARN` pattern
 /// (`^arn:aws[-a-z0-9]*:s3tables:[-a-z0-9]+:\d{12}:bucket/[a-z0-9_-]{3,63}$`).
-fn table_bucket_arn(bucket: &str) -> String {
+pub(crate) fn table_bucket_arn(bucket: &str) -> String {
     format!(
         "arn:aws:s3tables:{REGION}:{}:bucket/{bucket}",
         engine::EMULATOR_ACCOUNT_ID
@@ -106,7 +106,7 @@ fn table_bucket_arn(bucket: &str) -> String {
 
 /// The ARN of a Glue Schema Registry schema inside the `GSRSchemaARN` pattern
 /// (`^arn:aws[-a-z0-9]*:glue:[-a-z0-9]+:\d{12}:schema/[-a-zA-Z0-9_$#.]+/[-a-zA-Z0-9_$#.]+$`).
-fn schema_arn(registry: &str, schema: &str) -> String {
+pub(crate) fn schema_arn(registry: &str, schema: &str) -> String {
     format!(
         "arn:aws:glue:{REGION}:{}:schema/{registry}/{schema}",
         engine::EMULATOR_ACCOUNT_ID
@@ -134,7 +134,7 @@ fn alias_arn(alias: &str) -> String {
 
 /// The `S3StorageConfiguration` of a delivery bucket, carrying only the modelled required
 /// members unless a case names more.
-fn storage_configuration(bucket: &str) -> Value {
+pub(crate) fn storage_configuration(bucket: &str) -> Value {
     json!({
         "BucketARN": bucket_arn(bucket),
         "ExpectedBucketOwner": engine::EMULATOR_ACCOUNT_ID,
@@ -143,7 +143,7 @@ fn storage_configuration(bucket: &str) -> Value {
 }
 
 /// A `DeadLetterQueueS3Configuration` naming its own bucket and error prefix.
-fn dead_letter_queue(bucket: &str, prefix: &str) -> Value {
+pub(crate) fn dead_letter_queue(bucket: &str, prefix: &str) -> Value {
     json!({
         "BucketARN": bucket_arn(bucket),
         "ExpectedBucketOwner": engine::EMULATOR_ACCOUNT_ID,
@@ -163,7 +163,11 @@ fn default_dead_letter_queue(bucket: &str) -> Value {
 
 /// One source stream configuration, naming the stream by ARN and the format its records are
 /// read in.
-fn stream_configuration(arn: &str, record_format_type: &str, schema: Option<String>) -> Value {
+pub(crate) fn stream_configuration(
+    arn: &str,
+    record_format_type: &str,
+    schema: Option<String>,
+) -> Value {
     let mut record_configuration = json!({ "RecordFormatType": record_format_type });
     if let Some(schema) = schema {
         record_configuration["GSRSchemaARN"] = json!(schema);
@@ -171,12 +175,13 @@ fn stream_configuration(arn: &str, record_format_type: &str, schema: Option<Stri
     json!({ "StreamARN": arn, "RecordConfiguration": record_configuration })
 }
 
-/// An `ACTIVE` on-demand stream named `name`, which is the only capacity mode a channel
-/// supports — the stream a channel case reads from. Answers its ARN.
-async fn on_demand_stream(emulator: &Emulator, name: &str) -> String {
+/// An `ACTIVE` on-demand stream named `name` in `region`, which is the only capacity mode a
+/// channel supports — the stream a channel case reads from. Answers its ARN.
+pub(crate) async fn on_demand_stream_in(emulator: &Emulator, region: &str, name: &str) -> String {
     emulator
-        .ok(
+        .ok_in(
             name,
+            region,
             "CreateStream",
             &json!({
                 "StreamName": name,
@@ -185,11 +190,16 @@ async fn on_demand_stream(emulator: &Emulator, name: &str) -> String {
         )
         .await;
     tokio::time::sleep(past_activation()).await;
-    stream_arn(REGION, name)
+    stream_arn(region, name)
+}
+
+/// [`on_demand_stream_in`] in the default test region.
+pub(crate) async fn on_demand_stream(emulator: &Emulator, name: &str) -> String {
+    on_demand_stream_in(emulator, REGION, name).await
 }
 
 /// The `ChannelDescription` a `CreateChannel` or `DescribeChannel` response carries.
-fn description(case: &str, response: &Value) -> Value {
+pub(crate) fn description(case: &str, response: &Value) -> Value {
     response
         .get("ChannelDescription")
         .cloned()
@@ -209,7 +219,7 @@ fn description_without_status(case: &str, response: &Value) -> Value {
 }
 
 /// A string member of a description, which the model makes required.
-fn member(case: &str, description: &Value, name: &str) -> String {
+pub(crate) fn member(case: &str, description: &Value, name: &str) -> String {
     description
         .get(name)
         .and_then(Value::as_str)

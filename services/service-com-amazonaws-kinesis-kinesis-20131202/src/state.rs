@@ -19,10 +19,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     ChannelDescription, ChannelEncryptionConfiguration, ChannelLoggingConfiguration,
-    ChannelStreamDescription, ChildShard, Consumer, ConsumerDescription, EnhancedMetrics,
-    HashKeyRange, Record, S3DestinationDescription, S3TablesDestinationDescription,
-    SequenceNumberRange, Shard, StreamDescription, StreamDescriptionSummary, StreamModeDetails,
-    StreamSummary, Tag, WarmThroughputObject, METRICS_NAME_VALUES,
+    ChannelStreamDescription, ChannelStreamIdentifier, ChannelSummary, ChildShard, Consumer,
+    ConsumerDescription, EnhancedMetrics, HashKeyRange, Record, S3DestinationDescription,
+    S3TablesDestinationDescription, SequenceNumberRange, Shard, StreamDescription,
+    StreamDescriptionSummary, StreamModeDetails, StreamSummary, Tag, WarmThroughputObject,
+    METRICS_NAME_VALUES,
 };
 
 /// The region a stream is created in when the request carries no SigV4 credential scope
@@ -397,6 +398,16 @@ pub const MAX_CHANNELS_PER_REGION: usize = 50;
 /// partition, since the region a create is counted against is the caller's to choose. The
 /// emulator's OWN ceiling, not a modelled limit.
 pub const MAX_CHANNELS_TOTAL: usize = 100;
+
+/// How many channels `ListChannels` returns when the request names no `MaxResults`: "The
+/// maximum number of channels to return in a single call. The default value is 100"
+/// (`ListChannelsInput$MaxResults`).
+pub const DEFAULT_LIST_CHANNELS_LIMIT: i32 = 100;
+
+/// The most channels `ListChannels` returns in one call: "If you specify a value greater
+/// than 100, at most 100 results are returned" (`ListChannelsInput$MaxResults`), which the
+/// modelled `range 1..10000` deliberately leaves room above.
+pub const MAX_LIST_CHANNELS_LIMIT: i32 = 100;
 
 /// How many seconds an hour of a retention window holds, so the window a stream reports in
 /// hours can be measured against stored instants.
@@ -1596,6 +1607,66 @@ impl Channel {
         }
     }
 
+    /// Where the channel delivers, as `ChannelDestinationType` spells it: "S3 - Delivery to
+    /// a general purpose Amazon S3 bucket", "S3_TABLES - Delivery to streaming tables on
+    /// Apache Iceberg" (`ChannelSummary$ChannelDestinationType`). Derived from the stored
+    /// destination, exactly one of which a channel carries.
+    pub fn destination_type(&self) -> &'static str {
+        if self.s3_tables_destination.is_some() {
+            CHANNEL_DESTINATION_S3_TABLES
+        } else {
+            CHANNEL_DESTINATION_S3
+        }
+    }
+
+    /// The stored record projected onto `ChannelSummary`, which is what `ListChannels`
+    /// reports: "A summary of a channel". The members it shares with
+    /// [`Self::to_description`] come from the same stored fields, so a listing and a read of
+    /// one channel never disagree, and its source streams are reported as the identifier
+    /// pair (`ChannelStreamIdentifier`) a summary carries rather than the fuller
+    /// description.
+    pub fn to_summary(&self, now: SystemTime) -> ChannelSummary {
+        ChannelSummary {
+            channel_name: self.name.clone(),
+            channel_arn: self.arn.clone(),
+            channel_id: self.id.clone(),
+            channel_status: self.status(now).to_string(),
+            // See [`Self::to_description`]: a channel this emulator holds provisions, so
+            // none of them is `FAILED` and none carries a reason.
+            channel_status_reason: None,
+            channel_creation_timestamp: timestamp(self.created_at),
+            channel_destination_type: self.destination_type().to_string(),
+            streams: self
+                .streams
+                .iter()
+                .map(|stream| ChannelStreamIdentifier {
+                    stream_arn: stream.stream_arn.clone(),
+                    stream_creation_timestamp: stream.stream_creation_timestamp,
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether one of the channel's source streams is the stream `stream_arn` names, created
+    /// at `created_at` when the caller pinned an instant.
+    ///
+    /// An ARN a delete released and a later create took again names another stream, so a
+    /// caller that pins the creation instant is answered about THAT incarnation only; one
+    /// that pins none is answered about whichever stream the ARN holds. Instants are compared
+    /// at the millisecond precision this service's stored instants carry.
+    pub fn sources_stream(
+        &self,
+        stream_arn: &str,
+        created_at: Option<::aws_smithy_types::DateTime>,
+    ) -> bool {
+        self.streams.iter().any(|stream| {
+            stream.stream_arn == stream_arn
+                && created_at.is_none_or(|pinned| {
+                    pinned.to_millis().ok() == stream.stream_creation_timestamp.to_millis().ok()
+                })
+        })
+    }
+
     /// The stored record projected onto `ChannelDescription`, which is what `CreateChannel`
     /// and `DescribeChannel` both answer with: "The configuration and current status of the
     /// channel, including its ARN, destination configuration, and lifecycle state".
@@ -1887,6 +1958,22 @@ impl ComAmazonawsKinesisKinesis20131202State {
     /// [`MAX_CHANNELS_TOTAL`] bounds: the ceiling no request can partition.
     pub fn channels_held(&self) -> usize {
         self.channels.len()
+    }
+
+    /// Every channel `region`'s endpoint holds, ordered by name.
+    ///
+    /// A listing of them is paginated ("The results are paginated. Use the NextToken value
+    /// returned in the response to retrieve additional results", `ListChannels`), so the
+    /// channels a read reports need ONE total order every page agrees on; a channel is
+    /// addressed by a name unique in its region, so that order is by name.
+    pub fn channels_ordered_in(&self, region: &str) -> Vec<&Channel> {
+        let mut channels: Vec<&Channel> = self
+            .channels
+            .values()
+            .filter(|channel| channel.region == region)
+            .collect();
+        channels.sort_by(|left, right| left.name.cmp(&right.name));
+        channels
     }
 }
 
@@ -2940,34 +3027,60 @@ impl ShardPageToken {
     }
 }
 
-/// What a `ListStreams` pagination token is tagged with, so a string the service never
-/// issued is refused rather than read as a stream name.
-const STREAM_PAGE_TOKEN_TAG: &str = "listStreams";
+/// Which listing a regional cursor belongs to, which is what it is tagged with: a string
+/// this service never issued, and one minted for ANOTHER listing, both name no page of the
+/// listing being asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionalListing {
+    /// `ListStreams`, whose cursor names the stream its next page starts at.
+    Streams,
+    /// `ListChannels`, whose cursor names the channel its next page starts at.
+    Channels,
+}
 
-/// Where a truncated `ListStreams` page continues, and whose streams it continues.
+impl RegionalListing {
+    /// The tag this listing's cursors carry.
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::Streams => "listStreams",
+            Self::Channels => "listChannels",
+        }
+    }
+}
+
+/// Where a truncated page of a regional listing continues, and whose resources it continues.
 ///
-/// A stream name is scoped to one region, so the token carries the region the page was
-/// served for beside the stream the next page starts at; and it expires, so it carries the
-/// instant it was minted. All of it travels INSIDE the token: a read mints one without
-/// writing anything a later caller could see.
+/// Both `ListStreams` and `ListChannels` page a set of resources that a name unique inside
+/// one region addresses, so ONE cursor serves them: the listing it was minted for, the
+/// region the page was served for, the resource the next page starts at, and the instant it
+/// was minted, since it expires. All of it travels INSIDE the token: a read mints one
+/// without writing anything a later caller could see.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamPageToken {
-    /// The region whose streams are being listed.
+pub struct RegionalPageToken {
+    /// The listing this cursor was minted for.
+    pub listing: RegionalListing,
+    /// The region whose resources are being listed.
     pub region: String,
-    /// The name of the first stream the page did NOT return, which the next page starts at.
-    pub next_stream_name: String,
+    /// The name of the first resource the page did NOT return, which the next page starts
+    /// at.
+    pub next_name: String,
     /// When the page that handed this token out was served, in milliseconds since the
     /// epoch.
     pub issued_at_millis: u128,
 }
 
-impl StreamPageToken {
-    /// The token that resumes `region`'s listing at `next_stream_name`, minted at
-    /// `issued_at`.
-    pub fn new(region: &str, next_stream_name: &str, issued_at: SystemTime) -> Self {
+impl RegionalPageToken {
+    /// The token that resumes `listing` over `region` at `next_name`, minted at `issued_at`.
+    pub fn new(
+        listing: RegionalListing,
+        region: &str,
+        next_name: &str,
+        issued_at: SystemTime,
+    ) -> Self {
         Self {
+            listing,
             region: region.to_string(),
-            next_stream_name: next_stream_name.to_string(),
+            next_name: next_name.to_string(),
             issued_at_millis: epoch_millis(issued_at),
         }
     }
@@ -2979,27 +3092,32 @@ impl StreamPageToken {
     /// hex characters per byte keeps it far inside the modelled length 1..1048576.
     pub fn encode(&self) -> String {
         hex::encode(format!(
-            "{STREAM_PAGE_TOKEN_TAG}:{}:{}:{}",
-            self.issued_at_millis, self.region, self.next_stream_name
+            "{}:{}:{}:{}",
+            self.listing.tag(),
+            self.issued_at_millis,
+            self.region,
+            self.next_name
         ))
     }
 
-    /// The token `token` carries, or `None` when it is not one this service issued.
-    pub fn decode(token: &str) -> Option<Self> {
+    /// The token `token` carries for `listing`, or `None` when it is not one this service
+    /// issued for that listing.
+    pub fn decode(listing: RegionalListing, token: &str) -> Option<Self> {
         let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
         let mut fields = decoded.splitn(4, ':');
-        if fields.next()? != STREAM_PAGE_TOKEN_TAG {
+        if fields.next()? != listing.tag() {
             return None;
         }
         let issued_at_millis = fields.next()?.parse().ok()?;
         let region = fields.next()?.to_string();
-        let next_stream_name = fields.next()?.to_string();
-        if region.is_empty() || next_stream_name.is_empty() {
+        let next_name = fields.next()?.to_string();
+        if region.is_empty() || next_name.is_empty() {
             return None;
         }
         Some(Self {
+            listing,
             region,
-            next_stream_name,
+            next_name,
             issued_at_millis,
         })
     }

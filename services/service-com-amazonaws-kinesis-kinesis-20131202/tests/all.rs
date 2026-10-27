@@ -19,6 +19,8 @@ mod batch_write_failure_count;
 mod capacity_mode;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/channel_listing.rs"]
+mod channel_listing;
 #[path = "all/data_records.rs"]
 mod data_records;
 #[path = "all/encrypted_records.rs"]
