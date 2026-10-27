@@ -228,9 +228,11 @@ async fn seed_job(router: &MultiServiceRouter, profile_name: &str, platform_id: 
     job_id
 }
 
-/// The IAM principal ARN a revocation performed by these requests records.
+/// The IAM principal ARN a revocation performed by these requests records: the
+/// principal the request's credentials resolve to, which is the one IAM user
+/// whose credentials this emulator publishes.
 fn expected_revoker() -> Value {
-    json!(format!("arn:aws:iam::{ACCOUNT_ID}:user/{ACCESS_KEY_ID}"))
+    json!(format!("arn:aws:iam::{ACCOUNT_ID}:user/emulator"))
 }
 
 /// One revocation to perform. The rows differ along the reason's length (both

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBShardGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBShardGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBShardGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -106,6 +97,25 @@
 //! * `DBShardGroupNotFoundFault` (HTTP 404) — The specified DB shard group name wasn't found.
 //! * `InvalidDBClusterStateFault` (HTTP 400) — The requested operation can't be performed
 //!   while the cluster is in this state.
+//!
+//! ## What this handler does
+//!
+//! It writes the settings the request names onto the stored DB shard group — the capacity
+//! range it scales between and how many standby DB data access shards it carries — leaves
+//! the ones the request omits as they stand, and reports the shard group from the record it
+//! just wrote, so the next `DescribeDBShardGroups` of that identifier reports the same
+//! values.
+//!
+//! Two things the modelled error set settles:
+//!
+//! * The shard group KEEPS the status it had. Unlike `DeleteDBShardGroup` and
+//!   `RebootDBShardGroup`, which both declare `InvalidDBShardGroupStateFault` ("the DB
+//!   shard group must be in the available state"), this operation declares no state fault
+//!   for the shard group itself — it takes the modification in the state the shard group is
+//!   in and reports it back in that state, so no transient status and no transition are
+//!   owed here.
+//! * `DBShardGroupAlreadyExistsFault` is unreachable: the input carries no new name for the
+//!   shard group, so nothing this request can ask for collides with another one.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -180,18 +190,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBShardGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBShardGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBShardGroup"))
+        let region =
+            crate::state::request_region(ctx).map_err(ModifyDBShardGroupError::validation)?;
+
+        // The documented constraints of the values this request would store: a capacity in
+        // ACUs is a positive quantity and `ComputeRedundancy` has a published value list,
+        // checked for whichever of them the request names. `DBShardGroupIdentifier` needs no
+        // check here — this operation's input member targets the constrained
+        // `DBShardGroupIdentifier` shape, so the boundary validator has already refused a
+        // name outside its length and pattern.
+        if let Some(max_acu) = input.max_acu {
+            crate::state::check_capacity_units("MaxACU", max_acu)
+                .map_err(ModifyDBShardGroupError::invalid_parameter_value)?;
+        }
+        if let Some(min_acu) = input.min_acu {
+            crate::state::check_capacity_units("MinACU", min_acu)
+                .map_err(ModifyDBShardGroupError::invalid_parameter_value)?;
+        }
+        if let Some(compute_redundancy) = input.compute_redundancy {
+            crate::state::check_compute_redundancy(compute_redundancy)
+                .map_err(ModifyDBShardGroupError::invalid_parameter_value)?;
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a modification reported against no record.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional, and the identifier names one DB shard group of the region
+        // case-insensitively, so it is folded the way the store keys it.
+        let key = (
+            region.clone(),
+            crate::state::db_shard_group_key(&input.db_shard_group_identifier),
+        );
+        // "The specified DB shard group name wasn't found": a name no create stored in this
+        // region — and one a delete has already taken out — is the modelled not-found fault.
+        let Some(stored) = store.db_shard_groups.get(&key) else {
+            return Err(ModifyDBShardGroupErrorModeled::DBShardGroupNotFoundFault(
+                DBShardGroupNotFoundFault {
+                    message: Some(format!(
+                        "DBShardGroup {} not found.",
+                        input.db_shard_group_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+        // The capacity range the shard group would scale between once this modification is
+        // applied: each bound the request names, over the one the record already holds. The
+        // minimum capacity cannot be above the maximum, whichever of the two the request
+        // carried, so the pair is checked as it WOULD stand rather than one member at a
+        // time.
+        let identifier = stored.identifier.clone();
+        let primary_cluster = stored.db_cluster_identifier.clone();
+        let max_acu = input.max_acu.unwrap_or(stored.max_acu);
+        let min_acu = input.min_acu.or(stored.min_acu);
+        crate::state::check_capacity_range(min_acu, max_acu)
+            .map_err(ModifyDBShardGroupError::invalid_parameter_combination)?;
+        // "The requested operation can't be performed while the cluster is in this state":
+        // the shard group belongs to a primary DB cluster, and a cluster whose delete has
+        // begun — a delete "can't be canceled or reverted after it begins" — can take no
+        // further change to what hangs off it. Every other status accepts the modification,
+        // a provisioning status this emulator's clock has yet to settle included, exactly as
+        // `CreateDBShardGroup` resolves the same cluster.
+        if store
+            .resolve_db_cluster(&region, &primary_cluster)
+            .is_some_and(|cluster| cluster.is_deleting())
+        {
+            return Err(ModifyDBShardGroupErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(format!(
+                        "DB cluster {primary_cluster} is being deleted, so its DB shard group \
+                         {identifier} can't be modified"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The record was read above under this same lock, so it is still there. An invariant
+        // of this store that cannot hold is reported as a failure of this emulator rather
+        // than with a panic in a request path.
+        let Some(record) = store.db_shard_groups.get_mut(&key) else {
+            return Err(ModifyDBShardGroupError::internal_failure(format!(
+                "the DB shard group {identifier} left the store while it was locked"
+            )));
+        };
+        // Each setting the request named is written onto the stored record; a setting it
+        // omitted is not "changed to nothing", it stays as it was.
+        if let Some(value) = input.max_acu {
+            record.max_acu = value;
+        }
+        if let Some(value) = input.min_acu {
+            record.min_acu = Some(value);
+        }
+        if let Some(value) = input.compute_redundancy {
+            record.compute_redundancy = value;
+        }
+        let modified = record.to_wire();
+        // The generated types declare ONE struct per operation for the modelled
+        // `DBShardGroup` shape, so the projection every DB shard group operation shares
+        // (`DbShardGroupRecord::to_wire`) is mapped onto this operation's own output rather
+        // than written out a second time here.
+        Ok(ModifyDBShardGroupOutput {
+            db_shard_group_resource_id: modified.db_shard_group_resource_id,
+            db_shard_group_identifier: modified.db_shard_group_identifier,
+            db_cluster_identifier: modified.db_cluster_identifier,
+            max_acu: modified.max_acu,
+            min_acu: modified.min_acu,
+            compute_redundancy: modified.compute_redundancy,
+            status: modified.status,
+            publicly_accessible: modified.publicly_accessible,
+            endpoint: modified.endpoint,
+            db_shard_group_arn: modified.db_shard_group_arn,
+            tag_list: modified.tag_list,
+        })
     }
 }

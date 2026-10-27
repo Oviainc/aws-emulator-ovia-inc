@@ -3485,6 +3485,14 @@ pub const FIREWALL_CONFIG_LIST_SCOPE: &str = "ListFirewallConfigs/all/v1";
 /// narrower than the usual 1..100 the other list operations carry.
 pub const MAX_FIREWALL_CONFIGS_PER_PAGE: i32 = 10;
 
+/// The cursor scope of one `ListResolverConfigs` query.
+///
+/// `ListResolverConfigs` models no filter either — only `MaxResults` and
+/// `NextToken` (`smithy_query(query="operation",operation="ListResolverConfigs")`)
+/// — so, for the same reason as [`FIREWALL_DOMAIN_LIST_LIST_SCOPE`], the scope
+/// is a constant that names the operation.
+pub const RESOLVER_CONFIG_LIST_SCOPE: &str = "ListResolverConfigs/all/v1";
+
 /// One page of a `@paginated` list operation.
 #[derive(Debug)]
 pub struct Page<T> {
