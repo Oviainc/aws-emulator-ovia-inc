@@ -20,8 +20,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{
-    invalid_parameter_message, LIST_DEAD_LETTER_SOURCE_QUEUES_MAX_RESULTS_RANGE,
-    QUEUE_DOES_NOT_EXIST_MESSAGE,
+    invalid_parameter_message, invalid_parameter_message_without_value,
+    LIST_DEAD_LETTER_SOURCE_QUEUES_MAX_RESULTS_RANGE, QUEUE_DOES_NOT_EXIST_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -362,21 +362,23 @@ async fn a_request_the_listing_will_not_take_is_refused_with_its_own_message() {
     .await;
 
     let (min, max) = LIST_DEAD_LETTER_SOURCE_QUEUES_MAX_RESULTS_RANGE;
-    let range = format!("must be between {min} and {max}.");
+    // The refusal states the range this listing's `MaxResults` publishes, and names
+    // neither the rejected value nor this queue.
+    let range = format!("MaxResults must be an integer between {min} and {max}.");
     let rows = vec![
         Refusal {
             case: "a page size asking for no result at all",
             request: json!({"QueueUrl": dead_letter, "MaxResults": min - 1}),
             status: 400,
             code: "InvalidParameterValue",
-            message: invalid_parameter_message(&(min - 1).to_string(), "MaxResults", &range),
+            message: invalid_parameter_message_without_value("MaxResults", &range),
         },
         Refusal {
             case: "a page size one past the published maximum",
             request: json!({"QueueUrl": dead_letter, "MaxResults": max + 1}),
             status: 400,
             code: "InvalidParameterValue",
-            message: invalid_parameter_message(&(max + 1).to_string(), "MaxResults", &range),
+            message: invalid_parameter_message_without_value("MaxResults", &range),
         },
         Refusal {
             case: "a cursor that is not one this listing issues",
