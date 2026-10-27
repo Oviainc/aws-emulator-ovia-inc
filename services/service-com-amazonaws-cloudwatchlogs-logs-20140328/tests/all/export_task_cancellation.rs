@@ -6,11 +6,12 @@
 //! The rule under test: a cancel applies to the export task the `taskId` names and only
 //! while that task is in one of the statuses an export is still under way in — "The task
 //! must be in the PENDING or RUNNING state" — which it then leaves `CANCELLED`, discarding
-//! the transitions the clock had armed for it; a task in any other status is refused
-//! `InvalidOperationException` with the fixed text its class carries, an id the account holds
-//! no task under is refused `ResourceNotFoundException` naming the kind of resource, and
-//! either refusal leaves the stored task exactly as it was, so a report after it answers
-//! what it answered before.
+//! the transitions the clock had armed for it and reporting the status message that status
+//! carries ("the status message related to the status code"); a task in any other status is
+//! refused `InvalidOperationException` with the fixed text its class carries, an id the
+//! account holds no task under is refused `ResourceNotFoundException` naming the kind of
+//! resource, and either refusal leaves the stored task exactly as it was, so a report after
+//! it answers what it answered before.
 //!
 //! Every case drives the service the way a client does — `POST /` with
 //! `X-Amz-Target: Logs_20140328.<Operation>` through the router that mounts it — so a
@@ -19,9 +20,10 @@
 //! The tables span what the rule generalises over rather than one request: which non-terminal
 //! status the task is in when the cancel arrives (not started yet, exporting), which optional
 //! members the task carries, how the task came to be settled (finished on the clock, already
-//! cancelled, failed), and which form an id the account holds no task under takes — including
-//! each published bound of the modelled `ExportTaskId` length and one past it. The settled
-//! task an issue happens to mention is one row.
+//! cancelled, failed), which status the reported status message belongs to, and which form an
+//! id the account holds no task under takes — including each published bound of the modelled
+//! `ExportTaskId` length and one past it. The settled task an issue happens to mention is one
+//! row.
 
 use std::time::Duration;
 
@@ -55,6 +57,11 @@ const COMPLETED: &str = "COMPLETED";
 /// The whole message a cancel of a task that is no longer under way is refused with: fixed
 /// text for the error class, carrying nothing of the request or of the stored task.
 const ALREADY_FINISHED: &str = "The specified export task has already finished";
+
+/// The whole status message a cancelled export task reports beside that status code: what
+/// `ExportTaskStatus$message` ("the status message related to the status code") says about a
+/// task a caller stopped.
+const CANCELLED_BY_USER: &str = "Export task cancelled by user";
 
 /// The whole message a cancel naming an id the account holds no task under is refused with:
 /// the service's missing-resource sentence, naming the kind of resource that is not there.
@@ -222,6 +229,99 @@ async fn a_cancel_stops_an_export_that_is_still_under_way() {
         PENDING,
         "case a create after the cancels: the cancelled tasks hold no active slot"
     );
+}
+
+/// `ExportTaskStatus$message` is "the status message related to the status code", and the
+/// status a CALLER put the task in is the one this service has something to say about: a
+/// cancelled task reports why it stopped, while a status the export reached on its own
+/// carries no message at all.
+#[tokio::test]
+async fn a_cancelled_task_reports_the_status_message_that_status_carries() {
+    let logs = Logs::new();
+    const GROUP: &str = "/export/status-message";
+    logs.ok("CreateLogGroup", &json!({"logGroupName": GROUP}))
+        .await;
+
+    // One task per status an export task reaches, each driven there the way a client drives
+    // it — the account holds one active task at a time, so each is settled before the next is
+    // created — and the reported task is captured in the status it was read in.
+    let pending = start_export(&logs, GROUP, &json!({})).await;
+    let under_way = reported(&logs, "a task whose export is under way", &pending).await;
+    cancel(&logs, &pending).await;
+    let cancelled_while_pending =
+        reported(&logs, "a task cancelled before it started exporting", &pending).await;
+
+    let running = start_export(&logs, GROUP, &json!({})).await;
+    tokio::time::sleep(mid_export()).await;
+    let while_running = reported(&logs, "a task that is exporting", &running).await;
+    cancel(&logs, &running).await;
+    let cancelled_while_running =
+        reported(&logs, "a task cancelled while it was exporting", &running).await;
+
+    let finished = start_export(&logs, GROUP, &json!({})).await;
+    tokio::time::sleep(past_completion()).await;
+    let finished_on_the_clock = reported(&logs, "a task the clock finished", &finished).await;
+
+    // A failed export is a status the model carries that no request of this service reaches,
+    // so it is stood up in the store and read back over the wire like the rows above.
+    let failed = seed_failed_task(&logs, GROUP);
+    let failed_task = reported(&logs, "a task whose export failed", &failed).await;
+
+    // (case, the task as it was reported, the statuses that reading admits, the message that
+    // status carries — `None` where the service has nothing to say about the status). A row
+    // admits two statuses where the read races the clock the create armed: a task read right
+    // after the create has not started exporting unless that instant has already passed, and
+    // either way it is a status the export reached on its own.
+    let cases: Vec<(&str, &Value, Vec<&str>, Option<&str>)> = vec![
+        (
+            "a task whose export is under way",
+            &under_way,
+            vec![PENDING, RUNNING],
+            None,
+        ),
+        (
+            "a task that is exporting",
+            &while_running,
+            vec![RUNNING],
+            None,
+        ),
+        (
+            "a task the clock finished",
+            &finished_on_the_clock,
+            vec![COMPLETED],
+            None,
+        ),
+        (
+            "a task whose export failed",
+            &failed_task,
+            vec![EXPORT_TASK_STATUS_FAILED],
+            None,
+        ),
+        (
+            "a task cancelled before it started exporting",
+            &cancelled_while_pending,
+            vec![CANCELLED],
+            Some(CANCELLED_BY_USER),
+        ),
+        (
+            "a task cancelled while it was exporting",
+            &cancelled_while_running,
+            vec![CANCELLED],
+            Some(CANCELLED_BY_USER),
+        ),
+    ];
+    for (case, task, admitted, expected_message) in cases {
+        let code = task["status"]["code"].as_str().unwrap_or_default();
+        assert!(
+            admitted.contains(&code),
+            "case {case:?}: expected one of {admitted:?}, got {task}"
+        );
+        assert_eq!(
+            task["status"]["message"].as_str(),
+            expected_message,
+            "case {case:?}: expected the status message {expected_message:?}, got {task}"
+        );
+    }
 }
 
 /// A cancel of a task that is no longer under way is refused with the fixed text of its error

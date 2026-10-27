@@ -34,12 +34,12 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::ops::types::INDEX_STATUS_VALUES;
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    INDEX_SCHEMA_QUOTA, INDEX_STATUS_UPDATED,
+    INDEX_SCHEMA_MAX_DEPTH, INDEX_SCHEMA_QUOTA, INDEX_STATUS_UPDATED,
 };
 
 use super::data_source_registry::created_domain;
 use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFIX};
-use super::index_registry::{created_index, get as get_index};
+use super::index_registry::{create as create_index_call, created_index, get as get_index, stored_names};
 
 /// `UpdateIndex`: `PUT /opensearch/domain/{DomainName}/index/{IndexName}`. A sibling
 /// suite drives the same path, rather than growing a second copy of it.
@@ -776,12 +776,160 @@ async fn an_update_that_would_grow_one_schema_past_the_emulators_own_bound_is_re
         read["mappings"], inside["mappings"],
         "case past the bound: expected the mappings the create wrote, got {read:?}"
     );
+
+    // The same bound holds for the create that would PERSIST such a document, so no
+    // index starts out past the bound every later update is held to: the create is
+    // refused and mints nothing.
+    let past_on_create = wide_properties(0, INDEX_SCHEMA_QUOTA);
+    let refused = create_index_call(
+        &emulator,
+        "schema-bound",
+        json!({ "IndexName": "over-bound", "IndexSchema": past_on_create }),
+    )
+    .await;
+    assert_eq!(
+        refused.status, 400,
+        "case past the bound on create: expected 400 for a schema past the bound, got {} with \
+         {:?}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ValidationException",
+        "case past the bound on create: expected ValidationException, got {:?}",
+        refused.body
+    );
+    let created_message = string_member(&refused.body, "message", "past the bound on create");
+    assert!(
+        created_message.contains(&INDEX_SCHEMA_QUOTA.to_string()),
+        "case past the bound on create: expected the refusal to report the bound, got \
+         {created_message:?}"
+    );
+    let held = stored_names(&emulator, "schema-bound", "past the bound on create");
+    assert!(
+        !held.contains(&"over-bound".to_string()),
+        "case past the bound on create: a refused create must mint nothing, got {held:?}"
+    );
+
     updated_index(
         &emulator,
         "schema-bound",
         "bounded",
         &json!({ "settings": { "index": { "number_of_replicas": 2 } } }),
         "after the refusal",
+    )
+    .await;
+}
+
+/// A schema document nesting exactly `depth` levels: a leaf value under `depth - 1`
+/// named sets, which is what `state::index_schema_depth` measures as `depth`.
+fn nested_schema(depth: usize) -> Value {
+    let mut node = json!("text");
+    for _ in 1..depth {
+        node = json!({ "nested": node });
+    }
+    node
+}
+
+/// RULE: an `IndexSchema` nesting deeper than the emulator's own depth bound is refused
+/// with the modelled `ValidationException` (400) and changes nothing — by the create
+/// that would persist it and by the update that would merge it alike — while a document
+/// AT the bound is accepted. The walks that merge a schema and compare its mapped types
+/// address a member by its path, so this is what keeps the cost of accepting a document
+/// tied to the bytes the request carried. The rows are the published bound, one past it
+/// and far past it.
+#[tokio::test]
+async fn a_schema_nesting_past_the_emulators_own_depth_bound_is_refused() {
+    let emulator = Emulator::new();
+    created_domain(&emulator, "schema-depth").await;
+    let created = json!({ "mappings": { "properties": { "title": { "type": "text" } } } });
+    created_index(&emulator, "schema-depth", "deep", &created, "at the start").await;
+
+    // (the case, the depth the document nests to, whether it must be accepted, whether
+    // the refusal is the handler's own — past some depth the request boundary's own
+    // deserializer refuses the document first, with its own 400, before any handler
+    // sees it)
+    let rows: Vec<(&str, usize, bool, bool)> = vec![
+        ("at the bound", INDEX_SCHEMA_MAX_DEPTH, true, false),
+        ("one past the bound", INDEX_SCHEMA_MAX_DEPTH + 1, false, true),
+        ("well past the bound", INDEX_SCHEMA_MAX_DEPTH + 20, false, true),
+        ("deeper than any request may carry", 1_000, false, false),
+    ];
+
+    for (case, depth, accepted, handler_refusal) in rows {
+        let schema = nested_schema(depth);
+        let minted = format!("deep-{depth}");
+        // Each row is driven through BOTH operations that carry an `IndexSchema`: the
+        // update that merges it onto a stored schema and the create that persists it.
+        let answers = [
+            ("UpdateIndex", update(&emulator, "schema-depth", "deep", &schema).await),
+            (
+                "CreateIndex",
+                create_index_call(
+                    &emulator,
+                    "schema-depth",
+                    json!({ "IndexName": minted.clone(), "IndexSchema": schema.clone() }),
+                )
+                .await,
+            ),
+        ];
+        for (operation, answer) in &answers {
+            if accepted {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {operation}({case}): a document at the bound must be accepted, got {} \
+                     with {:?}",
+                    answer.status, answer.body
+                );
+                continue;
+            }
+            assert_eq!(
+                answer.status, 400,
+                "case {operation}({case}): expected 400 for a document past the depth bound, got \
+                 {} with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                error_code(answer),
+                "ValidationException",
+                "case {operation}({case}): expected ValidationException, got {:?}",
+                answer.body
+            );
+            if !handler_refusal {
+                continue;
+            }
+            let message = string_member(&answer.body, "message", case);
+            assert!(
+                message.contains(&INDEX_SCHEMA_MAX_DEPTH.to_string())
+                    && message.contains(&depth.to_string()),
+                "case {operation}({case}): expected the refusal to report the depth {depth} and \
+                 the bound {INDEX_SCHEMA_MAX_DEPTH}, got {message:?}"
+            );
+        }
+
+        // A refused create persisted no index; an accepted one is the index it named.
+        let held = stored_names(&emulator, "schema-depth", case);
+        assert_eq!(
+            held.contains(&minted),
+            accepted,
+            "case {case}: expected the store to hold {minted:?} only where the create was \
+             accepted, got {held:?}"
+        );
+    }
+
+    // Every refusal above left the stored schema's own mappings exactly as they were,
+    // and the index still takes a well-formed update.
+    let read = read_schema(&emulator, "schema-depth", "deep", "after the refusals").await;
+    assert_eq!(
+        read["mappings"], created["mappings"],
+        "case after the refusals: expected the mappings the create wrote, got {read:?}"
+    );
+    updated_index(
+        &emulator,
+        "schema-depth",
+        "deep",
+        &json!({ "mappings": { "properties": { "summary": { "type": "text" } } } }),
+        "after the refusals",
     )
     .await;
 }

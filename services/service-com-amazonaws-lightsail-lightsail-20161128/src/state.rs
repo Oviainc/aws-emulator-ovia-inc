@@ -9710,10 +9710,10 @@ pub fn instance_metric_unit(metric_name: &str) -> Option<&'static str> {
 /// state its caller asks to test: no
 /// metric an alarm can watch has a datapoint at all (this emulator runs no
 /// instance, container, load balancer or database workload and receives no
-/// measurement of one, which is why `GetInstanceMetricData` and
-/// `GetContainerServiceMetricData` both answer an empty `metricData`; the
-/// remaining `Get*MetricData` operations are still scaffolds with their own
-/// issues), and
+/// measurement of one, which is why `GetInstanceMetricData`,
+/// `GetContainerServiceMetricData` and `GetLoadBalancerMetricData` all answer an
+/// empty `metricData`; `GetRelationalDatabaseMetricData` is still a scaffold with
+/// its own issue), and
 /// the modelled `Alarm$state`
 /// documentation defines `INSUFFICIENT_DATA` as exactly that — "the metric is not
 /// available, or not enough data is available for the metric to determine the
@@ -10740,6 +10740,21 @@ pub const INSTANCE_HEALTH_DRAINING: &str = "draining";
 /// for it.
 pub const INSTANCE_HEALTH_REASON_DEREGISTRATION_IN_PROGRESS: &str =
     "Instance.DeregistrationInProgress";
+
+/// The unit the load balancer metric `metric_name` is published in, or `None`
+/// when this service publishes no such metric for a load balancer.
+///
+/// Every member of the modelled `LoadBalancerMetricName` enum — which is what
+/// `GetLoadBalancerMetricData`'s boundary walk admits — is also a metric an alarm
+/// can watch on a load balancer, and the "published `unit` value" each metric's
+/// own documentation states is already the `unit` of that metric's
+/// [`ALARM_METRICS`] row, so this reads that one catalog rather than restating
+/// it. (`INSTANCE_METRIC_UNITS` is its own list only because an instance
+/// publishes a metric no alarm can watch.) Source:
+/// `smithy_query(query="doc",shape="GetLoadBalancerMetricDataRequest",member="metricName")`.
+pub fn load_balancer_metric_unit(metric_name: &str) -> Option<&'static str> {
+    alarm_metric(RESOURCE_TYPE_LOAD_BALANCER, metric_name).map(|spec| spec.unit)
+}
 
 // ---------------------------------------------------------------------------
 // Load balancer TLS security policies

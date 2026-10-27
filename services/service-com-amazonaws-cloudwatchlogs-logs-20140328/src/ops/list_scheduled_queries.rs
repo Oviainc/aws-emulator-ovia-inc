@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListScheduledQueries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListScheduledQueries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListScheduledQueries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the scheduled queries this account holds — "Lists all scheduled queries in your
+//! account and region" — narrowed to the `state` and the `scheduleType` the request names,
+//! ordered by the name that identifies one and paged with the opaque `nextToken` it mints.
+//!
+//! Every query the account holds takes part, whoever created it: the ones
+//! `CreateScheduledQuery` stored, and the one CloudWatch MANAGES for each log alarm, which is
+//! derived from that alarm ([`crate::state::log_alarm_queries`]) exactly as `GetScheduledQuery`
+//! derives it — so an identifier this listing reports is one that reader resolves.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +120,71 @@ impl From<ListScheduledQueriesErrorModeled> for ListScheduledQueriesError {
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by
+/// another paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "ListScheduledQueries";
+
+/// Where the next page resumes: the name of the last query returned, plus the filters of the
+/// enumeration it belongs to. A continuation that changes a filter is refused, because the
+/// token is only a position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    filters: ::serde_json::Value,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "filters": self.filters,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        Some(Self {
+            filters: value.get("filters")?.clone(),
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
+/// Every member of the request that narrows the enumeration, as one comparable value: the page
+/// token is a position within THIS filtered enumeration, so a continuation that changes any of
+/// them is a different enumeration.
+fn filters_of(input: &ListScheduledQueriesInput) -> ::serde_json::Value {
+    ::serde_json::json!({
+        "state": input.state,
+        "scheduleType": input.schedule_type,
+    })
+}
+
+/// One stored query as this operation reports it. `ScheduledQuerySummary` is "Summary
+/// information about a scheduled query", so every member it carries is read off the record and
+/// a member the record holds nothing for is reported by nothing rather than invented.
+fn summary(query: &crate::state::ScheduledQueryRecord) -> ScheduledQuerySummary {
+    ScheduledQuerySummary {
+        scheduled_query_arn: Some(query.arn.clone()),
+        name: Some(query.name.clone()),
+        state: Some(query.state.clone()),
+        schedule_type: Some(query.schedule_type.clone()),
+        // Both members report an execution that happened, so a query no execution has been
+        // recorded for reports neither.
+        last_triggered_time: query.last_triggered_time_ms,
+        last_execution_status: query.last_execution_status.clone(),
+        schedule_expression: Some(query.schedule_expression.clone()),
+        timezone: query.timezone.clone(),
+        destination_configuration: query.destination_configuration.clone(),
+        creation_time: query.creation_time_ms,
+        last_updated_time: query.last_updated_time_ms,
+    }
+}
+
 /// The `ListScheduledQueries` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +221,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListScheduledQueries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListScheduledQueriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListScheduledQueries"))
+        // The Region the request was signed for, used only to name a managed query whose alarm
+        // states no ARN of its own — the same way `GetScheduledQuery` uses it.
+        let region = crate::state::request_region(ctx.parts());
+
+        let invalid = |message: &str| {
+            ListScheduledQueriesError::from(
+                ListScheduledQueriesErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                }),
+            )
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.filters != filters_of(&input) {
+                    return Err(invalid(
+                        "nextToken was issued for a different ListScheduledQueries request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListScheduledQueriesError::from(
+                ListScheduledQueriesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        // The log store's guard is taken and released before the alarm store is read, so the
+        // two services' stores are never locked at once.
+        let created: Vec<crate::state::ScheduledQueryRecord> =
+            state.lock().scheduled_queries.values().cloned().collect();
+        let managed = crate::state::log_alarm_queries::service_managed_scheduled_queries(
+            &*self.engine,
+            &region,
+        );
+
+        // ONE enumeration of every scheduled query the account holds, keyed by the name that
+        // identifies one — "The name must be unique within your account and region" — so the
+        // order is total and a page a client resumes names the same position on every call. A
+        // query a caller created wins a name a log alarm also carries, exactly as
+        // `GetScheduledQuery` resolves that identifier to the stored query.
+        let mut all: ::std::collections::BTreeMap<String, crate::state::ScheduledQueryRecord> =
+            managed
+                .into_iter()
+                .map(|query| (query.name.clone(), query))
+                .collect();
+        all.extend(created.into_iter().map(|query| (query.name.clone(), query)));
+
+        // "Filter scheduled queries by state. [...] If not specified, all scheduled queries are
+        // returned", and the same for the schedule type.
+        let matching: Vec<&crate::state::ScheduledQueryRecord> = all
+            .values()
+            .filter(|query| {
+                input
+                    .state
+                    .as_deref()
+                    .is_none_or(|wanted| query.state == wanted)
+            })
+            .filter(|query| {
+                input
+                    .schedule_type
+                    .as_deref()
+                    .is_none_or(|wanted| query.schedule_type == wanted)
+            })
+            .collect();
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|query| query.name <= cursor.after),
+            None => 0,
+        };
+        // `maxResults` is modelled `range 1..1000`, so the boundary validator has already
+        // refused a value outside it; a request that names none gets this service's own list
+        // page size, and `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.max_results.unwrap_or(crate::state::DEFAULT_LIST_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        // A token only where a page follows this one: "The token for the next set of items to
+        // return."
+        let next_token = page.last().filter(|_| last < matching.len()).map(|query| {
+            Cursor {
+                filters: filters_of(&input),
+                after: query.name.clone(),
+            }
+            .encode()
+        });
+
+        Ok(ListScheduledQueriesOutput {
+            scheduled_queries: Some(page.iter().map(|query| summary(query)).collect()),
+            next_token,
+        })
     }
 }

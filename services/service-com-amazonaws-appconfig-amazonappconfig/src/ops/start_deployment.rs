@@ -2,7 +2,8 @@
 
 //! @op StartDeployment
 //! IMPLEMENTED: starts a deployment of a configuration version into an environment
-//! and persists it, paced by the deployment strategy it names.
+//! and persists it, paced by the deployment strategy it names, once the configuration
+//! profile's validators have found the version's content compliant.
 //!
 //! ## Shape of an operation
 //!
@@ -185,6 +186,21 @@ fn not_found(message: String, resource_name: String) -> StartDeploymentError {
     .into()
 }
 
+/// A `BadRequestException` (HTTP 400) refusing the deployment because a validator of the
+/// configuration profile reported the candidate configuration non-compliant.
+///
+/// "The configuration deployment or update can only proceed when the configuration data is
+/// valid" (`smithy_query(query="doc",shape="Validator")`): the message is built by
+/// [`crate::state::validators::first_rejection`], which gives the verdict.
+fn validation_failed(message: String) -> StartDeploymentError {
+    StartDeploymentErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        reason: None,
+        details: None,
+    })
+    .into()
+}
+
 /// A `BadRequestException` (HTTP 400) refusing the deployment because an extension
 /// action AppConfig consults before starting it did not answer.
 ///
@@ -200,18 +216,27 @@ fn extension_failed(message: String) -> StartDeploymentError {
     .into()
 }
 
-/// What this call resolved before it consulted the `PRE_START_DEPLOYMENT` action point:
-/// everything the deployment is written from, plus the actions to invoke and the event
-/// they are handed.
+/// What this call resolved before it ran the configuration profile's validators and
+/// consulted the `PRE_START_DEPLOYMENT` action point: everything the deployment is written
+/// from, the gate the candidate configuration has to pass, plus the actions to invoke and
+/// the event they are handed.
 ///
-/// Collected under the state lock and then handed to the invocations, which cannot be
-/// made while it is held — so the record is written afterwards, from a second look at the
-/// store.
+/// Collected under the state lock and then handed to the validators and the invocations,
+/// which cannot be made while it is held — so the record is written afterwards, from a
+/// second look at the store.
 struct Prepared {
     configuration_name: String,
     configuration_location_uri: String,
     version_label: Option<String>,
     strategy: crate::state::DeploymentStrategy,
+    /// The validators the configuration profile carries, read with everything else the
+    /// call resolves and run against the candidate configuration before any record is
+    /// written.
+    validators: Vec<Validator>,
+    /// The bytes the candidate configuration version holds, as a consumer of this profile
+    /// would be served them; `None` for a profile whose configuration lives in a store
+    /// this service does not hold.
+    candidate_content: Option<Vec<u8>>,
     applied_extensions: Vec<AppliedExtension>,
     targets: Vec<crate::state::extension_actions::ActionTarget>,
     event: crate::state::extension_actions::ActionEvent,
@@ -329,9 +354,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let version_label = profile
             .resolve_hosted_version(&input.configuration_version)
             .and_then(|version| version.version_label.clone());
-        // The candidate configuration an extension action is handed: the bytes a
-        // consumer of this profile would be served for the version being deployed, read
-        // through the same projection the data plane serves.
+        // The candidate configuration an extension action is handed, and the document a
+        // validator of this profile checks: the bytes a consumer of this profile would be
+        // served for the version being deployed, read through the same projection the data
+        // plane serves.
         let candidate_content = profile
             .resolve_hosted_version(&input.configuration_version)
             .map(|version| {
@@ -340,6 +366,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     profile.served_content(&version.content),
                 )
             });
+        // "A validator provides a syntactic or semantic check to ensure the configuration
+        // that you want to deploy functions as intended": the gate the profile carries at
+        // the instant the deployment was asked for, so a validator added later does not
+        // decide this call.
+        let validators = profile.validators.clone();
 
         let Some(strategy) = store.resolve_strategy(&input.deployment_strategy_id) else {
             return Err(not_found(
@@ -439,11 +470,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "PreviousDeploymentNumber",
                 ::serde_json::Value::from(previous_deployment_number),
             );
-        event = match candidate_content {
+        event = match &candidate_content {
             Some((content_type, content)) => event.content(
-                &content_type,
+                content_type,
                 &input.configuration_version,
-                &content,
+                content,
             ),
             // A configuration whose bytes this service does not hold — one stored in S3,
             // Parameter Store or Secrets Manager — has a version but no content here,
@@ -459,11 +490,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             configuration_location_uri,
             version_label,
             strategy,
+            validators,
+            candidate_content: candidate_content.map(|(_, content)| content),
             applied_extensions,
             targets,
             event,
         }
         };
+
+        // A configuration profile's validators are the deployment-time gate: "the
+        // configuration deployment or update can only proceed when the configuration data
+        // is valid", so every one of them is run against the candidate configuration
+        // BEFORE anything is written — a verdict that the content is non-compliant refuses
+        // this call with no deployment record to roll back, and with the environment's
+        // deployment number untouched.
+        //
+        // A profile whose configuration lives in S3, Parameter Store or Secrets Manager
+        // has a version here but no bytes, so there is no document to check and a refusal
+        // reported for it would be a verdict no validator gave.
+        if let Some(content) = &prepared.candidate_content {
+            let candidate = crate::state::validators::Candidate {
+                application_id: &input.application_id,
+                configuration_profile_id: &input.configuration_profile_id,
+                configuration_version: &input.configuration_version,
+                location_uri: &prepared.configuration_location_uri,
+                content,
+            };
+            if let Some(rejection) = crate::state::validators::first_rejection(
+                ctx,
+                &prepared.validators,
+                &candidate,
+                &region,
+            )
+            .await
+            {
+                return Err(validation_failed(rejection));
+            }
+        }
 
         // The action point is consulted BEFORE the deployment is created: a target that
         // refuses the action refuses this call, and no deployment record exists to roll

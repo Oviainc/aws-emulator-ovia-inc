@@ -158,8 +158,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
-        // A statement the clock has already finished is no longer running, so
-        // the owed transitions are materialised before this call decides.
+        // A statement whose execution has already reported is no longer running,
+        // so those outcomes are materialised before this call decides.
         store.materialise_due_transitions();
         // ONE lookup decides the outcome and carries the status it observed.
         match store.cancel(&input.id) {

@@ -67,6 +67,8 @@ mod rds_database_recommendation_projected_metrics;
 mod rds_database_recommendations;
 #[path = "all/rds_database_recommendations_export.rs"]
 mod rds_database_recommendations_export;
+#[path = "all/rds_database_recommendations_export_file.rs"]
+mod rds_database_recommendations_export_file;
 #[path = "all/recommendation_export_admission.rs"]
 mod recommendation_export_admission;
 #[path = "all/recommendation_export_jobs.rs"]

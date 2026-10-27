@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConfigurationSetSendingEnabled
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConfigurationSetSendingEnabled`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConfigurationSetSendingEnabled::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +149,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConfigurationSetSendingEnabled` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConfigurationSetSendingEnabledErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConfigurationSetSendingEnabled"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let name = input.configuration_set_name;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and the only error this
+            // operation models is a client error, so it does not fit.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UpdateConfigurationSetSendingEnabled",
+            ));
+        };
+        let mut state = state.lock();
+
+        let Some(configuration_set) = state.configuration_sets.get_mut(&name) else {
+            // "Indicates that the configuration set does not exist", in the
+            // wording every operation of this service uses for a set that is not
+            // there.
+            return Err(
+                UpdateConfigurationSetSendingEnabledErrorModeled::ConfigurationSetDoesNotExistException(
+                    ConfigurationSetDoesNotExistException {
+                        configuration_set_name: Some(name.clone()),
+                        message: Some(format!("Configuration set <{name}> does not exist.")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "Enables or disables email sending for messages sent using a specific
+        // configuration set": the flag is written on the stored set, so a later
+        // send naming it is refused with `ConfigurationSetSendingPaused` while it
+        // is false, and `DescribeConfigurationSet` reports it as
+        // `ReputationOptions$SendingEnabled`. The fresh start a re-enable owes is
+        // part of that one write (`ConfigurationSet::set_sending_enabled`), and
+        // setting the state the set already holds is the same request.
+        configuration_set.set_sending_enabled(input.enabled, ::std::time::SystemTime::now());
+
+        // The modelled output has no members: what the call produced is the state
+        // it wrote, which `DescribeConfigurationSet` reports.
+        Ok(UpdateConfigurationSetSendingEnabledOutput)
     }
 }

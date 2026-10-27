@@ -4,10 +4,10 @@
 //! Submits one SQL statement to the database the request names and answers with the
 //! statement's `Id`. The statement runs on this emulator's in-process SQL engine (see
 //! [`crate::state`]); the Data API's own lifecycle is asynchronous, so the response
-//! reports `SUBMITTED` and the clock owes the terminal status
-//! [`crate::state::COMPLETION_SPAN`] later. A caller that supplies `WaitTimeSeconds`
-//! has asked to wait longer than that span, so for that caller the statement is
-//! already complete when the response is built.
+//! reports `SUBMITTED` and the statement reaches its terminal status when its
+//! execution finishes, whatever the caller does with this response. A caller that
+//! supplies `WaitTimeSeconds` waits for that execution here, up to the wait it
+//! asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -338,7 +338,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             db_user: connection.db_user,
             secret_arn: connection.secret_arn,
             statement_name: non_empty(input.statement_name.as_ref()),
-            parameters: input.parameters.unwrap_or_default(),
+            parameters: input.parameters.clone().unwrap_or_default(),
             with_event: input.with_event.unwrap_or(false),
             // "If no format is specified, the default is JSON."
             result_format: non_empty(input.result_format.as_ref())
@@ -346,103 +346,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             session_id,
             session_keep_alive_seconds: input.session_keep_alive_seconds,
             client_token,
-            wait_for_completion: input.wait_time_seconds.is_some(),
         };
 
-        // Resolve the engine under the state lock, then RELEASE it: the SQL runs
-        // on a blocking pool with only its own database's lock held, so a slow
-        // statement starves no async worker and serialises no other caller.
-        let (handle, pid) =
-            match state.lock().reserve_database(&submission.target, &submission.database) {
-                Ok(reserved) => reserved,
-                // A capacity limit of this emulator, not a malformed request, so
-                // it is answered with the modelled capacity error rather than a
-                // ValidationException that would tell the client its
-                // ClusterIdentifier or Database was wrong.
-                Err(NoDatabase::TooManyOpen(limit)) => {
-                    return Err(
-                        ExecuteStatementErrorModeled::ActiveStatementsExceededException(
-                            ActiveStatementsExceededException {
-                                message: Some(format!(
-                                    "this emulator holds at most {limit} databases at once; no \
-                                     further ClusterIdentifier/WorkgroupName and Database \
-                                     combination can be opened"
-                                )),
-                            },
-                        )
-                        .into(),
-                    )
-                }
-                Err(NoDatabase::EngineUnavailable(reason)) => {
-                    return Err(ExecuteStatementErrorModeled::InternalServerException(
-                        InternalServerException {
-                            message: format!(
-                                "the SQL engine could not open the database for this statement: \
-                                 {reason}"
-                            ),
-                        },
-                    )
-                    .into())
-                }
-            };
-
-        let sql = input.sql.clone();
-        let parameters = submission.parameters.clone();
-        // The engine bounds its own execution (a wall-clock deadline and a step
-        // budget, enforced by its progress handler), and THIS bounds how long the
-        // request waits for it: a statement queued behind another on the same
-        // database, or behind a saturated blocking pool, must not pin this
-        // request — or a blocking-pool thread — for longer than a caller could
-        // ever ask to wait. The modelled ceiling for `WaitTimeSeconds` is 30
-        // seconds, so the wait is that ceiling at most.
-        let budget = crate::state::wait_budget(input.wait_time_seconds);
-        let engine_timeout = crate::state::engine_timeout(budget);
-        // The bound belongs to THIS execution, and the handler keeps the handle
-        // that abandons it, so giving up on the wait abandons this statement and
-        // never another request's.
+        // The engine bounds its own execution: a wall-clock deadline and a step
+        // budget, enforced by its progress handler. The bound belongs to THIS
+        // execution, and the statement keeps the handle that abandons it, so
+        // `CancelStatement` stops this statement's work and never another's.
+        let engine_timeout = crate::state::engine_timeout();
         let bound = crate::state::ExecutionBound::new();
-        let interrupt = bound.interrupt();
-        let joined = tokio::time::timeout(
-            budget,
-            tokio::task::spawn_blocking(move || {
-                crate::state::run_on(&handle, &sql, &parameters, engine_timeout, &bound)
-            }),
-        )
-        .await;
-        let execution = match joined {
-            Ok(Ok(execution)) => execution,
-            // The wait expired. The engine is told to abandon the statement at
-            // its next progress callback, so a statement that was running cannot
-            // commit behind this error response, and the caller is told the
-            // service could not take on another running statement right now.
-            Err(_elapsed) => {
-                interrupt.now();
+
+        // Admitted, given a place in its database's queue and recorded as
+        // SUBMITTED under ONE state lock, which is then RELEASED: the `Id` this
+        // call answers with names a statement the service holds from here on —
+        // so a caller can poll it, cancel it or read its result whatever
+        // happens to this request — and the SQL runs on a blocking pool with
+        // only its own database's lock held, so a slow statement starves no
+        // async worker and serialises no other caller.
+        let (handle, mut slot, id) = {
+            let mut store = state.lock();
+            store.materialise_due_transitions();
+            // Every accepted submission runs independently of this request, so
+            // how many of them are in flight is what this service's
+            // active-statement limit bounds. Asked BEFORE anything is reserved
+            // for this one, and in the same lock that records it, so a refused
+            // submission reserves nothing and an admitted one cannot race past
+            // the limit.
+            if store.active_statements() >= crate::state::MAX_ACTIVE_STATEMENTS {
                 return Err(
                     ExecuteStatementErrorModeled::ActiveStatementsExceededException(
                         ActiveStatementsExceededException {
                             message: Some(format!(
-                                "the statement was abandoned after {} seconds; too many \
-                                 statements are already running on this database",
-                                budget.as_secs()
+                                "the number of active statements exceeds the limit of {}",
+                                crate::state::MAX_ACTIVE_STATEMENTS
                             )),
                         },
                     )
                     .into(),
-                )
+                );
             }
-            Ok(Err(_panicked)) => {
-                return Err(ExecuteStatementErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: "the SQL engine did not return a result for this statement"
-                            .to_string(),
-                    },
-                )
-                .into())
-            }
+            let (handle, pid, slot) =
+                match store.reserve_database(&submission.target, &submission.database) {
+                    Ok(reserved) => reserved,
+                    // A capacity limit of this emulator, not a malformed
+                    // request, so it is answered with the modelled capacity
+                    // error rather than a ValidationException that would tell
+                    // the client its ClusterIdentifier or Database was wrong.
+                    Err(NoDatabase::TooManyOpen(limit)) => {
+                        return Err(
+                            ExecuteStatementErrorModeled::ActiveStatementsExceededException(
+                                ActiveStatementsExceededException {
+                                    message: Some(format!(
+                                        "this emulator holds at most {limit} databases at once; \
+                                         no further ClusterIdentifier/WorkgroupName and Database \
+                                         combination can be opened"
+                                    )),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                    Err(NoDatabase::EngineUnavailable(reason)) => {
+                        return Err(ExecuteStatementErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: format!(
+                                    "the SQL engine could not open the database for this \
+                                     statement: {reason}"
+                                ),
+                            },
+                        )
+                        .into())
+                    }
+                };
+            let id = store.record_pending(submission, pid, bound.interrupt());
+            (handle, slot, id)
         };
 
+        let sql = input.sql.clone();
+        let parameters = input.parameters.clone().unwrap_or_default();
+
+        // The execution is the statement's, not the request's: it runs to a
+        // terminal status on its own, so two statements submitted at once are
+        // really concurrent and neither depends on the caller's patience. The
+        // statement's outcome is written back by the task that produced it, and
+        // dropping the queue slot at the end hands the database on.
+        let engine = ::std::sync::Arc::clone(&self.engine);
+        let recorded = id.clone();
+        let execution = tokio::spawn(async move {
+            slot.wait_for_turn().await;
+            let produced = tokio::task::spawn_blocking(move || {
+                vec![crate::state::run_on(
+                    &handle,
+                    &sql,
+                    &parameters,
+                    engine_timeout,
+                    &bound,
+                )]
+            })
+            .await
+            .unwrap_or_else(|_panicked| crate::state::unreported_executions(1));
+            if let Some(state) = crate::state::service_state(&*engine) {
+                state.lock().complete(&recorded, produced);
+            }
+            drop(slot);
+        });
+
+        // "The number of seconds to wait for the SQL statement to complete
+        // execution before returning the response": a caller that named one
+        // waits here, and gets whatever status the statement has reached by the
+        // time its own wait is up.
+        if let Some(budget) = crate::state::wait_budget(input.wait_time_seconds) {
+            let _ = tokio::time::timeout(budget, execution).await;
+        }
+
         let mut store = state.lock();
-        let id = store.record(submission, pid, vec![execution]);
+        store.materialise_due_transitions();
         let Some(statement) = store.statement(&id) else {
             return Err(unavailable());
         };

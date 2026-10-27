@@ -73,6 +73,8 @@ mod reserved_nodes;
 mod reset_cluster_parameter_group;
 #[path = "all/snapshot_access.rs"]
 mod snapshot_access;
+#[path = "all/snapshot_access_denied.rs"]
+mod snapshot_access_denied;
 #[path = "all/snapshot_access_revoke.rs"]
 mod snapshot_access_revoke;
 #[path = "all/snapshot_copy_configuration.rs"]

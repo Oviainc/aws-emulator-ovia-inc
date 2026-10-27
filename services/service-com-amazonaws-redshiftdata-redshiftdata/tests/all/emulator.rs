@@ -22,9 +22,18 @@ use service_com_amazonaws_redshiftdata_redshiftdata::EmulatedService;
 /// minted with.
 pub const ABSENT_ID: &str = "00000000-0000-0000-0000-000000000000";
 
-/// Comfortably longer than the span after which a submitted statement's terminal
-/// status falls due (`state::COMPLETION_SPAN`).
-pub const LONGER_THAN_COMPLETION_SPAN: Duration = Duration::from_millis(900);
+/// Comfortably longer than a trivial statement's execution takes, so a
+/// statement submitted without a wait has certainly reported its outcome by the
+/// time this has passed.
+pub const LONGER_THAN_A_QUICK_STATEMENT: Duration = Duration::from_millis(900);
+
+/// A statement whose execution takes long enough to be observed WHILE it runs,
+/// so the transient `SUBMITTED` state and the state-dependent behaviour that
+/// goes with it (`CancelStatement` stops it, `GetStatementResult` refuses) are
+/// observable without racing the engine. It counts rows in the engine rather
+/// than sleeping, so the engine's own step budget and deadline bound it.
+pub const SLOW_SQL: &str = "WITH RECURSIVE counter(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM \
+                            counter WHERE x < 3000000) SELECT count(*) FROM counter";
 
 /// The `WaitTimeSeconds` every test that waits for a statement asks for: inside
 /// the modelled 1..30 range and far longer than the engine's own deadline, so a
@@ -32,9 +41,10 @@ pub const LONGER_THAN_COMPLETION_SPAN: Duration = Duration::from_millis(900);
 /// running out of patience on a loaded machine.
 pub const WAIT_SECONDS: i32 = 10;
 
-/// A lower bound on that span, in seconds: the transition is owed a non-zero
-/// span after submission, so a caller acting immediately still sees `SUBMITTED`.
-pub const COMPLETION_SPAN_LOWER_BOUND_SECONDS: f64 = 0.2;
+/// A lower bound, in seconds, on how long a statement that produced a result
+/// ran for: its `UpdatedAt` is the instant its execution finished, so it is at
+/// or after the instant it was submitted.
+pub const RUN_TIME_LOWER_BOUND_SECONDS: f64 = 0.0;
 
 /// One emulator: a router with only this service mounted, over one shared engine.
 pub struct Emulator {

@@ -955,6 +955,7 @@ async fn a_token_that_names_no_signed_in_user_is_refused() {
                 username: username.to_string(),
                 sub: sub.to_string(),
                 kind: state::TokenKind::Access,
+                scopes: vec![state::USER_ADMIN_SCOPE.to_string()],
                 issued_at: now - Duration::from_secs(60),
                 expires_at,
                 revoked: false,
