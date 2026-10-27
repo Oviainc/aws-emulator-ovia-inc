@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketInventoryConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketInventoryConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketInventoryConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the S3 Inventory configuration the bucket carries under the
+//! inventory id the request names — the container `PutBucketInventoryConfiguration`
+//! recorded, every member of it and no member it did not carry. A bucket this emulator does
+//! not hold answers `NoSuchBucket` (404) and an id the bucket carries no configuration under
+//! answers `NoSuchConfiguration` (404); a read writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -110,14 +106,19 @@ use super::types::*;
 // `GetBucketInventoryConfigurationError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetBucketInventoryConfigurationError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetBucketInventoryConfiguration")]
+// The operation's MODELED errors, widened by `NoSuchBucket` the way
+// `GetBucketAnalyticsConfiguration` widens it: the model's error list for this operation is
+// empty (`smithy_query(query="operation",operation="GetBucketInventoryConfiguration")`
+// reports `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that
+// does not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`), which the SERVICE models.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetBucketInventoryConfiguration",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum GetBucketInventoryConfigurationErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -171,18 +172,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketInventoryConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketInventoryConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketInventoryConfiguration"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner … the request fails with the HTTP
+        // status code 403 Forbidden (access denied)", judged as every other bucket-scoped
+        // operation in this crate judges it: this emulator serves one account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no bucket store to read, so this
+            // answers 501 rather than a truthful-looking "no configuration".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetBucketInventoryConfiguration",
+            ));
+        };
+
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(
+                GetBucketInventoryConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        };
+        // A bucket carrying no configuration under that id has nothing to report, and
+        // `GetBucketInventoryConfigurationOutput` has no way to say so in a 200: S3 answers
+        // `NoSuchConfiguration` for it, the way `GetBucketAnalyticsConfiguration` answers it
+        // for an analytics id the bucket carries nothing under.
+        let Some(configuration) = bucket.inventory_configuration(&input.id) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_CONFIGURATION_CODE,
+                crate::state::NO_SUCH_CONFIGURATION_STATUS,
+                crate::state::NO_SUCH_CONFIGURATION_MESSAGE,
+            ));
+        };
+
+        Ok(GetBucketInventoryConfigurationOutput {
+            inventory_configuration: Some(configuration.clone()),
+        })
     }
 }
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;
