@@ -23,6 +23,10 @@
 //! YAML (refused at the line and column the reader stopped at), and one declaring no
 //! resource at all — there is nothing to estimate the cost of.
 //!
+//! A `TemplateURL` says WHERE that body is rather than what it means, so the object it
+//! addresses is read from this emulator's own Amazon S3 and the estimate is computed from
+//! it exactly as from an inline body ([`crate::state::template_url`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -232,19 +236,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = &self.engine;
         // "Conditional: You must pass TemplateBody or TemplateURL. If both are passed,
         // only TemplateBody is used" (`EstimateTemplateCostInput$TemplateBody`).
+        //
+        // A `TemplateURL` says WHERE the body is, not what it means: the object it
+        // addresses is read from this emulator's own Amazon S3 and the estimate below is
+        // computed from it exactly as from an inline body (`crate::state::template_url`).
+        let fetched: Option<String> = match (&input.template_body, &input.template_url) {
+            (None, Some(url)) => Some(
+                crate::state::template_url::fetch(
+                    ctx,
+                    &crate::state::request_region(ctx.parts()),
+                    url,
+                )
+                .await
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?,
+            ),
+            _ => None,
+        };
         // Borrowed, never copied: the body may be 51,200 bytes and nothing below needs to
         // own it.
-        let template_body: &str = match (&input.template_body, &input.template_url) {
+        let template_body: &str = match (&input.template_body, &fetched) {
             (Some(body), _) => body.as_str(),
-            // A `TemplateURL` names a template in an Amazon S3 bucket or a Systems Manager
-            // document, which would have to be fetched over the network — this emulator
-            // makes no outbound connections. Answered 501 rather than with an estimate of a
-            // template nobody read, exactly as the other operations that take a body do.
-            (None, Some(_)) => {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "EstimateTemplateCost with TemplateURL (fetching a template from Amazon S3)",
-                ))
-            }
+            (None, Some(body)) => body.as_str(),
             (None, None) => {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
                     "Either TemplateBody or TemplateURL must be specified",

@@ -49,7 +49,11 @@
 //! resource updates to govern it has nothing to override, so it is accepted and not
 //! stored. `DisableValidation` turns off pre-deployment validation this emulator does not
 //! perform either way. `StackPolicyURL` and `StackPolicyDuringUpdateURL` name a policy in
-//! Amazon S3 and are answered 501, like `TemplateURL`.
+//! Amazon S3 and are answered 501.
+//!
+//! A `TemplateURL` says WHERE the revised template is rather than what it means, so the
+//! object it addresses is read from this emulator's own Amazon S3 and the update is applied
+//! from it exactly as from an inline body ([`crate::state::template_url`]).
 //!
 //! ## Shape of an operation
 //!
@@ -327,7 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "Conditional: You must specify only one of the following parameters:
@@ -346,13 +350,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  UsePreviousTemplate",
             ));
         }
-        // A `TemplateURL` would have to be fetched from Amazon S3; this emulator makes no
-        // outbound connections, so the request is answered 501 rather than with an update
-        // applied from a template nobody read.
-        if input.template_url.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "UpdateStack with TemplateURL (fetching a template from Amazon S3)",
-            ));
+        // A `TemplateURL` says WHERE the revised template is, not what it means: the object
+        // it addresses is read from this emulator's own Amazon S3 and becomes the body this
+        // update deploys, so a template submitted by reference and the same one submitted
+        // inline apply the same update (`crate::state::template_url`).
+        if let Some(url) = input.template_url.take() {
+            let body = crate::state::template_url::fetch(
+                ctx,
+                &crate::state::request_region(ctx.parts()),
+                &url,
+            )
+            .await
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            input.template_body = Some(body);
         }
         // The same holds for a stack policy named by URL: fetching it would need an
         // outbound connection this emulator does not make.

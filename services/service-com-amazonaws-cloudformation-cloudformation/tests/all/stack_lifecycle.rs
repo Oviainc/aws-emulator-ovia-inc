@@ -1899,9 +1899,8 @@ async fn a_stack_policy_round_trips_and_a_policy_url_is_answered_501() {
         );
     }
 
-    // A policy named by URL would have to be fetched from Amazon S3, which this emulator
-    // does not do: 501, the same honest answer TemplateURL gets — never a 200 that
-    // discards the policy.
+    // A policy named by URL would have to be fetched from Amazon S3, which this slice does
+    // not do: 501, the honest answer — never a 200 that discards the policy.
     struct UrlCase {
         case: &'static str,
         action: &'static str,

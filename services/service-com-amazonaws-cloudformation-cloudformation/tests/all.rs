@@ -187,6 +187,8 @@ mod stack_status_accepts_an_update;
 mod stack_tag_propagation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/template_by_reference.rs"]
+mod template_by_reference;
 #[path = "all/template_outputs.rs"]
 mod template_outputs;
 #[path = "all/template_quotas.rs"]
