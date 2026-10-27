@@ -33,7 +33,7 @@ use crate::stack_lifecycle::{
     router, wait_for_the_transition, xml_text,
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::{
-    failed_action, resource_failure_summary, resource_status, status,
+    failed_action, resource_failure_summary, resource_status, rollback_requested, status,
 };
 
 /// `OnFailure=DO_NOTHING` keeps the failed state and whatever the create had already made,
@@ -294,8 +294,76 @@ async fn a_failed_update_reports_the_summary_sentence_alone() {
     );
 }
 
+/// A failed create the stack ROLLED BACK reports the same summary sentence, and the ROLLBACK
+/// EVENT is where the clause saying the rollback was asked for goes — the place that
+/// sentence's own separating space leaves. The stack-level field still carries the failed
+/// logical ids and nothing else, and the resource's own diagnosis still stays on its event.
+///
+/// `OnFailure` decides which of the two a caller sees — `DO_NOTHING` keeps the failed state
+/// (the rows above), the documented default rolls the create back — so the rows here are the
+/// same failures as above, read after the rollback.
+#[tokio::test]
+async fn a_rolled_back_create_reports_the_rollback_clause_on_its_event() {
+    for row in refused_rows() {
+        let router = router();
+        given(&router, row.case, &row.given).await;
+
+        // No `OnFailure` at all: "ROLLBACK — Roll back the stack creation. This is the
+        // default."
+        let (code, body) =
+            create_stack(&router, row.stack, &row.template, &acknowledging_iam(&[])).await;
+        assert_eq!(
+            code, 200,
+            "case {:?}: CreateStack must be accepted — the stack reports the outcome — got \
+             {code} {body}",
+            row.case
+        );
+        // The failure, and then the rollback it owes, each one transition away.
+        wait_for_the_transition().await;
+        wait_for_the_transition().await;
+
+        let (_, described) = describe_stack(&router, row.stack).await;
+        assert_eq!(
+            xml_text(&described, "StackStatus").as_deref(),
+            Some(status::ROLLBACK_COMPLETE),
+            "case {:?}: expected the create to be rolled back, got {described}",
+            row.case
+        );
+        let summary = resource_failure_summary(failed_action::CREATE, [row.logical_id]);
+        let reason = xml_text(&described, "StackStatusReason").unwrap_or_default();
+        assert_eq!(
+            reason, summary,
+            "case {:?}: expected the rolled-back stack's reason to be the summary {summary:?}, \
+             got {reason:?}",
+            row.case
+        );
+        assert!(
+            !reason.contains(row.diagnosis),
+            "case {:?}: the stack reason must not carry the resource's diagnosis {:?}, got \
+             {reason:?}",
+            row.case,
+            row.diagnosis
+        );
+        // The rollback's own event is where the clause goes.
+        let events = call(
+            &router,
+            "DescribeStackEvents",
+            &[member("StackName", row.stack)],
+        )
+        .await
+        .1;
+        let expected_event_reason = rollback_requested(&summary);
+        assert!(
+            events.contains(&expected_event_reason),
+            "case {:?}: expected an event carrying {expected_event_reason:?}, got {events}",
+            row.case
+        );
+    }
+}
+
 /// The sentence itself: the fixed text around the comma-separated logical ids, for every
-/// action a stack operation can fail at and for one, two and three failed resources.
+/// action a stack operation can fail at and for one, two and three failed resources — and
+/// the rolled-back form of each, which is that sentence plus the one clause.
 #[test]
 fn the_summary_is_the_fixed_text_around_the_failed_logical_ids() {
     // (the action, the ids that failed, the whole sentence)
@@ -336,6 +404,16 @@ fn the_summary_is_the_fixed_text_around_the_failed_logical_ids() {
         assert_eq!(
             rendered, expected,
             "case ({action:?}, {ids:?}): expected {expected:?}, got {rendered:?}"
+        );
+        // The rolled-back wording is that same sentence with the clause in the place its
+        // separating space leaves — never a second period and never a lost space. It is
+        // what the ROLLBACK's own event carries.
+        let unwound = rollback_requested(&rendered);
+        assert_eq!(
+            unwound,
+            format!("{expected}Rollback requested by user."),
+            "case ({action:?}, {ids:?}): expected the rolled-back wording to add the one \
+             clause, got {unwound:?}"
         );
     }
 }

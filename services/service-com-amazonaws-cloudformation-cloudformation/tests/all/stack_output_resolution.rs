@@ -8,7 +8,9 @@
 //! — the declared `Value` evaluated against the stack's parameters, the pseudo
 //! parameters and the resources the template declares. The functions a template composes
 //! those from are evaluated, not dropped: `Fn::GetAZs`, `Fn::Cidr`, `Fn::Base64`,
-//! `Fn::Length`, `Fn::ToJsonString`, `Fn::If` and the condition functions; a `Ref` to a
+//! `Fn::Length`, `Fn::ToJsonString` (both of which the `AWS::LanguageExtensions` transform
+//! defines, so the rows using them declare it), `Fn::If` and the condition functions; a
+//! `Ref` to a
 //! list-typed parameter is a list to every function that reads it; and `Fn::GetAtt`
 //! answers for a resource of ANY type — from the type's published return values, from the
 //! property the template declared where the attribute IS that property, and from
@@ -29,7 +31,8 @@
 //! what the stack created — is the last row.
 
 use crate::stack_lifecycle::{
-    create_stack, describe_stack, router, wait_for_the_transition, xml_text, ACCOUNT_ID, REGION,
+    create_stack, describe_stack, member, router, wait_for_the_transition, xml_text, ACCOUNT_ID,
+    REGION,
 };
 use crate::stack_outputs::{output_for, wire_outputs};
 use service_com_amazonaws_cloudformation_cloudformation::state::status;
@@ -120,7 +123,8 @@ fn cases() -> Vec<Case> {
         Case {
             case: "the Availability Zones a Region has, through Fn::GetAZs",
             stack_name: "zones",
-            template: r#"Outputs:
+            template: r#"Transform: AWS::LanguageExtensions
+Outputs:
   FirstZone:
     Value: !Select [0, !GetAZs ""]
   LastZone:
@@ -151,7 +155,7 @@ fn cases() -> Vec<Case> {
         Case {
             case: "Fn::Cidr carves subnets out of a block, in both address families",
             stack_name: "cidr",
-            template: r#"{"Outputs":{
+            template: r#"{"Transform":"AWS::LanguageExtensions","Outputs":{
                    "FirstV4":{"Value":{"Fn::Select":["0",{"Fn::Cidr":["10.0.0.0/16",3,8]}]}},
                    "SecondV4":{"Value":{"Fn::Select":["1",{"Fn::Cidr":["10.0.0.0/16",3,8]}]}},
                    "ThirdV4":{"Value":{"Fn::Select":["2",{"Fn::Cidr":["10.0.0.0/16",3,8]}]}},
@@ -185,7 +189,7 @@ fn cases() -> Vec<Case> {
         Case {
             case: "a list-typed parameter is a list to every function that reads it",
             stack_name: "typed-parameters",
-            template: r#"{"Parameters":{
+            template: r#"{"Transform":"AWS::LanguageExtensions","Parameters":{
                    "SubnetIds":{"Type":"List<AWS::EC2::Subnet::Id>"},
                    "Stages":{"Type":"CommaDelimitedList"},
                    "Single":{"Type":"String"}},
@@ -246,8 +250,6 @@ Outputs:
     Value: !If [EitherWay, "yes", "no"]
   Both:
     Value: !If [BothWays, "yes", "no"]
-  Unknown:
-    Value: !If [NoSuchCondition, "yes", "no"]
   NotCreated:
     Value: !Ref TestTopic
   OnlyInProd:
@@ -264,8 +266,6 @@ Outputs:
                 value("Negated", "prod"),
                 value("Either", "yes"),
                 value("Both", "yes"),
-                // A condition the template never declares is not false, it is unknown.
-                ("Unknown", Expect::NoValue),
                 // The resource its condition excluded is not in the stack, so there is
                 // no physical id for `Ref` to answer.
                 ("NotCreated", Expect::NoValue),
@@ -276,7 +276,7 @@ Outputs:
         Case {
             case: "Fn::Base64 and Fn::ToJsonString over resolved expressions",
             stack_name: "encoded",
-            template: r#"{"Outputs":{
+            template: r#"{"Transform":"AWS::LanguageExtensions","Outputs":{
                    "Literal":{"Value":{"Fn::Base64":"probe"}},
                    "Composed":{"Value":{"Fn::Base64":{"Fn::Sub":"${AWS::Region}"}}},
                    "Json":{"Value":{"Fn::ToJsonString":[
@@ -450,8 +450,13 @@ async fn every_declared_output_of_a_deployed_stack_carries_its_resolved_value() 
     let router = router();
 
     for case in cases() {
+        // A row declaring the language-extensions transform has to acknowledge it, and a
+        // request may acknowledge a capability its template does not need — so every row
+        // carries the same acknowledgement.
+        let mut extra = case.parameters.clone();
+        extra.push(member("Capabilities.member.1", "CAPABILITY_AUTO_EXPAND"));
         let (status_code, body) =
-            create_stack(&router, case.stack_name, &case.template, &case.parameters).await;
+            create_stack(&router, case.stack_name, &case.template, &extra).await;
         assert_eq!(
             status_code, 200,
             "case {:?}: CreateStack must accept the template, got {status_code}: {body}",

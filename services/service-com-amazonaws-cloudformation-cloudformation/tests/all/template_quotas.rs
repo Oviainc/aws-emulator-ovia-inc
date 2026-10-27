@@ -5,9 +5,9 @@
 //! The rule under test: a template body declaring more entries in a section than that
 //! section's documented per-template quota allows is not a template CloudFormation
 //! accepts, so every operation that SUBMITS a body refuses the request with a
-//! `ValidationError` naming the section, the count the body declares and the maximum it is
-//! past — rather than accepting it and deploying a stack holding none of what it declared.
-//! A body AT a quota is accepted and deployed in full.
+//! `ValidationError` naming what one entry of that section IS, the count the body declares
+//! and the maximum it is past — rather than accepting it and deploying a stack holding none
+//! of what it declared. A body AT a quota is accepted and deployed in full.
 //!
 //! The table spans the class the rule generalises over: each of the three sections the
 //! template reader meters (`Parameters`, `Resources`, `Outputs`), each at its published
@@ -23,8 +23,11 @@ use service_com_amazonaws_cloudformation_cloudformation::state::template::{
 
 /// One section of a template, its documented quota, and a declaration to repeat in it.
 struct Section {
-    /// The section as the template spells it, which is how the refusal names it.
+    /// The section as the template spells it.
     name: &'static str,
+    /// What ONE entry of the section IS, which is how the refusal counts them: a parameter,
+    /// a resource, an output.
+    entry_name: &'static str,
     quota: usize,
     /// One entry of this section, given its index.
     entry: fn(usize) -> (String, serde_json::Value),
@@ -35,6 +38,7 @@ fn sections() -> Vec<Section> {
     vec![
         Section {
             name: "Parameters",
+            entry_name: "Parameter",
             quota: MAX_PARAMETERS_PER_TEMPLATE,
             // A parameter carrying a default needs no value from the request, so a body at
             // the quota is submittable as it stands.
@@ -47,6 +51,7 @@ fn sections() -> Vec<Section> {
         },
         Section {
             name: "Resources",
+            entry_name: "Resource",
             quota: MAX_RESOURCES_PER_TEMPLATE,
             entry: |index| {
                 (
@@ -57,6 +62,7 @@ fn sections() -> Vec<Section> {
         },
         Section {
             name: "Outputs",
+            entry_name: "Output",
             quota: MAX_OUTPUTS_PER_TEMPLATE,
             entry: |index| {
                 (
@@ -79,7 +85,7 @@ fn template_with(section: &Section, count: usize) -> String {
 fn expected_message(section: &Section, declared: usize) -> String {
     format!(
         "Template format error: {} count {declared} is greater than max allowed {}",
-        section.name, section.quota
+        section.entry_name, section.quota
     )
 }
 
