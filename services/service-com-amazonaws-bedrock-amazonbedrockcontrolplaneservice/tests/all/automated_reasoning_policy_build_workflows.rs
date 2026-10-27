@@ -38,6 +38,13 @@
 //!    down, or already terminal, is accepted and keeps the status and the instants it had
 //!    — while a pair naming no stored workflow is refused with `ResourceNotFoundException`
 //!    carrying the service's wording for a missing build workflow.
+//! 8. **A listing of a policy's build workflows reports what a read of each one reports**,
+//!    in creation order, in pages that partition the workflows: over policies holding 0,
+//!    1, 3 and 7 workflows, walked with every page size, the pages concatenate to the
+//!    whole history with neither a gap nor a repeat; a listing is scoped to its own
+//!    policy; an ARN naming no policy of this account is refused rather than answered
+//!    empty; and a `nextToken` the listing never issued is refused
+//!    `ValidationException`.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation",operation="StartAutomatedReasoningPolicyBuildWorkflow,GetAutomatedReasoningPolicyBuildWorkflow")`
@@ -45,11 +52,12 @@
 //! suite in this crate drives the emulator with.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
-use crate::support::{emulator, label, Emulator, Reply, ACCOUNT, REGION};
+use crate::support::{date_time_seconds, emulator, label, Emulator, Reply, ACCOUNT, REGION};
 
 /// Every `AutomatedReasoningPolicyBuildWorkflowType` the model admits
 /// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyBuildWorkflowType")`).
@@ -1116,4 +1124,529 @@ async fn a_cancel_of_a_pair_naming_no_stored_workflow_is_not_found() {
         "case the started pair: the cancel must answer {CANCEL_ACCEPTED}, got {} {:?}",
         accepted.status, accepted.body
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// 8. The listing of a policy's build workflows.
+// ---------------------------------------------------------------------------------------
+
+/// The page size a listing request that names no `maxResults` takes: the member's own
+/// modelled `default`
+/// (`smithy_query(query="operation",operation="ListAutomatedReasoningPolicyBuildWorkflows")`).
+const DEFAULT_PAGE_SIZE: usize = 25;
+
+/// The output member the listing carries its page under.
+const SUMMARIES: &str = "automatedReasoningPolicyBuildWorkflowSummaries";
+
+/// `ListAutomatedReasoningPolicyBuildWorkflows`: the policy ARN is a path label, and both
+/// page parameters are `@httpQuery` members.
+async fn list_workflows(emu: &Emulator, policy_arn: &str, query: &str) -> Reply {
+    let base = format!(
+        "/automated-reasoning-policies/{}/build-workflows",
+        label(policy_arn)
+    );
+    let path = if query.is_empty() {
+        base
+    } else {
+        format!("{base}?{query}")
+    };
+    emu.call("GET", &path, None).await
+}
+
+/// The page a listing answered with. The member is modelled `@required` with
+/// `@length(min: 0)`, so a policy nothing has built reports `[]` rather than omitting it.
+fn summaries(case: &str, reply: &Reply) -> Vec<Value> {
+    let page = reply.get(SUMMARIES);
+    page.as_array()
+        .unwrap_or_else(|| {
+            panic!("case {case}: {SUMMARIES} is a required list, got {:?}", reply.body)
+        })
+        .clone()
+}
+
+/// One string member of one summary.
+fn member(case: &str, summary: &Value, name: &str) -> String {
+    summary
+        .get(name)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case}: the summary has no string member {name}: {summary:?}"))
+        .to_string()
+}
+
+/// Walk every page of one policy's listing and hand back the `buildWorkflowId`s in the
+/// order the pages reported them, checking each page's own invariants on the way: a page
+/// carries at most `maxResults` summaries, and a `nextToken` is issued only when the page
+/// was truncated — so a caller that follows the tokens sees each workflow exactly once.
+async fn walk_pages(
+    emu: &Emulator,
+    case: &str,
+    policy_arn: &str,
+    max_results: Option<usize>,
+) -> Vec<String> {
+    let bound = max_results.unwrap_or(DEFAULT_PAGE_SIZE);
+    let mut ids: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    // More than enough pages for any row below; a listing that keeps issuing tokens is a
+    // listing that does not terminate, which this turns into a failure rather than a hang.
+    for _ in 0..64 {
+        let mut query: Vec<String> = Vec::new();
+        if let Some(max) = max_results {
+            query.push(format!("maxResults={max}"));
+        }
+        if let Some(token) = token.as_deref() {
+            query.push(format!("nextToken={}", label(token)));
+        }
+        let reply = list_workflows(emu, policy_arn, &query.join("&")).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case}: the listing must answer 200, got {} {:?}",
+            reply.status, reply.body
+        );
+        let page = summaries(case, &reply);
+        assert!(
+            page.len() <= bound,
+            "case {case}: a page carries at most {bound} summaries, got {}",
+            page.len()
+        );
+        for summary in &page {
+            assert_eq!(
+                member(case, summary, "policyArn"),
+                policy_arn,
+                "case {case}: every summary names the policy the listing addressed, got {summary:?}"
+            );
+            ids.push(member(case, summary, "buildWorkflowId"));
+        }
+        match reply.get("nextToken") {
+            Value::Null => return ids,
+            value => {
+                let next = value
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case}: nextToken is a string, got {value:?}"))
+                    .to_string();
+                assert_eq!(
+                    page.len(),
+                    bound,
+                    "case {case}: a nextToken is issued only for a truncated page, got a page \
+                     of {} with the token {next:?}",
+                    page.len()
+                );
+                token = Some(next);
+            }
+        }
+    }
+    panic!("case {case}: the listing kept issuing pagination tokens past 64 pages");
+}
+
+/// Store the build workflow an admitted `StartAutomatedReasoningPolicyBuildWorkflow` would
+/// have written `created_ago` ago, and hand back its `buildWorkflowId`.
+///
+/// The record is built out of the state helpers the start itself uses
+/// ([`bedrock::state::mint_build_workflow_id`] and the status constants), so a seeded
+/// workflow is the workflow a start would have left — and seeding is what lets a row fix
+/// the instant a workflow was started, and so the order a listing must walk, without
+/// sleeping between starts. `tweak` is where a row differs from that baseline.
+fn seed_workflow(
+    emu: &Emulator,
+    policy_arn: &str,
+    workflow_type: &str,
+    created_ago: Duration,
+    tweak: impl FnOnce(&mut bedrock::state::AutomatedReasoningPolicyBuildWorkflowRecord),
+) -> String {
+    let state = bedrock::state::service_state(&*emu.engine)
+        .expect("the shared engine carries this service's store");
+    let now = SystemTime::now();
+    let created_at = now - created_ago;
+    let mut store = state.lock();
+    let id = store.mint_build_workflow_id(now);
+    let mut record = bedrock::state::AutomatedReasoningPolicyBuildWorkflowRecord {
+        policy_arn: policy_arn.to_string(),
+        id: id.clone(),
+        workflow_type: workflow_type.to_string(),
+        status: bedrock::state::BUILD_WORKFLOW_STATUS_SCHEDULED,
+        completed_due_at: Some(created_at + bedrock::state::BUILD_WORKFLOW_COMPLETE_AFTER),
+        cancelled_due_at: None,
+        document_name: None,
+        document_content_type: None,
+        document_description: None,
+        created_at,
+        updated_at: created_at,
+    };
+    tweak(&mut record);
+    store
+        .automated_reasoning_policy_build_workflows
+        .insert((policy_arn.to_string(), id.clone()), record);
+    id
+}
+
+/// Seed `count` workflows of one policy, oldest first, and hand back their ids in the
+/// order they were started — which is the order the listing must report them in.
+///
+/// The rows are spread a second apart so each one's start instant is distinct, and the
+/// workflow type cycles through the enum so nothing about the order can be keyed to one
+/// type.
+fn seed_history(emu: &Emulator, policy_arn: &str, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| {
+            seed_workflow(
+                emu,
+                policy_arn,
+                WORKFLOW_TYPES[index % WORKFLOW_TYPES.len()],
+                // The oldest row is the one seeded first, so the ids come back in start
+                // order.
+                Duration::from_secs((count - index) as u64),
+                |_| {},
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_listed_build_workflow_agrees_with_a_read_of_it() {
+    // Rows differ along the workflow type and the form the source content takes, so the
+    // summary is not keyed to one of either.
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "a document ingestion",
+            WORKFLOW_TYPES[0],
+            documents_source("listed.txt", "txt", Some("the listed build")),
+        ),
+        ("a policy repair", WORKFLOW_TYPES[1], repair_source()),
+        (
+            "a fidelity report",
+            WORKFLOW_TYPES[3],
+            fidelity_report_source(&[("listed.pdf", "pdf")]),
+        ),
+        (
+            "an iterative refinement",
+            WORKFLOW_TYPES[6],
+            iterative_refinement_source(&[("listed.pdf", "pdf")], "again"),
+        ),
+    ];
+
+    let emu = emulator();
+    for (index, (case, workflow_type, source)) in rows.iter().enumerate() {
+        let policy_arn = policy(&emu, &format!("listed policy {index}")).await;
+        let started = start(&emu, &policy_arn, workflow_type, source.clone()).await;
+        assert_eq!(
+            started.status, 200,
+            "case {case:?}: the start must answer 200, got {} {:?}",
+            started.status, started.body
+        );
+        let id = started.text("buildWorkflowId");
+        // Past the completion the clock owes the workflow, so the read and the listing
+        // below both report the terminal status rather than racing the transition.
+        tokio::time::sleep(PAST_THE_BUILD).await;
+
+        let read = get_workflow(&emu, &policy_arn, &id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: the read must answer 200, got {} {:?}",
+            read.status, read.body
+        );
+
+        let listed = list_workflows(&emu, &policy_arn, "").await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case:?}: the listing must answer 200, got {} {:?}",
+            listed.status, listed.body
+        );
+        let page = summaries(case, &listed);
+        assert_eq!(
+            page.len(),
+            1,
+            "case {case:?}: a policy one start has built reports one summary, got {page:?}"
+        );
+        let summary = &page[0];
+        assert_workflow_id_shape(case, &member(case, summary, "buildWorkflowId"));
+        // Every member the summary models is the member the read reports for the same
+        // workflow: one record, reported one way.
+        for name in [
+            "policyArn",
+            "buildWorkflowId",
+            "status",
+            "buildWorkflowType",
+        ] {
+            assert_eq!(
+                member(case, summary, name),
+                read.text(name),
+                "case {case:?}: the summary's {name} must be what the read reports, got {summary:?}"
+            );
+        }
+        for name in ["createdAt", "updatedAt"] {
+            // `AutomatedReasoningPolicyBuildWorkflowSummary`'s two `Timestamp` members
+            // target a shape carrying `@timestampFormat("date-time")`, so the wire form is
+            // an RFC 3339 STRING and never the epoch number the protocol default writes.
+            let value = summary.get(name).cloned().unwrap_or(Value::Null);
+            assert!(
+                value.is_string(),
+                "case {case:?}: {name} is a @timestampFormat(\"date-time\") member, so it \
+                 goes onto the wire as a string, got {value}"
+            );
+            let summarised = date_time_seconds(case, &member(case, summary, name));
+            let got = read.instant(name);
+            assert!(
+                (summarised - got).abs() < f64::EPSILON,
+                "case {case:?}: the summary's {name} must be what the read reports ({got}), \
+                 got {summarised}"
+            );
+        }
+        assert_eq!(
+            member(case, summary, "buildWorkflowType"),
+            *workflow_type,
+            "case {case:?}: the summary reports the type the start named, got {summary:?}"
+        );
+        assert_eq!(
+            member(case, summary, "status"),
+            COMPLETED,
+            "case {case:?}: a workflow past its span is terminal, got {summary:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_pages_of_a_listing_partition_a_policys_build_workflows() {
+    // Rows span a policy nothing has built, one with a single workflow, and ones holding
+    // several; the page sizes span one row per page, a part page, the modelled default and
+    // the whole modelled span (`maxResults` is `range 1..1000`).
+    let counts = [0usize, 1, 3, 7];
+    let page_sizes = [None, Some(1), Some(2), Some(5), Some(1000)];
+
+    let emu = emulator();
+    for count in counts {
+        let policy_arn = policy(&emu, &format!("history policy of {count}")).await;
+        let started = seed_history(&emu, &policy_arn, count);
+        for page_size in page_sizes {
+            let case = format!("{count} workflows read {page_size:?} at a time");
+            let walked = walk_pages(&emu, &case, &policy_arn, page_size).await;
+            assert_eq!(
+                walked, started,
+                "case {case:?}: the pages must concatenate to the history in start order, \
+                 expected {started:?}, got {walked:?}"
+            );
+            let unique: BTreeSet<&String> = walked.iter().collect();
+            assert_eq!(
+                unique.len(),
+                walked.len(),
+                "case {case:?}: no workflow is reported twice, got {walked:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_listing_is_scoped_to_the_policy_it_addresses() {
+    let emu = emulator();
+    let first_arn = policy(&emu, "scoped policy").await;
+    let second_arn = policy(&emu, "other scoped policy").await;
+    let empty_arn = policy(&emu, "unbuilt scoped policy").await;
+    let first = seed_history(&emu, &first_arn, 3);
+    let second = seed_history(&emu, &second_arn, 2);
+
+    for (case, policy_arn, expected) in [
+        ("the first policy", &first_arn, first.clone()),
+        ("the second policy", &second_arn, second.clone()),
+        ("a policy nothing has built", &empty_arn, Vec::new()),
+    ] {
+        let walked = walk_pages(&emu, case, policy_arn, None).await;
+        assert_eq!(
+            walked, expected,
+            "case {case:?}: a listing reports its own policy's workflows and no other's, \
+             expected {expected:?}, got {walked:?}"
+        );
+    }
+
+    // An ARN naming no policy of this account is refused rather than answered with an
+    // empty listing: a listing of nothing and a listing of a policy that does not exist
+    // are different answers.
+    let unminted =
+        format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:automated-reasoning-policy/00000000000z");
+    let elsewhere = first_arn.replace(REGION, "eu-west-1");
+    let versioned = format!("{first_arn}:1");
+    for (case, policy_arn) in [
+        ("a policy nothing minted", unminted.as_str()),
+        ("the policy of another region", elsewhere.as_str()),
+        ("a version nothing minted", versioned.as_str()),
+    ] {
+        let refused = list_workflows(&emu, policy_arn, "").await;
+        assert_eq!(
+            refused.status, 404,
+            "case {case:?}: {policy_arn:?} names no policy of this account, so the listing \
+             must answer 404, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            refused.error
+        );
+        assert_eq!(
+            refused.text("message"),
+            format!("no automated reasoning policy {policy_arn} exists in this account"),
+            "case {case:?}: expected the wording this service answers for a policy it holds \
+             none of, got {:?}",
+            refused.get("message")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_pagination_token_this_listing_never_issued_is_refused() {
+    let emu = emulator();
+    let policy_arn = policy(&emu, "token paged policy").await;
+    let started = seed_history(&emu, &policy_arn, 3);
+
+    // Rows span the ways a token can fail to be one this listing issues: a word, a bare
+    // number, an instant half of the wrong width, a non-digit in that half, and a cursor
+    // naming no workflow at all. Every row satisfies `PaginationToken`
+    // (`@length(1, 2048)`, `^\S*$`), so each is refused by the listing rather than by the
+    // constraint walk.
+    for case in [
+        "nextpage",
+        "17",
+        "12345:00000000-0000-4000-8000-000000000000",
+        "0000000000000000000x:00000000-0000-4000-8000-000000000000",
+        "00000000000000000000:",
+    ] {
+        let refused = list_workflows(&emu, &policy_arn, &format!("nextToken={}", label(case))).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: a token this listing never issued must be refused 400, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: expected ValidationException, got {:?}",
+            refused.error
+        );
+    }
+
+    // The token the listing DOES issue resumes it at the row the page stopped before.
+    let first = list_workflows(&emu, &policy_arn, "maxResults=1").await;
+    assert_eq!(
+        first.status, 200,
+        "case the issued token: the first page must answer 200, got {} {:?}",
+        first.status, first.body
+    );
+    let token = first.text("nextToken");
+    let resumed = list_workflows(
+        &emu,
+        &policy_arn,
+        &format!("maxResults=1&nextToken={}", label(&token)),
+    )
+    .await;
+    assert_eq!(
+        resumed.status, 200,
+        "case the issued token: the resumed page must answer 200, got {} {:?}",
+        resumed.status, resumed.body
+    );
+    let page = summaries("the issued token", &resumed);
+    assert_eq!(
+        page.len(),
+        1,
+        "case the issued token: a page of one carries one summary, got {page:?}"
+    );
+    assert_eq!(
+        member("the issued token", &page[0], "buildWorkflowId"),
+        started[1],
+        "case the issued token: the resumed page starts on the second workflow, got {page:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_listing_reports_the_status_the_clock_owes_and_changes_nothing() {
+    // Rows span every state a stored workflow can be in when a listing reads it: the two
+    // the clock has already made due, and the two it has not.
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        &str,
+        &str,
+        Box<dyn FnOnce(&mut bedrock::state::AutomatedReasoningPolicyBuildWorkflowRecord)>,
+    )> = vec![
+        (
+            "a completion the clock has made due",
+            COMPLETED,
+            Box::new(|_| {}),
+        ),
+        (
+            "a build the clock has not finished",
+            SCHEDULED,
+            Box::new(|record| {
+                record.completed_due_at = Some(SystemTime::now() + Duration::from_secs(60));
+            }),
+        ),
+        (
+            "a cancellation the clock has made due",
+            CANCELLED,
+            Box::new(|record| {
+                record.status = bedrock::state::BUILD_WORKFLOW_STATUS_CANCEL_REQUESTED;
+                record.completed_due_at = None;
+                record.cancelled_due_at = Some(record.created_at);
+            }),
+        ),
+        (
+            "a cancellation still winding down",
+            CANCEL_REQUESTED,
+            Box::new(|record| {
+                record.status = bedrock::state::BUILD_WORKFLOW_STATUS_CANCEL_REQUESTED;
+                record.completed_due_at = None;
+                record.cancelled_due_at = Some(SystemTime::now() + Duration::from_secs(60));
+            }),
+        ),
+    ];
+
+    let emu = emulator();
+    for (index, (case, expected, tweak)) in rows.into_iter().enumerate() {
+        let policy_arn = policy(&emu, &format!("settled policy {index}")).await;
+        let id = seed_workflow(
+            &emu,
+            &policy_arn,
+            WORKFLOW_TYPES[index % WORKFLOW_TYPES.len()],
+            Duration::from_secs(5),
+            tweak,
+        );
+
+        let listed = list_workflows(&emu, &policy_arn, "").await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case:?}: the listing must answer 200, got {} {:?}",
+            listed.status, listed.body
+        );
+        let page = summaries(case, &listed);
+        assert_eq!(
+            page.len(),
+            1,
+            "case {case:?}: the seeded policy holds one workflow, got {page:?}"
+        );
+        assert_eq!(
+            member(case, &page[0], "status"),
+            expected,
+            "case {case:?}: expected the status {expected:?}, got {:?}",
+            page[0]
+        );
+        assert_eq!(
+            member(case, &page[0], "buildWorkflowId"),
+            id,
+            "case {case:?}: the listing reports the seeded workflow, got {:?}",
+            page[0]
+        );
+
+        // A read of the same workflow agrees with the listing, and a second listing
+        // reports exactly what the first one did: reading changes nothing a later caller
+        // sees.
+        let read = get_workflow(&emu, &policy_arn, &id).await;
+        assert_eq!(
+            read.text("status"),
+            member(case, &page[0], "status"),
+            "case {case:?}: a read and a listing report one record one way, got {:?} and {:?}",
+            read.get("status"),
+            page[0]
+        );
+        let again = summaries(case, &list_workflows(&emu, &policy_arn, "").await);
+        assert_eq!(
+            again, page,
+            "case {case:?}: a second listing must report what the first one did, got {again:?}"
+        );
+    }
 }
