@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminSetUserSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdminSetUserSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! One user's SMS MFA configuration, written by an administrator: the request names
+//! the pool and the user, and the submitted `MFAOptions` REPLACE the configuration
+//! that stored user held ([`crate::state::User::set_sms_mfa_options`]), so a later
+//! read of the same user through `AdminGetUser` or the user's own `GetUser` renders
+//! exactly what was written and an empty list leaves the user with no MFA option at
+//! all.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdminSetUserSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Only an SMS configuration of the one attribute an `MFAOptionType` may name can be
+//! set ([`crate::state::sms_mfa_options`]); anything else is refused with 400
+//! `InvalidParameterException`, and a refused request writes nothing. A pool this
+//! emulator does not hold answers 404 `ResourceNotFoundException` and a user that pool
+//! does not hold answers 404 `UserNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +164,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdminSetUserSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdminSetUserSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdminSetUserSettings"))
+        // Request metadata only: the pool and the user this call configures are named
+        // by the request body.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        // Decide the whole write FIRST — the stored user it applies to, and the
+        // configuration the submitted list asks for — so a refused request leaves that
+        // user exactly as it was.
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        if pool.user(&input.username).is_none() {
+            return Err(user_not_found());
+        }
+        let options = crate::state::sms_mfa_options(&input.mfa_options)
+            .map_err(|rejection| invalid_parameter(rejection.message()))?;
+
+        let user = pool.user_mut(&input.username).ok_or_else(internal_error)?;
+        user.set_sms_mfa_options(options, now);
+
+        // This operation models no output member: what it asserts is the stored
+        // configuration a later read of the same user renders.
+        Ok(AdminSetUserSettingsOutput {})
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AdminSetUserSettingsError {
+    AdminSetUserSettingsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for an absent user. Carries the fixed
+/// message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no username.
+fn user_not_found() -> AdminSetUserSettingsError {
+    AdminSetUserSettingsErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> AdminSetUserSettingsError {
+    AdminSetUserSettingsErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AdminSetUserSettingsError {
+    AdminSetUserSettingsErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
