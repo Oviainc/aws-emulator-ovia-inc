@@ -1972,18 +1972,26 @@ fn stated_instant(at: &DateTime) -> String {
 /// when the window does not END before the SLO existed and does not BEGIN after now. So a
 /// read over a past window reports an entity the account has only just started monitoring
 /// as absent, and a window entirely in the future observes nothing at all.
+///
+/// Both bounds are compared on the module's one instant key ([`instant_nanos`]), the same
+/// one [`time_range_refusal`] orders a requested range by and
+/// [`ChangeRecord::inside`] places a recorded change by: a window this admits an SLO over
+/// and a window a change read reports that SLO's writes in are therefore decided by one
+/// comparison at one resolution, so an SLO created a fraction of a microsecond after the
+/// window ended is outside it in every read.
 fn monitored_in_window(
     slo: &ServiceLevelObjective,
     window_start: &DateTime,
     window_end: &DateTime,
 ) -> bool {
-    slo.created_time.as_secs_f64() <= window_end.as_secs_f64() && window_has_begun(window_start)
+    instant_nanos(&slo.created_time) <= instant_nanos(window_end) && window_has_begun(window_start)
 }
 
 /// Whether a window has begun: nothing has been observed in one that starts after now,
-/// however far ahead it ends.
+/// however far ahead it ends. Compared on the same instant key as every other window test
+/// here ([`instant_nanos`]).
 fn window_has_begun(window_start: &DateTime) -> bool {
-    window_start.as_secs_f64() <= DateTime::from(::std::time::SystemTime::now()).as_secs_f64()
+    instant_nanos(window_start) <= instant_nanos(&DateTime::from(::std::time::SystemTime::now()))
 }
 
 /// A dedup/order key for one `Attributes` map: its entries in key order. Used only to
@@ -3231,7 +3239,7 @@ impl InstrumentationConfigurationSet {
     fn record_change(&mut self, at: DateTime) {
         let keep = self
             .last_changed_at
-            .is_none_or(|previous| previous.as_secs_f64() < at.as_secs_f64());
+            .is_none_or(|previous| instant_nanos(&previous) < instant_nanos(&at));
         if keep {
             self.last_changed_at = Some(at);
         }
@@ -3616,7 +3624,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     fn schedule_instrumentation_pass(&mut self, due: DateTime) {
         let sooner = self
             .instrumentation_due_at
-            .is_none_or(|known| due.as_secs_f64() < known.as_secs_f64());
+            .is_none_or(|known| instant_nanos(&due) < instant_nanos(&known));
         if sooner {
             self.instrumentation_due_at = Some(due);
         }
@@ -3634,17 +3642,14 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                     .values()
                     .filter_map(|stored| stored.expires_at);
                 let droppable = if set.configurations.is_empty() {
-                    set.last_changed_at.map(|changed| {
-                        DateTime::from_secs_f64(
-                            changed.as_secs_f64() + EMPTY_SCOPE_RETENTION.as_secs_f64(),
-                        )
-                    })
+                    set.last_changed_at
+                        .map(|changed| instant_plus(&changed, EMPTY_SCOPE_RETENTION))
                 } else {
                     None
                 };
                 expiries.chain(droppable)
             })
-            .min_by(|left, right| left.as_secs_f64().total_cmp(&right.as_secs_f64()))
+            .min_by_key(instant_nanos)
     }
 
     /// Drop every configuration whose `ExpiresAt` has fallen due by `now`, record the instant
@@ -3664,10 +3669,10 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// by [`MAX_INSTRUMENTATION_CONFIGURATIONS`] entries, scopes included, so its cost cannot
     /// grow with the scopes a caller mints.
     pub fn expire_instrumentation_configurations(&mut self, now: &DateTime) {
-        let threshold = now.as_secs_f64();
+        let threshold = instant_nanos(now);
         if self
             .instrumentation_due_at
-            .is_none_or(|due| due.as_secs_f64() > threshold)
+            .is_none_or(|due| instant_nanos(&due) > threshold)
         {
             return;
         }
@@ -3678,7 +3683,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             .flat_map(|(scope, set)| {
                 set.configurations.iter().filter_map(move |(key, stored)| {
                     let expires_at = stored.expires_at?;
-                    (expires_at.as_secs_f64() <= threshold).then(|| {
+                    (instant_nanos(&expires_at) <= threshold).then(|| {
                         (
                             scope.clone(),
                             key.clone(),
@@ -3711,7 +3716,8 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         self.instrumentation_configurations.retain(|_, set| {
             !set.configurations.is_empty()
                 || set.last_changed_at.is_none_or(|changed| {
-                    changed.as_secs_f64() + EMPTY_SCOPE_RETENTION.as_secs_f64() > threshold
+                    instant_nanos(&changed).saturating_add(duration_nanos(EMPTY_SCOPE_RETENTION))
+                        > threshold
                 })
         });
 
@@ -3798,7 +3804,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         self.instrumentation_configurations
             .get(scope)
             .and_then(|set| set.last_changed_at)
-            .is_some_and(|changed| changed.as_secs_f64() > since.as_secs_f64())
+            .is_some_and(|changed| instant_nanos(&changed) > instant_nanos(since))
     }
 
     /// One page of `scope`'s configurations, in key order, starting strictly after `cursor`,
@@ -4018,14 +4024,12 @@ pub fn requested_expiry(
     }
 
     let Some(requested) = requested else {
-        return Ok(Some(DateTime::from_secs_f64(
-            now.as_secs_f64() + BREAKPOINT_DEFAULT_EXPIRY.as_secs_f64(),
-        )));
+        return Ok(Some(instant_plus(now, BREAKPOINT_DEFAULT_EXPIRY)));
     };
 
-    let lifetime = requested.as_secs_f64() - now.as_secs_f64();
-    if lifetime < BREAKPOINT_MIN_EXPIRY.as_secs_f64()
-        || lifetime > BREAKPOINT_MAX_EXPIRY.as_secs_f64()
+    let lifetime = instant_nanos(requested).saturating_sub(instant_nanos(now));
+    if lifetime < duration_nanos(BREAKPOINT_MIN_EXPIRY)
+        || lifetime > duration_nanos(BREAKPOINT_MAX_EXPIRY)
     {
         return Err(format!(
             "ExpiresAt must be between {} and {} seconds after the time of the request for \
@@ -4127,9 +4131,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         // it rather than leaving them for the next resource minted at that ARN.
         self.tags.remove(&removed.arn);
         if emptied {
-            self.schedule_instrumentation_pass(DateTime::from_secs_f64(
-                at.as_secs_f64() + EMPTY_SCOPE_RETENTION.as_secs_f64(),
-            ));
+            self.schedule_instrumentation_pass(instant_plus(&at, EMPTY_SCOPE_RETENTION));
         }
         Some(removed)
     }
@@ -4230,9 +4232,44 @@ pub fn service_entity_attributes(service: &str, environment: &str) -> HashMap<St
 /// [`status_event_instant`], the module's one reader of an instant's parts, so a comparison
 /// here and the chronology a status-event token carries cannot disagree about what instant a
 /// `Timestamp` denotes.
-fn instant_nanos(at: &DateTime) -> i128 {
+pub fn instant_nanos(at: &DateTime) -> i128 {
     let (secs, subsec_nanos) = status_event_instant(at);
     i128::from(secs) * i128::from(NANOS_PER_SECOND) + i128::from(subsec_nanos)
+}
+
+/// One span as a count of nanoseconds, so a span and an instant are measured on the one
+/// key instants are compared on ([`instant_nanos`]).
+///
+/// A span too long to count in nanoseconds on that key saturates, which keeps it the longer
+/// of any pair it is compared with rather than wrapping to a short one; no span this module
+/// holds comes near that.
+fn duration_nanos(span: Duration) -> i128 {
+    i128::try_from(span.as_nanos()).unwrap_or(i128::MAX)
+}
+
+/// The instant `span` after `at`, derived on the nanosecond key ([`instant_nanos`]) rather
+/// than through float seconds.
+///
+/// A horizon is compared against a stored instant, so it is derived at the precision that
+/// comparison is made at: deriving it through `DateTime::as_secs_f64` would round it by
+/// around a hundred nanoseconds, which would move the horizon off the instant plus the
+/// span.
+fn instant_plus(at: &DateTime, span: Duration) -> DateTime {
+    instant_at_nanos(instant_nanos(at).saturating_add(duration_nanos(span)))
+}
+
+/// The instant a count of nanoseconds since the epoch denotes — the inverse of
+/// [`instant_nanos`], for a derived instant that is stored and later compared.
+///
+/// The seconds are floored and the nanoseconds within them are the non-negative remainder,
+/// so an instant before the epoch keeps the sub-second part a `Timestamp` holds. A count
+/// beyond the seconds a `DateTime` can hold saturates there rather than wrapping to an
+/// unrelated instant.
+fn instant_at_nanos(nanos: i128) -> DateTime {
+    let nanos_per_second = i128::from(NANOS_PER_SECOND);
+    let secs = i64::try_from(nanos.div_euclid(nanos_per_second)).unwrap_or(i64::MAX);
+    let subsec_nanos = u32::try_from(nanos.rem_euclid(nanos_per_second)).unwrap_or_default();
+    DateTime::from_secs_and_nanos(secs, subsec_nanos)
 }
 
 /// The Region a stored record was written in: the one its own ARN carries, read through
