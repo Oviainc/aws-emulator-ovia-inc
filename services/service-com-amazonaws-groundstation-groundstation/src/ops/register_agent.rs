@@ -239,6 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             component_statuses: Vec::new(),
             task_id: None,
+            log_uploads: ::std::collections::HashMap::new(),
             tasking_document: None,
             registered,
             last_updated: registered,

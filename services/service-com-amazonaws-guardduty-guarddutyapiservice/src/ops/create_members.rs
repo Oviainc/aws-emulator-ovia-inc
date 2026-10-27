@@ -8,6 +8,14 @@
 //! these member accounts again only by calling the CreateMembers API" (the modelled
 //! contract below), which is how a disassociated member becomes associated again.
 //!
+//! Every account the request names takes the organization's auto-enable settings,
+//! "irrespective of the accounts being new or existing members" (the modelled
+//! contract below): a feature this administrator's organization configuration
+//! auto-enables is ENABLED for the account, while one it auto-enables for no account
+//! is left to be managed per account and keeps whatever the member's configuration
+//! already said. So a member's `GetMemberDetectors` configuration agrees with what
+//! `DescribeOrganizationConfiguration` reports for the same organization.
+//!
 //! The administrator's own account id cannot be one of its members, so it is
 //! reported in `UnprocessedAccounts` with that reason while the call succeeds with
 //! HTTP 200 — and so is an account past GuardDuty's quota of
@@ -17,11 +25,10 @@
 //! `DetectorId` this account/Region does not own is refused with HTTP 400 under the
 //! `InvalidInputException` class.
 //!
-//! What this does NOT model yet, each belonging to its own operation: enabling
-//! GuardDuty in the member account (the member account's own detector is not a
-//! resource this emulator holds) and the invitation flow (`InviteMembers` is still
-//! a scaffold), so a recorded member's `RelationshipStatus` is `Created` until an
-//! invitation is modelled.
+//! What this does NOT model yet, belonging to its own operation: enabling GuardDuty
+//! in the member account, whose own detector is not a resource this emulator holds.
+//! A recorded member's `RelationshipStatus` is `Created` until `InviteMembers`
+//! sends it an invitation.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -223,6 +230,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_owned(&input.detector_id));
         };
 
+        // The organization's auto-enable settings, read before any member is written
+        // so every account of one call is given the same configuration. Taken as a
+        // copy because it is a sibling field of the members being written.
+        let organization = detector.organization.clone();
+
         let mut unprocessed = Vec::new();
         let mut seen = ::std::collections::BTreeSet::new();
         for detail in &input.account_details {
@@ -259,6 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if changed {
                         existing.updated_at_millis = now;
                     }
+                    // An EXISTING member takes the organization's auto-enable
+                    // settings too, which is what `irrespective of the accounts
+                    // being new or existing members` says. Its own per-feature
+                    // instants move with the switches this writes; the
+                    // RELATIONSHIP's `UpdatedAt` above is a different fact and
+                    // stays where the relationship left it.
+                    crate::state::apply_organization_auto_enable(existing, &organization, now);
                 }
                 None => {
                     // The quota bounds the store: an account past it is reported
@@ -273,24 +292,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         });
                         continue;
                     }
-                    detector.members.insert(
-                        detail.account_id.clone(),
-                        crate::state::MemberRecord {
-                            account_id: detail.account_id.clone(),
-                            email: detail.email.clone(),
-                            // No invitation has been sent yet: `InviteMembers` is
-                            // what moves the relationship on from here, and what
-                            // records the instant it sent one.
-                            relationship_status: crate::state::RELATIONSHIP_CREATED.to_string(),
-                            invited_at_millis: None,
-                            updated_at_millis: now,
-                            // The member account's detector starts in the
-                            // configuration a detector created without a
-                            // `Features` list gets; `UpdateMemberDetectors` is
-                            // what the administrator changes it with.
-                            features: crate::state::default_features(now),
-                        },
+                    let mut member = crate::state::MemberRecord {
+                        account_id: detail.account_id.clone(),
+                        email: detail.email.clone(),
+                        // No invitation has been sent yet: `InviteMembers` is
+                        // what moves the relationship on from here, and what
+                        // records the instant it sent one.
+                        relationship_status: crate::state::RELATIONSHIP_CREATED.to_string(),
+                        invited_at_millis: None,
+                        updated_at_millis: now,
+                        // The member account's detector starts in the
+                        // configuration a detector created without a
+                        // `Features` list gets, and the organization's
+                        // auto-enable settings are applied over it;
+                        // `UpdateMemberDetectors` is what the administrator
+                        // changes it with afterwards.
+                        features: crate::state::default_features(now),
+                    };
+                    crate::state::apply_organization_auto_enable(
+                        &mut member,
+                        &organization,
+                        now,
                     );
+                    detector.members.insert(detail.account_id.clone(), member);
                 }
             }
         }

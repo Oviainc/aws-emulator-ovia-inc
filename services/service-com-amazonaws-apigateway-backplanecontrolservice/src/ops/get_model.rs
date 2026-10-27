@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let model = api.models.get(&input.model_name).ok_or_else(|| {
             GetModelErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::NO_SUCH_MODEL.to_string()),
+                message: Some(crate::state::no_such_model(&input.model_name)),
             })
         })?;
         // Rendered through the one `Model` body this crate has, so a read reports the

@@ -3226,8 +3226,15 @@ pub const AUTHORIZER_IN_USE: &str =
     "Active methods pointing to this authorizer must be updated or deleted";
 
 /// The `NotFoundException` message for a `modelName` that names no stored model of the
-/// API, in the shape of the sibling identifier messages above.
-pub const NO_SUCH_MODEL: &str = "Invalid model identifier specified";
+/// API.
+///
+/// A model is addressed by its NAME rather than by a minted id, so API Gateway names the
+/// name back in the refusal instead of stating the fixed identifier sentence its sibling
+/// resources earn: the message is BUILT FROM THE REQUEST, naming the one value the caller
+/// has to change.
+pub fn no_such_model(model_name: &str) -> String {
+    format!("Invalid model name specified: {model_name}")
+}
 
 /// The `ConflictException` message for a model name this API already holds a model under:
 /// a model is keyed by its name, so the second create under one name is refused rather

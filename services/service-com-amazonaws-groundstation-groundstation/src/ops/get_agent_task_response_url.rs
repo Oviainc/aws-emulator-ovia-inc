@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAgentTaskResponseUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAgentTaskResponseUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAgentTaskResponseUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +142,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAgentTaskResponseUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAgentTaskResponseUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAgentTaskResponseUrlErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The resource this operation addresses is the AGENT: both its request and its
+        // response carry a reference to the `Agent` resource and nothing else
+        // (`smithy_query(query="operation", operation="GetAgentTaskResponseUrl")`), so an
+        // `{agentId}` no agent was registered under is the missing resource, while the
+        // `{taskId}` label names the task of that agent whose response log is being
+        // uploaded.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAgentTaskResponseUrl"))
+        // The URL the agent ALREADY holds for THIS task is reported again while it is
+        // still signed for, so a second read does not leave a second credential able to
+        // sign the same upload. The only thing dropped is an upload whose validity the
+        // clock has run out on — the expiry that was due at this instant whether or not
+        // anybody called — so a URL this agent holds for ANY other task goes on working.
+        let (agent_id, held, expired) = {
+            let mut guard = state.lock();
+            let agent = guard
+                .agents
+                .get_mut(&input.agent_id)
+                .ok_or_else(|| agent_not_found(&input.agent_id))?;
+            let expired = agent.take_expired_log_uploads(now);
+            let held = agent
+                .log_uploads
+                .get(&input.task_id)
+                .map(|upload| upload.presigned_log_url.clone());
+            (agent.agent_id.clone(), held, expired)
+        };
+        for credential_id in expired {
+            crate::state::withdraw_credential(ctx, &credential_id);
+        }
+        if let Some(presigned_log_url) = held {
+            return Ok(GetAgentTaskResponseUrlOutput {
+                agent_id,
+                task_id: input.task_id,
+                presigned_log_url,
+            });
+        }
+
+        // Nothing live is held for this task, so the upload is signed now: a presigned
+        // Amazon S3 `PutObject` of this agent's response log for this task, in the
+        // emulator's own object storage, signed with a credential minted for that one
+        // upload (`crate::state::presign_agent_task_response_upload`).
+        let minted =
+            crate::state::presign_agent_task_response_upload(ctx, &region, &agent_id, &input.task_id)
+                .await
+                .ok_or_else(|| {
+                    GetAgentTaskResponseUrlErrorModeled::DependencyException(DependencyException {
+                        message: Some(format!(
+                            "No upload URL could be signed for task {} of agent {agent_id}",
+                            input.task_id
+                        )),
+                        parameter_name: None,
+                    })
+                })?;
+
+        let (presigned_log_url, withdrawn) = {
+            let mut guard = state.lock();
+            match guard.agents.get_mut(&agent_id) {
+                Some(agent) => {
+                    // Another call may have signed one for this same task while this one
+                    // was signing.
+                    let live = agent
+                        .log_uploads
+                        .get(&input.task_id)
+                        .filter(|held| held.is_live(now))
+                        .map(|held| held.presigned_log_url.clone());
+                    match live {
+                        // That URL is the one its caller holds, so it is reported and this
+                        // call's own credential withdrawn, rather than two credentials
+                        // being left able to sign one upload.
+                        Some(url) => (Some(url), Some(minted.credential_id)),
+                        None => {
+                            let url = minted.presigned_log_url.clone();
+                            // Anything replaced here is this task's own upload with the
+                            // clock already run out on it, so its credential goes the way
+                            // every expired one does.
+                            let replaced = agent.log_uploads.insert(input.task_id.clone(), minted);
+                            (Some(url), replaced.map(|spent| spent.credential_id))
+                        }
+                    }
+                }
+                // Unreachable through this model, which declares no operation that
+                // removes a registered agent: an agent that is gone is answered as the
+                // missing resource it is, and the credential that would have signed its
+                // upload is withdrawn.
+                None => (None, Some(minted.credential_id)),
+            }
+        };
+        if let Some(credential_id) = withdrawn {
+            crate::state::withdraw_credential(ctx, &credential_id);
+        }
+        let presigned_log_url = presigned_log_url.ok_or_else(|| agent_not_found(&agent_id))?;
+
+        Ok(GetAgentTaskResponseUrlOutput {
+            agent_id,
+            task_id: input.task_id,
+            presigned_log_url,
+        })
     }
+}
+
+/// The modelled answer to an `{agentId}` no agent was registered under: HTTP 434
+/// `ResourceNotFoundException`, carrying the text every operation of this service
+/// addressed at an agent by that label answers (`crate::state::agent_not_found_message`).
+fn agent_not_found(agent_id: &str) -> GetAgentTaskResponseUrlError {
+    GetAgentTaskResponseUrlErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::agent_not_found_message(agent_id)),
+    })
+    .into()
 }
