@@ -12,10 +12,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::get_scaling_plan_resource_forecast_data::FORECAST_INTERVAL_SECONDS;
 use crate::ops::types::{
-    ApplicationSource, PredefinedScalingMetricSpecification, ScalingInstruction,
+    ApplicationSource, PredefinedScalingMetricSpecification, ScalingInstruction, ScalingPolicy,
     TargetTrackingConfiguration, LOAD_METRIC_TYPE_VALUES, METRIC_STATISTIC_VALUES,
-    PREDICTIVE_SCALING_MAX_CAPACITY_BEHAVIOR_VALUES, PREDICTIVE_SCALING_MODE_VALUES,
-    SCALABLE_DIMENSION_VALUES, SCALING_METRIC_TYPE_VALUES,
+    POLICY_TYPE_VALUES, PREDICTIVE_SCALING_MAX_CAPACITY_BEHAVIOR_VALUES,
+    PREDICTIVE_SCALING_MODE_VALUES, SCALABLE_DIMENSION_VALUES, SCALING_METRIC_TYPE_VALUES,
     SCALING_POLICY_UPDATE_BEHAVIOR_VALUES, SERVICE_NAMESPACE_VALUES,
 };
 
@@ -68,6 +68,93 @@ pub const SCALING_STATUS_INACTIVE: &str = "Inactive";
 /// "because the scaling plan is being created or deleted" (same doc).
 pub const SCALING_STATUS_PARTIALLY_ACTIVE: &str = "PartiallyActive";
 
+// ---------------------------------------------------------------------------
+// What a described plan and its resources report about status
+//
+// `ScalingPlan$StatusMessage` is "A simple message about the current status of the
+// scaling plan" and `ScalingPlanResource$ScalingStatusMessage` "A simple message about
+// the current scaling status of the resource", and both status-code docs tell a caller
+// to "Check the status message for more information" — so the narrative is a fixed
+// sentence per status, saying what the service did or is doing to reach it, and is
+// reported on EVERY described plan and resource.
+//
+// One row per `ScalingPlanStatusCode` this emulator puts a plan in, so the scaling
+// status a resource reports and the two narratives that explain the pair cannot
+// disagree about one status, and a status added later has to bring its row.
+// ---------------------------------------------------------------------------
+
+/// What a plan in one `ScalingPlanStatusCode` reports, on both describe envelopes.
+#[derive(Debug)]
+pub struct ReportedStatus {
+    /// `ScalingPlan$StatusMessage`.
+    pub status_message: &'static str,
+    /// The `ScalingStatusCode` every resource of such a plan reports.
+    pub scaling_status_code: &'static str,
+    /// `ScalingPlanResource$ScalingStatusMessage`.
+    pub scaling_status_message: &'static str,
+}
+
+/// What a plan whose configuration is applied to its resources reports.
+const APPLIED_STATUS: ReportedStatus = ReportedStatus {
+    status_message: "Scaling plan has been created and applied to all resources.",
+    scaling_status_code: SCALING_STATUS_ACTIVE,
+    scaling_status_message: "Target tracking scaling policies have been applied to the resource.",
+};
+
+/// What a plan reports in a status this emulator never sets.
+///
+/// `ScalingPlanStatusCode` lists four more values, each of which says the configuration
+/// did not fully take (`ActiveWithProblems`, `CreationFailed`, `DeletionFailed`,
+/// `UpdateFailed`); no path here puts a plan in one, and [`ScalingPlanRecord::reported`]
+/// asserts as much in a debug build. Should one ever be set, what a resource reports is
+/// `PartiallyActive` — "the scaling configuration could not be fully applied. Check the
+/// status message for more information" — never "applied". It carries no status code of
+/// its own: it is the row for a status [`REPORTED_STATUS`] does not list, so it is never
+/// looked up BY code.
+const UNAPPLIED_STATUS: ReportedStatus = ReportedStatus {
+    status_message: "Scaling plan could not be fully applied to all resources.",
+    scaling_status_code: SCALING_STATUS_PARTIALLY_ACTIVE,
+    scaling_status_message: "Target tracking scaling policies could not be fully applied to the \
+                             resource.",
+};
+
+/// Every status this emulator puts a plan in, with what each one reports.
+const REPORTED_STATUS: &[(&str, ReportedStatus)] = &[
+    (STATUS_ACTIVE, APPLIED_STATUS),
+    (
+        STATUS_CREATION_IN_PROGRESS,
+        ReportedStatus {
+            status_message: "Scaling plan is being created.",
+            // Nothing has reached the resource yet, which is what `Inactive` reports.
+            scaling_status_code: SCALING_STATUS_INACTIVE,
+            scaling_status_message: "Target tracking scaling policies have not been applied to \
+                                     the resource yet because the scaling plan is being created.",
+        },
+    ),
+    (
+        STATUS_UPDATE_IN_PROGRESS,
+        ReportedStatus {
+            status_message: "Scaling plan is being updated.",
+            scaling_status_code: SCALING_STATUS_PARTIALLY_ACTIVE,
+            scaling_status_message: "Target tracking scaling policies are being updated on the \
+                                     resource.",
+        },
+    ),
+    (
+        STATUS_DELETION_IN_PROGRESS,
+        ReportedStatus {
+            status_message: "Scaling plan is being deleted.",
+            scaling_status_code: SCALING_STATUS_PARTIALLY_ACTIVE,
+            scaling_status_message: "Target tracking scaling policies are being removed from the \
+                                     resource.",
+        },
+    ),
+];
+
+/// The only `PolicyType` the model lists, and so the type of every policy a scaling
+/// instruction's target tracking configuration produces.
+pub const POLICY_TYPE_TARGET_TRACKING: &str = POLICY_TYPE_VALUES[0];
+
 /// What the clock owes a plan that is in a non-terminal status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingOutcome {
@@ -94,14 +181,12 @@ pub struct ScalingPlanRecord {
     pub name: String,
     /// `ScalingPlanVersion`; always [`ONLY_VERSION`].
     pub version: i64,
-    /// `ApplicationSource`, stored as the caller supplied it.
+    /// `ApplicationSource` in force, stored as the caller supplied it.
     pub application_source: ApplicationSource,
-    /// `ScalingInstructions`, stored as the caller supplied them.
+    /// `ScalingInstructions` in force, stored as the caller supplied them.
     pub scaling_instructions: Vec<ScalingInstruction>,
     /// `StatusCode` — a `ScalingPlanStatusCode` value.
     pub status_code: String,
-    /// `StatusMessage`.
-    pub status_message: Option<String>,
     /// `StatusStartTime` — when the plan entered `status_code`.
     pub status_start_time: SystemTime,
     /// `CreationTime`.
@@ -125,7 +210,6 @@ impl ScalingPlanRecord {
             application_source,
             scaling_instructions,
             status_code: STATUS_CREATION_IN_PROGRESS.to_string(),
-            status_message: None,
             status_start_time: now,
             creation_time: now,
             pending: Some(PendingTransition {
@@ -156,12 +240,92 @@ impl ScalingPlanRecord {
     /// The `ScalingStatusCode` every resource of this plan reports, derived from the
     /// plan's own status: applied only once the plan itself is applied.
     pub fn scaling_status_code(&self) -> &'static str {
-        match self.status_code.as_str() {
-            STATUS_ACTIVE => SCALING_STATUS_ACTIVE,
-            STATUS_CREATION_IN_PROGRESS => SCALING_STATUS_INACTIVE,
-            _ => SCALING_STATUS_PARTIALLY_ACTIVE,
-        }
+        self.reported().scaling_status_code
     }
+
+    /// `StatusMessage`: the narrative of the status this plan reports.
+    pub fn status_message(&self) -> &'static str {
+        self.reported().status_message
+    }
+
+    /// `ScalingStatusMessage`: the narrative of the scaling status every resource of
+    /// this plan reports, derived — like the status code itself — from what the plan is
+    /// doing to the policies on its resources.
+    pub fn scaling_status_message(&self) -> &'static str {
+        self.reported().scaling_status_message
+    }
+
+    /// The row of [`REPORTED_STATUS`] for the status this plan is in.
+    fn reported(&self) -> &'static ReportedStatus {
+        let reported = REPORTED_STATUS
+            .iter()
+            .find(|(status_code, _)| *status_code == self.status_code)
+            .map(|(_, reported)| reported);
+        debug_assert!(
+            reported.is_some(),
+            "status {:?} needs its own REPORTED_STATUS row",
+            self.status_code
+        );
+        reported.unwrap_or(&UNAPPLIED_STATUS)
+    }
+
+    /// The scaling policies AWS Auto Scaling has applied to the resource `instruction`
+    /// names, in the order the instruction lists their configurations.
+    ///
+    /// `ScalingInstruction` documents that "AWS Auto Scaling creates target tracking
+    /// scaling policies based on the scaling instructions", and `DisableDynamicScaling`
+    /// that "When dynamic scaling is enabled, AWS Auto Scaling creates target tracking
+    /// scaling policies based on the specified target tracking configurations" — so an
+    /// applied resource carries one `TargetTrackingScaling` policy per target tracking
+    /// configuration of its instruction, echoing that configuration, and an instruction
+    /// that turned dynamic scaling off carries none.
+    ///
+    /// Empty while the plan is still being created: no policy has reached the resource
+    /// yet, which is exactly what its `Inactive` scaling status reports.
+    ///
+    /// `resource` is the position of `instruction` in [`Self::scaling_instructions`],
+    /// which is what names the policies apart.
+    ///
+    /// The policies are PROJECTED per read rather than stored beside the instruction
+    /// they come from, so one record cannot disagree with another about what a resource
+    /// tracks; the configuration clone that costs is bounded by the documented
+    /// [`MAX_TARGET_TRACKING_CONFIGURATIONS`] per resource, and the page by `MaxResults`.
+    pub fn applied_policies(
+        &self,
+        resource: usize,
+        instruction: &ScalingInstruction,
+    ) -> Vec<ScalingPolicy> {
+        if self.scaling_status_code() == SCALING_STATUS_INACTIVE
+            || !configures_dynamic_scaling(instruction)
+        {
+            return Vec::new();
+        }
+        instruction
+            .target_tracking_configurations
+            .iter()
+            .enumerate()
+            .map(|(position, configuration)| ScalingPolicy {
+                policy_name: policy_name(&self.name, resource, position),
+                policy_type: POLICY_TYPE_TARGET_TRACKING.to_string(),
+                target_tracking_configuration: Some(configuration.clone()),
+            })
+            .collect()
+    }
+}
+
+/// The name AWS Auto Scaling gives the policy it mints from one target tracking
+/// configuration.
+///
+/// The service generates this name; `ScalingPolicy$PolicyName` only requires a
+/// printable string of 1-256 characters. It is therefore derived from the state that
+/// identifies the policy — the plan that owns it, the resource the policy was applied
+/// to and the configuration within that resource's instruction it came from — so no two
+/// policies of one plan share a name, every name stays inside the modelled 256
+/// characters however long a resource id is, and the name a resource reports does not
+/// change between reads. A `ScalingPlanName` carries no `/`
+/// (`^[\p{Print}&&[^|:/]]+$`), so the segments cannot run together.
+fn policy_name(plan_name: &str, resource: usize, position: usize) -> String {
+    format!("{plan_name}/TargetTracking/{resource}/{position}")
 }
 
 /// Per-service state for com-amazonaws-autoscalingplans-anyscalescalingplannerfrontendservice. A handler reaches it through [`service_state`].
@@ -574,6 +738,123 @@ pub const UNSUPPORTED_RESOURCE: &str =
 /// Example: `table/my-table/index/my-table-index`".
 const INDEX_SEGMENT: &str = "/index/";
 
+/// The scaling instructions in force after an update that asks for `requested`.
+///
+/// An update does not re-point a target tracking policy a resource already has: for a
+/// resource the plan already covers, the TARGET VALUE in force for a scaling metric the
+/// resource already tracks is kept, because that value is what the applied policy tracks
+/// to. Not even `ScalingInstruction$ScalingPolicyUpdateBehavior`
+/// (`ReplaceExternalPolicies`, "any scaling policies that are external to AWS Auto
+/// Scaling are deleted and new target tracking scaling policies created") re-points it:
+/// the policies the plan itself applied are not external to AWS Auto Scaling, and the
+/// recorded response to an update carrying that behaviour still reports the target value
+/// established earlier in the plan's lifecycle.
+///
+/// Everything else the update carries IS applied: an instruction for a resource the plan
+/// did not cover, the disappearance of one it did, an instruction's capacity bounds and
+/// predictive-scaling members, the rest of a tracked metric's configuration (its
+/// cooldowns, its warmup, whether scale-in is disabled), and a whole configuration for a
+/// metric the resource does not track yet.
+pub fn merge_scaling_instructions(
+    in_force: &[ScalingInstruction],
+    requested: Vec<ScalingInstruction>,
+) -> Vec<ScalingInstruction> {
+    // The instructions in force are INDEXED by the resource each applies to before the
+    // merge, so the work is one lookup per requested instruction rather than a scan of
+    // everything in force per requested instruction — neither list's length is bounded
+    // by the model, so their product must not drive the work.
+    let applied: BTreeMap<ResourceIdentity<'_>, &ScalingInstruction> = in_force
+        .iter()
+        .map(|instruction| (resource_identity(instruction), instruction))
+        .collect();
+    requested
+        .into_iter()
+        .map(|instruction| {
+            match applied.get(&resource_identity(&instruction)) {
+                Some(applied) => keep_tracked_target_values(applied, instruction),
+                None => instruction,
+            }
+        })
+        .collect()
+}
+
+/// `requested` with the target value of every metric `applied` already tracks taken
+/// from the configuration in force, and every other member as `requested` words it.
+///
+/// Both configuration lists are bounded by [`MAX_TARGET_TRACKING_CONFIGURATIONS`], the
+/// documented "(up to 10)" that [`validate_scaling_instructions`] enforces on the way
+/// in, so this inner scan is bounded whatever a caller sends.
+fn keep_tracked_target_values(
+    applied: &ScalingInstruction,
+    mut requested: ScalingInstruction,
+) -> ScalingInstruction {
+    requested.target_tracking_configurations = requested
+        .target_tracking_configurations
+        .into_iter()
+        .map(|mut configuration| {
+            let metric = target_metric_identity(&configuration);
+            let in_force = applied
+                .target_tracking_configurations
+                .iter()
+                .find(|in_force| metric.is_some() && target_metric_identity(in_force) == metric);
+            if let Some(in_force) = in_force {
+                configuration.target_value = in_force.target_value;
+            }
+            configuration
+        })
+        .collect();
+    requested
+}
+
+/// The identity of the one scalable resource a scaling instruction applies to.
+///
+/// "Each scaling instruction applies to one resource" (`ScalingInstruction` doc), and
+/// that resource is named by the `(ServiceNamespace, ResourceId, ScalableDimension)`
+/// triple — so this is the identity [`validate_scaling_instructions`] holds one
+/// instruction per, and the one the update merge matches on.
+pub type ResourceIdentity<'a> = (&'a str, &'a str, &'a str);
+
+/// The [`ResourceIdentity`] of `instruction`.
+fn resource_identity(instruction: &ScalingInstruction) -> ResourceIdentity<'_> {
+    (
+        instruction.service_namespace.as_str(),
+        instruction.resource_id.as_str(),
+        instruction.scalable_dimension.as_str(),
+    )
+}
+
+/// The identity of the metric a target tracking configuration tracks.
+///
+/// "Each of these structures must specify a unique scaling metric and a target value
+/// for the metric" (`ScalingInstruction$TargetTrackingConfigurations`), so a
+/// configuration is identified within its instruction by that metric: the predefined
+/// metric type, or the namespace, name, statistic and dimensions of a customized
+/// metric. `None` for a configuration naming neither metric — which both write paths
+/// refuse before it can be stored.
+pub fn target_metric_identity(configuration: &TargetTrackingConfiguration) -> Option<String> {
+    if let Some(predefined) = &configuration.predefined_scaling_metric_specification {
+        return Some(predefined.predefined_scaling_metric_type.clone());
+    }
+    let customized = configuration
+        .customized_scaling_metric_specification
+        .as_ref()?;
+    let mut dimensions: Vec<String> = customized
+        .dimensions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|dimension| format!("{}={}", dimension.name, dimension.value))
+        .collect();
+    dimensions.sort();
+    Some(format!(
+        "{}/{}/{}[{}]",
+        customized.namespace,
+        customized.metric_name,
+        customized.statistic,
+        dimensions.join(",")
+    ))
+}
+
 /// Validate the `ScalingInstructions` a caller wrote.
 ///
 /// `CreateScalingPlan` and `UpdateScalingPlan` both take this list and both model
@@ -588,15 +869,10 @@ pub fn validate_scaling_instructions(instructions: &[ScalingInstruction]) -> Res
     }
     // "Each scaling instruction applies to one resource" (`ScalingInstruction` doc), so
     // two instructions for one scalable resource contradict each other.
-    let mut covered: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
+    let mut covered: BTreeSet<ResourceIdentity<'_>> = BTreeSet::new();
     for (index, instruction) in instructions.iter().enumerate() {
         validate_scaling_instruction(index, instruction)?;
-        let resource = (
-            instruction.service_namespace.as_str(),
-            instruction.resource_id.as_str(),
-            instruction.scalable_dimension.as_str(),
-        );
-        if !covered.insert(resource) {
+        if !covered.insert(resource_identity(instruction)) {
             return Err(format!(
                 "ScalingInstructions[{index}]: a scaling plan can specify only one scaling \
                  instruction per scalable resource, and '{}' ({}) is already covered",
@@ -783,38 +1059,34 @@ fn validate_target_tracking_configuration(
         &configuration.predefined_scaling_metric_specification,
         &configuration.customized_scaling_metric_specification,
     ) {
-        (Some(_), Some(_)) => Err(format!(
-            "{at}: specify either PredefinedScalingMetricSpecification or \
-             CustomizedScalingMetricSpecification, not both"
-        )),
-        (None, None) => Err(format!(
-            "{at}: specify either PredefinedScalingMetricSpecification or \
-             CustomizedScalingMetricSpecification"
-        )),
-        (Some(predefined), None) => validate_predefined_scaling_metric(at, dimension, predefined),
-        (None, Some(customized)) => {
-            one_of(
-                &format!("{at}.CustomizedScalingMetricSpecification.Statistic"),
-                &customized.statistic,
-                METRIC_STATISTIC_VALUES,
-            )?;
-            let mut dimensions: Vec<String> = customized
-                .dimensions
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .map(|dimension| format!("{}={}", dimension.name, dimension.value))
-                .collect();
-            dimensions.sort();
-            Ok(format!(
-                "{}/{}/{}[{}]",
-                customized.namespace,
-                customized.metric_name,
-                customized.statistic,
-                dimensions.join(",")
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "{at}: specify either PredefinedScalingMetricSpecification or \
+                 CustomizedScalingMetricSpecification, not both"
             ))
         }
+        (None, None) => return Err(metric_specification_required(at)),
+        (Some(predefined), None) => validate_predefined_scaling_metric(at, dimension, predefined)?,
+        (None, Some(customized)) => one_of(
+            &format!("{at}.CustomizedScalingMetricSpecification.Statistic"),
+            &customized.statistic,
+            METRIC_STATISTIC_VALUES,
+        )?,
     }
+    // The identity of the metric this configuration tracks has ONE definition, shared
+    // with the update merge that keeps the configuration in force for a metric a
+    // resource already tracks.
+    target_metric_identity(configuration).ok_or_else(|| metric_specification_required(at))
+}
+
+/// How the service refuses a target tracking configuration that names no metric: "You
+/// can specify either a predefined metric or a customized metric", so one of the two is
+/// required.
+fn metric_specification_required(at: &str) -> String {
+    format!(
+        "{at}: specify either PredefinedScalingMetricSpecification or \
+         CustomizedScalingMetricSpecification"
+    )
 }
 
 /// A predefined scaling metric: a modelled metric type that measures the resource the
@@ -823,7 +1095,7 @@ fn validate_predefined_scaling_metric(
     at: &str,
     dimension: &str,
     specification: &PredefinedScalingMetricSpecification,
-) -> Result<String, String> {
+) -> Result<(), String> {
     let member = format!("{at}.PredefinedScalingMetricSpecification");
     let metric = specification.predefined_scaling_metric_type.as_str();
     one_of(
@@ -848,7 +1120,7 @@ fn validate_predefined_scaling_metric(
              type is {ALB_SCALING_METRIC_TYPE}"
         ));
     }
-    Ok(metric.to_string())
+    Ok(())
 }
 
 /// Whether this instruction configures predictive scaling.
