@@ -159,7 +159,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The content of the lenses this workload reviews, resolved from the whole lens
             // catalog, so the risk roll-up counts a custom lens's imported questions
             // exactly as it counts an official lens's catalog questions.
-            workload: Some(record.to_workload(&store.reviewed_lens_content(&record.lenses))),
+            workload: Some(record.to_workload(
+                &store.reviewed_lens_content(&record.reviewed_lens_versions()),
+            )),
         })
     }
 }

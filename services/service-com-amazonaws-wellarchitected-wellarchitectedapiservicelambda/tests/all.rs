@@ -350,3 +350,8 @@ mod agent_recommendation_feedback;
 // workload suite falls in a crowded run of this list.
 #[path = "all/workload_share_deletion.rs"]
 mod workload_share_deletion;
+
+// Declared last for the same reason as the declaration above: modules are appended here so
+// a new suite does not collide with another insertion.
+#[path = "all/lens_review_pinned_version_content.rs"]
+mod lens_review_pinned_version_content;

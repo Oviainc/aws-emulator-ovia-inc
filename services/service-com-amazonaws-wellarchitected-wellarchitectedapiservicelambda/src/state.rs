@@ -1901,11 +1901,11 @@ pub struct LensReviewRecord {
 ///
 /// A lens review reports and counts what the LENS defines, and this emulator holds lens
 /// content in two halves that never overlap: an AWS-official lens's content is its catalog
-/// row ([`official_lens`]) and a custom lens's is the document its published version
-/// carries ([`LensRecord::reviewed_content`]). Every derivation over "what does this lens
+/// row ([`official_lens`]) and a custom lens's is the document the version the review is
+/// against carries ([`LensRecord::content_at`]). Every derivation over "what does this lens
 /// ask?" — a question listing, a risk or question roll-up, a pillar summary, a `PillarId`
 /// or `QuestionId` a request supplies — resolves one of them through
-/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_content`] and
+/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_content_at`] and
 /// then reads THIS view, so neither half of the catalog is reported differently from the
 /// other and a lens this emulator holds no content for asks nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2229,6 +2229,19 @@ impl WorkloadRecord {
     /// follows.
     pub fn lens_reviews(&self) -> BTreeMap<&str, &str> {
         lens_reviews_of(&self.lenses)
+    }
+
+    /// Every lens this workload reviews, as the attach recorded it, beside the
+    /// `LensVersion` its review of that lens is against
+    /// ([`Self::lens_review_version`]) — what resolving the content of this workload's
+    /// reviews takes
+    /// ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::reviewed_lens_content`]),
+    /// because a lens review is a review against ONE version of the lens.
+    pub fn reviewed_lens_versions(&self) -> Vec<(&str, Option<&str>)> {
+        self.lenses
+            .iter()
+            .map(|lens| (lens.as_str(), self.lens_review_version(lens)))
+            .collect()
     }
 
     /// This workload's risk roll-up: one entry for every `Risk` the enum publishes, so
@@ -2955,6 +2968,17 @@ impl ReviewTemplateRecord {
         lens_reviews_of(&self.lenses)
     }
 
+    /// Every lens this template applies, as the apply recorded it, beside the
+    /// `LensVersion` its review of that lens is against — the mirror of
+    /// [`WorkloadRecord::reviewed_lens_versions`], because a review template's lens review
+    /// is a review against ONE version of the lens exactly as a workload's is.
+    pub fn reviewed_lens_versions(&self) -> Vec<(&str, Option<&str>)> {
+        self.lenses
+            .iter()
+            .map(|lens| (lens.as_str(), self.lens_review_version(lens)))
+            .collect()
+    }
+
     /// The pillars ONE lens review of this template reports a summary for, through the
     /// one place that rule lives ([`lens_review_pillars`]) — the same rule a WORKLOAD's
     /// lens review follows ([`WorkloadRecord::lens_review_pillars`]).
@@ -3498,9 +3522,31 @@ impl LensRecord {
     /// behind: re-importing a lens must not move the questions a review of it already asks.
     /// [`Self::latest_version`] is which published version that is, for the reason stated
     /// there.
+    ///
+    /// This is the content a review that pins NO version is against; a review that pins one
+    /// reads [`Self::content_at`].
     pub fn reviewed_content(&self) -> Option<&LensContent> {
         self.latest_version()
             .map(|(_, published)| &published.content)
+    }
+
+    /// The content ONE version of this lens carries — the content a review PINNED at
+    /// `version` asks.
+    ///
+    /// A lens review is a review against ONE version of the lens, and a published version
+    /// is immutable, so the pillars and questions a review asks are the ones the version it
+    /// is against defines: publishing a later version does not move them, which is what
+    /// `UpgradeLensReview` and `UpgradeReviewTemplateLensReview` are for. A review that
+    /// pins no version, and one pinned at a version this lens does not carry, is against
+    /// the lens's latest ([`Self::reviewed_content`]) — the same fallback
+    /// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_name_at`]
+    /// reads the lens's NAME through, so a review's name and its question set always come
+    /// from one version.
+    pub fn content_at(&self, version: Option<&str>) -> Option<&LensContent> {
+        version
+            .and_then(|version| self.versions.get(version))
+            .map(|published| &published.content)
+            .or_else(|| self.reviewed_content())
     }
 
     /// The `LensType` of this lens, as the account that reaches it sees it.
@@ -6532,24 +6578,33 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         alias_names_lens(alias, record).then_some(record)
     }
 
-    /// The CONTENT of the lens a request named — the pillars it is organized into and the
-    /// questions it asks — resolved from the WHOLE lens catalog.
+    /// The CONTENT of the lens a request named, AS OF the version a review of it is
+    /// against — the pillars it is organized into and the questions it asks — resolved from
+    /// the WHOLE lens catalog.
     ///
     /// A lens review reports and counts what the LENS's content defines, and this store
     /// holds that content in two halves that never overlap: an AWS-official lens (named by
     /// its alias or by its account-less ARN, [`is_aws_official_lens`]) is its catalog row
-    /// ([`official_lens`]), and a custom lens is the pillars and questions its imported
-    /// document defines, as published ([`LensRecord::reviewed_content`]). This is the ONE
+    /// ([`official_lens`]), and a custom lens is the pillars and questions the document of
+    /// one of its published versions defines ([`LensRecord::content_at`]). This is the ONE
     /// place that resolution lives, so a listing of a review's answers, a risk or question
     /// roll-up, a pillar summary and the judgement of a `PillarId` a request supplies
     /// cannot disagree about what a lens asks.
+    ///
+    /// `version` is the `LensVersion` the review is PINNED at, which is what makes a lens
+    /// review a review against ONE version of the lens: a custom lens's published versions
+    /// each carry their own document, so a later publish does not move the questions a
+    /// review already asks until an upgrade moves the review to it. An AWS-official lens
+    /// carries exactly one version here — the catalog row IS its content — so the pin
+    /// selects nothing further for it, exactly as [`Self::lens_name_at`] reads its name
+    /// from that row whatever version is named.
     ///
     /// Empty ([`LensContentView::is_empty`]) only for a lens this emulator holds no content
     /// for at all: an official alias the catalog carries no questions for, a custom lens
     /// this store does not hold, or one no version has been published from — and an
     /// unpublished custom lens cannot be applied to a workload or a review template in the
     /// first place ([`Self::unapplicable_lenses_refusal`]).
-    pub fn lens_content(&self, lens: &str) -> LensContentView {
+    pub fn lens_content_at(&self, lens: &str, version: Option<&str>) -> LensContentView {
         if is_aws_official_lens(lens) {
             return official_lens(lens).map_or_else(LensContentView::default, |official| {
                 LensContentView::new(
@@ -6569,7 +6624,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             });
         }
         self.lens_by_alias(lens)
-            .and_then(LensRecord::reviewed_content)
+            .and_then(|record| record.content_at(version))
             .map_or_else(LensContentView::default, |content| {
                 LensContentView::new(
                     content
@@ -6584,30 +6639,54 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     }
 
     /// The content of every lens ONE reviewed resource is reviewed against — a workload's
-    /// or a review template's `lenses`, or those of the workload a milestone recorded —
-    /// resolved in one pass through [`Self::lens_content`], so every projection of that
+    /// lens reviews, a review template's, or those of the workload a milestone recorded —
+    /// resolved in one pass through [`Self::lens_content_at`], so every projection of that
     /// resource reads the same answer to "what does this lens ask?".
-    pub fn reviewed_lens_content(&self, lenses: &[String]) -> ReviewedLensContent {
+    ///
+    /// `reviewed` is each lens as the reviewed resource records it beside the `LensVersion`
+    /// its review of that lens is against, which is what
+    /// [`WorkloadRecord::reviewed_lens_versions`] and
+    /// [`ReviewTemplateRecord::reviewed_lens_versions`] project: the version is part of the
+    /// question, because a lens review is a review against ONE version of the lens.
+    pub fn reviewed_lens_content(
+        &self,
+        reviewed: &[(&str, Option<&str>)],
+    ) -> ReviewedLensContent {
         ReviewedLensContent {
-            lenses: lenses
+            lenses: reviewed
                 .iter()
-                .map(|lens| (lens_alias(lens).to_string(), self.lens_content(lens)))
+                .map(|(lens, version)| {
+                    (
+                        lens_alias(lens).to_string(),
+                        self.lens_content_at(lens, *version),
+                    )
+                })
                 .collect(),
         }
     }
 
-    /// The questions the lens a request named asks, in the lens's own order — the ONE
-    /// question set every read of a lens review's answers reports and pages over, from the
-    /// one place that resolution lives ([`Self::lens_content`]).
-    pub fn lens_review_questions(&self, lens: &str) -> Vec<ReviewQuestion> {
-        self.lens_content(lens).into_questions()
+    /// The questions the lens a request named asks as of the version a review of it is
+    /// against, in the lens's own order — the ONE question set every read of a lens
+    /// review's answers reports and pages over, from the one place that resolution lives
+    /// ([`Self::lens_content_at`]).
+    pub fn lens_review_questions(
+        &self,
+        lens: &str,
+        version: Option<&str>,
+    ) -> Vec<ReviewQuestion> {
+        self.lens_content_at(lens, version).into_questions()
     }
 
-    /// The ONE question the lens a request named asks under `question_id`, when it asks
-    /// it: [`Self::lens_review_questions`] resolved by id, which is how every operation
-    /// that reads a single answer names the question.
-    pub fn lens_review_question(&self, lens: &str, question_id: &str) -> Option<ReviewQuestion> {
-        self.lens_review_questions(lens)
+    /// The ONE question the lens a request named asks under `question_id` as of the version
+    /// a review of it is against, when it asks it: [`Self::lens_review_questions`] resolved
+    /// by id, which is how every operation that reads a single answer names the question.
+    pub fn lens_review_question(
+        &self,
+        lens: &str,
+        version: Option<&str>,
+        question_id: &str,
+    ) -> Option<ReviewQuestion> {
+        self.lens_review_questions(lens, version)
             .into_iter()
             .find(|question| question.question_id == question_id)
     }
@@ -6651,7 +6730,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                     .map(|lens| {
                         let selected = manual.then(|| workload.jira_selected_question_ids(lens));
                         let questions = self
-                            .lens_review_questions(lens)
+                            .lens_review_questions(lens, workload.lens_review_version(lens))
                             .into_iter()
                             .map(|question| question.question_id)
                             .filter(|question_id| {
@@ -8533,7 +8612,7 @@ pub const JIRA_CONFIGURATION_MEMBER: &str = "JiraConfiguration";
 /// the lens does NOT define belongs to no pillar of that lens review and is refused rather
 /// than stored. Only a lens this emulator holds content for has a pillar set to judge an
 /// identifier against (`content`, resolved through
-/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_content`]); for
+/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_content_at`]); for
 /// a lens it holds none for there is nothing to judge, so the value is taken as given
 /// rather than refused for a pillar the real lens may well define.
 ///

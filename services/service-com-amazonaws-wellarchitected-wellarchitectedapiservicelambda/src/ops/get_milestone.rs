@@ -174,7 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // whole lens catalog: a custom lens's imported questions are counted in the
             // frozen workload's roll-up exactly as an official lens's are.
             milestone: Some(
-                record.to_milestone(&store.reviewed_lens_content(&record.workload.lenses)),
+                record.to_milestone(
+                    &store.reviewed_lens_content(&record.workload.reviewed_lens_versions()),
+                ),
             ),
         })
     }
