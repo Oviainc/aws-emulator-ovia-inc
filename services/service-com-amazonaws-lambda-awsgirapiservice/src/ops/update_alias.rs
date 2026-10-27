@@ -249,10 +249,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The alias has to exist to be updated: this operation creates none, so a name
         // the function holds no alias of is the modelled 404, naming the alias ARN the
-        // request asked about.
+        // request asked about. The sentence is the one the UPDATE of an alias states,
+        // which is not the one its read states for the same vanished alias.
         let alias_arn = record.versioned_arn(&input.name);
         if !record.aliases.contains_key(&input.name) {
-            return Err(not_found(crate::state::alias_not_found_message(&alias_arn)));
+            return Err(not_found(crate::state::alias_update_not_found_message(
+                &alias_arn,
+            )));
         }
 
         // "The function version that the alias invokes" has to be one the function has:
