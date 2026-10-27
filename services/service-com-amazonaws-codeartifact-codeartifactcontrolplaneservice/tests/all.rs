@@ -73,3 +73,5 @@ mod sub_package_group_listing;
 mod authorization_token;
 #[path = "all/package_version_listing.rs"]
 mod package_version_listing;
+#[path = "all/package_version_input_status.rs"]
+mod package_version_input_status;

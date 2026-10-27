@@ -2097,6 +2097,17 @@ pub struct FeatureRecord {
     pub status: String,
     pub updated_at_millis: i64,
     pub additional_configuration: Vec<AdditionalConfigRecord>,
+    /// When this feature's free trial began for the account that holds this
+    /// record, in epoch milliseconds, or `None` while the feature has never been
+    /// enabled for it and its trial has therefore not started.
+    ///
+    /// Recorded ONCE, at the instant the switch first becomes [`ENABLED`], and kept
+    /// across every later switch: the trial is a one-off per account per feature, so
+    /// turning a feature off and on again does not buy a second one. It is a
+    /// different fact from [`Self::updated_at_millis`], which moves every time the
+    /// switch changes, and it is the single stored fact
+    /// [`free_trial_days_remaining`] counts the remaining days from.
+    pub free_trial_started_at_millis: Option<i64>,
 }
 
 /// A feature's nested additional configuration (e.g. a Runtime Monitoring agent
@@ -3325,7 +3336,7 @@ pub const INVESTIGATION_TRANSITION_MILLIS: i64 = 500;
 /// The window the per-day investigation limit is counted over: "you can initiate
 /// up to 10 investigations per account per day"
 /// (`smithy_query(query="doc",shape="CreateInvestigation")`).
-pub const INVESTIGATION_DAY_MILLIS: i64 = 24 * 60 * 60 * 1000;
+pub const INVESTIGATION_DAY_MILLIS: i64 = DAY_MILLIS;
 
 /// How many investigations an account may initiate per day: "During the preview,
 /// you can initiate up to 10 investigations per account per day"
@@ -5351,15 +5362,22 @@ pub fn refuse_runtime_monitoring_overlap(asked_for: impl Fn(&str) -> bool) -> Re
 pub fn default_features(now: i64) -> Vec<FeatureRecord> {
     reported_features()
         .into_iter()
-        .map(|name| FeatureRecord {
-            name: name.to_string(),
-            status: if OPT_IN_FEATURES.contains(&name) {
-                DISABLED.to_string()
+        .map(|name| {
+            let status = if OPT_IN_FEATURES.contains(&name) {
+                DISABLED
             } else {
-                ENABLED.to_string()
-            },
-            updated_at_millis: now,
-            additional_configuration: Vec::new(),
+                ENABLED
+            };
+            FeatureRecord {
+                name: name.to_string(),
+                status: status.to_string(),
+                updated_at_millis: now,
+                additional_configuration: Vec::new(),
+                // A feature this account starts with ENABLED starts its free trial
+                // at the same instant; one it starts with DISABLED has not started
+                // its trial yet.
+                free_trial_started_at_millis: (status == ENABLED).then_some(now),
+            }
         })
         .collect()
 }
@@ -5694,12 +5712,19 @@ pub fn set_feature_in(features: &mut Vec<FeatureRecord>, name: &str, status: &st
             existing.status = status.to_string();
             existing.updated_at_millis = now;
         }
+        // Enabling a feature for the first time starts its free trial, and only the
+        // first time: a feature whose trial has already begun keeps the instant it
+        // began at, however often the switch moves afterwards.
+        if status == ENABLED && existing.free_trial_started_at_millis.is_none() {
+            existing.free_trial_started_at_millis = Some(now);
+        }
     } else {
         features.push(FeatureRecord {
             name: name.to_string(),
             status: status.to_string(),
             updated_at_millis: now,
             additional_configuration: Vec::new(),
+            free_trial_started_at_millis: (status == ENABLED).then_some(now),
         });
     }
 }
@@ -5757,6 +5782,46 @@ pub fn feature_data_source(
         || (DISABLED.to_string(), fallback_millis),
         |f| (f.status.clone(), f.updated_at_millis),
     )
+}
+
+/// How long GuardDuty's free trial of one feature runs, in days.
+///
+/// GuardDuty's own documentation of the trial: an account enabling GuardDuty, or
+/// enabling one of its protection plans, gets a 30-day free trial of it. The model
+/// carries no duration — `FreeTrialDaysRemaining` is a plain integer
+/// (`smithy_query(shape="DataSourceFreeTrial")`) — so the length is stated here
+/// once, and everything a read reports about the trial is derived from it.
+pub const FREE_TRIAL_DAYS: i32 = 30;
+
+/// Milliseconds in one day: the unit a duration this service counts in DAYS is
+/// measured against, the stored instants being epoch milliseconds.
+pub const DAY_MILLIS: i64 = 24 * 60 * 60 * 1_000;
+
+/// The whole days left in one feature's free trial at `now` — what
+/// `FreeTrialDaysRemaining` reports for it.
+///
+/// The trial runs [`FREE_TRIAL_DAYS`] days from the instant it began
+/// ([`FeatureRecord::free_trial_started_at_millis`]), so each whole day that has
+/// elapsed since then consumes one: a feature whose trial has not begun has the
+/// whole of it left, and one whose window has run out has none. The count follows
+/// the CLOCK and not the current switch, because the window is a span of time and
+/// not a measure of use: a feature switched off part-way through its trial has the
+/// same days left as one left on.
+///
+/// One reader for the detector's own features and for a member account's, so two
+/// reports of one account's trial cannot disagree.
+pub fn free_trial_days_remaining(features: &[FeatureRecord], feature: &str, now: i64) -> i32 {
+    let Some(started) = features
+        .iter()
+        .find(|f| f.name == feature)
+        .and_then(|f| f.free_trial_started_at_millis)
+    else {
+        return FREE_TRIAL_DAYS;
+    };
+    let elapsed_days = i32::try_from(now.saturating_sub(started) / DAY_MILLIS).unwrap_or(i32::MAX);
+    FREE_TRIAL_DAYS
+        .saturating_sub(elapsed_days)
+        .clamp(0, FREE_TRIAL_DAYS)
 }
 
 /// Write the deprecated `DataSources` view onto `detector`.
