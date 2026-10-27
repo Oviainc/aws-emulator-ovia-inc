@@ -23,12 +23,10 @@
 //! high-resolution 3-of-3 rows (a 10-second window three buckets wide) and the 3-of-5 row that
 //! holds `OK` one datapoint short of M.
 
-use aws_smithy_types::date_time::Format;
-use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{build_router, now_secs, ok, wait_for_evaluation};
+use crate::harness::{build_router, document_instant_secs, now_secs, ok, wait_for_evaluation};
 
 /// The customer namespace every row of the table watches.
 const NAMESPACE: &str = "Custom/MofN";
@@ -387,6 +385,9 @@ async fn publish_one(
                 "MetricName": METRIC,
                 "Dimensions": [{"Name": "Case", "Value": name}],
                 "Value": value,
+                // The same high-resolution series the rows publish into: a sub-minute period
+                // reads only data stored at that resolution.
+                "StorageResolution": 1,
                 "Timestamp": start,
             }],
         }),
@@ -395,17 +396,19 @@ async fn publish_one(
 }
 
 /// One instant of a decision record as epoch seconds: the record writes every instant in the
-/// modelled timestamp type's own rendering, so it is read back through that type rather than
-/// through a second date implementation.
+/// form this service's JSON documents stamp one with, so it is read back through the one reader
+/// every suite uses ([`document_instant_secs`]) rather than through a second date
+/// implementation.
 fn record_instant(case: &str, timestamp: &Value) -> f64 {
     let text = timestamp
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected an instant, got {timestamp}"));
-    DateTime::from_str(text, Format::DateTime)
-        .unwrap_or_else(|error| {
-            panic!("case {case:?}: {text:?} is not a modelled timestamp: {error}")
-        })
-        .as_secs_f64()
+    document_instant_secs(text).unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: {text:?} is not the form a document writes an instant in \
+             (yyyy-MM-dd'T'HH:mm:ss.SSSZ)"
+        )
+    })
 }
 
 #[tokio::test]

@@ -109,6 +109,18 @@ fn datum(metric: &str, value: f64, offset: f64) -> Value {
     })
 }
 
+/// The same datum published at HIGH resolution.
+///
+/// A read at a SUB-MINUTE period sees sub-minute buckets only of a series stored at that
+/// resolution: "Setting this to 1 specifies this metric as a high-resolution metric […] Setting
+/// this to 60 specifies this metric as regular resolution, which CloudWatch stores at 1-minute
+/// resolution." (`MetricDatum$StorageResolution`) — so a case that asserts windows finer than a
+/// minute publishes the series those windows can exist in.
+fn high_resolution(mut datum: Value) -> Value {
+    datum["StorageResolution"] = json!(1);
+    datum
+}
+
 /// A `GetMetricStatistics` request over the `Service=api` series of `metric`.
 fn statistics_request(metric: &str, period: i64, end_offset: f64, statistics: &[&str]) -> Value {
     json!({
@@ -480,9 +492,9 @@ async fn datapoints_bucket_into_period_windows_anchored_at_the_start_time() {
         &json!({
             "Namespace": "MyApp",
             "MetricData": [
-                datum("Windowed", 10.0, 0.0),
-                datum("Windowed", 20.0, 30.0),
-                datum("Windowed", 30.0, 90.0),
+                high_resolution(datum("Windowed", 10.0, 0.0)),
+                high_resolution(datum("Windowed", 20.0, 30.0)),
+                high_resolution(datum("Windowed", 30.0, 90.0)),
             ],
         }),
     )
@@ -584,6 +596,9 @@ async fn a_start_time_off_the_boundary_is_rounded_down_before_the_windows_are_la
                         "MetricName": metric,
                         "Dimensions": [{"Name": "Service", "Value": "api"}],
                         "Value": 4.0,
+                        // A row whose period is sub-minute asserts a window finer than a
+                        // minute, which only a high-resolution series has.
+                        "StorageResolution": if period < 60 { 1 } else { 60 },
                         "Timestamp": at,
                     }],
                 }),

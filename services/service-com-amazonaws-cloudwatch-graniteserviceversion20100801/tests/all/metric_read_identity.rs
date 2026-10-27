@@ -112,7 +112,8 @@ fn read(metric: &str, start: f64, end: f64, period: i64, unit: Option<&str>) -> 
 }
 
 /// Write one datapoint of the `Service=api` series of `metric` straight into the store, at an
-/// instant a publish can no longer stamp.
+/// instant a publish can no longer stamp, stored at `storage_resolution` seconds of
+/// granularity.
 ///
 /// The ingest window `PutMetricData` documents is about WHEN a datapoint may be written, not
 /// about how long CloudWatch keeps one, so the aged series a retention row reads is seeded the
@@ -122,6 +123,7 @@ fn seed_datapoint(
     metric: &str,
     at_secs: f64,
     value: f64,
+    storage_resolution: i32,
 ) {
     use service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as cloudwatch;
 
@@ -144,8 +146,7 @@ fn seed_datapoint(
                 minimum: value,
                 maximum: value,
                 unit: Some("Count".to_string()),
-                // The default `StorageResolution` of a published datum.
-                storage_resolution: 60,
+                storage_resolution,
             }],
         )
         .expect("the metric store has room for the seeded series");
@@ -311,7 +312,12 @@ async fn a_read_sees_a_datapoint_only_at_a_granularity_its_tier_still_holds() {
         // not the rounding of a start time off its boundary.
         let span = f64::from(period as i32);
         let at = ((now - age) / span).floor() * span;
-        seed_datapoint(&engine, &metric, at, 12_345.0);
+        // A span read at a SUB-MINUTE period is one only a high-resolution series has ("Data
+        // points with a period of less than 60 seconds are available only for custom metrics
+        // defined with a StorageResolution of 1"), because regular resolution stores a
+        // datapoint at 1-minute granularity; every other row is the default resolution.
+        let resolution = if period < 60 { 1 } else { 60 };
+        seed_datapoint(&engine, &metric, at, 12_345.0, resolution);
 
         let body = ok(
             &router,

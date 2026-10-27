@@ -261,7 +261,7 @@ impl Transition<'_> {
             &mut document,
             "AlarmConfigurationUpdatedTimestamp",
             self.configuration_updated_secs
-                .and_then(super::rfc3339)
+                .and_then(super::document_instant)
                 .map(Value::from),
         );
         document.insert(
@@ -281,7 +281,7 @@ impl Transition<'_> {
         insert(
             &mut document,
             "StateChangeTime",
-            super::rfc3339(self.at_secs).map(Value::from),
+            super::document_instant(self.at_secs).map(Value::from),
         );
         if !region.is_empty() {
             document.insert("Region".to_string(), Value::from(region));
@@ -900,7 +900,7 @@ fn triggering_children(children: &[super::ChildAlarmState]) -> Value {
                     "Timestamp",
                     child
                         .transitioned_secs
-                        .and_then(super::rfc3339)
+                        .and_then(super::document_instant)
                         .map(Value::from),
                 );
                 let mut entry = Map::new();

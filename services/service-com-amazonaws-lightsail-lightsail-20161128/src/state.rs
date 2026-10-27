@@ -12914,6 +12914,31 @@ impl ComAmazonawsLightsailLightsail20161128State {
         );
     }
 
+    /// Remove the container service `name` names in `region`, answering the
+    /// record that was stored under it, or `None` when this account holds no
+    /// container service of that name there.
+    ///
+    /// Everything a container service carries lives ON this record — its power
+    /// and scale, its tags, the groups of public domain names it served, the
+    /// access its image puller role held, the deployments (current and next) and
+    /// the container images registered to it — so removing the record is what
+    /// removes them all, and no later read can report a deployment or a
+    /// registered image of a service this account no longer holds. The name is
+    /// free again for a service that inherits nothing from this one, exactly as
+    /// it is for every other removal here. A CERTIFICATE a group of public
+    /// domain names was keyed by is NOT removed with it: a certificate is a
+    /// resource of its own, so it is released by this removal rather than
+    /// deleted by it. The operation log is append-only, so the entries this
+    /// service's earlier calls wrote stay readable.
+    pub fn remove_container_service(
+        &mut self,
+        region: &str,
+        name: &str,
+    ) -> Option<StoredContainerService> {
+        self.container_services
+            .remove(&(region.to_string(), name.to_string()))
+    }
+
     /// The bucket `name` names in `region`, for a reporting operation.
     pub fn bucket(&self, region: &str, name: &str) -> Option<&StoredBucket> {
         self.buckets.get(&(region.to_string(), name.to_string()))

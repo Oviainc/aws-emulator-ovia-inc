@@ -118,11 +118,31 @@ pub const HEALTHY_VALUE: f64 = 1.0;
 /// The value a datapoint carries while the health check is considered unhealthy.
 pub const UNHEALTHY_VALUE: f64 = 0.0;
 
-/// The resolution the series is stored at, in seconds — the regular resolution a
+/// The resolution a datapoint of this series is stored at, in seconds, for a
+/// check whose probes come a MINUTE or more apart — the regular resolution a
 /// metric has unless its publisher asks for the high-resolution one ("This field
 /// is optional, if you do not specify it the default of 60 is used",
 /// `MetricDatum$StorageResolution`).
-pub const STORAGE_RESOLUTION_SECS: i32 = 60;
+pub const REGULAR_STORAGE_RESOLUTION_SECS: i32 = 60;
+
+/// The resolution a SUB-MINUTE check's series is stored at: a series is readable
+/// at a period only as fine as the resolution it was stored at ("Data points with
+/// a period of less than 60 seconds are available only for custom metrics defined
+/// with a StorageResolution of 1"), and a regular-resolution datapoint is
+/// aggregated in the minute it was published in. A check probing faster than once
+/// a minute therefore publishes the high-resolution series its own cadence needs,
+/// so a window of the check's interval holds the one assessment made in it.
+pub const HIGH_STORAGE_RESOLUTION_SECS: i32 = 1;
+
+/// Which of the two resolutions the series of a check probing every `interval`
+/// carries.
+fn storage_resolution_secs(interval: Duration) -> i32 {
+    if interval < Duration::from_secs(60) {
+        HIGH_STORAGE_RESOLUTION_SECS
+    } else {
+        REGULAR_STORAGE_RESOLUTION_SECS
+    }
+}
 
 /// How far apart a health check's probes come DUE while its series is still
 /// catching up with the present.
@@ -540,7 +560,7 @@ fn publish_due_probes<Eng: Send + Sync + 'static>(engine: &Eng) {
         })
         .collect();
 
-    let published: Vec<(String, SystemTime, f64)> = {
+    let published: Vec<(String, SystemTime, f64, i32)> = {
         let mut store = state.lock();
         let mut published = Vec::with_capacity(assessed.len());
         for (id, observation) in assessed {
@@ -572,6 +592,9 @@ fn publish_due_probes<Eng: Send + Sync + 'static>(engine: &Eng) {
                 id,
                 stamp,
                 if healthy { HEALTHY_VALUE } else { UNHEALTHY_VALUE },
+                // The series carries one assessment per probe, so it is stored at
+                // the resolution this check's own cadence can be read at.
+                storage_resolution_secs(interval),
             ));
         }
         published
@@ -624,7 +647,10 @@ fn alarm_states<Eng: Send + Sync + 'static>(
 ///
 /// Nothing is published when the CloudWatch store is not mounted beside this
 /// service: a datapoint has one home, and this path never makes a second one.
-fn append_datapoints<Eng: Send + Sync + 'static>(engine: &Eng, published: &[(String, SystemTime, f64)]) {
+fn append_datapoints<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    published: &[(String, SystemTime, f64, i32)],
+) {
     if published.is_empty() {
         return;
     }
@@ -632,7 +658,7 @@ fn append_datapoints<Eng: Send + Sync + 'static>(engine: &Eng, published: &[(Str
         return;
     };
     let mut store = state.lock();
-    for (id, stamp, value) in published {
+    for (id, stamp, value, storage_resolution) in published {
         let key = cloudwatch::state::MetricKey {
             namespace: NAMESPACE.to_string(),
             metric_name: HEALTH_CHECK_STATUS_METRIC.to_string(),
@@ -652,7 +678,7 @@ fn append_datapoints<Eng: Send + Sync + 'static>(engine: &Eng, published: &[(Str
             // The series carries a status rather than a quantity, so there is no
             // unit to declare for it.
             unit: None,
-            storage_resolution: STORAGE_RESOLUTION_SECS,
+            storage_resolution: *storage_resolution,
         };
         if store.append_datapoints(key, vec![datum]).is_err() {
             // The metric store holds no more series. The health check itself was

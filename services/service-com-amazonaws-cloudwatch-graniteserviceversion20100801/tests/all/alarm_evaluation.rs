@@ -123,11 +123,19 @@ impl Datum {
     }
 
     /// This datapoint as a `MetricDatum` of the series `domain` names, stamped against `now`.
+    ///
+    /// Published at high resolution: the rows that evaluate a sub-minute period need a series
+    /// stored at that resolution, because regular resolution stores a datapoint at 1-minute
+    /// granularity ("Setting this to 1 specifies this metric as a high-resolution metric […]
+    /// Setting this to 60 specifies this metric as regular resolution, which CloudWatch stores
+    /// at 1-minute resolution", `MetricDatum$StorageResolution`). A row evaluating 60-second
+    /// periods reads the same windows either way.
     fn rendered(&self, now: f64, domain: &str) -> Value {
         let mut rendered = json!({
             "MetricName": METRIC,
             "Dimensions": [{"Name": "DomainName", "Value": domain}],
             "Value": self.value,
+            "StorageResolution": 1,
             "Timestamp": now - self.age_secs,
         });
         for (member, value) in self.extra.as_object().cloned().unwrap_or_default() {

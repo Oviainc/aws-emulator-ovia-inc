@@ -650,3 +650,26 @@ pub async fn alarm_history_items(
 pub fn alarm_stamp(alarm: &Value, member: &str) -> Option<f64> {
     alarm.get(member).and_then(Value::as_f64)
 }
+
+/// One instant read out of a JSON DOCUMENT this service reports — an alarm's `StateReasonData`,
+/// the `HistoryData` that records it, or an action's notification — as epoch seconds; `None`
+/// for text that is not the form those documents write.
+///
+/// That form is `yyyy-MM-dd'T'HH:mm:ss.SSSZ`: a three-digit millisecond field and a numeric UTC
+/// offset (`2026-09-22T23:06:00.000+0000`), the one pattern a consumer parses every instant of
+/// a document with. So this reader accepts exactly it — the offset and the millisecond field
+/// are required here rather than assumed — and reads the calendar fields back through the
+/// modelled timestamp type rather than through a second date implementation.
+pub fn document_instant_secs(text: &str) -> Option<f64> {
+    let utc = text.strip_suffix("+0000")?;
+    let (_, fraction) = utc.split_once('.')?;
+    if fraction.len() != 3 || !fraction.chars().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    ::aws_smithy_types::DateTime::from_str(
+        &format!("{utc}Z"),
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()
+    .map(|instant| instant.as_secs_f64())
+}
