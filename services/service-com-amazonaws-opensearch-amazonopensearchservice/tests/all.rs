@@ -107,6 +107,8 @@ mod upgrade_eligibility_checks;
 mod upgrade_history;
 #[path = "all/upgrade_status.rs"]
 mod upgrade_status;
+#[path = "all/upgrade_status_reporting.rs"]
+mod upgrade_status_reporting;
 #[path = "all/version_catalog.rs"]
 mod version_catalog;
 #[path = "all/vpc_access_endpoints.rs"]

@@ -44,7 +44,11 @@
 //!    [ … ]` — never the value the member held, which is rule 2's second exception: what
 //!    such a caller acts on is the set it must choose from. The set's MEMBERSHIP is the
 //!    model's; the ORDER it is listed in is the service's own listing of that enum's values
-//!    ([`VALUE_LISTINGS`], [`listed`]), which no order the model carries reproduces.
+//!    ([`VALUE_LISTINGS`], [`listed`]), which no order the model carries reproduces. The
+//!    order is a property of the ENUM, not of the member or the operation reaching it, so
+//!    one enum states one ordered set wherever it is reached — in the body, in the query
+//!    string, in a URI label, inside a nested structure, as a list element, and beside other
+//!    clauses of the same refusal.
 //!
 //! Rule 4's constraint set is read off the MODEL, not off the refusal: the structured
 //! refusal carries only the constraints that failed, so the ones a value satisfied would
@@ -173,6 +177,16 @@ fn enum_requirement<S: AsRef<str>>(values: &[S]) -> String {
 /// nor drop one it does, and an enum whose membership changes in the model stops matching a
 /// stale listing and states the model's order rather than an outdated set. An enum with no
 /// recorded listing keeps the order the member schema carries, which is the model's.
+///
+/// What a membership CANNOT identify is one enum among several declared over the same
+/// values: this model declares `Active, Creating, Failed` as both `ModelStatus`
+/// (`ListCustomModels.modelStatus`) and `CustomModelDeploymentStatus`
+/// (`ListCustomModelDeployments.statusEquals`), and `CreationTime` as three distinct sort
+/// enums. No listing below orders such a membership — the one recorded listing's five values
+/// are declared by one enum only, so it reaches exactly that enum — and a listing recorded
+/// for one of those enums would need narrower identification than its set before it could be
+/// applied to either. Both orders those two state today are their own model order, pinned by
+/// `tests/all/enum_value_set_listing.rs`.
 const VALUE_LISTINGS: &[&[&str]] = &[
     // `DataRetentionMode` (`PutAccountDataRetention.mode`), which the model declares
     // `default, none, aws_review, provider_data_share, inherit`. The listing is the one
@@ -820,6 +834,32 @@ mod tests {
                     .any(|set| orders_the_same_set(listing, set)),
                 "case {listing:?}: a listing must order a value set this model declares, \
                  and none of {declared:?} holds those values"
+            );
+        }
+    }
+
+    /// A listing's membership identifies ONE enum: no other value set this model declares
+    /// on an input member holds the same values in another order.
+    ///
+    /// [`listed`] resolves a listing by membership, a violation carrying no shape id, so a
+    /// membership two enums declare differently could not be told apart — this model
+    /// declares `Active, Creating, Failed` as two enums, and `CreationTime` as three. The
+    /// listings recorded today order none of those, and this is what keeps it that way: a
+    /// listing added for such a membership fails here rather than silently re-ordering the
+    /// other enum's clause. The sets compared are the ones the member schemas of this
+    /// service's input shapes carry.
+    #[test]
+    fn a_listings_membership_is_declared_by_one_enum_only() {
+        for listing in VALUE_LISTINGS {
+            let sharing: Vec<Vec<&str>> = declared_enum_sets()
+                .into_iter()
+                .filter(|set| orders_the_same_set(listing, set))
+                .collect();
+            assert_eq!(
+                sharing.len(),
+                1,
+                "case {listing:?}: a listing is resolved by its membership, so exactly one \
+                 declared value set may hold those values, got {sharing:?}"
             );
         }
     }

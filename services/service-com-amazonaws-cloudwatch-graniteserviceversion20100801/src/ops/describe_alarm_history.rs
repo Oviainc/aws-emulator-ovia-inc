@@ -220,6 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports, so it is materialised — and the actions it owes are executed — before the
         // items are selected, which keeps this read's answer the same for every later caller.
         crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+        // What this read settled was already due; the transitions the clock owes NEXT are not,
+        // and the client reading this history looks for what they deliver on the action's
+        // target rather than here, so the clock that materialises them is left running.
+        crate::state::alarm_actions::drive_alarm_clock(&self.engine, ctx);
         let mut store = state.lock();
         // Retention is due on the clock, not on this call: drop what has aged out of the
         // retention window before reporting, so a read never reports an expired item.
