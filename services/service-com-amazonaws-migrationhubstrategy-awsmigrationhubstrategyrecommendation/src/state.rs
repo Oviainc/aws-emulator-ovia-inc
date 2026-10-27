@@ -63,8 +63,8 @@
 //!
 //! Last, the account's **recommendation report generation tasks**
 //! ([`RecommendationReport`]): what `StartRecommendationReportGeneration` mints — one at
-//! a time, a start call made while one is running coalescing onto it — and
-//! `GetRecommendationReportDetails` reports.
+//! a time, a start call made while one is running being refused with the modelled
+//! conflict ([`ongoing_task_conflict`]) — and `GetRecommendationReportDetails` reports.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
@@ -784,8 +784,8 @@ pub struct RecommendationReport {
     pub start_time: SystemTime,
     pub completion_time: Option<SystemTime>,
     /// The instant the clock owes this task its terminal status, while it has one. It is
-    /// also what makes the task "in progress": a start call made while one is owed
-    /// coalesces onto this task rather than minting a second one.
+    /// also what makes the task "in progress": a start call made while one is owed is
+    /// refused for this task rather than minting a second one.
     pub completion_due: Option<SystemTime>,
 }
 
@@ -814,7 +814,7 @@ impl RecommendationReport {
     }
 
     /// True while this task has not reached a terminal `RecommendationReportStatus`, so a
-    /// new start call coalesces onto it.
+    /// new start call conflicts with it.
     pub fn is_in_progress(&self) -> bool {
         self.completion_due.is_some()
     }
@@ -2101,20 +2101,31 @@ impl RegionState {
         Some(report)
     }
 
-    /// The id of the report generation task still running at `now`, if there is one.
+    /// The report generation task of this portfolio still running at `now`, if there is
+    /// one.
     ///
     /// Every stored task gets the terminal status the clock already owed it first, so a
     /// task whose span has passed is not reported as running. At most one task is ever in
-    /// progress, because a start call made while this answers `Some` coalesces onto that
-    /// task instead of minting another.
-    pub fn in_progress_report_id(&mut self, now: SystemTime) -> Option<String> {
+    /// progress, because a start call made while this answers `Some` is refused with the
+    /// modelled conflict ([`ongoing_task_conflict`]) instead of minting another.
+    pub fn ongoing_report_generation(&mut self, now: SystemTime) -> Option<OngoingTask> {
         for report in self.recommendation_reports.values_mut() {
             report.settle(now);
         }
+        self.running_report_task()
+    }
+
+    /// The same task as [`Self::ongoing_report_generation`], read without materialising
+    /// anything: for a caller that has already settled what the clock owes this portfolio.
+    fn running_report_task(&self) -> Option<OngoingTask> {
         self.recommendation_reports
             .values()
             .find(|report| report.is_in_progress())
-            .map(|report| report.id.clone())
+            .map(|report| OngoingTask {
+                kind: RECOMMENDATION_REPORT_GENERATION_TASK,
+                id: report.id.clone(),
+                status: report.status.clone(),
+            })
     }
 
     /// How many servers of this account's portfolio a report scoped by `groups` covers.
@@ -2181,16 +2192,7 @@ impl RegionState {
                     status: assessment.status.clone(),
                 })
         };
-        let reporting = || {
-            self.recommendation_reports
-                .values()
-                .find(|report| report.is_in_progress())
-                .map(|report| OngoingTask {
-                    kind: RECOMMENDATION_REPORT_GENERATION_TASK,
-                    id: report.id.clone(),
-                    status: report.status.clone(),
-                })
-        };
+        let reporting = || self.running_report_task();
         importing.or_else(assessing).or_else(reporting)
     }
 

@@ -9,9 +9,10 @@
 //!    its `RecommendationTaskId`, and `GetRecommendationReportDetails` reports that
 //!    stored record — whatever `outputFormat` and however many `groupIdFilter` groups the
 //!    request carried;
-//! 2. while a task is in progress a further start call COALESCES onto it: it answers with
-//!    the running task's id and mints nothing, whatever parameters it carries; once the
-//!    clock has given that task its terminal status a start call mints a new task;
+//! 2. only ONE task runs at a time, so a start call made while one is in progress is
+//!    REFUSED with the modelled `ConflictException` (HTTP 409) naming the task already
+//!    running: it mints nothing and answers no id, whatever parameters it carries; once
+//!    the clock has given that task its terminal status a start call mints a new task;
 //! 3. the clock owes the task a terminal status after the completion span, and that
 //!    status is `SUCCESS` — the status the service's recorded behaviour shows a started
 //!    task settling on — with a status message reporting what was in scope and that no
@@ -49,10 +50,10 @@ use crate::import_and_assess::{at, call, emulator, Answer, TEST_REGION};
 
 /// Every value `OutputFormat` admits, from
 /// `smithy_query(query="shape",shape="OutputFormat")`.
-const OUTPUT_FORMATS: &[&str] = &["Excel", "Json"];
+pub(crate) const OUTPUT_FORMATS: &[&str] = &["Excel", "Json"];
 
 /// Every value `GroupName` admits, from `smithy_query(query="shape",shape="GroupName")`.
-const GROUP_NAMES: &[&str] = &["ExternalId", "ExternalSourceType"];
+pub(crate) const GROUP_NAMES: &[&str] = &["ExternalId", "ExternalSourceType"];
 
 /// Every value `RecommendationReportStatus` admits, from
 /// `smithy_query(query="shape",shape="RecommendationReportStatus")`.
@@ -60,8 +61,8 @@ const REPORT_STATUSES: &[&str] = &["FAILED", "IN_PROGRESS", "SUCCESS"];
 
 /// The non-terminal `RecommendationReportStatus`, and the terminal one a started task
 /// settles on.
-const REPORT_IN_PROGRESS: &str = "IN_PROGRESS";
-const REPORT_SETTLED: &str = "SUCCESS";
+pub(crate) const REPORT_IN_PROGRESS: &str = "IN_PROGRESS";
+pub(crate) const REPORT_SETTLED: &str = "SUCCESS";
 
 /// `RecommendationReportStatusMessage`'s `@length(0, 512)` and `.*\S.*`, from
 /// `smithy_query(query="shape",shape="RecommendationReportDetails")`.
@@ -77,7 +78,12 @@ fn matches_recommendation_task_id(value: &str) -> bool {
             .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || c == '-' || c == ':')
 }
 
-async fn start_report(router: &MultiServiceRouter, request: Value) -> Answer {
+/// The wire error code a start call refused for a report generation already running
+/// carries, and its status.
+pub(crate) const CONFLICT_EXCEPTION: &str = "ConflictException";
+pub(crate) const CONFLICT_STATUS: u16 = 409;
+
+pub(crate) async fn start_report(router: &MultiServiceRouter, request: Value) -> Answer {
     call(
         router,
         "POST",
@@ -87,7 +93,7 @@ async fn start_report(router: &MultiServiceRouter, request: Value) -> Answer {
     .await
 }
 
-async fn report_details(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn report_details(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -98,7 +104,7 @@ async fn report_details(router: &MultiServiceRouter, id: &str) -> Answer {
 }
 
 /// One `groupIdFilter` entry, held to the `GroupName` catalog above.
-fn group(name: &str, value: &str) -> Value {
+pub(crate) fn group(name: &str, value: &str) -> Value {
     assert!(
         GROUP_NAMES.contains(&name),
         "a group name GroupName does not declare: {name:?}"
@@ -144,7 +150,7 @@ fn start_cases() -> Vec<(&'static str, Value)> {
 
 /// One emulator, plus the engine behind it so a case can read the store the handlers
 /// write — which is how "a second start call minted nothing" is checked.
-fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -154,7 +160,7 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// How many report generation tasks the store holds in the Region the calls are signed
 /// for.
-fn stored_task_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
+pub(crate) fn stored_task_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
     engine
         .state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>()
         .lock()
@@ -228,8 +234,8 @@ fn inventory() -> Vec<ServerRecord> {
 async fn a_report_generation_task_is_reported_from_what_was_stored() {
     // ONE emulator for every row, so each row's id is minted by a store that already
     // holds the earlier rows' tasks and has to be fresh. Between rows the test waits out
-    // the completion span, because while a task is in progress a start call coalesces
-    // onto it (the next test's subject) instead of minting.
+    // the completion span, because while a task is in progress a start call is refused
+    // for it (the next test's subject) instead of minting.
     let router = emulator();
     let mut seen_ids: Vec<String> = Vec::new();
 
@@ -314,11 +320,12 @@ async fn a_report_generation_task_is_reported_from_what_was_stored() {
     }
 }
 
-/// While one task is in progress, a start call answers with THAT task's id and mints
-/// nothing — whatever parameters it carries. Once the clock has settled the task, the
-/// next start call mints a new one.
+/// While one task is in progress, a start call is refused with the modelled 409
+/// `ConflictException` and mints nothing — whatever parameters it carries, and whether or
+/// not they are the running task's. Once the clock has settled the task, the next start
+/// call mints a new one.
 #[tokio::test]
-async fn a_start_while_one_is_in_progress_answers_the_running_tasks_id() {
+async fn a_start_while_one_is_in_progress_is_refused_with_the_modelled_conflict() {
     let (router, engine) = emulator_with_engine();
 
     let started_at = Instant::now();
@@ -330,6 +337,9 @@ async fn a_start_while_one_is_in_progress_answers_the_running_tasks_id() {
     );
     let first_id = first.string("/id");
 
+    // How many rows really observed the conflict: a row the clock got ahead of is skipped
+    // rather than asserted wrongly, so the table has to state it did not skip everything.
+    let mut observed = 0usize;
     for (case, request) in start_cases() {
         if started_at.elapsed() >= COMPLETION_SPAN {
             // The clock has already settled the task, so a further call is no longer
@@ -339,25 +349,60 @@ async fn a_start_while_one_is_in_progress_answers_the_running_tasks_id() {
         }
         let again = start_report(&router, request).await;
         assert_eq!(
-            again.status, 200,
-            "case {case:?}: expected HTTP 200 from a coalescing start call, got {} with {:?}",
+            again.status, CONFLICT_STATUS,
+            "case {case:?}: expected HTTP {CONFLICT_STATUS} from a start call made while a task \
+             is in progress, got {} with {:?}",
             again.status, again.body
         );
         assert_eq!(
-            again.string("/id"),
-            first_id,
-            "case {case:?}: a start call made while a task is in progress must answer that \
-             task's id {first_id:?}, got {:?}",
+            again.error_code(),
+            CONFLICT_EXCEPTION,
+            "case {case:?}: expected {CONFLICT_EXCEPTION}, got {:?}",
+            again.body
+        );
+        let message = again.string("/message");
+        assert!(
+            message.contains(&first_id),
+            "case {case:?}: the conflict must name the task already running ({first_id:?}), got \
+             {message:?}"
+        );
+        assert!(
+            message.contains(REPORT_IN_PROGRESS),
+            "case {case:?}: the conflict must report the status that task holds \
+             ({REPORT_IN_PROGRESS}), got {message:?}"
+        );
+        assert_eq!(
+            at(&again.body, "/id"),
+            Value::Null,
+            "case {case:?}: a refused start call answers no task id, got {:?}",
             again.body
         );
         assert_eq!(
             stored_task_count(&engine),
             1,
-            "case {case:?}: a coalescing start call must mint nothing, but the store holds {} \
-             tasks",
+            "case {case:?}: a refused start call must mint nothing, but the store holds {} tasks",
             stored_task_count(&engine)
         );
+        // And the running task is left exactly as it was: still running, still the one
+        // the first call minted.
+        let running = report_details(&router, &first_id).await;
+        assert_eq!(
+            (
+                running.status,
+                running.string("/recommendationReportDetails/status")
+            ),
+            (200, REPORT_IN_PROGRESS.to_string()),
+            "case {case:?}: the refused call disturbed the running task, got {:?}",
+            running.body
+        );
+        observed += 1;
     }
+    assert!(
+        observed > 0,
+        "no row observed the conflict at all: expected at least one of the {} rows to be \
+         asserted inside the completion span",
+        start_cases().len()
+    );
 
     // Nothing is done here but wait: no call drives the transition.
     std::thread::sleep(COMPLETION_SPAN + Duration::from_millis(200));
@@ -371,6 +416,11 @@ async fn a_start_while_one_is_in_progress_answers_the_running_tasks_id() {
     );
 
     let next = start_report(&router, json!({})).await;
+    assert_eq!(
+        next.status, 200,
+        "a start call made after the running task settled is accepted, got {} with {:?}",
+        next.status, next.body
+    );
     let next_id = next.string("/id");
     assert_ne!(
         next_id, first_id,
@@ -659,7 +709,8 @@ async fn a_start_call_past_the_quota_is_refused() {
                     servers_covered: 0,
                     start_time: settled_at,
                     completion_time: Some(settled_at),
-                    // Settled: nothing is owed, so the call below is not a coalescing one.
+                    // Settled: nothing is owed, so the call below is not refused for a
+                    // task still running.
                     completion_due: None,
                 },
             );

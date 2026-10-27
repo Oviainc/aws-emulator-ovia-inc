@@ -8,9 +8,15 @@
 //! server endpoints created for a registration, and the tags written against any of
 //! those resources' ARNs. The two fleets this service resolves a request against but
 //! does not own — the account's EC2 instances and its AWS Directory Service directories —
-//! live here too, each behind its own seed seam. The
+//! live here too, each behind its own seed seam; the instances are ALSO resolved against
+//! the service that owns them ([`ec2_fleet`]), which is what makes an instance a client
+//! really launched a target this service accepts. The
 //! list/lookup/pagination/filter helpers live here as well, so the operation handlers in
 //! `ops/` all resolve a resource the same way instead of each growing its own copy.
+
+/// Resolving the EC2 instance a request names against the instances the account has,
+/// through the service that owns instances.
+pub mod ec2_fleet;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -693,16 +699,19 @@ pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscrip
     /// and a request that refreshes every instance would pay instances x associations with
     /// the service-state lock held.
     pub instance_users_by_instance: HashMap<String, Vec<String>>,
-    /// The EC2 instances this account has, keyed by instance id.
+    /// The EC2 instances this account has in this service's OWN fleet seam, keyed by
+    /// instance id.
     ///
     /// Whether the caller may associate a user with an instance is a fact about the
-    /// ACCOUNT's EC2 fleet, not about this service: this service models no operation
-    /// that launches an instance, so without a seed nothing could ever be authorized.
-    /// [`seed_account_instances`] is therefore a fixture standing in for EC2's own
-    /// `RunInstances`, exactly as `ec2instanceconnect`'s `seed_instances` is for its
-    /// instance registry, and it is the single place an EC2 emulator with an instance
-    /// store would publish instances for this service to read. A test registers its own
-    /// with [`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::register_account_instance`].
+    /// ACCOUNT's EC2 instances, not about this service, and this service models no
+    /// operation that launches one — so the instances a request is resolved against come
+    /// from the service that owns them, asked over the in-process callback
+    /// ([`ec2_fleet`]). This map is the OTHER half of that resolution, not a closed list
+    /// of the only ids that can be authorized: it holds the instances
+    /// [`seed_account_instances`] starts the account with, so a process that mounts this
+    /// service with no EC2 beside it still has instances to associate users with, plus any
+    /// a test registers with
+    /// [`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::register_account_instance`].
     pub account_instances: HashMap<String, String>,
     /// The AWS Directory Service directories this account has, keyed by `DirectoryId`,
     /// each carrying the `DirectoryStage` it is in.
@@ -733,12 +742,15 @@ pub struct ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscrip
     pub next_host_address: u32,
 }
 
-/// The EC2 instances the account starts with, as `(instance id, Availability Zone)`.
+/// The EC2 instances the account starts with in this service's own fleet seam, as
+/// `(instance id, Availability Zone)`.
 ///
 /// Three instances in the Region the emulator writes into the SDK shared config
 /// (`us-east-1`, see `vendor/server/src/lib.rs`), with ids of EC2's own
-/// `i-[0-9a-f]{17}` form. The set is deliberately small and fixed: it decides only
-/// whether an instance EXISTS, which is all this service's authorization gate reads.
+/// `i-[0-9a-f]{17}` form, so a process that mounts this service with no EC2 beside it has
+/// instances to associate users with. It is NOT the set of instances this service
+/// authorizes: an instance EC2 holds is resolved against EC2 itself
+/// ([`ec2_fleet::authorizes_instance`]), whatever this seed says.
 pub fn seed_account_instances() -> Vec<(String, String)> {
     [
         ("i-0f1e2d3c4b5a69788", "us-east-1a"),
@@ -1012,11 +1024,13 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .is_some_and(|stage| stage == DIRECTORY_STAGE_ACTIVE)
     }
 
-    /// Whether the caller may be shown to own `instance_id`: true exactly when the
-    /// account's EC2 fleet holds it.
+    /// Whether this service's OWN fleet seam holds `instance_id`.
     ///
-    /// The gate every operation that acts on an instance runs BEFORE it looks anything
-    /// else up, so a refusal discloses nothing about this service's own resources.
+    /// Half of the instance resolution: an id this answers `false` for is resolved against
+    /// the service that owns instances before the request is refused, which is what
+    /// [`ec2_fleet::authorizes_instance`] does — the one predicate every operation that
+    /// acts on a caller-named instance asks. Nothing calls this on its own to decide a
+    /// refusal.
     pub fn authorizes_instance(&self, instance_id: &str) -> bool {
         self.account_instances.contains_key(instance_id)
     }

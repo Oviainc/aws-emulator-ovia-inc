@@ -61,6 +61,17 @@ async fn delete(em: &Emulator, case: &str, arn: &str, range: &Value) {
     );
 }
 
+/// The billing period AFTER `billing_period`, in the zero-padded `YYYY-MM` spelling the
+/// modelled `BillingPeriod` pattern `^\d{4}-(0?[1-9]|1[012])$` allows.
+fn next_billing_period(billing_period: &str) -> String {
+    let (year, month) = billing_period
+        .split_once('-')
+        .expect("a billing period is spelled YYYY-MM");
+    let total = year.parse::<i64>().expect("a four-digit year") * 12
+        + month.parse::<i64>().expect("a month");
+    format!("{:04}-{:02}", total.div_euclid(12), total.rem_euclid(12) + 1)
+}
+
 /// One row: a custom line item, the pairs its create persisted, the ARN spelling the
 /// tagging calls address it by, and the update that intervenes between the tag and the
 /// read-back.
@@ -210,6 +221,7 @@ async fn a_deleted_custom_line_item_takes_its_tags_with_it() {
     // span it names starts at the current one, which the service's own clock decides.
     let current_billing_period =
         service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
+    let next_billing_period = next_billing_period(&current_billing_period);
     struct DeleteCase<'a> {
         label: &'a str,
         name: &'a str,
@@ -248,10 +260,11 @@ async fn a_deleted_custom_line_item_takes_its_tags_with_it() {
             created: vec![("stage", "test")],
             by_bare_id: false,
             range: json!({
-                // The item applies to every period, so a span starting at the current
-                // one leaves it applying to the periods before it — record and tags
-                // included.
+                // The item applies from the billing period it was created in on, so a
+                // delete bounded to that one period alone leaves it applying to the
+                // periods after it — record and tags included.
                 "InclusiveStartBillingPeriod": current_billing_period,
+                "ExclusiveEndBillingPeriod": next_billing_period,
             }),
             survives: true,
         },

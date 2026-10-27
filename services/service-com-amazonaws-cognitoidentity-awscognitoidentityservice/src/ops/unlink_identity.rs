@@ -6,7 +6,10 @@
 //! later `GetId` presenting it resolves nothing and mints a NEW identity — "unlinked
 //! logins will be considered new identities next time they are seen". The identity record
 //! itself survives with the remaining providers; removing its last one leaves it reachable
-//! through no login at all, which is what makes it inaccessible.
+//! through no login at all, which is what makes it inaccessible — a DISABLED identity,
+//! which every later read projects with the disabled sentinel in place of the providers
+//! that were removed. Being unsigned, the call is authorized by the TOKENS its `Logins`
+//! map presents, and it detaches PUBLIC providers only.
 //!
 //! ## Shape of an operation
 //!
@@ -244,6 +247,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
         };
         let identity_pool_id = identity.identity_pool_id.clone();
 
+        // An identity an unlink already left linked to NO provider can no longer be reached
+        // through a login of a provider: nothing resolves to it there, so there is no link of
+        // it left to forget. What can still name it is a token THIS service minted for it,
+        // which IS a login of that identity. The record is still read by the pool's
+        // administrative reads — that is how an operator sees the disabled identity.
+        if identity.is_disabled()
+            && !input.logins.is_empty()
+            && !store.logins_name_identity(
+                &identity_pool_id,
+                &input.identity_id,
+                &input.logins,
+                now,
+            )
+        {
+            return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
+                NotAuthorizedException {
+                    message: Some(crate::state::UNMATCHED_LOGINS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A `Logins` entry is decided by the pool the identity belongs to, exactly as it is
         // wherever else this service is handed one: an entry naming an Amazon Cognito user
         // pool carries its issuer in the provider name, so a token minted by a user pool
@@ -264,6 +289,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
             return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
                 NotAuthorizedException {
                     message: Some(crate::state::UNSUPPORTED_LOGIN_PROVIDER_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // This operation detaches PUBLIC-provider logins: a developer login is detached
+        // through `UnlinkDeveloperIdentity`, which is the operation that takes a
+        // `DeveloperProviderName`. A `Logins` map naming no public provider at all —
+        // carrying only the pool's own developer provider, or nothing — therefore presents
+        // nothing this operation can act for, which is a bad input parameter.
+        if !pool.logins_name_a_public_provider(&input.logins) {
+            return Err(UnlinkIdentityErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::NO_PUBLIC_PROVIDER_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Being an unsigned public API, the call carries no credential of this service: the
+        // TOKEN each `Logins` entry presents is the whole authorization for it, so a token
+        // that is not the kind of token its provider issues authorizes nothing and the call
+        // is refused before any index or record is touched. A provider whose logins are
+        // OpenID Connect identity tokens is the case this service can decide from the
+        // presented value alone.
+        if pool.presents_unreadable_identity_token(&input.logins) {
+            return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
+                NotAuthorizedException {
+                    message: Some(
+                        crate::state::INVALID_OPEN_ID_CONNECT_TOKEN_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        // A token presented under this service's OWN provider name names an issuance this
+        // service recorded, so its validity is readable here exactly as it is at the
+        // credential exchange: one outside the window its issuance recorded, or one this
+        // service never issued, authorizes nothing either.
+        if let Some(refusal) = store.refuse_presented_login_tokens(&input.logins, now) {
+            return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
+                NotAuthorizedException {
+                    message: Some(refusal.message().to_string()),
                 },
             )
             .into());
@@ -309,17 +377,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
 
         // The identity keeps the providers the call did not name. It is NOT deleted when the
         // last one goes: "removing the last linked login will make this identity
-        // inaccessible", which is what an identity no login resolves to already is.
+        // inaccessible", which is what an identity no login resolves to already is — and an
+        // identity an unlink left linked to nothing is a DISABLED one, which is what makes
+        // every later read of it project the disabled sentinel in place of the providers
+        // that were removed rather than the empty list of an identity never linked at all.
         if let Some(identity) = store.identities.get_mut(&input.identity_id) {
             let linked_before = identity.logins.len();
             identity
                 .logins
                 .retain(|provider| !unlinked.contains(provider.as_str()));
-            unlinked_anything |= identity.logins.len() != linked_before;
+            let took_a_provider_off = identity.logins.len() != linked_before;
+            unlinked_anything |= took_a_provider_off;
             // A link the call actually removed is a change to the identity, recorded with
             // the instant it happened; a call that removed none leaves the record alone.
             if unlinked_anything {
                 identity.last_modified_date = now;
+            }
+            if took_a_provider_off && identity.logins.is_empty() {
+                identity.disabled = true;
             }
         }
 

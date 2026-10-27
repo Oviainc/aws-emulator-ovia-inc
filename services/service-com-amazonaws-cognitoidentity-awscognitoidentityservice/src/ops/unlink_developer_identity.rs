@@ -257,7 +257,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkDeveloperId
                 .into(),
             );
         };
-        let developer_provider = pool.developer_provider_name.clone();
+        // A developer identity is a login of the pool keyed by the pool's own
+        // `DeveloperProviderName` — "the 'domain' by which Cognito will refer to your
+        // users" — whose value is the developer user identifier. A request naming any other
+        // provider therefore names a provider this pool does not support at all, which is a
+        // bad INPUT PARAMETER the caller has to correct (a stale or mistyped provider name,
+        // or a pool that names no developer provider), not an access decision about a
+        // mapping: it is decided against the pool's configuration alone, before any
+        // identifier is resolved.
+        if !pool.names_developer_provider(&input.developer_provider_name) {
+            return Err(
+                UnlinkDeveloperIdentityErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        let developer_provider = input.developer_provider_name.clone();
 
         // The identity named is what this call unlinks the identifier FROM: it has to be
         // one this service holds, and one of THIS pool's — an identity belongs to the pool
@@ -286,27 +306,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkDeveloperId
                 .into(),
             );
         }
+        // An identity an unlink left reachable through no login at all is INACCESSIBLE:
+        // nothing resolves to it, so it holds no mapping for this call to forget — which the
+        // identifier resolution below answers on its own, as it does for any identifier this
+        // pool has registered against nobody.
 
-        // A developer identity is a login of the pool keyed by the pool's own
-        // `DeveloperProviderName` — "the 'domain' by which Cognito will refer to your
-        // users" — whose value is the developer user identifier. A request naming any other
-        // provider therefore names a mapping this pool cannot hold, exactly as one naming an
-        // identifier that was never registered does, so both are the same absent mapping —
-        // and an absent mapping is refused as access this caller does not have, not as a
-        // resource reported missing: resolving a developer user identifier is an
-        // authorization question, so nothing is disclosed about what the pool holds for one.
-        let registered_to = developer_provider
-            .as_deref()
-            .filter(|provider| *provider == input.developer_provider_name.as_str())
-            .and_then(|provider| {
-                store
-                    .linked_identity(
-                        &input.identity_pool_id,
-                        provider,
-                        &input.developer_user_identifier,
-                    )
-                    .cloned()
-            });
+        // The provider is this pool's own, so what is left to resolve is the IDENTIFIER
+        // under it. An identifier this pool has indexed against no identity is refused as
+        // access this caller does not have, not as a resource reported missing: resolving a
+        // developer user identifier is an authorization question, so nothing is disclosed
+        // about what the pool holds for one.
+        let registered_to = store
+            .linked_identity(
+                &input.identity_pool_id,
+                &developer_provider,
+                &input.developer_user_identifier,
+            )
+            .cloned();
         let Some(registered_to) = registered_to else {
             return Err(
                 UnlinkDeveloperIdentityErrorModeled::NotAuthorizedException(
@@ -341,10 +357,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkDeveloperId
 
         // The mapping goes: the identifier resolves nothing in this pool from here on, which
         // is what makes it a new identity the next time it is seen.
-        let provider = input.developer_provider_name.clone();
         store.unlink_login(
             &input.identity_pool_id,
-            &provider,
+            &developer_provider,
             &input.developer_user_identifier,
         );
 
@@ -354,12 +369,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkDeveloperId
         // identity is never deleted — removing its developer user identifier along with its
         // federated logins leaves it reachable through nothing, which is what "the Cognito
         // identity becomes inaccessible" is.
+        //
+        // The DISABLED login projection of [`crate::state::Identity`] is the PUBLIC-provider
+        // unlink's: it is that operation, and only that operation, whose recorded end state
+        // projects the sentinel in place of the providers it removed. This operation detaches
+        // one developer user identifier of a pool, so the identity it leaves without logins
+        // keeps the projection it has — the flag is not set here until the developer path's
+        // own end state is recorded.
         let identifiers_left = store
-            .logins_of_identity(&input.identity_pool_id, &provider, &input.identity_id)
+            .logins_of_identity(
+                &input.identity_pool_id,
+                &developer_provider,
+                &input.identity_id,
+            )
             .len();
         if let Some(identity) = store.identities.get_mut(&input.identity_id) {
             if identifiers_left == 0 {
-                identity.logins.retain(|linked| *linked != provider);
+                identity
+                    .logins
+                    .retain(|linked| *linked != developer_provider);
             }
             // The mapping this call removed is a change to the identity, recorded with the
             // instant it happened.

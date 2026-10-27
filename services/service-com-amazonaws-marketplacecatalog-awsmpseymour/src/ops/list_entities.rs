@@ -183,11 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListEntitiesErrorModeled::ValidationException(fault).into());
         }
 
-        // `EntityType` is checked against the types this catalog HAS, not only
-        // against the characters its `@pattern` admits: a letters-only value
-        // naming no type of this catalog names nothing to list, so it is refused
-        // before any listing is performed rather than answered as an empty page,
-        // which a caller cannot tell from a catalog that holds no such entity.
+        // `EntityType` is checked against the types this catalog HAS — every
+        // type the model names, this member's own documented valid values
+        // included (`crate::state::ENTITY_TYPES`) — and not only against the
+        // characters its `@pattern` admits: a type the model names is listed,
+        // which is an empty page while the catalog holds no entity of it, while
+        // a letters-only value naming no type at all names nothing to list and
+        // is refused before any listing is performed.
         if !crate::state::is_entity_type(&input.entity_type) {
             return Err(ListEntitiesErrorModeled::ValidationException(
                 crate::state::invalid_entity_type(&input.entity_type),

@@ -607,6 +607,41 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
         Ok(status)
     }
 
+    /// The tax document the submitted `TaxDocumentMetadata` names, or the
+    /// `ValidationException` that metadata is refused with.
+    ///
+    /// The metadata must name a document this service HOLDS: the token locates
+    /// one document of ONE revision of ONE account's registration, so a token
+    /// minted for a registration that has since been rewritten (a later
+    /// revision) or deleted names nothing — the invalidation the model documents
+    /// for `taxDocumentAccessToken`. The stored token is compared whole, so a
+    /// metadata whose `taxDocumentName` disagrees with the document its token
+    /// locates names nothing either.
+    ///
+    /// A reporting call: resolving a token reads the registration documents a
+    /// write recorded and changes nothing, so a caller that asks for the same
+    /// document twice is answered the same way twice.
+    pub fn held_tax_document(
+        &self,
+        metadata: &TaxDocumentMetadata,
+    ) -> Result<HeldTaxDocument, ValidationException> {
+        let named = decode_document_access_token(&metadata.tax_document_access_token)?;
+        let held = self
+            .registrations
+            .get(&named.account_id)
+            .filter(|stored| stored.revision == named.revision)
+            .and_then(|stored| stored.tax_document_metadatas.get(named.index))
+            .is_some_and(|document| {
+                document.tax_document_access_token == metadata.tax_document_access_token
+                    && document.tax_document_name == metadata.tax_document_name
+            });
+        if held {
+            Ok(named)
+        } else {
+            Err(unknown_tax_document())
+        }
+    }
+
     /// Refuse a write whose registration type the account's STORED registration
     /// blocks — see [`TYPES_BLOCKED_BY_A_STORED_TYPE`].
     ///
@@ -1257,13 +1292,147 @@ fn document_metadatas(
                 .or_else(|| document.s3_location.as_ref().map(|loc| loc.key.clone()))
                 .unwrap_or_else(|| format!("document-{}", index + 1));
             TaxDocumentMetadata {
-                tax_document_access_token: base64::encode(format!(
-                    "{account_id}/{revision}/{index}/{name}"
-                )),
+                tax_document_access_token: document_access_token(
+                    account_id, revision, index, &name,
+                ),
                 tax_document_name: name,
             }
         })
         .collect()
+}
+
+/// The access token minted for ONE document of a stored registration: the
+/// coordinates that locate it — the account, the registration revision the
+/// document was submitted with, the document's position in that submission and
+/// its name — as one opaque string.
+///
+/// Paired with [`decode_document_access_token`], its only reader, so what a
+/// write mints and what a later request is resolved against cannot drift apart.
+/// Encoded with `aws_smithy_types::base64`, the codec this service's other
+/// opaque token carries ([`encode_page_token`]).
+fn document_access_token(account_id: &str, revision: u64, index: usize, name: &str) -> String {
+    base64::encode(format!("{account_id}/{revision}/{index}/{name}"))
+}
+
+/// A tax document this service holds: which registration's documents it is one
+/// of, and what it is called.
+///
+/// These are exactly the coordinates [`document_access_token`] carries, so
+/// resolving a token answers this and every reader of a held document — the
+/// download URL, the destination path — is built from the same four values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldTaxDocument {
+    /// The account whose tax registration carries the document.
+    pub account_id: String,
+    /// The revision of that registration the document was submitted with.
+    pub revision: u64,
+    /// The document's position in that submission, from zero.
+    pub index: usize,
+    /// The document's name — its uploaded file name, or its S3 object key where
+    /// it was referenced in S3.
+    pub name: String,
+}
+
+/// How this service words the refusal of a `taxDocumentAccessToken` that does
+/// not name a tax document it holds, whichever way the token failed.
+///
+/// AWS answers ONE sentence for the whole class — the token is "either
+/// malformed or incorrect" — so both refusals below state it and the published
+/// `errorCode` is what tells the two apart. It names no value from the request:
+/// the refusal is about the member, not about the text submitted for it.
+pub const TAX_DOCUMENT_TOKEN_REFUSED: &str = "The specified token in the request is either \
+                                             malformed or incorrect. Check your request and try \
+                                             again.";
+
+/// The name a refusal of a tax document access token reports in
+/// `ValidationExceptionField$name`.
+///
+/// OBSERVED, and NOT the CONSTANT_CASE of the member that carries the token
+/// (`TaxDocumentMetadata$taxDocumentAccessToken` would give
+/// `TAX_DOCUMENT_ACCESS_TOKEN`): the field list names the service's own
+/// PARAMETER, and for this one the service abbreviates the document. Recorded
+/// unit `taxsettings.get-tax-registration-document-invalid-token-rejected`. See
+/// [`parameter_name`] for the rule the parameters with no recording of their own
+/// follow, and [`validation_naming`] for how a parameter like this one is named.
+pub const TAX_DOCUMENT_ACCESS_TOKEN_PARAMETER: &str = "TAX_DOC_ACCESS_TOKEN";
+
+/// The coordinates a `taxDocumentAccessToken` carries, or the refusal of a text
+/// that is not a token this service minted.
+///
+/// The name is the REST of the encoded text rather than one more separated
+/// field, because a document named by its S3 object key carries the separator
+/// itself.
+fn decode_document_access_token(token: &str) -> Result<HeldTaxDocument, ValidationException> {
+    let malformed = || {
+        validation_naming(
+            ERROR_CODE_MALFORMED_TOKEN,
+            TAX_DOCUMENT_ACCESS_TOKEN_PARAMETER,
+            TAX_DOCUMENT_TOKEN_REFUSED,
+        )
+    };
+    let decoded = base64::decode(token).map_err(|_| malformed())?;
+    let decoded = String::from_utf8(decoded).map_err(|_| malformed())?;
+    let mut fields = decoded.splitn(4, '/');
+    let (Some(account_id), Some(revision), Some(index), Some(name)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err(malformed());
+    };
+    Ok(HeldTaxDocument {
+        account_id: account_id.to_string(),
+        revision: revision.parse().map_err(|_| malformed())?,
+        index: index.parse().map_err(|_| malformed())?,
+        name: name.to_string(),
+    })
+}
+
+/// The refusal of a `TaxDocumentMetadata` that names no tax document this
+/// service holds.
+///
+/// `InvalidToken` rather than `MalformedToken`: the token IS one of this
+/// service's, it just no longer locates a document — the registration it was
+/// minted for has since been rewritten or deleted, which is the invalidation the
+/// model documents for `taxDocumentAccessToken`.
+pub fn unknown_tax_document() -> ValidationException {
+    validation_naming(
+        ERROR_CODE_INVALID_TOKEN,
+        TAX_DOCUMENT_ACCESS_TOKEN_PARAMETER,
+        TAX_DOCUMENT_TOKEN_REFUSED,
+    )
+}
+
+/// The Amazon S3 bucket a reader reports an account's tax documents from.
+///
+/// The documents are the SERVICE's copies of what was submitted with the
+/// account's tax registration, so they live in a bucket of its own named from
+/// the account they belong to — never in the caller's bucket, which a request
+/// names only to be downloaded INTO. The form satisfies `S3BucketName`'s
+/// published constraints (3..=63 characters of lowercase label text) for every
+/// `accountId` the model admits (12 digits).
+pub fn document_bucket(account_id: &str) -> String {
+    format!("aws-tax-documents-{account_id}")
+}
+
+/// The URL a reader reports for a held tax document.
+///
+/// It names the document's own object in the account's document bucket by the
+/// coordinates its access token carries — the registration revision and the
+/// document's position in it — so every read of one document reports one URL,
+/// two documents never share one, and rewriting the registration retires the
+/// previous URL exactly as it retires the previous access token.
+///
+/// It carries no query signature: the model caps `Url` at 200 characters, which
+/// no SigV4 query-signed form fits (its signature parameters alone are longer
+/// than that), and this emulator keeps each document's metadata rather than its
+/// content, so there is no object body for a signature to authorise. What the
+/// URL does carry is where the document is, derived from this service's state.
+pub fn document_download_url(document: &HeldTaxDocument) -> String {
+    format!(
+        "https://{}.s3.amazonaws.com/{}/{}",
+        document_bucket(&document.account_id),
+        document.revision,
+        document.index
+    )
 }
 
 /// The account a request addresses: the `accountId` it carries, or the caller's
@@ -1314,11 +1483,25 @@ pub fn validation(
     member: &str,
     message: impl Into<String>,
 ) -> ValidationException {
+    validation_naming(error_code, &parameter_name(member), message)
+}
+
+/// The same refusal as [`validation`], naming the refused PARAMETER outright.
+///
+/// For a parameter whose name is not the CONSTANT_CASE of the member that
+/// carries it, which is the one thing [`parameter_name`] cannot derive — see
+/// [`TAX_DOCUMENT_ACCESS_TOKEN_PARAMETER`], the parameter a recording pins that
+/// way. Every other refusal names its member and goes through [`validation`].
+pub fn validation_naming(
+    error_code: &str,
+    parameter: &str,
+    message: impl Into<String>,
+) -> ValidationException {
     ValidationException {
         message: message.into(),
         error_code: error_code.to_string(),
         field_list: Some(vec![ValidationExceptionField {
-            name: parameter_name(member),
+            name: parameter.to_string(),
         }]),
     }
 }

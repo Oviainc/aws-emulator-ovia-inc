@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminDeleteUserAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdminDeleteUserAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdminDeleteUserAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An administrator gives up attributes of a user's profile: the `UserPoolId`
+//! and `Username` in the body name the STORED user, and every name the request
+//! lists is removed from it, together with the verified flag of a value that is
+//! gone. A name the user holds no value of removes nothing; a name the pool's
+//! schema does not declare, declares immutable or marks required is refused,
+//! and a refused request writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +162,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdminDeleteUserAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdminDeleteUserAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdminDeleteUserAttributes"))
+        // Request metadata only: the pool and the user whose attributes go are
+        // named in the body.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // The instant this deletion is stored at, which a later read renders as
+        // the user's last-modified date.
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // Decide the whole deletion against the STORED pool and user FIRST:
+        // every refusal below leaves the user exactly as it was, so a rejected
+        // request writes nothing.
+        let plan = {
+            let pool = guard
+                .pool(&input.user_pool_id)
+                .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+            let user = pool.user(&input.username).ok_or_else(user_not_found)?;
+            crate::state::plan_attribute_deletion(pool, user, &input.user_attribute_names)
+                .map_err(invalid_parameter)?
+        };
+
+        let user = guard
+            .pool_mut(&plan.user_pool_id)
+            .and_then(|pool| pool.user_mut(&plan.username))
+            .ok_or_else(internal_error)?;
+        user.apply_attribute_deletion(&plan, now);
+
+        Ok(AdminDeleteUserAttributesOutput {})
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AdminDeleteUserAttributesError {
+    AdminDeleteUserAttributesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for a user the pool does not hold.
+/// Carries the fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which
+/// names no username.
+fn user_not_found() -> AdminDeleteUserAttributesError {
+    AdminDeleteUserAttributesErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`: the
+/// refusal [`crate::state::plan_attribute_deletion`] judged the submitted
+/// attribute names by.
+fn invalid_parameter(message: String) -> AdminDeleteUserAttributesError {
+    AdminDeleteUserAttributesErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AdminDeleteUserAttributesError {
+    AdminDeleteUserAttributesErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

@@ -33,7 +33,12 @@
 //! 4. the detector — the precondition is the NAMED detector's own configuration, so
 //!    one administrator's `ALL` does not refuse another's call;
 //! 5. the order of the checks — a request the service does not understand is still
-//!    refused as such, and a lifted configuration lets the call through again.
+//!    refused as such, a detector holding no member record at all is refused before
+//!    any account is matched, and a lifted configuration lets the call through again;
+//! 6. the relationship the named members carry when the call arrives — every status a
+//!    member can be in, including the ones where the call would change nothing;
+//! 7. the boundary of the rule — the member calls that do NOT take a relationship
+//!    away still answer normally under the same configuration.
 
 use serde_json::{json, Value};
 
@@ -62,6 +67,11 @@ const ENVELOPE: &str = "BadRequestException";
 
 /// The Region these cases run in: the one the member suites call through.
 const REGION: &str = crate::member_association::DEFAULT_REGION;
+
+/// An account recorded while the organization already auto-enables `ALL`, with its
+/// email. Outside [`MEMBERS`] and outside [`NON_MEMBER_ACCOUNT_IDS`], so recording it
+/// leaves every table the other member suites share intact.
+const LATE_MEMBER: (&str, &str) = ("555566667777", "late-member@example.com");
 
 /// A second Region, which is how a second administrator's detector is reached:
 /// GuardDuty holds one detector per account per Region.
@@ -128,6 +138,26 @@ fn message(body: &Value) -> String {
     body["message"].as_str().unwrap_or_default().to_string()
 }
 
+/// Any member call bound at `/detector/{DetectorId}/member/{action}` that takes an
+/// `accountIds` list, through `region`'s endpoint: the operations the rule covers and
+/// the ones it does not are reached the same way, so one harness serves both.
+async fn member_action_in(
+    router: &Router,
+    region: &str,
+    action: &str,
+    detector_id: &str,
+    account_ids: &[&str],
+) -> (u16, Value) {
+    call_in(
+        router,
+        region,
+        "POST",
+        &format!("/detector/{detector_id}/member/{action}"),
+        Some(json!({"accountIds": account_ids})),
+    )
+    .await
+}
+
 /// One of [`OPERATIONS`], called through `region`'s endpoint.
 async fn call_operation_in(
     router: &Router,
@@ -136,14 +166,7 @@ async fn call_operation_in(
     detector_id: &str,
     account_ids: &[&str],
 ) -> (u16, Value) {
-    call_in(
-        router,
-        region,
-        "POST",
-        &format!("/detector/{detector_id}/member/{}", operation.path()),
-        Some(json!({"accountIds": account_ids})),
-    )
-    .await
+    member_action_in(router, region, operation.path(), detector_id, account_ids).await
 }
 
 /// Create an enabled detector in `region` and record [`MEMBERS`] against it,
@@ -550,4 +573,200 @@ async fn lifting_the_configuration_lets_the_call_through_and_restoring_it_refuse
         assert_organization_refusal(&case, operation, status, &body);
         assert_members_unchanged(&router, REGION, &detector_id, &case, &processed).await;
     }
+}
+
+#[tokio::test]
+async fn a_detector_holding_no_member_is_refused_before_any_account_is_matched() {
+    // Without the precondition every one of these accounts would be REPORTED in
+    // `unprocessedAccounts` with HTTP 200, since the detector holds no member record
+    // at all — so this row shows the precondition is read before the request's
+    // accounts are matched against the store, not after.
+    let ids: Vec<&str> = NON_MEMBER_ACCOUNT_IDS.iter().map(|(id, _)| *id).collect();
+
+    for operation in OPERATIONS {
+        let case = format!("{operation:?} on a detector holding no member record");
+        let router = new_router();
+        let detector_id = enabled_detector_in(&router, REGION).await;
+        update_ok_in(
+            &router,
+            REGION,
+            &detector_id,
+            json!({"autoEnableOrganizationMembers": "ALL"}),
+        )
+        .await;
+
+        let (status, body) =
+            call_operation_in(&router, REGION, operation, &detector_id, &ids).await;
+        assert_organization_refusal(&case, operation, status, &body);
+        assert!(
+            body["unprocessedAccounts"].is_null(),
+            "case {case}: expected no unprocessedAccounts on a refusal, got {body:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 6: the relationship the named members are in when the call arrives.
+// ---------------------------------------------------------------------------
+
+/// Every relationship a recorded member can carry, with the member calls that put it
+/// there and the `relationshipStatus` a read then reports. The statuses are the ones
+/// `Member.RelationshipStatus` takes
+/// (`smithy_query(query="doc",shape="Member",member="RelationshipStatus")`), reached
+/// through the calls that move them while the organization auto-enables nothing.
+///
+/// The last three rows are relationships where the refused call would change nothing
+/// anyway: monitoring already stopped, and an association a disassociation already
+/// ended. The precondition is on the request, not on its effect, so they are refused
+/// too.
+const PRE_STATES: [(&str, &str, &[&str]); 5] = [
+    ("Created", "recorded and not yet invited", &[]),
+    ("Invited", "invited and not yet answered", &["invite"]),
+    ("Disabled", "monitoring already stopped", &["stop"]),
+    (
+        "Enabled",
+        "monitoring stopped and restarted",
+        &["stop", "start"],
+    ),
+    (
+        "Removed",
+        "an association a disassociation already ended",
+        &["disassociate"],
+    ),
+];
+
+#[tokio::test]
+async fn the_refusal_holds_whatever_relationship_the_members_carry() {
+    for (expected_status, why, preparation) in PRE_STATES {
+        for operation in OPERATIONS {
+            let case = format!("{operation:?} on members {why}");
+            let router = new_router();
+            let detector_id = detector_with_members_in(&router, REGION).await;
+            let ids = all_ids();
+
+            // The pre-state is reached BEFORE the configuration is written, so each
+            // preparing call is one the precondition does not yet refuse.
+            for action in preparation {
+                let (status, body) =
+                    member_action_in(&router, REGION, action, &detector_id, &ids).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case}: preparing with {action} expected HTTP 200, got {status} {body:?}"
+                );
+            }
+            let (status, got) = get_members_in(&router, REGION, &detector_id, &ids).await;
+            assert_eq!(
+                status, 200,
+                "case {case}: expected get-members to answer 200, got {status} {got:?}"
+            );
+            for account_id in &ids {
+                let member = member_of(&got, account_id).unwrap_or_else(|| {
+                    panic!("case {case}: expected a member record for {account_id}, got {got:?}")
+                });
+                assert_eq!(
+                    member["relationshipStatus"].as_str(),
+                    Some(expected_status),
+                    "case {case}: expected {account_id} to be prepared as {expected_status}, got {member:?}"
+                );
+            }
+
+            let before = member_snapshot(&router, REGION, &detector_id).await;
+            update_ok_in(
+                &router,
+                REGION,
+                &detector_id,
+                json!({"autoEnableOrganizationMembers": "ALL"}),
+            )
+            .await;
+
+            let (status, body) =
+                call_operation_in(&router, REGION, operation, &detector_id, &ids).await;
+            assert_organization_refusal(&case, operation, status, &body);
+            assert_members_unchanged(&router, REGION, &detector_id, &case, &before).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 7: the boundary — the member calls the precondition does NOT cover.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_calls_that_do_not_take_a_relationship_away_still_answer_normally() {
+    let router = new_router();
+    let detector_id = detector_with_members_in(&router, REGION).await;
+    let ids = all_ids();
+
+    // Monitoring is stopped while nothing is auto-enabled, so the restart below has
+    // something to restart once the configuration is in place.
+    let (status, body) = member_action_in(&router, REGION, "stop", &detector_id, &ids).await;
+    assert_eq!(
+        status, 200,
+        "preparing the stop: expected HTTP 200, got {status} {body:?}"
+    );
+    update_ok_in(
+        &router,
+        REGION,
+        &detector_id,
+        json!({"autoEnableOrganizationMembers": "ALL"}),
+    )
+    .await;
+
+    // `StartMonitoringMembers` turns monitoring ON, which is what an organization
+    // that auto-enables GuardDuty for all of its accounts holds: it documents no such
+    // refusal (`smithy_query(query="doc",shape="StartMonitoringMembers")`).
+    let case = "start-monitoring while the organization auto-enables ALL";
+    let (status, body) = member_action_in(&router, REGION, "start", &detector_id, &ids).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: expected HTTP 200, got {status} {body:?}"
+    );
+    assert!(
+        unprocessed_ids(&body).is_empty(),
+        "case {case}: expected every member processed, got {body:?}"
+    );
+    let (status, got) = get_members_in(&router, REGION, &detector_id, &ids).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: expected get-members to answer 200, got {status} {got:?}"
+    );
+    for account_id in &ids {
+        let member = member_of(&got, account_id).unwrap_or_else(|| {
+            panic!("case {case}: expected a member record for {account_id}, got {got:?}")
+        });
+        assert_eq!(
+            member["relationshipStatus"].as_str(),
+            Some("Enabled"),
+            "case {case}: expected {account_id} to be monitored again, got {member:?}"
+        );
+    }
+
+    // `CreateMembers` adds a relationship rather than taking one away: the
+    // organization's auto-enable settings are APPLIED to the accounts in the request
+    // (`smithy_query(query="doc",shape="CreateMembers")`), so the call is processed.
+    let (late_account, late_email) = LATE_MEMBER;
+    let case = "create-members while the organization auto-enables ALL";
+    let (status, body) =
+        create_members_in(&router, REGION, &detector_id, &[(late_account, late_email)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: expected HTTP 200, got {status} {body:?}"
+    );
+    assert!(
+        unprocessed_ids(&body).is_empty(),
+        "case {case}: expected the account processed, got {body:?}"
+    );
+    let (status, got) = get_members_in(&router, REGION, &detector_id, &[late_account]).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: expected get-members to answer 200, got {status} {got:?}"
+    );
+    let member = member_of(&got, late_account).unwrap_or_else(|| {
+        panic!("case {case}: expected a member record for {late_account}, got {got:?}")
+    });
+    assert_eq!(
+        member["email"].as_str(),
+        Some(late_email),
+        "case {case}: expected the recorded email, got {member:?}"
+    );
 }

@@ -61,10 +61,9 @@ use crate::response_headers_policy_lifecycle::escape;
 /// (`smithy_query(query="shape",shape="Format")` lists `URLEncoded` and nothing else).
 const URL_ENCODED: &str = "URLEncoded";
 
-/// The sentences the model states on the error shapes themselves, spelled out here rather
+/// The sentences CloudFront sends on the wire for these refusals, spelled out here rather
 /// than taken from the crate, so a reworded refusal fails this suite.
-const NO_SUCH_CONFIG_MESSAGE: &str =
-    "The specified configuration for field-level encryption doesn't exist.";
+const NO_SUCH_CONFIG_MESSAGE: &str = "The specified field level encryption config does not exist.";
 const NO_SUCH_PROFILE_MESSAGE: &str =
     "The specified profile for field-level encryption doesn't exist.";
 const QUERY_ARG_PROFILE_EMPTY: &str =
@@ -76,7 +75,7 @@ const QUERY_ARG_PROFILE_EMPTY: &str =
 
 /// `POST /2020-05-31/field-level-encryption` with the `FieldLevelEncryptionConfig` document
 /// `body` — the member the operation binds to the HTTP payload.
-async fn create_config(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_config(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -88,7 +87,7 @@ async fn create_config(router: &MultiServiceRouter, body: &str) -> Answer {
 }
 
 /// `GET /2020-05-31/field-level-encryption/{Id}`.
-async fn get_config(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_config(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -103,7 +102,7 @@ async fn get_config(router: &MultiServiceRouter, id: &str) -> Answer {
 /// stored field-level encryption configuration
 /// (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` states the
 /// route).
-async fn get_config_document(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_config_document(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -241,9 +240,9 @@ impl<M> Section<M> {
 
 /// One `FieldLevelEncryptionConfig`, as a client submits it.
 #[derive(Debug, Clone)]
-struct Config {
+pub(crate) struct Config {
     /// What this row is a case of, named in every assertion it drives.
-    case: String,
+    pub(crate) case: String,
     caller_reference: String,
     /// `Comment`, or `None` to leave the optional member out entirely.
     comment: Option<String>,
@@ -273,7 +272,7 @@ impl Config {
     /// The `FieldLevelEncryptionConfig` XML a client sends for this configuration, in the
     /// model's member declaration order (`CallerReference`, `Comment`,
     /// `QueryArgProfileConfig`, `ContentTypeProfileConfig`).
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<FieldLevelEncryptionConfig \
              xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
@@ -463,7 +462,7 @@ fn assert_section<M>(
 /// mints: a `C` followed by 13 characters of the id alphabet, the shape its own answers show.
 ///
 /// Spelled out here rather than taken from the crate, so a changed mint fails this suite.
-fn is_config_id(value: &str) -> bool {
+pub(crate) fn is_config_id(value: &str) -> bool {
     match value.strip_prefix('C') {
         Some(body) => {
             body.len() == 13
@@ -483,7 +482,7 @@ fn is_config_id(value: &str) -> bool {
 /// one mapping and several; both settings of each forwarding flag; a content type mapping
 /// with and without a `ProfileId`; and the comment forms (absent, empty, plain ASCII, XML
 /// metacharacters, and the published 128-character bound).
-fn table(profile: &str) -> Vec<Config> {
+pub(crate) fn table(profile: &str) -> Vec<Config> {
     // "The comment cannot be longer than 128 characters": the bound itself is admissible, so
     // one row sits exactly on it.
     let on_the_bound = "c".repeat(MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT);
@@ -567,7 +566,7 @@ fn table(profile: &str) -> Vec<Config> {
 
 /// A configuration whose only mapping is one query argument pointing at `profile`, under
 /// `reference` — the minimal well-formed row the single-rule cases start from.
-fn simple(case: &str, reference: &str, profile: &str) -> Config {
+pub(crate) fn simple(case: &str, reference: &str, profile: &str) -> Config {
     Config::new(
         case,
         reference,

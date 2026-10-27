@@ -25,6 +25,8 @@ mod custom_key_store_connection;
 mod custom_key_stores;
 #[path = "all/data_key.rs"]
 mod data_key;
+#[path = "all/data_key_pair.rs"]
+mod data_key_pair;
 #[path = "all/data_key_pair_without_plaintext.rs"]
 mod data_key_pair_without_plaintext;
 #[path = "all/data_key_without_plaintext.rs"]

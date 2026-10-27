@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes the tags the submitted keys name off the tag set of the Amazon EMR resource the
+//! request names — a cluster, an EMR Studio, or a session of the cluster `ClusterId`
+//! scopes the call to — in the shared engine, so a later `DescribeCluster` /
+//! `DescribeStudio` / `GetSession` reports exactly what is left. A key the resource
+//! carries no tag for takes nothing off, the tags beside the named ones keep their place
+//! and their values (see [`crate::state::remove_tag_keys`]), a resource left carrying no
+//! tags reports none at all, and an id naming no resource this account holds is refused
+//! with `InvalidRequestException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Which resource the request names is resolved by
+//! [`crate::state::ComAmazonawsEmrElasticmapreduceState::tag_target_mut`], shared with
+//! `AddTags`: the `ClusterId`/`ResourceId` pair means the same thing on both.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +144,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveTags"))
+        use crate::state::remove_tag_keys;
+
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RemoveTagsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR resource store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // Which resource the `ClusterId`/`ResourceId` pair names is the same question
+        // for every tag operation, so it is answered in one place and this handler only
+        // takes the named keys off the set it hands back.
+        let mut target = store
+            .tag_target_mut(input.cluster_id.as_deref(), &input.resource_id, now)
+            .map_err(unresolved)?;
+        let mut held = target.held();
+        // "A list of tag keys to remove from the resource" (`RemoveTags$TagKeys` doc):
+        // a key names a tag whatever value it holds, and names nothing when the resource
+        // carries no tag of that key, so no list of keys is a bad request.
+        remove_tag_keys(&mut held, &input.tag_keys);
+        target.store(held);
+        Ok(RemoveTagsOutput {})
     }
+}
+
+/// Lift a refusal to resolve the resource into the client error this operation models.
+fn unresolved(refusal: crate::state::TagTargetRefusal) -> RemoveTagsError {
+    RemoveTagsErrorModeled::InvalidRequestException(refusal.into_invalid_request()).into()
 }

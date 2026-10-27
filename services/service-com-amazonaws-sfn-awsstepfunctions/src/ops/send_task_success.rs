@@ -158,9 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `taskToken` (1..2048) and `output` (0..262144) are modelled, so the
         // centralized walk has already refused anything outside them. That the output
         // is JSON, and that the token is one this service issued, are not modelled, so
-        // they are checked here. `ctx` carries no value this operation reads: a task
-        // token names its task, its execution and its region on its own.
-        let _ = ctx;
+        // they are checked here. No member of the request is read off `ctx`: a task
+        // token names its task, its execution and its region on its own. What `ctx`
+        // IS read for is the in-process callback the continuation's own service
+        // integrations are called through.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STORE_UNAVAILABLE,
@@ -348,9 +349,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
         let waiting = planned.waiting;
+        let parked = planned.parked;
         let task_bytes = waiting
             .as_ref()
-            .map_or(0, crate::state::PlannedActivityTask::measure);
+            .map_or(0, crate::state::PlannedActivityTask::measure)
+            + parked.as_ref().map_or(0, crate::state::PlannedJob::measure);
         let map_runs = planned.map_runs;
         let map_run_bytes = crate::state::planned_map_run_bytes(&map_runs);
         match store.answer_activity_task(
@@ -375,6 +378,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &crate::state::arn_region(&machine_arn),
                     map_runs,
                 );
+                // The continuation PARKED at the job a run-a-job task started, which
+                // is polled to its end exactly as one a start parked at is.
+                if let Some(parked) = parked {
+                    let region = crate::state::arn_region(&machine_arn);
+                    store.park_job(&execution_arn, parked, &region);
+                    drop(store);
+                    crate::state::run_a_job::watch(
+                        std::sync::Arc::clone(&self.engine),
+                        ctx.callback().clone(),
+                        crate::state::integration::chain_depth(ctx),
+                        execution_arn.clone(),
+                    );
+                }
                 Ok(SendTaskSuccessOutput {})
             }
             Err(crate::state::TaskReplyRejection::Gone) => {

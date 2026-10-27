@@ -21,6 +21,8 @@ mod identity_provider_deregistration;
 mod identity_provider_subscriptions;
 #[path = "all/instance_authorization_is_hoisted.rs"]
 mod instance_authorization_is_hoisted;
+#[path = "all/instance_fleet_resolution.rs"]
+mod instance_fleet_resolution;
 #[path = "all/instance_products_follow_the_registrations.rs"]
 mod instance_products_follow_the_registrations;
 #[path = "all/instance_status_check_date.rs"]

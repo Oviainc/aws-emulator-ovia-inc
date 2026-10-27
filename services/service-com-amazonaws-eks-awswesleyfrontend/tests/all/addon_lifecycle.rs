@@ -77,7 +77,7 @@ async fn create_addon_in(
     .await
 }
 
-async fn create_addon(
+pub(crate) async fn create_addon(
     router: &MultiServiceRouter,
     cluster: &str,
     body: &serde_json::Value,
@@ -105,7 +105,11 @@ async fn describe_addon_in(
     .await
 }
 
-async fn describe_addon(router: &MultiServiceRouter, cluster: &str, addon: &str) -> Answer {
+pub(crate) async fn describe_addon(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    addon: &str,
+) -> Answer {
     describe_addon_in(router, REGION, cluster, addon).await
 }
 

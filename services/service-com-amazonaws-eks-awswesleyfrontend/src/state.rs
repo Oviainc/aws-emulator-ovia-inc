@@ -3679,6 +3679,33 @@ pub const ADDON_ANY_PLATFORM_VERSION: &str = "*";
 /// as every JSON Schema does.
 const ADDON_CONFIGURATION_SCHEMA_DIALECT: &str = "http://json-schema.org/draft-06/schema#";
 
+/// One top-level property an add-on's configuration schema declares: the key a
+/// `configurationValues` document may set, and the JSON Schema type that key
+/// takes (`"boolean"`, `"string"`, `"integer"`, `"number"`, `"object"`,
+/// `"array"`).
+type AddonSchemaProperty = (&'static str, &'static str);
+
+/// The configuration keys EVERY published add-on's schema declares, beside the
+/// keys of its own ([`AddonCatalogSeed::configuration_properties`]).
+///
+/// Source: an add-on's configuration schema is the set of values its chart
+/// exposes, and every Amazon EKS add-on chart exposes the Kubernetes placement
+/// and pod-metadata values a cluster operator sets on any workload. They are
+/// written once here rather than repeated per row, so one add-on's schema cannot
+/// quietly declare fewer of them than another's.
+const ADDON_COMMON_CONFIGURATION_PROPERTIES: &[AddonSchemaProperty] = &[
+    ("affinity", "object"),
+    ("imagePullSecrets", "array"),
+    ("nodeSelector", "object"),
+    ("podAnnotations", "object"),
+    ("podDisruptionBudget", "object"),
+    ("podLabels", "object"),
+    ("priorityClassName", "string"),
+    ("resources", "object"),
+    ("tolerations", "array"),
+    ("topologySpreadConstraints", "array"),
+];
+
 /// One row of the add-on catalog seed: an Amazon EKS-managed add-on, and the
 /// version line its published builds run along.
 ///
@@ -3711,6 +3738,20 @@ struct AddonCatalogSeed {
     /// what leaves the published configuration schema with no required
     /// property: the flag and the schema have this one source.
     required_configuration: &'static [&'static str],
+    /// The top-level keys this add-on's OWN configuration schema declares, each
+    /// with the JSON type that key takes — published beside the keys every
+    /// add-on's schema carries ([`ADDON_COMMON_CONFIGURATION_PROPERTIES`]), and
+    /// beside the ones the install itself takes (see
+    /// [`AddonCatalogRecord::configuration_schema`]). A key named here with a
+    /// type of its own OVERRIDES the common one.
+    ///
+    /// Source: the schema each add-on publishes, which is the set of values its
+    /// own chart exposes — `aws eks describe-addon-configuration --addon-name
+    /// <name> --addon-version <build>` reports it, and the Amazon EKS User
+    /// Guide's configuration examples for an add-on set keys from this list
+    /// (`aws-efs-csi-driver`'s `useFIPS` is the one the guide's FIPS install
+    /// passes). Keys are written in the schema's own alphabetical order.
+    configuration_properties: &'static [AddonSchemaProperty],
     /// The Kubernetes service accounts the add-on runs as, each with the
     /// managed policies Amazon EKS recommends for it — what
     /// `DescribeAddonConfiguration$podIdentityConfiguration` reports ("The
@@ -3727,11 +3768,17 @@ struct AddonCatalogSeed {
 /// The add-ons this service publishes.
 ///
 /// The Amazon EKS-managed rows are the add-ons the "Amazon EKS add-ons" section
-/// of the Amazon EKS User Guide publishes: the name a caller installs them by,
-/// the category they are published under, the namespace their workloads run in,
-/// whether they need IAM permissions of their own, and the service account each
-/// one runs as with the managed policies the guide recommends for it. They are
-/// owned by [`ADDON_OWNER_AWS`] and published by [`ADDON_PUBLISHER_EKS`].
+/// of the Amazon EKS User Guide publishes — the ones Amazon EKS builds itself
+/// and the community projects it curates alongside them — with the name a caller
+/// installs each by, the category it is published under, the namespace its
+/// workloads run in, whether it needs IAM permissions of its own, the service
+/// account it runs as with the managed policies the guide recommends for it, and
+/// the keys its own configuration schema declares. They are owned by
+/// [`ADDON_OWNER_AWS`] and published by [`ADDON_PUBLISHER_EKS`].
+///
+/// This table is what the catalog PUBLISHES, so an add-on missing from it cannot
+/// be discovered or installed at all: a row here is the only way a caller reads
+/// an add-on's builds, its compatibilities and its configuration surface.
 ///
 /// The rest are AWS Marketplace add-ons ([`ADDON_OWNER_MARKETPLACE`]), published
 /// by their VENDOR and carrying the `marketplaceInformation` of the listing they
@@ -3755,6 +3802,13 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         requires_iam_permissions: false,
         required_configuration: &[],
         pod_identity: &[],
+        configuration_properties: &[
+            ("admissionWebhooks", "object"),
+            ("affinity", "object"),
+            ("collector", "object"),
+            ("manager", "object"),
+            ("tolerations", "array"),
+        ],
         oldest_build: (0, 102, 1),
     },
     AddonCatalogSeed {
@@ -3772,7 +3826,32 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
                 "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess",
             ],
         )],
+        configuration_properties: &[
+            ("admissionWebhooks", "object"),
+            ("agent", "object"),
+            ("containerLogs", "object"),
+            ("manager", "object"),
+            ("tolerations", "array"),
+        ],
         oldest_build: (1, 5, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "amazon-sagemaker-hyperpod-training-operator",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "machine-learning",
+        default_namespace: "aws-hyperpod",
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        configuration_properties: &[
+            ("hpTrainingControllerManager", "object"),
+            ("nodeSelector", "object"),
+            ("replicaCount", "integer"),
+            ("resources", "object"),
+            ("tolerations", "array"),
+        ],
+        oldest_build: (1, 0, 0),
     },
     AddonCatalogSeed {
         addon_name: "aws-ebs-csi-driver",
@@ -3786,6 +3865,15 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             "ebs-csi-controller-sa",
             &["arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"],
         )],
+        configuration_properties: &[
+            ("additionalDaemonSets", "object"),
+            ("controller", "object"),
+            ("defaultStorageClass", "object"),
+            ("node", "object"),
+            ("replicaCount", "integer"),
+            ("sidecars", "object"),
+            ("storageClasses", "array"),
+        ],
         oldest_build: (1, 31, 0),
     },
     AddonCatalogSeed {
@@ -3800,6 +3888,16 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
             "efs-csi-controller-sa",
             &["arn:aws:iam::aws:policy/service-role/AmazonEFSCSIDriverPolicy"],
         )],
+        configuration_properties: &[
+            ("controller", "object"),
+            ("node", "object"),
+            ("replicaCount", "integer"),
+            ("sidecars", "object"),
+            ("storageClasses", "array"),
+            // The key the guide's FIPS install sets: an add-on's schema
+            // declares the options that add-on itself takes.
+            ("useFIPS", "boolean"),
+        ],
         oldest_build: (2, 0, 7),
     },
     AddonCatalogSeed {
@@ -3811,6 +3909,12 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         requires_iam_permissions: false,
         required_configuration: &[],
         pod_identity: &[],
+        configuration_properties: &[
+            ("affinity", "object"),
+            ("priorityClassName", "string"),
+            ("resources", "object"),
+            ("tolerations", "array"),
+        ],
         oldest_build: (1, 6, 1),
     },
     AddonCatalogSeed {
@@ -3822,7 +3926,32 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         requires_iam_permissions: true,
         required_configuration: &[],
         pod_identity: &[],
+        configuration_properties: &[
+            ("controller", "object"),
+            ("node", "object"),
+            ("tolerations", "array"),
+        ],
         oldest_build: (1, 7, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "cert-manager",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "security",
+        default_namespace: "cert-manager",
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        configuration_properties: &[
+            ("cainjector", "object"),
+            ("installCRDs", "boolean"),
+            ("prometheus", "object"),
+            ("replicaCount", "integer"),
+            ("resources", "object"),
+            ("tolerations", "array"),
+            ("webhook", "object"),
+        ],
+        oldest_build: (1, 16, 2),
     },
     AddonCatalogSeed {
         addon_name: "coredns",
@@ -3833,6 +3962,12 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         requires_iam_permissions: false,
         required_configuration: &[],
         pod_identity: &[],
+        configuration_properties: &[
+            ("autoScaling", "object"),
+            ("computeType", "string"),
+            ("corefile", "string"),
+            ("replicaCount", "integer"),
+        ],
         oldest_build: (1, 11, 1),
     },
     AddonCatalogSeed {
@@ -3846,6 +3981,11 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         // it cannot do without that organisation's API key.
         required_configuration: &["apiKey"],
         pod_identity: &[],
+        configuration_properties: &[
+            ("clusterName", "string"),
+            ("resources", "object"),
+            ("site", "string"),
+        ],
         oldest_build: (1, 8, 0),
     },
     AddonCatalogSeed {
@@ -3859,6 +3999,7 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         // cannot do without that environment's API URL and token.
         required_configuration: &["apiUrl", "apiToken"],
         pod_identity: &[],
+        configuration_properties: &[("resources", "object"), ("tolerations", "array")],
         oldest_build: (1, 3, 0),
     },
     AddonCatalogSeed {
@@ -3870,6 +4011,12 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         requires_iam_permissions: false,
         required_configuration: &[],
         pod_identity: &[],
+        configuration_properties: &[
+            ("affinity", "object"),
+            ("nodeSelector", "object"),
+            ("resources", "object"),
+            ("tolerations", "array"),
+        ],
         oldest_build: (1, 0, 0),
     },
     AddonCatalogSeed {
@@ -3881,7 +4028,35 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         requires_iam_permissions: false,
         required_configuration: &[],
         pod_identity: &[],
+        configuration_properties: &[
+            ("affinity", "object"),
+            ("agent", "object"),
+            ("nodeSelector", "object"),
+            ("tolerations", "array"),
+        ],
         oldest_build: (1, 2, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "external-dns",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "networking",
+        default_namespace: "external-dns",
+        requires_iam_permissions: true,
+        required_configuration: &[],
+        pod_identity: &[(
+            "external-dns",
+            &["arn:aws:iam::aws:policy/AmazonRoute53FullAccess"],
+        )],
+        configuration_properties: &[
+            ("domainFilters", "array"),
+            ("policy", "string"),
+            ("provider", "string"),
+            ("resources", "object"),
+            ("sources", "array"),
+            ("txtOwnerId", "string"),
+        ],
+        oldest_build: (0, 15, 0),
     },
     AddonCatalogSeed {
         addon_name: "kube-proxy",
@@ -3894,7 +4069,30 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         pod_identity: &[],
         // kube-proxy is the one add-on whose version IS the Kubernetes version
         // it runs with, so its line starts at the oldest calendar row's version.
+        configuration_properties: &[
+            ("affinity", "object"),
+            ("nodeSelector", "object"),
+            ("resources", "object"),
+            ("tolerations", "array"),
+        ],
         oldest_build: (1, 30, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "kube-state-metrics",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "observability",
+        default_namespace: ADDON_DEFAULT_NAMESPACE,
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        configuration_properties: &[
+            ("collectors", "array"),
+            ("replicas", "integer"),
+            ("resources", "object"),
+            ("tolerations", "array"),
+        ],
+        oldest_build: (2, 13, 0),
     },
     AddonCatalogSeed {
         addon_name: "kubecost_kubecost",
@@ -3908,6 +4106,12 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         // cannot run without it.
         required_configuration: &[],
         pod_identity: &[],
+        configuration_properties: &[
+            ("global", "object"),
+            ("kubecostToken", "string"),
+            ("persistentVolume", "object"),
+            ("prometheus", "object"),
+        ],
         oldest_build: (2, 3, 0),
     },
     AddonCatalogSeed {
@@ -3919,7 +4123,31 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         requires_iam_permissions: false,
         required_configuration: &[],
         pod_identity: &[],
+        configuration_properties: &[
+            ("args", "array"),
+            ("nodeSelector", "object"),
+            ("replicas", "integer"),
+            ("resources", "object"),
+            ("tolerations", "array"),
+        ],
         oldest_build: (0, 7, 0),
+    },
+    AddonCatalogSeed {
+        addon_name: "prometheus-node-exporter",
+        owner: ADDON_OWNER_AWS,
+        publisher: ADDON_PUBLISHER_EKS,
+        addon_type: "observability",
+        default_namespace: "prometheus-node-exporter",
+        requires_iam_permissions: false,
+        required_configuration: &[],
+        pod_identity: &[],
+        configuration_properties: &[
+            ("hostNetwork", "boolean"),
+            ("resources", "object"),
+            ("service", "object"),
+            ("tolerations", "array"),
+        ],
+        oldest_build: (1, 8, 2),
     },
     AddonCatalogSeed {
         addon_name: "snapshot-controller",
@@ -3930,6 +4158,12 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         requires_iam_permissions: false,
         required_configuration: &[],
         pod_identity: &[],
+        configuration_properties: &[
+            ("replicaCount", "integer"),
+            ("resources", "object"),
+            ("tolerations", "array"),
+            ("volumeSnapshotClasses", "array"),
+        ],
         oldest_build: (8, 1, 0),
     },
     AddonCatalogSeed {
@@ -3941,6 +4175,18 @@ const ADDON_CATALOG: &[AddonCatalogSeed] = &[
         requires_iam_permissions: true,
         required_configuration: &[],
         pod_identity: &[("aws-node", &["arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"])],
+        configuration_properties: &[
+            ("branchENICooldown", "integer"),
+            // `enableNetworkPolicy` and `enableWindowsIpam` are STRINGS in this
+            // add-on's schema, not booleans: the key a client sets is the one
+            // the schema declares, with the type the schema gives it.
+            ("enableNetworkPolicy", "string"),
+            ("enableWindowsIpam", "string"),
+            ("eniConfig", "object"),
+            ("env", "object"),
+            ("init", "object"),
+            ("nodeAgent", "object"),
+        ],
         oldest_build: (1, 18, 0),
     },
 ];
@@ -4065,6 +4311,12 @@ pub struct AddonCatalogRecord {
     /// The service accounts the add-on runs as, with the managed policies
     /// recommended for each; see [`AddonCatalogSeed::pod_identity`].
     pub pod_identity: Vec<(String, Vec<String>)>,
+    /// The keys this add-on's configuration schema declares, each with the JSON
+    /// type it takes: its own ([`AddonCatalogSeed::configuration_properties`])
+    /// merged with the ones every add-on's schema carries
+    /// ([`ADDON_COMMON_CONFIGURATION_PROPERTIES`]), in the schema's own
+    /// alphabetical order.
+    pub configuration_properties: Vec<(String, String)>,
     /// Every build of this add-on, NEWEST FIRST — the order the catalog
     /// publishes versions in, so a caller reading it to pick a version sees the
     /// newest build at the head of the list.
@@ -4112,16 +4364,33 @@ impl AddonCatalogRecord {
     /// this add-on: "A JSON schema that's used to validate the configuration
     /// values you provide when an add-on is created or updated".
     ///
-    /// Every property it declares is one the catalog holds a value for — the
-    /// namespace the add-on is installed into, the service account it runs as,
-    /// and the properties the build cannot be installed without — so the schema
-    /// says what this service can actually act on rather than describing
-    /// settings nothing here honours. Its `required` list is the build's own
+    /// The properties it declares are THIS add-on's own configurable keys
+    /// ([`AddonCatalogSeed::configuration_properties`], each with the JSON type
+    /// that key takes) and the ones every add-on's schema carries
+    /// ([`ADDON_COMMON_CONFIGURATION_PROPERTIES`]), beside the two the install
+    /// itself takes — the namespace the add-on is installed into and the service
+    /// account it runs as — and the properties the build cannot be installed
+    /// without. A document may set no other key, which is what
+    /// `additionalProperties: false` states, so a client reading the schema
+    /// learns exactly the configuration surface of this add-on rather than a
+    /// document shared by every one of them. Its `required` list is the build's
+    /// own
     /// [`AddonCatalogVersionRecord::required_configuration`], which is also what
     /// makes [`AddonCatalogVersionRecord::requires_configuration`] true: a build
     /// that requires configuration publishes a schema that requires it, and one
     /// that does not publishes a schema with nothing required.
     pub fn configuration_schema(&self, version: &AddonCatalogVersionRecord) -> String {
+        self.configuration_schema_value(version).to_string()
+    }
+
+    /// That same published schema as the JSON document it is, which is what
+    /// [`Self::configuration_violation`] holds a configuration document to:
+    /// ONE source, with no serialise-and-parse round trip between the schema a
+    /// client reads and the schema a create is judged by.
+    fn configuration_schema_value(
+        &self,
+        version: &AddonCatalogVersionRecord,
+    ) -> ::serde_json::Value {
         let mut properties = ::serde_json::Map::new();
         properties.insert(
             "namespace".to_string(),
@@ -4147,11 +4416,27 @@ impl AddonCatalogRecord {
                 }),
             );
         }
+        for (property, json_type) in &self.configuration_properties {
+            properties.insert(
+                property.clone(),
+                ::serde_json::json!({ "type": json_type }),
+            );
+        }
         for property in &version.required_configuration {
+            // A required key keeps the type the add-on's own schema gives it —
+            // only the "you cannot install without this" description is added —
+            // so a required property of a type other than string cannot be
+            // mis-declared here and then refused when a caller sets it.
+            let declared = properties
+                .get(property)
+                .and_then(|declared| declared.get("type"))
+                .and_then(::serde_json::Value::as_str)
+                .unwrap_or("string")
+                .to_string();
             properties.insert(
                 property.clone(),
                 ::serde_json::json!({
-                    "type": "string",
+                    "type": declared,
                     "description": format!(
                         "Required to install {}: the add-on cannot run without it.",
                         self.addon_name
@@ -4164,8 +4449,134 @@ impl AddonCatalogRecord {
             "type": "object",
             "properties": ::serde_json::Value::Object(properties),
             "required": version.required_configuration,
+            // A key the schema does not declare is not a key this add-on takes,
+            // so a document that sets one does not satisfy the schema.
+            "additionalProperties": false,
         })
-        .to_string()
+    }
+
+    /// How `document` fails the configuration schema this entry publishes for
+    /// `version` — or `None` when it satisfies that schema.
+    ///
+    /// "The values that you provide are validated against the schema returned by
+    /// DescribeAddonConfiguration" (`CreateAddon$configurationValues`), so this
+    /// validates against THAT document — the one
+    /// [`Self::configuration_schema_value`] builds and
+    /// [`Self::configuration_schema`] publishes — which is what keeps what the
+    /// schema declares and what a document is held to from ever disagreeing.
+    pub fn configuration_violation(
+        &self,
+        version: &AddonCatalogVersionRecord,
+        document: &::serde_json::Value,
+    ) -> Option<String> {
+        json_schema_violation(
+            JSON_SCHEMA_ROOT_PATH,
+            &self.configuration_schema_value(version),
+            document,
+        )
+    }
+}
+
+/// The path a JSON Schema validator names the whole document by, which every
+/// violation below is reported relative to.
+const JSON_SCHEMA_ROOT_PATH: &str = "$";
+
+/// How `value` fails `schema`, as a validator states it — the path at fault and
+/// what is wrong with it — or `None` when it satisfies the schema.
+///
+/// It reads the four keywords the add-on configuration schemas above are written
+/// with: `type`, `properties`, `required` and `additionalProperties`. The first
+/// violation found is the one reported, and the walk is depth-first through the
+/// properties the SCHEMA declares, so its depth is bounded by the nesting of
+/// these schemas rather than by the document a caller sent; the document itself
+/// is parsed by `serde_json`, not here.
+fn json_schema_violation(
+    path: &str,
+    schema: &::serde_json::Value,
+    value: &::serde_json::Value,
+) -> Option<String> {
+    if let Some(expected) = schema.get("type").and_then(::serde_json::Value::as_str) {
+        if !json_value_has_type(expected, value) {
+            return Some(format!(
+                "{path}: {} found, {expected} expected",
+                json_type_name(value)
+            ));
+        }
+    }
+    let members = value.as_object()?;
+    let properties = schema
+        .get("properties")
+        .and_then(::serde_json::Value::as_object);
+    // `additionalProperties: false` is what makes a key the schema does not
+    // declare a violation rather than a value carried along unread.
+    if schema.get("additionalProperties") == Some(&::serde_json::Value::Bool(false)) {
+        if let Some(undeclared) = members.keys().find(|key| {
+            properties.is_none_or(|declared| !declared.contains_key(key.as_str()))
+        }) {
+            return Some(format!(
+                "{path}.{undeclared}: is not defined in the schema and the schema does not \
+                 allow additional properties"
+            ));
+        }
+    }
+    for required in schema
+        .get("required")
+        .and_then(::serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        if let Some(property) = required
+            .as_str()
+            .filter(|property| !members.contains_key(*property))
+        {
+            return Some(format!("{path}.{property}: is missing but it is required"));
+        }
+    }
+    let properties = properties?;
+    members.iter().find_map(|(key, member)| {
+        let declared = properties.get(key)?;
+        json_schema_violation(&format!("{path}.{key}"), declared, member)
+    })
+}
+
+/// Whether `value` is of the JSON Schema `type` named by `expected`.
+///
+/// A type the add-on configuration schemas do not use constrains nothing, which
+/// is what an unknown keyword value means in JSON Schema.
+fn json_value_has_type(expected: &str, value: &::serde_json::Value) -> bool {
+    match expected {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        // In the dialect these schemas name, an integer is any number with a
+        // zero fractional part, so `2.0` is an integer and `1.5` is not.
+        "integer" => {
+            value.is_i64()
+                || value.is_u64()
+                || value.as_f64().is_some_and(|number| number.fract() == 0.0)
+        }
+        "number" => value.is_number(),
+        "null" => value.is_null(),
+        _ => true,
+    }
+}
+
+/// The JSON Schema type name of a value, as a violation names what it found.
+fn json_type_name(value: &::serde_json::Value) -> &'static str {
+    match value {
+        ::serde_json::Value::Null => "null",
+        ::serde_json::Value::Bool(_) => "boolean",
+        ::serde_json::Value::Number(number) => {
+            if number.is_f64() {
+                "number"
+            } else {
+                "integer"
+            }
+        }
+        ::serde_json::Value::String(_) => "string",
+        ::serde_json::Value::Array(_) => "array",
+        ::serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -4265,6 +4676,18 @@ fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
                             policies.iter().map(|policy| (*policy).to_string()).collect(),
                         )
                     })
+                    .collect(),
+                configuration_properties: ADDON_COMMON_CONFIGURATION_PROPERTIES
+                    .iter()
+                    .chain(seed.configuration_properties)
+                    .map(|(property, json_type)| {
+                        ((*property).to_string(), (*json_type).to_string())
+                    })
+                    // A `BTreeMap` so a key the row declares a type of its own
+                    // for overrides the common one, and the properties come out
+                    // in the schema's alphabetical order with no duplicates.
+                    .collect::<BTreeMap<String, String>>()
+                    .into_iter()
                     .collect(),
                 versions,
             }
@@ -4473,6 +4896,25 @@ impl ComAmazonawsEksAwswesleyfrontendState {
     ) -> Option<&AddonCatalogRecord> {
         self.published_addons(now)
             .find(|addon| addon.addon_name == addon_name)
+    }
+
+    /// The catalog entry and the published build one `(addonName, addonVersion)`
+    /// pair names, or `None` when the catalog publishes no such build at `now`.
+    ///
+    /// It is the pair `DescribeAddonConfiguration` resolves, so whatever reads a
+    /// build's configuration schema reads the same build that operation
+    /// publishes it for.
+    pub fn published_addon_build(
+        &self,
+        addon_name: &str,
+        addon_version: &str,
+        now: SystemTime,
+    ) -> Option<(&AddonCatalogRecord, &AddonCatalogVersionRecord)> {
+        let addon = self.published_addon(addon_name, now)?;
+        let version = addon
+            .published_versions(now)
+            .find(|version| version.addon_version == addon_version)?;
+        Some((addon, version))
     }
 
     /// The version the catalog publishes as the DEFAULT build of one add-on for

@@ -230,10 +230,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // action. The ableToUpdateBundle parameter in the result will
             // indicate whether you can currently update your distribution's
             // bundle." — so a distribution that has already spent that one change
-            // is a well-formed request this resource's state does not allow,
-            // which is what the modelled `OperationFailureException` says.
-            // Refused BEFORE the first write, so it changes nothing.
-            if !distribution.able_to_update_bundle {
+            // within the billing cycle this call is made in is a well-formed
+            // request this resource's state does not allow, which is what the
+            // modelled `OperationFailureException` says. Refused BEFORE the first
+            // write, so it changes nothing.
+            if !distribution.able_to_update_bundle(now) {
                 return Err(operation_failure(format!(
                     "The bundle of the distribution {distribution_name} has already been updated \
                      within this monthly Amazon Web Services billing cycle. You can update your \
@@ -249,7 +250,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // bundle to be applied like any other rather than being
             // short-circuited.
             distribution.bundle_id = bundle_id;
-            distribution.able_to_update_bundle = false;
+            // The instant of the change is what spends the allowance: the cycle
+            // this call is made in holds no further change, and the clock makes
+            // the next cycle's available without anything being materialised.
+            distribution.bundle_updated_at_ms = Some(now);
             // The distribution's OWN status is left alone: a bundle names the
             // monthly network transfer quota and the monthly cost, none of the
             // configuration that is deployed to the edge locations, so this

@@ -110,7 +110,7 @@ const INSTANT_TOLERANCE_SECS: f64 = 1e-6;
 /// has decided anything ("When this operation creates an alarm, the alarm state is immediately
 /// set to INSUFFICIENT_DATA",
 /// `smithy_query(query="doc",shape="PutMetricAlarm")`).
-const CREATION_REASON: &str = "Unchecked: initial alarm creation";
+const CREATION_REASON: &str = "Unchecked: Initial alarm creation";
 
 /// The table: one row per shape the rule generalises over.
 const ROWS: &[Row] = &[

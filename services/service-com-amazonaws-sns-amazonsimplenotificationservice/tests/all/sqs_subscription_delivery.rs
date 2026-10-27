@@ -101,8 +101,23 @@ pub(crate) async fn sns(emulator: &Emulator, action: &str, params: &[(&str, &str
     text
 }
 
-/// One `awsJson1_0` call against SQS.
+/// One `awsJson1_0` call against SQS that must SUCCEED.
 pub(crate) async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> Value {
+    let (status, parsed) = sqs_call(emulator, operation, body).await;
+    assert_eq!(
+        status, 200,
+        "{operation}: expected HTTP 200, got {status} with {parsed}"
+    );
+    parsed
+}
+
+/// One `awsJson1_0` call against SQS, with whatever status it answered: the call every SQS
+/// request in this suite goes through, and the one a REFUSED call is read from.
+pub(crate) async fn sqs_call(
+    emulator: &Emulator,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -126,11 +141,7 @@ pub(crate) async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> V
     } else {
         serde_json::from_slice(&payload).unwrap_or(Value::Null)
     };
-    assert_eq!(
-        status, 200,
-        "{operation}: expected HTTP 200, got {status} with {parsed}"
-    );
-    parsed
+    (status, parsed)
 }
 
 /// The text of the first `<tag>…</tag>` element of an awsQuery response.
@@ -165,17 +176,22 @@ pub(crate) async fn given_queue_without_policy(
         .as_str()
         .unwrap_or_else(|| panic!("CreateQueue {name}: no QueueUrl in {created}"))
         .to_string();
+    let arn = queue_arn(emulator, &url).await;
+    (url, arn)
+}
+
+/// The `QueueArn` the queue at `url` reports: the ARN a subscription names that queue by.
+pub(crate) async fn queue_arn(emulator: &Emulator, url: &str) -> String {
     let attributes = sqs(
         emulator,
         "GetQueueAttributes",
         &json!({"QueueUrl": url, "AttributeNames": ["QueueArn"]}),
     )
     .await;
-    let arn = attributes["Attributes"]["QueueArn"]
+    attributes["Attributes"]["QueueArn"]
         .as_str()
-        .unwrap_or_else(|| panic!("GetQueueAttributes {name}: no QueueArn in {attributes}"))
-        .to_string();
-    (url, arn)
+        .unwrap_or_else(|| panic!("GetQueueAttributes {url}: no QueueArn in {attributes}"))
+        .to_string()
 }
 
 /// Write `policy` as the `Policy` attribute of the queue at `url`.

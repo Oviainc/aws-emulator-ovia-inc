@@ -176,8 +176,9 @@ const LOG_ALARM_COMPARISON_OPERATORS: [&str; 4] = [
     "LessThanThreshold",
 ];
 
-/// The `StateReason` of an alarm nothing has evaluated yet.
-const INITIAL_STATE_REASON: &str = "Unchecked: initial alarm creation";
+/// The `StateReason` of an alarm nothing has evaluated yet: the service constant every alarm
+/// writer of this service seeds a new alarm with ([`crate::state::INITIAL_STATE_REASON`]).
+const INITIAL_STATE_REASON: &str = crate::state::INITIAL_STATE_REASON;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

@@ -99,6 +99,8 @@ mod distributions_by_web_acl_id;
 mod edge_data_plane;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/field_level_encryption_config_delete.rs"]
+mod field_level_encryption_config_delete;
 #[path = "all/field_level_encryption_config_lifecycle.rs"]
 mod field_level_encryption_config_lifecycle;
 #[path = "all/field_level_encryption_config_list.rs"]

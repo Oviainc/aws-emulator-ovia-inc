@@ -25,6 +25,8 @@ mod change_set_lifecycle;
 mod change_type_validation;
 #[path = "all/delete_resource_policy_existence.rs"]
 mod delete_resource_policy_existence;
+#[path = "all/documented_entity_types.rs"]
+mod documented_entity_types;
 #[path = "all/entity_reads.rs"]
 mod entity_reads;
 #[path = "all/entity_type_projections.rs"]

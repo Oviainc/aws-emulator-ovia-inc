@@ -6,7 +6,7 @@
 //! `UpdateWorkload`, `DeleteWorkload`), the milestones recorded against a workload
 //! (`CreateMilestone`, `GetMilestone`, `ListMilestones`), the review templates
 //! (`CreateReviewTemplate`, `GetReviewTemplate`, `ListReviewTemplates`,
-//! `DeleteReviewTemplate`), the lens reviews of a workload (`GetLensReview`,
+//! `UpdateReviewTemplate`, `DeleteReviewTemplate`), the lens reviews of a workload (`GetLensReview`,
 //! `ListLensReviews`, `UpdateLensReview`), the answers of
 //! a workload's lens reviews (`GetAnswer`, `ListAnswers`, `UpdateAnswer`), the
 //! improvement plan of one of those lens
@@ -2855,6 +2855,30 @@ impl ReviewTemplateRecord {
             .iter()
             .any(|applied| lens_alias(applied) == lens_alias(lens))
     }
+
+    /// Drop the review of one lens from this template: the lens itself, the answers
+    /// recorded against its review and whatever a caller wrote to that review.
+    ///
+    /// The mirror of [`WorkloadRecord::disassociate_lens`], and for the same reason: a lens
+    /// review is not a resource of its own — it exists exactly while that lens is applied
+    /// to the template ([`Self::applies_lens`]) — so dropping the lens drops the review,
+    /// and the answers and notes held under it go with it rather than surviving to reappear
+    /// under a later apply. A workload created from this template copied its lenses, notes
+    /// and answers at create time (`CreateWorkload`), so it keeps them: the workload is not
+    /// a child of the template.
+    ///
+    /// Idempotent in the lens and in the SPELLING of it: a lens is one lens however it is
+    /// named ([`lens_alias`]), so every entry naming the same lens goes and the order of
+    /// the rest is left alone. It answers nothing, because whether the template applied the
+    /// lens is what [`Self::applies_lens`] is for — an operation that has to refuse a lens
+    /// the template does not apply resolves it BEFORE removing any.
+    pub fn disassociate_lens(&mut self, lens: &str) {
+        let alias = lens_alias(lens);
+        self.lenses.retain(|applied| lens_alias(applied) != alias);
+        self.answers.remove(alias);
+        self.lens_reviews.remove(alias);
+    }
+
     /// This template's question roll-up: one entry for every `Question` the enum
     /// publishes, so a caller reading a bucket to report review progress always finds
     /// it.

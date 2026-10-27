@@ -673,9 +673,10 @@ async fn the_reported_currency_is_the_one_the_items_partition_bills_in() {
 }
 
 /// An item is reported for a billing period its own half-open range covers: the
-/// inclusive start is in it, the exclusive end is not, an absent bound is open, and an
-/// item created with no range at all is reported for every period — including the
-/// current one, which is what a request naming no `BillingPeriod` asks for.
+/// inclusive start is in it, the exclusive end is not, an absent end is open, and an item
+/// created with no range at all applies from the billing period it was created in on —
+/// which is the current one, and so also what a request naming no `BillingPeriod` asks
+/// for. No period that closed before an item existed reports it.
 ///
 /// A create may put an item only into the current or the previous billing period, so
 /// every span here STARTS in that window ([`period`] counts from the current one) while
@@ -687,7 +688,9 @@ async fn the_requested_billing_period_selects_the_items_effective_in_it() {
     let group = emulator.billing_group("home", &[]).await;
     // (name, the BillingPeriodRange the create sets)
     let items: [(&str, Value); 5] = [
-        ("always", Value::Null),
+        // No range at all: the item applies from the period it was created in — the
+        // current one — on, so no earlier period reports it.
+        ("norange", Value::Null),
         (
             "previousonly",
             json!({
@@ -727,27 +730,25 @@ async fn the_requested_billing_period_selects_the_items_effective_in_it() {
 
     // The items reported for the CURRENT billing period, which is also what a request
     // naming no `BillingPeriod` asks for.
-    let current: Vec<&str> = vec!["always", "previousquarter", "fromcurrent", "currentonly"];
+    let current: Vec<&str> = vec!["norange", "previousquarter", "fromcurrent", "currentonly"];
     // (the BillingPeriod the read asks for, the names expected in response order)
     let cases: Vec<(String, Vec<&str>)> = vec![
-        // Before every span: only the item created with no range at all.
-        ("1970-01".to_string(), vec!["always"]),
-        (period(-2), vec!["always"]),
-        (
-            period(-1),
-            vec!["always", "previousonly", "previousquarter"],
-        ),
+        // Before every span: a closed billing period that precedes every item reports
+        // none of them, the one created with no range included.
+        ("1970-01".to_string(), vec![]),
+        (period(-2), vec![]),
+        (period(-1), vec!["previousonly", "previousquarter"]),
         // The same period, spelled with a one-digit month.
         (
             one_digit_month(&period(-1)),
-            vec!["always", "previousonly", "previousquarter"],
+            vec!["previousonly", "previousquarter"],
         ),
         // The end is EXCLUSIVE, so `previousonly` is gone the month it names.
         (period(0), current.clone()),
-        (period(1), vec!["always", "previousquarter", "fromcurrent"]),
-        (period(2), vec!["always", "fromcurrent"]),
-        (period(12), vec!["always", "fromcurrent"]),
-        ("2999-12".to_string(), vec!["always", "fromcurrent"]),
+        (period(1), vec!["norange", "previousquarter", "fromcurrent"]),
+        (period(2), vec!["norange", "fromcurrent"]),
+        (period(12), vec!["norange", "fromcurrent"]),
+        ("2999-12".to_string(), vec!["norange", "fromcurrent"]),
     ];
     for (billing_period, expected) in cases {
         let listed = emulator

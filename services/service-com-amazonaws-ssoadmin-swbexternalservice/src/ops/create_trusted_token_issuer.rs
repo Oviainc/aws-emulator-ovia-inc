@@ -15,6 +15,11 @@
 //! nothing, while the same token carrying DIFFERENT parameters is refused with the
 //! modelled `ConflictException` (409) rather than minting a second issuer.
 //!
+//! An instance whose own creation has not finished serves only its describe and its delete
+//! (`DescribeInstance`: "While the instance is in the CREATE_IN_PROGRESS state, you can
+//! call only DescribeInstance and DeleteInstance operations"), so a create made inside that
+//! window is refused with the modelled `ConflictException` and stores nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -217,6 +222,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             })?;
+
+        // An instance that is still being CREATED serves only its own describe and delete
+        // ("While the instance is in the CREATE_IN_PROGRESS state, you can call only
+        // DescribeInstance and DeleteInstance operations"), so nothing can be connected to
+        // it until that creation finishes — the conflict with the `CreateInstance` still
+        // in flight.
+        if store.instance_creation_in_progress(&instance_arn) {
+            return Err(CreateTrustedTokenIssuerErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::instance_creation_in_progress_message(
+                        &instance_arn,
+                    )),
+                },
+            )
+            .into());
+        }
 
         // Every parameter the `ClientToken` is scoped to: "Passing the same value to a
         // later call to an operation requires that you also pass the same value for all

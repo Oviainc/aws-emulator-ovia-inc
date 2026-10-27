@@ -43,14 +43,17 @@ const UNAUTHORIZED_MESSAGE: &str =
     "Unauthorized. Please check the request and access policy and try again.";
 const REFUSAL_STATUS: u16 = 400;
 
-/// One EC2 instance of the account's seeded fleet (`state::seed_account_instances`): the
-/// only instances a request that acts on an instance is authorized for.
+/// One EC2 instance of this service's own fleet seam (`state::seed_account_instances`),
+/// which is what authorizes a request that acts on an instance in a harness that mounts no
+/// EC2 beside this service; an instance EC2 itself has is authorized too (the rule, and the
+/// rows for it, are in [`super::instance_fleet_resolution`]).
 fn held_instance(index: usize) -> String {
     seed_account_instances()[index].0.clone()
 }
 
-/// Instance ids the account's fleet does NOT hold. `InstanceId` is a plain `String` in this
-/// service's model, so the rows vary in FORM and SIZE rather than against a pattern: EC2's
+/// Instance ids NO instance of the account has, in either place one can be reported from.
+/// `InstanceId` is a plain `String` in this service's model, so the rows vary in FORM and
+/// SIZE rather than against a pattern: EC2's
 /// two published id lengths, a near miss on a held instance, its uppercase spelling, and a
 /// value that is not an instance id at all.
 fn unheld_instances() -> Vec<(&'static str, String)> {

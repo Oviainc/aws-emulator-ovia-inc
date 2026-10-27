@@ -336,10 +336,18 @@ async fn a_scaffolded_operation_still_answers_501() {
 
     // Rows: operations this crate has not implemented yet, control plane and data
     // plane (`grep -l 'SCAFFOLDED, NOT IMPLEMENTED' src/ops/`).
-    let cases: Vec<(&str, Value)> = vec![(
-        "GenerateDataKeyPair",
-        json!({"KeyId": key_id, "KeyPairSpec": "RSA_2048"}),
-    )];
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "Verify",
+            json!({"KeyId": key_id, "Message": b64(b"still a stub"),
+                   "Signature": b64(b"still a stub"),
+                   "SigningAlgorithm": "RSASSA_PSS_SHA_256"}),
+        ),
+        (
+            "CreateCustomKeyStore",
+            json!({"CustomKeyStoreName": "still-a-stub"}),
+        ),
+    ];
     for (operation, body) in cases {
         let (status, payload) = call(&router, REGION, operation, &body).await;
         let code = error_code(&payload);

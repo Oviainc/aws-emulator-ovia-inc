@@ -22,7 +22,7 @@
 //!   — and nothing else a read could change is changed: two identical calls answer
 //!   identically;
 //! * the request is authorized before anything else about it is examined — an `InstanceId`
-//!   the account's EC2 fleet does not hold fails closed — and a directory no live
+//!   no instance of the account has fails closed — and a directory no live
 //!   registration is for is the modelled `ResourceNotFoundException`.
 //!
 //! The harness (router + engine + the account's directory fleet the registrations resolve
@@ -81,8 +81,10 @@ async fn list_associations(h: &Harness, body: &Value) -> Reply {
     call(h, "/user/ListUserAssociations", body).await
 }
 
-/// One EC2 instance of the account's seeded fleet (`state::seed_account_instances`): the
-/// only instances an association — or a list of associations — is authorized for.
+/// One EC2 instance of this service's own fleet seam (`state::seed_account_instances`),
+/// which is what authorizes an association in a harness that mounts no EC2 beside this
+/// service. An instance EC2 itself has is authorized too — the rule, and the rows for it,
+/// are in [`super::instance_fleet_resolution`].
 fn held_instance(index: usize) -> String {
     seed_account_instances()[index].0.clone()
 }

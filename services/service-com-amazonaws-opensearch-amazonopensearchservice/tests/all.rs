@@ -115,6 +115,8 @@ mod service_software_update;
 mod shared_es_signing_name_claim;
 #[path = "all/single_package_association.rs"]
 mod single_package_association;
+#[path = "all/single_package_dissociation.rs"]
+mod single_package_dissociation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_accumulation.rs"]

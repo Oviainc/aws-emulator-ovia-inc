@@ -38,11 +38,26 @@
 //!   the payload at one member), since handing such a service a JSON document would
 //!   not be its request, and equally one whose wire facts simply are not listed here
 //!   yet;
-//! * an integration pattern that waits for something this call cannot wait for:
-//!   `.sync`, which polls the invoked job to completion, and `.waitForTaskToken`,
-//!   which needs a later `SendTaskSuccess` from outside the execution;
+//! * the `.waitForTaskToken` integration pattern, which needs a later
+//!   `SendTaskSuccess` from outside the execution;
+//! * a run-a-job (`.sync`) pattern over an integration that is not in the
+//!   [`RUN_A_JOB`] catalogue below, because the job it starts is reported and
+//!   stopped through calls only that integration names;
 //! * a bare resource ARN (a Lambda function ARN as the `Resource`), which names a
 //!   resource rather than an integration call.
+//!
+//! ## The run-a-job (`.sync`) pattern
+//!
+//! A `Resource` ending in `.sync` (or `.sync:2`) asks for the run-a-job pattern:
+//! the integration's own call STARTS a job, and the task is not finished until that
+//! job is. [`RUN_A_JOB`] carries, per integration, the three calls that pattern is
+//! made of — the one that starts the job, the one that reports it and the one that
+//! stops it — plus where the job's identifier, its status and the reason it failed
+//! sit in those documents. The walk makes the starting call, records what came back
+//! as the task's submission and PARKS there ([`super::asl::ParkedJob`]); the job is
+//! then polled through its own reporting call until it reaches a terminal status,
+//! which is what resolves the task ([`super::run_a_job`]). Nothing is synthesised:
+//! the identifier, the status and the failure are the invoked service's own answers.
 //!
 //! An ACTIVITY `Resource` is not one of these: its work belongs to a worker that
 //! polls this emulator, so the walk schedules a task and suspends at it rather than
@@ -212,6 +227,17 @@ impl Api {
 /// mounted here but has no entry yet is one no call is made for, and [`read`] says
 /// exactly that rather than claiming anything about its protocol.
 pub const APIS: &[Api] = &[
+    // `services/service-com-amazonaws-athena-amazonathena/smithy-model/
+    // com-amazonaws-athena-amazonathena.json`: awsJson1_1, sigv4Name `athena`,
+    // endpointPrefix `athena`, sdkId `Athena`, service shape `AmazonAthena`.
+    Api {
+        namespace: "athena",
+        signing_name: "athena",
+        endpoint_prefix: "athena",
+        target_prefix: "AmazonAthena",
+        json_version: "1.1",
+        sdk_id: "Athena",
+    },
     // `services/service-com-amazonaws-dynamodb-dynamodb-20120810/smithy-model/
     // com-amazonaws-dynamodb-dynamodb-20120810.json`: awsJson1_0, sigv4Name
     // `dynamodb`, endpointPrefix `dynamodb`, sdkId `DynamoDB`, service shape
@@ -302,7 +328,201 @@ pub struct Call {
     pub api: &'static Api,
     /// The operation name as the service's model spells it, derived from the action.
     pub operation: String,
+    /// The run-a-job pattern this call STARTS, for a `Resource` that asked for one
+    /// (`.sync`, `.sync:2`): the task is finished when the job this call starts is,
+    /// so the walk parks at it instead of placing the response as the result.
+    /// `None` for a request-response integration, whose call IS the whole task.
+    pub job: Option<&'static RunAJob>,
+    /// Whether the `Resource` asked for the pattern's SECOND revision (`.sync:2`),
+    /// which differs in one thing: a job whose own output is carried as a
+    /// JSON-encoded string is reported as the parsed document rather than that
+    /// string ([`RunAJob::output_at`]).
+    pub parsed_output: bool,
 }
+
+/// The suffix a `Resource` names the run-a-job integration pattern with, and the
+/// revision of it that parses the job's own output
+/// (`arn:aws:states:::states:startExecution.sync:2`).
+const RUN_A_JOB_PATTERN: &str = "sync";
+const RUN_A_JOB_PATTERN_2: &str = "sync:2";
+
+/// The `.waitForTaskToken` pattern, whose outcome is a `SendTaskSuccess` from
+/// outside the execution rather than a job this emulator can poll.
+const CALLBACK_PATTERN: &str = "waitForTaskToken";
+
+/// One run-a-job (`.sync`) service integration: the three calls the pattern is made
+/// of, and where the job's identifier, status and failure sit in their documents.
+///
+/// The pattern itself is not in any Smithy model — it is Step Functions' own
+/// behaviour over another service's API — so each entry names the operations and
+/// members of the INVOKED service's model, cited on the entry. Only integrations
+/// whose reporting and stopping calls this emulator can really make have an entry:
+/// an integration with none is reported by [`read`] as one no job was started for,
+/// rather than parked at a job nothing could poll.
+#[derive(Debug)]
+pub struct RunAJob {
+    /// The `<service>:<action>` of the `Resource` that starts the job, as the
+    /// optimized integration spells it.
+    pub starts: &'static str,
+    /// The member of the STARTING call's response that identifies the job.
+    pub job_id: &'static str,
+    /// The operation that reports the job, and the member of its request the
+    /// identifier goes in.
+    pub describe: &'static str,
+    pub describe_member: &'static str,
+    /// Where the job's status sits in the reporting call's response.
+    pub status_at: &'static [&'static str],
+    /// The status values that mean the job finished its work, and those that mean it
+    /// ended without finishing it. A status in neither list is the job still running.
+    pub succeeded: &'static [&'static str],
+    pub failed: &'static [&'static str],
+    /// Where the reporting call's response says WHY a job that ended without
+    /// finishing did so; empty where that service reports no such member.
+    pub failure_cause_at: &'static [&'static str],
+    /// Where the reporting call's response carries the job's own output as a
+    /// JSON-encoded string, which the pattern's second revision reports parsed;
+    /// empty where that service carries none.
+    pub output_at: &'static [&'static str],
+    /// The operation that stops the job, and the member of its request the
+    /// identifier goes in.
+    pub stop: &'static str,
+    pub stop_member: &'static str,
+}
+
+impl RunAJob {
+    /// Whether `status` is one the job ENDED on, and whether it ended having done its
+    /// work: `None` while the job is still running.
+    fn finished(&self, status: &str) -> Option<bool> {
+        if self.succeeded.contains(&status) {
+            return Some(true);
+        }
+        if self.failed.contains(&status) {
+            return Some(false);
+        }
+        None
+    }
+
+    /// The value `path` names in `document`, as text.
+    fn text_at(document: &Value, path: &[&str]) -> Option<String> {
+        let mut node = document;
+        for member in path {
+            node = node.get(*member)?;
+        }
+        match node {
+            Value::String(text) => Some(text.clone()),
+            Value::Null => None,
+            other => Some(other.to_string()),
+        }
+    }
+
+    /// The job's status, as the reporting call's `answer` carries it.
+    pub fn status_of(&self, answer: &Value) -> Option<String> {
+        Self::text_at(answer, self.status_at)
+    }
+
+    /// Whether the job `answer` reports has ENDED, and with what: `Ok(answer)` for
+    /// one that did its work, `Err(the reason it did not)` for one that did not, and
+    /// `None` while it is still running.
+    pub fn outcome_of(&self, answer: &Value, parsed_output: bool) -> Option<Result<Value, String>> {
+        let status = self.status_of(answer)?;
+        match self.finished(&status)? {
+            true => Some(Ok(self.reported(answer, parsed_output))),
+            false => Some(Err(self.why_it_failed(answer, &status))),
+        }
+    }
+
+    /// The document the task reports as its result: the reporting call's own
+    /// response, with the job's JSON-encoded output parsed in place for the
+    /// pattern's second revision.
+    fn reported(&self, answer: &Value, parsed_output: bool) -> Value {
+        let mut reported = answer.clone();
+        if !parsed_output {
+            return reported;
+        }
+        let Some((last, leading)) = self.output_at.split_last() else {
+            return reported;
+        };
+        let mut node = &mut reported;
+        for member in leading {
+            match node.get_mut(*member) {
+                Some(next) => node = next,
+                None => return reported,
+            }
+        }
+        let parsed = node
+            .get(*last)
+            .and_then(Value::as_str)
+            .and_then(|text| ::serde_json::from_str::<Value>(text).ok());
+        if let (Some(parsed), Some(object)) = (parsed, node.as_object_mut()) {
+            object.insert((*last).to_string(), parsed);
+        }
+        reported
+    }
+
+    /// Why a job that ended without doing its work did so: the reason the reporting
+    /// call names, else the status it ended in.
+    fn why_it_failed(&self, answer: &Value, status: &str) -> String {
+        match Self::text_at(answer, self.failure_cause_at) {
+            Some(reason) if !reason.is_empty() => reason,
+            _ => format!(
+                "the '{}' job this task started ended in status {status}",
+                self.starts
+            ),
+        }
+    }
+}
+
+/// The run-a-job integrations this emulator performs.
+///
+/// One entry per `<service>:<action>` that STARTS a job, naming the calls that
+/// report and stop it. A `.sync` `Resource` outside this list starts nothing: see
+/// [`read`].
+pub const RUN_A_JOB: &[RunAJob] = &[
+    // A nested execution of a state machine, through this service's own API:
+    // `StartExecution` answers `executionArn`, `DescribeExecution` reports `status`
+    // (`ExecutionStatus`: RUNNING, SUCCEEDED, FAILED, TIMED_OUT, ABORTED) beside
+    // `error`, `cause` and the string `output`, and `StopExecution` stops it
+    // (`smithy_query(query="operation",operation="StartExecution,DescribeExecution,
+    // StopExecution")` on this crate's own model).
+    RunAJob {
+        starts: "states:startExecution",
+        job_id: "executionArn",
+        describe: "DescribeExecution",
+        describe_member: "executionArn",
+        status_at: &["status"],
+        succeeded: &[super::EXECUTION_STATUS_SUCCEEDED],
+        failed: &[
+            super::EXECUTION_STATUS_FAILED,
+            super::EXECUTION_STATUS_TIMED_OUT,
+            super::EXECUTION_STATUS_ABORTED,
+        ],
+        failure_cause_at: &["cause"],
+        output_at: &["output"],
+        stop: "StopExecution",
+        stop_member: "executionArn",
+    },
+    // An Athena query: `StartQueryExecution` answers `QueryExecutionId`,
+    // `GetQueryExecution` reports `QueryExecution.Status.State`
+    // (`QueryExecutionState`: QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED) beside
+    // `StateChangeReason`, and `StopQueryExecution` stops it
+    // (`smithy_query(query="operation",operation="StartQueryExecution,
+    // GetQueryExecution,StopQueryExecution",model_path="services/
+    // service-com-amazonaws-athena-amazonathena/smithy-model/
+    // com-amazonaws-athena-amazonathena.json")`).
+    RunAJob {
+        starts: "athena:startQueryExecution",
+        job_id: "QueryExecutionId",
+        describe: "GetQueryExecution",
+        describe_member: "QueryExecutionId",
+        status_at: &["QueryExecution", "Status", "State"],
+        succeeded: &["SUCCEEDED"],
+        failed: &["FAILED", "CANCELLED"],
+        failure_cause_at: &["QueryExecution", "Status", "StateChangeReason"],
+        output_at: &[],
+        stop: "StopQueryExecution",
+        stop_member: "QueryExecutionId",
+    },
+];
 
 /// What a task's own work failed with: the error NAME the state reports (which its
 /// `Retry` and `Catch` are matched against) and the cause that says what happened.
@@ -398,16 +618,13 @@ pub fn read(resource: &str) -> Result<Call, String> {
              made and nothing was run for it"
         ));
     }
-    // "<action>.sync", "<action>.sync:2" and "<action>.waitForTaskToken" each ask
-    // for an outcome that arrives after this call: the invoked job's completion, or
-    // a later `SendTaskSuccess`.
-    if let Some((_action, pattern)) = action.split_once('.') {
-        return Err(format!(
-            "'{shown}' asks for the '{}' integration pattern, whose outcome arrives after the \
-             call that starts it, so nothing was run for it",
-            super::asl::echoed(pattern)
-        ));
-    }
+    // "<action>.sync", "<action>.sync:2" and "<action>.waitForTaskToken" name an
+    // integration PATTERN after the action: the action is what is called either way,
+    // and the pattern says what finishes the task.
+    let (action, pattern) = match action.split_once('.') {
+        Some((action, pattern)) => (action, Some(pattern)),
+        None => (action, None),
+    };
     if action.is_empty() {
         return Err(format!(
             "'{shown}' names no action of its service, so nothing was run for it"
@@ -423,10 +640,83 @@ pub fn read(resource: &str) -> Result<Call, String> {
                 super::asl::echoed(service)
             )
         })?;
+    // The run-a-job pattern is performed for the integrations [`RUN_A_JOB`] names
+    // the reporting and stopping calls of; the callback pattern waits for a
+    // `SendTaskSuccess` nothing inside the execution makes.
+    let (job, parsed_output) = match pattern {
+        None => (None, false),
+        Some(pattern @ (RUN_A_JOB_PATTERN | RUN_A_JOB_PATTERN_2)) => {
+            let starts = format!("{service}:{action}");
+            let job = RUN_A_JOB
+                .iter()
+                .find(|job| job.starts == starts)
+                .ok_or_else(|| {
+                    format!(
+                        "'{shown}' asks for the run-a-job ('{}') pattern of an integration whose \
+                         job this emulator cannot report or stop, so no job was started and \
+                         nothing was run for it",
+                        super::asl::echoed(pattern)
+                    )
+                })?;
+            (Some(job), pattern == RUN_A_JOB_PATTERN_2)
+        }
+        Some(pattern) if pattern == CALLBACK_PATTERN => {
+            return Err(format!(
+                "'{shown}' asks for the '{}' integration pattern, whose outcome is a later \
+                 'SendTaskSuccess' from outside the execution, so nothing was run for it",
+                super::asl::echoed(pattern)
+            ))
+        }
+        Some(pattern) => {
+            return Err(format!(
+                "'{shown}' names '{}', which is not one of this service's integration patterns, \
+                 so nothing was run for it",
+                super::asl::echoed(pattern)
+            ))
+        }
+    };
     Ok(Call {
         api,
         operation: operation_of(action),
+        job,
+        parsed_output,
     })
+}
+
+/// The call that reports the job `job` started under `job_id`, and its request.
+pub fn describing(api: &'static Api, job: &'static RunAJob, job_id: &str) -> (Call, Value) {
+    let mut request = Map::new();
+    request.insert(
+        job.describe_member.to_string(),
+        Value::String(job_id.to_string()),
+    );
+    (
+        Call {
+            api,
+            operation: job.describe.to_string(),
+            job: None,
+            parsed_output: false,
+        },
+        Value::Object(request),
+    )
+}
+
+/// The call that STOPS the job `job` started under `job_id`, and its request.
+pub fn stopping(api: &'static Api, job: &'static RunAJob, job_id: &str) -> (Call, Value) {
+    let mut request = Map::new();
+    request.insert(
+        job.stop_member.to_string(),
+        Value::String(job_id.to_string()),
+    );
+    (
+        Call {
+            api,
+            operation: job.stop.to_string(),
+            job: None,
+            parsed_output: false,
+        },
+        Value::Object(request),
+    )
 }
 
 /// The operation name an action names: an action is the operation's name in
@@ -610,7 +900,27 @@ where
     Work: FnOnce(&dyn Tasks) -> Outcome + Send + 'static,
     Outcome: Send + 'static,
 {
-    let depth = chain_depth(ctx);
+    interpret_through(ctx.callback(), chain_depth(ctx), region, work).await
+}
+
+/// As [`interpret`], from a callback handle and a chain depth rather than from a
+/// request's own context.
+///
+/// A run-a-job pattern's outcome is not served by the request that started it: the
+/// job is polled after that call answered, so the task that polls it holds its own
+/// clone of the callback ([`super::run_a_job`]) and interprets the continuation
+/// through this. Everything else is identical, including the bound on how deep a
+/// chain of in-process calls may still make one.
+pub async fn interpret_through<Work, Outcome>(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    depth: u8,
+    region: &str,
+    work: Work,
+) -> Result<Outcome, ::tokio::task::JoinError>
+where
+    Work: FnOnce(&dyn Tasks) -> Outcome + Send + 'static,
+    Outcome: Send + 'static,
+{
     // One call is in flight at a time: the walk waits for each answer before it
     // transitions, so a deeper channel would buffer nothing.
     let (calls, mut handovers) = ::tokio::sync::mpsc::channel::<Handover>(1);
@@ -620,7 +930,7 @@ where
     });
     let serve = async {
         while let Some(handover) = handovers.recv().await {
-            let answer = perform(ctx, region, &handover.call, &handover.request).await;
+            let answer = call_api(callback, region, &handover.call, &handover.request).await;
             // A walk that has stopped waiting — it timed out, or it is gone — cannot
             // be told; it reported the timeout itself.
             let _ = handover.answer.send(answer);
@@ -638,7 +948,10 @@ where
 /// (`vendor/smithy-server-runtime/src/operation.rs`). This is the SAME counter the
 /// router bounds a cycle with, read here for the resource that counter does not
 /// bound: the blocking thread each level of the chain holds.
-fn chain_depth(ctx: &smithy_server_runtime::OperationContext<'_>) -> u8 {
+///
+/// Public, because the task that polls a parked job interprets the continuation
+/// outside the request that started the job and carries that request's depth into it.
+pub fn chain_depth(ctx: &smithy_server_runtime::OperationContext<'_>) -> u8 {
     ctx.parts()
         .extensions
         .get::<smithy_server_runtime::CallbackRecursionDepth>()
@@ -646,8 +959,12 @@ fn chain_depth(ctx: &smithy_server_runtime::OperationContext<'_>) -> u8 {
 }
 
 /// Make one integration call and read what the service answered.
-async fn perform(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+///
+/// Public, because the calls a run-a-job pattern is made of besides the one the walk
+/// asks for — the one that REPORTS the job and the one that STOPS it — are made
+/// outside any walk ([`super::run_a_job`]), through this same seam.
+pub async fn call_api(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     call: &Call,
     request: &Value,
@@ -665,7 +982,7 @@ async fn perform(
             })
         }
     };
-    match dispatch(ctx, api, region, &call.operation, body).await {
+    match dispatch(callback, api, region, &call.operation, body).await {
         Ok((status, error_type, payload)) => {
             answer_of(api, &call.operation, status, error_type.as_deref(), &payload)
         }
@@ -783,7 +1100,7 @@ fn error_message(document: &Value) -> Option<String> {
 /// is the one that serves the call. The answer is its status, the error type it
 /// named in the header, and its body.
 async fn dispatch(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     api: &Api,
     region: &str,
     operation: &str,
@@ -798,7 +1115,7 @@ async fn dispatch(
         .body(body)
         .map_err(|error| error.to_string())?;
 
-    let (access_key_id, secret_access_key) = credentials(ctx).await?;
+    let (access_key_id, secret_access_key) = credentials(callback).await?;
     sign(
         &mut request,
         api.signing_name,
@@ -815,7 +1132,7 @@ async fn dispatch(
     let request = ::aws_smithy_runtime_api::http::Request::try_from(request)
         .map_err(|error| error.to_string())?;
     let response = ::aws_smithy_runtime_api::client::http::HttpConnector::call(
-        &ctx.callback().http_connector(),
+        &callback.http_connector(),
         request,
     )
     .await
@@ -838,12 +1155,11 @@ async fn dispatch(
 /// the router vends none (request authentication off, where nothing verifies a
 /// signature). They sign this call and are never reported or logged.
 async fn credentials(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
 ) -> Result<(String, String), String> {
     use ::aws_credential_types::provider::ProvideCredentials;
 
-    let credentials = ctx
-        .callback()
+    let credentials = callback
         .aws_credentials_provider()
         .provide_credentials()
         .await
@@ -930,9 +1246,15 @@ fn sign(
 mod tests {
     use super::*;
 
-    /// One row of the `Resource` table: the case, the `Resource`, and the service's
-    /// signing name and the operation it names when a call is made for it.
-    type ResourceRow = (&'static str, &'static str, Option<(&'static str, &'static str)>);
+    /// One row of the `Resource` table: the case, the `Resource`, the service's
+    /// signing name and the operation it names when a call is made for it, and
+    /// whether that call STARTS a job the task is parked at (the run-a-job pattern).
+    type ResourceRow = (
+        &'static str,
+        &'static str,
+        Option<(&'static str, &'static str)>,
+        bool,
+    );
 
     /// One row of the answer table: the case, the status, the error-type header, the
     /// body, and the result document or the error name expected of it.
@@ -949,83 +1271,123 @@ mod tests {
     /// that name no call this emulator makes.
     #[test]
     fn a_resource_names_the_call_its_action_does() {
-        // (case, the Resource, the signing name and operation it names)
-        let rows: [ResourceRow; 15] = [
+        // (case, the Resource, the signing name and operation it names, parks at a job)
+        let rows: [ResourceRow; 19] = [
             (
                 "the optimized DynamoDB integration",
                 "arn:aws:states:::dynamodb:putItem",
                 Some(("dynamodb", "PutItem")),
+                false,
             ),
             (
                 "another action of the same service, which no code here names",
                 "arn:aws:states:::dynamodb:updateItem",
                 Some(("dynamodb", "UpdateItem")),
+                false,
             ),
             (
                 "the AWS SDK integration of the same operation",
                 "arn:aws:states:::aws-sdk:dynamodb:putItem",
                 Some(("dynamodb", "PutItem")),
+                false,
             ),
             (
                 "an action whose name is one word",
                 "arn:aws:states:::aws-sdk:sqs:receiveMessage",
                 Some(("sqs", "ReceiveMessage")),
+                false,
             ),
             (
                 "an EventBridge action",
                 "arn:aws:states:::events:putEvents",
                 Some(("events", "PutEvents")),
+                false,
             ),
             (
                 "a nested execution",
                 "arn:aws:states:::states:startExecution",
                 Some(("states", "StartExecution")),
+                false,
             ),
             (
                 "a Kinesis action",
                 "arn:aws:states:::aws-sdk:kinesis:putRecord",
                 Some(("kinesis", "PutRecord")),
+                false,
             ),
             (
                 "a Systems Manager action",
                 "arn:aws:states:::aws-sdk:ssm:getParameter",
                 Some(("ssm", "GetParameter")),
+                false,
             ),
             (
                 "an ECS action",
                 "arn:aws:states:::ecs:runTask",
                 Some(("ecs", "RunTask")),
+                false,
+            ),
+            // The run-a-job pattern: the ACTION is what is called, and the task is
+            // parked at the job that call starts.
+            (
+                "the run-a-job pattern over a nested execution",
+                "arn:aws:states:::states:startExecution.sync",
+                Some(("states", "StartExecution")),
+                true,
+            ),
+            (
+                "its second revision",
+                "arn:aws:states:::states:startExecution.sync:2",
+                Some(("states", "StartExecution")),
+                true,
+            ),
+            (
+                "the run-a-job pattern over an Athena query",
+                "arn:aws:states:::athena:startQueryExecution.sync",
+                Some(("athena", "StartQueryExecution")),
+                true,
             ),
             // The forms that name no call.
             (
                 "a service whose request is not one JSON document",
                 "arn:aws:states:::sns:publish",
                 None,
+                false,
             ),
             (
-                "the .sync pattern",
-                "arn:aws:states:::states:startExecution.sync",
+                "the run-a-job pattern over an integration whose job cannot be reported",
+                "arn:aws:states:::dynamodb:putItem.sync",
                 None,
+                false,
             ),
             (
                 "the .waitForTaskToken pattern",
                 "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
                 None,
+                false,
+            ),
+            (
+                "a pattern this service does not name",
+                "arn:aws:states:::states:startExecution.whenever",
+                None,
+                false,
             ),
             (
                 "an activity, whose work is a worker's rather than a call",
                 "arn:aws:states:us-west-2:000000000000:activity:worker",
                 None,
+                false,
             ),
             (
                 "a bare resource ARN",
                 "arn:aws:lambda:us-west-2:000000000000:function:f",
                 None,
+                false,
             ),
-            ("text that is not an ARN", "putItem", None),
+            ("text that is not an ARN", "putItem", None, false),
         ];
 
-        for (case, resource, expected) in rows {
+        for (case, resource, expected, parks) in rows {
             match (read(resource), expected) {
                 (Ok(call), Some((signing_name, operation))) => {
                     assert_eq!(
@@ -1037,6 +1399,12 @@ mod tests {
                         call.operation, operation,
                         "case {case:?}: expected the operation {operation}, got {}",
                         call.operation
+                    );
+                    assert_eq!(
+                        call.job.is_some(),
+                        parks,
+                        "case {case:?}: expected parks-at-a-job {parks}, got {:?}",
+                        call.job.map(|job| job.starts)
                     );
                 }
                 (Err(why), None) => assert!(

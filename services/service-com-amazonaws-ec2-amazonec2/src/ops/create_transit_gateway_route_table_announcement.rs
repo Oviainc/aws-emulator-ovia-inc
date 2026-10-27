@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayRouteTableAnnouncement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayRouteTableAnnouncement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: advertises the transit gateway route table the request names across the
+//! peering attachment it names, storing the announcement in the TRANSIENT `pending` state
+//! with the clock owing it `available`, and answering with it as stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayRouteTableAnnouncement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Everything the announcement reports about the two gateways — the announcing gateway, its
+//! core network, the peer gateway and the peer's core network — is read off the STORED
+//! route table and the STORED peering attachment, never echoed from the request.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +69,29 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// An announcement whose advertisement is still being carried out: the
+/// `TransitGatewayRouteTableAnnouncementState` enum's `pending` member
+/// ([`super::types::TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_STATE_VALUES`]) — the TRANSIENT
+/// state this create hands the announcement back in, with `available`
+/// ([`crate::state::ANNOUNCEMENT_STATE_AVAILABLE`], the state the rest of the announcement
+/// family already reads) owed to the clock.
+const ANNOUNCEMENT_STATE_PENDING: &str = "pending";
+
+/// The direction of an announcement made BY the transit gateway that owns the announced
+/// route table: the `TransitGatewayRouteTableAnnouncementDirection` enum's `outgoing` member
+/// ([`super::types::TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_DIRECTION_VALUES`]). The
+/// `incoming` member is that same announcement as the PEER gateway sees it, which nothing on
+/// this account's side creates.
+const ANNOUNCEMENT_DIRECTION_OUTGOING: &str = "outgoing";
+
+/// The `ResourceType` a route table announcement is tagged under — the
+/// `transit-gateway-route-table-announcement` member of that enum
+/// (`smithy_query(query="shape",shape="ResourceType")`) — which is the only type this
+/// action's tag specifications may name, "the tags specifications applied to the transit
+/// gateway route table announcement" being the only resource it tags.
+const RESOURCE_TYPE_TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT: &str =
+    "transit-gateway-route-table-announcement";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -139,18 +160,227 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayRouteTableAnnouncement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayRouteTableAnnouncementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayRouteTableAnnouncement"))
+        // `ctx` carries request metadata only; this operation reads none of it — both
+        // resources it acts on are named by id, and the announcement carries no Region of
+        // its own. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+        use std::time::SystemTime;
+
+        // The request's own form first: an id that is not an id of its kind at all is
+        // refused as malformed, so "not an id of this kind" never reads as "no such
+        // resource" and is never answered by the DryRun arm below either. The route table
+        // is asked about first, it being the resource this action announces.
+        state::require_well_formed_transit_gateway_route_table_id(
+            &input.transit_gateway_route_table_id,
+        )?;
+        state::require_well_formed_id(
+            state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+            &input.peering_attachment_id,
+            state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_MALFORMED,
+        )?;
+
+        // "The tags specifications applied to the transit gateway route table announcement"
+        // (`TagSpecifications`) — "you must specify the resource type to tag, otherwise the
+        // request will fail" (`TagSpecification`), and the only type this action tags is the
+        // announcement it creates. The tag payload's own bounds (the count per resource,
+        // each key and value's length, no key twice, nothing in the reserved namespace) are
+        // applied by the one shared reader every create holds its tags to.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            RESOURCE_TYPE_TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT,
+            Self::NAME,
+        )?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // named resources, so it is answered before anything is resolved or written, and
+        // every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first: whether this announcement can be made is asked of the state the
+        // route table and the attachment are ACTUALLY in rather than the one they were left
+        // in.
+        store.materialize_due_transitions();
+
+        // "The ID of the transit gateway route table" being announced: a route table this
+        // account does not hold has no routes to advertise, and the announcement reports the
+        // gateway that table belongs to, which is read off the stored table.
+        let announcing_gateway_id = store
+            .transit_gateway_route_tables
+            .get(&input.transit_gateway_route_table_id)
+            .ok_or_else(|| {
+                state::invalid_transit_gateway_route_table_id_not_found(
+                    &input.transit_gateway_route_table_id,
+                )
+            })?
+            .transit_gateway_id
+            .clone();
+        // A stored route table always records the gateway it is a table OF — the one writer
+        // of one sets it — so a table without one is this module disagreeing with itself
+        // rather than anything the request got wrong, and is reported as this emulator's own
+        // failure instead of a refusal with an empty gateway id in it.
+        let Some(announcing_gateway_id) = announcing_gateway_id else {
+            return Err(state::internal_error(format!(
+                "the stored transit gateway route table '{route_table_id}' records no transit \
+                 gateway",
+                route_table_id = input.transit_gateway_route_table_id,
+            )));
+        };
+
+        // "The ID of the peering attachment" the table is advertised across: every kind of
+        // attachment shares one id space, so an id naming an attachment that is not a
+        // PEERING one names no attachment this action can announce over and is refused as
+        // unknown, exactly as the accepting and rejecting operations of that family refuse
+        // one of another kind.
+        let peering = match store
+            .transit_gateway_attachments
+            .get(&input.peering_attachment_id)
+            .map(|record| &record.view)
+        {
+            Some(state::TransitGatewayAttachmentView::Peering(peering)) => peering,
+            // An attachment of any other kind, and an id nothing holds at all, are the one
+            // refusal: neither names a peering attachment this action can announce over.
+            _ => {
+                return Err(state::invalid_transit_gateway_attachment_id_not_found(
+                    &input.peering_attachment_id,
+                ))
+            }
+        };
+
+        // An announcement advertises routes ACROSS the peering, so the peering has to be in
+        // service: an attachment still waiting for the peer to accept it, or one a rejection
+        // or a delete has acted on, carries no path to advertise over. `IncorrectState` is
+        // this crate's code for "the resource exists, in a state that does not admit this
+        // call" (EC2's model declares no error shape for this operation at all,
+        // `smithy_query(query="operation",operation="CreateTransitGatewayRouteTableAnnouncement")`
+        // answering an empty `errors` list), and nothing is written.
+        let attachment_state = peering.state.as_deref().unwrap_or_default();
+        if attachment_state != state::TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE {
+            return Err(state::incorrect_state(format!(
+                "The transit gateway peering attachment '{attachment_id}' is in state \
+                 '{attachment_state}'; only an attachment in state '{available}' can \
+                 announce a route table",
+                attachment_id = input.peering_attachment_id,
+                available = state::TRANSIT_GATEWAY_ATTACHMENT_STATE_AVAILABLE,
+            )));
+        }
+
+        // Which side of the peering announces, and which side is the peer: the announcing
+        // gateway is the one the announced route table belongs to, so the peer is the OTHER
+        // side of that attachment. A route table of a gateway the attachment does not join
+        // has no peer to be advertised to, so the two members do not hold together and
+        // nothing is written.
+        let requester = peering.requester_tgw_info.as_ref();
+        let accepter = peering.accepter_tgw_info.as_ref();
+        let gateway_of = |side: Option<&PeeringTgwInfo>| -> Option<String> {
+            side.and_then(|info| info.transit_gateway_id.clone())
+        };
+        let announcing_gateway = announcing_gateway_id.as_str();
+        let (announcing, peer) = if gateway_of(requester).as_deref() == Some(announcing_gateway) {
+            (requester, accepter)
+        } else if gateway_of(accepter).as_deref() == Some(announcing_gateway) {
+            (accepter, requester)
+        } else {
+            return Err(state::invalid_parameter_combination(format!(
+                "The transit gateway route table '{route_table_id}' belongs to the transit \
+                 gateway '{announcing_gateway}', which is not a transit gateway the peering \
+                 attachment '{attachment_id}' peers",
+                route_table_id = input.transit_gateway_route_table_id,
+                attachment_id = input.peering_attachment_id,
+            )));
+        };
+
+        // The announcement as it will be stored: everything the service owns — the direction
+        // of an announcement this side makes, the transient state, the creation time and (in
+        // the writer below) the id — is derived here rather than taken from the request, and
+        // both gateways are read off the stored attachment.
+        let view = TransitGatewayRouteTableAnnouncement {
+            transit_gateway_route_table_announcement_id: None,
+            transit_gateway_id: Some(announcing_gateway_id.clone()),
+            core_network_id: announcing.and_then(|info| info.core_network_id.clone()),
+            peer_transit_gateway_id: gateway_of(peer),
+            peer_core_network_id: peer.and_then(|info| info.core_network_id.clone()),
+            peering_attachment_id: Some(input.peering_attachment_id.clone()),
+            announcement_direction: Some(ANNOUNCEMENT_DIRECTION_OUTGOING.to_string()),
+            transit_gateway_route_table_id: Some(input.transit_gateway_route_table_id.clone()),
+            // The TRANSIENT state of a create, with the clock owing it `available` below:
+            // the span is never zero, so a caller acting straight after this call still sees
+            // the announcement pending.
+            state: Some(ANNOUNCEMENT_STATE_PENDING.to_string()),
+            creation_time: Some(state::system_time_to_date_time(SystemTime::now())),
+            tags: Some(tags),
+        };
+
+        // A count ceiling first, then the byte budget: a record count on its own admits tags
+        // of any length, and a byte budget on its own admits records without end. The insert
+        // below asks the same count predicate and answers `None` for it, so this is the
+        // refusal the caller sees rather than a second rule.
+        if !store.has_transit_gateway_route_table_announcement_capacity() {
+            return Err(store_is_full(
+                store.transit_gateway_route_table_announcements.len(),
+            ));
+        }
+        // The bytes this announcement would add to the store, charged against the crate's one
+        // byte budget BEFORE the write: the tags are the record's only caller-chosen bytes,
+        // which is what the writer charges them for beside the fixed per-record overhead every
+        // stored record costs.
+        let payload_bytes = state::tag_list_bytes(view.tags.as_deref().unwrap_or_default());
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store another transit gateway route table announcement",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        let Some(announcement_id) = store.insert_transit_gateway_route_table_announcement(view)
+        else {
+            // Unreachable: the ceiling was asked above, and the store is locked throughout.
+            // Kept as the backstop that keeps a full store from reading as a 501 or a 200,
+            // worded by the ONE definition of that refusal so the two cannot drift apart.
+            return Err(store_is_full(
+                store.transit_gateway_route_table_announcements.len(),
+            ));
+        };
+        let Some(record) = store
+            .transit_gateway_route_table_announcements
+            .get_mut(&announcement_id)
+        else {
+            // Unreachable: the store is locked throughout, so the record written a statement
+            // ago is the one read back here.
+            return Err(state::internal_error(format!(
+                "the transit gateway route table announcement '{announcement_id}' written a \
+                 moment ago is not in the store"
+            )));
+        };
+        record.pending = Some(state::PendingStateMove::starting_now(
+            state::ANNOUNCEMENT_STATE_AVAILABLE,
+        ));
+
+        // The answer is the record as it was stored, so this create and
+        // `DescribeTransitGatewayRouteTableAnnouncements` cannot drift apart.
+        Ok(CreateTransitGatewayRouteTableAnnouncementOutput {
+            transit_gateway_route_table_announcement: Some(record.view.clone()),
+        })
     }
+}
+
+/// The refusal a store that holds as many route table announcements as it can answers: HTTP
+/// 400 `ResourceLimitExceeded`, naming how many it holds.
+///
+/// The ONE definition of that wording, so the pre-check and the writer's backstop below it
+/// cannot drift apart.
+fn store_is_full(held: usize) -> CreateTransitGatewayRouteTableAnnouncementError {
+    crate::state::resource_limit_exceeded(format!(
+        "This emulator holds {held} transit gateway route table announcements, which is as \
+         many as it stores"
+    ))
 }

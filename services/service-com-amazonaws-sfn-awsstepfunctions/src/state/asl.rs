@@ -23,7 +23,10 @@
 //!   other service's own handler in this same emulator, with the document the state
 //!   built as that operation's request and the operation's response as the state's
 //!   result (see [`super::integration`], which also states which integrations are
-//!   made and which are not);
+//!   made and which are not). A `Resource` asking for the run-a-job (`.sync`)
+//!   pattern is called the same way, and the task is then PARKED at the job that
+//!   call started ([`ParkedJob`]) until the invoked service reports it finished,
+//!   which is what resolves the task ([`super::run_a_job`]);
 //! * a `Resource` naming an ACTIVITY ARN belongs to a worker that polls this
 //!   emulator, so the state SCHEDULES a task carrying the state's effective input and
 //!   the walk SUSPENDS there ([`Run::waiting`]), which is the execution waiting for a
@@ -33,8 +36,9 @@
 //! What is NOT executed is what cannot be executed inside this process:
 //!
 //! * an integration [`super::integration::read`] makes no call for — a service whose
-//!   request is not one JSON document, a pattern whose outcome arrives after the
-//!   call, a `Resource` naming no integration at all;
+//!   request is not one JSON document, the callback (`.waitForTaskToken`) pattern,
+//!   a run-a-job pattern over an integration whose job cannot be reported or
+//!   stopped, a `Resource` naming no integration at all;
 //! * a Distributed Map's `ItemReader`, `ItemBatcher` and `ResultWriter`, which read
 //!   and write an S3 dataset;
 //! * a JSONata-mode definition (`QueryLanguage: "JSONata"`) and the members that
@@ -644,6 +648,10 @@ pub struct Run {
     /// carries this reached no terminal status: the task is what the execution is
     /// waiting for.
     pub waiting: Option<ScheduledActivity>,
+    /// The run-a-job integration's job the walk PARKED at, when it started one. A run
+    /// that carries this reached no terminal status either: what the execution is
+    /// waiting for is that job finishing.
+    pub parked: Option<ParkedJob>,
     /// The Map Run each Distributed Map state the walk entered started, in the order
     /// they were entered.
     pub map_runs: Vec<StartedMapRun>,
@@ -684,6 +692,57 @@ pub struct ScheduledActivity {
     /// `HeartbeatSeconds`: "If more time than the specified seconds elapses between
     /// heartbeats from the task, this state fails with a States.Timeout error name."
     pub heartbeat_seconds: Option<u64>,
+}
+
+/// The job a `Task` state's run-a-job (`.sync`) integration STARTED, which parked the
+/// walk: the task is finished when that job is, so what happens next is the job
+/// reaching a terminal status rather than another state of this definition.
+///
+/// The offset is into the RUN (the total of every `Wait` the walk passed before the
+/// state), so the caller that parks this turns it into an instant against the
+/// execution's own start — the walk never sleeps.
+#[derive(Debug, Clone)]
+pub struct ParkedJob {
+    /// The state that started the job, so the job's outcome resumes the execution
+    /// there.
+    pub state_name: String,
+    /// The RAW input of that state, before `InputPath` and `Parameters`: what its
+    /// `ResultPath` combines the job's own report with once the job has ended.
+    pub raw_input: Value,
+    /// The integration the job belongs to, and the service whose API reports and
+    /// stops it.
+    pub job: &'static super::integration::RunAJob,
+    pub api: &'static super::integration::Api,
+    /// Whether the `Resource` asked for the pattern's second revision.
+    pub parsed_output: bool,
+    /// The job's own identifier, as the call that started it reported it.
+    pub job_id: String,
+    /// The document that call answered, which is what the task reports as its
+    /// SUBMISSION.
+    pub submitted: Value,
+    /// How far into the run the state started the job.
+    pub at: Duration,
+    /// `TimeoutSeconds`: "If the task runs longer than the specified seconds, this
+    /// state fails with a States.Timeout error name" — which for this pattern bounds
+    /// how long the job may stay unfinished, because the task is not finished until
+    /// it is.
+    pub timeout_seconds: Option<u64>,
+}
+
+/// What the job an execution was PARKED at ended as, which is the result of the state
+/// that started it.
+///
+/// `Ok` carries the document the job's own reporting call answered — the job did its
+/// work, so that report IS the task's result — and `Err` why it ended without doing
+/// it, which is the task's failure.
+#[derive(Debug, Clone)]
+pub struct JobReply {
+    /// The state that started the job, as the parked record names it.
+    pub state_name: String,
+    /// The RAW input that state was entered with, as the parked record carries it.
+    pub state_input: String,
+    /// What the job ended as.
+    pub outcome: Result<Value, Failure>,
 }
 
 /// A worker's reply to the activity task an execution SUSPENDED at.
@@ -841,8 +900,9 @@ enum Next {
     /// Nowhere: this branch (or the execution) ends with the state's output.
     EndBranch,
     /// Nowhere YET: the state scheduled an activity task
-    /// ([`Interpreter::waiting`]), so the walk stops there and the execution waits
-    /// for the worker that polls for it.
+    /// ([`Interpreter::waiting`]) or started the job of a run-a-job integration
+    /// ([`Interpreter::parked`]), so the walk stops there and the execution waits —
+    /// for the worker that polls for the task, or for the job to finish.
     Suspended,
 }
 
@@ -2282,15 +2342,59 @@ pub fn resume(
     applied.then_some(run)
 }
 
+/// Walk `definition` on from the run-a-job task whose job has ENDED, and report what
+/// happened.
+///
+/// The job the state's integration started is its unit of work, so what that job
+/// ended as is the state's own outcome: the walk begins AT that state — with the raw
+/// input it was entered with the first time, which `reply` carries and which its
+/// `ResultPath` combines the job's report with — reports the outcome there instead of
+/// starting the job again, and carries on from its `Next` (or into its `Catch`, for a
+/// job that ended without doing its work). The states before it already ran, under
+/// the call that started the job, so neither their work nor their events are
+/// repeated.
+///
+/// `input` is the EXECUTION's own input, which the context object (`$$`) reports; it
+/// is not the document the walk starts from. `elapsed` is how long the execution had
+/// already been running when the job ended, which a definition-level `TimeoutSeconds`
+/// bounds: the span a job stayed unfinished is part of the execution's own run.
+///
+/// `None` when the definition declares no such state any more, so there is nothing to
+/// continue from.
+pub fn resume_job(
+    definition: &str,
+    input: &str,
+    start: SystemTime,
+    context: &Context,
+    reply: &JobReply,
+    elapsed: Duration,
+    tasks: &dyn Tasks,
+) -> Option<Run> {
+    let state_input: Value = serde_json::from_str(&reply.state_input).ok()?;
+    let (run, applied) = interpret(
+        definition,
+        input,
+        start,
+        context,
+        Entry::Job(reply.clone(), state_input),
+        elapsed,
+        tasks,
+    );
+    applied.then_some(run)
+}
+
 /// Where a walk of a definition begins, and what it does when it gets there.
-enum Entry {
-    /// At the definition's `StartAt`, with the execution's own input: an attempt of
+enum Entry {    /// At the definition's `StartAt`, with the execution's own input: an attempt of
     /// its own.
     Start,
     /// At the state whose activity task a worker's reply answers, with the raw input
     /// that state was entered with: the reply is that state's RESULT, so the state
     /// does not run again.
     Reply(ActivityReply, Value),
+    /// At the state whose run-a-job integration started the job that has now ended,
+    /// with the raw input that state was entered with: what the job ended as is that
+    /// state's outcome, so the job is not started again.
+    Job(JobReply, Value),
     /// At the state a redriven execution did not get past, with the raw input that
     /// state was entered with: the state RUNS, because it is the step the attempt
     /// stopped at.
@@ -2385,15 +2489,19 @@ fn interpret(
     // execution's input. A state the definition no longer declares — the state machine
     // an execution started through an unqualified ARN has been updated since — is no
     // step to continue from, so such a walk is an attempt of its own.
-    let (reply, start_at, first_input) = match entry {
+    let (reply, job_reply, start_at, first_input) = match entry {
         Entry::Reply(reply, state_input) => {
             let state_name = reply.state_name.clone();
-            (Some(reply), state_name, state_input)
+            (Some(reply), None, state_name, state_input)
+        }
+        Entry::Job(reply, state_input) => {
+            let state_name = reply.state_name.clone();
+            (None, Some(reply), state_name, state_input)
         }
         Entry::At(state_name, state_input) if states.contains_key(&state_name) => {
-            (None, state_name, state_input)
+            (None, None, state_name, state_input)
         }
-        Entry::At(..) | Entry::Start => (None, start_at.to_string(), input_value.clone()),
+        Entry::At(..) | Entry::Start => (None, None, start_at.to_string(), input_value.clone()),
     };
 
     let mut interpreter = Interpreter {
@@ -2409,8 +2517,10 @@ fn interpret(
         base_context: context.value(&input_value, start),
         tasks,
         waiting: None,
+        parked: None,
         map_runs: Vec::new(),
         reply,
+        job_reply,
         resumed: None,
         // A child execution's ARN is minted in the state machine's OWN region, from
         // the state machine's own ARN, so it agrees with the parent execution's
@@ -2427,6 +2537,7 @@ fn interpret(
         &Scope::default(),
     );
     let mut waiting = interpreter.waiting.take();
+    let mut parked = interpreter.parked.take();
     let mut steps = interpreter.steps;
     let mut map_runs = interpreter.map_runs;
     let mut end = branch.end;
@@ -2453,6 +2564,9 @@ fn interpret(
         }
         if let Some(waiting) = waiting.as_mut() {
             waiting.at = waiting.at.saturating_sub(resumed.at);
+        }
+        if let Some(parked) = parked.as_mut() {
+            parked.at = parked.at.saturating_sub(resumed.at);
         }
         end = end.saturating_sub(resumed.at);
     }
@@ -2511,13 +2625,14 @@ fn interpret(
     }
 
     // An execution that SUSPENDED reached no outcome: the walk stopped at an activity
-    // task, and what happens next is a worker's reply, so the run reports the task it
-    // is waiting for and no terminal event is written. Two checks come FIRST, so a run
-    // that cannot reach the task is not reported as waiting for it: the
-    // definition-level timeout above, which a run's own `Wait` states can already have
-    // spent, and the branch's outcome, which is a FAILURE where the document the task
-    // would carry outgrew what a state may produce.
-    if let (Some(waiting), true) = (waiting, branch.outcome.is_ok()) {
+    // task, and what happens next is a worker's reply, or it parked at the job a
+    // run-a-job integration started, and what happens next is that job finishing. So
+    // the run reports what it is waiting for and no terminal event is written. Two
+    // checks come FIRST, so a run that cannot reach it is not reported as waiting for
+    // it: the definition-level timeout above, which a run's own `Wait` states can
+    // already have spent, and the branch's outcome, which is a FAILURE where the
+    // document the task would carry outgrew what a state may produce.
+    if branch.outcome.is_ok() && (waiting.is_some() || parked.is_some()) {
         return (
             Run {
                 status: super::EXECUTION_STATUS_RUNNING,
@@ -2526,7 +2641,8 @@ fn interpret(
                 cause: None,
                 steps,
                 elapsed: end,
-                waiting: Some(waiting),
+                waiting,
+                parked,
                 map_runs,
             },
             applied,
@@ -2653,6 +2769,7 @@ fn terminal(
         elapsed,
         // A run that reached a terminal event is waiting for nothing.
         waiting: None,
+        parked: None,
         // Set by `run`, which is where the walk's Map Runs are in scope.
         map_runs: Vec::new(),
     }
@@ -2757,6 +2874,10 @@ struct Interpreter<'tasks> {
     /// execution waits at that state until a worker answers it. Set at most once,
     /// because the walk stops at the state that set it.
     waiting: Option<ScheduledActivity>,
+    /// The job a `Task` state's run-a-job integration started, which PARKED the walk:
+    /// the execution waits at that state until the job finishes. Set at most once,
+    /// because the walk stops at the state that set it.
+    parked: Option<ParkedJob>,
     /// The Map Run every Distributed Map state this walk entered started, in the
     /// order they were entered. Bounded by [`MAX_STATE_TRANSITIONS`], which every
     /// `Map` state spends from.
@@ -2765,6 +2886,10 @@ struct Interpreter<'tasks> {
     /// when it is one: the state the reply names produces that result instead of
     /// suspending. Taken when it is applied, so one reply answers one task.
     reply: Option<ActivityReply>,
+    /// What the job this walk is CONTINUING from ended as, when it is one: the state
+    /// that started that job reports that outcome instead of starting it again.
+    /// Taken when it is applied, so one outcome answers one parked job.
+    job_reply: Option<JobReply>,
     /// Where the reply was applied, once it has been: what the walk did BEFORE that
     /// point already happened under an earlier call, so [`interpret`] reports only
     /// what follows it.
@@ -3308,9 +3433,73 @@ impl Interpreter<'_> {
         self.push_detailed(event_type, state_name, after, details);
     }
 
+    /// The event one attempt of a run-a-job task failed to START its job with: "the
+    /// task submission failed", which is a different event from the failure of a task
+    /// whose work ran — and the same event a request-response task records when ITS
+    /// call failed, because for that pattern the call IS the work.
+    fn push_submit_failure(
+        &mut self,
+        state_name: &str,
+        resource_type: &str,
+        action: &str,
+        failure: &Failure,
+        after: Duration,
+        call: &super::integration::Call,
+    ) {
+        if call.job.is_none() || failure.name() == TIMEOUT_ERROR {
+            self.push_task_failure(state_name, resource_type, action, failure, after);
+            return;
+        }
+        let mut details = task_work_details(resource_type, action);
+        details.error = failure.error.clone();
+        details.cause = failure.cause.clone();
+        self.push_detailed(super::EVENT_TASK_SUBMIT_FAILED, state_name, after, details);
+    }
+
+    /// What the job a run-a-job task started ENDED as, placed as that state's own
+    /// outcome.
+    ///
+    /// The job is the task's unit of work, so a job that did its work makes the
+    /// task succeed with the report the invoked service gave of it — placed by the
+    /// state's own result-side data flow, exactly as a request-response call's
+    /// response is — and a job that ended without doing it makes the task fail, which
+    /// the state's `Catch` then answers for.
+    #[allow(clippy::too_many_arguments)]
+    fn finished_job(
+        &mut self,
+        name: &str,
+        state: &Map<String, Value>,
+        raw: &Value,
+        work: (&str, &str),
+        outcome: Result<Value, Failure>,
+        context: &Value,
+        at: Duration,
+    ) -> Result<StateStep, Fault> {
+        let (resource_type, action) = work;
+        let outcome = outcome.and_then(|result| {
+            measure_payload(&result, &format!("the 'Task' state '{name}'")).map(|_bytes| result)
+        });
+        match outcome {
+            Ok(result) => {
+                let mut details = task_work_details(resource_type, action);
+                details.output = Some(result.to_string());
+                self.push_detailed(super::EVENT_TASK_SUCCEEDED, name, at, details);
+                let value = self
+                    .place_result(state, raw, result, context, true)
+                    .map_err(|failure| failure.at(at))?;
+                self.push("TaskStateExited", name, at);
+                let next = self.next_of(name, state).map_err(|failure| failure.at(at))?;
+                Ok(StateStep { value, at, next })
+            }
+            Err(failure) => {
+                self.push_task_failure(name, resource_type, action, &failure, at);
+                self.catch_or_fail((name, "TaskStateExited"), state, raw, failure, context, at)
+            }
+        }
+    }
+
     /// A `Task` state's failure, recorded on the state that produced it and then
     /// reported to the walk.
-    ///
     /// The failure of a task is the TASK's, so the history attributes it to the work
     /// that failed — the error name and the cause, on the state that named it —
     /// whatever the walk then does with it: a caller reads what went wrong off the
@@ -3633,6 +3822,46 @@ impl Interpreter<'_> {
         let heartbeat = self
             .task_seconds(state, "HeartbeatSeconds", &effective, context)
             .map_err(|failure| self.task_fault(name, &resource_type, &action, failure, at))?;
+        // The job a run-a-job integration started has ENDED: what it ended as is this
+        // state's own outcome, so the state reports it instead of starting the job a
+        // second time. The events up to here are the ones the call that parked the
+        // walk already recorded, which is what [`Resumed::index`] marks.
+        let ended = match &self.job_reply {
+            Some(reply) if reply.state_name == name => self.job_reply.take(),
+            _ => None,
+        };
+        if let Some(ended) = ended {
+            self.resumed = Some(Resumed {
+                index: self.steps.len(),
+                at,
+            });
+            return self.finished_job(
+                name,
+                state,
+                &raw,
+                (&resource_type, &action),
+                ended.outcome,
+                context,
+                at,
+            );
+        }
+        // A nested state list is walked to its own end inside the enclosing state's
+        // turn, so there is nowhere for one of its states to park: a `Map` iteration
+        // or a `Parallel` branch that would start a job is not run, rather than run
+        // as though the job had already finished.
+        if call.job.is_some() && self.depth > 0 {
+            return Err(self.task_fault(
+                name,
+                &resource_type,
+                &action,
+                runtime(format!(
+                    "state '{name}' starts a run-a-job integration inside a 'Map' iteration or a \
+                     'Parallel' branch, which this emulator does not park at, so nothing was run \
+                     for it"
+                )),
+                at,
+            ));
+        }
         let (outcome, end) = self.with_retries(state, at, &mut |me, at| {
             // This attempt's own request reads `$$.State.RetryCount`, so the payload
             // template is rendered with the context of the attempt it is on.
@@ -3674,7 +3903,7 @@ impl Interpreter<'_> {
             // a run already past its deadline makes no further call (and a `Retry`
             // cannot keep making them).
             if let Some(failure) = me.out_of_time() {
-                me.push_task_failure(name, &resource_type, &action, &failure, at);
+                me.push_submit_failure(name, &resource_type, &action, &failure, at, &call);
                 return (Err(failure), at);
             }
             let answered = me.tasks.perform(&call, &request, within);
@@ -3693,17 +3922,57 @@ impl Interpreter<'_> {
                     cause: Some(cause),
                 }),
             };
-            match &attempt {
-                Ok(result) => {
+            match (&attempt, call.job) {
+                // A run-a-job integration's call STARTED a job: the task is not
+                // finished, so what the call answered is recorded as the task's
+                // SUBMISSION ("the response from a resource when a task has
+                // started") and the walk parks at the job until it ends.
+                (Ok(result), Some(job)) => {
+                    let Some(job_id) = result.get(job.job_id).and_then(Value::as_str) else {
+                        let failure = runtime(format!(
+                            "state '{name}': the '{}' call of {} answered no '{}', so the job it \
+                             started cannot be reported and nothing was run for it",
+                            call.operation, call.api.sdk_id, job.job_id
+                        ));
+                        me.push_submit_failure(name, &resource_type, &action, &failure, at, &call);
+                        return (Err(failure), at);
+                    };
+                    let mut details = task_work_details(&resource_type, &action);
+                    details.output = Some(result.to_string());
+                    me.push_detailed(super::EVENT_TASK_SUBMITTED, name, at, details);
+                    me.parked = Some(ParkedJob {
+                        state_name: name.to_string(),
+                        raw_input: raw.clone(),
+                        job,
+                        api: call.api,
+                        parsed_output: call.parsed_output,
+                        job_id: job_id.to_string(),
+                        submitted: result.clone(),
+                        at,
+                        timeout_seconds: within.map(|within| within.as_secs()),
+                    });
+                }
+                (Ok(result), None) => {
                     let mut details = task_work_details(&resource_type, &action);
                     details.output = Some(result.to_string());
                     me.push_detailed(super::EVENT_TASK_SUCCEEDED, name, at, details);
                 }
-                Err(failure) => me.push_task_failure(name, &resource_type, &action, failure, at),
+                (Err(failure), _) => {
+                    me.push_submit_failure(name, &resource_type, &action, failure, at, &call)
+                }
             }
             (attempt, at)
         });
         match outcome {
+            // The walk PARKED at the job this state's call started: the state has no
+            // result yet, so the walk stops here and the execution waits for the job
+            // ([`ParkedJob`]). The document the parked record carries is the one the
+            // starting call answered, which is what the submission event reports.
+            Ok(submitted) if self.parked.is_some() => Ok(StateStep {
+                value: submitted,
+                at: end,
+                next: Next::Suspended,
+            }),
             Ok(result) => {
                 let value = self
                     .place_result(state, &raw, result, context, true)
@@ -6127,6 +6396,7 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // for this walk and there is nowhere for it to wait.
         tasks: &super::integration::Unserved,
         waiting: None,
+        parked: None,
         // `TestState` starts nothing: it reports what one state computes, and the
         // Map Runs a Distributed Map starts — and the child executions its items run
         // as — belong to an execution.
@@ -6134,6 +6404,7 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // `TestState` continues no execution: a state whose work is an invocation is
         // answered by the request's own `mock`, not by a worker's reply.
         reply: None,
+        job_reply: None,
         resumed: None,
         machine_name: test.context.state_machine_name.clone(),
         region: super::arn_region(&test.context.state_machine_arn),

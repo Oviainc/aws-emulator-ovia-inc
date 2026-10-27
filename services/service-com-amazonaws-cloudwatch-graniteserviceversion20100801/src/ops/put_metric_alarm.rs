@@ -18,6 +18,11 @@
 //! alarm's Region). Each is checked
 //! before the write, so a refused request stores nothing.
 //!
+//! The alarm this write stores is then EVALUATED from the datapoints `PutMetricData` stored
+//! ([`crate::state::alarm_evaluation`]), whether its configuration names one metric or a
+//! `Metrics` query array — a metric-math alarm's state is the verdict over the series that
+//! array's returning query computes.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -818,7 +823,7 @@ fn write_alarm(
         existing.unwrap_or_else(|| {
             (
                 Some(initial_state.to_string()),
-                Some("Unchecked: initial alarm creation".to_string()),
+                Some(crate::state::INITIAL_STATE_REASON.to_string()),
                 None,
                 Some(crate::state::to_timestamp(now)),
                 Some(crate::state::to_timestamp(now)),

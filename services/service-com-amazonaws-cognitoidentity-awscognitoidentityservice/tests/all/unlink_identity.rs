@@ -13,7 +13,8 @@
 //!   same identity;
 //! * the identity record survives, carrying exactly the providers that were left; removing
 //!   its last one leaves it stored and reachable through no login at all, which is what
-//!   makes it inaccessible;
+//!   makes it inaccessible — a DISABLED identity, whose `Logins` list every read projects
+//!   as the single sentinel standing in place of the providers that were removed;
 //! * a call that removes no link changes nothing a later caller sees, so unlinking is
 //!   idempotent;
 //! * a call the store cannot act on is refused with the modelled error for what is wrong
@@ -135,6 +136,21 @@ fn sorted(providers: &[&str]) -> Vec<String> {
     sorted
 }
 
+/// The one element the `Logins` list of a DISABLED identity carries — an identity an unlink
+/// left linked to no provider at all. Spelled out here as the literal, so the wire-visible
+/// sentinel is pinned by the test rather than by the code under test.
+const DISABLED: &str = "DISABLED";
+
+/// The `Logins` list a read reports for an identity left linked to `kept`: those provider
+/// names, and for an identity an unlink left linked to NONE the single disabled sentinel,
+/// which is what tells it from an identity that never carried a login.
+fn projected_logins(kept: &[&str]) -> Vec<String> {
+    if kept.is_empty() {
+        return vec![DISABLED.to_string()];
+    }
+    sorted(kept)
+}
+
 /// RULE: unlinking a provider from an identity drops every login the pool had indexed for
 /// that provider against it, so a later `GetId` presenting one of those logins mints a NEW
 /// identity, while a login of a provider the call did not name still resolves to the same
@@ -235,7 +251,7 @@ async fn an_unlinked_login_resolves_to_a_new_identity_next_time() {
         let after = description(&emulator, &pool_id, &identity_id).await;
         assert_eq!(
             linked_providers(case, &after),
-            sorted(&kept),
+            projected_logins(&kept),
             "case {case:?}: expected the identity left linked to {kept:?} after unlinking \
              {removed:?}, got {after}"
         );
@@ -280,7 +296,7 @@ async fn an_unlinked_login_resolves_to_a_new_identity_next_time() {
         let settled = description(&emulator, &pool_id, &identity_id).await;
         assert_eq!(
             linked_providers(case, &settled),
-            sorted(&kept),
+            projected_logins(&kept),
             "case {case:?}: reading a login back must not relink an unlinked provider, got \
              {settled}"
         );
@@ -334,12 +350,14 @@ async fn removing_the_last_linked_login_leaves_the_identity_stored_but_unreachab
             )
             .await;
 
-        // Still described by the pool — it is inaccessible, not deleted.
+        // Still described by the pool — it is inaccessible, not deleted, and projected as the
+        // disabled identity it now is.
         let after = description(&emulator, &pool_id, &identity_id).await;
         assert_eq!(
             linked_providers(case, &after),
-            Vec::<String>::new(),
-            "case {case:?}: the identity is still stored, linked to nothing, got {after}"
+            vec![DISABLED.to_string()],
+            "case {case:?}: the identity is still stored, projecting the disabled sentinel, got \
+             {after}"
         );
 
         for (provider, token) in linked {

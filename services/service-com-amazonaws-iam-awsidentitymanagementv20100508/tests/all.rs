@@ -93,6 +93,8 @@ mod managed_policies;
 mod open_id_connect_client_ids;
 #[path = "all/open_id_connect_provider_listing.rs"]
 mod open_id_connect_provider_listing;
+#[path = "all/open_id_connect_provider_tag_removal.rs"]
+mod open_id_connect_provider_tag_removal;
 #[path = "all/open_id_connect_provider_tag_updates.rs"]
 mod open_id_connect_provider_tag_updates;
 #[path = "all/open_id_connect_providers.rs"]

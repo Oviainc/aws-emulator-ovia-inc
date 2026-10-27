@@ -547,9 +547,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it is admitted against every record together and the writes below cannot
         // grow the store past what was admitted.
         let waiting = planned.waiting;
+        let parked = planned.parked;
         let task_bytes = waiting
             .as_ref()
-            .map_or(0, crate::state::PlannedActivityTask::measure);
+            .map_or(0, crate::state::PlannedActivityTask::measure)
+            + parked.as_ref().map_or(0, crate::state::PlannedJob::measure);
         let map_run_bytes = crate::state::planned_map_run_bytes(&planned.map_runs);
         if let Some(why) = store.execution_rejection(
             &machine_arn,
@@ -578,6 +580,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that state until one answers it.
         if let Some(waiting) = waiting {
             store.schedule_activity_task(&arn, waiting);
+        }
+        // The walk PARKED at the job a run-a-job (`.sync`) task started: the task is
+        // not finished until that job is, so the job is recorded and polled through
+        // its own service's reporting call until it ends
+        // (`crate::state::run_a_job`). This call answers now, with the execution
+        // RUNNING, exactly as the service answers while such a task is parked.
+        if let Some(parked) = parked {
+            store.park_job(&arn, parked, &region);
+            drop(store);
+            crate::state::run_a_job::watch(
+                std::sync::Arc::clone(&self.engine),
+                ctx.callback().clone(),
+                crate::state::integration::chain_depth(ctx),
+                arn.clone(),
+            );
         }
 
         Ok(StartExecutionOutput {

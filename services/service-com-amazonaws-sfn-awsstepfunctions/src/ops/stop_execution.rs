@@ -3,7 +3,9 @@
 //! @op StopExecution
 //! IMPLEMENTED: stops a running execution — the stored record moves to `ABORTED`
 //! with the `error`/`cause` the caller gave and the `stopDate` this call set, which
-//! is what the response reports.
+//! is what the response reports. An execution parked inside a run-a-job (`.sync`)
+//! task is running a job of another service, so this call stops that job too,
+//! through the stopping call its integration names.
 //!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
@@ -173,52 +175,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = crate::state::now();
-        let mut store = state.lock();
-        // Settle first, so an execution whose own terminal status the clock already
-        // owed is not reported as stopped by this call.
-        store.settle(now);
+        // The store is held for THIS block alone: the stop itself is one state-level
+        // step, and the cross-service call below must not hold the store while it is
+        // in flight.
+        let stopped = {
+            let mut store = state.lock();
+            // Settle first, so an execution whose own terminal status the clock already
+            // owed is not reported as stopped by this call.
+            store.settle(now);
 
-        let express = store
-            .executions
-            .get(&input.execution_arn)
-            .and_then(|execution| store.state_machines.get(&execution.state_machine_arn))
-            .is_some_and(|machine| machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS);
-        // "This API action is not supported by EXPRESS state machines."
-        if express {
-            return Err(StopExecutionErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "StopExecution does not support execution {}, which belongs to an \
-                         EXPRESS state machine",
-                        input.execution_arn
-                    )),
-                    reason: None,
-                },
-            )
-            .into());
-        }
+            let express = store
+                .executions
+                .get(&input.execution_arn)
+                .and_then(|execution| store.state_machines.get(&execution.state_machine_arn))
+                .is_some_and(|machine| machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS);
+            // "This API action is not supported by EXPRESS state machines."
+            if express {
+                return Err(StopExecutionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "StopExecution does not support execution {}, which belongs to an \
+                             EXPRESS state machine",
+                            input.execution_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into());
+            }
 
-        // One state-level step does the whole stop: it moves a running execution to
-        // ABORTED with the caller's error and cause, discards the outcome the
-        // interpreter had computed along with its place in the settle queue, and
-        // reports the `stopDate` the execution carries — its own when it had already
-        // reached a terminal status.
-        let Some(stop_date) =
-            store.stop_execution(&input.execution_arn, now, input.error, input.cause)
-        else {
-            return Err(StopExecutionErrorModeled::ExecutionDoesNotExist(
-                ExecutionDoesNotExist {
-                    message: Some(crate::state::resource_error_message(
-                        crate::state::EXECUTION_DOES_NOT_EXIST,
-                        &input.execution_arn,
-                    )),
-                },
-            )
-            .into());
+            // One state-level step does the whole stop: it moves a running execution
+            // to ABORTED with the caller's error and cause, discards the outcome the
+            // interpreter had computed along with its place in the settle queue, and
+            // reports the `stopDate` the execution carries — its own when it had
+            // already reached a terminal status. It also hands back the job a
+            // run-a-job (`.sync`) task of this execution had started, which is work of
+            // ANOTHER service and so is stopped below rather than in the store.
+            match store.stop_execution(&input.execution_arn, now, input.error, input.cause) {
+                Some(stopped) => stopped,
+                None => {
+                    return Err(StopExecutionErrorModeled::ExecutionDoesNotExist(
+                        ExecutionDoesNotExist {
+                            message: Some(crate::state::resource_error_message(
+                                crate::state::EXECUTION_DOES_NOT_EXIST,
+                                &input.execution_arn,
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            }
         };
 
+        // "Stops an execution": an execution parked inside a run-a-job task is
+        // running the job that task started, so stopping the execution stops that
+        // job too — through the stopping call its own integration names, in the
+        // Region the starting call was made in. The abort therefore crosses the
+        // service boundary exactly as the start did, and the job is not left running
+        // behind an execution nothing will resume. What that service answers changes
+        // nothing here: this execution is already ABORTED, and the stop it reports is
+        // the stop of the execution.
+        if let Some(parked) = stopped.parked {
+            let (call, request) =
+                crate::state::integration::stopping(parked.api, parked.job, &parked.job_id);
+            let _answered = crate::state::integration::call_api(
+                ctx.callback(),
+                &parked.region,
+                &call,
+                &request,
+            )
+            .await;
+        }
+
         Ok(StopExecutionOutput {
-            stop_date: crate::state::to_date_time(stop_date),
+            stop_date: crate::state::to_date_time(stopped.stop_date),
         })
     }
 }

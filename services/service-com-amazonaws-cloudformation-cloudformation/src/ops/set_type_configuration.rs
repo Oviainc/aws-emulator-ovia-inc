@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetTypeConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetTypeConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The account-level CONFIGURATION of one activated extension: the configuration data this
+//! account and Region holds for it, and the ARN of that data.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`SetTypeConfiguration::handle`] with real behaviour and
@@ -101,6 +100,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::registry;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -171,18 +171,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetTypeConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetTypeConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetTypeConfiguration"))
+        // What the request identifies. A combination of members that cannot hold together is
+        // refused with the registry's own modelled 400 before any state is touched.
+        let identifier = read_request(&input).map_err(registry_exception)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no registry to configure an
+            // extension in, so this answers 501 rather than a write nothing recorded.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SetTypeConfiguration",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The settle walk every operation makes first, so this call reads and writes a
+        // registry in which every transition the clock had already made due is installed.
+        store.settle(now);
+
+        // "An alias by which to refer to this extension configuration data": the
+        // configuration an extension has when the request names no alias is its default one.
+        let alias = input
+            .configuration_alias
+            .clone()
+            .unwrap_or_else(|| registry::DEFAULT_CONFIGURATION_ALIAS.to_string());
+
+        // The extension the configuration belongs to, in the Region the request was served
+        // in: "specifies the configuration data for… an extension… in the given account and
+        // Region", so an extension of another Region's registry names nothing here.
+        let arn = store
+            .extensions_in(&region)
+            .find(|extension| match identifier {
+                Identifier::TypeArn(type_arn) => extension.arn == type_arn,
+                Identifier::Name {
+                    type_kind,
+                    type_name,
+                } => extension.type_kind == type_kind && extension.type_name == type_name,
+            })
+            .map(|extension| extension.arn.clone())
+            .ok_or_else(|| type_not_found(identifier.named()))?;
+
+        let Some(extension) = store.extension_by_arn_mut(&region, &arn) else {
+            // Unreachable: the record was resolved just above, under the same lock. Answered
+            // as the modelled 404 rather than with a panic, which would leave the shared
+            // store poisoned for every other caller.
+            return Err(type_not_found(identifier.named()));
+        };
+        let configuration_arn =
+            extension.set_configuration(&alias, &input.configuration, now);
+
+        Ok(SetTypeConfigurationOutput {
+            configuration_arn: Some(configuration_arn),
+        })
     }
+}
+
+/// How a request identifies the extension whose configuration it sets.
+#[derive(Debug, Clone, Copy)]
+enum Identifier<'a> {
+    /// `TypeArn`, "the Amazon Resource Name (ARN) for the extension in this account and
+    /// Region" — for a public extension "the ARN assigned when you call the ActivateType API
+    /// operation in this account and Region" — which addresses the record on its own.
+    TypeArn(&'a str),
+    /// `Type` and `TypeName`, resolved in the Region the request was served in. For an
+    /// extension activated under an alias that is the alias, which is the name this account
+    /// addresses the extension by.
+    Name {
+        type_kind: &'a str,
+        type_name: &'a str,
+    },
+}
+
+impl Identifier<'_> {
+    /// What the request named the extension by, for the not-found message.
+    fn named(&self) -> &str {
+        match self {
+            Self::TypeArn(type_arn) => type_arn,
+            Self::Name { type_name, .. } => type_name,
+        }
+    }
+}
+
+/// Read what the request identifies, or `Err(message)` for a request that identifies no
+/// extension at all.
+///
+/// Every modelled constraint (each member's length and pattern, and `Type`'s enum) is
+/// already enforced before the handler runs; what is left is the conditional rule the model
+/// states in prose: the extension is named by its own ARN, or by its kind and its name.
+///
+/// "Do not include the extension versions suffix at the end of the ARN. You can set the
+/// configuration for an extension, but not for a specific extension version": an ARN that
+/// names a VERSION names no extension here, which is what resolving it against the
+/// extensions' own ARNs comes to.
+fn read_request(input: &SetTypeConfigurationInput) -> Result<Identifier<'_>, String> {
+    match (
+        input.type_arn.as_deref(),
+        input.r#type.as_deref(),
+        input.type_name.as_deref(),
+    ) {
+        // The ARN names the extension on its own, so it is what the request identifies
+        // whatever else it spells out: "for public extensions, this will be the ARN assigned
+        // when you call the ActivateType API operation in this account and Region". The kind
+        // and the name beside it are the same extension said another way, which is why they
+        // are not a second identity.
+        (Some(type_arn), _, _) => Ok(Identifier::TypeArn(type_arn)),
+        (None, Some(type_kind), Some(type_name)) => Ok(Identifier::Name {
+            type_kind,
+            type_name,
+        }),
+        // Neither form, or half of the name form.
+        (None, _, _) => Err(
+            "Either TypeArn, or both Type and TypeName, must be specified to identify an \
+             extension"
+                .to_string(),
+        ),
+    }
+}
+
+/// The registry's own modelled refusal: HTTP 400 `CFNRegistryException`, "an error occurred
+/// during a CloudFormation registry operation".
+fn registry_exception(message: String) -> SetTypeConfigurationError {
+    SetTypeConfigurationErrorModeled::CFNRegistryException(CFNRegistryException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 404: "The specified extension doesn't exist in the CloudFormation
+/// registry."
+fn type_not_found(identifier: &str) -> SetTypeConfigurationError {
+    SetTypeConfigurationErrorModeled::TypeNotFoundException(TypeNotFoundException {
+        message: Some(crate::state::extension_does_not_exist(identifier)),
+    })
+    .into()
 }
