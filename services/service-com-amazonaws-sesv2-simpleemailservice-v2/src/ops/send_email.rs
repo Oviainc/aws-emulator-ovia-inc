@@ -208,7 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The Region whose identity list a send is checked against: SES identities are
+        // per Region, so the Region the call executes in is part of how a failed check
+        // is reported.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The engine is not the shared in-memory engine, so this service has no
             // store at all. That is not a modelled SES state: answer the scaffold's
@@ -317,9 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|identity| identity.verified_for_sending);
         if !authorised {
             return Err(SendEmailErrorModeled::MessageRejected(MessageRejected {
-                message: Some(format!(
-                    "Email address is not verified. The following identities failed the check: {from}"
-                )),
+                message: Some(crate::state::unverified_identities_message(&region, &from)),
             })
             .into());
         }

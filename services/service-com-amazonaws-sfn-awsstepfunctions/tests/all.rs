@@ -89,6 +89,8 @@ mod state_machine_versions;
 mod state_roundtrip;
 #[path = "all/sync_execution.rs"]
 mod sync_execution;
+#[path = "all/sync_service_integration.rs"]
+mod sync_service_integration;
 #[path = "all/task_integrations.rs"]
 mod task_integrations;
 #[path = "all/terminal_runtime_errors.rs"]

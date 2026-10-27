@@ -23,12 +23,23 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes this service's opaque pagination cursors.
 hex = { workspace = true }
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): the `InstanceId` a user association names is an EC2
+# instance, which is EC2's resource, so `src/state/ec2_fleet.rs` asks EC2 whether the
+# account has it rather than keeping a list of instance ids here. Only the generated
+# client is needed — the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The EC2 service, mounted beside this one in tests/all/instance_fleet_resolution.rs: that
+# an instance a client launched can have a user associated with it can only be driven end
+# to end with the owner of the instances on the same engine. DEV-ONLY: this crate depends
+# on no other service's crate outside its tests.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

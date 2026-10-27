@@ -406,10 +406,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut history = planned.opening;
         // A SYNCHRONOUS execution answers its own outcome in this call, so there is
         // nowhere for it to WAIT: a definition whose walk reached an activity task
-        // needs a worker to poll for that task and answer it, which cannot happen
-        // inside the call that would have to report the result. The run therefore ends
-        // in the service's own failure state, with the language's runtime error naming
-        // what was not run — nothing is reported as though a worker had answered.
+        // needs a worker to poll for that task and answer it, and one that started a
+        // run-a-job (`.sync`) integration's job needs that job to finish — neither of
+        // which can happen inside the call that would have to report the result. The
+        // run therefore ends in the service's own failure state, with the language's
+        // runtime error naming what was not run — nothing is reported as though a
+        // worker had answered or a job had finished.
+        let unwaitable = if planned.parked.is_some() {
+            "a synchronous execution cannot wait for the job a run-a-job integration starts, so \
+             the job this definition's task started was not waited for"
+        } else {
+            "a synchronous execution cannot wait for an activity worker's reply, so the activity \
+             task this definition schedules was not run"
+        };
         let outcome = match planned.pending {
             Some(outcome) => outcome,
             None => {
@@ -419,11 +428,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status: crate::state::EXECUTION_STATUS_FAILED.to_string(),
                     output: None,
                     error: Some(crate::state::asl::RUNTIME_ERROR.to_string()),
-                    cause: Some(
-                        "a synchronous execution cannot wait for an activity worker's reply, so \
-                         the activity task this definition schedules was not run"
-                            .to_string(),
-                    ),
+                    cause: Some(unwaitable.to_string()),
                     events: vec![crate::state::HistoryEvent {
                         id: previous_event_id + 1,
                         previous_event_id,

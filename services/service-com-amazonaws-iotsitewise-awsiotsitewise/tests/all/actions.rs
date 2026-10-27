@@ -21,8 +21,15 @@
 //! The wire harness (`router_with_engine`, `call`, `error_code`, …) is the one
 //! `asset_lifecycle` already defines, and the computation-model create is
 //! `computation_model_lifecycle`'s, re-used rather than copied.
+//!
+//! This module is in turn where the action-side harness lives, for the same
+//! reason: [`Target`], [`target_resource`], [`target_query`],
+//! [`create_action_targets`], [`seed_action`] and [`list_actions`] are what the
+//! sibling read suite (`describe_action_reads`) reaches for, so the two suites
+//! address and seed one action the same way rather than drifting apart.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
@@ -40,11 +47,11 @@ use crate::computation_model_lifecycle::{anomaly_detection, asset_model_property
 
 /// An id of the modelled `ID` form that no create in this suite mints, so it
 /// names a resource the store does not hold.
-const ABSENT_ID: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+pub(crate) const ABSENT_ID: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
 
 /// Which seeded resource an action is recorded against, or resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Target {
+pub(crate) enum Target {
     /// The first asset the fixture creates.
     AssetA,
     /// The second asset the fixture creates.
@@ -58,12 +65,110 @@ impl Target {
     /// `smithy_query(query="operation", operation="ListActions")` —
     /// `targetResourceType (TargetResourceType, one of: ASSET |
     /// COMPUTATION_MODEL)`.
-    fn resource_type(self) -> &'static str {
+    pub(crate) fn resource_type(self) -> &'static str {
         match self {
             Target::ComputationModel => "COMPUTATION_MODEL",
             _ => "ASSET",
         }
     }
+}
+
+/// The `TargetResource` naming ONE resource: the member of the kind the target
+/// is, and no other — which is what a stored action and every view of it carry.
+pub(crate) fn target_resource(target: Target, resource_id: &str) -> TargetResource {
+    match target {
+        Target::ComputationModel => TargetResource {
+            asset_id: None,
+            computation_model_id: Some(resource_id.to_string()),
+        },
+        _ => TargetResource {
+            asset_id: Some(resource_id.to_string()),
+            computation_model_id: None,
+        },
+    }
+}
+
+/// The query string that scopes a listing to the actions of one target resource.
+pub(crate) fn target_query(target: Target, resource_id: &str) -> String {
+    format!(
+        "targetResourceType={}&targetResourceId={}",
+        target.resource_type(),
+        resource_id
+    )
+}
+
+/// Create the resources an action can be taken on or resolve to: two assets of
+/// one model and a computation model, answering
+/// `(assetA, assetB, computationModel)`.
+pub(crate) async fn create_action_targets(router: &MultiServiceRouter) -> (String, String, String) {
+    let model = create_model(router, "Boiler", property_catalog()).await;
+    let asset_a = create_asset(router, "Boiler-A", &model).await;
+    let asset_b = create_asset(router, "Boiler-B", &model).await;
+
+    let (status, created) = call(
+        router,
+        "POST",
+        "/computation-models",
+        Some(json!({
+            "computationModelName": "boiler-anomaly",
+            "computationModelConfiguration": anomaly_detection("input", "result"),
+            "computationModelDataBinding": {
+                "input": asset_model_property(&id_of('1'), &id_of('2')),
+                "result": asset_model_property(&id_of('1'), &id_of('3')),
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, 202, "create computation model: got {status} {created}");
+    let computation_model = created["computationModelId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("create computation model: no id in {created}"))
+        .to_string();
+
+    (asset_a, asset_b, computation_model)
+}
+
+/// Record ONE action in the shared store, as `ExecuteAction` records it.
+///
+/// `ExecuteAction` resolves an `actionDefinitionId` against the actions the
+/// target resource publishes — which this store materialises for a computation
+/// model's computation type and for nothing else — so an action recorded against
+/// an ASSET cannot be taken through the API at all, and a suite about reading or
+/// listing actions seeds them here instead, through the same store the handlers
+/// write.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seed_action(
+    engine: &Arc<engine::InMemoryEngine>,
+    action_id: &str,
+    action_definition_id: &str,
+    target: Target,
+    target_id: &str,
+    payload: &str,
+    resolve_to: Option<&str>,
+    execution_time: SystemTime,
+) {
+    let state = service_state(&**engine).expect("the iotsitewise store");
+    let mut store = state.lock();
+    store.actions.insert(
+        action_id.to_string(),
+        ActionRecord {
+            action_id: action_id.to_string(),
+            action_definition_id: action_definition_id.to_string(),
+            target_resource: target_resource(target, target_id),
+            // The payload the call that took the action supplied, which only the
+            // read form of a single action reports back.
+            action_payload: ActionPayload {
+                string_value: payload.to_string(),
+            },
+            resolve_to: resolve_to.map(|asset_id| ResolveTo {
+                asset_id: asset_id.to_string(),
+            }),
+            execution_time,
+            // No idempotency token: a seeded row stands for an action already
+            // recorded, not for a call a suite retries.
+            client_token: None,
+        },
+    );
 }
 
 /// One row of the seeded action table.
@@ -205,11 +310,7 @@ impl Fixture {
 
     /// The query string that lists the actions of one seeded target.
     fn target_query(&self, target: Target) -> String {
-        format!(
-            "targetResourceType={}&targetResourceId={}",
-            target.resource_type(),
-            self.id_of(target)
-        )
+        target_query(target, self.id_of(target))
     }
 }
 
@@ -217,29 +318,7 @@ impl Fixture {
 /// then the action table recorded in the shared store.
 async fn fixture() -> Fixture {
     let (router, engine) = router_with_engine();
-    let model = create_model(&router, "Boiler", property_catalog()).await;
-    let asset_a = create_asset(&router, "Boiler-A", &model).await;
-    let asset_b = create_asset(&router, "Boiler-B", &model).await;
-
-    let (status, created) = call(
-        &router,
-        "POST",
-        "/computation-models",
-        Some(json!({
-            "computationModelName": "boiler-anomaly",
-            "computationModelConfiguration": anomaly_detection("input", "result"),
-            "computationModelDataBinding": {
-                "input": asset_model_property(&id_of('1'), &id_of('2')),
-                "result": asset_model_property(&id_of('1'), &id_of('3')),
-            },
-        })),
-    )
-    .await;
-    assert_eq!(status, 202, "create computation model: got {status} {created}");
-    let computation_model = created["computationModelId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("create computation model: no id in {created}"))
-        .to_string();
+    let (asset_a, asset_b, computation_model) = create_action_targets(&router).await;
 
     let fixture = Fixture {
         router,
@@ -250,50 +329,26 @@ async fn fixture() -> Fixture {
     };
 
     let anchor = SystemTime::now();
-    {
-        let state = service_state(&*engine).expect("the iotsitewise store");
-        let mut store = state.lock();
-        for row in &fixture.rows {
-            let target_id = fixture.id_of(row.target).to_string();
-            let target_resource = match row.target {
-                Target::ComputationModel => TargetResource {
-                    asset_id: None,
-                    computation_model_id: Some(target_id),
-                },
-                _ => TargetResource {
-                    asset_id: Some(target_id),
-                    computation_model_id: None,
-                },
-            };
-            store.actions.insert(
-                row.id.to_string(),
-                ActionRecord {
-                    action_id: row.id.to_string(),
-                    action_definition_id: row.definition.to_string(),
-                    target_resource,
-                    // The payload the call that took the action supplied. Only the
-                    // read form of a single action reports it, so the rows this
-                    // suite lists carry one naming the row they belong to.
-                    action_payload: ActionPayload {
-                        string_value: format!("{{\"case\":\"{}\"}}", row.case),
-                    },
-                    resolve_to: row.resolve_to.map(|resolved| ResolveTo {
-                        asset_id: fixture.id_of(resolved).to_string(),
-                    }),
-                    execution_time: anchor - Duration::from_secs(row.ran_ago),
-                    // No idempotency token: these rows stand for actions already
-                    // recorded, not for calls this suite retries.
-                    client_token: None,
-                },
-            );
-        }
+    for row in &fixture.rows {
+        seed_action(
+            &engine,
+            row.id,
+            row.definition,
+            row.target,
+            fixture.id_of(row.target),
+            // Only the read form of a single action reports the payload, so the
+            // rows this suite lists carry one naming the row they belong to.
+            &format!("{{\"case\":\"{}\"}}", row.case),
+            row.resolve_to.map(|resolved| fixture.id_of(resolved)),
+            anchor - Duration::from_secs(row.ran_ago),
+        );
     }
 
     fixture
 }
 
 /// Dispatch one `ListActions` with `query` as its query string.
-async fn list_actions(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
+pub(crate) async fn list_actions(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
     call(router, "GET", &format!("/actions?{query}"), None).await
 }
 

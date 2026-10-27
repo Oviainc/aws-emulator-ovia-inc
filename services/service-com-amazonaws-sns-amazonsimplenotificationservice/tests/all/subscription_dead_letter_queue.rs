@@ -36,7 +36,7 @@ fn redrive_to(queue_arn: &str) -> String {
 ///
 /// `raw` asks for raw message delivery; `dead_letter` is the queue undeliverable
 /// notifications are held in, when the subscription asks for one.
-async fn given_subscription(
+pub(crate) async fn given_subscription(
     emulator: &Emulator,
     topic: &str,
     queue_arn: &str,
@@ -86,7 +86,7 @@ async fn given_subscription(
 }
 
 /// Delete the queue at `url`.
-async fn delete_queue(emulator: &Emulator, url: &str) {
+pub(crate) async fn delete_queue(emulator: &Emulator, url: &str) {
     sqs(
         emulator,
         "DeleteQueue",

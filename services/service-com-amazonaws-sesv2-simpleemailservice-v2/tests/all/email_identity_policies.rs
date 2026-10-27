@@ -520,6 +520,104 @@ async fn a_document_past_the_published_size_ceiling_is_refused() {
 }
 
 #[tokio::test]
+async fn a_document_whose_resource_is_not_an_arn_is_refused() {
+    // A sending authorization policy authorizes sending THROUGH an identity, and an
+    // identity is named by its ARN, so the resource element has to name one. The rows
+    // differ along what the rule generalises over: which element carries the value,
+    // the form it is written in (one string or a list), and the kind of value that is
+    // not an ARN — the wildcard the IAM language itself admits, a bare identity name,
+    // a glob over a resource path, and a prefix that only looks like an ARN's.
+    let ses = Ses::new();
+    ses.create_identity("example.com").await;
+    let identity_arn = "arn:aws:ses:us-east-1:000000000000:identity/example.com";
+    let document = |element: &str| {
+        format!(
+            "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+             \"Action\":\"ses:SendEmail\",\"Principal\":{{\"AWS\":\"*\"}},{element}}}]}}"
+        )
+    };
+    let rows: [(&str, String, Option<&str>); 8] = [
+        (
+            "the identity's own ARN",
+            document(&format!("\"Resource\":\"{identity_arn}\"")),
+            None,
+        ),
+        (
+            "a list of identity ARNs",
+            document(&format!(
+                "\"Resource\":[\"{identity_arn}\",\"{identity_arn}\"]"
+            )),
+            None,
+        ),
+        (
+            "an ARN whose resource path ends in a wildcard",
+            document("\"Resource\":\"arn:aws:ses:us-east-1:000000000000:identity/*\""),
+            None,
+        ),
+        ("a bare wildcard", document("\"Resource\":\"*\""), Some("*")),
+        (
+            "the identity's name rather than its ARN",
+            document("\"Resource\":\"example.com\""),
+            Some("example.com"),
+        ),
+        (
+            "a glob over a resource path",
+            document("\"Resource\":\"identity/*\""),
+            Some("identity/*"),
+        ),
+        (
+            "the wildcard second in a list of resources",
+            document(&format!("\"Resource\":[\"{identity_arn}\",\"*\"]")),
+            Some("*"),
+        ),
+        (
+            "a NotResource that is not an ARN",
+            document("\"NotResource\":\"everything\""),
+            Some("everything"),
+        ),
+    ];
+
+    for (index, (case, policy, offending)) in rows.into_iter().enumerate() {
+        let name = format!("Resource{index}");
+        let reply = ses.create_policy("example.com", &name, &policy).await;
+        let stored = ses.stored_policies("example.com");
+
+        let Some(offending) = offending else {
+            assert_eq!(
+                reply.status, 200,
+                "case {case:?}: a policy naming its resource by ARN is accepted, got {} {:?}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                stored.get(&name),
+                Some(&policy),
+                "case {case:?}: the accepted document is stored verbatim, got {stored:?}"
+            );
+            continue;
+        };
+
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, "BadRequestException"),
+            "case {case:?}: expected 400 BadRequestException, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+        let expected = format!("Invalid ARN: ARNs must start with 'arn:': {offending}");
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {case:?}: expected the message {expected:?}, got {:?}",
+            reply.message()
+        );
+        assert!(
+            !stored.contains_key(&name),
+            "case {case:?}: a refused document is not persisted, got {stored:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_policy_name_outside_the_documented_character_set_is_refused() {
     let ses = Ses::new();
     ses.create_identity("example.com").await;

@@ -58,6 +58,13 @@
 //!   it with `GetActivityTask`, and the clock closes it — failing the execution — if
 //!   the `TimeoutSeconds` or `HeartbeatSeconds` of the scheduling state runs out
 //!   first.
+//! * an execution whose walk PARKED at the job a run-a-job (`.sync`) integration
+//!   started has no outcome yet either: the job is held as a [`JobTask`] and polled
+//!   through its own service's reporting call ([`run_a_job`]) until that service says
+//!   it finished, which is what resolves the task. This is NOT a transition the clock
+//!   owes — only the invoked service can say whether its job is done — but the TIME
+//!   the task is allowed is: a job unfinished past [`JobTask::times_out_at`] fails the
+//!   execution with the language's own timeout error.
 //! * `DeleteStateMachine` is documented as asynchronous: it "sets the state machine's
 //!   status to `DELETING` and begins the deletion process", so the record moves to
 //!   `DELETING` now and is removed once [`DELETE_SETTLE_DELAY`] has passed.
@@ -491,6 +498,15 @@ pub const EVENT_TASK_SUCCEEDED: &str = "TaskSucceeded";
 
 /// The history event a `Task` state writes when that work failed.
 pub const EVENT_TASK_FAILED: &str = "TaskFailed";
+
+/// The history event a run-a-job (`.sync`) `Task` state writes when the call it makes
+/// has STARTED the job, carrying "the response from a resource when a task has
+/// started" — which is what names the job the task is then parked at.
+pub const EVENT_TASK_SUBMITTED: &str = "TaskSubmitted";
+
+/// The history event such a state writes when that call did NOT start a job: "details
+/// about a task that failed to submit during an execution".
+pub const EVENT_TASK_SUBMIT_FAILED: &str = "TaskSubmitFailed";
 
 /// The history event a `Task` state writes when that work ran out of the time the
 /// state allowed it, which the language reports under [`TASK_TIMEOUT_ERROR`].
@@ -1234,10 +1250,115 @@ const TASK_TOKEN_CHARS: usize = 4 * (36 + 1 + MAX_ARN_BYTES).div_ceil(3) + 4;
 const ACTIVITY_TASK_EVENT_RESERVE_BYTES: usize =
     3 * (std::mem::size_of::<HistoryEvent>() + "ActivityTimedOut".len());
 
+/// One job an execution is PARKED at: the work a `Task` state's run-a-job (`.sync`)
+/// integration started, which the task is not finished until the invoked service
+/// reports finished.
+///
+/// Keyed in the store by the execution's own ARN, because a walk parks at one state
+/// at a time: the state that started the job is where the execution resumes, with the
+/// raw input that state was entered with ([`JobTask::state_input`]).
+#[derive(Debug, Clone)]
+pub struct JobTask {
+    pub execution_arn: String,
+    /// The state whose integration started the job.
+    pub state_name: String,
+    /// The RAW input of that state, which its `ResultPath` combines the job's report
+    /// with once the job has ended.
+    pub state_input: String,
+    /// The integration the job belongs to, and the service whose API reports and
+    /// stops it.
+    pub job: &'static integration::RunAJob,
+    pub api: &'static integration::Api,
+    /// Whether the `Resource` asked for the pattern's second revision.
+    pub parsed_output: bool,
+    /// The job's own identifier, as the call that started it reported it.
+    pub job_id: String,
+    /// The Region the calls that report and stop the job are made in: the
+    /// execution's own, which is the Region its state machine's ARN names.
+    pub region: String,
+    /// The instant the state started the job, which the state's `TimeoutSeconds` —
+    /// and this emulator's own ceiling on an unfinished job — are measured from.
+    pub parked_at: SystemTime,
+    /// `TimeoutSeconds` of the state that started it, when it declares one.
+    pub timeout_seconds: Option<u64>,
+    /// The bytes the store counts for this record, as every other record's are.
+    pub retained_bytes: usize,
+}
+
+impl JobTask {
+    /// When this job must have finished by, after which the task that started it has
+    /// run out of the time it was allowed.
+    ///
+    /// The state's own `TimeoutSeconds` when it declares one — "if the task runs
+    /// longer than the specified seconds, this state fails with a States.Timeout
+    /// error name", and for this pattern the task runs for as long as its job does —
+    /// else this emulator's own ceiling on how long it polls one job
+    /// ([`MAX_PARKED_JOB_DURATION`]).
+    pub fn times_out_at(&self) -> SystemTime {
+        let allowed = self
+            .timeout_seconds
+            .map_or(MAX_PARKED_JOB_DURATION, Duration::from_secs);
+        after(self.parked_at, allowed.min(MAX_PARKED_JOB_DURATION))
+    }
+}
+
+/// The job a planned run parked at, ready for the store to record: this is
+/// [`asl::ParkedJob`] with the walk's offset turned into an instant against the
+/// execution's own start.
+#[derive(Debug, Clone)]
+pub struct PlannedJob {
+    pub state_name: String,
+    pub state_input: String,
+    pub job: &'static integration::RunAJob,
+    pub api: &'static integration::Api,
+    pub parsed_output: bool,
+    pub job_id: String,
+    pub parked_at: SystemTime,
+    pub timeout_seconds: Option<u64>,
+}
+
+impl PlannedJob {
+    /// The bytes the record this will become retains, so an execution is admitted
+    /// against the whole of what its start adds to the store.
+    pub fn measure(&self) -> usize {
+        std::mem::size_of::<JobTask>()
+            + MAX_ARN_BYTES
+            + self.state_name.len()
+            + self.state_input.len()
+            + self.job_id.len()
+            // The two history events resolving the job appends to the execution
+            // waiting at it: the one that reports the job's outcome and the one the
+            // execution ends on.
+            + 2 * (std::mem::size_of::<HistoryEvent>()
+                + EVENT_TASK_FAILED.len()
+                + asl::MAX_ERROR_BYTES
+                + asl::MAX_CAUSE_BYTES)
+    }
+}
+
+/// The longest this emulator polls ONE job of a run-a-job integration before the task
+/// that started it reports the Amazon States Language's own timeout error.
+///
+/// Emulator bound, NOT an AWS limit: Step Functions polls a run-a-job task's job for
+/// as long as the task's own `TimeoutSeconds` allows, and a task that declares none
+/// has no bound at all. A job served inside this process is a resource this process
+/// holds — a parked execution and the task polling it — so one that never reaches a
+/// terminal status is let go of here rather than polled forever. It is the ceiling on
+/// a declared `TimeoutSeconds` too, for the same reason.
+pub const MAX_PARKED_JOB_DURATION: Duration = Duration::from_secs(300);
+
+/// How often a parked job is asked whether it has finished.
+///
+/// Emulator interval: the job is served in THIS process, so its own reporting call
+/// answers in microseconds, and the interval is what decides how soon after a job
+/// ends the execution waiting at it carries on. It is the same order as
+/// [`EXECUTION_SETTLE_DELAY`], so a parked execution is not reported finished sooner
+/// than an unparked one would be.
+pub const PARKED_JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// The bytes a tag set holds, so a tag write can move the store's total by what it
 /// changed instead of re-measuring a record whose definition is up to 1 MiB.
-fn tags_bytes(tags: &[Tag]) -> usize {
-    tags.iter()
+fn tags_bytes(tags: &[Tag]) -> usize {    tags.iter()
         .map(|tag| {
             std::mem::size_of::<Tag>()
                 + tag.key.as_ref().map_or(0, String::len)
@@ -2014,6 +2135,11 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// one name the worker holding it has, and what `SendTaskHeartbeat`,
     /// `SendTaskSuccess` and `SendTaskFailure` resolve it by.
     pub activity_tasks: BTreeMap<String, ActivityTask>,
+    /// Every job an execution is PARKED at, keyed by that execution's own ARN: the
+    /// work a `Task` state's run-a-job (`.sync`) integration started, which the task
+    /// is not finished until the invoked service reports finished. A walk parks at one
+    /// state at a time, so one execution has at most one.
+    pub job_tasks: BTreeMap<String, JobTask>,
     /// One activity's outstanding task tokens in SCHEDULE order, so a poll claims the
     /// task that has waited longest and two executions' tasks cannot cross.
     pub activity_tasks_by_activity: HashMap<String, Vec<String>>,
@@ -2060,6 +2186,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// owed before the machine disappeared is still recorded.
     pub fn settle(&mut self, now: SystemTime) {
         self.settle_activity_tasks(now);
+        self.settle_job_tasks(now);
         let mut still_pending = Vec::with_capacity(self.pending_executions.len());
         for arn in std::mem::take(&mut self.pending_executions) {
             let Some(execution) = self.executions.get_mut(&arn) else {
@@ -2350,12 +2477,37 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             state_name: task.state_name.clone(),
             state_input: task.state_input.clone(),
         });
+        self.continue_execution(&execution_arn, events, pending, extra_bytes, stopped_at)?;
+        self.discard_activity_task(token);
+        Ok(())
+    }
+
+    /// Carry the execution `execution_arn` names on with what a continuation walk
+    /// produced: its events are APPENDED to the history its earlier states left and
+    /// the outcome it computed is owed to the clock.
+    ///
+    /// The one place a continuation reaches an execution, whatever the execution was
+    /// waiting at — a worker's reply to an activity task, or the job a run-a-job
+    /// integration started — so both are admitted against the store's ceiling the
+    /// same way: `extra_bytes` is what the walk's own next task and Map Runs will
+    /// retain, and a continuation the store has no room for changes nothing.
+    ///
+    /// `stopped_at` is the step a later `RedriveExecution` continues the execution
+    /// from, for an attempt that STOPPED at the state it was waiting at.
+    fn continue_execution(
+        &mut self,
+        execution_arn: &str,
+        events: Vec<HistoryEvent>,
+        pending: Option<PendingOutcome>,
+        extra_bytes: usize,
+        stopped_at: Option<asl::RedriveStep>,
+    ) -> Result<(), TaskReplyRejection> {
         // A task whose execution is terminal — stopped, or failed when the clock
         // closed an earlier bound — is answered by nobody: `settle` discards it, and
         // one that is still here when this runs is in that same state.
         let Some(execution) = self
             .executions
-            .get(&execution_arn)
+            .get(execution_arn)
             .filter(|execution| !execution.is_terminal())
         else {
             return Err(TaskReplyRejection::Gone);
@@ -2376,15 +2528,15 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .saturating_add(after)
             .saturating_sub(before);
         // The continuation's outcome is owed to the clock, so this execution joins the
-        // settle queue; one that stopped at ANOTHER activity task owes the clock
-        // nothing and does not.
+        // settle queue; one that stopped at ANOTHER activity task — or parked at
+        // another job — owes the clock nothing and does not.
         self.pending_executions
-            .retain(|pending| pending != &execution_arn);
+            .retain(|pending| pending != execution_arn);
         if candidate.pending.is_some() {
-            self.pending_executions.push(execution_arn.clone());
+            self.pending_executions.push(execution_arn.to_string());
         }
-        self.executions.insert(execution_arn, candidate);
-        self.discard_activity_task(token);
+        self.executions
+            .insert(execution_arn.to_string(), candidate);
         Ok(())
     }
 
@@ -2564,6 +2716,163 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         self.retry_activity_task(token, error, EVENT_ACTIVITY_FAILED, at)
     }
 
+    // -----------------------------------------------------------------------
+    // The jobs a run-a-job (`.sync`) integration started
+    // -----------------------------------------------------------------------
+
+    /// Fail every parked job that has outlasted the time its task was allowed, and
+    /// drop every one no execution is waiting at any more.
+    ///
+    /// Both are owed whether or not anybody called, exactly as an activity task's own
+    /// bounds are: a task whose job did not finish inside its `TimeoutSeconds` failed
+    /// its execution at the instant that span ran out, and a job whose execution was
+    /// stopped — or went with the state machine it ran on — resolves nothing.
+    fn settle_job_tasks(&mut self, now: SystemTime) {
+        let mut timed_out: Vec<(String, SystemTime)> = Vec::new();
+        let mut orphaned: Vec<String> = Vec::new();
+        for task in self.job_tasks.values() {
+            if self
+                .executions
+                .get(&task.execution_arn)
+                .is_none_or(Execution::is_terminal)
+            {
+                orphaned.push(task.execution_arn.clone());
+                continue;
+            }
+            let due = task.times_out_at();
+            if due <= now {
+                timed_out.push((task.execution_arn.clone(), due));
+            }
+        }
+        for execution_arn in orphaned {
+            self.discard_job_task(&execution_arn);
+        }
+        for (execution_arn, due) in timed_out {
+            self.time_out_job_task(&execution_arn, due);
+        }
+    }
+
+    /// Record the job a planned run parked at, so the execution waits at that state
+    /// until the job finishes.
+    ///
+    /// Called once the execution has been ADMITTED, against bytes that already
+    /// include this record's ([`PlannedJob::measure`]).
+    pub fn park_job(&mut self, execution_arn: &str, planned: PlannedJob, region: &str) {
+        let mut task = JobTask {
+            execution_arn: execution_arn.to_string(),
+            state_name: planned.state_name,
+            state_input: planned.state_input,
+            job: planned.job,
+            api: planned.api,
+            parsed_output: planned.parsed_output,
+            job_id: planned.job_id,
+            region: region.to_string(),
+            parked_at: planned.parked_at,
+            timeout_seconds: planned.timeout_seconds,
+            retained_bytes: 0,
+        };
+        task.retained_bytes = std::mem::size_of::<JobTask>()
+            + task.execution_arn.len()
+            + task.state_name.len()
+            + task.state_input.len()
+            + task.job_id.len()
+            + task.region.len();
+        self.retained_bytes = self.retained_bytes.saturating_add(task.retained_bytes);
+        self.job_tasks.insert(execution_arn.to_string(), task);
+    }
+
+    /// Drop the job the execution `execution_arn` is parked at, giving back what its
+    /// record retained, and report it. `None` when the execution is parked at none.
+    pub fn discard_job_task(&mut self, execution_arn: &str) -> Option<JobTask> {
+        let task = self.job_tasks.remove(execution_arn)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(task.retained_bytes);
+        Some(task)
+    }
+
+    /// Record what the job an execution was parked at ENDED as: the job is closed and
+    /// the execution waiting at it carries on with what the continuation produced.
+    ///
+    /// `events` and `pending` are what [`plan_job_reply`] computed for the walk that
+    /// continued from the job's own report, admitted against the store's ceiling
+    /// exactly as a worker's reply is. `stopped_at_task` is whether the attempt
+    /// STOPPED at the state that started the job — the job ended without doing its
+    /// work and no `Catch` carried the execution on — which is the step a later
+    /// `RedriveExecution` continues from.
+    pub fn resolve_job_task(
+        &mut self,
+        execution_arn: &str,
+        events: Vec<HistoryEvent>,
+        pending: Option<PendingOutcome>,
+        extra_bytes: usize,
+        stopped_at_task: bool,
+    ) -> Result<(), TaskReplyRejection> {
+        let Some(task) = self.job_tasks.get(execution_arn) else {
+            return Err(TaskReplyRejection::Gone);
+        };
+        let stopped_at = stopped_at_task.then(|| asl::RedriveStep {
+            state_name: task.state_name.clone(),
+            state_input: task.state_input.clone(),
+        });
+        self.continue_execution(execution_arn, events, pending, extra_bytes, stopped_at)?;
+        self.discard_job_task(execution_arn);
+        Ok(())
+    }
+
+    /// Close the job the execution `execution_arn` is parked at because its task ran
+    /// out of the time it was allowed, and fail that execution with the error the
+    /// Amazon States Language names for a task that ran out of time.
+    ///
+    /// `due` is the instant the bound was reached, not the instant somebody looked, so
+    /// two callers reading afterwards see the same `stopDate`.
+    fn time_out_job_task(&mut self, execution_arn: &str, due: SystemTime) {
+        let Some(task) = self.discard_job_task(execution_arn) else {
+            return;
+        };
+        let cause = job_task_timeout_cause(&task);
+        let Some(execution) = self.executions.get_mut(execution_arn) else {
+            return;
+        };
+        if execution.is_terminal() {
+            return;
+        }
+        let before = execution.retained_bytes;
+        execution.pending = None;
+        execution.status = EXECUTION_STATUS_FAILED.to_string();
+        execution.stop_date = Some(due);
+        execution.error = Some(TASK_TIMEOUT_ERROR.to_string());
+        execution.cause = Some(cause);
+        // The attempt stopped AT the state that started the job, so that is the step a
+        // later redrive continues from — the same step a failed task leaves.
+        execution.redrive_step = Some(asl::RedriveStep {
+            state_name: task.state_name.clone(),
+            state_input: task.state_input.clone(),
+        });
+        execution.push_detailed_event(
+            EVENT_TASK_TIMED_OUT,
+            due,
+            EventDetails::of_failure(
+                Some(TASK_TIMEOUT_ERROR.to_string()),
+                execution.cause.clone(),
+            ),
+        );
+        execution.push_detailed_event(
+            EVENT_EXECUTION_FAILED,
+            due,
+            EventDetails::of_failure(
+                Some(TASK_TIMEOUT_ERROR.to_string()),
+                execution.cause.clone(),
+            ),
+        );
+        execution.retained_bytes = execution.measure();
+        let after = execution.retained_bytes;
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(after)
+            .saturating_sub(before);
+        self.pending_executions
+            .retain(|pending| pending != execution_arn);
+    }
+
     /// The definition the execution `arn` RUNS, which is where its states are read
     /// from.
     ///
@@ -2596,6 +2905,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .collect();
         for token in tokens {
             self.discard_activity_task(&token);
+        }
+        for arn in arns {
+            self.discard_job_task(arn);
         }
     }
 
@@ -4081,23 +4393,32 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         }
     }
 
-    /// Stop the execution `arn` names, and report the `stopDate` it carries.
+    /// Stop the execution `arn` names, and report the `stopDate` it carries together
+    /// with the job it was PARKED at, if any.
     ///
     /// The outcome the interpreter had computed is DISCARDED along with its place in
     /// the settle queue: the execution was stopped before the clock made that outcome
     /// due, so it never reached it. An execution that has already reached a terminal
     /// status is not moved — its own `stopDate` comes back, so two callers that stop
     /// the same execution see the same instant. `None` when nothing matched.
+    ///
+    /// A job a run-a-job task started is work of ANOTHER service, which this store
+    /// cannot reach: the record of it comes back so the operation that stopped the
+    /// execution cancels that job across the service boundary, which is what stopping
+    /// an execution parked inside such a task does.
     pub fn stop_execution(
         &mut self,
         arn: &str,
         now: SystemTime,
         error: Option<String>,
         cause: Option<String>,
-    ) -> Option<SystemTime> {
+    ) -> Option<Stopped> {
         let execution = self.executions.get_mut(arn)?;
         if let Some(stop_date) = execution.stop_date {
-            return Some(stop_date);
+            return Some(Stopped {
+                stop_date,
+                parked: None,
+            });
         }
         let before = execution.retained_bytes;
         execution.pending = None;
@@ -4126,7 +4447,15 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         self.pending_executions.retain(|pending| pending != arn);
         // A Map Run of this execution had not finished either, so it stopped here too.
         self.abort_map_runs_of(arn, now);
-        Some(now)
+        // The job this execution was parked at is nobody's work any more: the record
+        // leaves the store here — the next `settle` would drop it as orphaned anyway
+        // — and comes back so its own service is told to stop it. An activity task
+        // the execution was waiting at is dropped by that same settle, as it is for
+        // an execution that reached a terminal status any other way.
+        Some(Stopped {
+            stop_date: now,
+            parked: self.discard_job_task(arn),
+        })
     }
 
     /// Why `RedriveExecution` would refuse `execution` at `now`, in the words
@@ -4303,6 +4632,39 @@ fn activity_task_timeout_cause(task: &ActivityTask) -> String {
          'TimeoutSeconds' allows",
         task.state_name
     )
+}
+
+/// Why the task that started a parked job ran out of time, for the `cause` the
+/// execution it failed reports.
+///
+/// The error NAME is the language's own ([`TASK_TIMEOUT_ERROR`]); this says which
+/// span ran out — the state's own `TimeoutSeconds` where it declares one, else how
+/// long this emulator polls one job for — and how long that span was.
+fn job_task_timeout_cause(task: &JobTask) -> String {
+    match task.timeout_seconds {
+        Some(seconds) => format!(
+            "state '{}' ran the '{}' job it started for longer than the {seconds} seconds its \
+             'TimeoutSeconds' allows",
+            task.state_name, task.job.starts
+        ),
+        None => format!(
+            "state '{}' ran the '{}' job it started for longer than the {} seconds this emulator \
+             waits for one to finish",
+            task.state_name,
+            task.job.starts,
+            MAX_PARKED_JOB_DURATION.as_secs()
+        ),
+    }
+}
+
+/// What stopping an execution left: the `stopDate` it carries, and the job it was
+/// PARKED at when the stop reached it.
+#[derive(Debug, Clone)]
+pub struct Stopped {
+    pub stop_date: SystemTime,
+    /// The job a run-a-job task of this execution had started and nothing has
+    /// finished, for the caller to stop through that job's own service.
+    pub parked: Option<JobTask>,
 }
 
 /// One worker's open poll of an activity, counted against [`MAX_ACTIVITY_POLLERS`].
@@ -6016,9 +6378,9 @@ pub fn plan_redrive(
 
 /// What one planned run of a definition left for the store to record.
 ///
-/// Exactly one of `pending` and `waiting` is set: a walk either reached a terminal
-/// outcome the clock owes, or stopped at an activity task the execution is waiting
-/// for.
+/// At most one of `pending`, `waiting` and `parked` is set: a walk either reached a
+/// terminal outcome the clock owes, stopped at an activity task the execution is
+/// waiting for, or parked at the job a run-a-job integration started.
 #[derive(Debug, Clone)]
 pub struct Planned {
     /// The events the attempt has ALREADY produced: the opening event, and — for a
@@ -6030,6 +6392,8 @@ pub struct Planned {
     pub pending: Option<PendingOutcome>,
     /// The activity task the walk suspended on.
     pub waiting: Option<PlannedActivityTask>,
+    /// The job of a run-a-job integration the walk parked at.
+    pub parked: Option<PlannedJob>,
     /// The Map Run every Distributed Map state the walk entered started, with the
     /// offsets the walk reported turned into instants.
     pub map_runs: Vec<PlannedMapRun>,
@@ -6216,6 +6580,45 @@ pub fn plan_reply(
     Some(planned)
 }
 
+/// Plan the CONTINUATION of an execution whose parked job has ENDED.
+///
+/// The definition is walked on FROM the state that started the job, with the raw
+/// input that state was entered with and what the job ended as its outcome (see
+/// [`asl::resume_job`]), so what this reports is what the execution does from that
+/// outcome onward: the events it has produced since, and the terminal outcome it
+/// reached, owed to the clock one [`EXECUTION_SETTLE_DELAY`] after the job ended just
+/// as a worker's reply's outcome is owed after the reply.
+///
+/// `start` is the execution's own start, which the context object (`$$`) reports and a
+/// `Wait` state's `Timestamp` is measured against; `now` is the instant the job was
+/// found finished, which the continuation's own events are stamped from.
+///
+/// `None` when the definition no longer declares the state that started the job, so
+/// there is no continuation to record.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_job_reply(
+    definition: &str,
+    input: &str,
+    start: SystemTime,
+    now: SystemTime,
+    context: &asl::Context,
+    reply: &asl::JobReply,
+    previous_event_id: i64,
+    tasks: &dyn integration::Tasks,
+) -> Option<Planned> {
+    // What the execution has already spent, which a definition-level `TimeoutSeconds`
+    // counts: a job that stayed unfinished was part of this execution's run.
+    let elapsed = now.duration_since(start).unwrap_or_default();
+    let run = asl::resume_job(definition, input, start, context, reply, elapsed, tasks)?;
+    Some(plan_from_run(
+        run,
+        now,
+        EXECUTION_SETTLE_DELAY,
+        None,
+        previous_event_id,
+    ))
+}
+
 /// What a worker's reply that reports its activity task FAILED leaves for the store
 /// to record, once no `Retry` of the scheduling state answers for the error.
 ///
@@ -6269,6 +6672,7 @@ pub fn plan_task_failure(
             events: vec![ended],
         }),
         waiting: None,
+        parked: None,
         map_runs: Vec::new(),
     }
 }
@@ -6426,6 +6830,31 @@ fn plan_from_run(
             opening: history,
             pending: None,
             waiting: Some(scheduled),
+            parked: None,
+            map_runs,
+        };
+    }
+    // A walk that PARKED at a job computed no outcome either: the job was started at
+    // the offset the walk got to, and what happens next is that job finishing. The
+    // events of the states it walked — including the one recording the submission —
+    // are history, so they are recorded now rather than parked.
+    if let Some(parked) = run.parked {
+        let mut history = opened;
+        history.extend(events);
+        return Planned {
+            opening: history,
+            pending: None,
+            waiting: None,
+            parked: Some(PlannedJob {
+                state_name: parked.state_name,
+                state_input: parked.raw_input.to_string(),
+                job: parked.job,
+                api: parked.api,
+                parsed_output: parked.parsed_output,
+                job_id: parked.job_id,
+                parked_at: after(start, parked.at),
+                timeout_seconds: parked.timeout_seconds,
+            }),
             map_runs,
         };
     }
@@ -6440,6 +6869,7 @@ fn plan_from_run(
             events,
         }),
         waiting: None,
+        parked: None,
         map_runs,
     }
 }
@@ -6494,6 +6924,7 @@ fn round_up_to(value: i64, increment: i64) -> i64 {
 pub mod asl;
 pub mod integration;
 mod json_diagnostic;
+pub mod run_a_job;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

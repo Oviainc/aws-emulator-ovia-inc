@@ -575,7 +575,7 @@ async fn an_evaluated_state_reason_reports_an_empty_window_as_a_hole_and_names_t
             json!({"EvaluationPeriods": 3, "DatapointsToAlarm": 3}),
             vec![datum(42.0, 0.0), datum(43.0, 70.0)],
             "INSUFFICIENT_DATA",
-            vec!["Unchecked: initial alarm creation"],
+            vec!["Unchecked: Initial alarm creation"],
             vec!["out of the last", "missing datapoint"],
         ),
         reason_row(
