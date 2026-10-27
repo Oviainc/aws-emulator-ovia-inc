@@ -694,6 +694,8 @@ pub const OPERATION_TYPE_DELETE_DISK_SNAPSHOT: &str = "DeleteDiskSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_INSTANCE_SNAPSHOT: &str = "CreateInstanceSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DELETE_INSTANCE_SNAPSHOT: &str = "DeleteInstanceSnapshot";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_FROM_SNAPSHOT: &str = "CreateDiskFromSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_INSTANCES_FROM_SNAPSHOT: &str = "CreateInstancesFromSnapshot";
@@ -12729,6 +12731,21 @@ impl ComAmazonawsLightsailLightsail20161128State {
     pub fn insert_instance_snapshot(&mut self, snapshot: StoredInstanceSnapshot) {
         self.instance_snapshots
             .insert(snapshot.name.clone(), snapshot);
+    }
+
+    /// Remove the instance snapshot `name` names, answering it. `None` when
+    /// nothing matched.
+    ///
+    /// Nothing else in the store points AT an instance snapshot: the snapshot
+    /// itself holds the point-in-time copy of its source — the blueprint, the
+    /// bundle, the system volume size and the block storage disks the instance
+    /// had when it was taken — and an instance created from it, or an export of
+    /// it, copies what it needs out of that record as it is created. So removing
+    /// the record is the whole deletion: the clock-owed transition it was still
+    /// carrying goes with it, and the instance it was taken of, together with
+    /// every other snapshot of that instance, is untouched.
+    pub fn remove_instance_snapshot(&mut self, name: &str) -> Option<StoredInstanceSnapshot> {
+        self.instance_snapshots.remove(name)
     }
 
     /// The export snapshot record `name` names, for a reporting operation.
