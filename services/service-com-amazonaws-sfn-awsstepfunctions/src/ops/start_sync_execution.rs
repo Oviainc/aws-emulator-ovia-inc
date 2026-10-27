@@ -462,7 +462,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // either, so they are what the stored record attributes the run by.
             state_machine_version_arn: version_arn.clone(),
             state_machine_alias_arn: alias_arn.clone(),
-            ran: configuration,
+            ran: std::sync::Arc::new(configuration),
             redrive_count: 0,
             redrive_date: None,
             redrive_tokens: Vec::new(),
@@ -472,6 +472,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "This API action is not supported by EXPRESS state machines", so no
             // redrive continues this run from any step of it.
             redrive_step: None,
+            // A synchronous start begins an execution of its own, not a child of a
+            // Map Run.
+            map_run_arn: None,
+            item_count: None,
             // Measured and counted by `insert_execution`.
             retained_bytes: 0,
         };
