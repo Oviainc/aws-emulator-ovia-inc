@@ -282,6 +282,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // multi-Region set shares, read before the store is written through again.
         let key_id = key.key_id.clone();
 
+        // One multi-Region key set has ONE primary-key designation, and moving it is
+        // not instantaneous: "even after this operation completes, the process of
+        // updating the primary Region might still be in progress for a few more
+        // seconds. ... The old and new primary keys have a transient key state of
+        // Updating" (same doc). So concurrent promotions of one set are serialized:
+        // exactly one caller moves the designation, and a caller arriving while that
+        // move is still in flight finds the set in a state this operation is not
+        // compatible with — the modelled `KMSInvalidStateException`. Nothing about such
+        // a request's own values is wrong, so it is NOT a validation failure: a client
+        // that races or retries branches on this fault to learn the set is busy. The
+        // message is the key-state wording the rest of the service uses, naming the key
+        // the request resolved to by its ARN and the state the move in flight puts the
+        // set in.
+        if state.primary_region_update_in_flight(&key_id) {
+            return Err(UpdatePrimaryRegionErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(crate::state::key_state_refusal_message(
+                        key,
+                        crate::state::KEY_STATE_UPDATING,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // "The key ID and primary Region that you specify uniquely identify the
         // replica key that will become the primary key. The primary Region must
         // already have a replica key. This operation does not create a KMS key in

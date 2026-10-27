@@ -107,6 +107,29 @@ pub const KEY_STATE_CREATING: &str = "Creating";
 /// reports is derived from the clock, so nothing has to be written when it passes.
 pub const REPLICA_CREATING_SPAN: Duration = Duration::from_millis(500);
 
+/// The TRANSIENT state the old and the new primary key of a multi-Region key set are
+/// in while KMS is still moving the primary-key designation between them: "even after
+/// this operation completes, the process of updating the primary Region might still be
+/// in progress for a few more seconds. ... The old and new primary keys have a
+/// transient key state of Updating. The original key state is restored when the update
+/// is complete. While the key state is Updating, you can use the keys in cryptographic
+/// operations, but you cannot replicate the new primary key or perform certain
+/// management operations, such as enabling or disabling these keys"
+/// (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`). See
+/// [`KEY_STATE_ENABLED`].
+pub const KEY_STATE_UPDATING: &str = "Updating";
+
+/// How long the old and the new primary key of a multi-Region key set stay in
+/// [`KEY_STATE_UPDATING`] after the call that moved the designation between them.
+///
+/// The documentation says only "a few more seconds", so the length of the span is this
+/// emulator's. It is NON-ZERO, so a caller racing or retrying the move still observes
+/// the set while the move is in flight and the key-state refusal that goes with it.
+/// The instant it ends is stored on the key records that are moving
+/// ([`Cmk::primary_region_update_until`]) and the state a reader reports is derived
+/// from the clock, so nothing has to be written when it passes.
+pub const PRIMARY_REGION_UPDATE_SPAN: Duration = Duration::from_secs(3);
+
 /// The `KeyUsageType` a cryptographic encrypt/decrypt key carries, from
 /// `smithy_query(shape="KeyUsageType")`. "For encrypting, decrypting,
 /// re-encrypting, and generating data keys, the KeyUsage must be ENCRYPT_DECRYPT"
@@ -640,7 +663,17 @@ impl ComAmazonawsKmsTrentserviceState {
     /// `region` held a replica of it to promote at all.
     ///
     /// See [`Self::record_replica_region`] for why every member is written.
+    ///
+    /// The move is not instantaneous: "even after this operation completes, the process
+    /// of updating the primary Region might still be in progress for a few more
+    /// seconds. ... The old and new primary keys have a transient key state of
+    /// Updating" (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`), so the two
+    /// keys the designation moves between — and only those two — are given the instant
+    /// that move is due ([`PRIMARY_REGION_UPDATE_SPAN`]), which is what makes a second
+    /// move of the same set while this one is in flight a key-state refusal
+    /// ([`Self::primary_region_update_in_flight`]).
     pub fn promote_primary_region(&mut self, key_id: &str, region: &str) -> bool {
+        let former_primary_region = self.primary_region_of(key_id);
         let mut promoted = false;
         for arn in self.set_member_arns(key_id) {
             if let Some(topology) = self
@@ -651,7 +684,47 @@ impl ComAmazonawsKmsTrentserviceState {
                 promoted |= topology.promote(region);
             }
         }
-        promoted
+        if !promoted {
+            return false;
+        }
+        let due = SystemTime::now() + PRIMARY_REGION_UPDATE_SPAN;
+        for moving in former_primary_region
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(region))
+        {
+            if let Some(key) = self.key_mut_in(moving, key_id) {
+                key.primary_region_update_until = Some(due);
+            }
+        }
+        true
+    }
+
+    /// The Region holding the primary key of the multi-Region key set `key_id`, or
+    /// `None` when no key of that id belongs to a multi-Region set. Which Region that
+    /// is, is a property every key of the set shares, so any member reports it.
+    fn primary_region_of(&self, key_id: &str) -> Option<String> {
+        self.keys
+            .values()
+            .filter(|key| key.key_id == key_id)
+            .find_map(|key| {
+                key.multi_region_topology
+                    .as_ref()
+                    .map(|topology| topology.primary_region.clone())
+            })
+    }
+
+    /// Whether the clock still owes the multi-Region key set `key_id` a primary-Region
+    /// move a call has already started — the set is transiently busy moving its primary
+    /// key, so a management operation on the SET is not one it is in a valid state for.
+    ///
+    /// The judgement is set-wide rather than per key, because it is the set's single
+    /// primary-key designation that is moving: whichever of its keys a request names, a
+    /// promotion it asks for is serialized behind the one in flight.
+    pub fn primary_region_update_in_flight(&self, key_id: &str) -> bool {
+        self.keys
+            .values()
+            .any(|key| key.key_id == key_id && key.is_updating_primary_region())
     }
 
     /// Record that `operation` used the key `key_id` that `region`'s endpoint serves
@@ -1614,6 +1687,14 @@ pub struct Cmk {
     /// derives the transient state from this instant ([`Self::is_creating`]) rather
     /// than from anything a later call wrote.
     pub creating_until: Option<SystemTime>,
+    /// When this key stops being in the transient [`KEY_STATE_UPDATING`] state, or
+    /// `None` for a key whose multi-Region key set has no primary-Region move in
+    /// flight. Only the old and the new primary key of a set are given one, and only
+    /// until [`PRIMARY_REGION_UPDATE_SPAN`] after the call that moved the designation;
+    /// a reader derives the transient state from this instant
+    /// ([`Self::is_updating_primary_region`]) rather than from anything a later call
+    /// wrote.
+    pub primary_region_update_until: Option<SystemTime>,
     pub description: String,
     pub key_usage: String,
     pub key_spec: String,
@@ -1803,6 +1884,10 @@ impl std::fmt::Debug for Cmk {
             .field("enabled", &self.enabled)
             .field("key_state", &self.key_state)
             .field("creating_until", &self.creating_until)
+            .field(
+                "primary_region_update_until",
+                &self.primary_region_update_until,
+            )
             .field("description", &self.description)
             .field("key_usage", &self.key_usage)
             .field("key_spec", &self.key_spec)
@@ -1872,6 +1957,10 @@ impl Cmk {
             // A key `CreateKey` mints is never in the transient `Creating` state:
             // only a replica key is ([`Self::replica_in`]).
             creating_until: None,
+            // A key that has just been created has no primary-Region move in flight:
+            // only `UpdatePrimaryRegion` starts one
+            // ([`Store::promote_primary_region`]).
+            primary_region_update_until: None,
             description,
             key_usage,
             key_spec,
@@ -1967,6 +2056,9 @@ impl Cmk {
                 KEY_STATE_ENABLED.to_string()
             },
             creating_until: Some(SystemTime::now() + REPLICA_CREATING_SPAN),
+            // A replica joins the set as a replica key: the designation moves only
+            // when `UpdatePrimaryRegion` moves it.
+            primary_region_update_until: None,
             description,
             key_usage: self.key_usage.clone(),
             key_spec: self.key_spec.clone(),
@@ -2652,15 +2744,25 @@ impl Cmk {
 
     /// The `KeyState` a READER reports for this key, which is the one it carries unless
     /// the clock still owes it a transient state change: a replica key is `Creating`
-    /// until [`Self::creating_until`] passes, and material past its `ValidTo` is
-    /// deleted, leaving a key with no key material waiting in
-    /// [`KEY_STATE_PENDING_IMPORT`].
+    /// until [`Self::creating_until`] passes, material past its `ValidTo` is deleted,
+    /// leaving a key with no key material waiting in [`KEY_STATE_PENDING_IMPORT`], and
+    /// a key its set is still moving the primary-key designation through is `Updating`
+    /// until [`Self::primary_region_update_until`] passes.
     pub fn reported_key_state(&self) -> &str {
         if self.is_creating() {
             return KEY_STATE_CREATING;
         }
         if self.key_material_expired() {
             return KEY_STATE_PENDING_IMPORT;
+        }
+        // A key whose set is still moving its primary Region reports the transient
+        // state of that move, and "the original key state is restored when the update
+        // is complete" — so the state the record carries is left exactly as it was, and
+        // the transient state stands in for the ENABLED state it suspends. A key
+        // awaiting deletion, awaiting key material or disabled goes on reporting what
+        // it is: the move changes none of those, and each refuses what it refused.
+        if self.key_state == KEY_STATE_ENABLED && self.is_updating_primary_region() {
+            return KEY_STATE_UPDATING;
         }
         &self.key_state
     }
@@ -2672,17 +2774,38 @@ impl Cmk {
             .is_some_and(|until| SystemTime::now() < until)
     }
 
+    /// Whether the clock still owes this key's multi-Region key set the primary-Region
+    /// move a call has started, which is the transient [`KEY_STATE_UPDATING`] state —
+    /// see [`PRIMARY_REGION_UPDATE_SPAN`]. The clock ends it by itself.
+    pub fn is_updating_primary_region(&self) -> bool {
+        self.primary_region_update_until
+            .is_some_and(|until| SystemTime::now() < until)
+    }
+
     /// Whether this key can be used in a cryptographic operation right now.
+    ///
+    /// A key whose set is still moving its primary Region can: "while the key state is
+    /// Updating, you can use the keys in cryptographic operations"
+    /// (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`) — a move in flight
+    /// refuses the MANAGEMENT operations of the set, not its cryptographic ones.
     pub fn is_usable(&self) -> bool {
-        self.enabled && self.reported_key_state() == KEY_STATE_ENABLED
+        self.enabled
+            && matches!(
+                self.reported_key_state(),
+                KEY_STATE_ENABLED | KEY_STATE_UPDATING
+            )
     }
 
     /// Whether this key's key state is one of the two `EnableKey` and `DisableKey`
     /// move between. A key awaiting deletion or awaiting imported key material is in
     /// neither, so those operations refuse it rather than dropping the state it is
-    /// actually in.
+    /// actually in — and neither is a key whose set is still moving its primary
+    /// Region, since while that move is in flight "you cannot ... perform certain
+    /// management operations, such as enabling or disabling these keys"
+    /// (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`).
     pub fn is_enableable(&self) -> bool {
-        self.key_state == KEY_STATE_ENABLED || self.key_state == KEY_STATE_DISABLED
+        !self.is_updating_primary_region()
+            && (self.key_state == KEY_STATE_ENABLED || self.key_state == KEY_STATE_DISABLED)
     }
 }
 
@@ -3931,7 +4054,17 @@ pub fn invalid_arn_message(requested: &str) -> String {
 /// One function for the whole service, so no two operations word the same key state
 /// differently.
 pub fn invalid_state_message(key: &Cmk) -> String {
-    format!("{} is {}.", key.arn, key_state_prose(key.reported_key_state()))
+    key_state_refusal_message(key, key.reported_key_state())
+}
+
+/// [`invalid_state_message`] for a key state the caller is being refused for that a
+/// READER does not report on this key record — the transient state of a change in
+/// flight across a multi-Region key SET, which the key the request named need not be
+/// one of the keys carrying.
+///
+/// One wording for both, so a key state refuses every request the same way.
+pub fn key_state_refusal_message(key: &Cmk, key_state: &str) -> String {
+    format!("{} is {}.", key.arn, key_state_prose(key_state))
 }
 
 /// How KMS words the refusal of a request that REQUIRES a key state the key is not in
