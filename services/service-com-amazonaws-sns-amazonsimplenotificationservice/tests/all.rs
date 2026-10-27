@@ -17,6 +17,9 @@ mod account_subscriptions_listing;
 #[path = "all/confirm_subscription.rs"]
 mod confirm_subscription;
 
+#[path = "all/create_platform_application.rs"]
+mod create_platform_application;
+
 #[path = "all/data_protection_policy.rs"]
 mod data_protection_policy;
 
