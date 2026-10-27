@@ -25,9 +25,24 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex encoding for those identifiers and for the opaque pagination cursors.
 hex = { workspace = true }
+# The Amazon S3 client CreateWorkflow and UpdateWorkflow snapshot the workflow definition
+# file through, over the in-process callback into this same emulator (no network client
+# feature is enabled: the transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# YAML reader for the snapshotted workflow definition, whose DAG-level schedule key is
+# what `ScheduleConfiguration` reports. yaml-rust2 is the pure-Rust YAML 1.2
+# implementation the other services that read caller-supplied YAML use; YAML 1.2 is a
+# superset of JSON, so one reader covers both spellings of a definition.
+yaml-rust2 = { version = "0.10", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The mwaa-serverless tests mount the Amazon S3 service beside this one on a single
+# engine, because CreateWorkflow and UpdateWorkflow snapshot the workflow definition file
+# by calling it.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

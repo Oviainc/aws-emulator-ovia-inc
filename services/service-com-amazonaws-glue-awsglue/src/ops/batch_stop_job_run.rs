@@ -177,14 +177,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 job.settle_due_runs(now);
                 for run_id in &input.job_run_ids {
                     let Some(run) = job.run_mut(run_id) else {
+                        // The same fixed words every job-run lookup refuses a miss with:
+                        // the entry already names the run the request named, so the
+                        // detail states the miss without echoing it back.
                         errors.push(stop_error(
                             &input.job_name,
                             run_id,
                             ENTITY_NOT_FOUND_CODE,
-                            format!(
-                                "Job run {run_id} not found for job {}",
-                                input.job_name
-                            ),
+                            crate::state::messages::JOB_RUN_NOT_FOUND.to_string(),
                         ));
                         continue;
                     };

@@ -300,13 +300,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // THIS job, and the run started here is the next attempt of it.
         let retries = match input.job_run_id.as_deref() {
             Some(previous_run_id) => {
+                // A retry of a run the job does not hold is the same job-run miss
+                // `GetJobRun` refuses, so it carries the same fixed words and echoes back
+                // neither the id asked for nor the job name.
                 let Some(previous) = job.run(previous_run_id) else {
                     return Err(StartJobRunErrorModeled::EntityNotFoundException(
                         EntityNotFoundException {
-                            message: Some(format!(
-                                "Job run {previous_run_id} not found for job {}",
-                                input.job_name
-                            )),
+                            message: Some(
+                                crate::state::messages::JOB_RUN_NOT_FOUND.to_string(),
+                            ),
                             from_federation_source: None,
                         },
                     )

@@ -220,6 +220,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let now = SystemTime::now();
         let fingerprint = request_fingerprint(&input);
+
+        // An update "creates a new version with the updated configuration", and a
+        // version freezes the definition file as it stands when the version is created,
+        // so the definition object is read HERE, once, exactly as `CreateWorkflow` reads
+        // it. Read before the store is locked — the read is a call into another emulated
+        // service, and this service's store is not held across it.
+        let definition = crate::state::workflow_definition::snapshot_definition(
+            ctx,
+            &region,
+            &input.definition_s3_location,
+        )
+        .await;
+
         let mut store = state.lock();
 
         // Finish every workflow teardown the clock already made due, so a workflow
@@ -293,6 +306,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // time of the request", so the snapshot is taken now.
         let snapshot = crate::state::WorkflowSnapshot {
             definition_s3_location: input.definition_s3_location.clone(),
+            // The content read above, and the schedule that content declares: the new
+            // version freezes both, which is how a caller picks up a changed definition
+            // object — by creating a version, never by the object changing underneath an
+            // existing one.
+            workflow_definition: definition
+                .as_ref()
+                .map(|snapshot| snapshot.content.clone()),
+            schedule_configuration: definition
+                .and_then(|snapshot| snapshot.schedule_configuration),
             code: input.code.clone(),
             role_arn: input.role_arn.clone(),
             description: input.description.clone(),

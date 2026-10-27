@@ -14,12 +14,19 @@
 //! the attach point the connection is created on and the region the request is signed
 //! for; the refusal table's rows differ in the SHAPE of the unresolvable key, including
 //! both published `ActivationKey` length bounds and one character past the upper one.
+//!
+//! The second half of the rule: a key resolves to a proposal only while the connection
+//! it names is one a `DeleteConnection` has NOT been made on — the connectivity the
+//! proposal offered ceases to exist from the moment the delete is called, so the handle
+//! is void and describing it is the same 404 an unissued key gets, while the record
+//! itself stays readable by its identifier.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::emulator::{remote_account_for, Emulator};
+use crate::emulator::{code, message, remote_account_for, Emulator};
 
 /// The gateways the rows below attach their connections to: an attach point IS a
 /// Direct Connect gateway of the account, so the suite creates its own and the rows
@@ -318,6 +325,210 @@ async fn describe_connection_proposal_reports_the_proposal_each_activation_key_n
         "expected the describes to have created nothing, got {stored} connections for {} proposals",
         minted.len()
     );
+}
+
+/// How long a wait for the state the clock owes a connection runs before the case
+/// fails: a create is provisioned a span at a time, and `DeleteConnection` starts
+/// `deleting` with the clock owing `deleted`.
+const CLOCK_BUDGET: Duration = Duration::from_secs(5);
+
+/// How often that wait re-reads.
+const STATE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The `ConnectionState` `GetConnection` reports for `identifier` in `region`.
+async fn connection_state(emulator: &Emulator, region: &str, identifier: &str) -> String {
+    let fetched = emulator
+        .ic_ok_in(region, "GetConnection", json!({ "identifier": identifier }))
+        .await;
+    text(&fetched["connection"], "state")
+}
+
+/// Wait until `GetConnection` reports `identifier` in `wanted` — a state the clock
+/// owes it, never one this test sets.
+async fn wait_for_state(
+    emulator: &Emulator,
+    region: &str,
+    identifier: &str,
+    wanted: &str,
+    case: &str,
+) {
+    let started = Instant::now();
+    loop {
+        let state = connection_state(emulator, region, identifier).await;
+        if state == wanted {
+            return;
+        }
+        assert!(
+            started.elapsed() < CLOCK_BUDGET,
+            "case {case:?}: expected {identifier} to reach {wanted:?} within {CLOCK_BUDGET:?}, it is still {state:?}"
+        );
+        tokio::time::sleep(STATE_POLL_INTERVAL).await;
+    }
+}
+
+/// `DescribeConnectionProposal` for one key, as a `(status, body)` pair.
+async fn describe(emulator: &Emulator, region: &str, activation_key: &str) -> (u16, Value) {
+    emulator
+        .ic_in(
+            region,
+            "DescribeConnectionProposal",
+            json!({ "activationKey": activation_key }),
+        )
+        .await
+}
+
+/// The key names no describable proposal: the operation's modelled 404, worded the way
+/// this service words a key that resolves to nothing, and never echoing the
+/// `@sensitive` key itself.
+fn assert_void_handle(case: &str, status: u16, body: &Value, activation_key: &str) {
+    use service_com_amazonaws_interconnect_interconnect::state::proposal_not_retrievable_message;
+
+    assert_eq!(
+        status, 404,
+        "case {case:?}: expected the modelled 404 for a key that names no proposal, got {status} with {body:?}"
+    );
+    assert!(
+        code(body).contains("ResourceNotFoundException"),
+        "case {case:?}: expected ResourceNotFoundException, got {:?}",
+        code(body)
+    );
+    assert_eq!(
+        message(body),
+        proposal_not_retrievable_message(),
+        "case {case:?}: expected the service's own refusal wording, got {:?}",
+        message(body)
+    );
+    assert!(
+        !message(body).contains(activation_key),
+        "case {case:?}: expected the sensitive activationKey not to be echoed, got {:?}",
+        message(body)
+    );
+}
+
+/// A connection a `DeleteConnection` has been made on has no proposal left: its
+/// activation key is refused with the operation's modelled 404 from the instant the
+/// delete is called — while the record is still `deleting`, and once the clock has
+/// settled it into the terminal `deleted` — while the record stays readable by its
+/// identifier and every other key still names its own proposal.
+#[tokio::test]
+async fn a_deleted_connections_activation_key_names_no_proposal() {
+    use service_com_amazonaws_interconnect_interconnect::state::{
+        DELETED_CONNECTION_STATE, DELETING_CONNECTION_STATE,
+    };
+
+    let emulator = Emulator::new();
+    let catalog = emulator.environments().await;
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
+    let table = proposal_table(&catalog, &gateways);
+    assert!(
+        table.len() >= 4,
+        "the proposal table must span several environments and bandwidths, got {} rows",
+        table.len()
+    );
+
+    // Rows differ in the table's own axes — the environment, the bandwidth, the attach
+    // point and the region the request is signed for — and in the state the connection
+    // is in when the delete lands: one deleted straight after the create, while its
+    // proposal is still awaiting acceptance, and one deleted only once the clock has
+    // provisioned the connection all the way to `available`.
+    for (index, case) in table.iter().take(4).enumerate() {
+        let provisioned_first = index.is_multiple_of(2);
+        let label = format!(
+            "{} / {} in {} / {}",
+            case.environment_id(),
+            case.bandwidth,
+            case.region,
+            if provisioned_first {
+                "deleted once provisioned"
+            } else {
+                "deleted while awaiting acceptance"
+            }
+        );
+
+        // A sibling proposal in the same region, so what is refused below is THIS key
+        // and not the store having stopped answering for every proposal.
+        let sibling = emulator
+            .ic_ok_in(case.region, "CreateConnection", case.request())
+            .await["connection"]
+            .clone();
+        let sibling_key = text(&sibling, "activationKey");
+
+        let created = emulator
+            .ic_ok_in(case.region, "CreateConnection", case.request())
+            .await["connection"]
+            .clone();
+        let activation_key = text(&created, "activationKey");
+        let identifier = text(&created, "id");
+        if provisioned_first {
+            wait_for_state(&emulator, case.region, &identifier, "available", &label).await;
+        }
+
+        // The live baseline: the key describes the proposal it names.
+        let (status, before) = describe(&emulator, case.region, &activation_key).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected a live proposal to describe, got {status} with {before:?}"
+        );
+        assert_proposal_matches(&label, &before, &case.environment, &case.bandwidth);
+
+        // The delete starts the teardown the clock then finishes.
+        let deleted = emulator
+            .ic_ok_in(
+                case.region,
+                "DeleteConnection",
+                json!({ "identifier": identifier }),
+            )
+            .await["connection"]
+            .clone();
+        assert_eq!(
+            text(&deleted, "state"),
+            DELETING_CONNECTION_STATE,
+            "case {label:?}: expected DeleteConnection to report the teardown state, got {:?}",
+            deleted["state"]
+        );
+
+        // From that instant the key names nothing to describe or confirm.
+        let row = format!("{label} / right after the delete");
+        let (status, body) = describe(&emulator, case.region, &activation_key).await;
+        assert_void_handle(&row, status, &body, &activation_key);
+
+        // And once the clock has settled the terminal state, the same answer — twice
+        // over, because describing is a read.
+        wait_for_state(
+            &emulator,
+            case.region,
+            &identifier,
+            DELETED_CONNECTION_STATE,
+            &label,
+        )
+        .await;
+        let row = format!("{label} / once deleted");
+        let (status, body) = describe(&emulator, case.region, &activation_key).await;
+        assert_void_handle(&row, status, &body, &activation_key);
+        let (again_status, again_body) = describe(&emulator, case.region, &activation_key).await;
+        assert_eq!(
+            (again_status, &again_body),
+            (status, &body),
+            "case {row:?}: expected a repeated describe to answer identically, got {again_status} with {again_body:?}"
+        );
+
+        // The record itself is still there to be read by its identifier: only the
+        // proposal handle is void, which is what lets a caller poll the delete.
+        let state = connection_state(&emulator, case.region, &identifier).await;
+        assert_eq!(
+            state, DELETED_CONNECTION_STATE,
+            "case {label:?}: expected the deleted record to still report its terminal state, got {state:?}"
+        );
+
+        // Every other key still names its own proposal.
+        let row = format!("{label} / a sibling proposal");
+        let (status, sibling_body) = describe(&emulator, case.region, &sibling_key).await;
+        assert_eq!(
+            status, 200,
+            "case {row:?}: expected a live sibling proposal to still describe, got {status} with {sibling_body:?}"
+        );
+        assert_proposal_matches(&row, &sibling_body, &case.environment, &case.bandwidth);
+    }
 }
 
 /// An `activationKey` that resolves to no stored proposal is the operation's

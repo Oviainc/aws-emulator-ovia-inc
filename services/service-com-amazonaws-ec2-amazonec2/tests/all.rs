@@ -109,6 +109,13 @@ mod local_gateway_routes;
 // this file's header note gives: the sorted neighbourhood is the contended region.
 #[path = "all/network_insights_analyses.rs"]
 mod network_insights_analyses;
+// What `DeleteNetworkInsightsPath` takes out of the path store, what it answers, what it
+// refuses and what a dry run of it performs. Declared beside the analyses suite above —
+// topically its neighbour — rather than in sorted position or at the tail, for the reason
+// this file's header note gives: both are the contended regions where a serialized squash
+// merge is lost.
+#[path = "all/delete_network_insights_path.rs"]
+mod delete_network_insights_path;
 // The transit gateway prefix list reference slice (create, then read it back) and the
 // error envelope's request id. Declared beside the suites above for the reason they
 // give: the sorted region is where every new ec2 suite inserts its lines, and these two

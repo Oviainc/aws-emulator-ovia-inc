@@ -4207,6 +4207,18 @@ impl ComAmazonawsCloudformationCloudformationState {
             .find(|template| template.is_addressed_by(region, name_or_id))
     }
 
+    /// [`Self::resolve_generated_template`], for a caller that mutates the record it
+    /// resolved.
+    pub fn resolve_generated_template_mut(
+        &mut self,
+        region: &str,
+        name_or_id: &str,
+    ) -> Option<&mut generated_template::StoredGeneratedTemplate> {
+        self.generated_templates
+            .iter_mut()
+            .find(|template| template.is_addressed_by(region, name_or_id))
+    }
+
     /// The generated templates of one Region, in creation order: the set a name has to be
     /// unique within and the one its quotas are metered over.
     pub fn generated_templates_in<'a>(

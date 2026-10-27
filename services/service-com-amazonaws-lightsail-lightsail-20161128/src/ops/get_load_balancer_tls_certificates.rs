@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLoadBalancerTlsCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLoadBalancerTlsCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports every SSL/TLS certificate the load balancer the request names holds,
+//! in full: the ones `CreateLoadBalancer` and `CreateLoadBalancerTlsCertificate`
+//! stored on that load balancer, in the order they were added. "You can have a
+//! maximum of 2 certificates associated with a Lightsail load balancer. One is
+//! active and the other is inactive."
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLoadBalancerTlsCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING operation: it writes nothing, so a certificate's validation
+//! status moves only on the clock that owes it ([`crate::state::with_state`]
+//! applies what the clock already made due before this handler runs), never
+//! because somebody read it.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +164,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLoadBalancerTlsCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLoadBalancerTlsCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLoadBalancerTlsCertificates"))
+        // A load balancer is a REGIONAL resource, so the certificates a name
+        // addresses are those of the load balancer in the Region THIS request is
+        // signed for — the same Region `CreateLoadBalancer` stored the record in.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `loadBalancerName` is a modelled `@required` member carrying the
+        // `ResourceName` pattern, so the centralized walk already refused an
+        // absent or malformed name. A well-formed name that names nothing is the
+        // service's `DoesNotExist` rejection, never an empty list.
+        let name = input.load_balancer_name;
+
+        crate::state::with_state(&*self.engine, |store| {
+            store
+                .load_balancer(&region, &name)
+                // Every certificate the load balancer holds, in the order they
+                // were added, each reported on the load balancer that holds it.
+                // A load balancer holding none answers the empty list, which is
+                // what it holds: either nothing ever asked for a certificate on
+                // it, or `DeleteLoadBalancerTlsCertificate` removed the ones
+                // that were.
+                .map(crate::state::StoredLoadBalancer::certificate_views)
+                .ok_or_else(|| not_found(&name))
+        })
+        .ok_or_else(unavailable)?
+        .map(|tls_certificates| GetLoadBalancerTlsCertificatesOutput {
+            tls_certificates: Some(tls_certificates),
+        })
     }
+}
+
+/// No load balancer of that name is stored in this Region: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(name: &str) -> GetLoadBalancerTlsCertificatesError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetLoadBalancerTlsCertificatesError {
+    GetLoadBalancerTlsCertificatesErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail load balancer store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
