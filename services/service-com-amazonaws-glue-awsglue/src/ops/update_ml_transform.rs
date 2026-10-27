@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMLTransform
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMLTransform`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMLTransform::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates a machine learning transform this service's store holds: the request addresses
+//! the transform by the `TransformId` its create minted and carries the members to change,
+//! each of which replaces what is stored while every member it omits is preserved, so a
+//! later `GetMLTransform` reports the merged record. The write moves the transform's
+//! `LastModifiedOn`; a request naming no member to change writes nothing.
+//!
+//! The three capacity members are resolved together, by the rule the create uses: "when
+//! the `WorkerType` field is set to a value other than `Standard`, the `MaxCapacity` field
+//! is set automatically and becomes read-only".
+//!
+//! An id this account holds no transform under is this operation's `EntityNotFoundException`
+//! rather than a silently created transform. Its `AccessDeniedException` is not reachable:
+//! this emulator authorizes no caller against a transform.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +191,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMLTransform` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMLTransformErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMLTransform"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on — the same way
+            // `CreateMLTransform` and `GetMLTransform` report it.
+            return Err(UpdateMLTransformErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "the Glue machine learning transform store is unavailable".into(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `Role` is `@required` on the create, so an update cannot leave a transform
+        // without one: "the name or Amazon Resource Name (ARN) of the IAM role with the
+        // required permissions" is what its task runs assume, and a blank string names no
+        // role. Judged before the transform is touched, so a refused update writes nothing.
+        if input
+            .role
+            .as_deref()
+            .is_some_and(|role| role.trim().is_empty())
+        {
+            return Err(UpdateMLTransformErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("Role is required and cannot be blank".to_string()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // `TransformId` is `@required` with `length 1..255`, and `Timeout`'s `range 1..`,
+        // the `WorkerType` enum and the `Name`, `Description` and `GlueVersion` patterns are
+        // refused at the boundary — so the only question left here is whether this account
+        // holds a transform under that id. The id is the whole address of one: a name is
+        // not, since "Names are not guaranteed unique and can be changed at any time"
+        // (`MLTransform$Name`), which is also why an update may move a name onto one
+        // another transform already carries.
+        let Some(entry) = store.ml_transforms.get_mut(&input.transform_id) else {
+            return Err(UpdateMLTransformErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::ml_transform_not_found(
+                        &input.transform_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // A request that names no member to change asks for no change, so nothing is
+        // written and the transform's `LastModifiedOn` stays where the last write that did
+        // change something put it.
+        if crate::state::ml_transform_update_names_a_change(&input) {
+            entry.apply_update(&input, ::std::time::SystemTime::now());
+            ::tracing::info!(
+                operation = "UpdateMLTransform",
+                transform = %input.transform_id,
+                "updated a Glue machine learning transform"
+            );
+        }
+
+        Ok(UpdateMLTransformOutput {
+            // "The unique identifier for the transform that was updated", which is the id
+            // the request addressed and the record it just wrote still lives under: this
+            // operation has no member for the id and so cannot move it.
+            transform_id: Some(input.transform_id.clone()),
+        })
     }
 }

@@ -2,8 +2,10 @@
 
 //! @op PutManagedInsightRules
 //! Enables managed Contributor Insights rules for Amazon Web Services resources, one rule
-//! per `ManagedRule` the request carries. Implemented here, and the ONLY file to touch for
-//! this operation.
+//! per `ManagedRule` the request carries whose `TemplateName` names a template this account's
+//! catalog publishes for that entry's resource; an entry naming no published template is
+//! reported back among the rules that could not be enabled. Implemented here, and the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -186,6 +188,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // iterating the failures never has to tell the two apart.
         let mut failures: Vec<PartialFailure> = Vec::new();
         for rule in &input.managed_rules {
+            // "The template name for the managed Contributor Insights rule, as returned by
+            // ListManagedInsightRules." (`ManagedRule$TemplateName`) — the template is one the
+            // service publishes for the resource, so a name the catalog answers with no
+            // template names nothing this call could enable. The entry is reported back among
+            // the rules that could not be enabled and the rest of the request still takes
+            // effect: "If the operation could not process one of the rules, the following data
+            // is returned for each of those rules." (`PartialFailure`)
+            if store
+                .managed_rule_template(&rule.template_name, &rule.resource_arn)
+                .is_none()
+            {
+                failures.push(PartialFailure {
+                    failure_resource: Some(rule.template_name.clone()),
+                    exception_type: Some(TEMPLATE_NOT_FOUND_EXCEPTION.to_string()),
+                    failure_code: Some(TEMPLATE_NAME_FAILURE_CODE.to_string()),
+                    failure_description: Some(TEMPLATE_NOT_FOUND.to_string()),
+                });
+                continue;
+            }
             let origin = crate::state::ManagedRuleOrigin {
                 template_name: rule.template_name.clone(),
                 resource_arn: rule.resource_arn.clone(),
@@ -286,6 +307,20 @@ fn invalid_parameter_value(message: String) -> PutManagedInsightRulesError {
 
 /// How CloudWatch states that `ManagedRules` carries no entry.
 const EMPTY_MANAGED_RULES: &str = "EMPTY_MANAGED_RULES: ManagedRules cannot be an empty array.";
+
+/// What a `ManagedRule` entry naming a template the catalog does not publish is reported with:
+/// the entry could not be processed, and the member of it that is at fault is the template name.
+///
+/// The sentence is this error class's own and carries no variable part; the entry's
+/// `FailureResource` is what names the template the request submitted.
+const TEMPLATE_NOT_FOUND: &str = "Could not find template with the specified templateName.";
+
+/// The exception an entry naming no published template is reported as: the template it names
+/// does not exist.
+const TEMPLATE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// Which member of the entry the failure is about: its template name.
+const TEMPLATE_NAME_FAILURE_CODE: &str = "TEMPLATE_NAME";
 
 /// The `Definition` a managed rule carries: the managed-rule schema, and the template and
 /// resource the rule was enabled from.

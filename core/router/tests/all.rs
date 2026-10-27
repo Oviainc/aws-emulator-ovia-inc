@@ -19,6 +19,10 @@
 // else appends to.
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
 mod kinesisvideo_signing_name_routing;
+// Declared here, at the head, for the reason the entry above records: the appended tail and
+// the sorted `s…` span are both regions concurrently landing suites add their line to.
+#[path = "all/sts_does_not_disclose_an_absent_role.rs"]
+mod sts_does_not_disclose_an_absent_role;
 // Declared here, at the head, for the reason the entry above records: the appended tail
 // and the sorted `s…` span are both regions concurrent suites add their line to.
 #[path = "all/signer_revocation_status_across_services.rs"]

@@ -12,7 +12,7 @@
 //! removes the ONE account the request names from the set of accounts the named
 //! snapshot may be restored by, reports that snapshot back, and persists the
 //! shrunken set for a later read, while an account the set does not hold is
-//! refused with the modelled authorization fault and changes nothing. It is
+//! refused with the modelled access fault and changes nothing. It is
 //! asserted over a TABLE of grantee forms (account identifier, the documented
 //! Amazon Web Services Support alias), over every way a request can name the
 //! snapshot (identifier in any case, ARN, the pair), over the refusals (an
@@ -264,7 +264,7 @@ async fn every_way_of_naming_the_snapshot_reaches_the_same_record() {
 
 /// Only an authorization the snapshot HOLDS can be released: an account that was
 /// never granted access, and one whose grant an earlier revoke already released,
-/// are refused with the modelled authorization fault and change nothing.
+/// are refused with the modelled access fault and change nothing.
 #[tokio::test]
 async fn a_revoke_of_an_account_holding_no_access_is_refused_and_changes_nothing() {
     let (emulator, arn) = seeded_emulator().await;
@@ -296,7 +296,7 @@ async fn a_revoke_of_an_account_holding_no_access_is_refused_and_changes_nothing
     for (case, account, locator) in rows {
         let before = describe(&emulator, SNAPSHOT).await;
         let answer = revoke(&emulator, account, &locator).await;
-        assert_refused(case, &answer, 404, "AuthorizationNotFound");
+        assert_refused(case, &answer, 400, "AccessToSnapshotDenied");
         let after = describe(&emulator, SNAPSHOT).await;
         assert_eq!(
             granted_ids(&after),
@@ -321,7 +321,12 @@ async fn a_revoke_of_an_account_holding_no_access_is_refused_and_changes_nothing
         first.status, first.body
     );
     let again = revoke(&emulator, held, &[("SnapshotIdentifier", SNAPSHOT)]).await;
-    assert_refused("the same account revoked twice", &again, 404, "AuthorizationNotFound");
+    assert_refused(
+        "the same account revoked twice",
+        &again,
+        400,
+        "AccessToSnapshotDenied",
+    );
 }
 
 /// A request that names no snapshot this store holds, or no account at all, is
@@ -441,8 +446,8 @@ async fn a_revoke_touches_only_the_snapshot_it_names() {
 }
 
 /// A revoke asserts nothing about the snapshot's own status: a snapshot still
-/// being created holds no grant, so the request is the authorization fault — not
-/// the snapshot-state fault the grant path answers with.
+/// being created holds no grant, so the request is the access fault — not the
+/// snapshot-state fault the grant path answers with.
 #[tokio::test]
 async fn a_revoke_asserts_nothing_about_the_snapshots_status() {
     let (emulator, _) = creating_emulator(&[SNAPSHOT]).await;
@@ -452,8 +457,8 @@ async fn a_revoke_asserts_nothing_about_the_snapshots_status() {
     assert_refused(
         "a revoke on a snapshot still creating",
         &while_creating,
-        404,
-        "AuthorizationNotFound",
+        400,
+        "AccessToSnapshotDenied",
     );
 }
 

@@ -341,7 +341,8 @@ pub use node_registration_scripts::{
 pub mod event_bridge_rule_templates;
 
 pub use event_bridge_rule_templates::{
-    event_bridge_rule_template_summary, is_event_target_arn, is_event_type,
+    event_bridge_rule_template_summary, event_targets_from_request, is_event_target_arn,
+    is_event_type,
     EventBridgeRuleTemplateChanges, EventBridgeRuleTemplateRecord,
     EventBridgeRuleTemplateRefusal, EventBridgeRuleTemplateUpdateRefusal,
     NewEventBridgeRuleTemplate, EVENT_BRIDGE_RULE_TEMPLATE_EVENT_TYPES,
@@ -935,6 +936,36 @@ pub const MAX_RESOURCE_DESCRIPTION_LEN: usize = 1024;
 /// The longest `RequestId` (`@idempotencyToken`) a create accepts, from its
 /// target shape `__stringMin1Max256PatternS`.
 pub const MAX_REQUEST_ID_LEN: usize = 256;
+
+/// Check a string member against the length bounds its target shape names,
+/// answering the message that refusal carries: the member, the bound and the
+/// length that broke it.
+///
+/// ONE copy of that length rule and of its wording, so the operations that
+/// check the same member of the same resource against the same bound — a
+/// create and the update beside it — cannot drift into two readings of one
+/// constraint. Length is counted in characters, which is the unit a Smithy
+/// `@length` constraint counts in.
+///
+/// A member the request did not carry is `None` and asks for no change, so it
+/// breaks no bound.
+pub fn bounded_length(
+    member: &str,
+    value: Option<&str>,
+    min: usize,
+    max: usize,
+) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let len = value.chars().count();
+    if len >= min && len <= max {
+        return Ok(());
+    }
+    Err(format!(
+        "{member} must be between {min} and {max} characters long, but was {len}"
+    ))
+}
 
 /// The most tags one resource carries.
 ///

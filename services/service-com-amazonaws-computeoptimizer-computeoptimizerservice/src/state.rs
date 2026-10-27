@@ -79,8 +79,12 @@ use crate::ops::types::{
     LambdaSavingsOpportunityAfterDiscounts, LicenseConfiguration, LicenseRecommendation,
     LicenseRecommendationFilter, LicenseRecommendationOption, MemorySizeConfiguration,
     MetricSource, PreferredResource,
-    PutRecommendationPreferencesInput, RDSDBRecommendation, RDSDBRecommendationFilter,
-    RDSDBUtilizationMetric, RecommendationExportJob, RecommendationPreferencesDetail,
+    PutRecommendationPreferencesInput, RDSDBInstanceRecommendationOption, RDSDBRecommendation,
+    RDSDBRecommendationFilter, RDSDBStorageRecommendationOption, RDSDBUtilizationMetric,
+    RDSEffectiveRecommendationPreferences, RDSInstanceEstimatedMonthlySavings,
+    RDSInstanceSavingsOpportunityAfterDiscounts, RDSSavingsEstimationMode,
+    RDSStorageEstimatedMonthlySavings, RDSStorageSavingsOpportunityAfterDiscounts,
+    RecommendationExportJob, RecommendationPreferencesDetail,
     S3Destination, SavingsOpportunity, Scope, Tag, UtilizationMetric, UtilizationPreference,
     VolumeConfiguration, VolumeRecommendation, VolumeRecommendationOption,
     ENROLLMENT_FILTER_NAME_VALUES, EXTERNAL_METRICS_SOURCE_VALUES,
@@ -99,6 +103,7 @@ use crate::ops::types::{
     LAMBDA_FUNCTION_RECOMMENDATION_FINDING_VALUES, LICENSE_FINDING_REASON_CODE_VALUES,
     LICENSE_FINDING_VALUES, LICENSE_NAME_VALUES, LICENSE_RECOMMENDATION_FILTER_NAME_VALUES,
     RECOMMENDATION_SOURCE_TYPE_VALUES,
+    R_D_S_CURRENT_INSTANCE_PERFORMANCE_RISK_VALUES,
     R_D_S_D_B_RECOMMENDATION_FILTER_NAME_VALUES, R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES,
     R_D_S_INSTANCE_FINDING_VALUES, R_D_S_STORAGE_FINDING_REASON_CODE_VALUES,
     R_D_S_STORAGE_FINDING_VALUES, RESOURCE_TYPE_VALUES, STATUS_VALUES,
@@ -3591,6 +3596,230 @@ pub fn rds_option_performance_risk(projected: &[RDSDBUtilizationMetric]) -> f64 
         peak,
         UTILIZATION_PERCENTAGE_CEILING,
     ))
+}
+
+/// The rank of the one recommendation option this service reports for a database: "The rank
+/// identifier of the DB instance recommendation option" — the analysis records one
+/// configuration it would move the database to, so that option is the first-ranked one.
+const RDS_FIRST_RANK: i32 = 1;
+
+impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
+    /// One analysed database as this service REPORTS it: the `RDSDBRecommendation`
+    /// `GetRDSDatabaseRecommendations` answers for the catalog row `resource` at the endpoint
+    /// of `region`, under the CPU vendor architectures the request asked for.
+    ///
+    /// Every member is computed from that row, from the database configuration the analysis
+    /// recorded with it ([`RdsDatabaseDetail`]) and from the preference records in force for
+    /// the database; nothing here is stored as a recommendation, and a member the analysis
+    /// recorded nothing for is omitted rather than invented.
+    ///
+    /// Stated HERE rather than in the reader because an EXPORT of these recommendations fills
+    /// each column of its export file from the member that column names ([`export`]), so the
+    /// two readings of one catalog row cannot disagree about any of them.
+    pub fn rds_recommendation(
+        &self,
+        resource: &AnalysedResource,
+        region: &str,
+        requested_cpu_vendor_architectures: Option<&[String]>,
+    ) -> RDSDBRecommendation {
+        let resource_arn = resource.arn_in(region);
+        let detail = resource.rds_database.clone().unwrap_or_default();
+        // The catalog records ONE finding per analysed resource; a database is reported with a
+        // finding for its instance AND one for its storage, the side the analysis recorded
+        // nothing against reading `Optimized`: see [`rds_finding_members`].
+        let (instance_finding, storage_finding) = rds_finding_members(&resource.finding);
+        let instance_finding_reason_codes = reason_codes_in(
+            R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES,
+            &resource.finding_reason_codes,
+        );
+        let storage_finding_reason_codes = reason_codes_in(
+            R_D_S_STORAGE_FINDING_REASON_CODE_VALUES,
+            &resource.finding_reason_codes,
+        );
+
+        // "Describes the effective recommendation preferences for Amazon Aurora and RDS
+        // databases": the ONE resolution this service has ([`Self::effective_preferences`]),
+        // applied to this database, so the preferences a recommendation says it was generated
+        // under are the ones `GetEffectiveRecommendationPreferences` reports.
+        let effective = self.effective_preferences_for(
+            &resource_arn,
+            // `ResourceType` and `RecommendationSourceType` name a database identically, so one
+            // constant addresses both the preference records and the catalog rows.
+            SOURCE_TYPE_RDS_DB_INSTANCE,
+            &resource.account_id,
+        );
+
+        // The analysis would move the database only where the configuration it recommends
+        // costs something different from the current one; where it would not, there is no
+        // option to report. The option goes on the side that is not `Optimized`, because that
+        // is the side the analysis found something to change on.
+        let changes_configuration =
+            resource.recommended_monthly_cost != resource.current_monthly_cost;
+        let changes = |finding: Option<&str>| {
+            changes_configuration && finding.is_some_and(|finding| finding != FINDING_OPTIMIZED)
+        };
+        // Whether savings are reported net of Savings Plans and Reserved Instances discounts:
+        // the account activates that by storing the savings-estimation-mode preference —
+        // "specify the `AfterDiscounts` status to activate the preference" — and until it
+        // does, the member that preference activates is reported on no option.
+        let after_discounts = effective.after_discounts();
+        // The one saving this recommendation is for, computed once from the stored costs, so
+        // every savings member of the response reports the same two figures.
+        let (saved_percentage, saved) = rds_savings_figures(resource);
+        // The INSTANCE side of that condition is [`rds_changes_instance_configuration`],
+        // stated there so the metrics `GetRDSDatabaseRecommendationProjectedMetrics` projects
+        // for an option are projected for exactly the rows that report one here.
+        let instance_recommendation_options =
+            rds_changes_instance_configuration(resource).then(|| {
+                // The utilization the observed workload is projected to reach on the
+                // recommended class, and the risk that class then runs: both computed from the
+                // stored observation and the two class names, by the one rule this service
+                // projects a resized database's utilization with
+                // ([`rds_projected_metric_value`]) — so this option and the series
+                // `GetRDSDatabaseRecommendationProjectedMetrics` projects for it cannot
+                // disagree.
+                let projected = rds_projected_utilization_metrics(
+                    &detail.utilization_metrics,
+                    detail.current_db_instance_class.as_deref(),
+                    detail.recommended_db_instance_class.as_deref(),
+                );
+                let performance_risk = rds_option_performance_risk(&projected);
+                vec![RDSDBInstanceRecommendationOption {
+                    db_instance_class: detail.recommended_db_instance_class.clone(),
+                    projected_utilization_metrics: (!projected.is_empty()).then_some(projected),
+                    performance_risk,
+                    rank: RDS_FIRST_RANK,
+                    savings_opportunity: Some(rds_savings_opportunity(saved_percentage, saved)),
+                    // This emulator prices a database from the public prices stored with its
+                    // own analysis and records no Reserved Instances or Savings Plans
+                    // commitment against its spend, so the after-discount figures are those
+                    // before discounts — which is exactly what the reported
+                    // [`SAVINGS_ESTIMATION_SOURCE`] says they came from.
+                    savings_opportunity_after_discounts: after_discounts.then(|| {
+                        RDSInstanceSavingsOpportunityAfterDiscounts {
+                            savings_opportunity_percentage: saved_percentage,
+                            estimated_monthly_savings: Some(RDSInstanceEstimatedMonthlySavings {
+                                currency: Some(CURRENCY_USD.to_string()),
+                                value: saved,
+                            }),
+                        }
+                    }),
+                }]
+            });
+        let storage_recommendation_options = changes(storage_finding).then(|| {
+            vec![RDSDBStorageRecommendationOption {
+                storage_configuration: detail.recommended_storage_configuration.clone(),
+                rank: RDS_FIRST_RANK,
+                savings_opportunity: Some(rds_savings_opportunity(saved_percentage, saved)),
+                // See the instance option above: no discount is recorded against the
+                // database's spend, so a saving after discounts is the saving before them.
+                savings_opportunity_after_discounts: after_discounts.then(|| {
+                    RDSStorageSavingsOpportunityAfterDiscounts {
+                        savings_opportunity_percentage: saved_percentage,
+                        estimated_monthly_savings: Some(RDSStorageEstimatedMonthlySavings {
+                            currency: Some(CURRENCY_USD.to_string()),
+                            value: saved,
+                        }),
+                    }
+                }),
+                // "The estimated monthly volume IOPs cost variation" needs observed IOPs
+                // pricing, which the catalog records none of.
+                estimated_monthly_volume_io_ps_cost_variation: None,
+            }]
+        });
+
+        RDSDBRecommendation {
+            resource_arn: Some(resource_arn.clone()),
+            account_id: Some(resource.account_id.clone()),
+            engine: detail.engine,
+            engine_version: detail.engine_version,
+            promotion_tier: detail.promotion_tier,
+            current_db_instance_class: detail.current_db_instance_class,
+            current_storage_configuration: detail.current_storage_configuration,
+            db_cluster_identifier: detail.db_cluster_identifier,
+            // "Describes if an Amazon Aurora or RDS database is idle": it is exactly when this
+            // service also holds an IDLE recommendation for it, which is the record
+            // `GetIdleRecommendations` reports.
+            idle: Some(
+                if self.idle_recommendations.get(&resource_arn).is_some() {
+                    IDLE_TRUE
+                } else {
+                    IDLE_FALSE
+                }
+                .to_string(),
+            ),
+            instance_finding: instance_finding.map(ToString::to_string),
+            storage_finding: storage_finding.map(ToString::to_string),
+            instance_finding_reason_codes: (!instance_finding_reason_codes.is_empty())
+                .then_some(instance_finding_reason_codes),
+            storage_finding_reason_codes: (!storage_finding_reason_codes.is_empty())
+                .then_some(storage_finding_reason_codes),
+            // `RDSCurrentInstancePerformanceRisk` declares the same four ratings as the
+            // `CurrentPerformanceRisk` the catalog stores; a rating outside them is reported on
+            // neither member.
+            current_instance_performance_risk: R_D_S_CURRENT_INSTANCE_PERFORMANCE_RISK_VALUES
+                .contains(&resource.current_performance_risk.as_str())
+                .then(|| resource.current_performance_risk.clone()),
+            current_storage_estimated_monthly_volume_io_ps_cost_variation: None,
+            instance_recommendation_options,
+            storage_recommendation_options,
+            utilization_metrics: (!detail.utilization_metrics.is_empty())
+                .then_some(detail.utilization_metrics),
+            effective_recommendation_preferences: Some(RDSEffectiveRecommendationPreferences {
+                // `recommendationPreferences` "Describes the recommendation preferences to
+                // return in the response of a … GetRDSDatabaseRecommendations … request", so
+                // the CPU vendor architecture the request asks for is the one in force for its
+                // answer.
+                cpu_vendor_architectures: requested_cpu_vendor_architectures
+                    .filter(|architectures| !architectures.is_empty())
+                    .map(<[String]>::to_vec),
+                enhanced_infrastructure_metrics: effective.enhanced_infrastructure_metrics.clone(),
+                look_back_period: Some(effective.look_back_period.clone()),
+                // Where the money figures came from (`RDSSavingsEstimationModeSource`): every
+                // one of them is computed from the prices stored with this service's own
+                // analysis ([`SAVINGS_ESTIMATION_SOURCE`]), never from an account's own Cost
+                // Explorer or Cost Optimization Hub data, whether or not the
+                // savings-estimation-mode preference is active — what that preference changes
+                // is which savings members an option carries, above.
+                savings_estimation_mode: Some(RDSSavingsEstimationMode {
+                    source: Some(SAVINGS_ESTIMATION_SOURCE.to_string()),
+                }),
+            }),
+            // "The number of days the DB instance utilization metrics were analyzed": the days
+            // the look-back period in force covers.
+            lookback_period_in_days: look_back_period_in_days(&effective.look_back_period),
+            last_refresh_timestamp: detail.last_refresh_timestamp,
+            tags: (!detail.tags.is_empty()).then_some(detail.tags),
+        }
+    }
+}
+
+/// The savings opportunity of adopting the recommendation for one database: what it saves
+/// per month, and that saving "as a percentage of monthly cost"
+/// (`SavingsOpportunity$savingsOpportunityPercentage`) — both from [`rds_savings_figures`], so
+/// a reported saving and the costs it came from cannot disagree.
+fn rds_savings_opportunity(saved_percentage: f64, saved: f64) -> SavingsOpportunity {
+    SavingsOpportunity {
+        savings_opportunity_percentage: saved_percentage,
+        estimated_monthly_savings: Some(EstimatedMonthlySavings {
+            currency: Some(CURRENCY_USD.to_string()),
+            value: saved,
+        }),
+    }
+}
+
+/// What adopting the recommendation for one database saves per month, and that saving as a
+/// percentage of what the database costs today: both computed from the stored current and
+/// recommended monthly costs, so no savings member of a response or of an export row can
+/// disagree with the costs beside it. A recommendation that costs MORE than the current
+/// configuration saves nothing rather than a negative amount
+/// ([`AnalysedResource::monthly_savings`]).
+fn rds_savings_figures(resource: &AnalysedResource) -> (f64, f64) {
+    let savings = resource.monthly_savings();
+    (
+        percentage_of(savings, resource.current_monthly_cost),
+        round_hundredths(savings),
+    )
 }
 
 /// The most data points one projected-metrics response carries, whatever window and

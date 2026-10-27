@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let content = store
             .workloads
             .get(&input.workload_id)
-            .map(|workload| store.reviewed_lens_content(&workload.lenses))
+            .map(|workload| store.reviewed_lens_content(&workload.reviewed_lens_versions()))
             .unwrap_or_default();
 
         // The resource is resolved BEFORE the request's values are judged, so a request
