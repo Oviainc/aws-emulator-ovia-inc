@@ -771,17 +771,15 @@ pub struct TargetInvocation {
 pub const SERVICE_PRINCIPAL: &str = "events.amazonaws.com";
 
 /// The condition EventBridge reports for an event it could not deliver because
-/// the target's `RoleArn` does not let it act as that role.
-///
-/// The value is the condition's own name, not this constant's: EventBridge
-/// reports a role it cannot assume as `NO_PERMISSIONS` — the same vocabulary its
-/// `InvocationsFailedToBeSentToDlq`/delivery-failure reasons use — so the
-/// constant is named after the value it carries.
-pub const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
+/// it could not act as the role the target names at all: the role's trust policy
+/// does not let [`SERVICE_PRINCIPAL`] assume it, so the delivery failed at the
+/// assume-role step, before any target API call was attempted.
+pub const FAILED_TO_ASSUME_ROLE: &str = "FAILED_TO_ASSUME_ROLE";
 
 /// The condition EventBridge reports for an event whose target invocation was
-/// refused for want of a permission on the target itself.
-pub const ACCESS_DENIED: &str = "ACCESS_DENIED";
+/// refused for want of a permission: the role could be assumed, and the policies
+/// in force on it do not allow the API call the target's invocation makes.
+pub const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 
 /// The CloudWatch namespace EventBridge's own metrics live in.
 pub const METRIC_NAMESPACE: &str = "AWS/Events";
@@ -2877,6 +2875,11 @@ pub const MAX_ROLE_DOCUMENTS: usize = 32;
 /// and through the shared readers every service that resolves a caller-supplied
 /// role uses, so no two services answer differently.
 ///
+/// The condition this answers names the STEP that failed, which is what a
+/// dead-letter consumer triages on: a role that cannot be assumed at all is
+/// [`FAILED_TO_ASSUME_ROLE`], and a role that can be assumed but whose policies
+/// withhold the target's API call is [`NO_PERMISSIONS`].
+///
 /// The emulator refuses only what it can SHOW, so each of these is evidence of
 /// nothing and lets the delivery go ahead: a target naming no role at all (SQS,
 /// SNS and Lambda targets are reached through the resource's own policy instead),
@@ -2885,8 +2888,7 @@ pub const MAX_ROLE_DOCUMENTS: usize = 32;
 /// and a role carrying more documents than [`MAX_ROLE_DOCUMENTS`].
 pub fn delivery_refusal(
     role_arn: Option<&str>,
-    action: &str,
-    resource: &str,
+    attempt: &DeliveryAttempt<'_>,
     iam: &IamState,
 ) -> Option<(String, String)> {
     let role_arn = role_arn?;
@@ -2899,7 +2901,7 @@ pub fn delivery_refusal(
     }) == Some(false)
     {
         return Some((
-            NO_PERMISSIONS.to_string(),
+            FAILED_TO_ASSUME_ROLE.to_string(),
             format!(
                 "Event bus failed to assume role {role_arn}: its trust policy does not let \
                  {SERVICE_PRINCIPAL} perform {}.",
@@ -2908,18 +2910,87 @@ pub fn delivery_refusal(
         ));
     }
     let documents = role_documents(role_arn, iam)?;
+    let (action, resource) = (attempt.action, attempt.resource);
     let request = ::service_common::iam_authorization::Request::new(action, resource, &[]);
-    match ::service_common::iam_authorization::identity_decision(&documents, &request) {
-        ::service_common::iam_authorization::Decision::Allowed => None,
-        // Nothing stated is an implicit deny in IAM, and the documents in force
-        // on the role ARE the authority on what it may do: a role whose policies
-        // say nothing about the call is not allowed to make it.
-        ::service_common::iam_authorization::Decision::Denied
-        | ::service_common::iam_authorization::Decision::NotStated => Some((
-            ACCESS_DENIED.to_string(),
-            format!("Role {role_arn} is not authorized to perform {action} on {resource}."),
-        )),
+    let decision = ::service_common::iam_authorization::identity_decision(&documents, &request);
+    if decision == ::service_common::iam_authorization::Decision::Allowed {
+        return None;
     }
+    // Nothing stated is an implicit deny in IAM, and the documents in force on
+    // the role ARE the authority on what it may do: a role whose policies say
+    // nothing about the call is not allowed to make it. Which of the two it was
+    // is what the sentence's closing clause states, because they ask for
+    // different remedies.
+    let reason = if decision == ::service_common::iam_authorization::Decision::Denied {
+        "with an explicit deny in an identity-based policy".to_string()
+    } else {
+        format!("because no identity-based policy allows the {action} action")
+    };
+    Some((
+        NO_PERMISSIONS.to_string(),
+        format!(
+            "User: {} is not authorized to perform: {action} on resource: {resource} {reason}",
+            assumed_role_principal(role_arn, &role.role_name, attempt)
+        ),
+    ))
+}
+
+/// Which invocation the delivery gate is deciding: the API call EventBridge is
+/// about to make, on which resource, for which rule target.
+///
+/// The rule and the target are part of it because the identity the call is made
+/// as is a SESSION of the target's role, and a session is opened per rule target
+/// ([`target_role_session_name`]).
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryAttempt<'a> {
+    /// The rule whose target is being invoked.
+    pub rule: &'a str,
+    /// `Target$Id`: the id of that target within the rule.
+    pub target_id: &'a str,
+    /// The IAM action the invocation performs.
+    pub action: &'a str,
+    /// The resource it performs it on: the target's ARN.
+    pub resource: &'a str,
+}
+
+/// The prefix the session name of a target invocation carries, naming the
+/// service that opened the session.
+const SESSION_NAME_PREFIX: &str = "AWSEvents_";
+
+/// Longest role session name, in characters.
+///
+/// `sts:AssumeRole`'s `RoleSessionName` is bounded at 64 characters, so a session
+/// name assembled from a rule name and a target id — each of which may be that
+/// long on its own — is clipped to what the session can carry.
+const MAX_SESSION_NAME_CHARS: usize = 64;
+
+/// The name of the role SESSION a rule's target is invoked under.
+///
+/// A role is never acted as directly: it is acted as through a session, and the
+/// session a target invocation runs under is named for the service that opened it
+/// and the rule target it was opened for, so a refusal that names the session
+/// principal says which target of which rule was being invoked.
+pub fn target_role_session_name(rule: &str, target_id: &str) -> String {
+    let name = format!("{SESSION_NAME_PREFIX}{rule}_{target_id}");
+    name.chars().take(MAX_SESSION_NAME_CHARS).collect()
+}
+
+/// The principal EventBridge makes a role-governed target's API call as: a
+/// session of the role the target names
+/// (`arn:<partition>:sts::<account>:assumed-role/<role name>/<session name>`),
+/// which is the identity an authorization refusal is about.
+///
+/// The partition and the account are the role's own, read off its ARN through the
+/// ONE ARN parse, so a role of another partition or account is named as that
+/// role's session rather than as this emulator's.
+fn assumed_role_principal(role_arn: &str, role_name: &str, attempt: &DeliveryAttempt<'_>) -> String {
+    let parsed = ::service_common::arn::parse(role_arn);
+    let partition = parsed.map_or("aws", |arn| arn.partition);
+    let account = parsed.map_or("", |arn| arn.account);
+    format!(
+        "arn:{partition}:sts::{account}:assumed-role/{role_name}/{}",
+        target_role_session_name(attempt.rule, attempt.target_id)
+    )
 }
 
 /// The identity-based policy documents in force on the role `role_arn` names: its
