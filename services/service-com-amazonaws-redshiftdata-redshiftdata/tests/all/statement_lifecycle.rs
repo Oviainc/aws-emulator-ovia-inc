@@ -28,7 +28,7 @@ use service_com_amazonaws_redshiftdata_redshiftdata::state::{
 // The harness every suite in this crate drives the emulator through.
 use super::emulator::{
     error_code, flag, id_of, list, number, timestamp, Emulator, ABSENT_ID,
-    COMPLETION_SPAN_LOWER_BOUND_SECONDS, LONGER_THAN_COMPLETION_SPAN, WAIT_SECONDS,
+    LONGER_THAN_A_QUICK_STATEMENT, RUN_TIME_LOWER_BOUND_SECONDS, SLOW_SQL, WAIT_SECONDS,
 };
 
 // ---------------------------------------------------------------------------
@@ -535,13 +535,17 @@ async fn an_inferred_integer_column_widens_to_hold_every_value_it_carries() {
 // The asynchronous lifecycle
 // ---------------------------------------------------------------------------
 
-/// A submitted statement is `SUBMITTED` when `ExecuteStatement` returns and the
-/// clock owes it its terminal status afterwards; nothing about the result is
+/// A submitted statement is `SUBMITTED` while its execution runs and reports its
+/// terminal status once that execution has finished; nothing about the result is
 /// reported before then.
-#[tokio::test]
-async fn a_submitted_statement_reaches_its_terminal_status_on_the_clock() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_submitted_statement_reaches_its_terminal_status_when_its_execution_does() {
     let emulator = Emulator::new();
-    let submitted = emulator
+    // A trivial statement reports its outcome as soon as that outcome exists:
+    // the status follows the ENGINE, so a caller polling right after the submit
+    // reads what the statement really did rather than waiting out a span the
+    // work did not take.
+    let quick = emulator
         .ok(
             "ExecuteStatement",
             &json!({
@@ -549,66 +553,29 @@ async fn a_submitted_statement_reaches_its_terminal_status_on_the_clock() {
                 "Database": "dev",
                 "DbUser": "awsuser",
                 "Sql": "SELECT 1",
-                "StatementName": "boot",
             }),
         )
         .await;
-    let id = id_of(&submitted);
+    let quick_id = id_of(&quick);
     assert_eq!(
-        submitted["Status"], "SUBMITTED",
-        "a statement nobody waited for must still be SUBMITTED: {submitted}"
+        quick["Status"], "SUBMITTED",
+        "a statement nobody waited for is answered as submitted: {quick}"
     );
     assert!(
-        submitted["CreatedAt"].is_number(),
-        "ExecuteStatement must report CreatedAt: {submitted}"
+        quick["CreatedAt"].is_number(),
+        "ExecuteStatement must report CreatedAt: {quick}"
     );
     assert!(
-        is_uuid_shaped(&id),
-        "the minted Id must match the modelled UUID pattern, got {id:?}"
+        is_uuid_shaped(&quick_id),
+        "the minted Id must match the modelled UUID pattern, got {quick_id:?}"
     );
-
-    let pending = emulator.ok("DescribeStatement", &json!({"Id": id})).await;
-    // The span is real time, so on a heavily loaded builder the clock may
-    // already have made the transition due between the two calls. The assertions
-    // below are about what a SUBMITTED statement reports, so they apply only
-    // while it is still SUBMITTED; the FINISHED assertions after the wait are
-    // the ones that must always hold.
-    if pending["Status"] == "SUBMITTED" {
-        assert_eq!(
-            number(&pending, "Duration"),
-            0,
-            "a running statement has not run for any time yet: {pending}"
-        );
-        assert_eq!(
-            number(&pending, "ResultRows"),
-            0,
-            "a running statement reports no rows yet: {pending}"
-        );
-        assert!(
-            pending.get("HasResultSet").is_none(),
-            "whether a running statement has a result set is not known yet: {pending}"
-        );
-
-        let (status, refused) = emulator
-            .call("GetStatementResult", &json!({"Id": id}))
-            .await;
-        assert_eq!(
-            status, 400,
-            "a running statement has no rows to fetch: {refused}"
-        );
-        assert_eq!(
-            error_code(&refused),
-            "ValidationException",
-            "expected ValidationException, got {refused}"
-        );
-    }
-
-    tokio::time::sleep(LONGER_THAN_COMPLETION_SPAN).await;
-
-    let finished = emulator.ok("DescribeStatement", &json!({"Id": id})).await;
+    tokio::time::sleep(LONGER_THAN_A_QUICK_STATEMENT).await;
+    let finished = emulator
+        .ok("DescribeStatement", &json!({"Id": quick_id}))
+        .await;
     assert_eq!(
         finished["Status"], "FINISHED",
-        "the clock owed this statement its terminal status: {finished}"
+        "a statement whose execution finished reports its terminal status: {finished}"
     );
     assert!(
         flag(&finished, "HasResultSet"),
@@ -621,20 +588,80 @@ async fn a_submitted_statement_reaches_its_terminal_status_on_the_clock() {
     );
     assert!(
         timestamp(&finished, "UpdatedAt") - timestamp(&finished, "CreatedAt")
-            >= COMPLETION_SPAN_LOWER_BOUND_SECONDS,
-        "the terminal status was owed a non-zero span after submission: {finished}"
+            >= RUN_TIME_LOWER_BOUND_SECONDS,
+        "UpdatedAt is the instant the execution finished, so it is at or after \
+         CreatedAt: {finished}"
+    );
+    assert!(
+        number(&finished, "Duration") > 0,
+        "a statement that ran reports the time it took: {finished}"
     );
     assert_eq!(
         number(&finished, "RedshiftPid"),
-        number(&submitted, "RedshiftPid"),
+        number(&quick, "RedshiftPid"),
         "the connection's process id must not change between reads: {finished}"
     );
 
-    let fetched = emulator.ok("GetStatementResult", &json!({"Id": id})).await;
+    let fetched = emulator
+        .ok("GetStatementResult", &json!({"Id": quick_id}))
+        .await;
     assert_eq!(
         fetched["Records"],
         json!([[{"longValue": 1}]]),
         "expected the row the statement produced, got {fetched}"
+    );
+
+    // And a statement that takes real time is observable WHILE it runs: it
+    // reports SUBMITTED, nothing about its result, and no rows to fetch.
+    let submitted = emulator
+        .ok(
+            "ExecuteStatement",
+            &json!({
+                "ClusterIdentifier": "my-cluster",
+                "Database": "dev",
+                "DbUser": "awsuser",
+                "Sql": SLOW_SQL,
+                "StatementName": "boot",
+            }),
+        )
+        .await;
+    let id = id_of(&submitted);
+    assert_eq!(
+        submitted["Status"], "SUBMITTED",
+        "a statement nobody waited for must still be SUBMITTED: {submitted}"
+    );
+
+    let pending = emulator.ok("DescribeStatement", &json!({"Id": id})).await;
+    assert_eq!(
+        pending["Status"], "SUBMITTED",
+        "a statement whose execution is still running is SUBMITTED: {pending}"
+    );
+    assert_eq!(
+        number(&pending, "Duration"),
+        0,
+        "a running statement has not run for any time yet: {pending}"
+    );
+    assert_eq!(
+        number(&pending, "ResultRows"),
+        0,
+        "a running statement reports no rows yet: {pending}"
+    );
+    assert!(
+        pending.get("HasResultSet").is_none(),
+        "whether a running statement has a result set is not known yet: {pending}"
+    );
+
+    let (status, refused) = emulator
+        .call("GetStatementResult", &json!({"Id": id}))
+        .await;
+    assert_eq!(
+        status, 400,
+        "a running statement has no rows to fetch: {refused}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ValidationException",
+        "expected ValidationException, got {refused}"
     );
 }
 
@@ -735,11 +762,11 @@ async fn cancelling_a_running_statement_is_visible_to_the_next_read() {
         .await;
     let id = id_of(&submitted);
 
-    // The span the clock owes is real time, so on a heavily loaded builder the
-    // terminal status can fall due before this call arrives. Both outcomes are
-    // the same rule — a RUNNING statement is cancellable, a STOPPED one is not —
-    // so the branch asserts whichever one the clock produced, and never treats
-    // an already-terminal statement as a cancellation.
+    // A trivial statement's execution finishes in about the time this call takes
+    // to arrive, so either outcome is possible and both are the same rule — a
+    // RUNNING statement is cancellable, a STOPPED one is not. The branch asserts
+    // whichever one the engine produced, and never treats an already-terminal
+    // statement as a cancellation.
     let (cancel_status, cancelled) = emulator.call("CancelStatement", &json!({"Id": id})).await;
     if cancel_status == 200 {
         assert_eq!(
@@ -772,7 +799,7 @@ async fn cancelling_a_running_statement_is_visible_to_the_next_read() {
     } else {
         assert_eq!(
             cancel_status, 400,
-            "a statement the clock already finished is refused, not cancelled: {cancelled}"
+            "a statement whose execution already finished is refused, not cancelled: {cancelled}"
         );
         assert_eq!(
             error_code(&cancelled),
@@ -786,7 +813,7 @@ async fn cancelling_a_running_statement_is_visible_to_the_next_read() {
         );
     }
 
-    // Nor is a statement the clock already finished.
+    // Nor is a statement whose execution already finished.
     let finished = emulator.run("SELECT 2").await;
     let (status, refused) = emulator
         .call("CancelStatement", &json!({"Id": finished}))
@@ -1084,12 +1111,12 @@ async fn list_statements_honours_each_filter() {
     }
 }
 
-/// The `Status` filter separates a statement that is still running from one the
-/// clock has finished.
+/// The `Status` filter separates a statement that is still running from one that
+/// has finished.
 ///
-/// Kept apart from the filter table above because the span the clock owes is
-/// real time: what each page is required to hold is therefore stated as an
-/// invariant over the statuses the page itself reports, not as one fixed list.
+/// Kept apart from the filter table above because an execution takes real time:
+/// what each page is required to hold is therefore stated as an invariant over
+/// the statuses the page itself reports, not as one fixed list.
 #[tokio::test]
 async fn the_status_filter_separates_a_running_statement_from_a_finished_one() {
     let emulator = Emulator::new();
@@ -1118,8 +1145,8 @@ async fn the_status_filter_separates_a_running_statement_from_a_finished_one() {
     // Each filtered page must hold exactly the statements carrying that status.
     // The waited-for statement is FINISHED for good, so it must never match
     // SUBMITTED and must always match FINISHED; the statement nobody waited for
-    // is SUBMITTED until the clock makes its terminal status due, so it may
-    // appear under either, and the page itself says which.
+    // is SUBMITTED until its own execution reports, so it may appear under
+    // either, and the page itself says which.
     for filter in ["SUBMITTED", "FINISHED"] {
         let response = emulator
             .ok("ListStatements", &json!({"Status": filter}))

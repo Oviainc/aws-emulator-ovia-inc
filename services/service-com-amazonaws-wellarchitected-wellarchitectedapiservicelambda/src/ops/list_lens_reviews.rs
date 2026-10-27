@@ -229,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The content of the lenses this workload reviews, resolved from the whole lens
         // catalog: a lens review's risk roll-up counts the questions THAT lens asks, which
         // for a custom lens are the ones its imported document defines.
-        let content = store.reviewed_lens_content(&workload.lenses);
+        let content = store.reviewed_lens_content(&workload.reviewed_lens_versions());
         let lens_review_summaries: Vec<LensReviewSummary> = page
             .iter()
             .map(|(_, lens)| lens_review_summary(&store, workload, lens, &region, &content))

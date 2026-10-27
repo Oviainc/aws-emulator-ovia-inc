@@ -491,6 +491,33 @@ pub struct ConfigurationSet {
     /// `TrackingOptionsDoesNotExistException` reports the absence of), and what
     /// `DescribeConfigurationSet` reports as `TrackingOptions`.
     pub custom_redirect_domain: Option<String>,
+    /// When this set's reputation metrics were last reset — a *fresh start* —
+    /// and `None` while sending for the set "has never been disabled and later
+    /// re-enabled", which is what `ReputationOptions$LastFreshStart` documents
+    /// and what `DescribeConfigurationSet` reports.
+    ///
+    /// Written only by [`Self::set_sending_enabled`], which is where that rule
+    /// lives.
+    pub last_fresh_start: Option<SystemTime>,
+}
+
+impl ConfigurationSet {
+    /// Enable or disable email sending for this set, as of `at`.
+    ///
+    /// Re-enabling a set whose sending was disabled resets the set's reputation
+    /// metrics — `ReputationOptions$LastFreshStart`: "When you disable email
+    /// sending for a configuration set [...] and later re-enable it, the
+    /// reputation metrics for the configuration set (but not for the entire
+    /// Amazon SES account) are reset." So the fresh start is stamped on the
+    /// disabled-to-enabled transition only: a call that sets the state the set
+    /// already holds is idempotent and resets nothing, and disabling never
+    /// stamps one.
+    pub fn set_sending_enabled(&mut self, enabled: bool, at: SystemTime) {
+        if enabled && !self.sending_enabled {
+            self.last_fresh_start = Some(at);
+        }
+        self.sending_enabled = enabled;
+    }
 }
 
 /// A receipt rule set: a named, ordered collection of receipt rules.
@@ -909,6 +936,9 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     // And it carries no `TrackingOptions` sub-resource:
                     // `CreateConfigurationSetTrackingOptions` is what adds one.
                     custom_redirect_domain: None,
+                    // A set whose sending has never been disabled and later
+                    // re-enabled has had no fresh start.
+                    last_fresh_start: None,
                 }),
         )
     }

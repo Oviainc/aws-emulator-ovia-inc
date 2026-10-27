@@ -6,7 +6,7 @@
 //! aborted, or finished without a result set — is refused as a missing result
 //! (404), and a batch's own `Id` is refused as well: a batch's results live on
 //! the `:<n>` ids of the statements it submitted. A reporting operation, so the
-//! only thing it writes is the status transition the clock has already made due.
+//! only thing it writes is the outcome a statement's execution already reported.
 //!
 //! ## Shape of an operation
 //!

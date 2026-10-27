@@ -25,7 +25,12 @@
 //!   `RecommendationOptions*` field names ONE option). Each cell is that field's value for
 //!   that recommendation, computed from the stored analysis the same way the recommendation
 //!   READER computes it, so an exported row and a `Get*Recommendations` response cannot
-//!   disagree. A field the stored analysis records no value for is an empty cell.
+//!   disagree. A field the stored analysis records no value for is an empty cell, and so is one
+//!   that names no member of the surface's recommendation at all. Where a surface's
+//!   recommendation carries members the shared findings-catalog row does not — the Aurora and
+//!   RDS database surface, whose catalog row records the database's own configuration — the row
+//!   is built from the recommendation the reader reports rather than from that catalog row, so
+//!   the one rule serves both.
 //! * the metadata file — what the export job itself was: its id, the resource type and
 //!   account(s) it covers, the file format and columns of the export file, how many rows it
 //!   holds and where both objects were written.
@@ -59,18 +64,18 @@ use std::sync::Arc;
 use ::service_com_amazonaws_s3_amazons3 as s3;
 
 use super::{
-    look_back_period_in_days, parse_resource_arn, percentage_of, rds_finding_members,
-    reason_codes_in, round_hundredths, AnalysedResource, AnalyzedAutoScalingGroup,
+    look_back_period_in_days, parse_resource_arn, percentage_of, round_hundredths,
+    AnalysedResource, AnalyzedAutoScalingGroup,
     ComAmazonawsComputeoptimizerComputeoptimizerserviceState, EffectivePreferences, ExportJob,
-    GroupConfiguration, IdleResourceAnalysis, ObservedLicensedInstance, CURRENCY_USD, IDLE_FALSE,
-    IDLE_TRUE, RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_EBS_VOLUME,
-    RESOURCE_TYPE_EC2_INSTANCE, RESOURCE_TYPE_ECS_SERVICE, RESOURCE_TYPE_IDLE,
-    RESOURCE_TYPE_LAMBDA_FUNCTION, RESOURCE_TYPE_LICENSE, RESOURCE_TYPE_RDS_DB_INSTANCE,
-    SAVINGS_ESTIMATION_SOURCE,
+    GroupConfiguration, IdleResourceAnalysis, ObservedLicensedInstance, CURRENCY_USD,
+    RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_EBS_VOLUME, RESOURCE_TYPE_EC2_INSTANCE,
+    RESOURCE_TYPE_ECS_SERVICE, RESOURCE_TYPE_IDLE, RESOURCE_TYPE_LAMBDA_FUNCTION,
+    RESOURCE_TYPE_LICENSE, RESOURCE_TYPE_RDS_DB_INSTANCE, SAVINGS_ESTIMATION_SOURCE,
 };
 use crate::ops::types::{
+    DBStorageConfiguration, RDSDBRecommendation, RDSDBUtilizationMetric, SavingsOpportunity,
     EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES, EXPORTABLE_IDLE_FIELD_VALUES,
-    R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES, R_D_S_STORAGE_FINDING_REASON_CODE_VALUES,
+    EXPORTABLE_R_D_S_D_B_FIELD_VALUES,
 };
 
 /// The one `FileFormat` the model declares: "The only export file format currently supported
@@ -843,6 +848,9 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             RESOURCE_TYPE_AUTO_SCALING_GROUP => self.auto_scaling_group_export_rows(last_refresh),
             RESOURCE_TYPE_IDLE => self.idle_export_rows(&plan.region, last_refresh),
             RESOURCE_TYPE_LICENSE => self.license_export_rows(&plan.region, last_refresh),
+            RESOURCE_TYPE_RDS_DB_INSTANCE => {
+                self.rds_database_export_rows(&plan.region, last_refresh)
+            }
             resource_type => {
                 self.analysed_resource_export_rows(resource_type, &plan.region, last_refresh)
             }
@@ -913,18 +921,45 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                         let arn = resource.arn_in(region);
                         let preferences =
                             self.effective_preferences_for(&arn, resource_type, account_id);
-                        // "Describes if an Amazon Aurora or RDS database is idle": it is
-                        // exactly when this service also holds an IDLE recommendation for it,
-                        // which is what the database reader reports from.
-                        let idle = self.idle_recommendations.get(&arn).is_some();
                         analysed_resource_row(
                             resource,
                             resource_type,
                             &arn,
                             &preferences,
-                            idle,
                             last_refresh,
                         )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The export rows of the Amazon Aurora and RDS database analysis: one per analysed
+    /// database, carrying the members `GetRDSDatabaseRecommendations` reports for it
+    /// ([`rds_database_row`]).
+    ///
+    /// A database's recommendation carries the engine, the DB instance class, the storage
+    /// configuration, the utilization observed on it and the instance and storage options the
+    /// analysis would move it to — none of which is a column of the findings-catalog row every
+    /// other findings reader shares, so this surface builds its rows from the recommendation
+    /// itself rather than from that row.
+    fn rds_database_export_rows(&self, region: &str, last_refresh: Option<f64>) -> Vec<ExportRow> {
+        let account_id = ::engine::emulator_account_id();
+        let by_type = self.analysed_resources_by_type(account_id);
+        by_type
+            .get(RESOURCE_TYPE_RDS_DB_INSTANCE)
+            .map(|resources| {
+                resources
+                    .iter()
+                    .map(|resource| {
+                        // `cpuVendorArchitectures` is what the reader reports when a REQUEST
+                        // asks for an architecture, and the shared export plan does not carry
+                        // the export request's `recommendationPreferences`, so no architecture
+                        // is stated here and that column is empty — the file states the
+                        // preferences the analysis resolved for the database, which the
+                        // recommendation's other preference members carry.
+                        let recommendation = self.rds_recommendation(resource, region, None);
+                        rds_database_row(&recommendation, last_refresh)
                     })
                     .collect()
             })
@@ -1142,94 +1177,45 @@ fn put_configuration(row: &mut ExportRow, prefix: &str, configuration: &GroupCon
 ///
 /// The columns specific to a resource type's own configuration are left empty here: they are
 /// members of that type's recommendation rather than of the catalog row every findings reader
-/// shares.
+/// shares. The database surface, whose catalog row carries the configuration the analysis
+/// recorded for it, reports those members from the recommendation itself
+/// ([`rds_database_row`]).
 fn analysed_resource_row(
     resource: &AnalysedResource,
     resource_type: &str,
     arn: &str,
     preferences: &EffectivePreferences,
-    idle: bool,
     last_refresh: Option<f64>,
 ) -> ExportRow {
     let mut row = ExportRow::new();
     put(&mut row, "AccountId", resource.account_id.clone());
     put(&mut row, arn_field_of(resource_type), arn);
-    // A database's analysis reports a finding for its INSTANCE and one for its STORAGE
-    // rather than the one `Finding` every other resource type reports, and each side's reason
-    // codes are the stored codes that side's own vocabulary declares.
-    if resource_type == RESOURCE_TYPE_RDS_DB_INSTANCE {
-        let (instance, storage) = rds_finding_members(&resource.finding);
-        put(&mut row, "InstanceFinding", instance.unwrap_or_default());
-        put(&mut row, "StorageFinding", storage.unwrap_or_default());
-        put_list(
-            &mut row,
-            "InstanceFindingReasonCodes",
-            &reason_codes_in(
-                R_D_S_INSTANCE_FINDING_REASON_CODE_VALUES,
-                &resource.finding_reason_codes,
-            ),
-        );
-        put_list(
-            &mut row,
-            "StorageFindingReasonCodes",
-            &reason_codes_in(
-                R_D_S_STORAGE_FINDING_REASON_CODE_VALUES,
-                &resource.finding_reason_codes,
-            ),
-        );
-        put(
-            &mut row,
-            "Idle",
-            if idle { IDLE_TRUE } else { IDLE_FALSE },
-        );
-        put(
-            &mut row,
-            "CurrentInstancePerformanceRisk",
-            resource.current_performance_risk.clone(),
-        );
-        put_number(
-            &mut row,
-            "InstanceRecommendationOptionsSavingsOpportunityPercentage",
-            percentage_of(resource.monthly_savings(), resource.current_monthly_cost),
-        );
-        put_number(
-            &mut row,
-            "InstanceRecommendationOptionsEstimatedMonthlySavingsValue",
-            resource.monthly_savings(),
-        );
-        put(
-            &mut row,
-            "InstanceRecommendationOptionsEstimatedMonthlySavingsCurrency",
-            CURRENCY_USD,
-        );
-    } else {
-        put(&mut row, "Finding", resource.finding.clone());
-        put_list(
-            &mut row,
-            "FindingReasonCodes",
-            &resource.finding_reason_codes,
-        );
-        put(
-            &mut row,
-            "CurrentPerformanceRisk",
-            resource.current_performance_risk.clone(),
-        );
-        put_number(
-            &mut row,
-            "RecommendationOptionsSavingsOpportunityPercentage",
-            percentage_of(resource.monthly_savings(), resource.current_monthly_cost),
-        );
-        put_number(
-            &mut row,
-            "RecommendationOptionsEstimatedMonthlySavingsValue",
-            resource.monthly_savings(),
-        );
-        put(
-            &mut row,
-            "RecommendationOptionsEstimatedMonthlySavingsCurrency",
-            CURRENCY_USD,
-        );
-    }
+    put(&mut row, "Finding", resource.finding.clone());
+    put_list(
+        &mut row,
+        "FindingReasonCodes",
+        &resource.finding_reason_codes,
+    );
+    put(
+        &mut row,
+        "CurrentPerformanceRisk",
+        resource.current_performance_risk.clone(),
+    );
+    put_number(
+        &mut row,
+        "RecommendationOptionsSavingsOpportunityPercentage",
+        percentage_of(resource.monthly_savings(), resource.current_monthly_cost),
+    );
+    put_number(
+        &mut row,
+        "RecommendationOptionsEstimatedMonthlySavingsValue",
+        resource.monthly_savings(),
+    );
+    put(
+        &mut row,
+        "RecommendationOptionsEstimatedMonthlySavingsCurrency",
+        CURRENCY_USD,
+    );
     put_list(
         &mut row,
         "InferredWorkloadTypes",
@@ -1240,6 +1226,354 @@ fn analysed_resource_row(
         put(&mut row, "LastRefreshTimestamp", timestamp(at));
     }
     row
+}
+
+/// The `ExportableRDSDBField` prefix the columns of ONE recommendation option carry: the DB
+/// instance option's and the DB storage option's, each named for the member of
+/// `RDSDBRecommendation` that option is reported in.
+const INSTANCE_OPTION: &str = "InstanceRecommendationOptions";
+/// See [`INSTANCE_OPTION`].
+const STORAGE_OPTION: &str = "StorageRecommendationOptions";
+
+/// One Amazon Aurora or RDS database recommendation as an export row: the value of every
+/// `ExportableRDSDBField` the recommendation carries, taken from the member that field names.
+///
+/// `recommendation` is the one `GetRDSDatabaseRecommendations` reports for the same catalog
+/// row, so an exported row and that reader's response cannot disagree about any column.
+///
+/// The fields that name no member of an `RDSDBRecommendation` are left empty, because the
+/// analysis records no value for them: whether the database is a Multi-AZ deployment or the
+/// writer of its cluster, and the per-hour and per-month PRICES of the current and recommended
+/// configurations together with the cluster-level cost roll-ups — this analysis records a
+/// database's cost per month as a whole, and the money the recommendation reports is what
+/// adopting it saves.
+fn rds_database_row(recommendation: &RDSDBRecommendation, last_refresh: Option<f64>) -> ExportRow {
+    let text = |member: &Option<String>| member.clone().unwrap_or_default();
+    let mut row = ExportRow::new();
+    put(&mut row, "AccountId", text(&recommendation.account_id));
+    put(&mut row, "ResourceArn", text(&recommendation.resource_arn));
+    put(&mut row, "Engine", text(&recommendation.engine));
+    put(
+        &mut row,
+        "EngineVersion",
+        text(&recommendation.engine_version),
+    );
+    put(
+        &mut row,
+        "DBClusterIdentifier",
+        text(&recommendation.db_cluster_identifier),
+    );
+    if let Some(tier) = recommendation.promotion_tier {
+        put(&mut row, "PromotionTier", tier.to_string());
+    }
+    put(&mut row, "Idle", text(&recommendation.idle));
+    put(
+        &mut row,
+        "CurrentDBInstanceClass",
+        text(&recommendation.current_db_instance_class),
+    );
+    if let Some(configuration) = &recommendation.current_storage_configuration {
+        put_storage_configuration(&mut row, "CurrentStorageConfiguration", configuration);
+    }
+    put(
+        &mut row,
+        "CurrentStorageEstimatedMonthlyVolumeIOPsCostVariation",
+        text(
+            &recommendation.current_storage_estimated_monthly_volume_io_ps_cost_variation,
+        ),
+    );
+    put(
+        &mut row,
+        "CurrentInstancePerformanceRisk",
+        text(&recommendation.current_instance_performance_risk),
+    );
+    put(
+        &mut row,
+        "InstanceFinding",
+        text(&recommendation.instance_finding),
+    );
+    put(
+        &mut row,
+        "StorageFinding",
+        text(&recommendation.storage_finding),
+    );
+    put_list(
+        &mut row,
+        "InstanceFindingReasonCodes",
+        recommendation
+            .instance_finding_reason_codes
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    put_list(
+        &mut row,
+        "StorageFindingReasonCodes",
+        recommendation
+            .storage_finding_reason_codes
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    put_utilization_metrics(
+        &mut row,
+        "UtilizationMetrics",
+        recommendation.utilization_metrics.as_deref().unwrap_or_default(),
+    );
+
+    // The DB instance option: the class the analysis would move the database to, the
+    // utilization projected onto it, the risk it then runs and what adopting it saves. Each
+    // `*RecommendationOptions*` field names ONE option, and this analysis reports one option
+    // per side, so both sides' columns go in the same row.
+    if let Some(option) = recommendation
+        .instance_recommendation_options
+        .iter()
+        .flatten()
+        .next()
+    {
+        put(
+            &mut row,
+            "InstanceRecommendationOptionsDBInstanceClass",
+            text(&option.db_instance_class),
+        );
+        put(
+            &mut row,
+            "InstanceRecommendationOptionsRank",
+            option.rank.to_string(),
+        );
+        put_number(
+            &mut row,
+            "InstanceRecommendationOptionsPerformanceRisk",
+            option.performance_risk,
+        );
+        put_utilization_metrics(
+            &mut row,
+            "InstanceRecommendationOptionsProjectedUtilizationMetrics",
+            option
+                .projected_utilization_metrics
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        put_savings(&mut row, INSTANCE_OPTION, option.savings_opportunity.as_ref());
+        if let Some(after) = &option.savings_opportunity_after_discounts {
+            put_savings_after_discounts(
+                &mut row,
+                INSTANCE_OPTION,
+                after.savings_opportunity_percentage,
+                after
+                    .estimated_monthly_savings
+                    .as_ref()
+                    .map(|savings| (savings.currency.clone().unwrap_or_default(), savings.value)),
+            );
+        }
+    }
+
+    // The DB storage option: the storage configuration the analysis would move the database
+    // to, and what adopting it saves.
+    if let Some(option) = recommendation
+        .storage_recommendation_options
+        .iter()
+        .flatten()
+        .next()
+    {
+        if let Some(configuration) = &option.storage_configuration {
+            put_storage_configuration(&mut row, STORAGE_OPTION, configuration);
+        }
+        put(
+            &mut row,
+            "StorageRecommendationOptionsRank",
+            option.rank.to_string(),
+        );
+        put(
+            &mut row,
+            "StorageRecommendationOptionsEstimatedMonthlyVolumeIOPsCostVariation",
+            text(&option.estimated_monthly_volume_io_ps_cost_variation),
+        );
+        put_savings(&mut row, STORAGE_OPTION, option.savings_opportunity.as_ref());
+        if let Some(after) = &option.savings_opportunity_after_discounts {
+            put_savings_after_discounts(
+                &mut row,
+                STORAGE_OPTION,
+                after.savings_opportunity_percentage,
+                after
+                    .estimated_monthly_savings
+                    .as_ref()
+                    .map(|savings| (savings.currency.clone().unwrap_or_default(), savings.value)),
+            );
+        }
+    }
+
+    // The preferences the recommendation was generated under, as the recommendation itself
+    // reports them. The database field set declares a column for each member an
+    // `RDSEffectiveRecommendationPreferences` carries.
+    if let Some(preferences) = &recommendation.effective_recommendation_preferences {
+        put_list(
+            &mut row,
+            "EffectiveRecommendationPreferencesCpuVendorArchitectures",
+            preferences
+                .cpu_vendor_architectures
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        put(
+            &mut row,
+            "EffectiveRecommendationPreferencesEnhancedInfrastructureMetrics",
+            text(&preferences.enhanced_infrastructure_metrics),
+        );
+        put(
+            &mut row,
+            "EffectiveRecommendationPreferencesLookBackPeriod",
+            text(&preferences.look_back_period),
+        );
+        put(
+            &mut row,
+            "EffectiveRecommendationPreferencesSavingsEstimationMode",
+            preferences
+                .savings_estimation_mode
+                .as_ref()
+                .map(|mode| text(&mode.source))
+                .unwrap_or_default(),
+        );
+    }
+    put_number(
+        &mut row,
+        "LookbackPeriodInDays",
+        recommendation.lookback_period_in_days,
+    );
+    let tags: Vec<String> = recommendation
+        .tags
+        .iter()
+        .flatten()
+        .map(|tag| {
+            format!(
+                "{}={}",
+                tag.key.clone().unwrap_or_default(),
+                tag.value.clone().unwrap_or_default()
+            )
+        })
+        .collect();
+    put_list(&mut row, "Tags", &tags);
+    // "The timestamp of when the DB instance recommendation was last generated": the instant
+    // the recommendation reports where the analysis recorded one, and otherwise the instant
+    // this account's analysis was last refreshed, which is what every other export file of
+    // this service states.
+    let refreshed = recommendation
+        .last_refresh_timestamp
+        .map(|at| at.as_secs_f64())
+        .or(last_refresh);
+    if let Some(at) = refreshed {
+        put(&mut row, "LastRefreshTimestamp", timestamp(at));
+    }
+    row
+}
+
+/// The columns one `DBStorageConfiguration` fills, under the `prefix` the field set names that
+/// configuration with (`CurrentStorageConfiguration` for the database's own,
+/// `StorageRecommendationOptions` for the one its storage option would move it to).
+fn put_storage_configuration(
+    row: &mut ExportRow,
+    prefix: &str,
+    configuration: &DBStorageConfiguration,
+) {
+    put(
+        row,
+        &format!("{prefix}StorageType"),
+        configuration.storage_type.clone().unwrap_or_default(),
+    );
+    put(
+        row,
+        &format!("{prefix}AllocatedStorage"),
+        configuration.allocated_storage.to_string(),
+    );
+    if let Some(iops) = configuration.iops {
+        put(row, &format!("{prefix}IOPS"), iops.to_string());
+    }
+    if let Some(maximum) = configuration.max_allocated_storage {
+        put(
+            row,
+            &format!("{prefix}MaxAllocatedStorage"),
+            maximum.to_string(),
+        );
+    }
+    if let Some(throughput) = configuration.storage_throughput {
+        put(
+            row,
+            &format!("{prefix}StorageThroughput"),
+            throughput.to_string(),
+        );
+    }
+}
+
+/// The savings columns of one recommendation option: the saving as a percentage of what the
+/// resource costs today, and the amount and currency of that saving.
+fn put_savings(row: &mut ExportRow, prefix: &str, opportunity: Option<&SavingsOpportunity>) {
+    let Some(opportunity) = opportunity else {
+        return;
+    };
+    put_number(
+        row,
+        &format!("{prefix}SavingsOpportunityPercentage"),
+        opportunity.savings_opportunity_percentage,
+    );
+    if let Some(savings) = &opportunity.estimated_monthly_savings {
+        put(
+            row,
+            &format!("{prefix}EstimatedMonthlySavingsCurrency"),
+            savings.currency.clone().unwrap_or_default(),
+        );
+        put_number(
+            row,
+            &format!("{prefix}EstimatedMonthlySavingsValue"),
+            savings.value,
+        );
+    }
+}
+
+/// The AFTER-DISCOUNTS savings columns of one recommendation option, which each option shape
+/// carries under its own type but reports the same three figures in: the percentage, and the
+/// currency and amount of the estimated monthly saving.
+fn put_savings_after_discounts(
+    row: &mut ExportRow,
+    prefix: &str,
+    percentage: f64,
+    estimated: Option<(String, f64)>,
+) {
+    put_number(
+        row,
+        &format!("{prefix}SavingsOpportunityAfterDiscountsPercentage"),
+        percentage,
+    );
+    if let Some((currency, value)) = estimated {
+        put(
+            row,
+            &format!("{prefix}EstimatedMonthlySavingsCurrencyAfterDiscounts"),
+            currency,
+        );
+        put_number(
+            row,
+            &format!("{prefix}EstimatedMonthlySavingsValueAfterDiscounts"),
+            value,
+        );
+    }
+}
+
+/// The utilization columns of a database's observed or projected metrics: each metric under
+/// the field that names it and the statistic it was measured with ([`utilization_field`]).
+fn put_utilization_metrics(row: &mut ExportRow, prefix: &str, metrics: &[RDSDBUtilizationMetric]) {
+    for metric in metrics {
+        let (Some(name), Some(statistic)) = (metric.name.as_deref(), metric.statistic.as_deref())
+        else {
+            continue;
+        };
+        put_number(
+            row,
+            &utilization_field(
+                EXPORTABLE_R_D_S_D_B_FIELD_VALUES,
+                prefix,
+                name,
+                statistic,
+            ),
+            metric.value,
+        );
+    }
 }
 
 /// One commercial software license recommendation as an export row: the members

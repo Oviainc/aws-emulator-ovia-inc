@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The content of the lenses this template applies, resolved from the whole
                 // lens catalog, so a review of a custom lens reports the pillars and
                 // question roll-up its imported document defines.
-                &store.reviewed_lens_content(&template.lenses),
+                &store.reviewed_lens_content(&template.reviewed_lens_versions()),
             )),
         })
     }

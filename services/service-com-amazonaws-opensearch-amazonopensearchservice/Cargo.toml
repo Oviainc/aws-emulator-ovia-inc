@@ -27,6 +27,16 @@ tracing = { workspace = true }
 # UUID. The `v5` feature derives the GUID of a seeded Reserved Instance offering
 # from what the offering IS, so the catalog reports the same ids on every call.
 uuid = { version = "1", features = ["v4", "v5"] }
+# The STS session store, so the principal an index request is authorized as is the
+# identity `sts:GetCallerIdentity` answers for the access key it signed with.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The IAM store, which holds the identity policies in force on that principal — the
+# documents an index request is authorized against.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# `iam_authorization`: the shared evaluation of those documents against
+# (action, resource), so this service and every other one handed the same document
+# decide alike. Declared as a path dependency, the way the other consumers do.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

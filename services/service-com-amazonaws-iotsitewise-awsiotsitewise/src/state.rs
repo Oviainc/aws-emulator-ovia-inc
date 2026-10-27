@@ -7004,6 +7004,21 @@ impl ComputationModelRecord {
         self.version.to_string()
     }
 
+    /// Record that a mutating call — an update of this model's definition —
+    /// landed at `now`: the definition now stored counts one write more, so it
+    /// carries the next version, and the model reports `UPDATING` until the
+    /// transition that call owes falls due.
+    ///
+    /// The due instant is STORED, never slept on, exactly as
+    /// [`AssetRecord::begin_update`] does it for an asset, so the state a later
+    /// read reports stays derived from the clock.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.last_update_date = now;
+        self.version += 1;
+        self.settling_state = STATE_UPDATING.to_string();
+        self.active_at = now + ACTIVATION_DELAY;
+    }
+
     /// Whether this model answers a read scoped to the version the
     /// `ComputationModelVersionFilter` `filter` names (`LATEST | ACTIVE | <n>`),
     /// as of `now`.

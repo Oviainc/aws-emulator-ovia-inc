@@ -25,6 +25,8 @@ mod account_vdm_attributes;
 mod configuration_set_event_destinations;
 #[path = "all/configuration_set_event_publication_surface.rs"]
 mod configuration_set_event_publication_surface;
+#[path = "all/configuration_set_message_security.rs"]
+mod configuration_set_message_security;
 #[path = "all/configuration_set_sns_event_destinations.rs"]
 mod configuration_set_sns_event_destinations;
 #[path = "all/configuration_sets.rs"]

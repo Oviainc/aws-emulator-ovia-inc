@@ -238,10 +238,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // about another quote, which is how every idempotent create in this
         // crate treats it (`PaymentRequest::matches_send`,
         // `BillingAdjustmentRequest::matches_entry`).
-        let replayed = input
+        //
+        // The token is looked up and stored under
+        // `state::idempotency_key(Self::NAME, …)`: a `clientToken` is unique
+        // within the create that minted it rather than across the service, so
+        // the operation's own name is part of every key the shared map holds and
+        // no other create's token can name this one's quote.
+        let token = input
             .client_token
             .as_deref()
-            .and_then(|token| store.idempotency.get(token).cloned())
+            .map(|token| crate::state::idempotency_key(Self::NAME, token));
+        let replayed = token
+            .as_deref()
+            .and_then(|key| store.idempotency.get(key).cloned())
             .and_then(|id| store.agreement_requests.get(&id))
             .map(|request| {
                 (
@@ -331,14 +340,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             agreement_proposal_identifier: input.agreement_proposal_identifier,
             tax_configuration: input.tax_configuration,
             charge_summary: charge_summary.clone(),
-            client_token: input.client_token.clone(),
+            client_token: input.client_token,
             // Nothing is accepted until `AcceptAgreementRequest` runs.
             accepted_agreement_id: None,
             created_at: now,
         };
         store.agreement_requests.insert(id.clone(), request);
-        if let Some(token) = input.client_token {
-            store.idempotency.insert(token, id.clone());
+        if let Some(key) = token {
+            store.idempotency.insert(key, id.clone());
         }
         crate::state::audit("CreateAgreementRequest", "created", &id, ctx.parts());
 

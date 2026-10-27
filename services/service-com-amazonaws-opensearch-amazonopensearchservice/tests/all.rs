@@ -49,6 +49,8 @@ mod domain_package_listing_cursor;
 mod engine_version_resolution;
 #[path = "all/inbound_connections.rs"]
 mod inbound_connections;
+#[path = "all/index_authorization.rs"]
+mod index_authorization;
 #[path = "all/index_deletion.rs"]
 mod index_deletion;
 #[path = "all/index_registry.rs"]

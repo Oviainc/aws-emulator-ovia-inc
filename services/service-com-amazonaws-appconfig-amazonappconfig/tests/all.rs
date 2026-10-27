@@ -23,6 +23,8 @@ mod aws_authored_extensions;
 mod configuration_profile_deletion_protection;
 #[path = "all/configuration_profile_type.rs"]
 mod configuration_profile_type;
+#[path = "all/configuration_profile_validators.rs"]
+mod configuration_profile_validators;
 #[path = "all/control_plane_fidelity.rs"]
 mod control_plane_fidelity;
 #[path = "all/create_deployment_strategy.rs"]

@@ -208,7 +208,8 @@ use crate::ops::types::{
     TableVersion,
     TransformEncryption, TransformFilterCriteria, TransformParameters, TransformSortCriteria,
     Trigger, TriggerNodeDetails,
-    UpdateClassifierInput, UpdateCrawlerInput, Workflow, WorkflowGraph, WorkflowRun,
+    UpdateClassifierInput, UpdateCrawlerInput, UpdateMLTransformInput, Workflow, WorkflowGraph,
+    WorkflowRun,
     WorkflowRunStatistics, XMLClassifier,
 };
 
@@ -4100,7 +4101,11 @@ impl MlTransformEntry {
         schema: Vec<SchemaColumn>,
         now: SystemTime,
     ) -> Self {
-        let (worker_type, number_of_workers, max_capacity) = ml_transform_capacity(input);
+        let (worker_type, number_of_workers, max_capacity) = ml_transform_capacity(
+            input.worker_type.as_deref(),
+            input.number_of_workers,
+            input.max_capacity,
+        );
         Self {
             transform_id,
             name: input.name.clone(),
@@ -4128,6 +4133,60 @@ impl MlTransformEntry {
             transform_encryption: input.transform_encryption.clone(),
             tags: input.tags.clone().unwrap_or_default(),
         }
+    }
+
+    /// Apply an `UpdateMLTransform` request to this stored transform, member by member,
+    /// as served at `now`.
+    ///
+    /// Every member the request CARRIES replaces the stored one and every member it OMITS
+    /// is preserved: the request is a patch over the definition the create registered, not
+    /// a replacement for it, which is why "Call this operation to tune the algorithm
+    /// parameters" (`UpdateMLTransform`) names no required member beyond the `TransformId`
+    /// that addresses the transform. The three capacity members are resolved TOGETHER,
+    /// through the one rule the create uses ([`ml_transform_capacity`]), from the ones the
+    /// request names falling back on the ones already stored — so a request that moves the
+    /// worker configuration moves the DPU figure with it, and one that names no capacity
+    /// member at all leaves the stored figure where it was.
+    ///
+    /// The members `UpdateMLTransformRequest` has NO member for are not this request's to
+    /// change: the minted `TransformId`, the creation instant, the status, the label count,
+    /// the input tables and the schema they decide, the encryption settings and the tags
+    /// all stay as they are. `LastModifiedOn` becomes `now`, since it is "the last point in
+    /// time when this machine learning transform was modified" (`MLTransform`).
+    pub fn apply_update(&mut self, input: &UpdateMLTransformInput, now: SystemTime) {
+        if let Some(name) = input.name.as_ref() {
+            self.name = name.clone();
+        }
+        if let Some(description) = input.description.as_ref() {
+            self.description = Some(description.clone());
+        }
+        if let Some(parameters) = input.parameters.as_ref() {
+            self.parameters = parameters.clone();
+        }
+        if let Some(role) = input.role.as_ref() {
+            self.role = role.clone();
+        }
+        if let Some(glue_version) = input.glue_version.as_ref() {
+            self.glue_version = glue_version.clone();
+        }
+        if let Some(timeout) = input.timeout {
+            self.timeout = timeout;
+        }
+        if let Some(max_retries) = input.max_retries {
+            self.max_retries = Some(max_retries);
+        }
+        let (worker_type, number_of_workers, max_capacity) = ml_transform_capacity(
+            input
+                .worker_type
+                .as_deref()
+                .or(self.worker_type.as_deref()),
+            input.number_of_workers.or(self.number_of_workers),
+            input.max_capacity.or(self.max_capacity),
+        );
+        self.worker_type = worker_type;
+        self.number_of_workers = number_of_workers;
+        self.max_capacity = max_capacity;
+        self.last_modified_on = now;
     }
 
     /// Rebuild the modelled `MLTransform` shape from what is stored, so a listing reports
@@ -4251,7 +4310,8 @@ impl MlTransformEntry {
 }
 
 /// The capacity a machine learning transform runs its task runs with, as `(worker_type,
-/// number_of_workers, max_capacity)`.
+/// number_of_workers, max_capacity)`, resolved from the three capacity members a request
+/// asks for.
 ///
 /// `MaxCapacity` and the worker configuration are two spellings of one quantity, and the
 /// worker configuration wins where the request names one: "When the `WorkerType` field is
@@ -4262,27 +4322,56 @@ impl MlTransformEntry {
 /// convert leaves the figure the REQUEST named — nothing the client sent is discarded, and
 /// nothing is derived where the service documents no conversion. Where the request names
 /// no capacity at all the documented default applies ([`DEFAULT_ML_TRANSFORM_DPUS`]).
+///
+/// Taken as three values rather than as one request so that the create, which resolves
+/// them from the request alone, and an UPDATE, which resolves them from the members the
+/// request names falling back on the ones the transform already carries
+/// ([`MlTransformEntry::apply_update`]), cannot disagree about one capacity. Resolving a
+/// resolved triple again answers it unchanged, so a write that names no capacity member
+/// leaves the stored one where it was.
 pub fn ml_transform_capacity(
-    input: &CreateMLTransformInput,
+    worker_type: Option<&str>,
+    number_of_workers: Option<i32>,
+    max_capacity: Option<f64>,
 ) -> (Option<String>, Option<i32>, Option<f64>) {
-    match (input.worker_type.as_deref(), input.number_of_workers) {
+    match (worker_type, number_of_workers) {
         (Some(worker_type), workers) => (
             Some(worker_type.to_string()),
             workers,
             dpu_per_worker(worker_type)
                 .zip(workers)
                 .map(|(per_worker, workers)| per_worker * f64::from(workers))
-                .or(input.max_capacity),
+                .or(max_capacity),
         ),
         // A worker count with no worker type names no DPU figure this emulator could
         // derive, so only what the request itself named is reported.
-        (None, Some(workers)) => (None, Some(workers), input.max_capacity),
+        (None, Some(workers)) => (None, Some(workers), max_capacity),
         (None, None) => (
             None,
             None,
-            Some(input.max_capacity.unwrap_or(DEFAULT_ML_TRANSFORM_DPUS)),
+            Some(max_capacity.unwrap_or(DEFAULT_ML_TRANSFORM_DPUS)),
         ),
     }
+}
+
+/// Whether an `UpdateMLTransform` request names a member to change at all.
+///
+/// Every member of that request other than the `TransformId` addressing the transform is
+/// optional, so a request carrying none of them asks for no change: nothing is written, so
+/// the transform's `LastModifiedOn` stays where the last write that did change something
+/// put it — the same way an `UpdateCrawler` naming no member leaves its crawler's
+/// `LastUpdated` alone ([`crawler_update_names_a_change`]).
+pub fn ml_transform_update_names_a_change(input: &UpdateMLTransformInput) -> bool {
+    input.name.is_some()
+        || input.description.is_some()
+        || input.parameters.is_some()
+        || input.role.is_some()
+        || input.glue_version.is_some()
+        || input.max_capacity.is_some()
+        || input.worker_type.is_some()
+        || input.number_of_workers.is_some()
+        || input.timeout.is_some()
+        || input.max_retries.is_some()
 }
 
 /// The message the catalog's metadata form type surface refuses an identifier it holds no

@@ -46,6 +46,48 @@ pub fn service_managed_scheduled_query<Eng: Send + Sync + 'static>(
         .log_alarms
         .get(scheduled_query_name_from_identifier(identifier))?
         .alarm;
+    derived(alarm, region)
+}
+
+/// EVERY service-managed scheduled query this account holds — one per log alarm whose
+/// configuration names one — in ascending name order, which is the order the alarm's name is
+/// the query's name in.
+///
+/// A reader that enumerates scheduled queries must report these beside the ones callers
+/// created, because they are scheduled queries of this account that no `CreateScheduledQuery`
+/// call created. The alarm store is a hash map, so the derived queries are ordered here rather
+/// than left in the store's own iteration order: an enumeration a client pages through must not
+/// depend on it.
+///
+/// Empty when the alarm store is not mounted at all. `region` is used only for an alarm whose
+/// configuration names no ARN of its own, exactly as in
+/// [`service_managed_scheduled_query`].
+pub fn service_managed_scheduled_queries<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+) -> Vec<ScheduledQueryRecord> {
+    let Some(state) = cloudwatch::state::service_state(engine) else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    let mut queries: Vec<ScheduledQueryRecord> = store
+        .log_alarms
+        .values()
+        .filter_map(|stored| derived(&stored.alarm, region))
+        .collect();
+    queries.sort_by(|left, right| left.name.cmp(&right.name));
+    queries
+}
+
+/// The scheduled query one log alarm's configuration describes, or `None` when that alarm has
+/// no scheduled query configuration (so no managed query belongs to it).
+///
+/// The ONE derivation both readers above share, so a query reported by a lookup and the same
+/// query reported by an enumeration cannot disagree.
+fn derived(
+    alarm: &cloudwatch::ops::types::LogAlarm,
+    region: &str,
+) -> Option<ScheduledQueryRecord> {
     let name = alarm.alarm_name.as_deref()?;
     let configuration = alarm.scheduled_query_configuration.as_ref()?;
     let schedule = &configuration.schedule_configuration;

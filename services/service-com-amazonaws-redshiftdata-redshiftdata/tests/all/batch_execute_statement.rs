@@ -18,7 +18,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_redshiftdata_redshiftdata::state::MAX_RETAINED_STATEMENTS;
 
 use super::emulator::{
-    error_code, flag, id_of, list, number, Emulator, LONGER_THAN_COMPLETION_SPAN, WAIT_SECONDS,
+    error_code, flag, id_of, list, number, Emulator, LONGER_THAN_A_QUICK_STATEMENT, SLOW_SQL,
+    WAIT_SECONDS,
 };
 
 /// The connection every batch below is submitted with: one documented
@@ -593,16 +594,17 @@ async fn batch_parameters_are_bound_to_the_statements_that_reference_them() {
 // ---------------------------------------------------------------------------
 
 /// A batch nobody waited for is SUBMITTED, with every statement of it
-/// SUBMITTED, until the clock makes its terminal status due; cancelling it
-/// stops the whole batch, and one statement of a batch cannot be cancelled on
-/// its own.
-#[tokio::test]
-async fn an_unwaited_batch_is_submitted_until_the_clock_owes_its_outcome() {
+/// SUBMITTED, while its transaction runs; cancelling it stops the whole batch,
+/// and one statement of a batch cannot be cancelled on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unwaited_batch_is_submitted_while_its_transaction_runs() {
     let emulator = Emulator::new();
+    // Slow enough to be observed WHILE it runs, so what is cancelled below is a
+    // transaction that is really still open.
     let submitted = emulator
         .ok(
             "BatchExecuteStatement",
-            &batch(&["SELECT 1", "SELECT 2"], None),
+            &batch(&[SLOW_SQL, SLOW_SQL], None),
         )
         .await;
     let id = id_of(&submitted);
@@ -656,17 +658,18 @@ async fn an_unwaited_batch_is_submitted_until_the_clock_owes_its_outcome() {
         "cancelling a batch stops every statement of it: {aborted}"
     );
 
-    // A batch nobody cancels reaches its terminal status once the clock owes it.
+    // A batch nobody cancels reaches its terminal status once its transaction
+    // has run.
     let other = emulator
         .ok("BatchExecuteStatement", &batch(&["SELECT 1"], None))
         .await;
-    tokio::time::sleep(LONGER_THAN_COMPLETION_SPAN).await;
+    tokio::time::sleep(LONGER_THAN_A_QUICK_STATEMENT).await;
     let finished = emulator
         .ok("DescribeStatement", &json!({"Id": id_of(&other)}))
         .await;
     assert_eq!(
         finished["Status"], "FINISHED",
-        "the clock owes the batch its terminal status: {finished}"
+        "a batch whose transaction committed reports FINISHED: {finished}"
     );
     let finished_subs = sub_statements(&finished);
     assert_eq!(
