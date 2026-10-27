@@ -315,9 +315,10 @@
 //! request, and what the owning service answers is what the stack records. A property an
 //! arm does not map onto the create's request at all is REFUSED rather than dropped, so a
 //! stack never reports a resource configured differently from its declaration — the FIS
-//! arm's `ExperimentReportConfiguration` is the one such property today. Inside a nested
-//! structure the member tables are the type's published members, so a member not in one is
-//! not a member of the type.
+//! arm's `ExperimentReportConfiguration` and the ACM certificate arm's
+//! `DomainValidationOptions.HostedZoneId` are the two such properties today. Inside a
+//! nested structure the member tables are the type's published members, so a member not in
+//! one is not a member of the type.
 
 use std::collections::BTreeMap;
 
@@ -325,10 +326,11 @@ use serde_json::{Map, Value};
 
 use super::provisioning::{
     call_json_rpc, call_query, call_rest_json, call_rest_xml, percent_encoded, xml_element,
-    xml_entry_map, xml_leaf, xml_scalar_children, Created, Refusal, AWS_JSON_1_0, AWS_JSON_1_1,
+    xml_entry_map, xml_leaf, xml_scalar_children, Created, Readiness, Refusal, AWS_JSON_1_0,
+    AWS_JSON_1_1,
 };
 use super::template::{
-    ACM_ACME_ENDPOINT, AOSS_COLLECTION, AOSS_SECURITY_POLICY, APIGATEWAYV2_API,
+    ACM_ACME_ENDPOINT, ACM_CERTIFICATE, AOSS_COLLECTION, AOSS_SECURITY_POLICY, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_DOMAIN_NAME, BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
@@ -442,6 +444,7 @@ pub(super) enum Provisioner {
     SchedulerSchedule,
     CognitoUserPoolGroup,
     AcmAcmeEndpoint,
+    AcmCertificate,
     Route53ResolverEndpoint,
     Route53ResolverRule,
     Route53ResolverRuleAssociation,
@@ -510,6 +513,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         SCHEDULER_SCHEDULE => Some(Provisioner::SchedulerSchedule),
         COGNITO_USER_POOL_GROUP => Some(Provisioner::CognitoUserPoolGroup),
         ACM_ACME_ENDPOINT => Some(Provisioner::AcmAcmeEndpoint),
+        ACM_CERTIFICATE => Some(Provisioner::AcmCertificate),
         ROUTE53RESOLVER_ENDPOINT => Some(Provisioner::Route53ResolverEndpoint),
         ROUTE53RESOLVER_RULE => Some(Provisioner::Route53ResolverRule),
         ROUTE53RESOLVER_RULE_ASSOCIATION => Some(Provisioner::Route53ResolverRuleAssociation),
@@ -693,6 +697,7 @@ impl Provisioner {
             // taggable, so no tags are propagated to a group.
             Self::CognitoUserPoolGroup => create_group(ctx, region, resource).await,
             Self::AcmAcmeEndpoint => create_acme_endpoint(ctx, region, resource, propagated).await,
+            Self::AcmCertificate => request_certificate(ctx, region, resource, propagated).await,
             Self::Route53ResolverEndpoint => {
                 create_resolver_endpoint(ctx, region, resource, propagated).await
             }
@@ -813,6 +818,10 @@ impl Provisioner {
                 | Self::S3VectorsIndex
                 | Self::SchedulerScheduleGroup
                 | Self::AcmAcmeEndpoint
+                // ACM refuses a tag key in the reserved namespace on every call that takes
+                // tags, in the one check its own crate's tag validation makes, so a
+                // certificate's are left off the same way an ACME endpoint's are.
+                | Self::AcmCertificate
                 | Self::MskCluster
                 | Self::MskServerlessCluster
                 | Self::SqsQueue
@@ -830,6 +839,34 @@ impl Provisioner {
             .filter(|(key, _)| !(refuses_reserved_keys && is_reserved_tag_key(key)))
             .cloned()
             .collect()
+    }
+
+    /// Whether the resource this provisioner CREATED has reached the state the owning
+    /// service reports it ready in — read from that service, never decided here.
+    ///
+    /// Most creates leave the resource ready, so most types answer [`Readiness::Ready`]
+    /// without asking anything: the call that created the resource already said everything
+    /// there was to say about it. A type whose create is documented to leave the resource
+    /// coming up is the exception, and for such a type this is what CloudFormation holds the
+    /// resource's creation open on ([`super::stabilising`]) — asked once where the create
+    /// answered, and again by [`super::provisioning::advance_stabilisations`] until that
+    /// service reports it ready.
+    ///
+    /// `Err` is the owning service's own refusal of the READ, which says nothing about the
+    /// resource: the caller decides what an unanswered read means.
+    pub(super) async fn readiness(
+        self,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+        region: &str,
+        physical_resource_id: &str,
+    ) -> Result<Readiness, Refusal> {
+        match self {
+            // "A certificate enters status PENDING_VALIDATION upon being requested"
+            // (`CertificateDetail$Status`) and is usable once ACM has issued it, so the
+            // resource's creation is finished when ACM reports it `ISSUED`.
+            Self::AcmCertificate => certificate_readiness(ctx, region, physical_resource_id).await,
+            _ => Ok(Readiness::Ready),
+        }
     }
 
     /// Apply a CHANGED configuration to a resource that already exists, through the owning
@@ -1103,6 +1140,7 @@ impl Provisioner {
             // half of that pair is on the resource's own declaration.
             Self::CognitoUserPoolGroup => delete_group(ctx, region, resource).await,
             Self::AcmAcmeEndpoint => delete_acme_endpoint(ctx, region, physical_resource_id).await,
+            Self::AcmCertificate => delete_certificate(ctx, region, physical_resource_id).await,
             Self::Route53ResolverEndpoint => {
                 delete_resolver_endpoint(ctx, region, physical_resource_id).await
             }
@@ -1305,6 +1343,7 @@ impl Provisioner {
             Self::AcmAcmeEndpoint => {
                 describe_acme_endpoint(ctx, region, physical_resource_id).await
             }
+            Self::AcmCertificate => describe_certificate(ctx, region, physical_resource_id).await,
             Self::Route53ResolverEndpoint => {
                 describe_resolver_endpoint(ctx, region, physical_resource_id).await
             }
@@ -10032,6 +10071,256 @@ async fn describe_acme_endpoint(
             ("AuthorizationBehavior", "AuthorizationBehavior"),
             ("Contact", "Contact"),
             ("CertificateAuthority", "CertificateAuthority"),
+        ],
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// AWS Certificate Manager: AWS::CertificateManager::Certificate
+// ---------------------------------------------------------------------------
+
+/// The properties of `AWS::CertificateManager::Certificate` that are `RequestCertificate`'s
+/// own members, spelled identically on both sides: the domain the certificate covers, the
+/// further names it covers, how the domains are to be validated, the private CA that is to
+/// issue it and the key algorithm it is to be generated with
+/// (`smithy_query(operation="RequestCertificate")`).
+const ACM_CERTIFICATE_MEMBERS: &[(&str, &str)] = &[
+    ("DomainName", "DomainName"),
+    ("SubjectAlternativeNames", "SubjectAlternativeNames"),
+    ("ValidationMethod", "ValidationMethod"),
+    ("CertificateAuthorityArn", "CertificateAuthorityArn"),
+    ("KeyAlgorithm", "KeyAlgorithm"),
+];
+
+/// The members of one entry of the type's `DomainValidationOptions`, which are the members
+/// of ACM's own `DomainValidationOption` under the same names.
+const ACM_DOMAIN_VALIDATION_OPTION_MEMBERS: &[(&str, &str)] = &[
+    ("DomainName", "DomainName"),
+    ("ValidationDomain", "ValidationDomain"),
+];
+
+/// The property of a `DomainValidationOptions` entry this provisioner does not map onto the
+/// create's request: `HostedZoneId` is not a member of ACM's `DomainValidationOption` at
+/// all — it names the Route 53 hosted zone CloudFormation itself publishes the validation
+/// record into, which this emulator does not do — so a declaration that states one is
+/// refused rather than deployed as a certificate whose validation record nothing publishes.
+const ACM_HOSTED_ZONE_ID: &str = "HostedZoneId";
+
+/// The type's one property that is a member of the create's `Options` rather than of the
+/// request itself (`CertificateOptions$CertificateTransparencyLoggingPreference`).
+const ACM_TRANSPARENCY_LOGGING: &str = "CertificateTransparencyLoggingPreference";
+
+/// The `CertificateStatus` values this arm reads: the status a requested certificate enters
+/// and the one it is usable in ("A certificate enters status PENDING_VALIDATION upon being
+/// requested", `CertificateDetail$Status`).
+const CERTIFICATE_PENDING_VALIDATION: &str = "PENDING_VALIDATION";
+const CERTIFICATE_ISSUED: &str = "ISSUED";
+
+/// Request the certificate an `AWS::CertificateManager::Certificate` declares, so a client
+/// that reads the stack's physical resource id can call ACM with it (`DescribeCertificate`,
+/// `AddTagsToCertificate`) rather than being handed an identifier ACM never minted.
+///
+/// The type's properties are NOT the create's own members throughout, so they are mapped
+/// one by one ([`ACM_CERTIFICATE_MEMBERS`] for the ones named identically, `Tags` as ACM's
+/// own tag list, `CertificateTransparencyLoggingPreference` into the create's `Options`,
+/// and each `DomainValidationOptions` entry onto ACM's `DomainValidationOption`), and a
+/// property with no member at all is refused ([`ACM_HOSTED_ZONE_ID`]) rather than dropped.
+/// Nothing the declaration does not state is sent.
+///
+/// The certificate's identifier is ACM's OWN to mint — the create takes no identifier and
+/// answers with `CertificateArn`, and "Ref returns the certificate ARN" — so that answer is
+/// reported back as the resource's physical id, which is what a client then passes to
+/// `DescribeCertificate`.
+async fn request_certificate(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let properties = resource
+        .properties
+        .as_object()
+        .cloned()
+        .unwrap_or_else(Map::new);
+    let mut request = Map::new();
+    copy_members(&properties, ACM_CERTIFICATE_MEMBERS, &mut request);
+    if let Some(Value::Array(options)) = properties.get("DomainValidationOptions") {
+        let mut mapped: Vec<Value> = Vec::with_capacity(options.len());
+        for option in options {
+            if option.get(ACM_HOSTED_ZONE_ID).is_some() {
+                return Err(Refusal {
+                    code: NOT_IMPLEMENTED.to_string(),
+                    message: format!(
+                        "this emulator does not implement the {ACM_HOSTED_ZONE_ID} property of \
+                         {}'s DomainValidationOptions",
+                        resource.resource_type
+                    ),
+                });
+            }
+            mapped.push(mapped_members(option, ACM_DOMAIN_VALIDATION_OPTION_MEMBERS));
+        }
+        request.insert("DomainValidationOptions".to_string(), Value::Array(mapped));
+    }
+    if let Some(preference) = properties.get(ACM_TRANSPARENCY_LOGGING) {
+        let mut options = Map::new();
+        options.insert(ACM_TRANSPARENCY_LOGGING.to_string(), preference.clone());
+        request.insert("Options".to_string(), Value::Object(options));
+    }
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    let reported = call_json_rpc(
+        ctx,
+        ACM_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACM_TARGET_PREFIX}.RequestCertificate"),
+        &Value::Object(request),
+    )
+    .await?;
+    let Some(arn) = reported.get("CertificateArn").and_then(Value::as_str) else {
+        // The create answered 2xx without the ARN its output models. Nothing addresses a
+        // certificate without one, so this is reported as a failure rather than recorded as
+        // a resource with an identifier nothing minted.
+        return Err(Refusal {
+            code: "InternalFailure".to_string(),
+            message: "RequestCertificate answered no CertificateArn".to_string(),
+        });
+    };
+    Ok(Created {
+        physical_resource_id: Some(arn.to_string()),
+        attributes: BTreeMap::new(),
+    })
+}
+
+/// Whether ACM has issued the certificate a stack requested.
+///
+/// "A certificate enters status PENDING_VALIDATION upon being requested"
+/// (`CertificateDetail$Status`) and the certificate cannot serve traffic until ACM issues
+/// it, so `ISSUED` is the state the resource's creation is finished in, `PENDING_VALIDATION`
+/// is the state it is still coming up in, and every other status is one no wait will bring
+/// out of: a validation that timed out, a request ACM failed, a revoked or expired
+/// certificate. A certificate ACM no longer holds is in the same position — nothing is going
+/// to issue it.
+async fn certificate_readiness(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Readiness, Refusal> {
+    let request = serde_json::json!({ "CertificateArn": physical_resource_id });
+    let reported = match call_json_rpc(
+        ctx,
+        ACM_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACM_TARGET_PREFIX}.DescribeCertificate"),
+        &request,
+    )
+    .await
+    {
+        Ok(reported) => reported,
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => {
+            return Ok(Readiness::Failed(format!(
+                "ACM holds no certificate for {physical_resource_id}"
+            )))
+        }
+        Err(refusal) => return Err(refusal),
+    };
+    let detail = reported.get("Certificate");
+    let status = detail
+        .and_then(|detail| detail.get("Status"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match status {
+        CERTIFICATE_ISSUED => Ok(Readiness::Ready),
+        CERTIFICATE_PENDING_VALIDATION => Ok(Readiness::Pending(
+            CERTIFICATE_PENDING_VALIDATION.to_string(),
+        )),
+        other => {
+            // `FailureReason` "exists only when the certificate status is FAILED", so it is
+            // reported where ACM gave one and the status speaks for itself otherwise.
+            let reason = detail
+                .and_then(|detail| detail.get("FailureReason"))
+                .and_then(Value::as_str);
+            Ok(Readiness::Failed(match reason {
+                Some(reason) => format!(
+                    "ACM reports certificate {physical_resource_id} as {other}: {reason}"
+                ),
+                None => format!("ACM reports certificate {physical_resource_id} as {other}"),
+            }))
+        }
+    }
+}
+
+/// Delete the certificate a stack requested.
+///
+/// A certificate ACM no longer holds (`ResourceNotFoundException`) is already in the state
+/// the delete asks for, so that answer is a success. Every other refusal is ACM's own and
+/// is reported: a certificate still in use by another service is its
+/// `ResourceInUseException`, which is a delete that really did not happen.
+async fn delete_certificate(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "CertificateArn": physical_resource_id });
+    match call_json_rpc(
+        ctx,
+        ACM_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACM_TARGET_PREFIX}.DeleteCertificate"),
+        &request,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The certificate's configuration as ACM reports it, for drift detection. An ARN ACM no
+/// longer holds a certificate for (`ResourceNotFoundException`) was deleted.
+///
+/// Only the members `DescribeCertificate` reports in the SAME shape the type declares them
+/// in are reported, because a property the actual document does not carry is not evidence of
+/// anything (`super::drift::differs`): `DomainName`, `KeyAlgorithm` and
+/// `CertificateAuthorityArn`, each the identical member on both sides.
+/// `SubjectAlternativeNames` is not reported — ACM answers the whole name set of the
+/// certificate, which carries the primary domain too and in an order ACM decides, so
+/// comparing it would read ACM's own answer as drift — and neither is `Tags`, which that
+/// read does not carry at all.
+async fn describe_certificate(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "CertificateArn": physical_resource_id });
+    let reported = match call_json_rpc(
+        ctx,
+        ACM_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{ACM_TARGET_PREFIX}.DescribeCertificate"),
+        &request,
+    )
+    .await
+    {
+        Ok(reported) => reported,
+        Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let Some(detail) = reported.get("Certificate") else {
+        return Ok(Some(Value::Object(Map::new())));
+    };
+    Ok(Some(reported_as_properties(
+        detail,
+        &[
+            ("DomainName", "DomainName"),
+            ("KeyAlgorithm", "KeyAlgorithm"),
+            ("CertificateAuthorityArn", "CertificateAuthorityArn"),
         ],
     )))
 }

@@ -747,6 +747,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // No resource was asked of any service, so none transitioned: the stack's
                 // event log carries the transform's failure and nothing else.
                 transitions: Vec::new(),
+                // And nothing was created, so nothing is waiting to be ready.
+                stabilising: Vec::new(),
             },
             None => {
                 crate::state::provisioning::reconcile(ctx, &region, &provenance, declared, &[])
@@ -768,6 +770,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(stack) = store.resolve_mut(&region, &stack_id) else {
                 return Ok(output);
             };
+            // A resource whose owning service has not reported it ready yet holds this
+            // operation open ([`crate::state::stabilising`]): recorded BEFORE the events
+            // below, since that is what withholds the transition that would report the
+            // resource created.
+            stack.record_stabilisations(&materialised.stabilising, now);
             // The resources' own transitions come BEFORE the stack's terminal event: the
             // event stream is what the deployment did, in the order it did it.
             stack.schedule_resource_events(&materialised.transitions);
