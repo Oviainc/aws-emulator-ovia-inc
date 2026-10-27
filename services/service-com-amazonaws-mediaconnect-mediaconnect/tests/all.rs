@@ -177,3 +177,5 @@ mod router_input_thumbnail;
 mod router_deletion_supersedes_owed_transitions;
 #[path = "all/get_router_network_interface.rs"]
 mod get_router_network_interface;
+#[path = "all/router_tier_bitrate_rule.rs"]
+mod router_tier_bitrate_rule;
