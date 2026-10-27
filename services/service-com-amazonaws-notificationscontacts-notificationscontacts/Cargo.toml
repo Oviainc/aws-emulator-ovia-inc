@@ -23,12 +23,14 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque `nextToken` ListEmailContacts hands out.
 hex = { workspace = true }
+# Computes the integrity tag that `nextToken` carries, so a token this service never
+# issued is refused rather than resumed from.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 hex = { workspace = true }
 
 [lints]

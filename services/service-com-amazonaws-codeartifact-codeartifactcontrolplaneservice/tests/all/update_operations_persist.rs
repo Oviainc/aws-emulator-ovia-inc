@@ -180,7 +180,7 @@ pub(crate) async fn update_versions_status(
 
 /// `DisposePackageVersions` for the package a [`Publish`] addresses: the coordinate is
 /// `httpQuery`-bound, the versions and the preconditions travel in the BODY.
-async fn dispose_versions(
+pub(crate) async fn dispose_versions(
     router: &MultiServiceRouter,
     request: &Publish,
     versions: &[&str],

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRemainingFreeTrialDays
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRemainingFreeTrialDays`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports how many days are left of each named account's free trial of
+//! each GuardDuty feature, counted from the instant that feature's trial began for that
+//! account — the detector's own stored configuration for the account that owns it, and
+//! the member record's for an account it administers. An account that is neither is
+//! REPORTED in `UnprocessedAccounts`; a request the service cannot understand is refused
+//! with `BadRequestException`. A pure report: nothing here writes to the store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRemainingFreeTrialDays::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +142,207 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRemainingFreeTrialDays` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRemainingFreeTrialDaysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRemainingFreeTrialDays"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetRemainingFreeTrialDaysErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+        let administrator = crate::state::administrator_account_id();
+
+        // Parameter failures first: a value that cannot be a value of its member at
+        // all is refused whatever the store holds, because `UnprocessedAccounts`
+        // reports accounts that were not PROCESSED, never a request that was not
+        // understood.
+        if !crate::state::is_detector_id(&input.detector_id) {
+            return Err(bad_request(crate::state::invalid_parameter_message(
+                crate::state::DETECTOR_ID_MEMBER,
+            )));
+        }
+        if let Some(message) = crate::state::account_ids_rejection(&input.account_ids) {
+            return Err(bad_request(message));
+        }
+
+        // The trial is a span of wall-clock time, so the remaining days are READ off
+        // the clock; the store's own "this resource changed now" clock is not
+        // advanced, because a report materialises nothing.
+        let now = crate::state::now_millis();
+
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        // The accounts a free trial is reported for hang off the detector that
+        // administers them, so only the account/Region that owns it reads them.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+
+        let mut accounts = Vec::new();
+        let mut unprocessed = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+        for account_id in &input.account_ids {
+            // `AccountIds` names a SET of accounts: a repeated id is reported once,
+            // on either list.
+            if !seen.insert(account_id.as_str()) {
+                continue;
+            }
+            // Whose configuration carries the account's trial: the detector's own for
+            // the account that owns it, and the member record's for an account it
+            // administers. A member's features are maintained separately from the
+            // administrator's, so a member's trial is read from its own record.
+            let features = if *account_id == administrator {
+                Some(detector.features.as_slice())
+            } else {
+                detector
+                    .members
+                    .get(account_id)
+                    .filter(|member| member.is_associated())
+                    .map(|member| member.features.as_slice())
+            };
+            match features {
+                Some(features) => accounts.push(account_free_trial_info(account_id, features, now)),
+                None => unprocessed.push(UnprocessedAccount {
+                    account_id: account_id.clone(),
+                    result: crate::state::not_a_member_message(&administrator),
+                }),
+            }
+        }
+
+        Ok(GetRemainingFreeTrialDaysOutput {
+            accounts: Some(accounts),
+            unprocessed_accounts: Some(unprocessed),
+        })
     }
+}
+
+/// Every `FreeTrialFeatureResult` member a report names, paired with the stored
+/// feature switch whose trial it reports.
+///
+/// The catalogue is the MODELLED one: `FreeTrialFeatureConfigurationResult.Name`
+/// targets `FreeTrialFeatureResult`
+/// (`smithy_query(shape="FreeTrialFeatureConfigurationResult")`), and every member of
+/// that enum is reported, once each. The ORDER is this table's own total order over
+/// that set — the order the enum declares its members in, which the generated value
+/// list the assertions below check against does not preserve (it is sorted), so what
+/// they check is membership and coverage.
+///
+/// Most members name a stored feature of the same name. Runtime Monitoring is the
+/// exception: the `RUNTIME_MONITORING` switch is the one that covers the EC2 and
+/// Fargate runtimes, which is the same split `GetUsageStatistics` makes when it
+/// attributes a runtime finding to a per-resource-kind feature, while the legacy
+/// `EKS_RUNTIME_MONITORING` switch is a stored feature in its own right.
+const FREE_TRIAL_FEATURES: [(&str, &str); 12] = [
+    (crate::state::FEATURE_FLOW_LOGS, crate::state::FEATURE_FLOW_LOGS),
+    (crate::state::FEATURE_CLOUD_TRAIL, crate::state::FEATURE_CLOUD_TRAIL),
+    (crate::state::FEATURE_DNS_LOGS, crate::state::FEATURE_DNS_LOGS),
+    (crate::state::FEATURE_S3_DATA_EVENTS, crate::state::FEATURE_S3_DATA_EVENTS),
+    (crate::state::FEATURE_EKS_AUDIT_LOGS, crate::state::FEATURE_EKS_AUDIT_LOGS),
+    (crate::state::FEATURE_EBS_MALWARE_PROTECTION, crate::state::FEATURE_EBS_MALWARE_PROTECTION),
+    (crate::state::FEATURE_RDS_LOGIN_EVENTS, crate::state::FEATURE_RDS_LOGIN_EVENTS),
+    (FEATURE_LAMBDA_NETWORK_LOGS, FEATURE_LAMBDA_NETWORK_LOGS),
+    (crate::state::FEATURE_EKS_RUNTIME_MONITORING, crate::state::FEATURE_EKS_RUNTIME_MONITORING),
+    (FEATURE_EC2_RUNTIME_MONITORING, crate::state::FEATURE_RUNTIME_MONITORING),
+    (FEATURE_FARGATE_RUNTIME_MONITORING, crate::state::FEATURE_RUNTIME_MONITORING),
+    (FEATURE_AI_PROTECTION, FEATURE_AI_PROTECTION),
+];
+
+/// The feature names this file spells that [`crate::state`] carries no constant for.
+///
+/// The ones it does carry are reused from there: a feature is one name, whether a
+/// detector configures it, a usage report bills it or a free-trial report counts its
+/// days.
+const FEATURE_LAMBDA_NETWORK_LOGS: &str = "LAMBDA_NETWORK_LOGS";
+/// See [`FEATURE_LAMBDA_NETWORK_LOGS`].
+const FEATURE_AI_PROTECTION: &str = "AI_PROTECTION";
+/// See [`FEATURE_LAMBDA_NETWORK_LOGS`].
+const FEATURE_EC2_RUNTIME_MONITORING: &str = "EC2_RUNTIME_MONITORING";
+/// See [`FEATURE_LAMBDA_NETWORK_LOGS`].
+const FEATURE_FARGATE_RUNTIME_MONITORING: &str = "FARGATE_RUNTIME_MONITORING";
+
+// Named, not taken by position out of the generated enum list: these assertions fail
+// the BUILD if the model stops carrying a member this file reports, or if a row names
+// a switch this service does not store — where an index would instead have silently
+// reported some other member's trial. The length check is what makes the table COVER
+// the enum rather than merely draw from it.
+const _: () = {
+    let mut index = 0;
+    while index < FREE_TRIAL_FEATURES.len() {
+        assert!(crate::state::enum_carries(
+            crate::ops::types::shared_types::FREE_TRIAL_FEATURE_RESULT_VALUES,
+            FREE_TRIAL_FEATURES[index].0
+        ));
+        assert!(
+            crate::state::enum_carries(
+                &crate::state::DETECTOR_FEATURES,
+                FREE_TRIAL_FEATURES[index].1
+            ) || crate::state::enum_carries(
+                &crate::state::FOUNDATIONAL_FEATURES,
+                FREE_TRIAL_FEATURES[index].1
+            )
+        );
+        index += 1;
+    }
+    assert!(
+        FREE_TRIAL_FEATURES.len()
+            == crate::ops::types::shared_types::FREE_TRIAL_FEATURE_RESULT_VALUES.len()
+    );
+};
+
+/// One account's whole free-trial report, under both views the modelled
+/// `AccountFreeTrialInfo` carries.
+///
+/// The `DataSources` view "is deprecated, use Features instead"
+/// (`smithy_query(shape="AccountFreeTrialInfo",member="DataSources")`), so each of its
+/// nodes is read off the same switch the `Features` entry for that feature is: one
+/// stored fact per feature, reported under either name, so the two views of one
+/// account's trial cannot disagree.
+fn account_free_trial_info(
+    account_id: &str,
+    features: &[crate::state::FeatureRecord],
+    now: i64,
+) -> AccountFreeTrialInfo {
+    let days = |feature: &str| DataSourceFreeTrial {
+        free_trial_days_remaining: Some(crate::state::free_trial_days_remaining(
+            features, feature, now,
+        )),
+    };
+    AccountFreeTrialInfo {
+        account_id: Some(account_id.to_string()),
+        data_sources: Some(DataSourcesFreeTrial {
+            cloud_trail: Some(days(crate::state::FEATURE_CLOUD_TRAIL)),
+            dns_logs: Some(days(crate::state::FEATURE_DNS_LOGS)),
+            flow_logs: Some(days(crate::state::FEATURE_FLOW_LOGS)),
+            s3_logs: Some(days(crate::state::FEATURE_S3_DATA_EVENTS)),
+            kubernetes: Some(KubernetesDataSourceFreeTrial {
+                audit_logs: Some(days(crate::state::FEATURE_EKS_AUDIT_LOGS)),
+            }),
+            malware_protection: Some(MalwareProtectionDataSourceFreeTrial {
+                scan_ec2_instance_with_findings: Some(days(
+                    crate::state::FEATURE_EBS_MALWARE_PROTECTION,
+                )),
+            }),
+        }),
+        features: Some(
+            FREE_TRIAL_FEATURES
+                .iter()
+                .map(|(reported, switch)| FreeTrialFeatureConfigurationResult {
+                    name: Some((*reported).to_string()),
+                    free_trial_days_remaining: Some(crate::state::free_trial_days_remaining(
+                        features, switch, now,
+                    )),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
+fn bad_request(message: impl Into<String>) -> GetRemainingFreeTrialDaysError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }
