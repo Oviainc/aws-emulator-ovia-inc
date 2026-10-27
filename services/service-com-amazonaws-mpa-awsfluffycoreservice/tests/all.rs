@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/absent_approval_team_version_delete.rs"]
 mod absent_approval_team_version_delete;
+#[path = "all/active_team_deletion_approval.rs"]
+mod active_team_deletion_approval;
 #[path = "all/approval_sessions.rs"]
 mod approval_sessions;
 #[path = "all/approval_team_lifecycle.rs"]
