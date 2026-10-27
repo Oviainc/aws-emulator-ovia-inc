@@ -24,7 +24,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::sta
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router};
+use super::common::{call, error_code, router, Harness};
 
 /// Onboard the Connect instance a `CreateCampaign` body names, so the create has a
 /// campaign target: `CreateCampaign` mints a campaign only for an instance whose
@@ -32,7 +32,7 @@ use super::common::{call, error_code, router};
 /// [`ONBOARDING_JOB_DURATION`] after `StartInstanceOnboardingJob`. Idempotent and
 /// cheap to repeat: an instance already onboarded is left alone, so the wait is paid
 /// once per instance rather than once per create.
-async fn onboard_for(router: &MultiServiceRouter, region: &str, body: &Value) {
+async fn onboard_for(router: &Harness, region: &str, body: &Value) {
     let Some(instance) = body.get("connectInstanceId").and_then(Value::as_str) else {
         return;
     };
@@ -52,6 +52,7 @@ async fn onboard_for(router: &MultiServiceRouter, region: &str, body: &Value) {
     {
         return;
     }
+    router.register_connect_instance(region, instance);
     let (status, started) = call(
         router,
         region,
@@ -70,7 +71,7 @@ async fn onboard_for(router: &MultiServiceRouter, region: &str, body: &Value) {
 /// `CreateCampaign`, asserting it succeeded, and returning the response body. The
 /// instance the body names is onboarded first (see [`onboard_for`]) — a campaign
 /// belongs to an onboarded Connect instance, so a create without one is a 404.
-async fn create(router: &MultiServiceRouter, region: &str, body: &Value) -> Value {
+async fn create(router: &Harness, region: &str, body: &Value) -> Value {
     onboard_for(router, region, body).await;
     let (status, response) = call(router, region, "PUT", "/v2/campaigns", body).await;
     assert_eq!(

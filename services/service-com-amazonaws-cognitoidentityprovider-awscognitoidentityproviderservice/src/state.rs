@@ -308,17 +308,23 @@ pub fn terms_exists_message(terms_name: &str, client_id: &str) -> String {
     format!("Terms with name {terms_name} already exists for Client {client_id}.")
 }
 
-/// The message a `ResourceNotFoundException` carries when an app client holds no
-/// terms documents under the requested `TermsName`.
+/// The message a `ResourceNotFoundException` carries when a request resolves no
+/// set of terms documents — by its `TermsId` in the named pool, or by the app
+/// client and `TermsName` that name it together.
 ///
-/// A set of terms documents is looked up by app client and name together
-/// (`DescribeTermsByClient` resolves documents "identified by the app client ID,
-/// user pool ID, and terms name" in this service's model), so the refusal names
-/// the same two things the lookup used — the mirror of
-/// [`terms_exists_message`], which reports that pair already taken.
-pub fn terms_not_found_for_client_message(terms_name: &str, client_id: &str) -> String {
-    format!("Terms with name {terms_name} does not exist for Client {client_id}.")
-}
+/// Amazon Cognito answers the same sentence however the documents were looked
+/// up: it reports that the lookup found no terms documents and quotes neither
+/// the id, the name, the app client nor the pool, exactly as
+/// [`USER_NOT_FOUND_MESSAGE`] and [`GROUP_NOT_FOUND_MESSAGE`] report their own
+/// unresolved lookups. A message built from the request would word the refusal
+/// differently per id or per name, so anything that groups refusals by message
+/// would see one error per request rather than one not-found class — and the
+/// lookup by app client would put a `@sensitive` `ClientId` in it.
+///
+/// The app-client lookup THIS pool fails to resolve at all is a different class
+/// and keeps its own wording (the `describe_terms_by_client` handler): there the
+/// app client, not the terms documents, is what does not exist.
+pub const TERMS_NOT_FOUND_MESSAGE: &str = "Terms does not exist.";
 
 // ---------------------------------------------------------------------------
 // Password policy rejection wording

@@ -450,8 +450,11 @@ async fn a_connector_is_only_created_against_a_worker_configuration_this_account
 
     // Every row below is a reference this account does not hold at that ARN and
     // revision: a name never created, the same name in another region, the held
-    // ARN with its uuid altered, a value that is no ARN at all, and the held ARN
-    // at revisions the configuration does not have.
+    // ARN with its uuid altered, a well-formed ARN of a resource kind this
+    // service mints none of, and the held ARN at revisions the configuration
+    // does not have. Every ARN here is WELL-FORMED, so each names a resource
+    // that is absent; a value that is not an ARN at all is incorrect input
+    // instead, which `validation_messages::arn_label_refusals` pins.
     let (head, last) = held.split_at(held.len() - 1);
     let altered = format!("{head}{}", if last == "0" { "1" } else { "0" });
     let unheld: Vec<(&str, String, i64, &str)> = vec![
@@ -477,8 +480,8 @@ async fn a_connector_is_only_created_against_a_worker_configuration_this_account
             "workerConfigurationArn",
         ),
         (
-            "not an ARN at all",
-            "worker-configuration".to_string(),
+            "not a resource kind this service mints",
+            format!("arn:aws:kafkaconnect:{REGION}:{ACCOUNT}:worker-configuration"),
             1,
             "workerConfigurationArn",
         ),

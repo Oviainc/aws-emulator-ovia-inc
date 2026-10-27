@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCustomPlugin
-//! Reports the stored plugin the ARN names, from state. An ARN no stored plugin carries is
+//! Reports the stored plugin the ARN names, from state. A `customPluginArn` that is not a
+//! well-formed ARN of this service is a `BadRequestException`; a well-formed one no stored
+//! plugin carries is
 //! a `NotFoundException`. Reporting only: the one write it makes is materialising the state
 //! change the clock already owed (see `crate::state::ComAmazonawsKafkaconnectKafkaconnectState::settle_due`).
 //!
@@ -167,6 +169,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
+
+        // A value that is not a kafkaconnect ARN at all names no plugin, so it
+        // is incorrect input rather than a resource that is absent: the
+        // modelled 400, blaming the member that carried it.
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "customPluginArn",
+            &input.custom_plugin_arn,
+            crate::state::ARN_SERVICE,
+        ) {
+            return Err(DescribeCustomPluginErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // A regional endpoint resolves only its own region's plugins, so a
         // customPluginArn minted in another region is as absent here as one

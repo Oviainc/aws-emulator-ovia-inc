@@ -2801,6 +2801,11 @@ pub fn depot_url(region: &str, environment_id: &str, token: &str) -> String {
 /// environment does not hold its name: the type is free for a new connector again. One
 /// that is still `DELETING` does count — its connection to the appliance is still being
 /// torn down, so the type is not free yet.
+///
+/// So this answers only whether the TYPE is taken, never whether the record it found is
+/// one a caller can be handed as a connector: a create that reports the record it found
+/// asks [`StoredConnector::is_live`] about that too, because a record on its way to
+/// `DELETED` is not a connector any later call resolves.
 pub fn live_connector_of_type<'a>(
     environment: &'a StoredEnvironment,
     connector_type: &str,

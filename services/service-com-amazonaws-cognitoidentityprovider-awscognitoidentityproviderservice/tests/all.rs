@@ -129,6 +129,8 @@ mod sign_up_client_secret;
 mod state_roundtrip;
 #[path = "all/terms_documents.rs"]
 mod terms_documents;
+#[path = "all/terms_not_found_message.rs"]
+mod terms_not_found_message;
 #[path = "all/token_signing.rs"]
 mod token_signing;
 #[path = "all/ui_customization.rs"]

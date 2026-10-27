@@ -15,7 +15,9 @@
 //! * `RunMicrovm` — "The MicroVM starts in PENDING state and transitions to
 //!   RUNNING once provisioning completes."; and
 //! * `DeleteMicrovmImage` — the image is reported `DELETING` and the removal that
-//!   makes every later read miss is owed by the clock.
+//!   makes every later read miss is owed by the clock; and
+//! * `CreateMicrovmAuthToken` — "the duration in minutes before the authentication
+//!   token expires", after which the MicroVM endpoint accepts it no longer.
 //!
 //! Each record therefore stores the INSTANT its next transition becomes due and
 //! [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::materialize_due`] applies
@@ -32,6 +34,10 @@ use crate::ops::types::{
     CloudWatchLogging, CodeArtifact, CpuConfiguration, Hooks, IdlePolicy, Logging, Resources,
     SnapshotBuild,
 };
+
+/// The MicroVM endpoint: the address a MicroVM is published on, the tokens that
+/// address accepts, and what this emulator answers there.
+pub mod microvm_endpoint;
 
 /// The region an ARN carries when the request is unsigned, matching the region
 /// the emulator's generated client config defaults to.
@@ -770,6 +776,15 @@ pub struct ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     pub microvm_arn_index: BTreeMap<String, String>,
     /// `clientToken` -> the resource that token already minted.
     pub idempotency: BTreeMap<String, IdempotencyRecord>,
+    /// The live authentication tokens a published MicroVM endpoint accepts, keyed by
+    /// the DIGEST of the token rather than by the token itself
+    /// ([`microvm_endpoint::auth_token_digest`]) — the caller keeps the only copy of
+    /// the secret. Bounded by [`microvm_endpoint::MAX_LIVE_AUTH_TOKENS`] and by the
+    /// expiry the clock applies.
+    pub auth_tokens: BTreeMap<String, microvm_endpoint::MicrovmAuthToken>,
+    /// The one address every MicroVM of this store is published on, opened on first
+    /// use. `None` until a `RunMicrovm` needs an endpoint.
+    pub microvm_proxy: Option<microvm_endpoint::MicrovmProxy>,
     /// The sequence the next minted `microvmId` is formatted from.
     pub next_microvm_seq: u64,
     /// The sequence the next minted `buildId` is formatted from.
@@ -794,6 +809,8 @@ impl Default for ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             microvms: BTreeMap::new(),
             microvm_arn_index: BTreeMap::new(),
             idempotency: BTreeMap::new(),
+            auth_tokens: BTreeMap::new(),
+            microvm_proxy: None,
             next_microvm_seq: 0,
             next_build_seq: 0,
             managed_catalogue_published_at: now_datetime(),
@@ -945,6 +962,7 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
             self.microvm_arn_index.remove(&arn);
         }
         self.idempotency.retain(|_, record| record.expires_at > now);
+        self.expire_auth_tokens(now);
     }
 
     /// The AWS-managed base images this service publishes, in catalogue-id order and
@@ -1241,12 +1259,6 @@ pub fn microvm_arn(region: &str, microvm_id: &str) -> String {
     ::engine::emulator_arn("lambda", region, &format!("microvm:{microvm_id}"))
 }
 
-/// The HTTPS endpoint a MicroVM is reached on. `RunMicrovmResponse$endpoint` is
-/// documented as "The HTTPS endpoint URL for communicating with the MicroVM".
-pub fn microvm_endpoint(region: &str, microvm_id: &str) -> String {
-    format!("https://{microvm_id}.microvm.lambda.{region}.amazonaws.com")
-}
-
 /// A fresh authentication token for connecting a client to one MicroVM's endpoint,
 /// for `CreateMicrovmAuthToken`.
 ///
@@ -1256,6 +1268,8 @@ pub fn microvm_endpoint(region: &str, microvm_id: &str) -> String {
 /// minted by the one component that generates secrets, the emulator's credential
 /// store, and then removed from that store again: the caller gets the secret, the
 /// emulator keeps no credential it would accept, and nothing accumulates per call.
+/// What the MicroVM endpoint keeps to recognise the token again is its DIGEST
+/// ([`microvm_endpoint::auth_token_digest`]), never the token.
 ///
 /// `None` when the store minted no token secret, which leaves the operation to refuse
 /// rather than report a token it made up.
@@ -1308,7 +1322,19 @@ pub fn wire_list<T: Clone>(list: &[T]) -> Option<Vec<T>> {
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsLambdamicrovmsLambdamicrovmsState>> {
-    (engine as &dyn ::std::any::Any)
-        .downcast_ref::<::engine::InMemoryEngine>()
+    shared_engine(engine)
         .map(::engine::InMemoryEngine::state::<ComAmazonawsLambdamicrovmsLambdamicrovmsState>)
+}
+
+/// The ONE shared engine behind a handler's `Eng`, which is both what holds this
+/// service's store ([`service_state`]) and what vends the listener a MicroVM endpoint
+/// is served from ([`microvm_endpoint::ensure_base_url`]) — so the crate downcasts in
+/// exactly one place.
+///
+/// `None` when the engine is not the shared in-memory one, which leaves the caller to
+/// answer with a modelled server error rather than with a fresh engine.
+pub(crate) fn shared_engine<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<&::engine::InMemoryEngine> {
+    (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()
 }

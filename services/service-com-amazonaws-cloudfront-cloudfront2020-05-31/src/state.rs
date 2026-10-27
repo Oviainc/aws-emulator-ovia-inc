@@ -5827,6 +5827,58 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         Some(stored)
     }
 
+    /// Apply an update to the connection group `id` names, and report the record as it now
+    /// stands.
+    ///
+    /// Every member `UpdateConnectionGroup` submits beside the group's id is optional and
+    /// is documented as what the group is updated TO ("whether the connection group is
+    /// enabled", "enable IPv6 for the connection group", "the ID of the Anycast static IP
+    /// list"), so a member the request leaves out is left exactly as it was and one it
+    /// states REPLACES what the record held — the same rule
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::apply_anycast_ip_list_update`] and
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::apply_distribution_tenant_update`]
+    /// follow.
+    ///
+    /// The write versions the group exactly as every other change to it does:
+    /// `LastModifiedTime` becomes `now`, a fresh version token is minted so the token the
+    /// caller matched on no longer satisfies an `If-Match`, and the group goes back to
+    /// [`STATUS_IN_PROGRESS`] with a new propagation deadline, since the settings it now
+    /// runs under have to reach the edge locations before they are in effect. The group's
+    /// identity — its id, its ARN, its name, its routing endpoint, its creation time and
+    /// whether it is the account's default one — is untouched: an update submits none of
+    /// them, and the name "can't be updated after you create the connection group".
+    ///
+    /// `None` when the store holds no such group, checked BEFORE the mint so a version
+    /// token is never spent on a group that is not there.
+    pub fn apply_connection_group_update(
+        &mut self,
+        id: &str,
+        anycast_ip_list_id: Option<String>,
+        enabled: Option<bool>,
+        ipv6_enabled: Option<bool>,
+        now: SystemTime,
+    ) -> Option<&StoredConnectionGroup> {
+        if !self.connection_groups.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.connection_groups.get_mut(id)?;
+        if let Some(anycast_ip_list_id) = anycast_ip_list_id {
+            stored.anycast_ip_list_id = Some(anycast_ip_list_id);
+        }
+        if let Some(enabled) = enabled {
+            stored.enabled = enabled;
+        }
+        if let Some(ipv6_enabled) = ipv6_enabled {
+            stored.ipv6_enabled = ipv6_enabled;
+        }
+        stored.status = STATUS_IN_PROGRESS.to_string();
+        stored.deployed_due = now + PROPAGATION_DELAY;
+        stored.last_modified_time = now;
+        stored.etag = etag;
+        Some(stored)
+    }
+
     /// Replace the configuration of the origin access identity `id` names, and report the
     /// record as it now stands.
     ///

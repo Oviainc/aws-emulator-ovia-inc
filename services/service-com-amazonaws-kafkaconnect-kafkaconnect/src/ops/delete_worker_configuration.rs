@@ -8,7 +8,9 @@
 //! `DescribeWorkerConfiguration` answers the modelled `NotFoundException`
 //! (HTTP 404). A repeat of the delete while it is still in flight answers the
 //! same ARN and `DELETING` without restarting that clock, the way the modelled
-//! `@idempotent` trait on this operation calls for.
+//! `@idempotent` trait on this operation calls for. A `workerConfigurationArn`
+//! that is not a well-formed ARN of this service is the modelled
+//! `BadRequestException` (HTTP 400) instead: it names no configuration at all.
 //!
 //! ## Shape of an operation
 //!
@@ -169,6 +171,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
+
+        // A value that is not a kafkaconnect ARN at all names no configuration,
+        // so it is incorrect input rather than a resource that is absent: the
+        // modelled 400, blaming the member that carried it. Refused before any
+        // state is touched, so nothing is marked for deletion.
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "workerConfigurationArn",
+            &input.worker_configuration_arn,
+            crate::state::ARN_SERVICE,
+        ) {
+            return Err(DeleteWorkerConfigurationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // A regional endpoint resolves only its own region's configurations, so
         // a workerConfigurationArn minted in another region deletes nothing and

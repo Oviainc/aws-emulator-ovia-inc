@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GenerateRandom
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GenerateRandom`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: returns a random byte string drawn from the OS CSPRNG, as long as the
+//! request's `NumberOfBytes` asks for. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GenerateRandom::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "You must use the NumberOfBytes parameter to specify the length of the random byte
+//! string. There is no default value for string length"
+//! (`smithy_query(query="doc",shape="GenerateRandom")`), so a request that omits it does
+//! not say how long the string is and is refused; a value outside the member's own
+//! modelled range is refused before this handler runs.
+//!
+//! "GenerateRandom does not use any account-specific resources, such as KMS keys" (the
+//! same doc): no key is named and nothing is persisted, and the bytes are drawn fresh per
+//! call, so two requests for the same length answer different strings.
+//!
+//! A request CAN name one account-specific resource: `CustomKeyStoreId` asks for the
+//! bytes to be generated "in the CloudHSM cluster that is associated with the specified
+//! CloudHSM key store"
+//! (`smithy_query(query="doc",shape="GenerateRandomRequest",member="CustomKeyStoreId")`),
+//! so that id is judged against the custom key stores this account and Region hold
+//! ([`crate::state::ComAmazonawsKmsTrentserviceState::custom_key_store_in`]): an id that
+//! names none is refused, an external key store "is not valid for this parameter", and an
+//! CloudHSM key store serves the request only while it is connected.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +140,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The smallest and the largest random byte string one request can ask for: the modelled
+/// range of `NumberOfBytes`
+/// (`smithy_query(query="operation",operation="GenerateRandom")`). They bound how much
+/// this handler draws and allocates for one request.
+const MIN_RANDOM_BYTES: usize = 1;
+/// See [`MIN_RANDOM_BYTES`].
+const MAX_RANDOM_BYTES: usize = 1024;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -199,18 +220,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GenerateRandom` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GenerateRandomErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GenerateRandom"))
+        // "You must use the NumberOfBytes parameter to specify the length of the random
+        // byte string. There is no default value for string length" (the operation doc),
+        // and the model does not mark the member `@required`, so an absent one reaches
+        // this handler: it is refused the way the boundary validator refuses a member
+        // that must not be null, because there is no length to generate.
+        let Some(number_of_bytes) = input.number_of_bytes else {
+            return Err(member_must_not_be_null("NumberOfBytes"));
+        };
+        // `NumberOfBytesType`'s modelled range is already enforced before this handler
+        // runs, and the length is clamped to it here as well, so the number of bytes
+        // drawn below is never a raw request value however the handler is reached.
+        let length = usize::try_from(number_of_bytes)
+            .unwrap_or(MIN_RANDOM_BYTES)
+            .clamp(MIN_RANDOM_BYTES, MAX_RANDOM_BYTES);
+
+        // "Generates the random byte string in the CloudHSM cluster that is associated
+        // with the specified CloudHSM key store" (the `CustomKeyStoreId` member's doc):
+        // the id names a key store of this account and Region, and whether that key store
+        // can serve the request is judged BEFORE any bytes are drawn. A request naming no
+        // key store reaches none, so it never locks the store at all.
+        if let Some(custom_key_store_id) = input.custom_key_store_id.as_deref() {
+            let Some(state) = crate::state::service_state(&*self.engine) else {
+                return Err(internal("the KMS state store is unavailable"));
+            };
+            let region = crate::state::request_region(ctx);
+            let mut state = state.lock();
+            // A connection change an earlier call started may already have fallen due.
+            // Materialising it first is what makes this request judge the key store by
+            // the connection state the clock owes rather than the transient one the call
+            // that started it left behind.
+            state.settle_custom_key_stores();
+
+            // "The request was rejected because KMS cannot find a custom key store with
+            // the specified key store name or ID" (`CustomKeyStoreNotFoundException`): an
+            // id this account and Region holds no key store under names none at all.
+            let Some(store) = state.custom_key_store_in(&region, custom_key_store_id) else {
+                return Err(not_found());
+            };
+
+            // "External key store IDs are not valid for this parameter. If you specify
+            // the ID of an external key store, GenerateRandom throws an
+            // UnsupportedOperationException" (the member's doc) — an external key store
+            // is a resource that is not valid for this operation whatever state it is in,
+            // so it is judged before the connection state.
+            if store.custom_key_store_type()
+                == crate::state::CUSTOM_KEY_STORE_TYPE_EXTERNAL_KEY_STORE
+            {
+                return Err(unsupported(format!(
+                    "{custom_key_store_id} is an external key store, which cannot generate a \
+                     random byte string. Specify the ID of an CloudHSM key store, or omit \
+                     CustomKeyStoreId."
+                )));
+            }
+            // "You requested the GenerateRandom operation in an CloudHSM key store that
+            // is not connected. This operation is valid only when the CloudHSM key store
+            // ConnectionState is CONNECTED"
+            // (`smithy_query(query="doc",shape="CustomKeyStoreInvalidStateException")`).
+            if store.connection_state != crate::state::CONNECTION_STATE_CONNECTED {
+                return Err(invalid_state());
+            }
+        }
+
+        // `Recipient` asks KMS to return the random bytes encrypted under the public key
+        // in a Nitro enclave's attestation document. Nothing here can verify an
+        // attestation, so that capability is reported as not implemented rather than
+        // answered with a `CiphertextForRecipient` no enclave produced.
+        if input.recipient.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GenerateRandom with a Recipient (enclave attestation)",
+            ));
+        }
+
+        // "Returns a random byte string that is cryptographically secure" (the operation
+        // doc): the bytes come from the OS CSPRNG, so nothing about the string follows
+        // from the request beyond its length and no two calls answer the same string.
+        // No entropy, no string: the caller sees a retryable server error rather than
+        // predictable bytes.
+        let Some(plaintext) = crate::state::random_bytes(length) else {
+            return Err(internal("a random byte string could not be generated"));
+        };
+
+        Ok(GenerateRandomOutput {
+            plaintext: Some(plaintext),
+            // "This field is included in the response only when the Recipient parameter
+            // in the request includes a valid attestation document" — and a request
+            // carrying one is refused above.
+            ciphertext_for_recipient: None,
+        })
     }
+}
+
+/// How a member the operation documents as required, but the model does not mark
+/// `@required`, is refused when it is absent: the framework's own clause for a member that
+/// must not be null, in the envelope it states one in, so this refusal reads exactly like
+/// the one the boundary validator answers for a value outside the same member's range.
+fn member_must_not_be_null(member: &str) -> GenerateRandomError {
+    use ::aws_smithy_schema_server::constraints::{envelope, path, Violation, ViolationKind};
+
+    let violation = Violation {
+        path: path::member(member),
+        kind: ViolationKind::MissingRequiredMember,
+        value: None,
+    };
+    match envelope(&[violation]) {
+        Some(message) => crate::scaffolded::Scaffolded::validation(message),
+        // `envelope` answers `None` only for an empty slice, which this is not.
+        None => internal("the request could not be validated"),
+    }
+}
+
+/// How a request naming no custom key store of this account and Region is refused: "KMS
+/// cannot find a custom key store with the specified key store name or ID"
+/// (`CustomKeyStoreNotFoundException`).
+///
+/// The refusal carries NO message member, as the custom key store family's
+/// missing-key-store refusals do (see `crate::ops::connect_custom_key_store`), so no
+/// message is invented for it.
+fn not_found() -> GenerateRandomError {
+    GenerateRandomErrorModeled::CustomKeyStoreNotFoundException(CustomKeyStoreNotFoundException {
+        message: None,
+    })
+    .into()
+}
+
+/// How a request against a key store whose connection state does not admit this operation
+/// is refused: "The request was rejected because of the ConnectionState of the custom key
+/// store" (`CustomKeyStoreInvalidStateException`). Like this family's other refusals it
+/// carries the error code alone.
+fn invalid_state() -> GenerateRandomError {
+    GenerateRandomErrorModeled::CustomKeyStoreInvalidStateException(
+        CustomKeyStoreInvalidStateException { message: None },
+    )
+    .into()
+}
+
+/// Refuse a resource that is not valid for this operation, with the operation's modelled
+/// 400: "a specified parameter is not supported or a specified resource is not valid for
+/// this operation" (`smithy_query(query="doc",shape="UnsupportedOperationException")`).
+fn unsupported(message: impl Into<String>) -> GenerateRandomError {
+    GenerateRandomErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The state store is missing, or the platform produced no entropy: a server fault rather
+/// than a bad request, and one the caller can retry — "The request was rejected because
+/// an internal exception occurred. The request can be retried"
+/// (`smithy_query(query="doc",shape="KMSInternalException")`).
+fn internal(message: impl Into<String>) -> GenerateRandomError {
+    GenerateRandomErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some(message.into()),
+    })
+    .into()
 }

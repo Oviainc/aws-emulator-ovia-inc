@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // client and the name together resolve at most one stored set.
         let terms = pool
             .terms_for_client(&input.client_id, &input.terms_name)
-            .ok_or_else(|| terms_not_found(&input.terms_name, &input.client_id))?;
+            .ok_or_else(terms_not_found)?;
 
         // Rendered from the STORED terms documents, member for member, so this
         // answers exactly what a read by `TermsId` answers for the same set and
@@ -228,12 +228,13 @@ fn client_not_found(client_id: &str, user_pool_id: &str) -> DescribeTermsByClien
 
 /// This operation's `ResourceNotFoundException` for an app client that holds no
 /// terms documents under the requested name, worded as
-/// [`crate::state::terms_not_found_for_client_message`].
-fn terms_not_found(terms_name: &str, client_id: &str) -> DescribeTermsByClientError {
+/// [`crate::state::TERMS_NOT_FOUND_MESSAGE`] — the one sentence every
+/// terms-document lookup that resolves nothing answers, so this read and a read
+/// by `TermsId` refuse an absent set of documents identically and neither puts
+/// the requested name or the `@sensitive` app client id in the message.
+fn terms_not_found() -> DescribeTermsByClientError {
     DescribeTermsByClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::terms_not_found_for_client_message(
-            terms_name, client_id,
-        )),
+        message: Some(crate::state::TERMS_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

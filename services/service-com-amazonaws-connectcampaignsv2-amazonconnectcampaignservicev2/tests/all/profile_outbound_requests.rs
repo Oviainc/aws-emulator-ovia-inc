@@ -33,7 +33,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::sta
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router, router_with_engine};
+use super::common::{call, error_code, router, router_with_engine, Harness};
 
 /// Now, as seconds since the Unix epoch.
 fn unix_secs() -> f64 {
@@ -80,7 +80,10 @@ fn profile_request(client_token: &str, seed: u128, offset_secs: Option<f64>) -> 
 
 /// Onboard `instance` and wait out the span the clock owes its onboarding job, so the
 /// instance is a campaign target by the time this returns.
-async fn onboard(router: &MultiServiceRouter, region: &str, instance: &str) {
+async fn onboard(router: &Harness, region: &str, instance: &str) {
+    // Onboarding resolves the `connectInstanceId` against the account's Connect
+    // instance registry, so the instance is registered there first.
+    router.register_connect_instance(region, instance);
     let (status, body) = call(
         router,
         region,
@@ -98,7 +101,7 @@ async fn onboard(router: &MultiServiceRouter, region: &str, instance: &str) {
 
 /// A campaign on a freshly onboarded instance, returning its id. The campaign is left
 /// in `Initialized` — the state `CreateCampaign` mints it in.
-async fn campaign(router: &MultiServiceRouter, region: &str, instance: &str) -> String {
+async fn campaign(router: &Harness, region: &str, instance: &str) -> String {
     onboard(router, region, instance).await;
     let (status, created) = call(
         router,
@@ -145,7 +148,7 @@ async fn lifecycle(router: &MultiServiceRouter, region: &str, id: &str, action: 
 }
 
 /// A running campaign on a freshly onboarded instance, returning its id.
-async fn running_campaign(router: &MultiServiceRouter, region: &str, instance: &str) -> String {
+async fn running_campaign(router: &Harness, region: &str, instance: &str) -> String {
     let id = campaign(router, region, instance).await;
     lifecycle(router, region, &id, "start").await;
     id

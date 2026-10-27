@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::DEFAULT_PAGE_SIZE;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, create_campaign, error_code, router};
+use super::common::{call, create_campaign, error_code, router, Harness};
 use super::connect_instance_integrations::{list_integrations, onboard, put_integration, summaries};
 
 /// The region every case here signs for: both stores are regional and one region is
@@ -187,7 +187,7 @@ impl List {
 /// `RECORDS` campaigns on their own instance, in creation order, and `RECORDS`
 /// Lambda integrations on their own, in put order — so each list under test holds a
 /// set of the same size whose stored order is the order it was written in.
-async fn seed(router: &MultiServiceRouter) -> (String, Vec<String>, String, Vec<String>) {
+async fn seed(router: &Harness) -> (String, Vec<String>, String, Vec<String>) {
     let campaign_instance = "cursor-rule-campaigns".to_string();
     let mut campaigns: Vec<String> = Vec::new();
     for n in 0..RECORDS {

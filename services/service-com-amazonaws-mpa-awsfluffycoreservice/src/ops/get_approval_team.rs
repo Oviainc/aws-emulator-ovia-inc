@@ -8,8 +8,9 @@
 //!
 //! `@readonly`: this handler writes nothing of its own. It calls
 //! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] first, which applies only what the
-//! CLOCK already owed at this instant (an invitation response that has come due, a
-//! pending deletion window that has run out, the approval and activation of a change the
+//! CLOCK already owed at this instant (an invitation response that has come due, the
+//! approval of a deletion the team was asked for and the end of the pending window that
+//! approval starts, the approval and activation of a change the
 //! team was asked for) — changes a caller who never polled would
 //! have seen anyway. Each approver's `MfaMethods` is reported off the stored record too,
 //! so a read never synchronizes an MFA device: `UpdateApprovalTeam`'s

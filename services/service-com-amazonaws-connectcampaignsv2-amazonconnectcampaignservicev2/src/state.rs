@@ -1281,6 +1281,34 @@ pub fn instance_not_found_message(connect_instance_id: &str) -> String {
     )
 }
 
+/// Whether the caller's Amazon Connect account holds an instance with
+/// `connect_instance_id`.
+///
+/// Amazon Connect owns the instance registry — `CreateInstance` is the only call that
+/// mints an instance id and `DeleteInstance` the only one that drops it — so the answer
+/// is read from THAT service's own store through the one shared engine rather than kept
+/// a second time here: an instance created or deleted over the Connect API is
+/// onboardable, or not, with no propagation step. It resolves by instance id alone,
+/// which is how every Connect operation that takes an `InstanceId` resolves one.
+///
+/// `None` when that store is unreachable (the engine is not the shared in-memory one),
+/// which a caller answers with a modelled server error exactly as it answers this
+/// service's own store being unavailable — never by treating the instance as absent.
+///
+/// LOCK ORDER: this takes the Connect store's lock, holds no other while it does, and
+/// hands back an owned value rather than a guard — so it is called with NO guard of
+/// this service's store held. Keeping the cross-service read one-directional and
+/// guard-free is what makes a lock cycle between the two stores unreachable.
+pub fn connect_instance_exists<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    connect_instance_id: &str,
+) -> Option<bool> {
+    let state =
+        ::service_com_amazonaws_connect_amazonconnectservice::state::service_state(engine)?;
+    let store = state.lock();
+    Some(store.instances.contains_key(connect_instance_id))
+}
+
 /// The most integrations one Connect instance's store holds, after which a further
 /// put is refused rather than taken.
 ///
