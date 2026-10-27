@@ -299,14 +299,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         // The databases the request selects: those the account it asks about owns, of the
-        // named resources, whose recommendation satisfies every filter. A member the request
-        // omits selects nothing away. The account is never a filter key a request chooses:
-        // it is the ONE account this service answers for ([`requested_account_id`]), so a row
+        // named resources, whose recommendation satisfies every filter. A caller sees the
+        // catalog's rows only once the analysis its enrollment started is due
+        // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_analysed_resources`]),
+        // so a just-enrolled account reads no recommendation rather than one nothing has
+        // produced yet. A member the request omits selects nothing away. The account is
+        // never a filter key a request chooses: it is the ONE account this service answers
+        // for ([`requested_account_id`]), so a row
         // another account owns is reported to nobody. The filters read the REPORTED
         // recommendation, so they select on exactly the values the response carries.
         let selected: Vec<RDSDBRecommendation> = store
-            .analysed_resources
-            .iter()
+            .visible_analysed_resources()
             .filter(|resource| resource.resource_type == crate::state::SOURCE_TYPE_RDS_DB_INSTANCE)
             .filter(|resource| resource.account_id == account_id)
             .filter(|resource| {
@@ -339,7 +342,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let errors: Vec<GetRecommendationError> = resource_arns
             .iter()
             .filter(|arn| {
-                !store.analysed_resources.iter().any(|resource| {
+                !store.visible_analysed_resources().any(|resource| {
                     resource.resource_type == crate::state::SOURCE_TYPE_RDS_DB_INSTANCE
                         && resource.account_id == account_id
                         && resource.arn_in(&region) == **arn

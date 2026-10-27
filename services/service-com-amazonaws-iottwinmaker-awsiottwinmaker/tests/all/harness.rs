@@ -434,6 +434,22 @@ impl Emulator {
         .await
     }
 
+    /// `UpdateScene`: PUT on the scene's own path, with both ids as
+    /// `@httpLabel`s and the members the patch names in the body.
+    pub(crate) async fn update_scene(
+        &self,
+        workspace_id: &str,
+        scene_id: &str,
+        body: Value,
+    ) -> Resp {
+        self.call(
+            "PUT",
+            &format!("/workspaces/{workspace_id}/scenes/{scene_id}"),
+            Some(body),
+        )
+        .await
+    }
+
     /// `ListScenes`: POST /workspaces/{workspaceId}/scenes-list, with the
     /// workspace as the only `@httpLabel` and the page members (`maxResults`,
     /// `nextToken`) carried in the body.

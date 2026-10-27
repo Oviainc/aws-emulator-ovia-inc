@@ -125,6 +125,9 @@ mod scene_listing;
 #[path = "all/scene_read.rs"]
 mod scene_read;
 
+#[path = "all/scene_update.rs"]
+mod scene_update;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

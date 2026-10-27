@@ -285,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.branch_name,
             &input.commit_id,
             std::time::SystemTime::now(),
-            Some(&crate::state::caller_identity_arn(ctx.parts())),
+            Some(&crate::state::caller_identity_arn(&*self.engine, ctx)),
         );
         // Adding a reference modifies the repository, and `lastModifiedDate` is "the
         // date and time the repository was last modified"

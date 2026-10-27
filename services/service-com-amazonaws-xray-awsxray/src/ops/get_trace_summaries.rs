@@ -624,13 +624,17 @@ fn http_of(root: &crate::state::SegmentRecord) -> Option<Http> {
     })
 }
 
-/// One segment's service identity: its `name`, plus its `origin` as the type.
+/// One segment's service identity: its `name`, plus the type the service is
+/// reported with — the `origin` a service that submitted the segment carried,
+/// or, for a service this trace only CALLED, the type the call inferred
+/// (`namespace: "remote"` is reported as `remote`), which is what tells a reader
+/// an external dependency apart from a service that reports segments of its own.
 fn service_id_of(segment: &crate::state::SegmentRecord) -> ServiceId {
     ServiceId {
         name: Some(segment.name.clone()),
         names: Some(vec![segment.name.clone()]),
         account_id: segment.account_id.clone(),
-        r#type: segment.origin.clone(),
+        r#type: segment.service_type(),
     }
 }
 

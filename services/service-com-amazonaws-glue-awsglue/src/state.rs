@@ -6868,6 +6868,18 @@ pub mod messages {
     /// template.
     pub const JOB_METADATA_MISSING: &str = "Failed to start job run due to missing metadata.";
 
+    /// A tag write whose `ResourceArn` names a Region other than the one the endpoint
+    /// serving the request is in (`TagResource`). Recorded constant: the refusal states
+    /// only that the ARN belongs elsewhere and names neither the ARN nor either Region,
+    /// and it is a client-INPUT refusal rather than a miss — a Glue ARN of another Region
+    /// is a bad parameter, whether or not that Region holds the resource.
+    ///
+    /// This is the WRITE's wording and not yet this crate's answer everywhere: the tag
+    /// READ (`GetTags`) still answers that condition with the kind's miss, which is what
+    /// the cross-service tag projection's own suite pins it to. Only a recording of the
+    /// read's refusal settles whether the two are one sentence.
+    pub const ARN_WRONG_REGION: &str = "Arn passed doesn't belong to this region.";
+
     /// Any Data Catalog operation whose `DatabaseName`/`Name` names no database
     /// (`GetDatabase`, `DeleteDatabase`, `UpdateDatabase`, and the parent-database miss
     /// of every table operation: `GetTable`, `GetTables`, `CreateTable`, `UpdateTable`,
@@ -7492,6 +7504,14 @@ pub const TAGGED_RESOURCE_TYPES: [(&str, TaggedResourceKind); 4] = [
     ("job", TaggedResourceKind::Job),
 ];
 
+/// How many tags one resource's tag set may hold at once.
+///
+/// Source: the modelled `TagsMap` bound (len 0..50), which is the shape BOTH a tag
+/// write's `TagsToAdd` and `GetTags`'s `Tags` target — so a tag set past this many
+/// entries could not be reported by the read that serves it. A write that would carry a
+/// resource past it is refused instead of stored.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 impl TaggedResourceKind {
     /// This kind's ARN resource-type segment, from [`TAGGED_RESOURCE_TYPES`].
     pub fn arn_segment(self) -> &'static str {
@@ -7602,6 +7622,20 @@ pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
         "ResourceArn must be the ARN of a taggable Glue resource naming one of {}; got \
          {resource_arn:?}",
         kinds.join(", ")
+    )
+}
+
+/// The message a refusal carries for a tag write that would leave the resource holding
+/// more tags than one tag set may have ([`MAX_TAGS_PER_RESOURCE`]).
+///
+/// Derived from the request, like this crate's other refusals whose wording no recording
+/// or doc states: it names how many tags the write would leave and the bound it passes.
+/// What is pinned is the behaviour — 400 with `InvalidInputException`, and nothing
+/// stored.
+pub fn tag_limit_exceeded_message(would_hold: usize) -> String {
+    format!(
+        "TagsToAdd would leave the resource holding {would_hold} tags, more than the \
+         {MAX_TAGS_PER_RESOURCE} allowed per resource"
     )
 }
 

@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A managed policy's document is bounded well below `policyDocumentType`'s own
         // 131072-character ceiling, so a document past the quota is refused rather
         // than stored.
-        let characters = crate::state::managed_policy_characters(&input.policy_document);
+        let characters = crate::state::policy_document_characters(&input.policy_document);
         if characters > crate::state::MAX_MANAGED_POLICY_CHARACTERS {
             return Err(CreatePolicyErrorModeled::LimitExceededException(
                 LimitExceededException {

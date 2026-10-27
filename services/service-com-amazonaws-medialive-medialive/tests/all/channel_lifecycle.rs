@@ -687,31 +687,195 @@ async fn the_store_is_bounded_and_a_full_store_fits_one_page() {
     );
 }
 
-/// Rule: `DryRun` carries no documented semantics in this model, so a create that
-/// asks for one is refused with the operation's modelled client error rather than
-/// silently creating a channel.
+/// The input attachments a row carries, as many as it asks for.
+fn attachments(count: usize) -> Vec<Value> {
+    (0..count)
+        .map(|slot| json!({ "inputId": "1000000", "inputAttachmentName": format!("slot-{slot}") }))
+        .collect()
+}
+
+/// The output destinations a row carries, as many as it asks for.
+fn destinations(count: usize) -> Vec<Value> {
+    (0..count)
+        .map(|slot| json!({ "id": format!("destination-{slot}") }))
+        .collect()
+}
+
+/// Rule: a request carrying the modelled `dryRun` flag is VALIDATE-ONLY — the
+/// service checks it exactly as it checks the same request without the flag and
+/// answers the same status and error code, but performs none of the writes, so
+/// no resource is created and the success response describes none.
+///
+/// The rows span what the rule generalises over: the configuration classes the
+/// create accepts (bare, every stored member named, a list at its ceiling) and
+/// each class it refuses (a reserved `aws:` tag key, a caller-chosen list one
+/// entry past its ceiling). Every row runs three times — with `dryRun` true,
+/// with it false and with it omitted — so the verdict the dry run reports is the
+/// verdict the real create reports.
 #[tokio::test]
-async fn a_dry_run_create_is_refused_rather_than_creating_a_channel() {
+async fn a_dry_run_create_validates_without_creating_a_channel() {
+    use service_com_amazonaws_medialive_medialive::state::{
+        MAX_CHANNEL_DESTINATIONS, MAX_INPUT_ATTACHMENTS,
+    };
+
+    // (case, the configuration, the verdict the create earns, its error code)
+    let table: [(&str, Value, u16, &str); 6] = [
+        ("the bare configuration", json!({ "name": "dry" }), 201, ""),
+        (
+            "every stored member named",
+            json!({
+                "name": "dry-full",
+                "channelClass": "SINGLE_PIPELINE",
+                "logLevel": "INFO",
+                "roleArn": "arn:aws:iam::111122223333:role/Dry",
+                "destinations": destinations(1),
+                "inputAttachments": attachments(1),
+                "tags": { "team": "video" },
+            }),
+            201,
+            "",
+        ),
+        (
+            "attachments at the ceiling",
+            json!({ "name": "dry", "inputAttachments": attachments(MAX_INPUT_ATTACHMENTS) }),
+            201,
+            "",
+        ),
+        (
+            "a reserved tag key",
+            json!({ "name": "dry", "tags": { "aws:owner": "video" } }),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "attachments one past the ceiling",
+            json!({ "name": "dry", "inputAttachments": attachments(MAX_INPUT_ATTACHMENTS + 1) }),
+            400,
+            "BadRequestException",
+        ),
+        (
+            "destinations one past the ceiling",
+            json!({ "name": "dry", "destinations": destinations(MAX_CHANNEL_DESTINATIONS + 1) }),
+            400,
+            "BadRequestException",
+        ),
+    ];
+
+    for (case, configuration, verdict, code) in table {
+        let router = medialive();
+        let mut asked = configuration.clone();
+        asked["dryRun"] = json!(true);
+        let (status, body) = call(&router, "POST", "/prod/channels", Some(asked)).await;
+        assert_eq!(
+            status, verdict,
+            "case {case:?}: expected the dry run to answer {verdict}, got {status}: {body}"
+        );
+        if verdict == 201 {
+            assert!(
+                body["channel"].is_null(),
+                "case {case:?}: a dry run creates nothing, so it must describe no channel, got {:?}",
+                body["channel"]
+            );
+        } else {
+            assert_eq!(
+                error_code(status, &body),
+                code,
+                "case {case:?}: expected {code}, got {body}"
+            );
+        }
+        let (_, listed) = call(&router, "GET", "/prod/channels", None).await;
+        assert_eq!(
+            listed["channels"],
+            json!([]),
+            "case {case:?}: a dry run must not have created a channel, got {:?}",
+            listed["channels"]
+        );
+
+        // The same configuration performed for real — once with the flag set to
+        // false and once with it left out — is the control: it earns the very
+        // verdict the dry run reported, and creates a channel when it succeeds.
+        for flag in [Some(false), None] {
+            let router = medialive();
+            let mut performed = configuration.clone();
+            if let Some(flag) = flag {
+                performed["dryRun"] = json!(flag);
+            }
+            let (status, body) = call(&router, "POST", "/prod/channels", Some(performed)).await;
+            assert_eq!(
+                status, verdict,
+                "case {case:?} with dryRun {flag:?}: expected {verdict}, got {status}: {body}"
+            );
+            let (_, listed) = call(&router, "GET", "/prod/channels", None).await;
+            let expected_channels = usize::from(verdict == 201);
+            assert_eq!(
+                listed["channels"].as_array().map(Vec::len),
+                Some(expected_channels),
+                "case {case:?} with dryRun {flag:?}: expected {expected_channels} channel(s) stored, got {:?}",
+                listed["channels"]
+            );
+        }
+    }
+}
+
+/// Rule (the same one, seen from the state a dry run must leave alone): a
+/// validate-only create performs none of the create's writes, so it consumes no
+/// id and records no idempotency token — the next real create mints exactly what
+/// it would have minted had the dry runs never been made.
+#[tokio::test]
+async fn a_dry_run_create_writes_nothing_a_later_create_can_see() {
+    // What a first real create mints in a store no dry run ever touched.
+    let control = medialive();
+    let first = create(&control, json!({ "name": "control" })).await;
+
     let router = medialive();
-    let (status, body) = call(
-        &router,
-        "POST",
-        "/prod/channels",
-        Some(json!({ "name": "dry", "dryRun": true })),
-    )
-    .await;
-    assert_eq!(status, 400, "expected a refusal, got {status}: {body}");
+    for attempt in 0..3 {
+        let (status, body) = call(
+            &router,
+            "POST",
+            "/prod/channels",
+            Some(json!({
+                "name": format!("dry-{attempt}"),
+                "requestId": "retry-token",
+                "dryRun": true,
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "attempt {attempt}: expected the dry run to succeed, got {status}: {body}"
+        );
+        assert!(
+            body["channel"].is_null(),
+            "attempt {attempt}: a dry run describes no channel, got {:?}",
+            body["channel"]
+        );
+    }
+
+    let created = create(&router, json!({ "name": "real", "requestId": "retry-token" })).await;
     assert_eq!(
-        error_code(status, &body),
-        "BadRequestException",
-        "expected BadRequestException, got {body}"
+        created["id"], first["id"],
+        "expected the create after the dry runs to mint the first id, got {:?}",
+        created["id"]
+    );
+    assert_eq!(
+        created["arn"], first["arn"],
+        "expected the create after the dry runs to build the first ARN, got {:?}",
+        created["arn"]
     );
 
+    // The create that really ran DID record its token, so the retry answers with
+    // that same channel rather than minting a second one.
+    let retried = create(&router, json!({ "name": "real", "requestId": "retry-token" })).await;
+    assert_eq!(
+        retried["id"], created["id"],
+        "expected the retried create to answer with the channel it created, got {:?}",
+        retried["id"]
+    );
     let (_, listed) = call(&router, "GET", "/prod/channels", None).await;
     assert_eq!(
-        listed["channels"],
-        json!([]),
-        "a refused dry run must not have created a channel, got {:?}",
+        listed["channels"].as_array().map(Vec::len),
+        Some(1),
+        "expected exactly the one channel the real create made, got {:?}",
         listed["channels"]
     );
 }

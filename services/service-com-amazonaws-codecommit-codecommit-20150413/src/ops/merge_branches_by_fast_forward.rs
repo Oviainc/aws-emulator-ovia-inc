@@ -432,7 +432,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &target,
                 &merged_commit_id,
                 now,
-                Some(&crate::state::caller_identity_arn(ctx.parts())),
+                Some(&crate::state::caller_identity_arn(&*self.engine, ctx)),
             );
             // Moving a reference modifies the repository, so `lastModifiedDate`
             // moves with it, exactly as it does for a write through `PutFile` or a

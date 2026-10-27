@@ -467,6 +467,9 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         )),
         state_transition_reason: None,
         state_reason: None,
+        // Nobody has asked to reboot a host that has just been launched.
+        queued_reboots: 0,
+        last_reboot_queued_at: None,
         launch_time: ::std::time::SystemTime::now(),
         ami_launch_index: 0,
         // "EC2 instances created through Amazon EVS do not support associating an IAM

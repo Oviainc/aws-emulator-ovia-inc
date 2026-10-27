@@ -217,12 +217,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // associated ingestion before you can delete an app authorization."
         if let Some(ingestion) = bundle.ingestion_for(&app, &tenant) {
             return Err(DeleteAppAuthorizationErrorModeled::ValidationException(
-                crate::state::precondition_not_met(format!(
-                    "App authorization {authorization_arn} is associated with ingestion {}; \
-                     you must delete the associated ingestion before you can delete an app \
-                     authorization.",
-                    ingestion.arn
-                )),
+                crate::state::associated_ingestion_still_held(
+                    &authorization_arn,
+                    &ingestion.arn,
+                    "delete",
+                ),
             )
             .into());
         }

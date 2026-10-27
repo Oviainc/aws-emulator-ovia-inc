@@ -279,7 +279,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // endpoint: the database it asks about is that region's, and a resource named by the
         // ARN of another region is one this endpoint holds no analysis for.
         let region = crate::state::request_region(ctx);
-        let Some(resource) = guard.analysed_resources.iter().find(|resource| {
+        // The databases a caller can read: those of the findings catalog, which a caller sees
+        // only once the analysis its enrollment started is due
+        // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_analysed_resources`]),
+        // so a database the analysis has not reached yet is reported exactly as one this
+        // service holds no analysis for — the gate every recommendation reader of this
+        // service applies.
+        let Some(resource) = guard.visible_analysed_resources().find(|resource| {
             resource.resource_type == crate::state::SOURCE_TYPE_RDS_DB_INSTANCE
                 && resource.arn_in(&region) == input.resource_arn
         }) else {

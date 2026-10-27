@@ -671,6 +671,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
                 state_transition_reason: None,
                 state_reason: None,
+                // Nobody has asked to reboot an instance that has just been launched.
+                queued_reboots: 0,
+                last_reboot_queued_at: None,
                 launch_time,
                 ami_launch_index: i32::try_from(launch_index).unwrap_or(i32::MAX),
                 user_data: input.user_data.clone(),
