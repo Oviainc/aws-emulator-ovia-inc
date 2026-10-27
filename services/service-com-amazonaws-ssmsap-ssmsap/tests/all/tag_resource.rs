@@ -126,6 +126,19 @@ pub(crate) fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// `count` distinct tags, keyed from the modelled `TagKey` character class
+/// (`smithy_query(query="shape", shape="TagKey")`: letters, digits and `-` are all in it)
+/// and valued inside the modelled `TagValue` length — a set of a size a row chooses.
+///
+/// `pub(crate)` because the suites of this target share one harness: the registration
+/// suite (`tests/all/registration_tag_ceiling.rs`) fills a resource to the same ceiling
+/// through `RegisterApplication$Tags`, and both must fill it with the same set.
+pub(crate) fn numbered_tags(count: usize) -> Vec<(String, String)> {
+    (0..count)
+        .map(|index| (format!("key-{index}"), format!("value-{index}")))
+        .collect()
+}
+
 /// One row of the "what a call persists" table.
 struct Case {
     /// How an assertion names the row.
@@ -508,11 +521,8 @@ async fn the_per_resource_tag_ceiling_is_refused_and_persists_nothing() {
     .await;
     let arn = application_arn(REGION, "tag-ceiling");
 
-    // Keys drawn from the modelled `TagKey` class (letters, digits and `-` are all in
-    // it), one per tag the store will hold.
-    let at_ceiling: Vec<(String, String)> = (0..MAX_TAGS_PER_RESOURCE)
-        .map(|index| (format!("key-{index}"), format!("value-{index}")))
-        .collect();
+    // One key per tag the store will hold, drawn from the modelled `TagKey` class.
+    let at_ceiling = numbered_tags(MAX_TAGS_PER_RESOURCE);
     assert_accepted("filled to the ceiling", &tag(&emulator, &arn, &at_ceiling).await);
     let expected: BTreeMap<String, String> = at_ceiling.iter().cloned().collect();
     let held = tags_held(&emulator, "filled to the ceiling", &arn).await;
