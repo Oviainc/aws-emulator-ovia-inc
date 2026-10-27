@@ -1,15 +1,51 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateOriginRequestPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateOriginRequestPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateOriginRequestPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the configuration of the origin request policy an id names, WHOLE: "all the
+//! fields are updated with the values provided in the request. You cannot update some
+//! fields independent of others" — so the stored configuration becomes the submitted one
+//! down to the members it leaves out, `LastModifiedTime` moves to now, and a fresh version
+//! token is minted, which is the one a later `If-Match` against this policy is checked
+//! against. Reports the record as it then stands, read from the store rather than from the
+//! request.
+//!
+//! The refusals, in the order they are checked — each one BEFORE anything is written, so a
+//! refused update leaves the stored policy, its version token and its `LastModifiedTime`
+//! exactly as they were:
+//!
+//! * an id a policy AWS published holds — `IllegalUpdate` (HTTP 400), the same rule a
+//!   delete of one is refused by: a published policy is readable in this account but
+//!   belongs to AWS ([`crate::state::illegal_update_managed_policy`]);
+//! * an id no stored policy holds — `NoSuchOriginRequestPolicy` (HTTP 404), decided BEFORE
+//!   the precondition, because the id is what the mutation is about: a policy that is gone
+//!   is unusable, not merely unreadable, so no version of it can make the write land
+//!   ([`crate::state::no_such_origin_request_policy`]);
+//! * an `If-Match` that is absent or is not a version token at all —
+//!   `InvalidIfMatchVersion` (HTTP 400), "The If-Match version is missing or not valid";
+//!   one that carries a token that is not this policy's current one — `PreconditionFailed`
+//!   (HTTP 412), so an update only lands on the configuration its caller actually read
+//!   ([`crate::state::check_if_match`]);
+//! * a list wrapper whose `Quantity` disagrees with the length of its `Items` —
+//!   `InconsistentQuantities` (HTTP 400), the same rule every CloudFront list wrapper obeys
+//!   and the one the create path walks
+//!   ([`crate::state::origin_request_policy_quantity_mismatch`]);
+//! * a `Name` ANOTHER policy already holds — `OriginRequestPolicyConfig$Name` is "A unique
+//!   name to identify the origin request policy", so renaming a policy onto a name that is
+//!   taken is `OriginRequestPolicyAlreadyExists` (HTTP 409); the name this policy already
+//!   holds is its own, so an update that keeps its name is not a conflict with itself.
+//!
+//! Those are exactly the configuration constraints
+//! [`crate::ops::create_origin_request_policy`] refuses a payload with, so an update stores
+//! nothing the create would have refused and refuses nothing it accepts. `InvalidArgument`
+//! is unreachable for that reason: an `OriginRequestPolicyConfig` carries no member this
+//! service validates beyond those, and the three per-list quota refusals
+//! (`TooManyCookiesInOriginRequestPolicy`, `TooManyHeadersInOriginRequestPolicy`,
+//! `TooManyQueryStringsInOriginRequestPolicy`) are unreachable for the reason the create
+//! path states: their maximum is an account quota CloudFront can raise and neither the model
+//! nor the shape documentation states a number for it, so a bound invented for them would
+//! refuse configurations the service accepts. `AccessDenied` is unreachable here, as it is
+//! from every other operation in this service: the emulator authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -100,6 +136,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -178,18 +218,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateOriginRequestPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateOriginRequestPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateOriginRequestPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.origin_request_policy_config;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // A policy AWS published belongs to AWS, so this account cannot write over the
+        // configuration AWS gave it: the update is refused for what the REQUEST asked for
+        // — a change to a service-owned resource — the same rule a delete of one is
+        // refused by, and the policy keeps serving the configuration a read reports.
+        if crate::state::managed_origin_request_policy(&input.id).is_some() {
+            return Err(UpdateOriginRequestPolicyErrorModeled::IllegalUpdate(
+                crate::state::illegal_update_managed_policy(),
+            )
+            .into());
+        }
+
+        // The policy being updated is looked up FIRST: every refusal below is about the
+        // record this id names, so an id the store does not hold is answered "does not
+        // exist" before any precondition is evaluated, and nothing is minted for it.
+        let Some(current_etag) = store
+            .origin_request_policy(&input.id)
+            .map(|stored| stored.etag.clone())
+        else {
+            return Err(
+                UpdateOriginRequestPolicyErrorModeled::NoSuchOriginRequestPolicy(
+                    crate::state::no_such_origin_request_policy(),
+                )
+                .into(),
+            );
+        };
+
+        // The precondition is checked against the STORED version, so an update only lands
+        // on the configuration its caller actually read.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(
+                    UpdateOriginRequestPolicyErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            IfMatch::Stale => {
+                return Err(UpdateOriginRequestPolicyErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // "The value of Quantity and the size of Items don't match." — walked over every
+        // wrapper this configuration reaches, exactly as the create path walks it.
+        if let Some(message) = crate::state::origin_request_policy_quantity_mismatch(&config) {
+            return Err(
+                UpdateOriginRequestPolicyErrorModeled::InconsistentQuantities(
+                    InconsistentQuantities {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "A unique name to identify the origin request policy": a name identifies ONE
+        // policy, so a name another policy holds cannot be moved onto this one. The policy
+        // being updated already holds its own name, which is why the holder's id is
+        // compared.
+        if store
+            .origin_request_policy_named(&config.name)
+            .is_some_and(|holder| holder.id != input.id)
+        {
+            return Err(
+                UpdateOriginRequestPolicyErrorModeled::OriginRequestPolicyAlreadyExists(
+                    crate::state::origin_request_policy_already_exists(&config.name),
+                )
+                .into(),
+            );
+        }
+
+        // Defensive: the id was confirmed present above under this same lock, so the write
+        // cannot miss. The `None` arm is the modelled 404 rather than a panic.
+        let Some(stored) = store.apply_origin_request_policy_config(&input.id, config, now) else {
+            return Err(
+                UpdateOriginRequestPolicyErrorModeled::NoSuchOriginRequestPolicy(
+                    crate::state::no_such_origin_request_policy(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(UpdateOriginRequestPolicyOutput {
+            // "An origin request policy." — read from the record just written, never from
+            // the request.
+            origin_request_policy: Some(stored.to_origin_request_policy()),
+            // "The current version of the origin request policy" — a fresh token, so the
+            // version this caller just replaced no longer satisfies an `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }
