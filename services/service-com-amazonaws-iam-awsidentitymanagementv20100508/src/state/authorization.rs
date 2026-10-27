@@ -138,6 +138,9 @@ pub const UNTAG_POLICY: &str = "iam:UntagPolicy";
 /// `iam:CreatePolicyVersion`.
 pub const CREATE_POLICY_VERSION: &str = "iam:CreatePolicyVersion";
 
+/// `iam:DeletePolicyVersion`.
+pub const DELETE_POLICY_VERSION: &str = "iam:DeletePolicyVersion";
+
 /// `iam:SetDefaultPolicyVersion`.
 pub const SET_DEFAULT_POLICY_VERSION: &str = "iam:SetDefaultPolicyVersion";
 
