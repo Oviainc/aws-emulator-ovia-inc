@@ -806,6 +806,17 @@ impl ComAmazonawsKendrarankingAwskendrarerankingfrontendserviceState {
         self.regions.get(region)
     }
 
+    /// [`plans_in`](Self::plans_in), for a call that writes the plans it resolves.
+    ///
+    /// A WRITER's view of an EXISTING region: like the reader, it never creates the
+    /// region's bucket, so a write addressed to a region this store holds nothing in
+    /// resolves to nothing instead of leaving an empty bucket behind. The one place the
+    /// write path takes a region's bucket, so it cannot reach a different set of plans
+    /// than the read path does.
+    fn plans_in_mut(&mut self, region: &str) -> Option<&mut RegionalPlans> {
+        self.regions.get_mut(region)
+    }
+
     /// The plan that id names in `region`, whatever its status.
     pub fn plan(&self, region: &str, id: &str) -> Option<&RescoreExecutionPlan> {
         self.plans_in(region)?.plans.get(id)
@@ -813,28 +824,36 @@ impl ComAmazonawsKendrarankingAwskendrarerankingfrontendserviceState {
 
     /// [`plan`](Self::plan), for a call that writes the plan it resolves.
     pub fn plan_mut(&mut self, region: &str, id: &str) -> Option<&mut RescoreExecutionPlan> {
-        self.regions.get_mut(region)?.plans.get_mut(id)
+        self.plans_in_mut(region)?.plans.get_mut(id)
     }
 
-    /// The plan an ARN-addressed call names in `region`, or `None` when that region
-    /// holds no plan under that ARN. Resolved through the region's `arn_index`, so no
-    /// caller scans `plans`; an ARN naming another region resolves to nothing here,
-    /// because the plan it names does not live in this region.
+    /// The id of the plan an ARN names in `region`, or `None` when that region holds no
+    /// plan under that ARN — the ONE place a `ResourceARN` becomes a plan id, so the
+    /// reading and the writing lookup below resolve an ARN by the same steps and any
+    /// rule added to this mapping reaches both.
+    ///
+    /// Resolved through the region's `arn_index`, so no caller scans `plans`; an ARN
+    /// naming another region resolves to nothing here, because the plan it names does
+    /// not live in this region.
+    fn id_for_arn(&self, region: &str, resource_arn: &str) -> Option<&str> {
+        Some(self.plans_in(region)?.arn_index.get(resource_arn)?.as_str())
+    }
+
+    /// The plan an ARN-addressed call names in `region`, or `None` when that ARN
+    /// resolves to no plan there.
     pub fn plan_by_arn(&self, region: &str, resource_arn: &str) -> Option<&RescoreExecutionPlan> {
-        let regional = self.plans_in(region)?;
-        let id = regional.arn_index.get(resource_arn)?;
-        regional.plans.get(id)
+        self.plan(region, self.id_for_arn(region, resource_arn)?)
     }
 
-    /// [`plan_by_arn`](Self::plan_by_arn), for a call that writes the plan it resolves.
+    /// [`plan_by_arn`](Self::plan_by_arn), for a call that writes the plan it resolves:
+    /// the same ARN -> id step, then the write path's lookup of that id.
     pub fn plan_by_arn_mut(
         &mut self,
         region: &str,
         resource_arn: &str,
     ) -> Option<&mut RescoreExecutionPlan> {
-        let regional = self.regions.get_mut(region)?;
-        let id = regional.arn_index.get(resource_arn)?.clone();
-        regional.plans.get_mut(&id)
+        let id = self.id_for_arn(region, resource_arn)?.to_string();
+        self.plan_mut(region, &id)
     }
 
     /// The plan an ARN-addressed call names in `region`, or the modelled refusal that

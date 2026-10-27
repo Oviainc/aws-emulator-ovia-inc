@@ -416,8 +416,9 @@ async fn a_delete_naming_no_billing_period_range_removes_the_item_from_every_per
 }
 
 /// One row of the billing-period-range table: the case, the span the item is created
-/// with (none when it applies to every period), the span the delete names, the periods a
-/// later read still reports the item for, and the periods it does not.
+/// with (none when the create names no range, so the item applies from the period it was
+/// created in on), the span the delete names, the periods a later read still reports the
+/// item for, and the periods it does not.
 type SpanRow = (&'static str, Option<Value>, Value, Vec<String>, Vec<String>);
 
 /// THE RULE for a request that names a billing period range: the item is deleted only
@@ -434,18 +435,18 @@ async fn a_delete_naming_a_billing_period_range_removes_the_item_only_from_those
     // the item is still reported for, the periods it is not)
     let rows: Vec<SpanRow> = vec![
         (
-            "an open-ended delete of an item with no span",
+            "an open-ended delete of an item with no span of its own",
             None,
             range(&period(0), None),
-            vec![period(-3), period(-1)],
-            vec![period(0), period(1), period(12)],
+            vec![],
+            vec![period(-3), period(-1), period(0), period(1), period(12)],
         ),
         (
             "a bounded delete of an item with no span takes only the periods it named",
             None,
             range(&period(-1), Some(&period(1))),
-            vec![period(-3), period(-2), period(1), period(2), period(12)],
-            vec![period(-1), period(0)],
+            vec![period(1), period(2), period(12)],
+            vec![period(-3), period(-2), period(-1), period(0)],
         ),
         (
             "a bounded delete strictly inside a bounded span keeps both sides of it",
@@ -882,10 +883,16 @@ async fn a_delete_whose_range_starts_outside_the_current_or_previous_period_is_r
     for (case, deleted_with, inside_the_window) in rows {
         let emulator = Emulator::new();
         let group = emulator.billing_group("payer").await;
-        // An item with no span of its own applies to EVERY billing period, so a range
-        // the operation may act in always has something of it to delete and one it may
-        // not act in is refused for the period it names, not for naming nothing.
-        let item = emulator.custom_line_item(&group, "guarded", json!({})).await;
+        // An item applying from the PREVIOUS billing period on, with no end: every range
+        // the operation may act in has something of it to delete, so a range it may not
+        // act in is refused for the period it names, not for naming nothing.
+        let item = emulator
+            .custom_line_item(
+                &group,
+                "guarded",
+                json!({ "BillingPeriodRange": range(&period(-1), None) }),
+            )
+            .await;
         let before = emulator.stored(case, &item).await;
 
         let (status, body) = emulator.delete(&item, &deleted_with).await;
@@ -910,7 +917,7 @@ async fn a_delete_whose_range_starts_outside_the_current_or_previous_period_is_r
             before,
             "case {case:?}: a refused delete must leave the stored item untouched"
         );
-        for probe in [period(-120), period(-1), period(0), period(120)] {
+        for probe in [period(-1), period(0), period(120)] {
             assert!(
                 emulator.reports(case, &item, Some(&probe)).await,
                 "case {case:?}: expected the read for {probe:?} to still report the item"
@@ -1051,9 +1058,16 @@ async fn deleting_an_item_releases_the_associations_other_items_held_to_it() {
 async fn repeated_bounded_deletes_each_take_only_the_periods_they_name() {
     let emulator = Emulator::new();
     let group = emulator.billing_group("payer").await;
-    // No span of its own, so the item starts out applying to every billing period and
-    // each delete carves out exactly the periods it names.
-    let item = emulator.custom_line_item(&group, "twice", json!({})).await;
+    // An open-ended span from the PREVIOUS billing period on, so the item starts out
+    // applying to that period and every later one and each delete carves out exactly the
+    // periods it names.
+    let item = emulator
+        .custom_line_item(
+            &group,
+            "twice",
+            json!({ "BillingPeriodRange": range(&period(-1), None) }),
+        )
+        .await;
 
     // (the span the delete names, the periods a read still reports the item for
     // afterwards, the periods it does not) — the second delete names periods abutting the
@@ -1061,13 +1075,13 @@ async fn repeated_bounded_deletes_each_take_only_the_periods_they_name() {
     let steps: Vec<(Value, Vec<String>, Vec<String>)> = vec![
         (
             range(&period(0), Some(&period(1))),
-            vec![period(-2), period(-1), period(1), period(12)],
-            vec![period(0)],
+            vec![period(-1), period(1), period(12)],
+            vec![period(-2), period(0)],
         ),
         (
             range(&period(-1), Some(&period(0))),
-            vec![period(-2), period(1), period(12)],
-            vec![period(-1), period(0)],
+            vec![period(1), period(12)],
+            vec![period(-2), period(-1), period(0)],
         ),
     ];
 

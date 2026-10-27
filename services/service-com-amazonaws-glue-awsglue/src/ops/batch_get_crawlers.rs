@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetCrawlers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetCrawlers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetCrawlers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads several crawlers by name in one call. A batch READ: it answers from the store
+//! and writes nothing.
+//!
+//! Each name the request lists is answered on its own, in the order it was sent and with
+//! its repeats kept, because the answer reports "a list of resource metadata for a given
+//! list of crawler names" rather than a set: a name the account holds a crawler for
+//! contributes that crawler's own projection — the one [`crate::ops::get_crawler`] serves
+//! — and a name it holds none for contributes that name to `CrawlersNotFound`. A miss is
+//! therefore an absence this answer REPORTS, not a failure of the whole batch, which is
+//! what distinguishes this read from the single-crawler one that answers
+//! `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +145,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetCrawlers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetCrawlersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetCrawlers"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as its own timeout error — the way the single-crawler read reports it
+            // (`crate::ops::get_crawler`).
+            return Err(BatchGetCrawlersErrorModeled::OperationTimeoutException(
+                OperationTimeoutException {
+                    message: Some("the Glue crawler store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `CrawlerNameList` is bounded `length 0..100`, and each of its elements
+        // `length 1..255` with a pattern, so a batch too large to serve and a name too
+        // long or too short to address a crawler are both refused at the request
+        // boundary: reaching here, the only question per name is whether the account
+        // holds a crawler of that name. The walk keeps the request's order and its
+        // repeats — one answer per REQUESTED name, not per distinct name — and runs in a
+        // critical section scoped to the lookups alone, bounded above by that modelled
+        // list length, with the guard dropped before the answer is built.
+        let (crawlers, crawlers_not_found) = {
+            let store = state.lock();
+            let mut crawlers = Vec::new();
+            let mut crawlers_not_found = Vec::new();
+            for name in &input.crawler_names {
+                match store.crawlers.get(name) {
+                    Some(entry) => crawlers.push(entry.to_crawler()),
+                    None => crawlers_not_found.push(name.clone()),
+                }
+            }
+            (crawlers, crawlers_not_found)
+        };
+
+        ::tracing::info!(
+            operation = "BatchGetCrawlers",
+            requested = input.crawler_names.len(),
+            found = crawlers.len(),
+            not_found = crawlers_not_found.len(),
+            "read Glue crawlers in a batch"
+        );
+
+        // Both lists are reported, empty included: a caller reads `CrawlersNotFound` to
+        // learn which of its names missed, so an omitted list would make "none missed"
+        // indistinguishable from "not answered".
+        Ok(BatchGetCrawlersOutput {
+            crawlers: Some(crawlers),
+            crawlers_not_found: Some(crawlers_not_found),
+        })
     }
 }
