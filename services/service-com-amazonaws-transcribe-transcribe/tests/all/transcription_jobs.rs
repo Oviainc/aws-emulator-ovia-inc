@@ -23,6 +23,12 @@ use smithy_server_runtime::MultiServiceRouter;
 /// available here.
 const PAST_EVERY_TRANSITION: Duration = Duration::from_millis(1_300);
 
+/// How long [`Transcribe::vocabulary_ready`] waits between two polls, and how many
+/// polls it makes before giving up: together comfortably past one
+/// `crate::state::VOCABULARY_TRANSITION_DELAY` (500 ms) even on a slow machine.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const POLLS_FOR_READY: usize = 40;
+
 /// One emulator: the service mounted on a single shared engine behind the router.
 ///
 /// `pub(crate)`, like [`Reply`] and [`dispatch`] below it: the vocabulary suite in this
@@ -69,6 +75,50 @@ impl Transcribe {
         region: Option<&str>,
     ) -> Reply {
         dispatch(&self.router, operation, input, region).await
+    }
+
+    /// Wait until the custom vocabulary `name`, held in `region`, is one a job may
+    /// APPLY — polling `GetVocabulary` exactly as a caller must.
+    ///
+    /// A custom vocabulary is usable only once its build has finished successfully
+    /// ("If the state is READY, you can use the custom vocabulary" — the model's doc
+    /// for `VocabularyState`, `smithy_query(query="shape", shape="VocabularyState")`),
+    /// and a create leaves it `PENDING` until its build falls due. So a suite that
+    /// starts a job naming a vocabulary it just created waits here first; nothing about
+    /// the wait is specific to one vocabulary, hence one home for it beside the
+    /// dispatcher.
+    pub(crate) async fn vocabulary_ready(&self, name: &str, region: Option<&str>) {
+        let state = self.vocabulary_settled(name, region).await;
+        assert_eq!(
+            state, "READY",
+            "case {name:?}: a vocabulary built from Phrases must settle READY, got \
+             {state:?}"
+        );
+    }
+
+    /// Poll `GetVocabulary` until the build of the custom vocabulary `name`, held in
+    /// `region`, has FINISHED, and answer the `VocabularyState` it settled in — `READY`
+    /// for one built from the terms the request listed, `FAILED` for one whose terms
+    /// were to be read from a file.
+    ///
+    /// The one home for "wait out a vocabulary's build": [`Self::vocabulary_ready`] is
+    /// this plus the assertion that the build succeeded.
+    pub(crate) async fn vocabulary_settled(&self, name: &str, region: Option<&str>) -> String {
+        let case = format!("GetVocabulary {name:?}");
+        for _ in 0..POLLS_FOR_READY {
+            let reply = self
+                .call_in_region("GetVocabulary", json!({"VocabularyName": name}), region)
+                .await;
+            let state = reply.ok(&case)["VocabularyState"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: expected a VocabularyState"))
+                .to_string();
+            if state != "PENDING" {
+                return state;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        panic!("case {case:?}: the custom vocabulary's build never finished");
     }
 }
 
