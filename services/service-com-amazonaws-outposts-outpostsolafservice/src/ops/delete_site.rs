@@ -147,17 +147,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // region's inventory and of no other's, so that is where the identifier is
         // resolved — one region's endpoint cannot delete another region's site.
         let region = crate::state::request_region(ctx.parts());
-        // `SiteId` accepts the bare id or the full site ARN; both name the same
-        // stored record.
-        let site_id = crate::state::resolve_site_id(&input.site_id).ok_or_else(|| {
-            DeleteSiteErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::site_id_pattern_report()),
-            })
-        })?;
-
-        let mut store = state.lock();
-        if store.site(&region, &site_id).is_none() {
-            return Err(DeleteSiteErrorModeled::NotFoundException(NotFoundException {
+        // `SiteId` accepts the bare id or the full site ARN. A bare id names a site of
+        // the inventory this endpoint serves; an ARN carries a partition, a Region and
+        // an account of its own, and one that is not this endpoint's names no site it
+        // holds — so it deletes nothing here.
+        let not_found = || {
+            DeleteSiteErrorModeled::NotFoundException(NotFoundException {
                 // The identifier echo, of the value AS SUPPLIED — not of
                 // `site_id`, which is the bare id an ARN resolved to.
                 message: Some(crate::state::identifier_not_found(
@@ -165,7 +160,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.site_id,
                 )),
             })
-            .into());
+        };
+        let site_id = crate::state::resolve_site_id(&input.site_id, &region)
+            .ok_or_else(|| {
+                DeleteSiteErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::site_id_pattern_report()),
+                })
+            })?
+            .here()
+            .ok_or_else(not_found)?
+            .to_string();
+
+        let mut store = state.lock();
+        if store.site(&region, &site_id).is_none() {
+            return Err(not_found().into());
         }
         // An Outpost names the site it lives at, so removing a site that still has
         // one would leave that Outpost pointing at nothing: the service refuses the

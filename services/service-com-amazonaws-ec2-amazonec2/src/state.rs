@@ -1871,6 +1871,16 @@ pub const INVALID_VPC_ID_NOT_FOUND: &str = "InvalidVpcID.NotFound";
 /// EC2's error code for a request that named a subnet id no subnet of the account has.
 pub const INVALID_SUBNET_ID_NOT_FOUND: &str = "InvalidSubnetID.NotFound";
 
+/// EC2's error code for a request that named a subnet CIDR reservation id no reservation of
+/// the account has.
+///
+/// The same `Invalid<Resource>ID.NotFound` spelling the subnet surface answers an unknown
+/// `SubnetId` with ([`INVALID_SUBNET_ID_NOT_FOUND`]), built from the id member's own name
+/// (`SubnetCidrReservationId`) — a reservation is part of a subnet and is named by one id,
+/// so it is reported absent the way its subnet is.
+pub const INVALID_SUBNET_CIDR_RESERVATION_ID_NOT_FOUND: &str =
+    "InvalidSubnetCidrReservationID.NotFound";
+
 /// EC2's error code for a request that named a DHCP options id no option set of the
 /// account has (EC2 API "Error codes": `InvalidDhcpOptionID.NotFound`).
 pub const INVALID_DHCP_OPTION_ID_NOT_FOUND: &str = "InvalidDhcpOptionID.NotFound";
@@ -4013,6 +4023,28 @@ impl ComAmazonawsEc2Amazonec2State {
         self.subnet_cidr_reservations
             .insert(reservation_id.clone(), reservation);
         Some(reservation_id)
+    }
+
+    /// Remove the subnet CIDR reservation `reservation_id` names and answer it as it was
+    /// last reported, or `None` when the store holds no such reservation.
+    ///
+    /// The answer is the record the removal took OUT of the store, so what a delete reports
+    /// is what the readers reported — never a second copy built beside it. The bytes the
+    /// record held go back to the store's budget on exactly the terms
+    /// [`Self::insert_subnet_cidr_reservation`] took them on
+    /// ([`subnet_cidr_reservation_payload_bytes`]), so a reservation that is created and
+    /// deleted leaves the budget where it started.
+    pub fn remove_subnet_cidr_reservation(
+        &mut self,
+        reservation_id: &str,
+    ) -> Option<SubnetCidrReservation> {
+        let reservation = self.subnet_cidr_reservations.remove(reservation_id)?;
+        self.release_stored_bytes(subnet_cidr_reservation_payload_bytes(
+            reservation.cidr.as_deref().unwrap_or_default(),
+            reservation.description.as_deref(),
+            reservation.tags.as_deref().unwrap_or_default(),
+        ));
+        Some(reservation)
     }
 
     /// Insert a customer-owned IP (CoIP) address pool, and answer the `PoolId` it was
@@ -9914,6 +9946,25 @@ pub fn invalid_subnet_id_not_found<E>(subnet_id: &str) -> crate::scaffolded::Sca
         INVALID_SUBNET_ID_NOT_FOUND,
         400,
         format!("The subnet ID '{subnet_id}' does not exist"),
+    )
+}
+
+/// Refuse a request that named a subnet CIDR reservation id no reservation of the account
+/// has: HTTP 400 [`INVALID_SUBNET_CIDR_RESERVATION_ID_NOT_FOUND`], worded by the one place
+/// this module words a missing resource id ([`id_not_found`]) and naming the id the REQUEST
+/// named.
+///
+/// The resource the sentence names is spelled as EC2's own `ResourceType` spells it
+/// ([`RESOURCE_TYPE_SUBNET_CIDR_RESERVATION`]), the way this module words the newer
+/// resources that are named by one id — a reservation's own type name rather than a second
+/// spelling of it.
+pub fn invalid_subnet_cidr_reservation_id_not_found<E>(
+    reservation_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    id_not_found(
+        INVALID_SUBNET_CIDR_RESERVATION_ID_NOT_FOUND,
+        &format!("{RESOURCE_TYPE_SUBNET_CIDR_RESERVATION} ID"),
+        reservation_id,
     )
 }
 

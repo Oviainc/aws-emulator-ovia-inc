@@ -37,6 +37,8 @@ mod custom_model_deployments;
 mod custom_models;
 #[path = "all/enforced_guardrail_configuration.rs"]
 mod enforced_guardrail_configuration;
+#[path = "all/enum_value_set_listing.rs"]
+mod enum_value_set_listing;
 #[path = "all/enum_value_set_order.rs"]
 mod enum_value_set_order;
 #[path = "all/evaluation_jobs.rs"]

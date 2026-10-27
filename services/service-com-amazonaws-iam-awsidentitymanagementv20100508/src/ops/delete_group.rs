@@ -213,11 +213,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that still holds a subordinate entity is NOT deleted, and the caller is told
         // with the modelled `DeleteConflictException` ("attempted to delete a resource
         // that has attached subordinate entities") so nothing is removed behind its
-        // back. An inline policy embedded by `PutGroupPolicy` is such an entity and is
-        // what the account can hold today; a membership (`AddUserToGroup`) and a
-        // managed-policy attachment (`AttachGroupPolicy`) are still scaffolded and so
-        // persist nothing, and the check for each belongs with whichever of them first
-        // does.
+        // back. A membership `AddUserToGroup` wrote is such an entity, and so is an
+        // inline policy `PutGroupPolicy` embedded; a managed-policy attachment
+        // (`AttachGroupPolicy`) is still scaffolded and so persists nothing, and the
+        // check for it belongs with the operation that first writes one.
+        let holds_users = store
+            .group_members
+            .get(&key)
+            .is_some_and(|members| !members.is_empty());
+        if holds_users {
+            return Err(DeleteGroupErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(
+                        "Cannot delete entity, must remove users from group first.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
         let embeds_policies = store
             .group_inline_policies
             .get(&key)
@@ -232,9 +245,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         store.groups.remove(&key);
-        // The group embedded no policy, so this only drops an empty leftover entry: a
-        // later group of the same name must not look as though it inherited one.
+        // The group embedded no policy and held no member, so this only drops empty
+        // leftover entries: a later group of the same name must not look as though it
+        // inherited either.
         store.group_inline_policies.remove(&key);
+        store.group_members.remove(&key);
 
         // Audit record for the change: the acting principal, the operation and what it
         // removed, so a state-changing call leaves a local record.

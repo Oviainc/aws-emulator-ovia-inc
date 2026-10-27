@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSubnetCidrReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSubnetCidrReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the subnet CIDR reservation the request names out of
+//! [`crate::state`] (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::subnet_cidr_reservations`]) and answers it
+//! as it was last reported, so the range it held is reservable again and
+//! `GetSubnetCidrReservations` no longer reports it. An id this account holds no reservation
+//! for is a refusal rather than a no-op.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSubnetCidrReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +134,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSubnetCidrReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSubnetCidrReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSubnetCidrReservation"))
+        use crate::state;
+
+        // A reservation is named by id, so nothing here depends on the Region the request
+        // was signed for; the store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "Deletes a subnet CIDR reservation": an id this account holds no reservation for
+        // is a refusal, not a no-op — a caller that deletes twice has to be able to tell the
+        // deletion it performed from one it did not.
+        if !store
+            .subnet_cidr_reservations
+            .contains_key(&input.subnet_cidr_reservation_id)
+        {
+            return Err(state::invalid_subnet_cidr_reservation_id_not_found(
+                &input.subnet_cidr_reservation_id,
+            ));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `remove_subnet_cidr_reservation` is what takes the record out of the store and
+        // gives its caller-supplied bytes back to the budget the create charged them to, so
+        // the range it reserved is reservable again and no reader reports it afterwards.
+        let Some(reservation) =
+            store.remove_subnet_cidr_reservation(&input.subnet_cidr_reservation_id)
+        else {
+            return Err(state::internal_error(
+                "the subnet CIDR reservation checked a moment ago could not be removed",
+            ));
+        };
+
+        // "Information about the deleted subnet CIDR reservation"
+        // (`DeleteSubnetCidrReservationResult$DeletedSubnetCidrReservation`): the record the
+        // removal took out, reported the way the create and the get report one — the tags
+        // only when it carries any, so a reservation that was never tagged is not answered
+        // with an empty set.
+        Ok(DeleteSubnetCidrReservationOutput {
+            deleted_subnet_cidr_reservation: Some(SubnetCidrReservation {
+                tags: reservation.tags.clone().filter(|tags| !tags.is_empty()),
+                ..reservation
+            }),
+        })
     }
 }

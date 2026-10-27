@@ -150,7 +150,10 @@ impl Emulator {
     }
 
     /// Hold a plan's pending transition open, so the transient window is deterministic.
-    fn hold_pending(&self, name: &str) {
+    ///
+    /// `pub(crate)` so a suite that reads a plan mid-transition holds it open the same
+    /// way rather than racing the real span.
+    pub(crate) fn hold_pending(&self, name: &str) {
         self.with_state(|state| {
             let plan = state
                 .scaling_plans
@@ -679,6 +682,19 @@ async fn an_update_replaces_only_what_the_request_carries() {
         "ASGAverageCPUUtilization",
         75.0,
     );
+    // What the update above leaves in force. An update does not re-point the target
+    // tracking policy a resource already has, so the new capacity bounds apply while
+    // the target value of the metric already tracked is kept; the whole rule is
+    // tabulated in [`crate::applied_policies_and_status_narratives`].
+    let updated_in_force = instruction(
+        "autoscaling",
+        "autoScalingGroup/my-asg",
+        "autoscaling:autoScalingGroup:DesiredCapacity",
+        3,
+        30,
+        "ASGAverageCPUUtilization",
+        40.0,
+    );
 
     // Rows: which members the update carries, and what each one leaves behind.
     for (label, request_extras, expect_source, expect_instructions) in [
@@ -686,19 +702,19 @@ async fn an_update_replaces_only_what_the_request_carries() {
             "instructions only",
             json!({ "ScalingInstructions": [updated] }),
             source.clone(),
-            json!([updated]),
+            json!([updated_in_force]),
         ),
         (
             "application source only",
             json!({ "ApplicationSource": other_source }),
             other_source.clone(),
-            json!([updated]),
+            json!([updated_in_force]),
         ),
         (
             "neither member",
             json!({}),
             other_source.clone(),
-            json!([updated]),
+            json!([updated_in_force]),
         ),
         (
             "both members",
