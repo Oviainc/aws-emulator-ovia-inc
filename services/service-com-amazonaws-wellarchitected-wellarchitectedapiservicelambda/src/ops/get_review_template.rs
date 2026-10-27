@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The content of the lenses this template applies, resolved from the whole
                 // lens catalog: the question roll-up counts a custom lens's imported
                 // questions exactly as it counts an official lens's.
-                &store.reviewed_lens_content(&record.lenses),
+                &store.reviewed_lens_content(&record.reviewed_lens_versions()),
             )),
         })
     }

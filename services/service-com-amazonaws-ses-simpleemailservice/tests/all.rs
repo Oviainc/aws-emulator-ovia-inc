@@ -29,6 +29,8 @@ mod ses_configuration_set_creation;
 mod ses_configuration_set_listing;
 #[path = "all/ses_configuration_set_reputation_metrics.rs"]
 mod ses_configuration_set_reputation_metrics;
+#[path = "all/ses_configuration_set_sending_state.rs"]
+mod ses_configuration_set_sending_state;
 #[path = "all/ses_identity_policies.rs"]
 mod ses_identity_policies;
 #[path = "all/ses_identity_send_loop.rs"]

@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let content = store
             .review_templates
             .get(&input.template_arn)
-            .map(|template| store.reviewed_lens_content(&template.lenses))
+            .map(|template| store.reviewed_lens_content(&template.reviewed_lens_versions()))
             .unwrap_or_default();
         // The resource is resolved BEFORE the request's values are judged, so a request
         // that names a template or a lens review that does not exist is answered with

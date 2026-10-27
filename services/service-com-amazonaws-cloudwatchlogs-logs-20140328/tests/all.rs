@@ -149,6 +149,8 @@ mod resource_tags;
 mod retention_policy;
 #[path = "all/scheduled_queries.rs"]
 mod scheduled_queries;
+#[path = "all/scheduled_query_enumeration.rs"]
+mod scheduled_query_enumeration;
 #[path = "all/scratch_queries.rs"]
 mod scratch_queries;
 #[path = "all/state_roundtrip.rs"]
