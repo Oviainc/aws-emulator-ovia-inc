@@ -32,7 +32,7 @@ use crate::domain_name_lifecycle::{call, certificate_arn, get_domain_name};
 
 /// Create one custom domain name, asserting the 201 the model binds to
 /// `CreateDomainName`.
-async fn seed_domain(emulator: &MultiServiceRouter, case: &str, domain: &str) {
+pub(crate) async fn seed_domain(emulator: &MultiServiceRouter, case: &str, domain: &str) {
     let (status, body) = call(
         emulator,
         "POST",
@@ -136,7 +136,7 @@ async fn listed_mappings(emulator: &MultiServiceRouter, case: &str, domain: &str
 
 /// Assert a refusal is the 404 `NotFoundException` whose message names the resource kind
 /// the request addressed.
-fn assert_not_found(case: &str, status: u16, body: &Value, expected_message: &str) {
+pub(crate) fn assert_not_found(case: &str, status: u16, body: &Value, expected_message: &str) {
     assert_eq!(
         status, 404,
         "case {case:?}: expected 404, got {status} {body}"
