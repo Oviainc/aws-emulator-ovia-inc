@@ -256,9 +256,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             endpoint_details,
             tags: input.tags.unwrap_or_default(),
             web_app_id: web_app_id.clone(),
-            // `CreateWebApp` models no customization member: a new web app carries no
-            // title, logo or icon until `UpdateWebAppCustomization` assigns one.
-            customization: st::WebAppCustomization::default(),
+            // `CreateWebApp` models no customization member: a new web app HAS no
+            // customization object at all until `UpdateWebAppCustomization` assigns
+            // one.
+            customization: None,
             // A new web app is applying no update yet — see `state::WEB_APP_UPDATE_SPAN`.
             update_due: None,
         };

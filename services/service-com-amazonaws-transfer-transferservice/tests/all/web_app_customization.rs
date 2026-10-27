@@ -14,7 +14,10 @@
 //! 1. `UpdateWebAppCustomization` assigns the customization members the request CARRIES
 //!    to the addressed web app and leaves the ones it omits exactly as they stand, and
 //!    `DescribeWebAppCustomization` reports them back under the web app's own ARN and
-//!    id, reporting only the members some update assigned.
+//!    id, reporting only the members some update assigned. A customization is an OBJECT
+//!    that exists only once an update assigned it, so a web app no update has named HAS
+//!    none and its reader is refused — `DeleteWebAppCustomization`, which removes the
+//!    object, has its own suite (`web_app_customization_deletion.rs`).
 //! 2. A customization belongs to the web app it was assigned to and to no other.
 //! 3. A `WebAppId` the store does not hold is answered with this service's not-found
 //!    refusal, by the update as well as by the read.
@@ -113,6 +116,37 @@ async fn update_customization(emulator: &Emulator, case: &str, web_app_id: &str,
     );
 }
 
+/// Assert that `web_app_id` HAS no customization object: the read is refused with
+/// `ResourceNotFoundException` whose `Message` names the web app the request addressed.
+/// The status is this service's recorded not-found status (`RESOURCE_NOT_FOUND_HTTP_STATUS`
+/// in `src/state.rs`), the same one rule 3 below asserts.
+async fn assert_has_no_customization(emulator: &Emulator, case: &str, web_app_id: &str) {
+    let answer = emulator
+        .call("DescribeWebAppCustomization", json!({"WebAppId": web_app_id}))
+        .await;
+    assert_eq!(
+        answer.status, 400,
+        "case {case:?}: expected HTTP 400 for a web app with no customization, got {} with \
+         body {}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error_code(),
+        "ResourceNotFoundException",
+        "case {case:?}: expected ResourceNotFoundException, got {}",
+        answer.body
+    );
+    let message = member_of(&answer.body, "Message")
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        message,
+        format!("The WebApp {web_app_id} doesn't have customization"),
+        "case {case:?}: unexpected Message for a web app with no customization, got {message:?}"
+    );
+}
+
 /// Describe `web_app_id`'s customization and hand back the `WebAppCustomization`
 /// structure, having checked the two identifiers every customization carries: the web
 /// app's own ARN (`Arn` is documented as "the ARN for the web app") and its id.
@@ -207,14 +241,9 @@ async fn an_update_persists_every_customization_member_and_the_read_rebuilds_it(
     for (case, members) in cases {
         let web_app_id = create_web_app(&emulator, case).await;
 
-        // Before any update: a web app nothing customized reports its identifiers and
-        // none of the three customization members.
-        let fresh = describe_customization(&emulator, case, &web_app_id).await;
-        assert_members(
-            case,
-            &fresh,
-            &json!({"Title": null, "LogoFile": null, "FaviconFile": null}),
-        );
+        // Before any update: a web app nothing customized HAS no customization object,
+        // so the read is refused rather than answering an empty one.
+        assert_has_no_customization(&emulator, case, &web_app_id).await;
 
         update_customization(&emulator, case, &web_app_id, &members).await;
         let customization = describe_customization(&emulator, case, &web_app_id).await;
@@ -368,12 +397,7 @@ async fn a_customization_belongs_to_the_web_app_it_was_assigned_to() {
         assert_members(case, &customization, &expected);
     }
 
-    let customization = describe_customization(&emulator, untouched_case, &untouched).await;
-    assert_members(
-        untouched_case,
-        &customization,
-        &json!({"Title": null, "LogoFile": null, "FaviconFile": null}),
-    );
+    assert_has_no_customization(&emulator, untouched_case, &untouched).await;
 }
 
 // ---------------------------------------------------------------------------

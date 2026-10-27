@@ -14,6 +14,9 @@
 #[path = "all/batch_execute_statement.rs"]
 mod batch_execute_statement;
 
+#[path = "all/caller_patience.rs"]
+mod caller_patience;
+
 #[path = "all/contended_transactions.rs"]
 mod contended_transactions;
 

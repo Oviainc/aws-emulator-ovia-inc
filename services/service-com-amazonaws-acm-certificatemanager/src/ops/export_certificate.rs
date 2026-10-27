@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExportCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExportCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: resolves the `CertificateArn` against this service's certificate store
+//! and answers the export of the record stored under it — classifying an ARN that names
+//! no ACM certificate, an ARN naming no stored certificate, a certificate export was
+//! never allowed for, and a certificate whose material ACM does not hold yet, each with
+//! the modelled error that reports exactly that condition.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExportCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Export is opt-in at creation and cannot be turned on afterwards
+//! (`CertificateOptions$Export`), so a certificate created without it — which every
+//! imported certificate is, `ImportCertificate` carrying no options — is one this
+//! operation can never export, and is refused rather than told to retry.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +172,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExportCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExportCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // The `Passphrase` is "to associate with the encrypted exported private key",
+        // read by whoever decrypts the key this call hands back. Nothing else about the
+        // request depends on it, and it is neither stored nor reported.
+        let _ = &input.passphrase;
+
+        // Unreachable in the assembled emulator (the engine is the shared store), and
+        // this operation models no server fault, so the modelled validation failure is
+        // the one honest answer left.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the acm certificate store is unavailable",
+            ));
+        };
+
+        // The member's `@pattern` already admitted only an `acm` ARN; what is left is
+        // that it names a CERTIFICATE. Classified before any lookup, exactly as on
+        // every other operation that resolves `CertificateArn`.
+        if crate::state::certificate_id_from_arn(&input.certificate_arn).is_none() {
+            return Err(ExportCertificateErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(&input.certificate_arn)),
+                },
+            )
+            .into());
+        }
+
+        // A read of one record, except for the outcomes the clock already owes: a
+        // request whose validation fell due before this call is answered as it stands
+        // now rather than as it stood when it was made.
+        let mut store = state.lock();
+        store.materialize_due(::std::time::SystemTime::now());
+        let Some(certificate) = store.certificates.get(&input.certificate_arn) else {
+            return Err(ExportCertificateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::certificate_not_found_message(
+                        &input.certificate_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "You can opt in to allow the export of your certificates by specifying
+        // ENABLED. You cannot update the value of Export after the the certificate is
+        // created" (`CertificateOptions$Export` doc): whether a certificate may ever
+        // leave ACM was decided when it was created, so a certificate created without
+        // that opt-in can never be exported — an input this operation does not apply
+        // to, which is what `ValidationException` reports ("the supplied input failed
+        // to satisfy constraints of an Amazon Web Services service"). It is reported
+        // with this surface's own sentence, and NOT with the retry-now signal below: a
+        // caller must not poll a call that can never succeed.
+        if !certificate.export_allowed() {
+            return Err(ExportCertificateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::not_export_enabled_message(
+                        &input.certificate_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The exported file contains the certificate, the certificate chain, and the
+        // encrypted private key associated with the public key that is embedded in the
+        // certificate" (this operation's doc): all three are material of a key pair ACM
+        // generated itself, which is the only private key it ever holds — a client's own
+        // key arrives with an import, and an imported certificate is refused above.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExportCertificate"))
+        // A certificate whose request has not produced that material has nothing to
+        // export, which is the condition `RequestInProgressException` reports: "the
+        // certificate request is in process and the certificate in your account has not
+        // yet been issued". This service mints no key pair for a certificate it was
+        // asked to issue, so that material is what it does not hold — the same gap
+        // `GetCertificate` reports with the same modelled error for the same record.
+        Err(ExportCertificateErrorModeled::RequestInProgressException(
+            RequestInProgressException {
+                message: Some(crate::state::REQUEST_IN_PROGRESS_MESSAGE.to_string()),
+            },
+        )
+        .into())
     }
 }
