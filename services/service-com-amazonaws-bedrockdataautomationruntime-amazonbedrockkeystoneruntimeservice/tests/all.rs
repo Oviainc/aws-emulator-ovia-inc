@@ -13,9 +13,13 @@
 // points it into `tests/all/`.
 #[path = "all/asset_processing_configuration.rs"]
 mod asset_processing_configuration;
+#[path = "all/control_plane_reference_resolution.rs"]
+mod control_plane_reference_resolution;
 #[path = "all/data_automation_invocations.rs"]
 mod data_automation_invocations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/support.rs"]
+mod support;
 #[path = "all/tag_key_refusal.rs"]
 mod tag_key_refusal;

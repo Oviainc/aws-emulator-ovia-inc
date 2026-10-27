@@ -52,8 +52,14 @@ fn expected_refusal(path: &str) -> String {
 }
 
 /// A router serving only this service over one shared engine.
+///
+/// [`PROJECT_ARN`] is arranged in the store of the service that OWNS data-automation
+/// projects first: a submission's project reference is resolved against it, so a
+/// submission naming a project nobody created is refused before any rule this suite is
+/// about can be reached.
 fn service() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    crate::support::seed_project(&engine, PROJECT_ARN, "tag-key-refusal-receipts");
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(bda::EmulatedService::new(engine));

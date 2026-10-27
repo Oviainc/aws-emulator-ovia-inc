@@ -35,7 +35,7 @@ use crate::landing_zone_lifecycle::{call, emulator, past_the_settle_span, Answer
 
 /// An organizational-unit target, in the form the AWS Organizations documentation
 /// publishes. `suffix` keeps the rows of one case on distinct targets.
-fn ou(suffix: &str) -> String {
+pub(crate) fn ou(suffix: &str) -> String {
     format!("arn:aws:organizations::123456789012:ou/o-exampleorg/ou-eq11-{suffix}")
 }
 
@@ -79,7 +79,7 @@ fn baseline_identifier_forms(baseline_id: &str) -> Vec<(String, String)> {
 /// whose resource segment is the control's name, and the AWS Control Catalog form, whose
 /// resource segment is the control's opaque id — in several partitions and regions, which
 /// a control ARN carries no identity in either.
-fn control_identifier_forms(control: &CatalogControl) -> Vec<(String, String)> {
+pub(crate) fn control_identifier_forms(control: &CatalogControl) -> Vec<(String, String)> {
     [
         (
             "the AWS Control Tower form, in the request's region",
@@ -149,7 +149,7 @@ async fn enable_baseline(
 }
 
 /// POST `/enable-control` for a control/target pair.
-async fn enable_control(
+pub(crate) async fn enable_control(
     router: &MultiServiceRouter,
     control_identifier: &str,
     target: &str,
@@ -172,7 +172,7 @@ async fn list_enabled_baselines(router: &MultiServiceRouter, body: serde_json::V
 
 /// The `arn` of every entry of a listing of `member`, sorted, so a case compares SETS
 /// without depending on the order the ARNs were minted in.
-fn listed_arns(listed: &Answer, member: &str) -> Vec<String> {
+pub(crate) fn listed_arns(listed: &Answer, member: &str) -> Vec<String> {
     let mut arns: Vec<String> = entries(listed.get(member))
         .iter()
         .map(|entry| {
@@ -189,7 +189,7 @@ fn listed_arns(listed: &Answer, member: &str) -> Vec<String> {
 
 /// Assert that `refused` carries the status and error code the rule names, and that it
 /// minted nothing: a refused enablement reports neither an ARN nor an operation.
-fn assert_refused(case: &str, refused: &Answer, status: u16, code: &str) {
+pub(crate) fn assert_refused(case: &str, refused: &Answer, status: u16, code: &str) {
     assert_eq!(
         (refused.status, refused.error_code.as_deref()),
         (status, Some(code)),

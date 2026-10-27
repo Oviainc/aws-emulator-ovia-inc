@@ -160,7 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal_error());
         };
 
-        // A read: this handler takes the lock to READ and writes nothing.
+        // A read: this handler takes the lock to READ and writes nothing. A
+        // pool's replica Regions are rendered as of this instant, so a replica
+        // whose deletion the clock has completed is no longer reported.
+        let now = ::std::time::SystemTime::now();
         let guard = state.lock();
         // The pools are stored keyed by their minted id, so ascending id is a
         // stable order over the whole store — the order a page token indexes
@@ -184,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .keys
             .iter()
             .filter_map(|id| guard.pool(id))
-            .map(crate::state::UserPool::to_user_pool_description_type)
+            .map(|pool| pool.to_user_pool_description_type(now))
             .collect();
 
         // A listing's result member is PRESENT and empty when the account holds

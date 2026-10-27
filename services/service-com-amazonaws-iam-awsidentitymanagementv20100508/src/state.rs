@@ -1557,6 +1557,34 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         })
     }
 
+    /// Whether the managed policy `arn` names may be attached to an identity, or used
+    /// to set one's permissions boundary — the `IsAttachable` flag every reader of that
+    /// policy reports ("specifies whether the policy can be attached to an IAM user,
+    /// group, or role", `Policy$IsAttachable`).
+    ///
+    /// ONE decision, consulted by the attach calls and by the permissions-boundary
+    /// puts, so the flag a client pre-screens an ARN with is exactly what those
+    /// operations enforce: a policy a reader reports as not attachable is refused, and
+    /// one it reports as attachable is accepted. The resolved record answers for every
+    /// policy this emulator can report — the account's own, and the entries of AWS's
+    /// catalog. An ARN in AWS's namespace the catalog does not carry resolves to no
+    /// record, so AWS's published rule answers for it instead: a policy filed under the
+    /// path reserved for service-linked roles belongs to that role alone
+    /// ([`AwsManagedPolicy::is_attachable`]).
+    ///
+    /// A value that is not a managed-policy ARN at all is not this question's business
+    /// and is taken as attachable: an operation taking a `PolicyArn` refuses such a
+    /// value as an invalid input before it asks.
+    pub fn policy_is_attachable(&self, arn: &str) -> bool {
+        if let Some(held) = self.policy_by_arn(arn) {
+            return held.policy.is_attachable;
+        }
+        if let Some(entry) = aws_managed_policy(arn) {
+            return entry.is_attachable();
+        }
+        parse_policy_arn(arn).is_none_or(|parsed| !is_service_linked_role_path(&parsed.path))
+    }
+
     /// The delegation request `arn` names, if the account holds it.
     ///
     /// Every read of a delegation request addressed by ARN resolves it here, and the
@@ -2900,6 +2928,26 @@ impl AwsManagedPolicy {
         )
     }
 
+    /// Whether this policy may be attached to an IAM user, group or role —
+    /// `Policy$IsAttachable`, "specifies whether the policy can be attached to an IAM
+    /// user, group, or role".
+    ///
+    /// AWS's catalog holds two kinds of policy. Most are published to be attached, and
+    /// report `true`. The ones AWS files under the path it reserves for service-linked
+    /// roles ([`SERVICE_LINKED_ROLE_PATH_PREFIX`]) belong to the service-linked role
+    /// they were written for — "Amazon Web Services service role policies can only be
+    /// attached to the service-linked role for that service"
+    /// (`PolicyNotAttachableException`) — so no identity may take one as a permissions
+    /// policy or as a permissions boundary, and they report `false`.
+    ///
+    /// DERIVED from the path rather than carried per entry, so the flag a reader reports
+    /// and the refusal an attach or a boundary put answers
+    /// ([`ComAmazonawsIamAwsidentitymanagementv20100508State::policy_is_attachable`])
+    /// cannot disagree about one policy.
+    pub fn is_attachable(&self) -> bool {
+        !is_service_linked_role_path(self.path)
+    }
+
     /// This entry as a managed policy record: the `Policy` metadata every reader
     /// reports, plus the single version `GetPolicyVersion` serves.
     ///
@@ -2925,9 +2973,9 @@ impl AwsManagedPolicy {
                 attachment_count: Some(attachment_count),
                 permissions_boundary_usage_count: Some(permissions_boundary_usage_count),
                 // "Specifies whether the policy can be attached to an IAM user,
-                // group, or role" (`Policy$IsAttachable`): an AWS-managed policy is
-                // published to be attached, which is what every account uses it for.
-                is_attachable: true,
+                // group, or role" (`Policy$IsAttachable`): see [`Self::is_attachable`]
+                // for the two kinds of entry AWS's catalog holds.
+                is_attachable: self.is_attachable(),
                 // See the type's documentation: AWS's prose is not carried.
                 description: None,
                 create_date: Some(created),
@@ -2955,10 +3003,12 @@ impl AwsManagedPolicy {
 /// Guide), which publishes each policy's path, friendly name and default-version
 /// document. AWS's catalog runs to well over a thousand policies and this is a
 /// SUBSET of it — the policies the emulator's own suites and fixtures attach, plus
-/// the account-wide and job-function ones a client is most likely to read. An
-/// `arn:aws:iam::aws:policy/` ARN this catalog does not carry is therefore NOT
-/// refused as absent: see `crate::ops::get_policy`, which answers 501 for it rather
-/// than claiming AWS holds no such policy.
+/// the account-wide and job-function ones a client is most likely to read, and the
+/// service-linked-role policies that are published but NOT attachable
+/// ([`AwsManagedPolicy::is_attachable`]), so both kinds of entry a client can meet
+/// are discoverable here. An `arn:aws:iam::aws:policy/` ARN this catalog does not
+/// carry is therefore NOT refused as absent: see `crate::ops::get_policy`, which
+/// answers 501 for it rather than claiming AWS holds no such policy.
 pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
     AwsManagedPolicy {
         path: "/",
@@ -3016,6 +3066,12 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
     },
     AwsManagedPolicy {
         path: "/",
+        policy_name: "IAMFullAccess",
+        policy_id: "ANPA_IAMFULLACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iam:*","organizations:DescribeAccount","organizations:DescribeOrganization","organizations:DescribeOrganizationalUnit","organizations:DescribePolicy","organizations:ListChildren","organizations:ListParents","organizations:ListPoliciesForTarget","organizations:ListRoots","organizations:ListPolicies","organizations:ListTargetsForPolicy"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/",
         policy_name: "IAMReadOnlyAccess",
         policy_id: "ANPA_IAMREADONLYACCESS",
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iam:GenerateCredentialReport","iam:GenerateServiceLastAccessedDetails","iam:Get*","iam:List*","iam:SimulateCustomPolicy","iam:SimulatePrincipalPolicy"],"Resource":"*"}]}"#,
@@ -3025,6 +3081,42 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         policy_name: "PowerUserAccess",
         policy_id: "ANPA_POWERUSERACCESS",
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotAction":["iam:*","organizations:*","account:*"],"Resource":"*"},{"Effect":"Allow","Action":["iam:CreateServiceLinkedRole","iam:DeleteServiceLinkedRole","iam:ListRoles","organizations:DescribeOrganization","account:ListRegions","account:GetAccountInformation"],"Resource":"*"}]}"#,
+    },
+    // The job-function policy a client most often resolves by name: "ReadOnlyAccess"
+    // grants the read verbs of every service. AWS's own default version enumerates
+    // them service by service and runs far past the managed-policy character quota
+    // ([`MAX_MANAGED_POLICY_CHARACTERS`]), so the document carried here is an
+    // EMULATOR-SCOPED approximation of it — the same read-only grant over the service
+    // namespaces this emulator serves, and a subset of AWS's where a client reasons
+    // about the grants `GetPolicyVersion` serves. The policy's identity — its path,
+    // name, ARN and attachability — is AWS's.
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "ReadOnlyAccess",
+        policy_id: "ANPA_READONLYACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudformation:Describe*","cloudformation:Get*","cloudformation:List*","cloudwatch:Describe*","cloudwatch:Get*","cloudwatch:List*","dynamodb:Describe*","dynamodb:Get*","dynamodb:List*","dynamodb:Query","dynamodb:Scan","ec2:Describe*","iam:Get*","iam:List*","iam:SimulateCustomPolicy","iam:SimulatePrincipalPolicy","kms:Describe*","kms:Get*","kms:List*","lambda:Get*","lambda:List*","logs:Describe*","logs:FilterLogEvents","logs:Get*","logs:List*","s3:Describe*","s3:Get*","s3:List*","sns:Get*","sns:List*","sqs:Get*","sqs:List*","sts:GetCallerIdentity"],"Resource":"*"}]}"#,
+    },
+    // The policies AWS files under the path it reserves for service-linked roles.
+    // Each belongs to the service-linked role it was written for, so every one of
+    // them reports `IsAttachable` false ([`AwsManagedPolicy::is_attachable`]) and no
+    // identity can attach it or be bounded by it.
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AWSSupportServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AWSSUPPORTSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["support:*","trustedadvisor:Describe*","trustedadvisor:Get*","trustedadvisor:List*","cloudformation:DescribeStacks","cloudwatch:DescribeAlarms","ec2:DescribeInstances","iam:GetRole","iam:ListRoles","s3:ListAllMyBuckets"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "AmazonEKSServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_AMAZONEKSSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:CreateNetworkInterface","ec2:CreateNetworkInterfacePermission","ec2:DeleteNetworkInterface","ec2:DescribeInstances","ec2:DescribeNetworkInterfaces","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcs","ec2:ModifyNetworkInterfaceAttribute","elasticloadbalancing:DescribeLoadBalancers","elasticloadbalancing:DescribeTargetGroups","iam:ListAttachedRolePolicies","kms:CreateGrant","kms:DescribeKey"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/aws-service-role/",
+        policy_name: "ElasticLoadBalancingServiceRolePolicy",
+        policy_id: "ANPA_AWSSERVICEROLE_ELASTICLOADBALANCINGSERVICEROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:AssignIpv6Addresses","ec2:AssignPrivateIpAddresses","ec2:CreateNetworkInterface","ec2:DeleteNetworkInterface","ec2:DescribeAddresses","ec2:DescribeInstances","ec2:DescribeInternetGateways","ec2:DescribeNetworkInterfaces","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcs","ec2:ModifyNetworkInterfaceAttribute","ec2:UnassignIpv6Addresses","ec2:UnassignPrivateIpAddresses","logs:CreateLogDelivery","logs:DeleteLogDelivery","logs:GetLogDelivery","logs:ListLogDeliveries","logs:UpdateLogDelivery"],"Resource":"*"}]}"#,
     },
     AwsManagedPolicy {
         path: "/service-role/",
@@ -3119,6 +3211,24 @@ pub fn policy_not_found(arn: &str) -> String {
 /// cannot take part in an attachment", and its wording says so.
 pub fn policy_not_attachable(arn: &str) -> String {
     format!("Policy {arn} does not exist or is not attachable.")
+}
+
+/// The message IAM refuses an attach or a permissions-boundary put with when the policy
+/// the `PolicyArn` resolves to EXISTS but reports `IsAttachable` false — the
+/// `PolicyNotAttachableException` message, whose fixed text is `Policy ` and ` is not
+/// attachable.` around the ARN the request supplied.
+///
+/// Distinct from [`policy_not_attachable`], which is the `NoSuchEntityException` text for
+/// an ARN that resolves to NOTHING: here the policy is one the account can read, and what
+/// the refusal says is that this policy may not take part in an attachment. The two names
+/// are deliberately unalike, because the error classes are: picking one at a call site
+/// picks the error code a client branches on. ONE wording, shared by the three attach calls
+/// and the two boundary puts
+/// ([`ComAmazonawsIamAwsidentitymanagementv20100508State::policy_is_attachable`] is the
+/// one decision behind them), so a caller matching IAM's text sees one sentence whichever
+/// operation it reached the policy through.
+pub fn policy_cannot_be_attached(arn: &str) -> String {
+    format!("Policy {arn} is not attachable.")
 }
 
 /// The message IAM refuses an operation addressed by a `PolicyArn` and a `VersionId`

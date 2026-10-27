@@ -169,6 +169,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(pool) = guard.pool_mut(&input.user_pool_id) else {
             return Err(user_pool_not_found(&input.user_pool_id));
         };
+        // A replica whose started deletion the clock has already finished is
+        // gone, so this mutating operation drops it before looking the
+        // request's Region up.
+        pool.prune_removed_replicas(now);
+
+        // "The status to set for the replica. Valid values are ACTIVE and
+        // INACTIVE": `UpdateReplicaStatusType` names those two, so no other
+        // value names a status a replica can be set to, and storing one would
+        // make a later read report a status the model does not declare.
+        if !UPDATE_REPLICA_STATUS_TYPE_VALUES.contains(&input.status.as_str()) {
+            return Err(invalid_status(&input.status));
+        }
 
         // Only a replica this pool holds in the named Region is updated. The
         // pool's own Region is never one of them — it holds the PRIMARY
@@ -178,6 +190,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(replica) = pool.replicas.get_mut(&input.region_name) else {
             return Err(replica_not_found());
         };
+
+        // A replica a delete has started is on its way out, so its status is no
+        // longer the caller's to set.
+        if replica.removal_due.is_some() {
+            return Err(replica_not_found());
+        }
 
         // "You can modify the status to activate or deactivate the replica":
         // the status the request names is what is stored, so it supersedes the
@@ -208,6 +226,34 @@ fn user_pool_not_found(user_pool_id: &str) -> UpdateUserPoolReplicaError {
 fn replica_not_found() -> UpdateUserPoolReplicaError {
     UpdateUserPoolReplicaErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some("Replica not found in the requested region".to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a `Status` outside
+/// `UpdateReplicaStatusType`, stated the way this service states every refusal
+/// of a value outside a modelled set: the framework's own constraint envelope,
+/// which names the member, echoes the submitted value and lists the set
+/// (`crate::service`'s refusal override answers a modelled-constraint violation
+/// with this code and that envelope).
+fn invalid_status(submitted: &str) -> UpdateUserPoolReplicaError {
+    let violation = ::aws_smithy_schema_server::constraints::Violation {
+        path: ::aws_smithy_schema_server::constraints::path::member("Status"),
+        kind: ::aws_smithy_schema_server::constraints::ViolationKind::EnumValue(
+            UPDATE_REPLICA_STATUS_TYPE_VALUES
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        ),
+        // Echoed only as far as the envelope's own bound, so a long submitted
+        // value cannot amplify this refusal.
+        value: Some(crate::state::echoed_value(submitted)),
+    };
+    UpdateUserPoolReplicaErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: ::aws_smithy_schema_server::constraints::envelope(&[violation]),
+        // `ReasonCode` is an optional machine code AWS fills in for a few
+        // specific refusals only, so none is invented here.
+        reason_code: None,
     })
     .into()
 }

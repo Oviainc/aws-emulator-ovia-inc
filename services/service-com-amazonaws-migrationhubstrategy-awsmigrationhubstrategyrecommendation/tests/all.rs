@@ -35,6 +35,9 @@ mod assessment_error_paths;
 #[path = "all/assessment_server_status.rs"]
 mod assessment_server_status;
 
+#[path = "all/assessment_targets.rs"]
+mod assessment_targets;
+
 #[path = "all/clock_owed_before_a_config_update.rs"]
 mod clock_owed_before_a_config_update;
 

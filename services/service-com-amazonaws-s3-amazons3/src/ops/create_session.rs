@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Vends the temporary security credentials a client signs Zonal endpoint requests on one
+//! DIRECTORY bucket with: a credential this emulator's own credential store minted, scoped
+//! to that bucket and expiring after the published interval.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,6 +158,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::emulator_server::aws_credentials::{AWS_SESSION, SECRET_ACCESS_KEY, SESSION_TOKEN};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -231,18 +228,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSession"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store there is no bucket to create a session for, and the one
+            // modelled error does not say that, so the scaffold's 501 carries what is true.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateSession",
+            ));
+        };
+
+        // The ENCRYPTION the session is created under, settled while the bucket is held:
+        // "Amazon S3 will use the encryption settings values from the CreateSession request
+        // to protect new objects in the directory bucket", and the CLI and the SDKs "use
+        // the bucket's default encryption configuration for the CreateSession request" —
+        // so a request that names an algorithm is answered with its own configuration, and
+        // one that names none with the bucket's own default.
+        let encryption = {
+            let store = state.lock();
+            let Some(bucket) = store.bucket(&input.bucket) else {
+                return Err(CreateSessionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+            };
+            // This operation "creates a session that establishes temporary security
+            // credentials to support fast authentication and authorization for the Zonal
+            // endpoint API operations on DIRECTORY buckets" (its own documentation), and no
+            // Zonal endpoint addresses a general purpose bucket — so a session on one names
+            // a bucket that is not valid for this request, which is `InvalidRequest` (400).
+            if !bucket.is_directory() {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_REQUEST_CODE,
+                    crate::state::INVALID_REQUEST_STATUS,
+                    crate::state::INVALID_REQUEST_MESSAGE,
+                ));
+            }
+            let requested = crate::state::ObjectEncryption {
+                sse_algorithm: input.server_side_encryption.clone(),
+                kms_key_id: input.ssekms_key_id.clone(),
+                kms_encryption_context: input.ssekms_encryption_context.clone(),
+                bucket_key_enabled: input.bucket_key_enabled,
+            };
+            if requested.names_no_member() {
+                bucket.default_object_encryption()
+            } else {
+                requested
+            }
+        };
+
+        // "Temporary security credentials are scoped to the bucket and EXPIRE AFTER 5
+        // MINUTES. After the expiration time, any calls that you make with those
+        // credentials will fail" (this operation's own documentation) — the interval is
+        // documented, so it is the one the session is minted with, and the one the release
+        // below is measured against: the expiry is enforced, not merely reported.
+        let expires_at = ::std::time::SystemTime::now() + SESSION_DURATION;
+
+        // The credential this call returns: created in the emulator's credential store, so
+        // the emulator ACCEPTS requests signed with it and neither the id nor the secrets
+        // are chosen here.
+        let minted = ctx.credential_store().create(&AWS_SESSION);
+        let (Some(secret_access_key), Some(session_token)) = (
+            minted.secret(SECRET_ACCESS_KEY).map(str::to_string),
+            minted.secret(SESSION_TOKEN).map(str::to_string),
+        ) else {
+            // A credential without the secrets a caller has to sign with is no session at
+            // all; it is forgotten again rather than returned half-made.
+            let _ = ctx.credential_store().delete(&minted.id);
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the session credential was minted without the secrets a caller signs with",
+            ));
+        };
+
+        // The sessions this process still holds, and the room for one more. Every session
+        // is a credential the emulator keeps ACCEPTING until it expires, so each vend both
+        // releases the ones the clock has already expired — "after the expiration time, any
+        // calls that you make with those credentials will fail" — and refuses to vend past
+        // the number this emulator keeps at once. The release and the bound are read and
+        // written under ONE guard, so two concurrent vends cannot both pass a bound only one
+        // of them fits in; the credential store is told outside it, because forgetting a
+        // credential needs no lock on this service's state.
+        let (released, recorded) = {
+            let mut store = state.lock();
+            let released = store.release_expired_sessions(::std::time::SystemTime::now());
+            let recorded = store.record_vended_session(&minted.id, expires_at);
+            (released, recorded)
+        };
+        for id in released {
+            let _ = ctx.credential_store().delete(&id);
+        }
+        if !recorded {
+            // The credential this vend had already minted is forgotten again, so a refused
+            // vend leaves nothing behind that would be accepted for signing. The bound is
+            // this emulator's own rather than an AWS quota, so no S3 error code describes
+            // it: it goes out through the framework's 400 `ValidationException` channel, the
+            // same channel `CreateBucket` answers its own bucket budget with.
+            let _ = ctx.credential_store().delete(&minted.id);
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator already holds the maximum of {} unexpired sessions; wait for \
+                 one to expire before creating a session on {}",
+                crate::state::MAX_VENDED_SESSIONS,
+                input.bucket
+            )));
+        }
+
+        // The vend leaves a local record of what was done, the way every other operation
+        // that mints a credential here does: the operation, the bucket the session is scoped
+        // to, the mode it was asked for and the outcome. Never the id and never the secrets
+        // — a log is a file, and a credential in it outlives the session.
+        ::tracing::info!(
+            operation = Self::NAME,
+            bucket = %input.bucket,
+            session_mode = ?input.session_mode,
+            outcome = "vended",
+            "established a session on a directory bucket"
+        );
+
+        Ok(CreateSessionOutput {
+            credentials: SessionCredentials {
+                access_key_id: minted.id,
+                secret_access_key,
+                session_token,
+                expiration: ::aws_smithy_types::DateTime::from(expires_at),
+            },
+            // The encryption the session was established with, which is what the Zonal
+            // endpoint calls made under it store new objects with.
+            server_side_encryption: encryption.sse_algorithm.clone(),
+            ssekms_key_id: encryption.kms_key_id.clone(),
+            ssekms_encryption_context: encryption.kms_encryption_context.clone(),
+            bucket_key_enabled: encryption.bucket_key_enabled,
+        })
     }
 }
+
+/// How long a session's credentials are valid: "temporary security credentials are scoped to
+/// the bucket and expire after 5 minutes" (this operation's own documentation).
+const SESSION_DURATION: ::std::time::Duration = ::std::time::Duration::from_secs(5 * 60);

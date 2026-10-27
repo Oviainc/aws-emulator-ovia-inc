@@ -11,7 +11,14 @@
 //! drops report their own events. A resource the new template declares anew is CREATED in
 //! the service that owns it, and one it no longer declares is deleted there, exactly as on
 //! a create (see [`crate::state::provisioning`]); a resource an owning service refuses
-//! leaves the stack in `UPDATE_FAILED` with that service's own refusal as the reason. A
+//! leaves the stack in `UPDATE_FAILED` with that service's own refusal as the reason, and
+//! the update is then ROLLED BACK to the previous stack configuration — put back in the
+//! services that own the resources it had already changed there — which lands the stack in
+//! `UPDATE_ROLLBACK_COMPLETE`, or in `UPDATE_ROLLBACK_FAILED` where one of them refuses to
+//! put a resource back. That rollback is owed however the update failed, including a
+//! failure the clock makes due after this call has answered: an update held at a wait
+//! condition whose `Timeout` runs out is rolled back the same way
+//! ([`crate::state::settle_due_rollbacks`]). A
 //! template that declares a transform the request has not acknowledged with
 //! `CAPABILITY_AUTO_EXPAND` is refused with the modelled
 //! `InsufficientCapabilitiesException`. A request whose `ClientRequestToken` an operation
@@ -401,6 +408,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         // A stack name or id names a stack only in the Region the request was signed for.
         let request_region = crate::state::request_region(ctx.parts());
+        // Whether this stack can take an update at all depends on the status it is in, so a
+        // rollback the failure of an earlier update already made due is carried out first:
+        // it was owed at the instant that update failed, whether or not anybody called
+        // (`crate::state::settle_due_rollbacks`).
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
         // The store is read under the lock and the lock is RELEASED with this block: what
         // the update computes from the request and the stack's previous values needs no
         // lock, and the calls that create or delete the stack's resources must not run
@@ -797,7 +809,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stack.schedule_resource_events(&materialised.transitions);
             stack.record_materialised_resources(materialised.resources.clone());
             match materialised.failure {
-                None => None,
+                None => {
+                    // The update got through its calls to the owning services and is not
+                    // over: a wait condition it is held at can still fail it, with no call
+                    // of its own to work out what that failure's rollback owes those
+                    // services. So it is worked out HERE and held on the stack
+                    // (`crate::state::settle_due_rollbacks` performs it), under the same
+                    // rule the failure path below follows: a rollback is owed only where the
+                    // update really carried a change out, since otherwise the previous
+                    // configuration is the one in force.
+                    stack.hold_rollback_plan(applied_a_change.then(|| {
+                        crate::state::OwedRollback {
+                            previous: previous_resources.clone(),
+                            applied: materialised.resources.clone(),
+                        }
+                    }));
+                    None
+                }
                 Some(failure) => {
                     // A resource an owning service refused: the update does not reach
                     // UPDATE_COMPLETE, and the stack reports the summary of what failed
@@ -825,7 +853,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ctx,
                 &region,
                 &provenance,
-                previous_resources,
+                previous_resources.clone(),
                 &materialised.resources,
             )
             .await;
@@ -833,16 +861,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
                 stack.schedule_resource_events(&reverted.transitions);
                 stack.record_materialised_resources(reverted.resources);
+                // What the rollback left each resource in, which is what a client reads
+                // back — and what says which resource a resumed rollback may skip.
+                stack.record_rollback_resource_statuses(
+                    &reverted.transitions,
+                    ::std::time::SystemTime::now(),
+                );
                 if let Some(failure) = reverted.failure {
                     // "A stack goes into the UPDATE_ROLLBACK_FAILED state when
                     // CloudFormation can't roll back all changes after a failed stack
                     // update": a resource the owning service would not put back leaves the
-                    // stack there, which is the state `ContinueUpdateRollback` resumes from.
+                    // stack there, which is the state `ContinueUpdateRollback` resumes from
+                    // — against what those services are still holding, which is why it is
+                    // kept.
                     stack.fail_transition(
                         ::std::time::SystemTime::now(),
                         status::UPDATE_ROLLBACK_FAILED,
                         failure,
                     );
+                    stack.unreverted_rollback = Some(crate::state::OwedRollback {
+                        previous: previous_resources,
+                        applied: materialised.resources,
+                    });
                 }
             }
         }

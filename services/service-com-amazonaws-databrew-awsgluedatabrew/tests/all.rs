@@ -19,6 +19,8 @@ mod databrew_harness;
 mod dataset_update_lifecycle;
 #[path = "all/recipe_lifecycle.rs"]
 mod recipe_lifecycle;
+#[path = "all/resource_not_found_message.rs"]
+mod resource_not_found_message;
 #[path = "all/schedule_lifecycle.rs"]
 mod schedule_lifecycle;
 #[path = "all/state_roundtrip.rs"]

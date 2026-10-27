@@ -24,6 +24,7 @@
 //! directly through the shared engine — the same `servers` map that ingestion writes and
 //! these operations read — and then drive every assertion through the router.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -357,7 +358,10 @@ fn emulator_collecting(servers: Vec<ServerRecord>, assessment_id: &str) -> Multi
             .state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>();
         let mut store = state.lock();
         let portfolio = store.region_entry(TEST_REGION);
-        let count = i32::try_from(servers.len()).unwrap_or(0);
+        // The seeded assessment covers the whole seeded inventory — its criteria are
+        // empty, and an assessment with no criteria scopes nothing out.
+        let covered: BTreeSet<String> = servers.iter().map(|record| record.id.clone()).collect();
+        let count = i32::try_from(covered.len()).unwrap_or(0);
         for record in servers {
             portfolio.servers.insert(record.id.clone(), record);
         }
@@ -374,7 +378,7 @@ fn emulator_collecting(servers: Vec<ServerRecord>, assessment_id: &str) -> Multi
                 start_time: now,
                 completion_time: None,
                 status_message: None,
-                servers: count,
+                covered_servers: covered,
                 success: 0,
                 failed: 0,
                 in_progress: count,

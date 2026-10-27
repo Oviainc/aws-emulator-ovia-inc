@@ -212,6 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // The resource statuses a rollback the failure of an update already made due leaves
+        // behind are that rollback's own: it is carried out here, before the records are
+        // read, since it was owed at the instant that update failed whether or not anybody
+        // called (`crate::state::settle_due_rollbacks`).
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
+
         let mut store = state.lock();
         // Reporting operation: the only write is materialising a status transition the
         // clock had already made due, which was owed whether or not anyone called — and

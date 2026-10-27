@@ -47,7 +47,10 @@ pub struct ResourceNotFoundException {
     pub message: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ssmquicksetup#StatusSummary")]
+/// `LastUpdatedAt` carries `@timestampFormat("date-time")`, so this shape's schema comes
+/// from `qs_schema_and_codec!` rather than the derive — see `types/date_time_wire.rs`.
+/// Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="StatusSummary")`.
 #[derive(Debug, Clone)]
 pub struct StatusSummary {
     pub status_type: String,
@@ -56,6 +59,19 @@ pub struct StatusSummary {
     pub last_updated_at: ::aws_smithy_types::DateTime,
     pub status_details: Option<std::collections::HashMap<String, String>>,
 }
+
+qs_schema_and_codec!(
+    StatusSummary,
+    STATUS_SUMMARY_SCHEMA,
+    "com.amazonaws.ssmquicksetup#StatusSummary",
+    "com.amazonaws.ssmquicksetup",
+    "StatusSummary",
+    (M_STATUS_TYPE, status_type, "StatusType", 0, req, string),
+    (M_STATUS, status, "Status", 1, opt, string),
+    (M_STATUS_MESSAGE, status_message, "StatusMessage", 2, opt, string),
+    (M_LAST_UPDATED_AT, last_updated_at, "LastUpdatedAt", 3, req, date_time),
+    (M_STATUS_DETAILS, status_details, "StatusDetails", 4, opt, map_of_string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ssmquicksetup#Filter")]
 #[derive(Debug, Clone, Default)]

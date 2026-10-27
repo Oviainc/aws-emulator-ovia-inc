@@ -160,13 +160,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The `Name` is the resource's identity, so it is stored and echoed back exactly
-        // as the caller sent it — never normalised. The trim is only the test for a name
+        // as the caller sent it — never normalised. The one test it takes is for a name
         // that carries no characters at all, which the model's bare `__string` does not
-        // refuse before this handler runs.
+        // refuse before this handler runs — the same test every named resource in this
+        // service takes, in `crate::state::carries_no_characters`.
         let name = input.name;
-        if name.trim().is_empty() {
+        if crate::state::carries_no_characters(&name) {
             return Err(CreatePresetErrorModeled::BadRequestException(BadRequestException {
-                message: Some("Name must not be empty.".to_string()),
+                message: Some(crate::state::blank_member_message("Name")),
             })
             .into());
         }

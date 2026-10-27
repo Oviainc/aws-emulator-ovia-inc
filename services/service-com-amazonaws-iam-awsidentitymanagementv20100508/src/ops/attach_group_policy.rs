@@ -237,17 +237,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Amazon Web Services service role policies can only be attached to the
-        // service-linked role for that service" (`PolicyNotAttachableException`):
-        // such a policy is one filed under the reserved service-linked role path,
-        // and a group is not a service-linked role, so no group can carry one.
-        if crate::state::is_service_linked_role_path(&policy.path) {
+        // service-linked role for that service" (`PolicyNotAttachableException`): a
+        // policy that is published but NOT attachable is refused, and the flag a
+        // reader of that policy reports (`Policy$IsAttachable`) is the one decision
+        // behind it (`crate::state::policy_is_attachable`), so a client that
+        // pre-screens a policy ARN on that flag and IAM agree.
+        if !store.policy_is_attachable(&input.policy_arn) {
             return Err(AttachGroupPolicyErrorModeled::PolicyNotAttachableException(
                 PolicyNotAttachableException {
-                    message: Some(format!(
-                        "Policy {} is not attachable: a service role policy can only be \
-                         attached to the service-linked role for that service",
-                        input.policy_arn
-                    )),
+                    message: Some(crate::state::policy_cannot_be_attached(&input.policy_arn)),
                 },
             )
             .into());

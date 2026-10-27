@@ -8,9 +8,9 @@
 //! record: `ServerDetail$recommendationSet` is "a set of recommendations",
 //! `ServerDetail$lastAnalyzedTimestamp` is "the timestamp of when the server was
 //! assessed", and `ApplicationComponentDetail` carries the same two members — so once a
-//! completion is materialised ([`super::RegionState::analyze_portfolio`]) every read of a
-//! server or an application component reports the recommendation the analysis stored for
-//! it.
+//! completion is materialised ([`super::RegionState::analyze_covered_resources`]) every
+//! read of a server or an application component reports the recommendation the analysis
+//! stored for it.
 //!
 //! WHICH recommendation it stores is what the account's saved preferences decide:
 //! `PutPortfolioPreferences` "Saves the specified migration and modernization

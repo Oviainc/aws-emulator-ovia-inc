@@ -56,6 +56,9 @@ mod entity_update;
 #[path = "all/execute_query.rs"]
 mod execute_query;
 
+#[path = "all/execute_query_hierarchy.rs"]
+mod execute_query_hierarchy;
+
 #[path = "all/harness.rs"]
 mod harness;
 

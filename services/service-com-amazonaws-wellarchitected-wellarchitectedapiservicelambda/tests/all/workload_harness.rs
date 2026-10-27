@@ -807,6 +807,16 @@ pub(crate) async fn stored_workload(client: &Client, workload_id: &str, case: &s
     answer.body.get("Workload").cloned().unwrap_or(Value::Null)
 }
 
+/// How many workloads the store holds, read off the shared state — for an assertion about
+/// what a refused write RECORDED, which no list projection of the store can answer. Every
+/// request such a test asserts about still crosses the HTTP boundary. The one workload
+/// counter this crate's suites share.
+pub(crate) fn stored_workload_count(client: &Client) -> usize {
+    let state = client.store();
+    let store = state.lock();
+    store.workloads.len()
+}
+
 /// The `Workload$Profiles` a workload reports, empty for a workload that reports none.
 pub(crate) async fn profiles_of(client: &Client, workload_id: &str, case: &str) -> Vec<Value> {
     stored_workload(client, workload_id, case)

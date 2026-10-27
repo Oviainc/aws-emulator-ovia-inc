@@ -180,19 +180,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let store = state.lock();
-        // Both a recipe this account does not hold and a version this recipe does not
-        // hold are "one or more resources can't be found": the request names a
-        // (recipe, version) pair, and only the pair resolves to a definition.
-        let not_found = || {
-            DescribeRecipeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
-            })
-        };
         let Some(recipe) = store.recipes.get(&input.name) else {
-            return Err(not_found().into());
+            return Err(DescribeRecipeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::not_found_message("Recipe", &input.name)),
+                },
+            )
+            .into());
         };
+        // A request that names a version addresses the (recipe, version) PAIR, and
+        // only the pair resolves to a definition: a version this recipe does not hold
+        // is a miss, and the identifier the request looked up is both halves.
         let Some(version) = recipe.resolve_version(input.recipe_version.as_deref()) else {
-            return Err(not_found().into());
+            let requested = input.recipe_version.clone().unwrap_or_default();
+            return Err(DescribeRecipeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        "Recipe",
+                        &format!("{} version {requested}", input.name),
+                    )),
+                },
+            )
+            .into());
         };
 
         Ok(DescribeRecipeOutput {

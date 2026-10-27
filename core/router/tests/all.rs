@@ -364,6 +364,11 @@ mod cloudformation_provisions_codepipeline_pipelines;
 mod eks_wire;
 #[path = "all/eks_cluster_security_group.rs"]
 mod eks_cluster_security_group;
+// Declared HERE, in this same quiet `n`/`o` gap rather than in the appended tail at the end
+// of this file or beside the sibling `logs_emf_*` suite in it: both of those are where every
+// concurrently landing router suite puts its line.
+#[path = "all/logs_emf_disabled_errors.rs"]
+mod logs_emf_disabled_errors;
 #[path = "all/partnercentral_channel_target_routing.rs"]
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]

@@ -32,7 +32,8 @@
 //! Nothing here grows with what a caller sends: a barrier is the plan plus one instant,
 //! and the signals themselves are the stack's own bounded log
 //! ([`crate::state::MAX_SIGNALS_PER_STACK`]). The `Timeout` a template may declare is
-//! bounded by its own documented maximum ([`MAX_TIMEOUT`]), and reading the template's
+//! bounded by its own documented maximum ([`MAX_TIMEOUT`]) and the wait it opens is held
+//! for at most [`MAX_HELD_OPEN`], and reading the template's
 //! wait conditions out of a caller-supplied body is ONE pass over it whatever it declares
 //! ([`declared`]), charged to that deployment's evaluation budget.
 
@@ -60,6 +61,19 @@ pub const DEFAULT_SIGNAL_COUNT: usize = 1;
 /// The documented ceiling of a duration the TEMPLATE asks for, so a declaration past it
 /// waits this long rather than as long as it asked.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(43_200);
+
+/// The longest this emulator HOLDS one stack operation open at a wait condition, whatever
+/// `Timeout` the template declares.
+///
+/// Chosen, exactly as [`crate::state::STATUS_TRANSITION_DELAY`] is: a stack operation of
+/// this emulator takes that span rather than the minutes the real service's resources take,
+/// so the wait inside one operation runs on the same compressed clock as the operation
+/// around it. Long enough that a client polling a stack held at a wait condition observes
+/// it waiting, reads the resources the operation has started and delivers its signals;
+/// short enough that an operation nothing signals reaches its failed status inside that
+/// client's poll loop instead of outliving it. A declaration asking for LESS than this
+/// still waits exactly as long as it asked ([`WaitConditionBarrier::deadline`]).
+pub const MAX_HELD_OPEN: Duration = Duration::from_secs(15);
 
 /// One wait condition a deployment found in the template it is deploying.
 ///
@@ -219,8 +233,12 @@ impl WaitConditionBarrier {
     }
 
     /// The instant the wait gives up.
+    ///
+    /// The declared `Timeout`, bounded by the longest this emulator holds one operation
+    /// open at a wait condition ([`MAX_HELD_OPEN`]): a wait asking for less than that waits
+    /// exactly as long as it asked.
     pub fn deadline(&self) -> SystemTime {
-        self.opened_at + self.declared.timeout
+        self.opened_at + self.declared.timeout.min(MAX_HELD_OPEN)
     }
 
     /// Whether the wait has run out at `now` — which fails the operation for a wait
