@@ -232,13 +232,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_implemented("CreateBucket"));
         };
 
+        // The CONFIGURATION this create carries, and the kind of bucket it asks for: a
+        // `CreateBucketConfiguration$Bucket` of type `Directory` asks for a DIRECTORY
+        // bucket, which is placed in ONE zone (`CreateBucketConfiguration$Location`) rather
+        // than in a Region, and which the API serves a different surface on.
+        let configuration = input.create_bucket_configuration.as_ref();
+        let placement = directory_placement(&input.bucket, configuration)?;
+
         // Where the bucket lives, from the request's own location constraint. Note this
         // is NOT the Region the request was signed for: the constraint is what the model
         // documents as deciding the bucket's Region, and an absent one means us-east-1.
-        let constraint = input
-            .create_bucket_configuration
-            .as_ref()
-            .and_then(|configuration| configuration.location_constraint.as_deref());
+        let constraint = configuration.and_then(|configuration| {
+            // "This functionality is not supported for directory buckets"
+            // (`CreateBucketConfiguration$LocationConstraint`): a directory bucket is placed
+            // by its `Location`, so its Region is the endpoint's rather than a constraint's.
+            match placement.is_some() {
+                true => None,
+                false => configuration.location_constraint.as_deref(),
+            }
+        });
 
         // A create that names NO constraint can only mean the one Region the unspecified
         // constraint stands for: "If you don't specify a Region, the bucket is created in
@@ -248,7 +260,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller did not ask for — so S3 refuses it rather than choosing for the caller.
         // The endpoint is the Region the request was signed for.
         let endpoint_region = crate::state::request_region(ctx.parts());
-        if constraint.is_none() && endpoint_region != crate::state::DEFAULT_BUCKET_REGION {
+        if placement.is_none()
+            && constraint.is_none()
+            && endpoint_region != crate::state::DEFAULT_BUCKET_REGION
+        {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::ILLEGAL_LOCATION_CONSTRAINT_CODE,
                 crate::state::INVALID_ARGUMENT_STATUS,
@@ -256,7 +271,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let region = crate::state::bucket_region(constraint);
+        // A directory bucket lives in a zone OF the endpoint's Region, so that Region is
+        // the one it is recorded in; every other bucket's Region is its constraint's.
+        let region = match placement.is_some() {
+            true => endpoint_region,
+            false => crate::state::bucket_region(constraint),
+        };
 
         // "By default, `ObjectOwnership` is set to `BucketOwnerEnforced` and ACLs are
         // disabled" (`smithy_query(query="shape",shape="ObjectOwnership")`): the setting
@@ -297,6 +317,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // before its Object Ownership setting and its ACL are in place.
                 if let Some(bucket) = store.bucket_mut(&input.bucket) {
                     bucket.set_object_ownership(ownership);
+                    // The zone this create placed a DIRECTORY bucket in, recorded with the
+                    // bucket as it comes into being: what makes it a directory bucket at
+                    // all, so `CreateSession` and an appending write serve it from the
+                    // moment it exists.
+                    if let Some(placement) = placement.clone() {
+                        bucket.set_directory_placement(placement);
+                    }
                     // "Specifies whether you want S3 Object Lock to be enabled for the new
                     // bucket" (`CreateBucketRequest$ObjectLockEnabledForBucket`): a create
                     // that asks for it brings the bucket into being with an Object Lock
@@ -323,9 +350,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &region,
                         input.bucket_namespace.as_deref(),
                     )),
-                    // Directory buckets only, per the member's documentation; a general
-                    // purpose bucket reports none.
-                    bucket_arn: None,
+                    // "This parameter is only supported for S3 directory buckets"
+                    // (`CreateBucketOutput$BucketArn`), so a general purpose bucket reports
+                    // none and a directory bucket reports its own ARN in the `s3express`
+                    // namespace ([`crate::state::directory_bucket_arn`]).
+                    bucket_arn: placement
+                        .as_ref()
+                        .map(|_| crate::state::directory_bucket_arn(&region, &input.bucket)),
                 })
             }
             crate::state::BucketCreation::NameTaken => {
@@ -404,6 +435,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The `BucketNamespace` value whose buckets live in the caller's account regional
 /// namespace rather than the shared global one (one of that enum's two values).
 const ACCOUNT_REGIONAL_NAMESPACE: &str = "account-regional";
+
+/// Where this create places a DIRECTORY bucket, `None` when it asks for a general purpose
+/// bucket, or the refusal the request earns.
+///
+/// "The location type is Availability Zone or Local Zone" and, for a directory bucket, "the
+/// name of the location is the Zone ID of the Availability Zone (AZ) or Local Zone (LZ)
+/// where the bucket will be created" (`LocationInfo`) — so a create that asks for a
+/// directory bucket has to name the zone, and the name it asks for has to be a directory
+/// bucket's: `<base>--<zone-id>--x-s3`, naming that same zone (Amazon S3 User Guide,
+/// *Directory bucket naming rules*). Both are settled here, before the bucket is recorded,
+/// so a refused create leaves nothing behind.
+fn directory_placement(
+    bucket: &str,
+    configuration: Option<&CreateBucketConfiguration>,
+) -> Result<Option<crate::state::DirectoryBucketPlacement>, CreateBucketError> {
+    let asks_for_directory = configuration
+        .and_then(|configuration| configuration.bucket.as_ref())
+        .and_then(|info| info.r#type.as_deref())
+        == Some(crate::state::DIRECTORY_BUCKET_TYPE);
+    let location = configuration.and_then(|configuration| configuration.location.as_ref());
+    if !asks_for_directory {
+        // A `Location` without a directory `Bucket` names a zone for a bucket that is not
+        // placed in one: "this functionality is only supported by directory buckets"
+        // (`CreateBucketConfiguration$Location`), which is a parameter that is not valid
+        // for this request.
+        if location.is_some() {
+            return Err(invalid_request());
+        }
+        return Ok(None);
+    }
+
+    // The zone: `LocationInfo$Type` is an enum, so the boundary has already refused a value
+    // outside [`crate::state::LOCATION_TYPE_VALUES`]; what is left to require is that a
+    // zone was named at all, since nothing else says where the bucket goes.
+    let location_type = location
+        .and_then(|location| location.r#type.as_deref())
+        .unwrap_or(crate::state::LOCATION_TYPE_AVAILABILITY_ZONE);
+    let Some(zone_id) = location
+        .and_then(|location| location.name.as_deref())
+        .map(str::trim)
+        .filter(|zone_id| !zone_id.is_empty())
+    else {
+        return Err(invalid_request());
+    };
+
+    // The NAME has to be a directory bucket's, and has to name the zone the bucket is
+    // placed in: the zone segment of the name is what every client addressing the bucket
+    // reads the zonal endpoint out of, so a name that names another zone — or that is not
+    // shaped like a directory bucket's at all — is not a valid bucket name.
+    if crate::state::directory_bucket_zone(bucket) != Some(zone_id) {
+        return Err(crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::INVALID_BUCKET_NAME_CODE,
+            crate::state::INVALID_ARGUMENT_STATUS,
+            crate::state::INVALID_BUCKET_NAME_MESSAGE,
+        ));
+    }
+
+    // The redundancy: the value the create named, or the one its location type implies.
+    // `BucketInfo$DataRedundancy` is an enum too, so a value outside its two is already
+    // refused; a value that names the OTHER kind of zone than the location does would
+    // describe a bucket kept in a zone it is not placed in, which is not a configuration S3
+    // can carry out.
+    let data_redundancy = configuration
+        .and_then(|configuration| configuration.bucket.as_ref())
+        .and_then(|info| info.data_redundancy.as_deref())
+        .unwrap_or_else(|| crate::state::implied_data_redundancy(location_type));
+    if data_redundancy != crate::state::implied_data_redundancy(location_type) {
+        return Err(invalid_request());
+    }
+
+    Ok(Some(crate::state::DirectoryBucketPlacement {
+        location_type: location_type.to_string(),
+        zone_id: zone_id.to_string(),
+        data_redundancy: data_redundancy.to_string(),
+    }))
+}
+
+/// The refusal S3 answers a create whose `CreateBucketConfiguration` names a combination it
+/// cannot carry out: `InvalidRequest` (400) with the sentence the model states for that
+/// shape ([`crate::state::INVALID_REQUEST_MESSAGE`]) — answered through the unmodelled
+/// channel because `CreateBucket` declares only the two name-in-use errors
+/// (`smithy_query(query="operation",operation="CreateBucket")`).
+///
+/// The sentence is the modelled one verbatim, with nothing of the request interpolated into
+/// it: "a parameter or header in your request isn't valid. For details, see the description
+/// of this API operation" is what the shape states for every such combination, and an error
+/// message is a requirement rather than a place for a diagnostic of this emulator's own.
+fn invalid_request() -> CreateBucketError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        crate::state::INVALID_REQUEST_CODE,
+        crate::state::INVALID_REQUEST_STATUS,
+        crate::state::INVALID_REQUEST_MESSAGE,
+    )
+}
 
 /// The ACL this create names, or `None` when it names none at all.
 ///

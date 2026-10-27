@@ -168,20 +168,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
 
         let now = ::std::time::SystemTime::now();
+        let request_region = crate::state::request_region(ctx.parts());
         let mut guard = state.lock();
 
         // The pool to replicate is resolved FIRST: a request naming a pool that
         // does not exist names nothing to replicate, whatever else it carries.
-        let Some(pool) = guard.pool(&input.user_pool_id) else {
+        let Some(pool) = guard.pool_mut(&input.user_pool_id) else {
             return Err(user_pool_not_found(&input.user_pool_id));
         };
+        // A replica whose started deletion the clock has already finished is
+        // gone, so the Region it held is free again: a write this mutating
+        // operation owes before it decides whether that Region is taken.
+        pool.prune_removed_replicas(now);
+
+        // A pool lives in the Region it was created in, and that Region holds
+        // its PRIMARY replica. `UpdateUserPoolReplica` is the one operation of
+        // this family that "can be made in both primary and secondary regions
+        // of the user pool", so the operations that change WHICH replicas a
+        // pool has belong to the primary Region alone — as
+        // `DeleteUserPoolReplica` ("This operation must be called from the
+        // primary Region") states for the other half of this pair.
+        if request_region != pool.region {
+            return Err(operation_not_enabled(format!(
+                "{} must be called in the primary Region of user pool {}, which is {}.",
+                Self::NAME,
+                pool.id,
+                pool.region
+            )));
+        }
 
         // Replicating a user pool to another Region is a feature-plan feature,
         // so a pool on the plan that does not include it is refused the way
@@ -225,18 +246,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The record to store, built from the pool this create read, before the
-        // pool is borrowed mutably.
         let record = crate::state::UserPoolReplica::new(
             input.region_name.clone(),
             pool.arn_in_region(&input.region_name),
+            // "A map of tags to assign to the replica user pool", which the
+            // replica keeps independently of the pool's own tags.
             input.user_pool_tags.clone().unwrap_or_default(),
             now,
         );
-
-        let Some(pool) = guard.pool_mut(&input.user_pool_id) else {
-            return Err(user_pool_not_found(&input.user_pool_id));
-        };
         pool.replicas.insert(input.region_name.clone(), record);
         pool.last_modified_date = now;
 
@@ -267,6 +284,15 @@ fn invalid_parameter(message: String) -> CreateUserPoolReplicaError {
         // `ReasonCode` is an optional machine code AWS fills in for a few
         // specific refusals only, so none is invented here.
         reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `OperationNotEnabledException` for a request made in a
+/// Region this operation is not available in.
+fn operation_not_enabled(message: String) -> CreateUserPoolReplicaError {
+    CreateUserPoolReplicaErrorModeled::OperationNotEnabledException(OperationNotEnabledException {
+        message: Some(message),
     })
     .into()
 }

@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             invalid_subnet_id_not_found, request_region, require_service_state,
             require_visible_image, resource_count_exceeded,
             spot_instance_request_payload_bytes, system_time_to_date_time, tag_list,
-            validate_kernel_or_ramdisk_id, validate_tag_size,
+            validate_hourly_price, validate_kernel_or_ramdisk_id, validate_tag_size,
         };
 
         // The launch specification IS the request's description of the instance to launch,
@@ -286,18 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The maximum price per unit hour that you are willing to pay for a Spot
         // Instance" (`RequestSpotInstancesRequest$SpotPrice`): a price, so a value that is
         // not a non-negative number is not one. The member is a plain String in the model,
-        // so the handler is the only place that can be said.
-        if let Some(spot_price) = input.spot_price.as_deref() {
-            let valid = spot_price
-                .parse::<f64>()
-                .is_ok_and(|price| price.is_finite() && price >= 0.0);
-            if !valid {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value '{spot_price}' for spotPrice. \
-                     It must be a non-negative hourly price"
-                )));
-            }
-        }
+        // so a handler is the only place that can be said — through the one definition every
+        // price member of this service is held to.
+        validate_hourly_price("spotPrice", input.spot_price.as_deref())?;
 
         // The same byte bounds the on-demand launch path puts on the members a launch
         // retains, for the same reason: a count ceiling on `InstanceCount` does not bound

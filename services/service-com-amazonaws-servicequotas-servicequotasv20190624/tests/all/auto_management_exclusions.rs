@@ -26,9 +26,11 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_servicequotas_servicequotasv20190624::ops::types::OPT_IN_LEVEL_VALUES;
+use service_com_amazonaws_servicequotas_servicequotasv20190624::ops::types::{
+    OPT_IN_LEVEL_VALUES, OPT_IN_TYPE_VALUES,
+};
 use service_com_amazonaws_servicequotas_servicequotasv20190624::state::{
-    AVAILABLE_OPT_IN_TYPES, OPT_IN_STATUS_DISABLED, OPT_IN_STATUS_ENABLED,
+    OPT_IN_STATUS_DISABLED, OPT_IN_STATUS_ENABLED,
 };
 
 use crate::quota_workflow::{client, emulator, Client};
@@ -37,9 +39,10 @@ use crate::quota_workflow::{client, emulator, Client};
 /// list rather than spelled again here.
 const ACCOUNT_LEVEL: &str = OPT_IN_LEVEL_VALUES[0];
 
-/// An `OptInType` a write will record: the service offers only a subset of the members
-/// the enum declares, and this suite is about the exclusion list rather than that rule.
-const AVAILABLE_TYPE: &str = AVAILABLE_OPT_IN_TYPES[0];
+/// An `OptInType` member a write records, taken from the model's own value list: this
+/// suite is about the exclusion list rather than about that member, which
+/// `auto_management.rs` spans over every member the enum declares.
+const OPT_IN_TYPE: &str = OPT_IN_TYPE_VALUES[0];
 
 /// The operation that reads a configuration back.
 const GET_CONFIG: &str = "GetAutoManagementConfiguration";
@@ -247,7 +250,7 @@ async fn an_exclusion_that_names_no_quota_is_refused_and_records_nothing() {
         let start_case = format!("StartAutoManagement {case}");
         let request = json!({
             "OptInLevel": ACCOUNT_LEVEL,
-            "OptInType": AVAILABLE_TYPE,
+            "OptInType": OPT_IN_TYPE,
             "ExclusionList": exclusion_request(exclusions),
         });
         refused_as_no_such_resource(
@@ -281,7 +284,7 @@ async fn an_exclusion_that_names_no_quota_is_refused_and_records_nothing() {
                 "StartAutoManagement",
                 json!({
                     "OptInLevel": ACCOUNT_LEVEL,
-                    "OptInType": AVAILABLE_TYPE,
+                    "OptInType": OPT_IN_TYPE,
                     "ExclusionList": exclusion_request(RUNNING),
                 }),
             )
@@ -393,7 +396,7 @@ async fn an_exclusion_naming_quotas_the_catalog_holds_is_stored_and_reported_wit
             "StartAutoManagement",
             json!({
                 "OptInLevel": ACCOUNT_LEVEL,
-                "OptInType": AVAILABLE_TYPE,
+                "OptInType": OPT_IN_TYPE,
                 "ExclusionList": Value::Object(request.clone()),
             }),
         )

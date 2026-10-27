@@ -152,3 +152,5 @@ mod batch_get_resource_config;
 mod conformance_pack_compliance_details;
 #[path = "all/recorder_discovers_other_service_resources.rs"]
 mod recorder_discovers_other_service_resources;
+#[path = "all/aggregate_conformance_pack_compliance_summary.rs"]
+mod aggregate_conformance_pack_compliance_summary;

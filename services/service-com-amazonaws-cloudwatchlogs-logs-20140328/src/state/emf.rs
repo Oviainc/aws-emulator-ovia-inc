@@ -16,7 +16,11 @@
 //!
 //! What this module does NOT decide is whether extraction happens at all: an account-level
 //! `METRIC_EXTRACTION_POLICY` can turn it off for the log groups its selection criteria
-//! name, and that question belongs to the account policies in [`super`].
+//! name, and that question belongs to the account policies in [`super`]. What this module
+//! does do with that answer is account for it: a document whose metric creation was skipped
+//! because extraction is off for its log group is COUNTED, as the service's own
+//! [`EMF_DISABLED_ERRORS_METRIC`] metric in [`LOGS_NAMESPACE`], so a client can tell a
+//! suppressing policy from a broken pipeline.
 
 use std::collections::BTreeMap;
 
@@ -51,6 +55,23 @@ const STORAGE_RESOLUTION_MEMBER: &str = "StorageResolution";
 /// it the default of 60 is used"), so an extracted metric is a regular-resolution metric
 /// unless the document says otherwise.
 const DEFAULT_STORAGE_RESOLUTION: i32 = 60;
+
+/// The namespace CloudWatch Logs publishes its OWN operational metrics into, rather than a
+/// client's: the service's metrics are "in the AWS/Logs namespace".
+pub const LOGS_NAMESPACE: &str = "AWS/Logs";
+
+/// The metric counting the Embedded Metric Format documents whose metric creation was
+/// skipped because it is disabled for the log group they were ingested into. See
+/// [`LOGS_NAMESPACE`].
+pub const EMF_DISABLED_ERRORS_METRIC: &str = "EMFDisabledErrors";
+
+/// The dimension [`EMF_DISABLED_ERRORS_METRIC`] is published under: the log group whose
+/// documents were skipped, which is the granularity a metric extraction policy selects at.
+pub const LOG_GROUP_NAME_DIMENSION: &str = "LogGroupName";
+
+/// The unit of a count of documents, from the `StandardUnit` enumeration CloudWatch metric
+/// data is published with.
+const COUNT_UNIT: &str = "Count";
 
 /// How many datapoints one ingested event may publish, whatever its document declares: the
 /// ceiling that keeps one `PutLogEvents` batch from writing an unbounded number of series.
@@ -155,6 +176,38 @@ pub fn extracted_datapoints(message: &str, event_timestamp_ms: i64) -> Vec<Extra
         }
     }
     datapoints
+}
+
+/// The datapoints an ingested log event publishes when metric extraction is OFF for the log
+/// group `log_group_name` it landed in: one count of [`EMF_DISABLED_ERRORS_METRIC`] for a
+/// document whose metrics were skipped, and nothing at all for a message that declared no
+/// metric to skip.
+///
+/// A suppressed document publishes NOTHING into its own namespace — that is what the policy
+/// does — so the count is the only trace it leaves, and one document counts one whatever
+/// number of metrics it declared. The count carries the document's own instant, so it falls
+/// in the same period as the datapoints it stands in for.
+pub fn suppressed_datapoints(
+    message: &str,
+    event_timestamp_ms: i64,
+    log_group_name: &str,
+) -> Vec<ExtractedDatapoint> {
+    let skipped = extracted_datapoints(message, event_timestamp_ms);
+    let Some(first) = skipped.first() else {
+        return Vec::new();
+    };
+    vec![ExtractedDatapoint {
+        namespace: LOGS_NAMESPACE.to_string(),
+        metric_name: EMF_DISABLED_ERRORS_METRIC.to_string(),
+        dimensions: BTreeMap::from([(
+            LOG_GROUP_NAME_DIMENSION.to_string(),
+            log_group_name.to_string(),
+        )]),
+        timestamp_ms: first.timestamp_ms,
+        value: 1.0,
+        unit: Some(COUNT_UNIT.to_string()),
+        storage_resolution: DEFAULT_STORAGE_RESOLUTION,
+    }]
 }
 
 /// The dimension sets one directive publishes under, each resolved from the document's own
