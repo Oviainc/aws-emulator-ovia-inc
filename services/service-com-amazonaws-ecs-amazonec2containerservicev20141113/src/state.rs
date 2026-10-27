@@ -70,7 +70,10 @@ use crate::ops::types::{
     NetworkConfiguration,
     PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProtectedTask,
     ProxyConfiguration,
-    Resource, RuntimePlatform, Scale, Service, ServiceConnectConfiguration,    ServiceCurrentRevisionSummary, ServiceDeploymentBrief, ServiceEvent, ServiceRegistry,
+    Resource, RuntimePlatform, Scale, Service, ServiceConnectConfiguration,
+    ServiceCurrentRevisionSummary, ServiceDeployment, ServiceDeploymentAlarms,
+    ServiceDeploymentBrief, ServiceDeploymentCircuitBreaker, ServiceEvent, ServiceRegistry,
+    ServiceRevisionSummary,
     ServiceVolumeConfiguration, Setting, Tag, Task, TaskDefinition,
     TaskDefinitionPlacementConstraint, TaskOverride, TaskSet,
     ThresholdConfiguration, UpdatedExpressGatewayService, VersionInfo, Volume,
@@ -1112,6 +1115,43 @@ pub const SERVICE_DEPLOYMENT_STOPPED: &str = "STOPPED";
 /// then ListServiceDeployments returns up to 20 results and a nextToken value if
 /// applicable." The upper bound is the shared [`MAX_LIST_PAGE_SIZE`].
 pub const DEFAULT_LIST_SERVICE_DEPLOYMENTS_PAGE_SIZE: usize = 20;
+
+/// How many service deployments ONE `DescribeServiceDeployments` request may name, from
+/// the `serviceDeploymentArns` doc: "The ARN of the service deployment. You can specify a
+/// maximum of 20 ARNs."
+pub const MAX_DESCRIBE_SERVICE_DEPLOYMENTS: usize = 20;
+
+/// `ServiceDeploymentAlarms$status` and `ServiceDeploymentCircuitBreaker$status` for a
+/// failure-detection mechanism the deployment's configuration did not turn on — one of
+/// `ServiceDeploymentRollbackMonitorsStatus`, whose doc reads "Amazon ECS is not using
+/// alarms for service deployment failures when the status is `DISABLED`".
+pub const ROLLBACK_MONITORS_DISABLED: &str = "DISABLED";
+
+/// See [`ROLLBACK_MONITORS_DISABLED`]: a mechanism that IS turned on, watching a rollout
+/// that has not ended yet.
+pub const ROLLBACK_MONITORS_MONITORING: &str = "MONITORING";
+
+/// See [`ROLLBACK_MONITORS_DISABLED`]: a mechanism that was turned on and whose watch is
+/// over, because the rollout it was watching has ended.
+pub const ROLLBACK_MONITORS_MONITORING_COMPLETE: &str = "MONITORING_COMPLETE";
+
+/// The `ThresholdType` that uses the threshold configuration's `value` as the failure
+/// threshold itself: "For `COUNT`, Amazon ECS uses `value` directly as the threshold."
+pub const THRESHOLD_COUNT: &str = "COUNT";
+
+/// The `ThresholdType` that reads `value` as a percentage of the desired count and leaves
+/// the result unbounded: it multiplies "`value` by the latest service desired count,
+/// without applying the `3`-to-`200` bounds".
+pub const THRESHOLD_UNBOUNDED_PERCENT: &str = "UNBOUNDED_PERCENT";
+
+/// The lowest failure threshold a [`THRESHOLD_BOUNDED_PERCENT`] circuit breaker computes.
+/// That `ThresholdType` value's doc: Amazon ECS "calculates the failure threshold by
+/// multiplying `value` by the latest service desired count, then clamping the result to a
+/// minimum of `3` and a maximum of `200`".
+pub const MIN_CIRCUIT_BREAKER_THRESHOLD: i32 = 3;
+
+/// See [`MIN_CIRCUIT_BREAKER_THRESHOLD`]: the highest threshold that clamp allows.
+pub const MAX_CIRCUIT_BREAKER_THRESHOLD: i32 = 200;
 
 /// How many service deployments this emulator keeps for ONE service. EMULATOR-CHOSEN, for
 /// the same reason as [`MAX_SERVICE_EVENTS`]: every `UpdateService` that forces a new
@@ -3042,6 +3082,15 @@ pub struct ServiceDeploymentRecord {
     /// `ServiceDeploymentBrief$statusReason`: "Information about why the service deployment
     /// is in the current status."
     pub status_reason: String,
+    /// The deployment configuration this rollout is being carried out under, as the call
+    /// that started it left the service.
+    ///
+    /// `ServiceDeployment$deploymentConfiguration` belongs to ONE rollout, and a later
+    /// update can change the service's configuration without releasing a new revision, so
+    /// the configuration the rollout runs under is stored with it rather than read off the
+    /// service afterwards. The failure-detection mechanisms this record reports (the
+    /// circuit breaker and the CloudWatch alarms) are the ones it turned on.
+    pub deployment_configuration: DeploymentConfiguration,
 }
 
 impl ServiceDeploymentRecord {
@@ -4388,6 +4437,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let cluster_name = service.cluster_name.clone();
         let cluster_arn = service.cluster_arn.clone();
         let target_service_revision_arn = service.service_revision_arn.clone();
+        let deployment_configuration = service.deployment_configuration.clone();
         // A rollout this one replaces never reaches the steady state it was rolling out:
         // its tasks are the ones `scale_service` stops as superseded, so it ends here
         // rather than staying open for a steady state that can no longer arrive.
@@ -4412,6 +4462,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 finished_at: None,
                 target_service_revision_arn,
                 status: SERVICE_DEPLOYMENT_IN_PROGRESS.to_string(),
+                deployment_configuration,
             },
         );
         self.prune_service_deployments(&service_arn);
@@ -4472,6 +4523,150 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             deployment.service_arn == service.arn
                 && deployment.deployment_id == service.deployment_id
         })
+    }
+
+    /// The `ServiceDeployment` `DescribeServiceDeployments` reports for ONE stored
+    /// rollout: what the call that started it wrote, the revisions it moves the service
+    /// between with their task counts COUNTED off the task map, and the state of the
+    /// failure-detection mechanisms its own deployment configuration turned on.
+    ///
+    /// The same rollout the brief reports ([`ServiceDeploymentRecord::brief`]) in less
+    /// detail, read from the same record, so the two views cannot disagree.
+    pub fn service_deployment_view(&self, record: &ServiceDeploymentRecord) -> ServiceDeployment {
+        let service = self
+            .services
+            .get(&(record.cluster_name.clone(), record.service_name.clone()));
+        let finished = record.is_finished();
+        // "The service deployment stops when ... a user manually stops the deployment" or
+        // the service fails with no rollback in use — the ends this slice records as
+        // [`SERVICE_DEPLOYMENT_STOPPED`], while a rollout that reached the steady state it
+        // was rolling out COMPLETED instead. One stored instant ends the rollout either
+        // way, and the status it ended in is what decides which member reports it.
+        let stopped = record.status == SERVICE_DEPLOYMENT_STOPPED;
+        let target_service_revision = match service {
+            Some(service) => self.service_revision_summary(
+                service,
+                &record.deployment_id,
+                &record.target_service_revision_arn,
+            ),
+            // The service record outlives its deployments, so this is the tombstone-free
+            // case of a history whose service is gone: the revision is still named, and
+            // nothing holds a task of it.
+            None => ServiceRevisionSummary {
+                arn: Some(record.target_service_revision_arn.clone()),
+                ..ServiceRevisionSummary::default()
+            },
+        };
+        ServiceDeployment {
+            service_deployment_arn: Some(record.arn.clone()),
+            service_arn: Some(record.service_arn.clone()),
+            cluster_arn: Some(record.cluster_arn.clone()),
+            created_at: Some(record.created_at),
+            // The rollout begins with the call that created it — the same instant the
+            // brief reports as its `startedAt`.
+            started_at: Some(record.created_at),
+            finished_at: record.finished_at,
+            stopped_at: record.finished_at.filter(|_| stopped),
+            // "The time that the service deployment was last updated": the record is
+            // written by the call that starts the rollout and written again only where
+            // that rollout ends, so its last change is one of those two instants.
+            updated_at: Some(record.finished_at.unwrap_or(record.created_at)),
+            source_service_revisions: Some(
+                service
+                    .map(|service| self.source_service_revisions(service, record))
+                    .unwrap_or_default(),
+            ),
+            target_service_revision: Some(target_service_revision),
+            status: Some(record.status.clone()),
+            status_reason: Some(record.status_reason.clone()),
+            // Every stage `ServiceDeploymentLifecycleStage` names is a step of a traffic
+            // shift between two running service revisions, and a lifecycle hook is the
+            // custom logic a stage runs. A rollout here shifts no traffic and runs no
+            // hook, so it stands in no stage and holds no hook detail to report.
+            lifecycle_stage: None,
+            lifecycle_hook_details: None,
+            deployment_configuration: Some(record.deployment_configuration.clone()),
+            // "The rollback options the service deployment uses when the deployment
+            // fails": no rollout here fails, so none has been rolled back.
+            rollback: None,
+            deployment_circuit_breaker: Some(deployment_circuit_breaker_view(
+                &record.deployment_configuration,
+                // "the latest service desired count" — the count the threshold is
+                // computed from, which is the service's own and not a count this
+                // deployment once asked for.
+                service.map_or(0, |service| service.desired_count),
+                finished,
+            )),
+            alarms: Some(deployment_alarms_view(
+                &record.deployment_configuration,
+                finished,
+            )),
+        }
+    }
+
+    /// The `ServiceRevisionSummary` of the revision `revision_arn` names, as the
+    /// deployment `deployment_id` of `service` rolls it out.
+    ///
+    /// Every count is read off the records that exist: the tasks that deployment holds are
+    /// COUNTED off the task map, and the count it was asked for is the desired count of
+    /// the service while it is the current rollout, the count the superseded entry kept
+    /// while its task set is still being replaced, and none once it holds nothing.
+    fn service_revision_summary(
+        &self,
+        service: &ServiceRecord,
+        deployment_id: &str,
+        revision_arn: &str,
+    ) -> ServiceRevisionSummary {
+        let tally = self.deployment_tally(&service.cluster_name, deployment_id);
+        let requested_task_count = if service.deployment_id == deployment_id {
+            service.desired_count
+        } else {
+            service
+                .superseded_deployments
+                .iter()
+                .find(|superseded| superseded.id == deployment_id)
+                .map_or(0, |superseded| superseded.desired_count)
+        };
+        ServiceRevisionSummary {
+            arn: Some(revision_arn.to_string()),
+            requested_task_count,
+            running_task_count: tally.running,
+            pending_task_count: tally.pending,
+            // "The percentage of test traffic that is directed to this service revision" /
+            // "... of production traffic": a share of a traffic shift between two running
+            // revisions, which the rollout this slice carries out does not perform, so
+            // neither weight is reported.
+            requested_test_traffic_weight: None,
+            requested_production_traffic_weight: None,
+        }
+    }
+
+    /// The revisions a rollout of `service` is moving it FROM.
+    ///
+    /// `ServiceDeployment$sourceServiceRevisions` is "the currently deployed workload
+    /// configuration" — the revision the service was running when this rollout started,
+    /// which is the one the rollout just before it released. The FIRST rollout of a
+    /// service replaces nothing, so it has no source at all.
+    fn source_service_revisions(
+        &self,
+        service: &ServiceRecord,
+        record: &ServiceDeploymentRecord,
+    ) -> Vec<ServiceRevisionSummary> {
+        self.service_deployments
+            .values()
+            .filter(|other| {
+                other.service_arn == record.service_arn && other.order_key() < record.order_key()
+            })
+            .max_by(|left, right| left.order_key().cmp(&right.order_key()))
+            .map(|previous| {
+                self.service_revision_summary(
+                    service,
+                    &previous.deployment_id,
+                    &previous.target_service_revision_arn,
+                )
+            })
+            .into_iter()
+            .collect()
     }
 
     /// Mint the container records of ONE task of `definition`, each with its own ARN and
@@ -7143,6 +7338,97 @@ fn default_deployment_circuit_breaker() -> DeploymentCircuitBreaker {
             value: THRESHOLD_DEFAULT_VALUE,
         }),
     }
+}
+
+/// The status a failure-detection mechanism of a rollout reports.
+///
+/// `ServiceDeploymentRollbackMonitorsStatus`: a mechanism the deployment configuration did
+/// not turn on is [`ROLLBACK_MONITORS_DISABLED`] ("Amazon ECS is not using alarms for
+/// service deployment failures when the status is `DISABLED`"); one that is on watches the
+/// rollout while it runs and has nothing left to watch once it has ended.
+fn rollback_monitors_status(enabled: bool, finished: bool) -> &'static str {
+    match (enabled, finished) {
+        (false, _) => ROLLBACK_MONITORS_DISABLED,
+        (true, false) => ROLLBACK_MONITORS_MONITORING,
+        (true, true) => ROLLBACK_MONITORS_MONITORING_COMPLETE,
+    }
+}
+
+/// `ServiceDeployment$alarms`: "The CloudWatch alarms that determine when a service
+/// deployment fails", as the rollout's own deployment configuration set them.
+fn deployment_alarms_view(
+    configuration: &DeploymentConfiguration,
+    finished: bool,
+) -> ServiceDeploymentAlarms {
+    let alarms = configuration.alarms.as_ref();
+    ServiceDeploymentAlarms {
+        status: Some(
+            rollback_monitors_status(alarms.is_some_and(|alarms| alarms.enable), finished)
+                .to_string(),
+        ),
+        // "The name of the CloudWatch alarms that determine when a service deployment
+        // failed": the names the configuration carries, and none when it carries none.
+        alarm_names: Some(alarms.map(|alarms| alarms.alarm_names.clone()).unwrap_or_default()),
+        // "One or more CloudWatch alarm names that have been triggered during the service
+        // deployment": an alarm is moved into its `ALARM` state by the metric it watches,
+        // which nothing in this slice publishes, so none has been triggered.
+        triggered_alarm_names: Some(Vec::new()),
+    }
+}
+
+/// `ServiceDeployment$deploymentCircuitBreaker`: "The circuit breaker configuration that
+/// determines a service deployment failed", as the rollout's own deployment configuration
+/// set it.
+fn deployment_circuit_breaker_view(
+    configuration: &DeploymentConfiguration,
+    desired_count: i32,
+    finished: bool,
+) -> ServiceDeploymentCircuitBreaker {
+    let breaker = configuration.deployment_circuit_breaker.as_ref();
+    let enabled = breaker.is_some_and(|breaker| breaker.enable);
+    ServiceDeploymentCircuitBreaker {
+        status: Some(rollback_monitors_status(enabled, finished).to_string()),
+        // "The number of times the circuit breaker detected a service deployment failure":
+        // no task of a rollout fails to start here, which is the same true zero the
+        // deployment's own `failedTasks` reports.
+        failure_count: 0,
+        // "The threshhold which determines that the service deployment failed" — a
+        // threshold only a breaker that is watching the rollout has at all.
+        threshold: if enabled {
+            circuit_breaker_threshold(breaker, desired_count)
+        } else {
+            0
+        },
+    }
+}
+
+/// The failure threshold a deployment circuit breaker tolerates before it triggers.
+///
+/// The `ThresholdConfiguration$type` doc states the whole rule: "For the percentage types
+/// (`BOUNDED_PERCENT` and `UNBOUNDED_PERCENT`), Amazon ECS multiplies `value` by the
+/// latest service desired count. For `COUNT`, Amazon ECS uses `value` directly as the
+/// threshold", and `BOUNDED_PERCENT` additionally clamps the product "to a minimum of `3`
+/// and a maximum of `200`". A breaker that configured no threshold takes the documented
+/// default, [`THRESHOLD_BOUNDED_PERCENT`] with [`THRESHOLD_DEFAULT_VALUE`].
+fn circuit_breaker_threshold(breaker: Option<&DeploymentCircuitBreaker>, desired_count: i32) -> i32 {
+    let configuration = breaker.and_then(|breaker| breaker.threshold_configuration.as_ref());
+    let kind = configuration.map_or(THRESHOLD_BOUNDED_PERCENT, |configuration| {
+        configuration.r#type.as_str()
+    });
+    let value = configuration.map_or(THRESHOLD_DEFAULT_VALUE, |configuration| configuration.value);
+    if kind == THRESHOLD_COUNT {
+        return value;
+    }
+    let scaled = i64::from(value) * i64::from(desired_count) / 100;
+    let bounded = if kind == THRESHOLD_UNBOUNDED_PERCENT {
+        scaled
+    } else {
+        scaled.clamp(
+            i64::from(MIN_CIRCUIT_BREAKER_THRESHOLD),
+            i64::from(MAX_CIRCUIT_BREAKER_THRESHOLD),
+        )
+    };
+    i32::try_from(bounded).unwrap_or(i32::MAX)
 }
 
 /// The ARN of the IAM role the CREATE named, resolved from the `role` reference it
