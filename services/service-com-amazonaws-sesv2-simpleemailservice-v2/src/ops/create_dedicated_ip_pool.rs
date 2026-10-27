@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDedicatedIpPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDedicatedIpPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDedicatedIpPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a pool of dedicated IP addresses under the name the request names, and
+//! persists it so `GetDedicatedIpPool` reports it and `ListDedicatedIpPools` pages over
+//! it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDedicatedIpPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDedicatedIpPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDedicatedIpPool"))
+        // Request metadata is not needed: a pool is keyed by name within the one
+        // emulated account, the same reading the rest of this service's named
+        // resources take.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDedicatedIpPool without the shared emulator state",
+            ));
+        };
+
+        // `ScalingMode` is a plain string in the generated input, so the value set is
+        // the handler's to check: the generated const is the model's own
+        // (`smithy_query(query="shape",shape="ScalingMode")`).
+        let scaling_mode = match input.scaling_mode {
+            Some(mode) => Some(crate::state::modelled_enum_value(
+                "ScalingMode",
+                mode,
+                SCALING_MODE_VALUES,
+            )
+            .map_err(bad_request)?),
+            None => None,
+        };
+
+        let name = input.pool_name;
+        let mut record = crate::state::DedicatedIpPoolRecord::new(
+            &name,
+            scaling_mode,
+            ::std::time::SystemTime::now(),
+        );
+        record.tags = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        if record.tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateDedicatedIpPoolErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "A resource can have as many as {} tags, got {}.",
+                        crate::state::MAX_TAGS_PER_RESOURCE,
+                        record.tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        if store.dedicated_ip_pools.contains_key(&name) {
+            return Err(CreateDedicatedIpPoolErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(crate::state::dedicated_ip_pool_already_exists(&name)),
+                },
+            )
+            .into());
+        }
+        if store.dedicated_ip_pools.len() >= crate::state::MAX_DEDICATED_IP_POOLS {
+            return Err(CreateDedicatedIpPoolErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} dedicated IP pools.",
+                        crate::state::MAX_DEDICATED_IP_POOLS
+                    )),
+                },
+            )
+            .into());
+        }
+        store.dedicated_ip_pools.insert(name, record);
+
+        // `CreateDedicatedIpPoolResponse` carries no members: the stored pool is read
+        // back with `GetDedicatedIpPool` and listed by `ListDedicatedIpPools`.
+        Ok(CreateDedicatedIpPoolOutput {})
     }
+}
+
+/// Refuse the request with this operation's input error — "the input you provided is
+/// invalid".
+fn bad_request(message: impl Into<String>) -> CreateDedicatedIpPoolError {
+    CreateDedicatedIpPoolErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }

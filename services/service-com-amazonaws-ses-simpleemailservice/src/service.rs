@@ -45,6 +45,10 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// How this service WORDS a request the framework refused before any handler ran, and
+/// which error code it names. Applied through [`EmulatedService::override_refusal`].
+pub mod validation;
+
 /// This service's endpoint prefix, as its model gives it
 /// (`smithy_query(query="service_info")`: `awsService.endpointPrefix` `email`) — the name
 /// a host-addressed request resolves to, beside the SigV4 signing name (`ses`) the
@@ -135,16 +139,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. The words and the code are [`validation`]'s: this API answers
+        // every structural refusal with one code, and states an absent member and an
+        // enum rejection without echoing the request, which the framework's own
+        // default does neither of. Both halves are replaced together, because a
+        // client branches on the code.
+        validation::refusal(refusal)
     }
 
     fn override_routing_error(

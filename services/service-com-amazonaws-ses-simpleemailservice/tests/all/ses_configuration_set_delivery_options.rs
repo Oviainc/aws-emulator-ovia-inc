@@ -325,13 +325,16 @@ async fn a_policy_outside_the_model_s_value_set_is_refused_and_changes_nothing()
             code.is_some() && !message.is_empty(),
             "case put {value:?}: expected a refusal naming a code and a message, got {body}"
         );
-        // The refusal says what was wrong with the request: the value it rejected
-        // and the member it rejected it at, so the caller can fix the request from
-        // the text alone.
+        // The refusal says what was wrong with the request: the member it rejected
+        // the value at and the set the value had to come from, so the caller can fix
+        // the request from the text alone. The rejected value itself is NOT echoed —
+        // an enum clause states the admitted set instead (`crate::service::validation`
+        // of this crate states that rule for every enum-constrained member).
         assert!(
-            message.contains(value) && message.contains("tlsPolicy"),
-            "case put {value:?}: expected a message naming the value and the member, \
-             got {message:?}"
+            message.contains("tlsPolicy")
+                && message.contains("Member must satisfy enum value set: [Require, Optional]"),
+            "case put {value:?}: expected a message naming the member and the admitted \
+             set, got {message:?}"
         );
         // And it stored nothing: the policy the set already carried stands.
         let reported = described_tls_policy(&router, "guarded-set").await;

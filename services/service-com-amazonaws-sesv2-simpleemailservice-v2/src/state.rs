@@ -605,6 +605,15 @@ pub const MAX_CONFIGURATION_SET_NAME_LEN: usize = 64;
 /// `LimitExceededException` its model binds.
 pub const MAX_EVENT_DESTINATIONS_PER_SET: usize = 1_000;
 
+/// Dedicated IP pools the account may hold: SES's documented quota is 50 dedicated IP
+/// pools per account per Region, and `CreateDedicatedIpPool` refuses past it with the
+/// `LimitExceededException` its model binds.
+pub const MAX_DEDICATED_IP_POOLS: usize = 50;
+
+/// `ScalingMode$STANDARD`: "a dedicated IP pool where you can control which IPs are part
+/// of the pool" (`DedicatedIpPool$ScalingMode`'s own documentation).
+pub const SCALING_MODE_STANDARD: &str = "STANDARD";
+
 /// Per-service state for com-amazonaws-sesv2-simpleemailservice-v2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
@@ -646,6 +655,12 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// exactly, so it is keyed exactly as supplied. Ordered, so
     /// `ListConfigurationSets` enumerates and pages deterministically.
     pub configuration_sets: BTreeMap<String, ConfigurationSetRecord>,
+    /// Dedicated IP pools, keyed by the `PoolName` they were created with. The name
+    /// is the identity of a pool — every pool operation binds it as a path label and
+    /// `ListDedicatedIpPools` reports it — so it is keyed exactly as supplied.
+    /// Ordered, so `ListDedicatedIpPools` enumerates and pages deterministically.
+    /// Bounded by [`MAX_DEDICATED_IP_POOLS`], which `CreateDedicatedIpPool` enforces.
+    pub dedicated_ip_pools: BTreeMap<String, DedicatedIpPoolRecord>,
     /// Addresses on a suppression list, keyed by [`suppression_key`]: the list the
     /// entry belongs to (a tenant's, or the account's) and the address within it, so
     /// a tenant's list and the account-level list are separate. Ordered, so
@@ -814,6 +829,10 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
                 .values()
                 .find(|tenant| tenant.arn == resource_arn)
                 .map(TenantRecord::tag_list),
+            "dedicated-ip-pool" => self
+                .dedicated_ip_pools
+                .get(resource_id)
+                .map(DedicatedIpPoolRecord::tag_list),
             _ => None,
         }
     }
@@ -2418,6 +2437,81 @@ pub fn configuration_set_not_found(configuration_set_name: &str) -> String {
     format!("Configuration set <{configuration_set_name}> does not exist.")
 }
 
+/// One dedicated IP pool: "a pool can include one or more dedicated IP addresses that
+/// are associated with your Amazon Web Services account"
+/// (`CreateDedicatedIpPool`'s own documentation).
+///
+/// The addresses a pool holds are not kept here: no operation of this emulator
+/// allocates a dedicated IP address, so a pool holds the attributes its create and its
+/// scaling write and nothing invented.
+#[derive(Debug, Clone)]
+pub struct DedicatedIpPoolRecord {
+    /// `DedicatedIpPool$PoolName`, as the request that created the pool spelled it —
+    /// also the key this record is held under.
+    pub pool_name: String,
+    /// `DedicatedIpPool$ScalingMode`, a `ScalingMode`: `STANDARD` for a pool whose
+    /// member addresses the account controls, `MANAGED` for one SES manages.
+    pub scaling_mode: String,
+    /// Tags, in the order they were supplied.
+    pub tags: Vec<(String, String)>,
+    /// When the pool was created.
+    pub created_at: SystemTime,
+}
+
+impl DedicatedIpPoolRecord {
+    /// A pool as `CreateDedicatedIpPool` stores it.
+    ///
+    /// A request that names no `ScalingMode` gets [`SCALING_MODE_STANDARD`]: the
+    /// member is optional on the create and `@required` on the pool SES reports, and
+    /// `PutDedicatedIpPoolScalingAttributes` converts a pool "to a different scaling
+    /// mode" with the note that "`MANAGED` pools cannot be converted to `STANDARD`
+    /// scaling mode" — so `STANDARD` is the mode a pool starts in and `MANAGED` the
+    /// one it can be moved to.
+    pub fn new(pool_name: &str, scaling_mode: Option<String>, now: SystemTime) -> Self {
+        Self {
+            pool_name: pool_name.to_string(),
+            scaling_mode: scaling_mode.unwrap_or_else(|| SCALING_MODE_STANDARD.to_string()),
+            tags: Vec::new(),
+            created_at: now,
+        }
+    }
+
+    /// The modelled `DedicatedIpPool` view of this record, as `GetDedicatedIpPool`
+    /// reports it. One projection, so a write and the read after it cannot disagree.
+    pub fn view(&self) -> crate::ops::types::DedicatedIpPool {
+        crate::ops::types::DedicatedIpPool {
+            pool_name: self.pool_name.clone(),
+            scaling_mode: self.scaling_mode.clone(),
+        }
+    }
+
+    /// The modelled `TagList` view of this record's tags.
+    pub fn tag_list(&self) -> Vec<crate::ops::types::Tag> {
+        self.tags
+            .iter()
+            .map(|(key, value)| crate::ops::types::Tag {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+}
+
+/// How this service words `AlreadyExistsException` for a dedicated IP pool the account
+/// already holds — "the resource specified in your request already exists".
+pub fn dedicated_ip_pool_already_exists(pool_name: &str) -> String {
+    format!("Dedicated IP pool <{pool_name}> already exists.")
+}
+
+/// How this service words `NotFoundException` for a dedicated IP pool it does not hold.
+///
+/// One wording for every operation that takes a `PoolName`, so a client sees the same
+/// sentence whichever call first tells it the pool is not there — the form
+/// [`configuration_set_not_found`] states for the resource it names.
+pub fn dedicated_ip_pool_not_found(pool_name: &str) -> String {
+    format!("Dedicated IP pool <{pool_name}> does not exist.")
+}
+
 /// The `WarmupPercentage` a dedicated IP in a MANAGED pool reports.
 ///
 /// From `DedicatedIp$WarmupPercentage`: "-1 — Appears for IP addresses in managed
@@ -3163,6 +3257,9 @@ pub const TENANT_RESOURCES_PAGE_TOKEN_TAG: &str = "sesv2:tenant-resources:";
 
 /// The tag `ListTenants`'s own tokens carry.
 pub const TENANTS_PAGE_TOKEN_TAG: &str = "sesv2:tenants:";
+
+/// The tag `ListDedicatedIpPools`'s own tokens carry.
+pub const DEDICATED_IP_POOLS_PAGE_TOKEN_TAG: &str = "sesv2:dedicated-ip-pools:";
 
 /// Encode a `NextToken` that resumes the listing tagged `tag` after `last_returned`.
 ///

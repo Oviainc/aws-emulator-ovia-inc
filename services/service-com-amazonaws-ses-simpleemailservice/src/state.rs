@@ -1716,6 +1716,24 @@ pub fn illegal_address_message(value: &str) -> String {
     )
 }
 
+/// How a send refuses a message whose sending identity this account has not
+/// verified, for every operation that gates a send on one.
+///
+/// SES identities are per-REGION — an identity verified in one Region is not
+/// verified in another — so the refusal names the Region the check ran in, upper
+/// cased, before the identities that failed it. Everything but the Region token
+/// and the identity list is fixed text; the Region comes from the request's
+/// credential scope ([`region_from_request`]) and the identities from the request.
+/// One wording, for the same reason as [`illegal_address_message`].
+pub fn unverified_identities_message(region: &str, identities: &[&str]) -> String {
+    format!(
+        "Email address is not verified. The following identities failed the check in region \
+         {}: {}",
+        region.to_uppercase(),
+        identities.join(", ")
+    )
+}
+
 /// How a send refuses a message that would take the account past its 24-hour
 /// sending quota, for every operation that counts against it.
 ///

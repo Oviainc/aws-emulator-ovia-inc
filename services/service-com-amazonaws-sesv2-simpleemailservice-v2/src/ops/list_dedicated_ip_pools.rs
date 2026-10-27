@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDedicatedIpPools
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDedicatedIpPools`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDedicatedIpPools::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the names of the dedicated IP pools the account holds, a page at a time.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +140,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDedicatedIpPools` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDedicatedIpPoolsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDedicatedIpPools"))
+        // The listing is the account's whole pool table, so no request metadata is
+        // needed — the same reading this service's other listings take.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // No store at all, which is not a modelled SES state: answer the
+            // scaffold's 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListDedicatedIpPools without the shared emulator state",
+            ));
+        };
+
+        // "The number of results to show in a single call": `PageSize` targets
+        // `MaxItems`, on which the model puts no bound, so only a positive count
+        // truncates a page; a non-positive one is read as no truncation, which keeps a
+        // caller that sends 0 from being stuck on an empty page forever. The same
+        // reading as this service's other listings.
+        let page_size = usize::try_from(input.page_size.unwrap_or_default())
+            .ok()
+            .filter(|size| *size > 0);
+
+        // The token is this operation's own: it names the last pool the previous page
+        // reported, so the next page resumes strictly after it. A token the caller made
+        // up, or one minted by another listing, decodes to nothing and is refused
+        // rather than silently read as the start of the listing.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_tagged_page_token(
+                    crate::state::DEDICATED_IP_POOLS_PAGE_TOKEN_TAG,
+                    token,
+                )
+                .ok_or_else(|| bad_request(crate::state::invalid_next_token()))?,
+            ),
+        };
+
+        // Reporting only: nothing here writes, so a read leaves every later caller
+        // seeing exactly what it saw. The table is keyed by `PoolName`, so it
+        // enumerates in name order whatever order the pools were created in — which is
+        // what makes a token a stable position in the listing.
+        let names: Vec<String> = {
+            let store = state.lock();
+            store.dedicated_ip_pools.keys().cloned().collect()
+        };
+
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(last) => names.partition_point(|name| name.as_str() <= last),
+        };
+        let remaining = &names[start..];
+        let page = match page_size {
+            Some(size) => &remaining[..size.min(remaining.len())],
+            None => remaining,
+        };
+        // A token only when pools remain behind this page, so a walk terminates.
+        let next_token = (page.len() < remaining.len())
+            .then(|| page.last())
+            .flatten()
+            .map(|name| {
+                crate::state::encode_tagged_page_token(
+                    crate::state::DEDICATED_IP_POOLS_PAGE_TOKEN_TAG,
+                    name,
+                )
+            });
+
+        Ok(ListDedicatedIpPoolsOutput {
+            // Present even when empty: an account holding no pool has an empty list,
+            // which is a different answer from an absent member.
+            dedicated_ip_pools: Some(page.to_vec()),
+            next_token,
+        })
     }
+}
+
+/// Refuse the request with this operation's input error — "the input you provided is
+/// invalid".
+fn bad_request(message: impl Into<String>) -> ListDedicatedIpPoolsError {
+    ListDedicatedIpPoolsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
 }
