@@ -28,6 +28,13 @@
 //! changes nothing — the stack keeps the template, the parameters and the resources it has,
 //! and the update fails carrying the transform's own reason.
 //!
+//! A submitted template is VALIDATED before the stack is touched, by the same pass a
+//! create's body goes through ([`crate::state::template_validation`]): a body whose own
+//! declarations CloudFormation cannot resolve is refused with HTTP 400 `ValidationError`
+//! and the stack keeps the template it has. A `Rules` assertion the parameter values in
+//! force do not satisfy is not such a refusal — it fails the update, which likewise leaves
+//! the stack as it was.
+//!
 //! Members this slice stores but has nothing to act on, because it performs no resource
 //! updates: `StackPolicyBody` (replaces the stack's policy, which `GetStackPolicy`
 //! reports back) and `ResourceTypes`. `StackPolicyDuringUpdateBody` is a policy that
@@ -382,7 +389,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // (`crate::state::resource_types`).
                 crate::state::validate_resource_types(body)
                     .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-                Some((body.clone(), crate::state::template::process(body)))
+                Some(body.clone())
             }
             None => None,
         };
@@ -448,8 +455,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             PreviousValues::of(previous)
         };
 
-        let (template_body, processed_template) = match submitted {
-            Some((body, processed)) => (body, processed),
+        let (template_body, reuses_previous_stage) = match submitted {
+            Some(body) => (body, false),
             // `UsePreviousTemplate`: "Reuse the existing template that is associated with
             // the stack that you are updating." A stack a `CREATE` change set created and
             // nothing has executed yet carries no template to reuse.
@@ -460,7 +467,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         input.stack_name
                     ))
                 })?,
-                previous.processed_template.clone(),
+                true,
             ),
         };
         // "In some cases, you must explicitly acknowledge that your stack template contains
@@ -486,6 +493,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A parameter the template declares and the request passed no value for takes the
         // template's own `Default`, exactly as on a create.
         let parameters = crate::state::parameters_in_force(&template_body, parameters);
+        let parameter_values: ::std::collections::BTreeMap<String, String> = parameters
+            .iter()
+            .map(|parameter| (parameter.key.clone(), parameter.value.clone()))
+            .collect();
+        // The stage this update would deploy, computed from the values in force: a
+        // language-extensions directive reads them, so the stage depends on them. An update
+        // reusing the stack's own template keeps the stage that was computed for it.
+        let processed_template = if reuses_previous_stage {
+            previous.processed_template.clone()
+        } else {
+            crate::state::template::process_with_parameters(&template_body, &parameter_values)
+        };
+        // The same template validation a create is held to: a body whose own declarations
+        // CloudFormation cannot resolve is refused HERE, so the stack keeps the template it
+        // has rather than starting an update from one real AWS would never accept.
+        crate::state::validate_submitted_template(
+            &template_body,
+            &processed_template,
+            &parameter_values,
+            &request_region,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "Rules: validates a parameter or a combination of parameters passed to a template
+        // during a stack creation or stack update": an assertion the values in force do not
+        // satisfy fails the update, which leaves the stack as it was — and so does a
+        // directive the declared transform cannot apply where it stands.
+        let deployment_failure = crate::state::template_validation::deployment_failure(
+            &template_body,
+            &parameter_values,
+        );
         // "If you don't specify this parameter, CloudFormation doesn't modify the stack's
         // tags. If you specify an empty value, CloudFormation removes all associated
         // tags." The same shape holds for the other collection members the request may
@@ -574,13 +611,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let transform_failure = match &processing {
             crate::state::include::Processed::Failed(reason) => Some(reason.clone()),
             _ => None,
-        };
+        }
+        .or(deployment_failure);
         // The transforms the template DECLARES are applied to the spliced document, so the
         // stage this update deploys and `GetTemplate` serves is the whole pipeline's — and
         // that expansion, like the splice, happens before the store lock below.
         let processed_template = match &processing {
             crate::state::include::Processed::Expanded(processed) => {
-                crate::state::template::process(processed)
+                crate::state::template::process_with_parameters(processed, &parameter_values)
             }
             _ => processed_template,
         };

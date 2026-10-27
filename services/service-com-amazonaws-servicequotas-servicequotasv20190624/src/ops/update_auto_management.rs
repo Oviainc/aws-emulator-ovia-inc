@@ -25,11 +25,12 @@
 //! looked up FIRST, so an account with nothing running is told that rather than being
 //! told about the names in a call it has no configuration to apply.
 //!
-//! Only SOME of the modes the `OptInType` enum declares are available yet: the
-//! member's own documentation (below) names the available subset, so an update naming
-//! a mode outside it is refused with the modelled `IllegalArgumentException` and
-//! changes nothing at all — see [`crate::state::AVAILABLE_OPT_IN_TYPES`], the rule
-//! `StartAutoManagement` applies to the same member.
+//! An `OptInType` this call names is stored as given whichever member of the enum it
+//! is: the member carries no constraint narrowing it to a subset of the enum, so the
+//! boundary validator's enum check is the whole of its validation and the handler adds
+//! none of its own — the rule `StartAutoManagement` applies to the same member. The
+//! member's prose note about which mode is available is documentation, not a modelled
+//! constraint, and an update of the mode leaves `OptInStatus` as it was.
 //!
 //! ---
 //!
@@ -129,23 +130,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // An opt-in type the service does not offer yet is refused before anything is
-        // read or written: it is a fact of the REQUEST, the way the constraints the
-        // boundary validator checks just before this are, so it is refused whatever
-        // the account's configuration is.
-        if input
-            .opt_in_type
-            .as_deref()
-            .is_some_and(|opt_in_type| !crate::state::opt_in_type_is_available(opt_in_type))
-        {
-            return Err(UpdateAutoManagementErrorModeled::IllegalArgumentException(
-                IllegalArgumentException {
-                    message: Some(crate::state::unavailable_opt_in_type_message()),
-                },
-            )
-            .into());
-        }
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateAutoManagementErrorModeled::ServiceException(ServiceException {
                 message: Some("the Service Quotas state store is unavailable".to_string()),

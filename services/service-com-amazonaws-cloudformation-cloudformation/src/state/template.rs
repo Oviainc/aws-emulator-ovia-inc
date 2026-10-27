@@ -850,22 +850,23 @@ pub fn quota_violation(body: &str) -> Option<String> {
 /// than disagreeing about them.
 fn quota_violation_in(document: &Value) -> Option<String> {
     // In section order, so a template past more than one is refused for the same quota
-    // however its body is spelled. The refusal names the section, the count the body
-    // declares and the maximum it is past, which is the form the service words it in.
+    // however its body is spelled. The refusal counts the ENTRIES of the section and names
+    // them by what one entry IS — a parameter, a resource, an output — which is the form the
+    // service words it in, rather than by the section's own plural key.
     [
-        ("Parameters", MAX_PARAMETERS_PER_TEMPLATE),
-        ("Resources", MAX_RESOURCES_PER_TEMPLATE),
-        ("Outputs", MAX_OUTPUTS_PER_TEMPLATE),
+        ("Parameters", "Parameter", MAX_PARAMETERS_PER_TEMPLATE),
+        ("Resources", "Resource", MAX_RESOURCES_PER_TEMPLATE),
+        ("Outputs", "Output", MAX_OUTPUTS_PER_TEMPLATE),
     ]
     .into_iter()
-    .find_map(|(section, quota)| {
+    .find_map(|(section, entry, quota)| {
         let declared = document
             .get(section)
             .and_then(Value::as_object)
             .map_or(0, Map::len);
         (declared > quota).then(|| {
             format!(
-                "Template format error: {section} count {declared} is greater than max \
+                "Template format error: {entry} count {declared} is greater than max \
                  allowed {quota}"
             )
         })
@@ -1775,7 +1776,7 @@ fn collect_references(value: &Value, depth: usize, into: &mut References) {
 /// The variable names an `Fn::Sub` source string names, each `${…}` without its
 /// attribute path, and the WHOLE `${…}` where it read an attribute path off the name (the
 /// `${Name.Attribute}` form, which is an `Fn::GetAtt` by another spelling).
-fn substitution_names(source: &str) -> Vec<(String, Option<String>)> {
+pub fn substitution_names(source: &str) -> Vec<(String, Option<String>)> {
     let mut names = Vec::new();
     let mut rest = source;
     while let Some(start) = rest.find("${") {
@@ -5298,8 +5299,11 @@ fn intrinsic(
         }
         // "The intrinsic function Fn::FindInMap returns the value corresponding to keys
         // in a two-level map declared in the Mappings section":
-        // [MapName, TopLevelKey, SecondLevelKey].
-        "Fn::FindInMap" => {
+        // [MapName, TopLevelKey, SecondLevelKey], plus the optional fourth argument that
+        // carries "the value to be returned if the key is not found": `{"DefaultValue":
+        // <value>}`. A lookup that misses resolves to that default where one is given, and
+        // to NO value otherwise — which is what the submitted template is refused for.
+        FN_FIND_IN_MAP => {
             let keys = argument.as_array()?;
             if keys.len() < 3 {
                 return None;
@@ -5309,11 +5313,17 @@ fn intrinsic(
             let second = text(&keys[2], scope, depth + 1, budget)?;
             let found = scope
                 .mappings
-                .get(map)?
-                .get(top)?
-                .get(second)
-                .and_then(scalar_text)?;
-            Some(Resolved::Text(found))
+                .get(map)
+                .and_then(|entries| entries.get(top))
+                .and_then(|entries| entries.get(second))
+                .and_then(scalar_text);
+            match found {
+                Some(found) => Some(Resolved::Text(found)),
+                None => {
+                    let default = keys.get(3)?.get(FIND_IN_MAP_DEFAULT_VALUE)?;
+                    evaluate(default, scope, depth + 1, budget)
+                }
+            }
         }
         // "The intrinsic function Fn::GetAZs returns an array that lists Availability
         // Zones for a specified Region … you can specify "" (empty string) … to get all
@@ -5838,11 +5848,20 @@ const TRANSFORM: &str = "Transform";
 pub const LANGUAGE_EXTENSIONS: &str = "AWS::LanguageExtensions";
 
 /// The loop directive's key prefix: `Fn::ForEach::<UniqueLoopName>`.
-const FOR_EACH_PREFIX: &str = "Fn::ForEach::";
+pub const FOR_EACH_PREFIX: &str = "Fn::ForEach::";
 /// The directive that replaces itself with the number of items in a list.
-const FN_LENGTH: &str = "Fn::Length";
+pub const FN_LENGTH: &str = "Fn::Length";
 /// The directive that replaces itself with the JSON text of its argument.
-const FN_TO_JSON_STRING: &str = "Fn::ToJsonString";
+pub const FN_TO_JSON_STRING: &str = "Fn::ToJsonString";
+/// `Fn::GetAtt`, whose first argument names the resource an attribute is read off.
+pub const FN_GET_ATT: &str = "Fn::GetAtt";
+/// `Fn::FindInMap`, which reads a value out of the `Mappings` section.
+pub const FN_FIND_IN_MAP: &str = "Fn::FindInMap";
+/// `Fn::If`, whose first argument names the condition that chooses between its branches.
+pub const FN_IF: &str = "Fn::If";
+/// The member of `Fn::FindInMap`'s optional fourth argument that carries "the value to be
+/// returned if the key is not found".
+pub const FIND_IN_MAP_DEFAULT_VALUE: &str = "DefaultValue";
 /// `Fn::Sub`, whose template string is where a loop identifier is read inside a value.
 const FN_SUB: &str = "Fn::Sub";
 /// `Fn::ImportValue`, whose argument names the EXPORT a template imports.
@@ -5993,6 +6012,19 @@ fn transform_names(node: &Value) -> Vec<String> {
 /// that runs outside this emulator, so the stage is reported UNAVAILABLE rather than
 /// computed from a macro nothing ran.
 pub fn process(body: &str) -> Processed {
+    process_with_parameters(body, &BTreeMap::new())
+}
+
+/// [`process`] with the parameter values the submitting request carried.
+///
+/// The language-extensions directives read the parameters in force: "Fn::Length returns the
+/// number of elements within an array or an intrinsic function that returns an array", and a
+/// `Ref` to a list-typed parameter IS such an intrinsic — so the stage this computes depends
+/// on the values the stack is deployed with, exactly as the resources and outputs evaluated
+/// from it do. A parameter the request passed no value for takes the template's own
+/// `Default`; one with no value in force at all leaves the directive unresolved, which is a
+/// stage this service reports as unavailable rather than guessing a count for.
+pub fn process_with_parameters(body: &str, supplied: &BTreeMap<String, String>) -> Processed {
     // The documented submitted-body maximum, enforced here too: every handler checks it
     // before storing a body, and this is the expander's own guard so no caller reaches the
     // expansion with a body past that bound.
@@ -6030,6 +6062,10 @@ pub fn process(body: &str) -> Processed {
         );
     };
     let mut document = Value::Object(root);
+    // What a `Ref` inside a directive's argument resolves to, read from the document's own
+    // declarations and the values this request carried, BEFORE the `Parameters` section is
+    // walked over by the expansion.
+    let parameters = directive_parameters(&document, supplied);
     // The SAM macro's expansion reads the `Transform` section itself, so it runs while that
     // section is still there.
     super::sam::expand(&mut document);
@@ -6039,7 +6075,7 @@ pub fn process(body: &str) -> Processed {
         sections.remove(TRANSFORM);
     }
     let mut budget = ExpansionBudget::new();
-    if let Err(reason) = expand_directives(&mut document, &mut budget, 0) {
+    if let Err(reason) = expand_directives(&mut document, &parameters, &mut budget, 0) {
         return Processed::Unavailable(reason);
     }
     // Serialised in KEY order, whatever map type `serde_json` was compiled with: see
@@ -6099,6 +6135,7 @@ pub fn properties_blob(properties: &Value) -> Option<String> {
 /// served half-expanded.
 fn expand_directives(
     node: &mut Value,
+    parameters: &DirectiveParameters,
     budget: &mut ExpansionBudget,
     depth: usize,
 ) -> Result<(), String> {
@@ -6108,7 +6145,7 @@ fn expand_directives(
     match node {
         Value::Array(items) => {
             for item in items.iter_mut() {
-                expand_directives(item, budget, depth + 1)?;
+                expand_directives(item, parameters, budget, depth + 1)?;
             }
             Ok(())
         }
@@ -6120,26 +6157,114 @@ fn expand_directives(
                     // the directive's own key.
                     Some(loop_name) => {
                         for (entry_key, entry_value) in
-                            expand_for_each(loop_name, &value, budget, depth + 1)?
+                            expand_for_each(loop_name, &value, parameters, budget, depth + 1)?
                         {
                             insert_expanded(&mut expanded, entry_key, entry_value)?;
                         }
                     }
                     None => {
-                        expand_directives(&mut value, budget, depth + 1)?;
+                        expand_directives(&mut value, parameters, budget, depth + 1)?;
                         insert_expanded(&mut expanded, key, value)?;
                     }
                 }
             }
             *map = expanded;
             // The directives that REPLACE their own node, now their argument is expanded.
-            if let Some(replacement) = evaluate_directive(map, budget)? {
+            if let Some(replacement) = evaluate_directive(map, parameters, budget)? {
                 *node = replacement;
             }
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+/// The parameter values a language-extensions directive resolves a `Ref` against: the
+/// values in force on the deployment whose stage is being computed.
+#[derive(Debug, Default)]
+struct DirectiveParameters {
+    /// Each parameter's value in force, keyed by the name a `Ref` names it by.
+    values: BTreeMap<String, String>,
+    /// The parameters declared with a LIST type, whose value is "an array of literal
+    /// strings that are separated by commas" rather than one string.
+    lists: BTreeSet<String>,
+}
+
+impl DirectiveParameters {
+    /// What `{"Ref": "<name>"}` stands for inside a directive's argument, or `None` for a
+    /// name with no value in force — which leaves the reference where it was, so the
+    /// directive that needed it is reported unresolved rather than resolved to nothing.
+    fn value_of(&self, name: &str) -> Option<Value> {
+        let value = self.values.get(name)?;
+        if self.lists.contains(name) {
+            // The split is stopped one past the bound every list this service resolves is
+            // held to ([`MAX_RESOLVED_LIST_LEN`]): the text is request-supplied, so as many
+            // items as a body holds commas must never be materialised — a value past the
+            // bound leaves the reference unresolved instead.
+            let items: Vec<Value> = value
+                .split(',')
+                .take(MAX_RESOLVED_LIST_LEN + 1)
+                .map(|item| Value::String(item.trim().to_string()))
+                .collect();
+            return (items.len() <= MAX_RESOLVED_LIST_LEN).then_some(Value::Array(items));
+        }
+        Some(Value::String(value.clone()))
+    }
+}
+
+/// The parameters in force for `document`: its own declared defaults, overridden by the
+/// values the submitting request carried.
+fn directive_parameters(
+    document: &Value,
+    supplied: &BTreeMap<String, String>,
+) -> DirectiveParameters {
+    let declared = template_of(document).unwrap_or_default();
+    let mut values = declared.parameter_defaults();
+    for (key, value) in supplied {
+        values.insert(key.clone(), value.clone());
+    }
+    let lists = declared
+        .parameter_types()
+        .into_iter()
+        .filter(|(_, declared_type)| is_list_type(Some(declared_type.as_str())))
+        .map(|(key, _)| key)
+        .collect();
+    DirectiveParameters { values, lists }
+}
+
+/// Replace every `{"Ref": "<parameter>"}` inside a directive's argument with the value in
+/// force for that parameter, so a directive reading a parameter resolves from the template
+/// and the request alone. Refuses below [`MAX_EXPANSION_DEPTH`], like the expander itself.
+fn resolve_parameter_refs(
+    node: &mut Value,
+    parameters: &DirectiveParameters,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_EXPANSION_DEPTH {
+        return Err(too_deep());
+    }
+    match node {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                resolve_parameter_refs(item, parameters, depth + 1)?;
+            }
+        }
+        Value::Object(map) => {
+            if map.len() == 1 {
+                if let Some(name) = map.get(REF_FUNCTION).and_then(Value::as_str) {
+                    if let Some(value) = parameters.value_of(name) {
+                        *node = value;
+                    }
+                    return Ok(());
+                }
+            }
+            for value in map.values_mut() {
+                resolve_parameter_refs(value, parameters, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Insert one expanded entry, refusing a key that is already taken.
@@ -6168,6 +6293,7 @@ fn insert_expanded(
 fn expand_for_each(
     loop_name: &str,
     node: &Value,
+    parameters: &DirectiveParameters,
     budget: &mut ExpansionBudget,
     depth: usize,
 ) -> Result<Vec<(String, Value)>, String> {
@@ -6186,7 +6312,11 @@ fn expand_for_each(
         return Err(malformed());
     };
     let mut collection = collection.clone();
-    expand_directives(&mut collection, budget, depth + 1)?;
+    expand_directives(&mut collection, parameters, budget, depth + 1)?;
+    // "The collection ... can be a list or a reference to a list": a `Ref` to a list-typed
+    // parameter is resolved to the items in force for it, like every other directive's
+    // argument.
+    resolve_parameter_refs(&mut collection, parameters, depth + 1)?;
     let Value::Array(collection) = collection else {
         return Err(format!(
             "{FOR_EACH_PREFIX}{loop_name}: the collection is not a list this service can \
@@ -6250,7 +6380,7 @@ fn expand_for_each(
         // Expanded only now: a nested loop or an `Fn::Length` inside the output map is
         // resolved against THIS item's substitutions.
         let mut instance = Value::Object(instance);
-        expand_directives(&mut instance, budget, depth + 1)?;
+        expand_directives(&mut instance, parameters, budget, depth + 1)?;
         let Value::Object(instance) = instance else {
             return Err(malformed());
         };
@@ -6333,6 +6463,7 @@ fn substitute_identifier(
 /// this map is not one.
 fn evaluate_directive(
     map: &Map<String, Value>,
+    parameters: &DirectiveParameters,
     budget: &mut ExpansionBudget,
 ) -> Result<Option<Value>, String> {
     // An intrinsic function is a single-member object, so a map with any other member
@@ -6345,29 +6476,37 @@ fn evaluate_directive(
     };
     match name.as_str() {
         FN_LENGTH => {
-            let Value::Array(items) = argument else {
-                return Err(format!(
-                    "{FN_LENGTH}: the argument is not a list this service can count from the \
-                     template alone"
-                ));
-            };
-            Ok(Some(Value::from(items.len())))
+            // The argument's own parameter references first: "an intrinsic function that
+            // returns an array" includes a `Ref` to a list-typed parameter.
+            let mut argument = argument.clone();
+            resolve_parameter_refs(&mut argument, parameters, 0)?;
+            match &argument {
+                Value::Array(items) => Ok(Some(Value::from(items.len()))),
+                // Not a list the DOCUMENT decides: the directive is left where it is, for
+                // the deployment to evaluate against the whole scope — `Fn::GetAZs` and
+                // `Fn::Split` are "an intrinsic function that returns an array" too, and
+                // what they return is not in the template. An argument that can be no list
+                // at all is refused where the submitted template is validated
+                // ([`super::template_validation`]).
+                _ => Ok(None),
+            }
         }
         FN_TO_JSON_STRING => {
-            if holds_intrinsic(argument, 0) {
-                return Err(format!(
-                    "{FN_TO_JSON_STRING}: the argument still holds an intrinsic function this \
-                     service cannot resolve from the template alone"
-                ));
+            let mut argument = argument.clone();
+            resolve_parameter_refs(&mut argument, parameters, 0)?;
+            if holds_intrinsic(&argument, 0) {
+                // Likewise: a document still holding an intrinsic function is rendered by
+                // the deployment, which can evaluate it.
+                return Ok(None);
             }
             // Charged BEFORE the text is produced, from an upper bound computed without
             // building it: this directive renders a document INTO a string, which escapes
             // every quote and backslash, so one nested inside another would otherwise
             // double its own input per level with nothing to stop it.
-            budget.charge(FN_TO_JSON_STRING, 1, escaped_size_bound(argument))?;
+            budget.charge(FN_TO_JSON_STRING, 1, escaped_size_bound(&argument))?;
             // Rendered in KEY order, like the processed document itself: see
             // [`in_key_order`].
-            ::serde_json::to_string(&in_key_order(argument.clone()))
+            ::serde_json::to_string(&in_key_order(argument))
                 .map(|text| Some(Value::String(text)))
                 .map_err(|error| error.to_string())
         }

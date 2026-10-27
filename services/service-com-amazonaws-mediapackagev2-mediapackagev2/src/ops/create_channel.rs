@@ -2,8 +2,10 @@
 
 //! @op CreateChannel
 //! IMPLEMENTED. Creates a channel under an existing channel group and persists it in
-//! [`crate::state`], including the pair of ingest endpoints derived from the parent
-//! group's egress domain and the input-switch / output-header configuration blocks the
+//! [`crate::state`], including the ingest endpoints derived from the parent
+//! group's egress domain and the channel's input type (a channel whose input type
+//! receives no ingest of its own publishes none) and the input-switch / output-header
+//! configuration blocks the
 //! service materialises for every channel, alongside the two members whose default the
 //! model documents (`InputType`, and `OutputLockingMode` on a channel whose input type
 //! may carry it). An unknown parent is a
@@ -461,10 +463,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = input.channel_name.clone();
         let created_at = crate::state::now();
         let arn = crate::state::channel_arn(&region, &group.name, &name);
-        // The ingest URLs are a function of the parent group's egress domain and this
-        // channel's name, computed once and stored: a later read returns these bytes.
-        let ingest_endpoints =
-            crate::state::ingest_endpoints(&group.egress_domain, &group.name, &name);
         // The switching and CMSD-header blocks are applied by the service, not merely
         // echoed: a channel created without them still has a switching state, so they
         // are materialized here and stored. `Channel::recompute_etag` folds the applied
@@ -483,6 +481,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let input_type = crate::state::materialized_input_type(input.input_type);
         let output_locking_mode = crate::state::materialized_output_locking_mode(
             input.output_locking_mode,
+            &input_type,
+        );
+        // The ingest URLs are a function of the parent group's egress domain, this
+        // channel's name and its input type, computed once and stored: a later read
+        // returns these bytes. A channel whose input type receives no ingest of its own
+        // gets none, so none is published and none is reachable.
+        let ingest_endpoints = crate::state::ingest_endpoints(
+            &group.egress_domain,
+            &group.name,
+            &name,
             &input_type,
         );
 

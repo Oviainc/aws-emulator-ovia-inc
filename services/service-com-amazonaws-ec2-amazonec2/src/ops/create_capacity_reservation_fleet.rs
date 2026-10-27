@@ -500,33 +500,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The modelled word `requested` names out of `catalog`, the catalog's first value when it
 /// names none, or a refusal naming `member`.
 ///
-/// `catalog` is a GENERATED `*_VALUES` constant, so an enum's members live in exactly one
-/// place; answering a `&'static str` out of it is what keeps a request's own text out of the
-/// store. Defaulting to the first value is only reached for the single-member enums this
-/// operation documents no other default for. An empty catalog cannot happen for a modelled
-/// enum, and would leave nothing to default to, so it is refused rather than guessed at.
+/// The lookup itself is [`crate::state::modelled_catalog_word`], the one of its kind in the
+/// crate; only the DEFAULT is this operation's, and defaulting to the first value is only
+/// reached for the single-member enums this operation documents no other default for. An
+/// empty catalog cannot happen for a modelled enum, and would leave nothing to default to, so
+/// it is refused rather than guessed at.
 fn catalog_word<E>(
     requested: Option<&str>,
     catalog: &'static [&'static str],
     member: &str,
 ) -> Result<&'static str, crate::scaffolded::Scaffolded<E>> {
-    match requested {
-        None => catalog.first().copied().ok_or_else(|| {
+    crate::state::modelled_catalog_word(requested, catalog, member, catalog.first().copied())?
+        .ok_or_else(|| {
             crate::scaffolded::Scaffolded::internal_error(format!(
                 "the model publishes no value for {member}"
             ))
-        }),
-        Some(requested) => catalog
-            .iter()
-            .copied()
-            .find(|modelled| *modelled == requested)
-            .ok_or_else(|| {
-                crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value '{requested}' for {member}. Valid values: {}",
-                    catalog.join(" | ")
-                ))
-            }),
-    }
+        })
 }
 
 /// This operation's result for the Fleet `view`.

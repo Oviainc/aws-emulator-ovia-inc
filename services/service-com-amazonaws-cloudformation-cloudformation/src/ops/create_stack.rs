@@ -61,15 +61,24 @@
 //! token claimed, because the token is what identifies the request ("a unique identifier
 //! for this `CreateStack` request"), so a retry under a token already claimed by one of
 //! that stack's OTHER operations is not a retry at all and is refused with the modelled
-//! `TokenAlreadyExistsException`. One gap is deliberate, so a test
-//! author can see it: a `TemplateBody` that is neither JSON nor YAML is stored rather than
-//! refused with a template-format `ValidationError` (the create it opens then ends in the
-//! modelled `CREATE_FAILED`, because this service cannot deploy a template it cannot
-//! read).
+//! `TokenAlreadyExistsException`.
 //!
-//! A template whose `Resources` section declares a resource type CloudFormation does not
-//! recognise IS refused, with HTTP 400 `ValidationError` naming those types, before the
-//! stack is created: see [`crate::state::resource_types`] for the recognised set.
+//! The submitted template is VALIDATED before anything is written: a body whose own
+//! declarations CloudFormation cannot resolve is refused with HTTP 400 `ValidationError`
+//! and leaves no stack behind — a body neither reader will read, a function no template may
+//! use, an intrinsic spelled with arguments it does not take, a `Ref` or an `Fn::GetAtt`
+//! naming something the template does not declare, a `Condition` it does not declare, an
+//! `Fn::FindInMap` whose lookup the `Mappings` section does not carry, and a dependency
+//! cycle among the declared resources. See [`crate::state::template_validation`] for the
+//! whole pass. A template whose `Resources` section declares a resource type CloudFormation
+//! does not recognise is refused the same way, naming those types: see
+//! [`crate::state::resource_types`] for the recognised set.
+//!
+//! What the template says about the DEPLOYMENT rather than about the request fails the
+//! stack instead: a `Rules` assertion the parameter values in force do not satisfy, and an
+//! `Fn::ForEach` in a section the declared transform does not define it for, are accepted
+//! here and then end the create in `CREATE_FAILED`, which rolls back as `OnFailure`'s
+//! default asks.
 //!
 //! ## Shape of an operation
 //!
@@ -415,10 +424,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // empty previous set.
         let parameters = crate::state::merged_parameters(&[], input.parameters.as_deref())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // What the stack reports as `Parameters`: the values the request supplied, plus
+        // the template's own `Default` for a declared parameter it passed none for.
+        // Resolved HERE because the template's own processing reads them — a
+        // language-extensions directive counting a list-typed parameter's items among them.
+        let parameters = crate::state::parameters_in_force(&template_body, parameters);
+        let parameter_values: ::std::collections::BTreeMap<String, String> = parameters
+            .iter()
+            .map(|parameter| (parameter.key.clone(), parameter.value.clone()))
+            .collect();
         // Applying the template's transforms is caller-sized work, so it happens HERE —
         // before the store lock below — and never while every other request waits on that
         // lock. The stage it computes is what the stack deploys.
-        let processed_template = crate::state::template::process(&template_body);
+        let processed_template =
+            crate::state::template::process_with_parameters(&template_body, &parameter_values);
+        // "Creates a stack as specified in the template" — a template CloudFormation
+        // VALIDATES first: a body whose own declarations it cannot resolve is refused HERE,
+        // with nothing created, rather than accepted with a stack id and then deployed into
+        // a stack whose resources carry nulls (`crate::state::template_validation`).
+        crate::state::validate_submitted_template(
+            &template_body,
+            &processed_template,
+            &parameter_values,
+            &crate::state::request_region(ctx.parts()),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "Rules: validates a parameter or a combination of parameters passed to a template
+        // during a stack creation": an assertion that does not hold for the values in force
+        // is not a bad request — it fails the create this call opens, which then rolls back,
+        // and so does a directive the declared transform cannot apply where it stands.
+        let deployment_failure = crate::state::template_validation::deployment_failure(
+            &template_body,
+            &parameter_values,
+        );
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // This service was mounted on an engine that is not the shared in-memory
@@ -483,12 +521,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         );
         stack.region = region.clone();
-        // What the stack reports as `Parameters`: the values the request supplied, plus
-        // the template's own `Default` for a declared parameter it passed none for.
-        stack.parameters = crate::state::parameters_in_force(
-            stack.template_body.as_deref().unwrap_or_default(),
-            parameters,
-        );
+        // What the stack reports as `Parameters`, resolved above: the values the request
+        // supplied, plus the template's own `Default` for a declared parameter it passed
+        // none for.
+        stack.parameters = parameters;
         stack.capabilities = input.capabilities.clone().unwrap_or_default();
         stack.tags = crate::state::stored_tags(input.tags.as_deref().unwrap_or_default());
         stack.notification_arns = input.notification_ar_ns.clone().unwrap_or_default();
@@ -516,12 +552,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let transform_failure = match processing {
             crate::state::include::Processed::Unchanged => None,
             crate::state::include::Processed::Expanded(processed) => {
-                stack.processed_template = crate::state::template::process(&processed);
+                stack.processed_template = crate::state::template::process_with_parameters(
+                    &processed,
+                    &parameter_values,
+                );
                 stack.set_processed_template_body(processed);
                 None
             }
             crate::state::include::Processed::Failed(reason) => Some(reason),
-        };
+        }
+        // A `Rules` assertion the values in force do not satisfy, or a directive the
+        // declared transform cannot apply where it stands, fails this create the same way:
+        // the stack is created, deploys nothing, and settles into the rollback below
+        // carrying that reason.
+        .or(deployment_failure);
 
         // Everything the template's resources and outputs are computed from is now in
         // place: materialise the resources its PROCESSED stage declares and evaluate its

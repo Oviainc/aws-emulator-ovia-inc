@@ -259,7 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let created_date = crate::state::now_epoch_millis();
-        let policy_version = store.next_policy_version(created_date);
+        let policy_version = crate::state::mint_policy_version();
         let record = SecurityPolicyRecord {
             kind: input.r#type.clone(),
             name: input.name.clone(),

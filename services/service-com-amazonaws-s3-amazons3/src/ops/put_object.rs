@@ -341,7 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
@@ -415,29 +415,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Appending to an object through a write offset "is only supported for objects in
-        // the Amazon S3 Express One Zone storage class in directory buckets"
-        // (`PutObjectOutput$Size`). This emulator holds general purpose buckets, so the
-        // header names a parameter that is not valid for this request, which is exactly
-        // what the modelled `InvalidRequest` reports ("A parameter or header in your
-        // request isn't valid. For details, see the description of this API operation.").
-        if input.write_offset_bytes.is_some() {
-            return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
-        }
+        // The integrity values this write DECLARED, judged before anything is stored:
+        // `Content-MD5` is "a message integrity check to verify that the request body was
+        // not corrupted in transit" (`PutObjectRequest$ContentMD5`) and each `Checksum*`
+        // member is the client's digest of the same bytes under one algorithm, so each is
+        // checked against the payload actually received — first for its SHAPE, then against
+        // the digest. The codes and the sentences are the store's
+        // ([`crate::state::verify_declared_integrity`]), so every write that accepts these
+        // headers refuses the same value the same way.
+        let declared_checksums = declared_checksums(&input);
+        crate::state::verify_declared_integrity(
+            input.content_md5.as_deref(),
+            &declared_checksums,
+            &input.body,
+        )
+        .map_err(integrity_refusal)?;
 
-        // `ContentMD5` is "the Base64 encoded 128-bit MD5 digest of the data. You must
-        // use this header as a message integrity check to verify that the request body
-        // was not corrupted in transit", so when the request carries it, it is CHECKED
-        // against the payload actually received. A mismatch means the body is not the
-        // body the client hashed; AWS answers `BadDigest`, a code this model carries no
-        // shape for, so the refusal goes out as the modelled `InvalidRequest` (HTTP 400)
-        // rather than storing bytes the client did not intend.
-        if let Some(declared) = input.content_md5.as_deref() {
-            let actual = crate::state::content_md5(&input.body);
-            if declared != actual {
-                return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
-            }
-        }
+        // Which algorithm this write's checksum is computed under: the one an individual
+        // `Checksum*` member named, else the `ChecksumAlgorithm` member — "if you provide an
+        // individual checksum, Amazon S3 ignores any provided ChecksumAlgorithm parameter"
+        // (`PutObjectRequest$ChecksumAlgorithm`).
+        let algorithm = declared_checksums
+            .named_algorithm()
+            .map(str::to_string)
+            .or_else(|| input.checksum_algorithm.clone());
 
         // "The tag-set for the object. The tag-set must be encoded as URL Query
         // parameters. (For example, "Key1=Value1")" (`PutObjectRequest$Tagging`) — so the
@@ -553,6 +554,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             requested
         };
 
+        // The BYTES this write leaves at the key, and the class they are stored in.
+        //
+        // A write that carries no `x-amz-write-offset-bytes` replaces the key with the bytes
+        // it carried. One that DOES carry it appends them: "specifies the offset for
+        // appending data to existing objects in bytes. The offset must be equal to the size
+        // of the existing object being appended to. If no object exists, setting this header
+        // to 0 will create a new object" (`PutObjectRequest$WriteOffsetBytes`) — and the
+        // functionality "is only supported for objects in the Amazon S3 Express One Zone
+        // storage class in directory buckets", so the header on a general purpose bucket is
+        // a parameter that is not valid for the request, which the modelled `InvalidRequest`
+        // reports.
+        //
+        // The offset is read, and the appended object written, under the ONE guard this
+        // handler already holds, so two writes racing at the same offset cannot both find it
+        // current: the one that gets there first appends, and the other's offset is no longer
+        // the object's size, which is exactly the modelled `InvalidWriteOffset` ("the write
+        // offset value that you specified does not match the current object size").
+        let storage_class = input
+            .storage_class
+            .clone()
+            .unwrap_or_else(|| bucket_record.default_storage_class().to_string());
+        let body = match input.write_offset_bytes {
+            None => ::std::mem::take(&mut input.body),
+            Some(offset) => {
+                if !bucket_record.is_directory() {
+                    return Err(PutObjectErrorModeled::InvalidRequest(InvalidRequest {}).into());
+                }
+                let held = bucket_record
+                    .object(&input.key)
+                    .map(|object| object.body.clone())
+                    .unwrap_or_default();
+                if offset != i64::try_from(held.len()).unwrap_or(i64::MAX) {
+                    return Err(PutObjectErrorModeled::InvalidWriteOffset(
+                        InvalidWriteOffset {},
+                    )
+                    .into());
+                }
+                [held, ::std::mem::take(&mut input.body)].concat()
+            }
+        };
+
         // The ACL this write puts on the object it stores, and the rules it is judged
         // against — all of it decided before anything is written, so a refused write leaves
         // whatever was at the key exactly as it was.
@@ -609,7 +651,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let etag = crate::state::object_etag(&input.body);
+        let etag = crate::state::object_etag(&body);
         // The checksum this write stores with the object: the algorithm the request named,
         // computed over the bytes it carried. "When you perform a request with a
         // checksum-based data integrity check, Amazon S3 … calculates the checksum"
@@ -618,11 +660,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from. A request that names no algorithm stores no checksum, which is what makes
         // every later read of such an object report none.
         //
-        // The `Checksum*` members the request may also carry are NOT verified against this:
-        // they are the client's own value for the same bytes, and this emulator answers with
-        // the checksum it computed itself rather than with anything echoed back.
-        let checksum = input.checksum_algorithm.as_deref().and_then(|algorithm| {
-            crate::state::full_object_checksum(algorithm, &input.body).map(|value| {
+        // The VALUE is always the one computed here over the stored bytes, never the one the
+        // request carried: the two are equal by the time this runs (the verification above
+        // refused the write otherwise), so the reported checksum describes the bytes rather
+        // than echoing a header.
+        let checksum = algorithm.as_deref().and_then(|algorithm| {
+            crate::state::full_object_checksum(algorithm, &body).map(|value| {
                 crate::state::ObjectChecksum {
                     algorithm: algorithm.to_string(),
                     value,
@@ -631,13 +674,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         });
         let reported = crate::state::reported_checksums(checksum.as_ref());
+        // What the key holds after this write, for the one member that reports it: "the size
+        // of the object in bytes. This will only be present if you append to an object"
+        // (`PutObjectOutput$Size`).
+        let stored_size = i64::try_from(body.len()).unwrap_or(i64::MAX);
+        let appended = input.write_offset_bytes.is_some();
         let object = crate::state::Object {
             etag: etag.clone(),
             last_modified: ::std::time::SystemTime::now(),
-            storage_class: input
-                .storage_class
-                .clone()
-                .unwrap_or_else(|| crate::state::DEFAULT_STORAGE_CLASS.to_string()),
+            storage_class,
             // S3 never infers a type from the key: a write that names no `Content-Type`
             // stores `binary/octet-stream`, so a later read reports that rather than a
             // type nobody sent.
@@ -693,7 +738,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // assembled from parts" unless `CompleteMultipartUpload` assembled it, which is
             // also what AWS reports for an object a single `PutObject` wrote.
             parts: Vec::new(),
-            body: input.body,
+            body,
         };
 
         // "Amazon S3 is a distributed system. If it receives multiple write requests for
@@ -804,11 +849,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             checksum_xxhash3: reported.xxhash3,
             checksum_xxhash128: reported.xxhash128,
             checksum_type: reported.checksum_type,
+            // "The size of the object in bytes. This will only be present if you append to
+            // an object" (`PutObjectOutput$Size`) — the size of what the key holds once this
+            // write's bytes are part of it, which is what an appending client's next offset
+            // is.
+            size: appended.then_some(stored_size),
             // Everything else this output can carry describes a feature no stored object
             // here has, so none of it is reported rather than being invented: the SSE-C
-            // members are refused above, `Size` is for appends in directory buckets, and
-            // `RequestCharged` reports a Requester Pays charge this emulator does not
-            // model.
+            // members are refused above, and `RequestCharged` reports a Requester Pays
+            // charge this emulator does not model.
             ..PutObjectOutput::default()
         })
     }
@@ -917,6 +966,37 @@ fn requested_acl(
 const ACCESS_DENIED_CODE: &str = "AccessDenied";
 /// See [`ACCESS_DENIED_CODE`].
 const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The `Checksum*` members of this request, as the store's one mapping from member to
+/// `ChecksumAlgorithm` reads them ([`crate::state::DeclaredChecksums`]).
+fn declared_checksums(input: &PutObjectInput) -> crate::state::DeclaredChecksums<'_> {
+    crate::state::DeclaredChecksums {
+        crc32: input.checksum_crc32.as_deref(),
+        crc32c: input.checksum_crc32_c.as_deref(),
+        crc64nvme: input.checksum_crc64_nvme.as_deref(),
+        sha1: input.checksum_sha1.as_deref(),
+        sha256: input.checksum_sha256.as_deref(),
+        sha512: input.checksum_sha512.as_deref(),
+        md5: input.checksum_md5.as_deref(),
+        xxhash64: input.checksum_xxhash64.as_deref(),
+        xxhash3: input.checksum_xxhash3.as_deref(),
+        xxhash128: input.checksum_xxhash128.as_deref(),
+    }
+}
+
+/// The wire code, status and sentence S3 answers one rejected integrity value with.
+///
+/// The store owns all three ([`crate::state::IntegrityRejection`]) so that a malformed
+/// header and a digest that does not describe the bytes stay two different answers, and the
+/// same ones for every write that carries these headers; this lifts that answer into this
+/// operation's error channel.
+fn integrity_refusal(rejection: crate::state::IntegrityRejection) -> PutObjectError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        rejection.code(),
+        rejection.status(),
+        rejection.to_string(),
+    )
+}
 
 /// The IAM action this operation is performed under — `s3:<OperationName>`, as the IAM
 /// Service Authorization Reference names the actions of Amazon S3 — which is what a refusal

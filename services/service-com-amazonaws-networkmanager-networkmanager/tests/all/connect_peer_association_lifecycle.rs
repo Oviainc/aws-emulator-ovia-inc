@@ -39,14 +39,14 @@ use crate::link_lifecycle::{create_link_ok, plain_link};
 
 /// The edge locations the fixture's core network configures, one Connect attachment each,
 /// so the rows below span more than one edge.
-const EDGES: [&str; 2] = ["us-west-2", "eu-central-1"];
+pub(crate) const EDGES: [&str; 2] = ["us-west-2", "eu-central-1"];
 
 /// The largest page a caller may ask for: `MaxResults` is modelled `range 1..500`
 /// (`smithy_query query="operation" operation="GetConnectPeerAssociations"`).
 const MAX_PAGE: usize = 500;
 
 /// `AssociateConnectPeer` on `network`, with the request body as given.
-async fn associate(emulator: &Emulator, network: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn associate(emulator: &Emulator, network: &str, body: Value) -> (u16, Value) {
     emulator
         .post(
             &format!("/global-networks/{network}/connect-peer-associations"),
@@ -56,7 +56,7 @@ async fn associate(emulator: &Emulator, network: &str, body: Value) -> (u16, Val
 }
 
 /// `GetConnectPeerAssociations` on `network` with `query` appended to the URI.
-async fn get_associations(emulator: &Emulator, network: &str, query: &str) -> (u16, Value) {
+pub(crate) async fn get_associations(emulator: &Emulator, network: &str, query: &str) -> (u16, Value) {
     let uri = if query.is_empty() {
         format!("/global-networks/{network}/connect-peer-associations")
     } else {
@@ -66,7 +66,7 @@ async fn get_associations(emulator: &Emulator, network: &str, query: &str) -> (u
 }
 
 /// `GetConnectPeerAssociations` that must succeed, answering the whole response.
-async fn get_associations_ok(emulator: &Emulator, case: &str, network: &str, query: &str) -> Value {
+pub(crate) async fn get_associations_ok(emulator: &Emulator, case: &str, network: &str, query: &str) -> Value {
     let (status, body) = get_associations(emulator, network, query).await;
     assert_eq!(
         status, 200,
@@ -76,7 +76,7 @@ async fn get_associations_ok(emulator: &Emulator, case: &str, network: &str, que
 }
 
 /// The `ConnectPeerId`s one page reports, in the order returned.
-fn reported(case: &str, body: &Value) -> Vec<String> {
+pub(crate) fn reported(case: &str, body: &Value) -> Vec<String> {
     body["ConnectPeerAssociations"]
         .as_array()
         .unwrap_or_else(|| {
@@ -93,7 +93,7 @@ fn reported(case: &str, body: &Value) -> Vec<String> {
 }
 
 /// The one association a page reports for `peer`, or `None` when it reports none.
-fn association_of(case: &str, body: &Value, peer: &str) -> Option<Value> {
+pub(crate) fn association_of(case: &str, body: &Value, peer: &str) -> Option<Value> {
     body["ConnectPeerAssociations"]
         .as_array()
         .unwrap_or_else(|| {
@@ -107,27 +107,27 @@ fn association_of(case: &str, body: &Value, peer: &str) -> Option<Value> {
 /// A built fixture: a global network, its core network, one Connect attachment per entry
 /// of [`EDGES`], two devices (one at a site, one with none), the site's link, and one
 /// Connect peer per row of [`CASES`].
-struct Fixture {
-    global_network: String,
-    core_network: String,
+pub(crate) struct Fixture {
+    pub(crate) global_network: String,
+    pub(crate) core_network: String,
     /// The device at a site, which is the only device a link can be associated with.
-    sited_device: String,
+    pub(crate) sited_device: String,
     /// A device created with no site at all.
-    siteless_device: String,
+    pub(crate) siteless_device: String,
     /// The link associated with [`Self::sited_device`].
-    link: String,
+    pub(crate) link: String,
     /// A link of the same site that NO device is associated with.
-    unassociated_link: String,
+    pub(crate) unassociated_link: String,
     /// The Connect peers, one per row of [`CASES`], in row order.
-    peers: Vec<String>,
+    pub(crate) peers: Vec<String>,
 }
 
 /// One row of the table: the association one `AssociateConnectPeer` asks for.
-struct Case {
+pub(crate) struct Case {
     /// Names the case in every assertion message.
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// Which entry of [`EDGES`] the row's peer hangs off.
-    edge: usize,
+    pub(crate) edge: usize,
     /// Whether the row associates the device that sits at a site.
     sited_device: bool,
     /// How the row spells the optional `LinkId`.
@@ -148,7 +148,7 @@ enum LinkMember {
 
 /// The rows, spanning what the rule generalises over: both edges, a device at a site and
 /// one with none, and all three spellings of the optional link member.
-const CASES: [Case; 4] = [
+pub(crate) const CASES: [Case; 4] = [
     Case {
         name: "a peer of the first edge, over a link of the device's site",
         edge: 0,
@@ -177,7 +177,7 @@ const CASES: [Case; 4] = [
 
 impl Case {
     /// The device this row associates.
-    fn device(&self, fixture: &Fixture) -> String {
+    pub(crate) fn device(&self, fixture: &Fixture) -> String {
         if self.sited_device {
             fixture.sited_device.clone()
         } else {
@@ -187,7 +187,7 @@ impl Case {
 
     /// The link this row expects the stored association to carry, or `None` where it
     /// named none.
-    fn expected_link(&self, fixture: &Fixture) -> Option<String> {
+    pub(crate) fn expected_link(&self, fixture: &Fixture) -> Option<String> {
         match self.link {
             LinkMember::Associated => Some(fixture.link.clone()),
             LinkMember::Absent | LinkMember::Empty => None,
@@ -195,7 +195,7 @@ impl Case {
     }
 
     /// The `AssociateConnectPeer` body this row sends for `peer`.
-    fn request(&self, fixture: &Fixture, peer: &str) -> Value {
+    pub(crate) fn request(&self, fixture: &Fixture, peer: &str) -> Value {
         let mut body = json!({
             "ConnectPeerId": peer,
             "DeviceId": self.device(fixture),
@@ -243,7 +243,7 @@ async fn create_connect_peer(emulator: &Emulator, attachment: &str, index: usize
 
 /// Build a fixture named `name`. `base` offsets the VPC and subnet ARNs its Connect
 /// attachments are carried over, so two fixtures of one emulator attach different VPCs.
-async fn fixture(emulator: &Emulator, name: &str, base: usize) -> Fixture {
+pub(crate) async fn fixture(emulator: &Emulator, name: &str, base: usize) -> Fixture {
     let global_network = emulator.create_global_network(name).await;
     let (status, created) = create_core_network(
         emulator,
@@ -337,7 +337,7 @@ async fn fixture(emulator: &Emulator, name: &str, base: usize) -> Fixture {
 }
 
 /// Assert one reported association against the row that made it.
-fn assert_association(case: &Case, fixture: &Fixture, peer: &str, association: &Value, state: &str) {
+pub(crate) fn assert_association(case: &Case, fixture: &Fixture, peer: &str, association: &Value, state: &str) {
     let name = case.name;
     assert_eq!(
         association["ConnectPeerId"].as_str(),
@@ -376,7 +376,7 @@ fn assert_association(case: &Case, fixture: &Fixture, peer: &str, association: &
 
 /// Associate every row of [`CASES`], asserting each call succeeded, and answer the
 /// associations in row order.
-async fn associate_all(emulator: &Emulator, fixture: &Fixture) -> Vec<Value> {
+pub(crate) async fn associate_all(emulator: &Emulator, fixture: &Fixture) -> Vec<Value> {
     let mut made: Vec<Value> = Vec::new();
     for (index, case) in CASES.iter().enumerate() {
         let peer = &fixture.peers[index];

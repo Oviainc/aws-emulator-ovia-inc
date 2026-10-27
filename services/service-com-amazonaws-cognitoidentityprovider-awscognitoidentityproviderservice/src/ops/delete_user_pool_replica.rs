@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUserPoolReplica
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUserPoolReplica`'s real behaviour. Implement it here — this is
+//! Implemented: this operation starts the deletion of a stored secondary replica
+//! of a user pool, and `ListUserPoolReplicas` renders what it stored. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUserPoolReplica::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The handler reads and writes this service's state through
+//! [`crate::state::service_state`]; the replica it marks for removal is the
+//! record every later read of that replica renders.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +160,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUserPoolReplica` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserPoolReplicaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUserPoolReplica"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let request_region = crate::state::request_region(ctx.parts());
+        let mut guard = state.lock();
+
+        let Some(pool) = guard.pool_mut(&input.user_pool_id) else {
+            return Err(user_pool_not_found(&input.user_pool_id));
+        };
+        // A replica whose started deletion the clock has already finished is
+        // gone, so this mutating operation drops it before looking the request's
+        // Region up: a second delete of it names no replica.
+        pool.prune_removed_replicas(now);
+
+        // "This operation must be called from the primary Region."
+        if request_region != pool.region {
+            return Err(operation_not_enabled(format!(
+                "{} must be called in the primary Region of user pool {}, which is {}.",
+                Self::NAME,
+                pool.id,
+                pool.region
+            )));
+        }
+
+        // "Deletes a SECONDARY replica user pool": the pool's own Region holds
+        // the primary replica, which is the pool itself and which only
+        // `DeleteUserPool` deletes, so that Region names no replica this
+        // operation deletes — just as a Region nothing was replicated to does
+        // not.
+        let pool_id = pool.id.clone();
+        let Some(replica) = pool.replicas.get_mut(&input.region_name) else {
+            return Err(replica_not_found());
+        };
+
+        // "You can only delete replicas that are in the INACTIVE status."
+        let status = replica.status(now);
+        if status != crate::state::REPLICA_STATUS_INACTIVE {
+            return Err(invalid_parameter(format!(
+                "The replica of user pool {pool_id} in {} is {status}; only a replica in the {} status can be deleted.",
+                input.region_name,
+                crate::state::REPLICA_STATUS_INACTIVE
+            )));
+        }
+
+        replica.start_deletion(now);
+        // "Information about the deleted user pool replica", rendered from the
+        // STORED replica: `DELETING` until the clock has made its removal due.
+        let rendered = replica.to_user_pool_replica_type(now);
+        pool.last_modified_date = now;
+
+        Ok(DeleteUserPoolReplicaOutput {
+            user_pool_replica: Some(rendered),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> DeleteUserPoolReplicaError {
+    DeleteUserPoolReplicaErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a Region this pool holds no
+/// replica in, whose message is the fixed text `UpdateUserPoolReplica` answers
+/// the same condition with: it interpolates no value.
+fn replica_not_found() -> DeleteUserPoolReplicaError {
+    DeleteUserPoolReplicaErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some("Replica not found in the requested region".to_string()),
+    })
+    .into()
+}
+
+/// This operation's `InvalidParameterException`, which names the member the
+/// request has to fix.
+fn invalid_parameter(message: String) -> DeleteUserPoolReplicaError {
+    DeleteUserPoolReplicaErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `ReasonCode` is an optional machine code AWS fills in for a few
+        // specific refusals only, so none is invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// This operation's `OperationNotEnabledException` for a request made in a
+/// Region this operation is not available in.
+fn operation_not_enabled(message: String) -> DeleteUserPoolReplicaError {
+    DeleteUserPoolReplicaErrorModeled::OperationNotEnabledException(OperationNotEnabledException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> DeleteUserPoolReplicaError {
+    DeleteUserPoolReplicaErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

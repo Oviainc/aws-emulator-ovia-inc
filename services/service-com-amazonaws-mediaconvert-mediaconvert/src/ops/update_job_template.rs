@@ -180,16 +180,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller named is a reference to a queue resource, by name or by ARN, exactly as
         // it is on create. A member the caller SENT is a value they meant, so an empty
         // one is refused rather than quietly dropped.
-        let queue = match input.queue.as_deref().map(str::trim) {
-            Some("") => {
+        let queue = match input.queue.as_deref() {
+            Some(reference) if crate::state::carries_no_characters(reference) => {
                 return Err(UpdateJobTemplateErrorModeled::BadRequestException(
                     BadRequestException {
-                        message: Some("Queue must not be empty.".to_string()),
+                        message: Some(crate::state::blank_member_message("Queue")),
                     },
                 )
                 .into())
             }
-            Some(reference) => Some(crate::state::queue_name_from_reference(reference).to_string()),
+            Some(reference) => {
+                Some(crate::state::queue_name_from_reference(reference.trim()).to_string())
+            }
             None => None,
         };
 

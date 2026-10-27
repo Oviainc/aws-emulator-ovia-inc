@@ -164,6 +164,17 @@ pub const MAX_OBJECTS_TOTAL: usize = 10_000;
 /// A write that would take the whole store past it is refused rather than recorded.
 pub const MAX_OBJECT_BYTES_TOTAL: usize = 64 * 1024 * 1024;
 
+/// How many sessions `CreateSession` keeps vended at once.
+///
+/// Each session is a credential this process accepts for signing until it expires, so the
+/// count is what bounds that memory whatever a caller does — a vend past this is refused
+/// rather than recorded, and an expired one is released
+/// ([`ComAmazonawsS3Amazons3State::release_expired_sessions`]) before the bound is read, so
+/// a caller that keeps a reasonable number of live sessions never meets it. Not a fidelity
+/// claim: AWS publishes no limit on concurrent sessions, and the same order as the peer
+/// credential budget in this workspace (s3control's `DATA_ACCESS_CREDENTIAL_QUOTA`).
+pub const MAX_VENDED_SESSIONS: usize = 256;
+
 /// The version id an object written while the bucket was NOT versioning-enabled is
 /// addressed by.
 ///
@@ -4154,6 +4165,124 @@ pub fn metadata_table_arn(region: &str, table: &str) -> String {
     )
 }
 
+/// Where a DIRECTORY bucket is placed, and how its data is kept there.
+///
+/// Both members come from the `CreateBucketConfiguration` the create carried: "the location
+/// type is Availability Zone or Local Zone" and, for a directory bucket, "the name of the
+/// location is the Zone ID of the Availability Zone (AZ) or Local Zone (LZ) where the
+/// bucket will be created" (`LocationInfo`), with "the number of Zone … that's used for
+/// redundancy for the bucket" beside it (`BucketInfo$DataRedundancy`). Recorded as the
+/// create settled them, so every later answer about the bucket reports the placement it was
+/// created with rather than one re-derived from its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryBucketPlacement {
+    /// The `LocationType` value the create named: one of [`LOCATION_TYPE_VALUES`].
+    pub location_type: String,
+    /// The Zone ID the create named, which is also the zone segment of the bucket's own
+    /// name ([`directory_bucket_zone`]).
+    pub zone_id: String,
+    /// The `DataRedundancy` value the create named, or the one its location type implies
+    /// ([`implied_data_redundancy`]).
+    pub data_redundancy: String,
+}
+
+/// The `BucketType` value that asks `CreateBucket` for a directory bucket — the single
+/// value that enum publishes (`smithy_query(query="shape",shape="BucketType")`).
+pub const DIRECTORY_BUCKET_TYPE: &str = "Directory";
+
+/// The `LocationType` value for an Availability Zone, the first of that enum's two values.
+pub const LOCATION_TYPE_AVAILABILITY_ZONE: &str = "AvailabilityZone";
+
+/// The `LocationType` value for a Local Zone, the other one.
+pub const LOCATION_TYPE_LOCAL_ZONE: &str = "LocalZone";
+
+/// The `DataRedundancy` value a bucket in an Availability Zone is stored with.
+pub const DATA_REDUNDANCY_SINGLE_AVAILABILITY_ZONE: &str = "SingleAvailabilityZone";
+
+/// The `DataRedundancy` value a bucket in a Local Zone is stored with.
+pub const DATA_REDUNDANCY_SINGLE_LOCAL_ZONE: &str = "SingleLocalZone";
+
+/// The redundancy a directory bucket in `location_type` is kept with when the create named
+/// none: one zone, the zone it was placed in — the `DataRedundancy` value that names that
+/// zone's kind ("the number of Zone (Availability Zone or Local Zone) that's used for
+/// redundancy for the bucket", `BucketInfo$DataRedundancy`, whose two values are exactly
+/// the two location types).
+pub fn implied_data_redundancy(location_type: &str) -> &'static str {
+    if location_type == LOCATION_TYPE_LOCAL_ZONE {
+        DATA_REDUNDANCY_SINGLE_LOCAL_ZONE
+    } else {
+        DATA_REDUNDANCY_SINGLE_AVAILABILITY_ZONE
+    }
+}
+
+/// The suffix every directory bucket's name ends with.
+///
+/// "Directory bucket names must … end with the suffix `--x-s3`" and carry the zone before
+/// it: the name is `<base>--<zone-id>--x-s3` (Amazon S3 User Guide, *Directory bucket
+/// naming rules*), which is why the zone a request's bucket lives in can be read off its
+/// name at all ([`directory_bucket_zone`]).
+pub const DIRECTORY_BUCKET_SUFFIX: &str = "--x-s3";
+
+/// The separator the base name, the zone id and the suffix of a directory bucket's name are
+/// joined with — two hyphens, which is what makes a zone id (itself hyphenated, `usw2-az1`)
+/// readable out of the name.
+const DIRECTORY_BUCKET_SEPARATOR: &str = "--";
+
+/// The Zone ID in the directory-bucket name `name`, or `None` for a name that is not a
+/// directory bucket's.
+///
+/// The rule is the published naming rule above, read in one place so the create that places
+/// a bucket in a zone and anything that later asks which zone a name claims agree.
+pub fn directory_bucket_zone(name: &str) -> Option<&str> {
+    let base = name.strip_suffix(DIRECTORY_BUCKET_SUFFIX)?;
+    let (stem, zone_id) = base.rsplit_once(DIRECTORY_BUCKET_SEPARATOR)?;
+    (!stem.is_empty() && !zone_id.is_empty()).then_some(zone_id)
+}
+
+/// The ARN of the directory bucket `bucket` in `region`: `CreateBucket` reports one for a
+/// directory bucket and for no other kind ("this parameter is only supported for S3
+/// directory buckets", `CreateBucketOutput$BucketArn`).
+///
+/// A directory bucket's ARN carries the Region and the account — unlike a general purpose
+/// bucket's ([`bucket_arn`]), whose name is globally unique — and is scoped to the
+/// `s3express` namespace, which is what the member's own pattern admits beside `s3`
+/// (`^arn:[^:]+:(s3|s3express):`).
+pub fn directory_bucket_arn(region: &str, bucket: &str) -> String {
+    ::engine::emulator_arn(
+        DIRECTORY_BUCKET_ARN_SERVICE,
+        region,
+        &format!("bucket/{bucket}"),
+    )
+}
+
+/// The ARN namespace a directory bucket is named in — the S3 Express One Zone service,
+/// whose own API operations are the `s3express:` actions a directory bucket's policy grants.
+const DIRECTORY_BUCKET_ARN_SERVICE: &str = "s3express";
+
+/// The storage class the objects of a directory bucket are stored in.
+///
+/// "Directory buckets … only support the S3 Express One Zone storage class"
+/// (`PutObjectRequest$StorageClass`), so a write into one stores its object in that class
+/// rather than in the [`DEFAULT_STORAGE_CLASS`] a general purpose bucket's objects default
+/// to — and it is the class an appending write requires
+/// (`PutObjectRequest$WriteOffsetBytes`).
+pub const EXPRESS_ONEZONE_STORAGE_CLASS: &str = "EXPRESS_ONEZONE";
+
+/// The code S3 answers a bucket name that does not follow the published naming rules with:
+/// "InvalidBucketName — The specified bucket is not valid" (Amazon S3 *Error responses*,
+/// list of error codes), HTTP 400.
+pub const INVALID_BUCKET_NAME_CODE: &str = "InvalidBucketName";
+
+/// See [`INVALID_BUCKET_NAME_CODE`] — the text that list publishes for it.
+pub const INVALID_BUCKET_NAME_MESSAGE: &str = "The specified bucket is not valid.";
+
+/// The `<Message>` the modelled `InvalidRequest` shape states for itself
+/// (`smithy_query(query="shape",shape="InvalidRequest")`), for the places that answer that
+/// code through the unmodelled channel because the operation does not declare the shape.
+pub const INVALID_REQUEST_MESSAGE: &str =
+    "A parameter or header in your request isn't valid. For details, see the description of \
+     this API operation.";
+
 /// One general purpose bucket this emulator holds.
 #[derive(Debug, Clone, Default)]
 pub struct Bucket {
@@ -4288,6 +4417,19 @@ pub struct Bucket {
     /// Private, like `ownership_controls`, so the accessor pair below is the only way in or
     /// out.
     object_ownership: Option<String>,
+    /// What makes this bucket a DIRECTORY bucket — the zone it is placed in and the
+    /// redundancy it is stored with ([`DirectoryBucketPlacement`]) — or `None` for a
+    /// general purpose bucket, which is every bucket a create that named no
+    /// `CreateBucketConfiguration$Bucket` of type [`DIRECTORY_BUCKET_TYPE`] made.
+    ///
+    /// The two kinds of bucket are the same record because they hold objects the same way:
+    /// what differs is what the API serves on them — a session (`CreateSession`), an
+    /// appending write (`PutObjectRequest$WriteOffsetBytes`), an ARN on the create, and the
+    /// storage class their objects are stored in — each of which reads this one field
+    /// rather than guessing from the bucket's name.
+    ///
+    /// Private, like `tags`, so the accessor pair below is the only way in or out.
+    directory: Option<DirectoryBucketPlacement>,
     /// The access control list `PutBucketAcl` last set on the bucket — one entry per
     /// `Grant` of the `AccessControlPolicy` it applied, in the order that ACL names them
     /// — or `None` while no ACL has ever been set on it.
@@ -4815,6 +4957,38 @@ impl Bucket {
     /// `PutBucketOwnershipControls` payload applies.
     pub fn set_object_ownership(&mut self, ownership: &str) {
         self.object_ownership = Some(ownership.to_string());
+    }
+
+    /// The zone and redundancy this bucket was placed with as a DIRECTORY bucket, or `None`
+    /// for a general purpose bucket. See [`Bucket::directory`].
+    pub fn directory_placement(&self) -> Option<&DirectoryBucketPlacement> {
+        self.directory.as_ref()
+    }
+
+    /// Whether this is a directory bucket — the one question the operations that serve only
+    /// directory buckets, and the ones that serve only general purpose buckets, ask.
+    pub fn is_directory(&self) -> bool {
+        self.directory.is_some()
+    }
+
+    /// Place this bucket in a zone as a directory bucket. Called by `CreateBucket` under the
+    /// same guard that recorded the bucket, so no reader can see the bucket before its kind
+    /// is settled.
+    pub fn set_directory_placement(&mut self, placement: DirectoryBucketPlacement) {
+        self.directory = Some(placement);
+    }
+
+    /// The storage class an object written into this bucket is stored in when the write
+    /// names none: the S3 Express One Zone class for a directory bucket
+    /// ([`EXPRESS_ONEZONE_STORAGE_CLASS`]) and [`DEFAULT_STORAGE_CLASS`] for a general
+    /// purpose one — "if you don't specify, S3 Standard is the default storage class"
+    /// (`PutObjectRequest$StorageClass`).
+    pub fn default_storage_class(&self) -> &'static str {
+        if self.is_directory() {
+            EXPRESS_ONEZONE_STORAGE_CLASS
+        } else {
+            DEFAULT_STORAGE_CLASS
+        }
     }
 
     /// Whether ACLs are DISABLED on the bucket, i.e. its effective `ObjectOwnership`
@@ -7165,6 +7339,218 @@ pub fn reported_checksums(checksum: Option<&ObjectChecksum>) -> ReportedChecksum
     reported
 }
 
+/// The `x-amz-checksum-*` request header one `ChecksumAlgorithm` value's digest arrives
+/// on.
+///
+/// Derived rather than tabulated: every `Checksum*` member of this model binds
+/// `x-amz-checksum-` followed by its algorithm in lowercase
+/// (`smithy_query(query="operation",operation="PutObject")` reports `ChecksumSHA256 ->
+/// x-amz-checksum-sha256`, `ChecksumCRC64NVME -> x-amz-checksum-crc64nvme`, and so on for
+/// all ten), so a refusal names the header the value really arrived on and the two cannot
+/// drift apart.
+pub fn checksum_header_name(algorithm: &str) -> String {
+    format!("x-amz-checksum-{}", algorithm.to_ascii_lowercase())
+}
+
+/// The values of the ten `Checksum*` members one write declared — what
+/// [`verify_declared_integrity`] judges.
+///
+/// One struct rather than a table per operation, because the algorithm each member stands
+/// for is a property of the MODEL, not of the operation: every write that accepts these
+/// headers (`PutObject`, `UploadPart`, `PutObjectAnnotation`) hands over the members it
+/// deserialized and the mapping from member to algorithm lives here, in one place, so a
+/// `ChecksumAlgorithm` value added to the model is added once.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeclaredChecksums<'a> {
+    pub crc32: Option<&'a str>,
+    pub crc32c: Option<&'a str>,
+    pub crc64nvme: Option<&'a str>,
+    pub sha1: Option<&'a str>,
+    pub sha256: Option<&'a str>,
+    pub sha512: Option<&'a str>,
+    pub md5: Option<&'a str>,
+    pub xxhash64: Option<&'a str>,
+    pub xxhash3: Option<&'a str>,
+    pub xxhash128: Option<&'a str>,
+}
+
+impl<'a> DeclaredChecksums<'a> {
+    /// Each `ChecksumAlgorithm` value paired with the value its member carried, in the
+    /// model's own member order (`smithy_query(query="operation",operation="PutObject")`:
+    /// `ChecksumCRC32`, `ChecksumCRC32C`, `ChecksumCRC64NVME`, `ChecksumSHA1`,
+    /// `ChecksumSHA256`, `ChecksumSHA512`, `ChecksumMD5`, `ChecksumXXHASH64`,
+    /// `ChecksumXXHASH3`, `ChecksumXXHASH128`) — which is the order a request naming more
+    /// than one of them is judged in.
+    pub fn pairs(&self) -> [(&'static str, Option<&'a str>); 10] {
+        [
+            ("CRC32", self.crc32),
+            ("CRC32C", self.crc32c),
+            ("CRC64NVME", self.crc64nvme),
+            ("SHA1", self.sha1),
+            ("SHA256", self.sha256),
+            ("SHA512", self.sha512),
+            ("MD5", self.md5),
+            ("XXHASH64", self.xxhash64),
+            ("XXHASH3", self.xxhash3),
+            ("XXHASH128", self.xxhash128),
+        ]
+    }
+
+    /// The `ChecksumAlgorithm` value of the FIRST member that carried one, in that same
+    /// order, or `None` when the write declared no individual checksum — which is what makes
+    /// an individual checksum name the algorithm a write's own checksum is computed under
+    /// ("if you provide an individual checksum, Amazon S3 ignores any provided
+    /// ChecksumAlgorithm parameter", `PutObjectRequest$ChecksumAlgorithm`).
+    pub fn named_algorithm(&self) -> Option<&'static str> {
+        self.pairs()
+            .into_iter()
+            .find_map(|(algorithm, declared)| declared.map(|_| algorithm))
+    }
+}
+
+/// Why a write's declared integrity value cannot be accepted.
+///
+/// Two classes, because a client branches on them differently: a value that cannot
+/// POSSIBLY be a digest of the named width is a malformed request (fix the client), while a
+/// well-formed digest that is not the digest of the bytes received says the bytes are not
+/// the bytes the client hashed (recompute and retry the same payload). Neither code is a
+/// shape in this model, so a handler renders one through the unmodelled channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntegrityRejection {
+    /// An `x-amz-checksum-*` value that does not Base64-decode, or decodes to a width the
+    /// named algorithm's digest does not have.
+    MalformedChecksum {
+        /// The `ChecksumAlgorithm` value whose member carried it.
+        algorithm: String,
+    },
+    /// A well-formed digest that is not the one the algorithm computes over the payload.
+    ChecksumMismatch {
+        /// The `ChecksumAlgorithm` value whose member carried it.
+        algorithm: String,
+    },
+    /// A `Content-MD5` that does not Base64-decode to a 128-bit digest.
+    MalformedContentMd5,
+    /// A well-formed `Content-MD5` that is not the MD5 of the payload.
+    ContentMd5Mismatch,
+}
+
+impl IntegrityRejection {
+    /// The wire error code S3 answers this rejection with.
+    ///
+    /// A malformed `x-amz-checksum-*` header is `InvalidRequest` — "a parameter or header
+    /// in your request isn't valid" — and a malformed `Content-MD5` is `InvalidDigest`, the
+    /// code S3's *Error responses* list publishes for that header specifically. Either
+    /// value failing the COMPARISON is `BadDigest`, the code that list publishes for a
+    /// digest that does not describe the bytes.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::MalformedChecksum { .. } => INVALID_REQUEST_CODE,
+            Self::MalformedContentMd5 => INVALID_DIGEST_CODE,
+            Self::ChecksumMismatch { .. } | Self::ContentMd5Mismatch => BAD_DIGEST_CODE,
+        }
+    }
+
+    /// The HTTP status every one of them is rendered with: 400, from that same list.
+    pub fn status(&self) -> u16 {
+        BAD_DIGEST_STATUS
+    }
+}
+
+impl std::fmt::Display for IntegrityRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The header the value arrived on is the only variable part: S3 names the
+            // header it could not read and nothing about the value or the width expected.
+            Self::MalformedChecksum { algorithm } => write!(
+                f,
+                "Value for {} header is invalid.",
+                checksum_header_name(algorithm)
+            ),
+            // The algorithm whose digest did not match, as the `ChecksumAlgorithm` enum
+            // spells it, which is how S3 names it in this sentence.
+            Self::ChecksumMismatch { algorithm } => write!(
+                f,
+                "The {algorithm} you specified did not match the calculated checksum."
+            ),
+            Self::MalformedContentMd5 => write!(f, "{INVALID_DIGEST_MESSAGE}"),
+            Self::ContentMd5Mismatch => write!(f, "{CONTENT_MD5_MISMATCH_MESSAGE}"),
+        }
+    }
+}
+
+/// The code S3 answers a `Content-MD5` that is not a Base64 128-bit digest at all:
+/// "InvalidDigest — The Content-MD5 or checksum value that you specified is not valid"
+/// (Amazon S3 *Error responses*, list of error codes), HTTP 400.
+pub const INVALID_DIGEST_CODE: &str = "InvalidDigest";
+
+/// See [`INVALID_DIGEST_CODE`] — the text that list publishes for it.
+pub const INVALID_DIGEST_MESSAGE: &str =
+    "The Content-MD5 or checksum value that you specified is not valid.";
+
+/// The `<Message>` S3 sends with [`BAD_DIGEST_CODE`] for a `Content-MD5` that IS a digest
+/// but not this payload's: fixed text, with no variable part — it names neither the digest
+/// declared nor the one computed.
+pub const CONTENT_MD5_MISMATCH_MESSAGE: &str =
+    "The Content-MD5 you specified did not match what we received.";
+
+/// Whether the integrity values one write declared describe the bytes it carried.
+///
+/// ONE rule for every write that accepts them, so the code and the sentence a client
+/// branches on are the same whichever operation and whichever header carried the value:
+/// each value's SHAPE is judged first — a digest of the wrong width cannot be the digest of
+/// anything, so it is refused before any comparison — and only then is it compared against
+/// the digest of the payload actually received. `Content-MD5` is judged first because it is
+/// the integrity check HTTP itself defines over the body.
+///
+/// A declared algorithm this emulator cannot compute ([`checksum_digest`] implements every
+/// value the model's `ChecksumAlgorithm` publishes) is left unjudged rather than refused: no
+/// comparison is possible, so neither answer would be a true statement about the value.
+pub fn verify_declared_integrity(
+    content_md5: Option<&str>,
+    checksums: &DeclaredChecksums<'_>,
+    body: &[u8],
+) -> Result<(), IntegrityRejection> {
+    if let Some(declared) = content_md5 {
+        // "The Base64 encoded 128-bit MD5 digest of the data" (`PutObjectRequest$ContentMD5`)
+        // — so a value that is not Base64 at all, or is Base64 of anything other than 16
+        // bytes, is not a digest the header may carry.
+        let decoded = ::aws_smithy_types::base64::decode(declared.trim())
+            .map_err(|_| IntegrityRejection::MalformedContentMd5)?;
+        if decoded.len() != MD5_DIGEST_BYTES {
+            return Err(IntegrityRejection::MalformedContentMd5);
+        }
+        if decoded != Md5::digest(body).as_slice() {
+            return Err(IntegrityRejection::ContentMd5Mismatch);
+        }
+    }
+    for (algorithm, declared) in checksums.pairs() {
+        let Some(declared) = declared else { continue };
+        let Some(expected) = checksum_digest(algorithm, body) else {
+            continue;
+        };
+        let decoded = ::aws_smithy_types::base64::decode(declared.trim()).map_err(|_| {
+            IntegrityRejection::MalformedChecksum {
+                algorithm: algorithm.to_string(),
+            }
+        })?;
+        if decoded.len() != expected.len() {
+            return Err(IntegrityRejection::MalformedChecksum {
+                algorithm: algorithm.to_string(),
+            });
+        }
+        if decoded != expected {
+            return Err(IntegrityRejection::ChecksumMismatch {
+                algorithm: algorithm.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// How many bytes an MD5 digest is wide: "the Base64 encoded 128-bit MD5 digest of the
+/// data" (`PutObjectRequest$ContentMD5`), which is 16 bytes.
+const MD5_DIGEST_BYTES: usize = 128 / 8;
+
 /// The one `EncodingType` the model declares: `url`
 /// (`smithy_query(query="shape",shape="EncodingType")` reports exactly one value), which
 /// is also the one the AWS CLI sends on every listing.
@@ -7300,6 +7686,19 @@ pub struct ComAmazonawsS3Amazons3State {
     /// How many stored versions the published catalog is. See
     /// [`Self::published_retained_bytes`].
     published_versions: usize,
+    /// The sessions `CreateSession` has vended and not released, as `credential id ->
+    /// the instant it expires`.
+    ///
+    /// Kept because a session has a LIFETIME: "temporary security credentials are scoped to
+    /// the bucket and expire after 5 minutes" (`CreateSession`'s own documentation), and a
+    /// credential nothing releases would be accepted for signing for as long as the process
+    /// lives. [`Self::release_expired_sessions`] reports the ones the clock has already
+    /// expired so the vending operation can forget them, and
+    /// [`Self::record_vended_session`] bounds how many this process holds at once.
+    ///
+    /// Private: the two methods below are the only way in or out, so the quota and the
+    /// release cannot be applied in one place and skipped in another.
+    vended_sessions: BTreeMap<String, SystemTime>,
 }
 
 impl Default for ComAmazonawsS3Amazons3State {
@@ -7321,6 +7720,7 @@ impl Default for ComAmazonawsS3Amazons3State {
             minted_upload_ids: 0,
             published_retained_bytes: 0,
             published_versions: 0,
+            vended_sessions: BTreeMap::new(),
         };
         store.record_published_buckets();
         store
@@ -7328,6 +7728,48 @@ impl Default for ComAmazonawsS3Amazons3State {
 }
 
 impl ComAmazonawsS3Amazons3State {
+    /// Forget every session whose expiry the clock has already passed, reporting the
+    /// credential ids so the caller can delete them from the credential store too.
+    ///
+    /// A session "expire[s] after 5 minutes. After the expiration time, any calls that you
+    /// make with those credentials will fail" (`CreateSession`'s own documentation), so this
+    /// materialises only what the CLOCK already made due: the release was owed at the same
+    /// instant whether or not anybody called. Nothing else about the store moves.
+    pub fn release_expired_sessions(&mut self, now: SystemTime) -> Vec<String> {
+        let expired: Vec<String> = self
+            .vended_sessions
+            .iter()
+            .filter(|(_, expires_at)| **expires_at <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &expired {
+            self.vended_sessions.remove(id);
+        }
+        expired
+    }
+
+    /// Record the session `id` as vended until `expires_at`, or report that this process
+    /// already holds as many sessions as it keeps at once ([`MAX_VENDED_SESSIONS`]).
+    ///
+    /// The bound is this emulator's, not an AWS quota: a caller may ask for a session as
+    /// often as it likes, and each one is a credential this process has to keep accepting
+    /// until it expires — so the count is what keeps that memory bounded whatever a caller
+    /// does. Read and written under the one guard the caller already holds, so two
+    /// concurrent vends cannot both pass a bound only one of them fits in.
+    pub fn record_vended_session(&mut self, id: &str, expires_at: SystemTime) -> bool {
+        if self.vended_sessions.len() >= MAX_VENDED_SESSIONS {
+            return false;
+        }
+        self.vended_sessions.insert(id.to_string(), expires_at);
+        true
+    }
+
+    /// Whether `access_key_id` names a session this service vended and has not released —
+    /// so a request presenting it presents a credential the emulator ISSUED.
+    pub fn holds_vended_session(&self, access_key_id: &str) -> bool {
+        self.vended_sessions.contains_key(access_key_id)
+    }
+
     /// Every bucket this account holds, as `(name, bucket)` in bucket-name order — the
     /// order S3 lists buckets in.
     ///
@@ -8582,17 +9024,12 @@ pub const BUCKET_NOT_EMPTY_MESSAGE: &str = "The bucket you tried to delete is no
 /// says "versions" to a versioned bucket's caller.
 pub const BUCKET_NOT_EMPTY_VERSIONED_MESSAGE: &str =
     "The bucket you tried to delete is not empty. You must delete all versions in the bucket.";
-/// The code S3 answers a write whose `Content-MD5` is not the digest of the bytes it
-/// carried: "The Content-MD5 or checksum value that you specified did not match what the
-/// server received."
+/// The code S3 answers a write whose declared digest is not the digest of the bytes it
+/// carried — a `Content-MD5` or an `x-amz-checksum-*` value that is well formed but does
+/// not describe the payload ([`IntegrityRejection`] decides which sentence it carries).
 pub const BAD_DIGEST_CODE: &str = "BadDigest";
-/// See [`BAD_DIGEST_CODE`] — the text Amazon S3 "Error responses" publishes for that code
-/// in its list of error codes.
-pub const BAD_DIGEST_MESSAGE: &str =
-    "The Content-MD5 or checksum value that you specified did not match what the server \
-     received.";
-/// The HTTP status [`BAD_DIGEST_CODE`] is rendered with: 400, from the same list ("400 Bad
-/// Request").
+/// The HTTP status [`BAD_DIGEST_CODE`] is rendered with: 400, from Amazon S3's list of
+/// error codes ("400 Bad Request").
 pub const BAD_DIGEST_STATUS: u16 = 400;
 /// The code S3 answers a write whose body is larger than one request may carry
 /// ([`MAX_OBJECT_BYTES`]).

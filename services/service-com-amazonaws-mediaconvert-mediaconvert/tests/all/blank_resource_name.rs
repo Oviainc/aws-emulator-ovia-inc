@@ -1,0 +1,406 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end HTTP coverage of the rule that a member naming a resource must carry at
+//! least one character.
+//!
+//! Every such member in this service targets the model's bare `__string`
+//! (`smithy_query(query="operation",operation="CreateQueue,CreatePreset,CreateJobTemplate,CreateJob",model_path="services/service-com-amazonaws-mediaconvert-mediaconvert/smithy-model/com-amazonaws-mediaconvert-mediaconvert.json")`):
+//! no pattern, no length and no normalisation, so the framework's boundary validation
+//! passes the zero-length string and a value made only of whitespace alike. Neither
+//! carries a resource identity — a key with no characters addresses nothing a later read
+//! can reach, and a reference with none resolves to nothing — so every door that mints or
+//! resolves a named resource answers such a value with `BadRequestException` (400) naming
+//! the member, and leaves the store exactly as it was.
+//!
+//! The other side of the same rule is that a value which DOES carry characters is never
+//! normalised: surrounding whitespace is part of the key, so a padded name creates its own
+//! resource and reads back verbatim (`tests/all/queue_name_identity.rs` pins that for
+//! queues; the second case below pins it for all three named resources at once).
+//!
+//! Each case drives the real restJson1 wire path through the crate's one test harness (the
+//! router, the SigV4 scope and the reply decoding `job_lifecycle` exports), so what is
+//! asserted is the bytes a client would see.
+
+use serde_json::{json, Value};
+
+use super::job_lifecycle::{settings as job_settings, Emulator, Reply, ROLE};
+use super::job_template_crud::settings as template_settings;
+
+/// A value a resource-naming member can be made ENTIRELY of, which is what the rule
+/// generalises over: whether there are any characters at all, which whitespace character is
+/// used, how many there are, and whether they are mixed.
+struct Blank {
+    label: &'static str,
+    /// The member value exactly as the request body carries it.
+    value: &'static str,
+    /// `value` percent-encoded for a `{Name}` path label, so a case can try to READ the
+    /// resource a refused create must not have stored. Empty for the zero-length value,
+    /// which is no path label at all.
+    path: &'static str,
+}
+
+/// The blank forms every row below is driven through.
+fn blanks() -> Vec<Blank> {
+    vec![
+        Blank {
+            label: "no characters at all",
+            value: "",
+            path: "",
+        },
+        Blank {
+            label: "one space",
+            value: " ",
+            path: "%20",
+        },
+        Blank {
+            label: "three spaces",
+            value: "   ",
+            path: "%20%20%20",
+        },
+        Blank {
+            label: "one tab",
+            value: "\t",
+            path: "%09",
+        },
+        Blank {
+            label: "one newline",
+            value: "\n",
+            path: "%0A",
+        },
+        Blank {
+            label: "one carriage return",
+            value: "\r",
+            path: "%0D",
+        },
+        // `str::trim` is defined over `char::is_whitespace`, so the vertical tab and the
+        // form feed are whitespace exactly as a space is.
+        Blank {
+            label: "one vertical tab",
+            value: "\u{000B}",
+            path: "%0B",
+        },
+        Blank {
+            label: "one form feed",
+            value: "\u{000C}",
+            path: "%0C",
+        },
+        Blank {
+            label: "a mixture of spaces, a tab and a newline",
+            value: " \t\n ",
+            path: "%20%09%0A%20",
+        },
+    ]
+}
+
+/// One door that MINTS a named resource: the collection it posts to, what a valid request
+/// carries beside `Name`, and how the resource is reported.
+struct Door {
+    /// The operation, for the case label.
+    label: &'static str,
+    /// The collection URI: `POST` creates, `GET` lists, `GET <uri>/{Name}` reads one.
+    collection: &'static str,
+    /// The required members a request to this door carries BESIDE `Name`, so the only thing
+    /// wrong with a refused row is the name itself.
+    extra: Value,
+    /// The member a single-resource reply reports the resource in.
+    view: &'static str,
+    /// The member a listing reports its records in.
+    listing: &'static str,
+}
+
+/// The three named resources this service mints, each with the smallest request that is
+/// valid apart from its `Name`.
+fn doors() -> Vec<Door> {
+    vec![
+        Door {
+            label: "CreateQueue",
+            collection: "/2017-08-29/queues",
+            extra: json!({}),
+            view: "queue",
+            listing: "queues",
+        },
+        Door {
+            label: "CreatePreset",
+            collection: "/2017-08-29/presets",
+            // A preset's settings must name the container the output is written in.
+            extra: json!({ "settings": { "containerSettings": { "container": "MP4" } } }),
+            view: "preset",
+            listing: "presets",
+        },
+        Door {
+            label: "CreateJobTemplate",
+            collection: "/2017-08-29/jobTemplates",
+            extra: json!({ "settings": template_settings(1, 1) }),
+            view: "jobTemplate",
+            listing: "jobTemplates",
+        },
+    ]
+}
+
+/// A create request for `door` naming `name`.
+fn create_request(door: &Door, name: &str) -> Value {
+    let mut body = door.extra.clone();
+    body.as_object_mut()
+        .expect("the fixture request is a JSON object")
+        .insert("name".to_string(), json!(name));
+    body
+}
+
+/// How this service words the refusal of a member that carries no characters.
+fn refusal_message(member: &str) -> String {
+    format!("{member} must not be empty.")
+}
+
+/// Assert `reply` is the modelled bad request naming `member`.
+fn assert_blank_refusal(case: &str, member: &str, reply: &Reply) {
+    assert_eq!(
+        reply.status, 400,
+        "case {case:?}: expected HTTP 400, got {} with body {}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error_type.as_deref(),
+        Some("BadRequestException"),
+        "case {case:?}: expected BadRequestException, got {:?} with body {}",
+        reply.error_type,
+        reply.body
+    );
+    assert_eq!(
+        reply.string("/message"),
+        refusal_message(member),
+        "case {case:?}: expected the refusal to name {member}, got body {}",
+        reply.body
+    );
+}
+
+/// The names a collection's listing reports.
+async fn listed_names(emulator: &Emulator, door: &Door) -> Vec<String> {
+    let listed = emulator.send("GET", door.collection, None).await;
+    assert_eq!(
+        listed.status, 200,
+        "case {:?}: listing must answer HTTP 200, got {} with body {}",
+        door.label, listed.status, listed.body
+    );
+    listed
+        .at(&format!("/{}", door.listing))
+        .as_array()
+        .map(|records| {
+            records
+                .iter()
+                .map(|record| {
+                    record
+                        .pointer("/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// No door that mints a named resource stores one whose name carries no characters: each
+/// blank form is the modelled bad request, nothing is readable under it afterwards, and the
+/// listing reports no such record.
+#[tokio::test]
+async fn a_name_carrying_no_characters_is_refused_by_every_named_create() {
+    let emulator = Emulator::new();
+
+    for door in doors() {
+        for blank in blanks() {
+            let case = format!("{} with a name of {}", door.label, blank.label);
+            let refused = emulator
+                .send(
+                    "POST",
+                    door.collection,
+                    Some(create_request(&door, blank.value)),
+                )
+                .await;
+            assert_blank_refusal(&case, "Name", &refused);
+
+            if !blank.path.is_empty() {
+                let fetched = emulator
+                    .send(
+                        "GET",
+                        &format!("{}/{}", door.collection, blank.path),
+                        None,
+                    )
+                    .await;
+                assert_eq!(
+                    fetched.status, 404,
+                    "case {case:?}: a refused create must persist nothing, got {} with \
+                     body {}",
+                    fetched.status, fetched.body
+                );
+            }
+        }
+
+        let blank_names: Vec<String> = listed_names(&emulator, &door)
+            .await
+            .into_iter()
+            .filter(|name| name.trim().is_empty())
+            .collect();
+        assert!(
+            blank_names.is_empty(),
+            "case {:?}: the listing must report no record whose name carries no \
+             characters, got {blank_names:?}",
+            door.label
+        );
+    }
+}
+
+/// The boundary of the same rule: a name that carries characters is stored and addressed
+/// byte for byte, surrounding whitespace included — so only a name made ENTIRELY of
+/// whitespace is refused, and nothing is trimmed on the way in.
+#[tokio::test]
+async fn a_name_that_carries_characters_keeps_its_whitespace() {
+    let emulator = Emulator::new();
+
+    // Each row carries at least one character, padded with the forms the refused table
+    // above is made only of.
+    let kept: [(&str, &str, &str); 5] = [
+        ("no padding", "plain", "plain"),
+        ("a trailing space", "trail ", "trail%20"),
+        ("a leading space", " lead", "%20lead"),
+        ("spaces on both sides", "  both  ", "%20%20both%20%20"),
+        ("a trailing tab and newline", "padded\t\n", "padded%09%0A"),
+    ];
+
+    for door in doors() {
+        for (label, name, path) in kept {
+            let case = format!("{} with {label}", door.label);
+            let created = emulator
+                .send("POST", door.collection, Some(create_request(&door, name)))
+                .await;
+            assert_eq!(
+                created.status, 201,
+                "case {case:?}: expected HTTP 201, got {} with body {}",
+                created.status, created.body
+            );
+            assert_eq!(
+                created.string(&format!("/{}/name", door.view)),
+                name,
+                "case {case:?}: expected the name echoed verbatim, got body {}",
+                created.body
+            );
+
+            let fetched = emulator
+                .send("GET", &format!("{}/{}", door.collection, path), None)
+                .await;
+            assert_eq!(
+                fetched.status, 200,
+                "case {case:?}: expected the created resource to read back under its own \
+                 name, got {} with body {}",
+                fetched.status, fetched.body
+            );
+            assert_eq!(
+                fetched.at(&format!("/{}", door.view)),
+                created.at(&format!("/{}", door.view)),
+                "case {case:?}: expected the stored resource, got body {}",
+                fetched.body
+            );
+        }
+    }
+}
+
+/// The same rule on the members that REFERENCE a named resource rather than mint one: a
+/// reference carrying no characters resolves to nothing, so it is the modelled bad request
+/// naming the member, never a stored record pointing at nothing.
+#[tokio::test]
+async fn a_resource_reference_carrying_no_characters_is_refused() {
+    let emulator = Emulator::new();
+
+    // A template a blank `Queue` can be sent to an update of.
+    let fixture = emulator
+        .create_job_template(json!({
+            "name": "referencing-template",
+            "settings": template_settings(1, 1),
+        }))
+        .await;
+    assert_eq!(
+        fixture.status, 201,
+        "the fixture template must be created: got {} with body {}",
+        fixture.status, fixture.body
+    );
+
+    for (index, blank) in blanks().into_iter().enumerate() {
+        let job_settings = job_settings("s3://example-bucket/in/a.mp4", "_out");
+
+        // `CreateJob$Role` is required, and a role name with no characters is no role.
+        assert_blank_refusal(
+            &format!("CreateJob with a role of {}", blank.label),
+            "Role",
+            &emulator
+                .create_job(json!({ "role": blank.value, "settings": job_settings.clone() }))
+                .await,
+        );
+
+        // `CreateJob$Queue` and `CreateJob$JobTemplate` are optional, so a value the caller
+        // SENT is one they meant: a blank one is refused rather than resolved or dropped.
+        assert_blank_refusal(
+            &format!("CreateJob with a queue of {}", blank.label),
+            "Queue",
+            &emulator
+                .create_job(json!({
+                    "role": ROLE,
+                    "queue": blank.value,
+                    "settings": job_settings.clone(),
+                }))
+                .await,
+        );
+        assert_blank_refusal(
+            &format!("CreateJob with a job template of {}", blank.label),
+            "JobTemplate",
+            &emulator
+                .create_job(json!({
+                    "role": ROLE,
+                    "jobTemplate": blank.value,
+                    "settings": job_settings.clone(),
+                }))
+                .await,
+        );
+
+        // And on both doors into a stored job template, whose `Queue` is the same kind of
+        // reference.
+        let name = format!("blank-queue-{index}");
+        assert_blank_refusal(
+            &format!("CreateJobTemplate with a queue of {}", blank.label),
+            "Queue",
+            &emulator
+                .create_job_template(json!({
+                    "name": name,
+                    "queue": blank.value,
+                    "settings": template_settings(1, 1),
+                }))
+                .await,
+        );
+        let fetched = emulator.get_job_template(&name).await;
+        assert_eq!(
+            fetched.status, 404,
+            "case CreateJobTemplate with a queue of {}: a refused create must persist \
+             nothing, got {} with body {}",
+            blank.label, fetched.status, fetched.body
+        );
+        assert_blank_refusal(
+            &format!("UpdateJobTemplate with a queue of {}", blank.label),
+            "Queue",
+            &emulator
+                .update_job_template("referencing-template", json!({ "queue": blank.value }))
+                .await,
+        );
+    }
+
+    // The fixture is untouched by every refusal above: it still names no queue.
+    let after = emulator.get_job_template("referencing-template").await;
+    assert_eq!(
+        after.status, 200,
+        "the fixture template must still be readable, got {} with body {}",
+        after.status, after.body
+    );
+    assert_eq!(
+        after.at("/jobTemplate/queue"),
+        &Value::Null,
+        "a refused update must change nothing, got body {}",
+        after.body
+    );
+}
