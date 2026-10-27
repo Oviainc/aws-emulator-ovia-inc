@@ -77,7 +77,7 @@ use crate::ops::types::{
     DistributionBundle, DistributionCustomErrorResponse,
     Domain, DomainEntry, DomainValidationRecord, ExportSnapshotRecord,
     ExportSnapshotRecordSourceInfo,
-    Instance,
+    HostKeyAttributes, Instance,
     InstanceHardware, InstanceHealthSummary, InstanceMetadataOptions, InstanceNetworking,
     InstancePortInfo, InstanceState, KeyPair, LightsailDistribution, LoadBalancer,
     LoadBalancerTlsCertificateSummary,
@@ -620,6 +620,8 @@ pub const OPERATION_TYPE_STOP_INSTANCE: &str = "StopInstance";
 pub const OPERATION_TYPE_REBOOT_INSTANCE: &str = "RebootInstance";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_INSTANCE: &str = "DeleteInstance";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DELETE_KNOWN_HOST_KEYS: &str = "DeleteKnownHostKeys";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DOMAIN: &str = "CreateDomain";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -4791,6 +4793,20 @@ pub struct StoredInstance {
     /// `UpdateInstanceMetadataOptions` sets and `Instance$metadataOptions`
     /// reports.
     pub metadata_options: StoredMetadataOptions,
+    /// The host keys the service has RECORDED for this instance — the known
+    /// host keys the Lightsail browser-based SSH and RDP clients authenticate
+    /// it by, each carrying "the time that the SSH host key or RDP certificate
+    /// was recorded by Lightsail" (`HostKeyAttributes$witnessedAt`).
+    ///
+    /// They live on the instance's own record, as its GUI session access does:
+    /// a recorded host key is the service's record of THAT instance, so
+    /// deleting the instance takes its recorded host keys with it.
+    ///
+    /// An instance's record starts empty — nothing is recorded until the
+    /// browser-based access path witnesses the instance's key — and
+    /// `DeleteKnownHostKeys` is what empties it again, which is how a caller
+    /// recovers from a host key mismatch.
+    pub known_host_keys: Vec<HostKeyAttributes>,
 }
 
 /// The state of an instance's metadata options while the service is still
