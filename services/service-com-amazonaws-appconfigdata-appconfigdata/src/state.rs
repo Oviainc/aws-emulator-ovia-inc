@@ -13,7 +13,7 @@
 //! configuration profiles exist, which configuration version is deployed into an
 //! environment, and the bytes of that version — belongs to the AppConfig CONTROL
 //! PLANE, and is read out of that service's own store through the one shared engine
-//! rather than copied into a second map here ([`resolve_triple`],
+//! rather than copied into a second map here ([`resolve_deployed_triple`],
 //! [`served_configuration`]). A session therefore resolves against the same records
 //! AppConfig's own operations report, and a configuration deployed through
 //! `StartDeployment` is the one a poll serves.
@@ -280,6 +280,8 @@ pub const RESOURCE_TYPE_ENVIRONMENT: &str = "Environment";
 pub const RESOURCE_TYPE_CONFIGURATION_PROFILE: &str = "ConfigurationProfile";
 /// See [`RESOURCE_TYPE_APPLICATION`].
 pub const RESOURCE_TYPE_CONFIGURATION: &str = "Configuration";
+/// See [`RESOURCE_TYPE_APPLICATION`].
+pub const RESOURCE_TYPE_DEPLOYMENT: &str = "Deployment";
 
 /// The `StartConfigurationSession` input members that name each level of the
 /// hierarchy, which the modelled `ReferencedBy` map is keyed by.
@@ -289,18 +291,22 @@ pub const ENVIRONMENT_IDENTIFIER_MEMBER: &str = "EnvironmentIdentifier";
 /// See [`APPLICATION_IDENTIFIER_MEMBER`].
 pub const CONFIGURATION_PROFILE_IDENTIFIER_MEMBER: &str = "ConfigurationProfileIdentifier";
 
-/// A level of the AppConfig hierarchy a request named and the control plane does not
-/// hold, carrying everything the modelled `ResourceNotFoundException` reports.
+/// A resource a request referred to that the AppConfig control plane does not hold — a
+/// level of its hierarchy, the deployment that would have put a configuration into an
+/// environment, or the configuration itself — carrying everything the modelled
+/// `ResourceNotFoundException` reports.
 #[derive(Debug, Clone)]
 pub struct UnresolvedResource {
     /// The modelled `ResourceType` value for the level that is missing.
     pub resource_type: &'static str,
-    /// The input member that named it, and the identifier it carried — the modelled
+    /// The input members that named it, and the identifiers they carried — the modelled
     /// `ReferencedBy` is "a map indicating which parameters in the REQUEST reference
     /// the resource that was not found", so it is filled only where the request
-    /// itself named the resource. A poll names only its token, so a poll leaves it
-    /// absent.
-    pub referenced_by: Option<(&'static str, String)>,
+    /// itself named the resource, with EVERY member that referenced it: a missing level
+    /// of the hierarchy is named by its own identifier, and a deployment is named by the
+    /// whole triple that identifies it. A poll names only its token, so a poll leaves it
+    /// absent ([`UnresolvedResource::unreferenced`]).
+    referenced_by: Vec<(&'static str, String)>,
     /// What the refusal says, built from the request rather than stored as prose.
     pub message: String,
 }
@@ -316,9 +322,50 @@ impl UnresolvedResource {
     fn named(resource_type: &'static str, member: &'static str, identifier: &str) -> Self {
         Self {
             resource_type,
-            referenced_by: Some((member, identifier.to_string())),
+            referenced_by: vec![(member, identifier.to_string())],
             message: format!("{resource_type} not found"),
         }
+    }
+
+    /// No configuration has ever been deployed into the environment for a configuration
+    /// profile that does resolve.
+    ///
+    /// A deployment has no identifier of its own in a session's request: it is
+    /// identified by the triple, so all three members referenced the resource that was
+    /// not found and `ReferencedBy` carries all three. The message is the same fixed
+    /// text as for every other level and interpolates nothing.
+    fn deployment(
+        application_identifier: &str,
+        environment_identifier: &str,
+        configuration_profile_identifier: &str,
+    ) -> Self {
+        Self {
+            resource_type: RESOURCE_TYPE_DEPLOYMENT,
+            referenced_by: vec![
+                (APPLICATION_IDENTIFIER_MEMBER, application_identifier.to_string()),
+                (ENVIRONMENT_IDENTIFIER_MEMBER, environment_identifier.to_string()),
+                (
+                    CONFIGURATION_PROFILE_IDENTIFIER_MEMBER,
+                    configuration_profile_identifier.to_string(),
+                ),
+            ],
+            message: format!("{RESOURCE_TYPE_DEPLOYMENT} not found"),
+        }
+    }
+
+    /// The modelled `ReferencedBy` map, and `None` where the call's own input named
+    /// nothing the refusal is about — the member is absent rather than empty, because an
+    /// empty map would claim the request referenced no parameter at all.
+    pub fn referenced_by(&self) -> Option<HashMap<String, String>> {
+        if self.referenced_by.is_empty() {
+            return None;
+        }
+        Some(
+            self.referenced_by
+                .iter()
+                .map(|(member, identifier)| ((*member).to_string(), identifier.clone()))
+                .collect(),
+        )
     }
 
     /// The same missing level, reported for a call whose own input did not name it:
@@ -326,7 +373,7 @@ impl UnresolvedResource {
     /// request parameter to key `ReferencedBy` by.
     fn unreferenced(self) -> Self {
         Self {
-            referenced_by: None,
+            referenced_by: Vec::new(),
             ..self
         }
     }
@@ -336,7 +383,7 @@ impl UnresolvedResource {
     fn configuration(message: String) -> Self {
         Self {
             resource_type: RESOURCE_TYPE_CONFIGURATION,
-            referenced_by: None,
+            referenced_by: Vec::new(),
             message,
         }
     }
@@ -374,18 +421,28 @@ fn app_config_state<Eng: Send + Sync + 'static>(
     ::service_com_amazonaws_appconfig_amazonappconfig::state::service_state(engine)
 }
 
-/// Resolve a session's three identifiers against the AppConfig control plane, as
-/// `StartConfigurationSession` must before it mints a session.
+/// Resolve what a session polls against the AppConfig control plane, as
+/// `StartConfigurationSession` must before it mints a session: the three identifiers,
+/// and the deployment that put a configuration into that environment.
 ///
 /// Each identifier is "the ID or the name" of its level, so each resolves either way,
 /// and the levels are resolved outermost first: an environment or a profile is a child
 /// of the application, so a request naming an application that does not exist is
 /// refused on the application rather than on its children.
 ///
+/// A session is over a DEPLOYED configuration — the operation's own doc is "starts a
+/// configuration session used to retrieve a deployed configuration" — so a triple whose
+/// configuration profile has never been deployed into that environment has no
+/// configuration for a session to be over, and the deployment is the resource that is
+/// missing. Whether the configuration that deployment put in force is still the one
+/// served is a separate question, answered per poll by [`served_configuration`]: what
+/// makes a session possible is that the profile HAS been deployed here.
+///
 /// A one-directional, guard-free read of the AppConfig store: it takes that store's
 /// lock, holds no other while it does, and hands back owned values — so it is called
-/// with NO guard of this service's own store held.
-pub fn resolve_triple<Eng: Send + Sync + 'static>(
+/// with NO guard of this service's own store held. Nothing is written: existence of a
+/// deployment record is not something the clock changes.
+pub fn resolve_deployed_triple<Eng: Send + Sync + 'static>(
     engine: &Eng,
     application_identifier: &str,
     environment_identifier: &str,
@@ -393,15 +450,32 @@ pub fn resolve_triple<Eng: Send + Sync + 'static>(
 ) -> Option<Result<(), UnresolvedResource>> {
     let state = app_config_state(engine)?;
     let store = state.lock();
-    Some(
-        resolve_in(
-            &store,
+    let resolved = match resolve_in(
+        &store,
+        application_identifier,
+        environment_identifier,
+        configuration_profile_identifier,
+    ) {
+        Err(unresolved) => return Some(Err(unresolved)),
+        Ok(resolved) => resolved,
+    };
+    // Every id came out of the resolution above, so each lookup holds.
+    let deployed = store
+        .application(&resolved.application_id)
+        .and_then(|application| application.environments.get(&resolved.environment_id))
+        .is_some_and(|environment| {
+            environment
+                .latest_deployment_of(&resolved.configuration_profile_id)
+                .is_some()
+        });
+    if !deployed {
+        return Some(Err(UnresolvedResource::deployment(
             application_identifier,
             environment_identifier,
             configuration_profile_identifier,
-        )
-        .map(|_| ()),
-    )
+        )));
+    }
+    Some(Ok(()))
 }
 
 /// The configuration a session over this triple polls, at `now`.

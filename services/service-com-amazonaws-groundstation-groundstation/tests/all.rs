@@ -89,6 +89,8 @@ mod satellite_catalog;
 mod satellite_reads;
 #[path = "all/scheduling_loop.rs"]
 mod scheduling_loop;
+#[path = "all/search_window_rule.rs"]
+mod search_window_rule;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_removal.rs"]

@@ -50,6 +50,10 @@ quick-xml = "0.41"
 # the SigV4 canonical request over it need. The same encoder the emulator's own request
 # verifier uses (`vendor/server/src/request_authentication.rs`).
 percent-encoding = "2"
+# Reads the `TemplateURL` of a template submitted by reference — its scheme, host, path and
+# `versionId` query — rather than hand-rolling a URL parser over caller-supplied text
+# (`state::template_url`).
+url = "2"
 # A CloudFormation template body is JSON *or* YAML ("You can write CloudFormation
 # templates in JSON or YAML"), and the YAML spelling carries the short-form intrinsic
 # tags (`!Ref`, `!GetAtt`) that give a template its meaning. yaml-rust2 is a pure-Rust

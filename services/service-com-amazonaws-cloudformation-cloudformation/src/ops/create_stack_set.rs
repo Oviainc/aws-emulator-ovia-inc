@@ -12,6 +12,10 @@
 //! and a store already holding its ceiling of StackSets answers the modelled
 //! `LimitExceededException`.
 //!
+//! A `TemplateURL` says WHERE the StackSet's template is rather than what it means, so the
+//! object it addresses is read from this emulator's own Amazon S3 and the StackSet is
+//! created from it exactly as from an inline body ([`crate::state::template_url`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -253,15 +257,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "You cannot specify both TemplateBody and TemplateURL",
                 ))
             }
-            // A `TemplateURL` names a template in an Amazon S3 bucket or a Systems Manager
-            // document, which would have to be fetched over the network — this emulator
-            // makes no outbound connections, so it is answered 501 rather than with a
-            // StackSet created from a template nobody read.
-            (None, Some(_)) => {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "CreateStackSet with TemplateURL (fetching a template from Amazon S3)",
-                ))
-            }
+            // A `TemplateURL` says WHERE the template is, not what it means: the object it
+            // addresses is read from this emulator's own Amazon S3 and becomes the body the
+            // StackSet carries, so a template submitted by reference and the same one
+            // submitted inline create the same StackSet (`crate::state::template_url`).
+            (None, Some(url)) => Some(
+                crate::state::template_url::fetch(
+                    ctx,
+                    &crate::state::request_region(ctx.parts()),
+                    url,
+                )
+                .await
+                .map_err(crate::scaffolded::Scaffolded::validation_error)?,
+            ),
             // Neither: the StackSet's template is then the one the stack being IMPORTED
             // carries. That is what `StackId` states — "the stack ID you are importing into
             // a new StackSet" — so an import submits no template of its own, and a request

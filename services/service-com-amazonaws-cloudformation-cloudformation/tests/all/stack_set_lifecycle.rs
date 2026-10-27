@@ -637,12 +637,15 @@ async fn a_request_naming_no_template_or_two_is_refused() {
             expected_message: "You cannot specify both TemplateBody and TemplateURL",
         },
         Row {
-            // A URL would have to be fetched over the network, which this emulator does not
-            // do: that is "not written here", not a bad request.
-            case: "a template URL alone",
+            // A `TemplateURL` is resolved by reading the object it addresses out of this
+            // emulator's own Amazon S3: a URL naming a bucket nothing created is the
+            // REQUEST's own bad reference, not a StackSet created from a template nobody
+            // read.
+            case: "a template URL naming no object this account can read",
             request: vec![member("TemplateURL", "https://example.s3.amazonaws.com/t.json")],
-            expected_status: 501,
-            expected_message: "CreateStackSet with TemplateURL",
+            expected_status: 400,
+            expected_message: "S3 object does not exist. Bucket: example, Key: t.json. \
+                               Error: NoSuchBucket",
         },
     ];
     for Row {

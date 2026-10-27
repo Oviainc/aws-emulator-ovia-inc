@@ -2707,6 +2707,19 @@ pub fn delegation_request_arn(delegation_request_id: &str) -> String {
     )
 }
 
+/// The message a read of a delegation request the account does not hold is refused
+/// with: the entity type that was looked for, then the identifier the request named —
+/// "the error message describes the resource" (`NoSuchEntityException`).
+///
+/// The delegation-request API family's own wording, which is not the "The &lt;entity&gt;
+/// with name &lt;name&gt; cannot be found." form IAM words its user, role and group
+/// reads with (see `crate::ops::get_human_readable_summary`). Stated ONCE here so the
+/// reads of a delegation request cannot word their refusal two ways; the identifier is
+/// taken from the request.
+pub fn delegation_request_not_found_message(delegation_request_id: &str) -> String {
+    format!("DelegationRequest not found: {delegation_request_id}")
+}
+
 /// The account and resource segments of `arn` when it is an IAM resource's ARN, or
 /// `None` when it is not one.
 ///
@@ -3031,6 +3044,75 @@ fn covers_namespace(value: &str, service_namespace: &str) -> bool {
         }
         None => value == ANY_ACTION,
     }
+}
+
+/// The most `(action, resource)` asks one delegation request's permission policy is
+/// read as ([`delegated_asks`]).
+///
+/// Every document that reaches that reading came through an operation that bounds the
+/// policy it carries, so this is a backstop such a document never meets: it keeps one
+/// that somehow got past those from making a decision walk do work proportional to the
+/// PRODUCT of a statement's two element lists. A document naming more asks than this is
+/// read as one whose asks cannot be enumerated, which is what the reading answers for
+/// every other document it cannot reduce to concrete asks.
+const MAX_DELEGATED_ASKS: usize = 1_024;
+
+/// Every `(action, resource)` pair the permission policy `document` of a delegation
+/// request ASKS to have delegated, or `None` when the asks cannot be read out of it in
+/// full.
+///
+/// A delegation request carries the permissions it asks for as an IAM policy document
+/// (`DelegationRequest$PermissionPolicy`, "JSON content of the associated permission
+/// policy of this delegation request"), so what it asks for is the set of
+/// `(action, resource)` pairs its GRANTING statements name — the cartesian product of a
+/// statement's action and resource elements, each written either as one string or as a
+/// list of them ([`element_values`]). A `Deny` statement asks for nothing: it narrows
+/// what the delegated session may do rather than naming a permission anybody must hold.
+///
+/// `None` is the answer for every document whose asks are not that set: one that is not
+/// an IAM policy document at all, one that states no granting statement, one whose
+/// statement is missing an element this needs, and one written with `NotAction`,
+/// `NotResource` or a `Condition` — a complement names the permissions the statement
+/// does NOT ask for and a condition narrows an ask to request states that are not
+/// modelled here, so neither reduces to the concrete pairs a decision is made against.
+/// `Statement` is read both as the list and as the single statement the IAM policy
+/// grammar admits, as [`grants_service_access`] and [`context_keys_in_policies`] read
+/// it.
+pub fn delegated_asks(document: &str) -> Option<Vec<(String, String)>> {
+    let parsed = ::serde_json::from_str::<::serde_json::Value>(document).ok()?;
+    let statement = parsed.get("Statement")?;
+    let statements = match statement.as_array() {
+        Some(statements) => statements.as_slice(),
+        None => ::std::slice::from_ref(statement),
+    };
+
+    let mut asks: Vec<(String, String)> = Vec::new();
+    for statement in statements {
+        let effect = statement.get("Effect").and_then(::serde_json::Value::as_str)?;
+        if effect != EFFECT_ALLOW {
+            continue;
+        }
+        if statement.get("NotAction").is_some()
+            || statement.get("NotResource").is_some()
+            || statement.get("Condition").is_some()
+        {
+            return None;
+        }
+        let actions = element_values(statement.get("Action")?);
+        let resources = element_values(statement.get("Resource")?);
+        if actions.is_empty() || resources.is_empty() {
+            return None;
+        }
+        if asks.len() + actions.len() * resources.len() > MAX_DELEGATED_ASKS {
+            return None;
+        }
+        for action in &actions {
+            for resource in &resources {
+                asks.push(((*action).to_string(), (*resource).to_string()));
+            }
+        }
+    }
+    (!asks.is_empty()).then_some(asks)
 }
 
 /// One entry of AWS's own catalog of managed policies — a policy AWS owns and

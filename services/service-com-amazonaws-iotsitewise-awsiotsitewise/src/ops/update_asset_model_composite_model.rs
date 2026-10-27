@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAssetModelCompositeModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAssetModelCompositeModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAssetModelCompositeModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Rewrites one composite model of an asset model from the definition the request
+//! carries — its name, its description, the external id it may be given once and
+//! its property definitions — and persists it on that asset model's stored
+//! record, so every reader of the model, and of the assets created from it,
+//! reports the new definition.
 //!
 //! ## Shape of an operation
 //!
@@ -208,18 +205,349 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAssetModelCompositeModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAssetModelCompositeModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // `clientToken` makes this update idempotent, as the member documents: "A
+        // unique case-sensitive identifier that you can provide to ensure the
+        // idempotency of the request." A retry carries the token of the call it
+        // repeats, so it reports the asset model's status and writes nothing — it
+        // neither restarts the owed transition nor mints a second version; a token
+        // already spent on a DIFFERENT request belongs to another call, which is
+        // the modelled conflict. It is the FIRST thing decided, ahead even of the
+        // conditional headers: the first call moved the ETag they were written
+        // against, so a retry judged on them would be refused the precondition its
+        // own call had already satisfied.
+        let fingerprint = crate::state::request_fingerprint(
+            &[
+                &input.asset_model_id,
+                &input.asset_model_composite_model_id,
+                &input.asset_model_composite_model_name,
+                &input.asset_model_composite_model_external_id,
+                &input.asset_model_composite_model_description,
+                &input.asset_model_composite_model_properties,
+                &input.if_match,
+                &input.if_none_match,
+                &input.match_for_version_type,
+            ],
+            None,
+        );
+        match store.idempotent_verdict(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenVerdict::Replay(replayed) => {
+                // A composite model — or the asset model holding it — deleted since
+                // leaves the retry nothing to answer from, so that retry is served
+                // as the fresh update it now is.
+                let answered = store.asset_models.get(&replayed).and_then(|model| {
+                    let composite_model_id =
+                        model.resolve_composite_model_id(&input.asset_model_composite_model_id)?;
+                    Some(UpdateAssetModelCompositeModelOutput {
+                        asset_model_composite_model_path: model
+                            .composite_model_path(&composite_model_id),
+                        asset_model_status: model.status(now),
+                        asset_model_id: Some(model.id.clone()),
+                    })
+                });
+                if let Some(output) = answered {
+                    return Ok(output);
+                }
+            }
+            crate::state::TokenVerdict::Spent(spent_on) => {
+                return Err(token_spent(&region, &spent_on));
+            }
+            crate::state::TokenVerdict::Serve => {}
+        }
+
+        // Both id members are `CustomID` labels — a raw UUID or
+        // `externalId:<externalId>`. The asset model is resolved FIRST: a request
+        // that names no stored asset model is a 404 whatever else it asks for, and
+        // a composite model is addressable only within its asset model.
+        let asset_model_id = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .ok_or_else(|| not_found(crate::state::RESOURCE_ASSET_MODEL, &input.asset_model_id))?;
+        let record = store
+            .asset_models
+            .get(&asset_model_id)
+            .ok_or_else(internal_failure)?;
+        let composite_model_id = record
+            .resolve_composite_model_id(&input.asset_model_composite_model_id)
+            .ok_or_else(|| {
+                not_found(
+                    crate::state::RESOURCE_ASSET_MODEL_COMPOSITE_MODEL,
+                    &input.asset_model_composite_model_id,
+                )
+            })?;
+
+        // The conditional request headers are evaluated BEFORE anything is
+        // written, the way HTTP preconditions are: one that fails leaves the asset
+        // model exactly as it was. They talk about the asset model, since that is
+        // the versioned resource this call writes to, and which version they target
+        // is the shared rule every asset-model write follows.
+        let version_type = input
+            .match_for_version_type
+            .as_deref()
+            .unwrap_or(crate::state::VERSION_TYPE_LATEST)
+            .to_lowercase();
+        let target_e_tag = crate::state::asset_model_target_etag(
+            record,
+            input.match_for_version_type.as_deref(),
+            now,
+        );
+        // `If-Match`: update only if the targeted version's ETag is the one the
+        // caller last read. A caller that read a different version — or that
+        // targets a version which does not exist — is refused 412.
+        if let Some(expected) = input.if_match.as_deref() {
+            if target_e_tag.as_deref() != Some(expected) {
+                return Err(precondition_failed(
+                    &region,
+                    &asset_model_id,
+                    format!(
+                        "Provided If-Match value does not match the current {version_type} \
+                         version ETag."
+                    ),
+                ));
+            }
+        }
+        // `ifNoneMatch` is modelled as `SelectAll` with the pattern `^\*$`, so `*`
+        // is the only value that reaches here; it asks that the targeted version
+        // NOT exist.
+        if input.if_none_match.as_deref() == Some(crate::state::SELECT_ALL)
+            && target_e_tag.is_some()
+        {
+            return Err(precondition_failed(
+                &region,
+                &asset_model_id,
+                format!(
+                    "Provided If-None-Match value does not match the current {version_type} \
+                     version ETag."
+                ),
+            ));
+        }
+
+        let composite = record
+            .composite_model(&composite_model_id)
+            .ok_or_else(internal_failure)?;
+
+        // `assetModelCompositeModelExternalId` ASSIGNS an external id to a
+        // composite model that has none: "You can only set the external ID ... if
+        // it wasn't set when it was created, or you're setting it to the exact same
+        // thing as when it was created." Re-stating the id it already carries asks
+        // for the state it is already in, so that is a no-op rather than a refusal;
+        // a different one cannot replace it. An id free to assign still has to be
+        // free among the composite models of this asset model, which is the scope a
+        // composite model's `externalId:` label resolves in.
+        if let Some(requested) = input.asset_model_composite_model_external_id.as_deref() {
+            match composite.external_id.as_deref() {
+                Some(current) if current == requested => {}
+                Some(current) => {
+                    return Err(invalid_request(format!(
+                        "The composite model {composite_model_id} already has the external ID \
+                         {current}, so the external ID {requested} cannot be assigned to it."
+                    )));
+                }
+                None => {
+                    if record
+                        .resolve_composite_model_id(&format!(
+                            "{}{requested}",
+                            crate::state::EXTERNAL_ID_PREFIX
+                        ))
+                        .is_some()
+                    {
+                        return Err(already_exists(
+                            &region,
+                            &asset_model_id,
+                            crate::state::already_using_message("composite model", "externalId"),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // A component-model-based composite model has no properties of its own:
+        // the `COMPONENT_MODEL` it reuses provides them, and every reader of it
+        // reports them from that model's record. So one cannot be given property
+        // definitions here either, and the ones it reports stay where they are.
+        let component_based = record
+            .composed_asset_model_id(&composite_model_id)
+            .is_some();
+        let requested_properties = input
+            .asset_model_composite_model_properties
+            .as_deref()
+            .unwrap_or(&[]);
+        if component_based {
+            if !requested_properties.is_empty() {
+                return Err(invalid_request(format!(
+                    "The composite model {composite_model_id} reuses the properties of the asset \
+                     model it is composed of, so assetModelCompositeModelProperties cannot be \
+                     stated for it."
+                )));
+            }
+        } else if requested_properties.len() > crate::state::MAX_PROPERTIES_PER_COMPOSITE_MODEL {
+            return Err(limit_exceeded(format!(
+                "A composite model carries at most {} properties, but {} were specified.",
+                crate::state::MAX_PROPERTIES_PER_COMPOSITE_MODEL,
+                requested_properties.len()
+            )));
+        }
+        // The request carries the composite model's NEW property list in full, so
+        // a property it does not name is removed — which is exactly what this
+        // operation's own documentation asks a caller to do to replace one
+        // ("Submit an UpdateAssetModelCompositeModel request with the entire
+        // existing property removed"). A property it still names keeps the stored
+        // id it was read under, and so the asset-level data recorded against it,
+        // and cannot change its type or its data type. One rule for every stored
+        // property list an update rewrites, so a model's own properties and those
+        // of one of its composite models are resolved by the same code.
+        let properties = if component_based {
+            None
+        } else {
+            Some(
+                crate::state::resolve_updated_properties(
+                    composite.properties.as_deref().unwrap_or(&[]),
+                    requested_properties,
+                )
+                .map_err(invalid_request)?,
+            )
+        };
+
+        // Nothing can be refused from here on, so the writes land together.
+        let record = store
+            .asset_models
+            .get_mut(&asset_model_id)
+            .ok_or_else(internal_failure)?;
+        // The definition this call supersedes, read before its writes land: it
+        // stays the model's ACTIVE version until the new one settles.
+        let superseded = record.definition();
+        let composite = record
+            .composite_models
+            .iter_mut()
+            .find(|composite| composite.id.as_deref() == Some(composite_model_id.as_str()))
+            .ok_or_else(internal_failure)?;
+        composite.name = input.asset_model_composite_model_name.clone();
+        composite.description = input.asset_model_composite_model_description.clone();
+        if let Some(requested) = input.asset_model_composite_model_external_id.clone() {
+            composite.external_id = Some(requested);
+        }
+        // `None` for a component-model-based composite model, which is what it
+        // already stored: its properties are the reused model's.
+        composite.properties = properties;
+        // `assetModelCompositeModelType` has no member on this request, so the kind
+        // of composite model this is cannot change here, and neither can the
+        // composite model it is nested inside or the component model it reuses.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAssetModelCompositeModel"))
+        // The asset model's definition changed, so it carries a new version — hence
+        // a new ETag — and owes a transition back to ACTIVE: the rule every
+        // mutating call on a record follows, kept on the record itself.
+        record.begin_update(superseded, now);
+        let output = UpdateAssetModelCompositeModelOutput {
+            asset_model_composite_model_path: record.composite_model_path(&composite_model_id),
+            asset_model_status: record.status(now),
+            asset_model_id: Some(asset_model_id.clone()),
+        };
+
+        // "Updates a composite model and all of the assets that were created from
+        // the model. Each asset created from the model inherits the updated asset
+        // model's property and hierarchy definitions."
+        store.propagate_asset_model_definitions(&asset_model_id, now);
+
+        // The token is spent only now that the update has succeeded: a refused
+        // request changed nothing, so the caller may send its token again. It is
+        // recorded against the asset model, the versioned resource this call wrote
+        // to and the one a conflicting call is pointed at.
+        store.record_idempotent_call(
+            Self::NAME,
+            input.client_token.as_deref(),
+            fingerprint,
+            &asset_model_id,
+            now,
+        );
+
+        Ok(output)
     }
+}
+
+/// HTTP 500 `InternalFailureException`: this service's store is not reachable.
+fn internal_failure() -> UpdateAssetModelCompositeModelError {
+    UpdateAssetModelCompositeModelErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> UpdateAssetModelCompositeModelError {
+    UpdateAssetModelCompositeModelErrorModeled::InvalidRequestException(InvalidRequestException {
+        message,
+    })
+    .into()
+}
+
+/// HTTP 410 `LimitExceededException` carrying `message`.
+fn limit_exceeded(message: String) -> UpdateAssetModelCompositeModelError {
+    UpdateAssetModelCompositeModelErrorModeled::LimitExceededException(LimitExceededException {
+        message,
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the resource kind and the
+/// identifier the REQUEST supplied, as this service words every absence.
+fn not_found(resource: &str, requested: &str) -> UpdateAssetModelCompositeModelError {
+    UpdateAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(resource, requested),
+        },
+    )
+    .into()
+}
+
+/// HTTP 409 `ResourceAlreadyExistsException` naming the asset model the update
+/// targeted: the composite model whose external id collided lives on it, so that
+/// is the resource the caller has to look at.
+fn already_exists(
+    region: &str,
+    asset_model_id: &str,
+    message: String,
+) -> UpdateAssetModelCompositeModelError {
+    UpdateAssetModelCompositeModelErrorModeled::ResourceAlreadyExistsException(
+        ResourceAlreadyExistsException {
+            message,
+            resource_id: asset_model_id.to_string(),
+            resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+        },
+    )
+    .into()
+}
+
+/// HTTP 412 `PreconditionFailedException`: an `If-Match` / `If-None-Match`
+/// precondition on the asset model evaluated to FALSE.
+fn precondition_failed(
+    region: &str,
+    asset_model_id: &str,
+    message: String,
+) -> UpdateAssetModelCompositeModelError {
+    UpdateAssetModelCompositeModelErrorModeled::PreconditionFailedException(
+        PreconditionFailedException {
+            message,
+            resource_id: asset_model_id.to_string(),
+            resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+        },
+    )
+    .into()
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `clientToken` a DIFFERENT
+/// request already spent: the conflict is with the asset model that request
+/// wrote to, so `resourceId`/`resourceArn` name it.
+fn token_spent(region: &str, asset_model_id: &str) -> UpdateAssetModelCompositeModelError {
+    UpdateAssetModelCompositeModelErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("asset model", "clientToken"),
+            resource_id: asset_model_id.to_string(),
+            resource_arn: crate::state::asset_model_arn(region, asset_model_id),
+        },
+    )
+    .into()
 }

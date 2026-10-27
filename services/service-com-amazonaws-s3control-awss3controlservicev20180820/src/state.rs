@@ -52,8 +52,9 @@ pub struct AccessPointRecord {
     /// copy.
     pub tags: Vec<Tag>,
     /// The document the last `PutAccessPointPolicy` stored, byte for byte;
-    /// `None` until one is put, which is what `GetAccessPointPolicy` reports as
-    /// `NoSuchAccessPointPolicy`.
+    /// `None` until one is put, and `None` again once
+    /// `DeleteAccessPointPolicy` removes it, which is what
+    /// `GetAccessPointPolicy` reports as `NoSuchAccessPointPolicy`.
     pub policy: Option<String>,
 }
 

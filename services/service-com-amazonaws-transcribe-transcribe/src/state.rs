@@ -114,6 +114,17 @@
 //! personal health information is identified, so the
 //! `MedicalTranscript.TranscriptFileUri` a completed job reports names a location
 //! nothing writes to or serves (see [`MedicalTranscriptionJobRecord`]).
+//!
+//! The INPUT media is the other half of that: a job's audio is an object in Amazon S3
+//! the caller uploaded before starting the job, and this emulator holds an Amazon S3 of
+//! its own, so the location a start names is RESOLVED against it before any record is
+//! stored ([`resolve_media_objects`]) — a start pointed at an object that store says is
+//! not there is refused, and a job whose media the store does answer for is accepted
+//! and then judged by what that media is ([`media_failure_reason`]): the one per-media
+//! failure this emulator can establish without decoding audio is a `MediaFormat` the
+//! stored object's own name contradicts, and a job of it ends in the service's own
+//! modelled `FAILED` state with that `FailureReason`. With no Amazon S3 mounted to ask,
+//! nothing is known about the media and nothing is refused or failed on an assumption.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -137,7 +148,9 @@ pub const STATUS_QUEUED: &str = "QUEUED";
 pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// See [`STATUS_QUEUED`].
 pub const STATUS_COMPLETED: &str = "COMPLETED";
-/// See [`STATUS_QUEUED`]. No job this emulator records reaches it: nothing it does
+/// See [`STATUS_QUEUED`]. Reached by a job the service found something wrong with in
+/// the media it was pointed at — the one per-media failure this emulator can establish
+/// (see [`media_failure_reason`]) — and by no other job, because nothing else it does
 /// can fail a job that was accepted.
 pub const STATUS_FAILED: &str = "FAILED";
 
@@ -2923,13 +2936,26 @@ const UNCONSTRAINED_BUCKET_REGION: &str = "us-east-1";
 ///
 /// The callback is the framework's documented seam for calling another emulated
 /// service: it routes in process, so no network client is configured here and this
-/// crate names no other service's crate. `region` is the request's own signing region,
-/// so the file is written where the caller's own Amazon S3 requests go — which is the
-/// Region the reported `DownloadUri` names.
+/// crate names no other service's crate. The `endpoint_url` below is therefore an
+/// ADDRESS the in-process router reads, never a host any resolver looks up — and the
+/// one value that reaches its authority is narrowed HERE, in every build: a region
+/// outside the Region-identifier grammar ([`is_region_like`]) falls back to
+/// [`DEFAULT_REGION`], exactly as a request carrying no credential scope does. Otherwise
+/// `region` is the request's own signing region, so a file is written where the caller's
+/// own Amazon S3 requests go — which is the Region the reported `DownloadUri` names —
+/// and the signing scope and the address always agree.
+///
+/// The credentials are the emulator's own: they only sign this operation's in-process
+/// calls and are never put in a response or a log.
 fn s3_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_s3::Client {
+    let region = if is_region_like(region) {
+        region
+    } else {
+        DEFAULT_REGION
+    };
     let config = ::aws_sdk_s3::Config::builder()
         .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
         .region(::aws_sdk_s3::config::Region::new(region.to_string()))
@@ -3087,7 +3113,7 @@ pub struct TranscriptionJobRecord {
     /// pages with.
     pub sequence: u64,
     /// `TranscriptionJobStatus`: one of [`STATUS_QUEUED`], [`STATUS_IN_PROGRESS`],
-    /// [`STATUS_COMPLETED`].
+    /// [`STATUS_COMPLETED`], [`STATUS_FAILED`].
     pub status: String,
     pub language_code: Option<String>,
     pub media: Media,
@@ -3125,6 +3151,12 @@ pub struct TranscriptionJobRecord {
     /// Where the transcript was written; `None` until the job completes.
     pub transcript: Option<Transcript>,
     pub failure_reason: Option<String>,
+    /// The `FailureReason` the clock owes this job INSTEAD of a transcript, established
+    /// from the media the start was pointed at ([`media_failure_reason`]); `None` for a
+    /// job the service found nothing wrong with. Processing is what fails, so the job is
+    /// accepted and reports this only once the clock has finished with it
+    /// ([`Self::advance_clock`]).
+    pub failure_due: Option<String>,
     pub creation_time: SystemTime,
     /// When the job began processing; `None` while it is still `QUEUED`.
     pub start_time: Option<SystemTime>,
@@ -3156,8 +3188,15 @@ impl TranscriptionJobRecord {
             }
         }
         if self.status == STATUS_IN_PROGRESS && now >= self.completion_due {
-            self.status = STATUS_COMPLETED.to_string();
             self.completion_time = Some(self.completion_due);
+            // A job whose media the service found wrong ends FAILED, reporting why and
+            // no transcript: there is no output to name for a job that produced none.
+            if let Some(reason) = self.failure_due.clone() {
+                self.status = STATUS_FAILED.to_string();
+                self.failure_reason = Some(reason);
+                return;
+            }
+            self.status = STATUS_COMPLETED.to_string();
             self.materialise_identified_languages();
             let transcript_uri = self.output_uri("json");
             // Which transcripts the request asked the service to produce decides
@@ -3305,8 +3344,10 @@ pub struct MedicalTranscriptionJobRecord {
     /// would page with.
     pub sequence: u64,
     /// `TranscriptionJobStatus`: [`STATUS_IN_PROGRESS`] until the clock owes it
-    /// [`STATUS_COMPLETED`]. The enum's other two values are modelled but unreached —
-    /// nothing queues such a job and nothing this emulator does can fail one.
+    /// [`STATUS_COMPLETED`] — or [`STATUS_FAILED`], for a job the service found
+    /// something wrong with in the media it was pointed at ([`Self::failure_due`]).
+    /// [`STATUS_QUEUED`] is modelled but unreached: nothing queues a job of this
+    /// family.
     pub status: String,
     /// `LanguageCode`, a REQUIRED member the operation narrows to one value: "US
     /// English (en-US) is the only valid value for medical transcription jobs"
@@ -3334,8 +3375,15 @@ pub struct MedicalTranscriptionJobRecord {
     pub job_type: String,
     /// Where the transcript was written; `None` until the job completes.
     pub transcript: Option<MedicalTranscript>,
-    /// `FailureReason`, set only on a `FAILED` job — which none of this emulator's are.
+    /// `FailureReason`, set only on a [`STATUS_FAILED`] job — the reason the clock
+    /// materialised from [`Self::failure_due`].
     pub failure_reason: Option<String>,
+    /// The `FailureReason` the clock owes this job INSTEAD of a transcript, established
+    /// from the media the start was pointed at ([`media_failure_reason`]); `None` for a
+    /// job the service found nothing wrong with. Processing is what fails, so the job is
+    /// accepted and reports this only once the clock has finished with it
+    /// ([`Self::advance_clock`]).
+    pub failure_due: Option<String>,
     pub creation_time: SystemTime,
     pub start_time: Option<SystemTime>,
     pub completion_time: Option<SystemTime>,
@@ -3356,8 +3404,15 @@ impl MedicalTranscriptionJobRecord {
         if self.status != STATUS_IN_PROGRESS || now < self.completion_due {
             return;
         }
-        self.status = STATUS_COMPLETED.to_string();
         self.completion_time = Some(self.completion_due);
+        // A job whose media the service found wrong ends FAILED, reporting why and no
+        // transcript: there is no output to name for a job that produced none.
+        if let Some(reason) = self.failure_due.clone() {
+            self.status = STATUS_FAILED.to_string();
+            self.failure_reason = Some(reason);
+            return;
+        }
+        self.status = STATUS_COMPLETED.to_string();
         self.transcript = Some(MedicalTranscript {
             // The same `OutputKey` rule the non-medical family applies, which this
             // operation documents in the same words — so one implementation
@@ -3662,6 +3717,186 @@ pub fn media_format_of(media: &Media) -> Option<String> {
         .iter()
         .find(|format| **format == extension)
         .map(|format| (*format).to_string())
+}
+
+/// The Amazon S3 object a media URI addresses: its bucket and its key.
+///
+/// `Media$MediaFileUri` is "The Amazon S3 location of the media file you want to
+/// transcribe", spelled `s3://DOC-EXAMPLE-BUCKET/media-files/my-media-file.flac` in the
+/// member's own examples: the first path segment is the bucket and everything after it
+/// is the key. `None` for a URI that addresses no such pair — including the
+/// `http(s)://` form the member's pattern also admits, which addresses a HOST, and this
+/// emulator resolves no hosts, so such a URI names no object it can ask about.
+fn media_object_address(uri: &str) -> Option<(&str, &str)> {
+    let (bucket, key) = uri.trim().strip_prefix("s3://")?.split_once('/')?;
+    (!bucket.is_empty() && !key.is_empty()).then_some((bucket, key))
+}
+
+/// What asking this emulator's own Amazon S3 about the media a start request named
+/// established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaVerdict {
+    /// Amazon S3 reports that an object the request named is not there: the start is
+    /// refused and nothing is stored.
+    NoSuchObject,
+    /// Every object the request addressed resolved, so the service has seen the stored
+    /// media it is to process.
+    Resolved,
+    /// Nothing is known about the media: there was no object store to ask, the URI
+    /// addresses no object this emulator can resolve ([`media_object_address`]), or only
+    /// SOME of the objects the request addressed resolved. Nothing is refused and no job
+    /// is failed on an assumption.
+    Unknown,
+}
+
+/// The refusal a start request whose media names no stored object gets: "To make a
+/// StartMedicalTranscriptionJob request, you must first upload your media file into an
+/// Amazon S3 bucket; you can then specify the Amazon S3 location of the file using the
+/// Media parameter" — the same precondition every job family's start documents, so one
+/// wording answers for all of them.
+pub const MEDIA_URI_NAMES_NO_OBJECT: &str =
+    "The URI that you provided doesn't point to an S3 object. Make sure that the object \
+     exists and try your request again.";
+
+/// The Amazon S3 error codes in which S3 reports that an object a request names is NOT
+/// THERE: a bucket it does not hold (`NoSuchBucket`), a key that bucket does not hold
+/// (`NoSuchKey`), a version it holds none of (`NoSuchVersion`), and the code `HeadObject`
+/// models for either (`NotFound`, which a HEAD carries no body to spell out).
+///
+/// The code is required TOGETHER WITH the 404 status ([`object_is_absent`]), and never
+/// the status alone, because a status is not evidence that S3 answered at all: a request
+/// that reached no S3 is a 404 too, and that is this emulator failing to ask rather than
+/// a verdict about the object. The list is deliberately CLOSED, and holds only the codes
+/// that say the object is absent — the refusal this wording states
+/// ([`MEDIA_URI_NAMES_NO_OBJECT`]) is about an object that is not there, so a code
+/// reporting something else about it (a read that is not permitted, a refusal S3 adds
+/// later) answers [`MediaVerdict::Unknown`] and refuses nothing.
+const ABSENT_OBJECT_CODES: &[&str] = &["NoSuchBucket", "NoSuchKey", "NoSuchVersion", "NotFound"];
+
+/// Whether S3's answer to a `HeadObject` is S3 ITSELF saying it holds nothing at that
+/// address: HTTP 404 AND one of the codes it sends for a missing one
+/// ([`ABSENT_OBJECT_CODES`]).
+fn object_is_absent(
+    error: &::aws_sdk_s3::error::SdkError<
+        ::aws_sdk_s3::operation::head_object::HeadObjectError,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    use ::aws_sdk_s3::error::ProvideErrorMetadata;
+
+    error
+        .raw_response()
+        .is_some_and(|response| response.status().as_u16() == 404)
+        && error
+            .code()
+            .is_some_and(|code| ABSENT_OBJECT_CODES.contains(&code))
+}
+
+/// Resolve every media object `uris` names against this emulator's own Amazon S3 and
+/// report what that established.
+///
+/// A job's media is resolved when the job is STARTED: "you must first upload your media
+/// file into an Amazon S3 bucket; you can then specify the Amazon S3 location of the
+/// file using the Media parameter", so a start naming an object the store does not hold
+/// is refused with the operation's modelled `BadRequestException`
+/// ([`MEDIA_URI_NAMES_NO_OBJECT`]) and nothing is persisted. S3 is reached the way any
+/// emulated service reaches another: through the in-process callback
+/// ([`smithy_server_runtime::OperationContext::callback`], see [`s3_client`] — no
+/// socket, no outbound request, no host resolution).
+///
+/// The verdict is read from S3's own absent-object answer and never from an HTTP status
+/// alone ([`object_is_absent`]): with no S3 to ask (a router with only this service
+/// mounted, say) nothing is known about the media, so the start is accepted — a refusal
+/// has to be grounded in what the object store answered, never assumed.
+///
+/// The read is a `HeadObject`, "the same options as a GET operation on an object"
+/// without its body: what a start has to establish is that the media it was pointed at
+/// IS there, and nothing in this service transcribes audio, so no media file's bytes are
+/// ever fetched or held.
+pub async fn resolve_media_objects(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    uris: &[&str],
+) -> MediaVerdict {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    // One client for the whole set: a family that names its input audio in two members
+    // resolves both through it.
+    let client = s3_client(ctx, region);
+    let mut asked = 0usize;
+    let mut resolved = 0usize;
+    for uri in uris {
+        let Some((bucket, key)) = media_object_address(uri) else {
+            continue;
+        };
+        asked += 1;
+        match client.head_object().bucket(bucket).key(key).send().await {
+            // The object is there. Only its METADATA was asked for, never its bytes:
+            // nothing in this service transcribes audio, so what the start needs to
+            // know is that the media it was pointed at exists.
+            Ok(_) => resolved += 1,
+            Err(error) => {
+                if object_is_absent(&error) {
+                    // S3 says the object is not there: the refusal is grounded.
+                    return MediaVerdict::NoSuchObject;
+                }
+                // Any other answer is not S3 reporting an absent object, so it refuses
+                // nothing — and it is worth a warning, because a deployment with no S3
+                // mounted to ask is one where this check does not run. The caller's own
+                // values are rendered with their escaped `Debug` form, so a key carrying
+                // a newline cannot forge a log line.
+                ::tracing::warn!(
+                    bucket = ?bucket,
+                    key = ?key,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    code = ?error.code(),
+                    "the media object could not be resolved against this emulator's Amazon S3"
+                );
+            }
+        }
+    }
+    // `Resolved` says the service has seen EVERY object the request addressed, which is
+    // what judging the media it was given rests on: one object that resolved beside one
+    // the store could not be asked about leaves the set unknown, whatever order they
+    // were asked in.
+    if asked > 0 && resolved == asked {
+        MediaVerdict::Resolved
+    } else {
+        MediaVerdict::Unknown
+    }
+}
+
+/// The `FailureReason` of a job whose declared `MediaFormat` is not the format of the
+/// media the service found at the location the request named: "The media format
+/// specified in `MediaFormat` doesn't match the format of the input file" — one of the
+/// values the model enumerates for that member (`smithy_query(query="doc",
+/// shape="MedicalTranscriptionJob", member="FailureReason")`), reported verbatim as the
+/// doc spells it.
+pub const MEDIA_FORMAT_MISMATCH_FAILURE_REASON: &str =
+    "The media format provided does not match the detected media format";
+
+/// The `FailureReason` the clock owes a job started with `declared` as its
+/// `MediaFormat` over the media `media` names, or `None` for a job the service found
+/// nothing wrong with.
+///
+/// A format MISMATCH is the one per-media failure this emulator can establish: the
+/// format of the stored media is what its name evidences ([`media_format_of`]), and the
+/// request states what the caller believes it to be, so the two can disagree. Judged
+/// only for a job whose media actually RESOLVED ([`MediaVerdict::Resolved`]) — the
+/// service has to have seen the file to have detected its format — and never for the
+/// members only the audio itself could answer (the sample rate, the file size), which
+/// stay unjudged rather than guessed.
+pub fn media_failure_reason(
+    verdict: MediaVerdict,
+    declared: Option<&str>,
+    media: &Media,
+) -> Option<String> {
+    if verdict != MediaVerdict::Resolved {
+        return None;
+    }
+    let declared = declared?;
+    let detected = media_format_of(media)?;
+    (detected != declared).then(|| MEDIA_FORMAT_MISMATCH_FAILURE_REASON.to_string())
 }
 
 /// The `MediaSampleRateHertz` a finished Call Analytics job reports: "The sample rate,

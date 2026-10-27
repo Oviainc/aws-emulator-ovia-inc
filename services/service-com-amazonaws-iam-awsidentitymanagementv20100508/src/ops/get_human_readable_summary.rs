@@ -230,13 +230,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A request the account does not hold "referenced a resource entity that does
         // not exist", and "the error message describes the resource": the entity type
-        // that was looked for, then the identifier the request named.
+        // that was looked for, then the identifier the request named — worded by the one
+        // place this crate states a delegation request's missing-entity message, so the
+        // reads of a delegation request cannot refuse two ways.
         if !holds_request {
             return Err(
                 GetHumanReadableSummaryErrorModeled::NoSuchEntityException(NoSuchEntityException {
-                    message: Some(format!(
-                        "DelegationRequest not found: {}",
-                        parsed.delegation_request_id
+                    message: Some(crate::state::delegation_request_not_found_message(
+                        &parsed.delegation_request_id,
                     )),
                 })
                 .into(),

@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ChangeMessageVisibilityBatch
-//! IMPLEMENTED: this operation applies [`crate::state::Queue::change_visibility_as_of`] —
-//! the same change `ChangeMessageVisibility` makes — once per entry, each entry judged
-//! against the message states the REQUEST arrived to, and reports each entry under
-//! `Successful` or `Failed` with that entry's own refusal. The whole-request refusals
+//! IMPLEMENTED: this operation applies [`crate::state::Queue::change_visibility`] —
+//! the same change `ChangeMessageVisibility` makes — once per entry, and reports each entry
+//! under `Successful` or `Failed` with that entry's own refusal. The whole-request refusals
 //! (an empty batch, too many entries, a repeated or malformed entry id) are the ones every
 //! batch operation of this service shares. It is the ONLY file to touch for
 //! `ChangeMessageVisibilityBatch`.
@@ -256,13 +255,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(denied);
         }
 
-        // Which messages are IN FLIGHT is read ONCE, before the first entry is applied: a
-        // batch answers every entry for the queue the request arrived to, so an entry that
-        // hands a message back cannot turn a later entry naming that same message into a
-        // message that is not in flight. Two entries for one message are therefore both
-        // applied, and the LAST one's span is the one the message keeps.
-        let in_flight = queue.in_flight_message_ids(now);
-
         let (min, max) = sqs::integer_bounds(sqs::VISIBILITY_TIMEOUT);
         let mut successful = Vec::with_capacity(input.entries.len());
         let mut failed = Vec::new();
@@ -305,7 +297,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
                 continue;
             }
-            match queue.change_visibility_as_of(&entry.receipt_handle, requested, now, &in_flight) {
+            // Each entry names a handle, and a handle names its message for as long as the
+            // queue holds that message: an entry that hands a message back therefore cannot
+            // decide the outcome of a later entry naming it. Two entries for one message are
+            // both applied, and the LAST one's span is the one the message keeps.
+            match queue.change_visibility(&entry.receipt_handle, requested, now) {
                 Ok(()) => successful.push(ChangeMessageVisibilityBatchResultEntry {
                     id: entry.id.clone(),
                 }),
@@ -323,14 +319,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message,
                     })
                 }
-                Err(sqs::VisibilityRefusal::NotInFlight) => {
-                    failed.push(BatchResultErrorEntry {
-                        id: entry.id.clone(),
-                        sender_fault: true,
-                        code: MESSAGE_NOT_INFLIGHT.to_string(),
-                        message: Some(MESSAGE_NOT_INFLIGHT_MESSAGE.to_string()),
-                    })
-                }
                 Err(sqs::VisibilityRefusal::BeyondLimit) => {
                     failed.push(BatchResultErrorEntry {
                         id: entry.id.clone(),
@@ -345,13 +333,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ChangeMessageVisibilityBatchOutput { successful, failed })
     }
 }
-
-/// The per-entry error code for a message that is not in flight, named after the modelled
-/// error `ChangeMessageVisibility` answers for the same condition.
-const MESSAGE_NOT_INFLIGHT: &str = "MessageNotInflight";
-
-/// What that refusal states, in the words the model's own shape documents it with ("The
-/// specified message isn't in flight."). The single-message operation's modelled shape
-/// carries no `message` member at all, so this wording lives here, where a batch entry has
-/// one to fill.
-const MESSAGE_NOT_INFLIGHT_MESSAGE: &str = "The specified message isn't in flight.";

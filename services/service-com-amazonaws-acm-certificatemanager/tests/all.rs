@@ -35,6 +35,8 @@ mod acme_endpoint_list;
 mod acme_endpoint_update;
 #[path = "all/acme_external_account_binding_credentials.rs"]
 mod acme_external_account_binding_credentials;
+#[path = "all/acme_external_account_binding_delete.rs"]
+mod acme_external_account_binding_delete;
 #[path = "all/acme_external_account_binding_lifecycle.rs"]
 mod acme_external_account_binding_lifecycle;
 #[path = "all/acme_external_account_binding_listing.rs"]

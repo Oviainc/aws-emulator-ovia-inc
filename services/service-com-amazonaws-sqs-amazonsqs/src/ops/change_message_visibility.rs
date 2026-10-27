@@ -12,9 +12,10 @@
 //! while a handle this queue holds no message under — its message deleted, purged or
 //! expired, or the handle superseded by a later receive — is refused as a `ReceiptHandle`
 //! value the call cannot act on, because the message whose visibility there is to change
-//! is gone. A message that is not in flight has no timeout to change, which is what the
-//! modelled `MessageNotInflight` reports, and the span asked for is held to the range the
-//! parameter documents and to what one receive may hide a message for.
+//! is gone. Whether that message is hidden right now decides nothing: a handle names its
+//! message for as long as the queue holds it, so a consumer whose visibility window has
+//! lapsed re-hides the message it is still working on. The span asked for is held to the
+//! range the parameter documents and to what one receive may hide a message for.
 //!
 //! Past those the message is hidden from the instant of THIS call — "the timeout value is
 //! applied immediately" — and a span of zero hides it for nothing, which is what makes a
@@ -248,7 +249,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // Retention lapses and visibility timeouts are owed by the clock, not by this call:
-        // a message whose timeout has already lapsed is not in flight.
+        // a message whose retention period has run out is gone, and one whose timeout has
+        // lapsed is visible again — and still the message its handle names.
         queue.materialise_due(now);
 
         // Whether this caller may change a message's visibility on this queue is decided
@@ -299,10 +301,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ))
                 }
             },
-            Err(sqs::VisibilityRefusal::NotInFlight) => Err(
-                ChangeMessageVisibilityErrorModeled::MessageNotInflight(MessageNotInflight {})
-                    .into(),
-            ),
             Err(sqs::VisibilityRefusal::BeyondLimit) => {
                 Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
                     sqs::visibility_beyond_limit_message(requested, max),

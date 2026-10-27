@@ -1090,6 +1090,41 @@ pub fn page_size(max_results: Option<i32>) -> usize {
     }
 }
 
+/// The two members a window-filtered listing is asked for its window in, spelled once so
+/// the refusal below names and quotes the same members every listing binds.
+const SEARCH_WINDOW_START_PARAMETER: &str = "startTime";
+
+/// See [`SEARCH_WINDOW_START_PARAMETER`].
+const SEARCH_WINDOW_END_PARAMETER: &str = "endTime";
+
+/// Refuse a search window that does not run forwards, with the modelled
+/// `InvalidParameterException` (HTTP 431) naming [`SEARCH_WINDOW_END_PARAMETER`].
+///
+/// The window a listing searches runs forwards: a request whose `endTime` precedes its
+/// `startTime` describes no interval at all, so it is refused rather than answered with
+/// the empty page the window test would produce. A window naming the same instant twice
+/// still describes an interval — the CLOSED reading [`windows_overlap`] applies — so it is
+/// answered.
+///
+/// Every window-filtered listing of this service searches its window the same way, so
+/// they read ONE rule here and map it into their own error enum, the way they already do
+/// for [`validate_tags`]: a change to the comparison, or to the member the refusal names,
+/// is then made once rather than once per listing.
+pub fn validate_search_window(
+    start_time: DateTime,
+    end_time: DateTime,
+) -> Result<(), InvalidParameterException> {
+    if end_time.as_secs_f64() < start_time.as_secs_f64() {
+        return Err(invalid_parameter(
+            SEARCH_WINDOW_END_PARAMETER,
+            format!(
+                "{SEARCH_WINDOW_END_PARAMETER} must not precede {SEARCH_WINDOW_START_PARAMETER}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// What an ARN this service minted points at, so an ARN-valued reference resolves in
 /// one lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]

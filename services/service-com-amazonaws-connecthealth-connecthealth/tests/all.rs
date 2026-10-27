@@ -53,5 +53,7 @@ mod tag_bound_precedence;
 mod tag_bound_unit;
 #[path = "all/tag_count_cap.rs"]
 mod tag_count_cap;
+#[path = "all/tag_entry_refusal_completeness.rs"]
+mod tag_entry_refusal_completeness;
 #[path = "all/tag_map_bounds.rs"]
 mod tag_map_bounds;

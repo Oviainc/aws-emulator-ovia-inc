@@ -525,7 +525,10 @@ async fn a_credential_no_iam_user_owns_is_not_refused() {
 /// (`crate::state::AWS_MANAGED_POLICIES` holds a subset of AWS's catalog, and
 /// `AttachUserPolicy` accepts the ARNs outside it because AWS does). What it grants is
 /// not held anywhere, so it is a grant the emulator cannot read.
-const UNREADABLE_GRANT: &str = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess";
+///
+/// `pub(crate)` because every suite about what this emulator can and cannot read off a
+/// principal names the same unreadable grant.
+pub(crate) const UNREADABLE_GRANT: &str = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess";
 
 /// RULE: a grant whose document this emulator cannot read is not evidence either way —
 /// it cannot refuse a call, and it cannot overturn an explicit `Deny` that a document

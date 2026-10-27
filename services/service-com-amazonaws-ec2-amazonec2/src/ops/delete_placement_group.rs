@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePlacementGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePlacementGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePlacementGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: takes the placement group the request names by name out of
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::placement_groups`], so neither its name
+//! nor its id resolves for any later caller. A name the account holds no group under is
+//! refused rather than answered as a deletion that happened. The modelled output declares
+//! no members, so the answer is the ec2Query envelope's `<return>` success flag alone.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +149,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePlacementGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePlacementGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — a
+        // placement group name "must be unique within the scope of your account for the
+        // Region" (`CreatePlacementGroupRequest$GroupName`) and this store IS that one
+        // account's resources. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The name of the placement group" (`DeletePlacementGroupRequest$GroupName`) is
+        // what this call names its subject by, so a request carrying the member empty names
+        // no group at all. Read VERBATIM otherwise, the way `CreatePlacementGroup` stores a
+        // name and `DescribePlacementGroups` selects on one, so one name resolves to one
+        // group across the three operations.
+        let group_name = input.group_name.as_str();
+        if group_name.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter GroupName",
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "Deletes the specified placement group": a name the account holds no group under
+        // is a refusal, not a no-op — a caller that deletes twice, or that probes a name
+        // after deleting it, has to be able to tell the deletion it performed from one it
+        // did not.
+        let group_id = store
+            .placement_group_id_for_name(group_name)
+            .ok_or_else(|| state::invalid_placement_group_unknown(group_name))?;
+
+        // "You cannot delete a placement group that is a parent of a cluster placement
+        // group. Delete the cluster placement groups first" (`DeletePlacementGroup`): a
+        // group another group still names as its parent is in use, so it stays stored.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePlacementGroup"))
+        // "You must terminate all instances in the placement group before you can delete
+        // the placement group" is the other dependency AWS names, and this emulator records
+        // no instance's placement group — a launch stores an instance's Availability Zone
+        // and nothing narrower — so no stored instance holds a place in a group for this
+        // check to find.
+        if store.has_placement_group_children(&group_id) {
+            return Err(state::invalid_placement_group_in_use(group_name));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation"
+        // (`$DryRun`). Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `remove_placement_group` is what gives the record's caller-supplied bytes back to
+        // the store's budget, so a create-delete-create cycle does not leak budget.
+        if store.remove_placement_group(&group_id).is_none() {
+            return Err(state::internal_error(
+                "the placement group checked a moment ago could not be removed",
+            ));
+        }
+        Ok(DeletePlacementGroupOutput)
     }
 }
