@@ -93,6 +93,8 @@ mod glossaries;
 mod glossary_term_listing;
 #[path = "all/glossary_terms.rs"]
 mod glossary_terms;
+#[path = "all/integration_resource_properties.rs"]
+mod integration_resource_properties;
 #[path = "all/job_deletion.rs"]
 mod job_deletion;
 #[path = "all/job_listing.rs"]
