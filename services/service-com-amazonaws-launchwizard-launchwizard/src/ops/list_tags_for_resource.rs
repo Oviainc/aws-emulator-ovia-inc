@@ -163,10 +163,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The tags come from the stored deployment, which is where every tagging call
-        // writes them. A deployment carrying none reports an empty map rather than no
-        // map at all: the answer is "this resource has no tags", not "no answer".
+        // writes them. A deployment carrying none leaves the member OUT rather than
+        // reporting a map of zero entries, which `Tags`' floor of one entry does not
+        // admit — the same projection the deployment's own reader uses, so the two
+        // cannot answer "this resource has no tags" differently.
         Ok(ListTagsForResourceOutput {
-            tags: Some(crate::state::to_hash_map(&deployment.tags)),
+            tags: crate::state::to_hash_map_member(&deployment.tags),
         })
     }
 }

@@ -1180,7 +1180,7 @@ async fn a_revoked_certificate_is_reported_and_filtered_as_revoked() {
     }
     make_validation_due_now(&engine);
     // The one fact `RevokeCertificate` requires of a certificate, which
-    // `ExportCertificate` sets in production and is still its own stub issue.
+    // `ExportCertificate` sets in production (see `mark_exported`).
     mark_exported(&engine, &arns[0]);
 
     let (status, response) = call(
