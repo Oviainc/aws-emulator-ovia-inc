@@ -436,12 +436,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let managed = environment.ce_type == batch::CE_TYPE_MANAGED;        // `computeResources` is "details of the compute resources MANAGED by the compute
-        // environment", so only a MANAGED environment has any to update.
+        let managed = environment.ce_type == batch::CE_TYPE_MANAGED;
+        // `computeResources` is "details of the compute resources MANAGED by the compute
+        // environment", so only a MANAGED environment has any to update. The refusal is
+        // the rule's own sentence, naming the environment by the ARN it is stored under
+        // ([`batch::unmanaged_compute_resources_message`]).
         if input.compute_resources.is_some() && !managed {
-            return Err(refuse(format!(
-                "computeResources can only be updated for a MANAGED compute environment, and {} is {}",
-                environment.name, environment.ce_type
+            return Err(refuse(batch::unmanaged_compute_resources_message(
+                &environment.arn,
             )));
         }
         // `unmanagedvCpus`: "Don't specify this parameter for a managed compute

@@ -199,14 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(now);
 
         // `jobName` is a plain `String` in the model, so the framework admits anything:
-        // the charset and length the member documents are applied here.
+        // the service applies the pattern the member documents and refuses a value outside
+        // it with the pattern sentence every name refusal of this service carries
+        // ([`batch::name_pattern_detail`]).
         if !batch::is_valid_job_name(&input.job_name) {
-            return Err(SubmitServiceJobErrorModeled::ClientException(batch::client_exception(
-                format!(
-                    "jobName must be 1 to {} letters, numbers, hyphens (-) or underscores (_)",
-                    batch::MAX_JOB_NAME_LEN
-                ),
-            ))
+            return Err(SubmitServiceJobErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::name_pattern_detail("jobName")),
+            )
             .into());
         }
 

@@ -178,12 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Ok(DeleteJobQueueOutput {});
             }
             if queue.state != batch::STATE_DISABLED {
+                // The same rule as every other delete of this service that requires a
+                // disabled resource, in the same sentence, naming this kind
+                // ([`batch::delete_enabled_message`]).
                 return Err(DeleteJobQueueErrorModeled::ClientException(
-                    batch::client_exception(format!(
-                        "Cannot delete job queue {name} while its state is {}: disable \
-                         submissions with UpdateJobQueue first",
-                        queue.state
-                    )),
+                    batch::client_exception(batch::delete_enabled_message("job queue")),
                 )
                 .into());
             }

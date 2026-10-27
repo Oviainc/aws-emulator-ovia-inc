@@ -697,6 +697,20 @@ pub fn is_extended_statistic(statistic: &str) -> bool {
     parse_percentile(statistic).is_some() || bounded_statistic(statistic).is_some()
 }
 
+/// One series ONE write stored datapoints into: its identity, and the unit each of those
+/// datapoints carried.
+///
+/// What [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::make_alarms_due`] needs to
+/// decide whether a write stored anything a given alarm would GRADE — the series alone cannot
+/// answer it, because an alarm's `Unit` selects which datapoints of that series it evaluates.
+#[derive(Debug, Clone)]
+pub struct WrittenSeries {
+    /// The series the datapoints were stored into.
+    pub key: MetricKey,
+    /// The unit each stored datapoint carried, in the order the request listed them.
+    pub units: Vec<Option<String>>,
+}
+
 /// A stored metric alarm: the modelled shape `DescribeAlarms` returns, plus the tags
 /// `PutMetricAlarm` accepted (no `MetricAlarm` member carries them).
 #[derive(Debug, Clone, Default)]
@@ -713,18 +727,11 @@ pub struct StoredAlarm {
     /// INSUFFICIENT_DATA. The alarm is then evaluated and its state is set appropriately."
     /// (`PutMetricAlarm`) — so a write starts a span during which the alarm still reports the
     /// state the write left it in, and the evaluation becomes due at its end. `SetAlarmState`
-    /// starts one of the same length: the state it forces stands until that evaluation is due
-    /// ([`alarm_evaluation::forced_state_span_secs`]).
+    /// starts one of the alarm's own evaluation periods instead: the state it forces stands
+    /// until the alarm's next evaluation is due
+    /// ([`alarm_evaluation::forced_state_span_secs`]), and a datapoint of the series the alarm
+    /// watches brings that evaluation forward ([`Self::make_alarms_due`]).
     pub evaluation_due_secs: f64,
-    /// The instant, in epoch seconds, until which a state `SetAlarmState` forced on this alarm
-    /// stands; `None` when the alarm reports its own evaluated state.
-    ///
-    /// "Temporarily sets the state of an alarm for testing purposes." (`SetAlarmState`) — a
-    /// forced state is meant to stand for the span the force started, so an arriving datapoint
-    /// does not cut it short:
-    /// [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::make_alarms_due`] leaves an
-    /// alarm holding one alone until that span is out.
-    pub forced_state_until_secs: Option<f64>,
 }
 
 /// A stored composite alarm: the modelled shape `DescribeAlarms` returns, plus what the
@@ -2304,30 +2311,35 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// the clock the write starts materialises the transition and delivers the actions it fires
     /// without waiting for whatever call happens to read the alarm next. Nothing else is
     /// pulled forward: an alarm whose series this write did not touch keeps the instant it
-    /// carries, and an alarm holding a state a caller forced keeps it until that force's own
-    /// span is out.
+    /// carries.
     ///
-    /// An alarm is matched on the series it names — namespace, metric name and dimension set —
-    /// which is the identity its own evaluation reads, so a datapoint of any other series makes
-    /// no alarm due.
-    pub fn make_alarms_due(&mut self, keys: &[MetricKey], now_secs: f64) {
-        if keys.is_empty() {
+    /// This is also what takes back a state `SetAlarmState` forced on an alarm whose metric is
+    /// really being published, which is why such an alarm "returns to [its] actual state
+    /// quickly, often within seconds" (`SetAlarmState`) while one over a metric nothing writes
+    /// keeps the forced state until its next scheduled pass
+    /// ([`alarm_evaluation::forced_state_span_secs`]). The evaluation is still owed a span, not
+    /// the instant of the write, so the forced state is never cut short by the datapoint that
+    /// arrives with it.
+    ///
+    /// An alarm is matched on the datapoints it would GRADE: the series it names — namespace,
+    /// metric name and dimension set, the identity its own evaluation reads — and the unit it
+    /// selects ("If you specify a unit, the operation returns only data that was collected with
+    /// that unit specified"), so a datapoint of another series, or of a unit this alarm does not
+    /// grade, makes it no more due than one nobody published.
+    pub fn make_alarms_due(&mut self, written: &[WrittenSeries], now_secs: f64) {
+        if written.is_empty() {
             return;
         }
         let due = now_secs + alarm_evaluation::EVALUATION_DELAY_SECS;
         for stored in self.alarms.values_mut() {
-            if stored
-                .forced_state_until_secs
-                .is_some_and(|until| now_secs < until)
-            {
-                continue;
-            }
-            let watched = MetricKey {
-                namespace: stored.alarm.namespace.clone().unwrap_or_default(),
-                metric_name: stored.alarm.metric_name.clone().unwrap_or_default(),
-                dimensions: dimension_set(stored.alarm.dimensions.as_deref()),
-            };
-            if keys.contains(&watched) {
+            let watched = alarm_evaluation::watched_series(&stored.alarm);
+            let grades = written.iter().any(|series| {
+                series.key == watched
+                    && series.units.iter().any(|unit| {
+                        alarm_evaluation::alarm_grades_unit(&stored.alarm, unit.as_deref())
+                    })
+            });
+            if grades {
                 stored.evaluation_due_secs = stored.evaluation_due_secs.min(due);
             }
         }
@@ -2384,9 +2396,14 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// so a name of any kind is written.
     ///
     /// A write that CHANGES the member is a configuration update: it stamps
-    /// `AlarmConfigurationUpdatedTimestamp` and records the `ConfigurationUpdate` history item
-    /// every other configuration write records. Asking for the setting an alarm already has
-    /// changes nothing, so it records nothing either.
+    /// `AlarmConfigurationUpdatedTimestamp`, records the `ConfigurationUpdate` history item
+    /// every other configuration write records, and — like every other configuration write —
+    /// hands the alarm's state back to its own evaluation, which becomes due a span later ("the
+    /// alarm is then evaluated and its state is set appropriately", `PutMetricAlarm`; "It is
+    /// also reevaluated if you update its configuration", `SetAlarmState` on a composite
+    /// alarm). So a state a caller forced does not outlive a reconfiguration of the alarm it
+    /// was forced on. Asking for the setting an alarm already has changes nothing, so it
+    /// records nothing and re-evaluates nothing either.
     pub fn set_actions_enabled(
         &mut self,
         names: &[String],
@@ -2401,6 +2418,10 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         named.dedup();
 
         let mut unknown: Vec<String> = Vec::new();
+        // When a configuration write re-evaluates the alarm it touched: the same span after the
+        // write as every other transition this store's clock owes, so a caller reading straight
+        // back still sees the state the write found.
+        let due = now_secs + alarm_evaluation::EVALUATION_DELAY_SECS;
         // The history items the writes owe, recorded once the store is no longer borrowed by
         // the alarm each one belongs to.
         let mut records: Vec<(String, &'static str, String)> = Vec::new();
@@ -2412,6 +2433,7 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
                 let previous = stored.alarm.clone();
                 stored.alarm.actions_enabled = Some(enabled);
                 stored.alarm.alarm_configuration_updated_timestamp = Some(to_timestamp(now_secs));
+                stored.evaluation_due_secs = stored.evaluation_due_secs.min(due);
                 let data = configuration_update_history_data(Some(&previous), &stored.alarm);
                 records.push((name.to_string(), ALARM_TYPE_METRIC, data));
             } else if let Some(stored) = self.composite_alarms.get_mut(name) {
@@ -2421,6 +2443,10 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
                 let previous = stored.alarm.clone();
                 stored.alarm.actions_enabled = Some(enabled);
                 stored.alarm.alarm_configuration_updated_timestamp = Some(to_timestamp(now_secs));
+                stored.evaluation_due_secs = stored.evaluation_due_secs.min(due);
+                // "It is also reevaluated if you update its configuration" (`SetAlarmState`) —
+                // so the rule, not the force, owns this alarm's state from that evaluation on.
+                stored.forced_child_states = None;
                 let data =
                     composite_configuration_update_history_data(Some(&previous), &stored.alarm);
                 records.push((name.to_string(), ALARM_TYPE_COMPOSITE, data));

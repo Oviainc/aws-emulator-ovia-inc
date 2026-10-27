@@ -738,6 +738,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // owner's `FULL_CONTROL`, which a reader derives — until a `PutObjectAcl` sets
             // one on it.
             acl: None,
+            // The checksum the destination object carries: the algorithm the copy request
+            // names, computed over the bytes being stored, so it describes THIS object.
+            // "Indicates the algorithm that you want Amazon S3 to use to create the
+            // checksum for the object" (`CopyObjectRequest$ChecksumAlgorithm`); a copy that
+            // names none carries the source's checksum when that was over the whole object,
+            // because the bytes are the same bytes, and none at all when the source's was
+            // composed of the checksums of parts this copy is not assembled from.
+            checksum: input
+                .checksum_algorithm
+                .as_deref()
+                .and_then(|algorithm| {
+                    crate::state::full_object_checksum(algorithm, &source_object.body).map(
+                        |value| crate::state::ObjectChecksum {
+                            algorithm: algorithm.to_string(),
+                            value,
+                            checksum_type: crate::state::CHECKSUM_TYPE_FULL_OBJECT.to_string(),
+                        },
+                    )
+                })
+                .or_else(|| {
+                    source_object.checksum.clone().filter(|checksum| {
+                        checksum.checksum_type == crate::state::CHECKSUM_TYPE_FULL_OBJECT
+                    })
+                }),
+            // A copy is one write of the whole object, so the destination is not assembled
+            // from parts even when the SOURCE was: its bytes arrive as one object.
+            parts: Vec::new(),
             body: source_object.body.clone(),
         };
         if replaces_metadata {

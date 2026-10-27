@@ -479,7 +479,7 @@ fn refusal_for(violation: &Violation) -> Option<Refused> {
         // which model these codes for them.
         ("title", _) if missing => (
             "TitleRequiredException",
-            "A pull request title is required.",
+            crate::state::TITLE_REQUIRED_MESSAGE,
         ),
         ("title", _) => (
             "InvalidTitleException",

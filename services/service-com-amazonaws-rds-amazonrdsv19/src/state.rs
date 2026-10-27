@@ -3635,6 +3635,21 @@ pub fn db_subnet_group_does_not_exist_message(name: &str) -> String {
     format!("DB subnet group '{name}' does not exist.")
 }
 
+/// The message the `InvalidDBSubnetGroupStateFault` carries where a DB subnet group cannot
+/// be deleted because a database is still placed in it ("The specified database subnet
+/// group must not be associated with any DB instances").
+///
+/// Amazon RDS words this one sentence from the request and from the blocking resource: the
+/// group name the request asked to delete, quoted, and the identifier of the database that
+/// still holds it. It lives here, beside the not-found wordings, so the one operation that
+/// answers it and any later one word it the same way.
+pub fn db_subnet_group_in_use_message(name: &str, holder_identifier: &str) -> String {
+    format!(
+        "Cannot delete the subnet group '{name}' because at least one database instance: \
+         {holder_identifier} is still using it."
+    )
+}
+
 /// A stored DB subnet group: the name, the description and the EC2 subnets the request
 /// named.
 ///

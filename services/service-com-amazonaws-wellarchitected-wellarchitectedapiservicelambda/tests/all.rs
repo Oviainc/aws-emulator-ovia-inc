@@ -345,3 +345,8 @@ mod workload_from_review_template_content;
 // agent suite is the one gap of this list every new agent suite lands in.
 #[path = "all/agent_recommendation_feedback.rs"]
 mod agent_recommendation_feedback;
+
+// Declared last for the same reason as the declarations above: the sorted position for a
+// workload suite falls in a crowded run of this list.
+#[path = "all/workload_share_deletion.rs"]
+mod workload_share_deletion;

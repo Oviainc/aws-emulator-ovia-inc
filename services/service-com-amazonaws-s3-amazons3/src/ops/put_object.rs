@@ -379,10 +379,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // back by this write and by every later read of it — see
         // `crate::state::ObjectEncryption`.
         //
-        // The checksum members are NOT in this list either: a checksum this handler
-        // neither computes nor verifies is simply not reported back, so nothing is claimed
-        // about it, and refusing the request would break every SDK that sends one by
-        // default.
+        // The checksum members are NOT in this list either: the algorithm one of them names
+        // is what this write computes the object's checksum WITH (see below), and a value
+        // one of them carries is the client's own for the same bytes, which is neither
+        // verified nor echoed.
         for (member, present) in [
             ("If-Match", input.if_match.is_some()),
             ("If-None-Match", input.if_none_match.is_some()),
@@ -610,6 +610,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let etag = crate::state::object_etag(&input.body);
+        // The checksum this write stores with the object: the algorithm the request named,
+        // computed over the bytes it carried. "When you perform a request with a
+        // checksum-based data integrity check, Amazon S3 … calculates the checksum"
+        // (`PutObjectRequest$ChecksumAlgorithm`), and a single write's checksum is over the
+        // whole object, so its type is `FULL_OBJECT`: there are no parts to compose one
+        // from. A request that names no algorithm stores no checksum, which is what makes
+        // every later read of such an object report none.
+        //
+        // The `Checksum*` members the request may also carry are NOT verified against this:
+        // they are the client's own value for the same bytes, and this emulator answers with
+        // the checksum it computed itself rather than with anything echoed back.
+        let checksum = input.checksum_algorithm.as_deref().and_then(|algorithm| {
+            crate::state::full_object_checksum(algorithm, &input.body).map(|value| {
+                crate::state::ObjectChecksum {
+                    algorithm: algorithm.to_string(),
+                    value,
+                    checksum_type: crate::state::CHECKSUM_TYPE_FULL_OBJECT.to_string(),
+                }
+            })
+        });
+        let reported = crate::state::reported_checksums(checksum.as_ref());
         let object = crate::state::Object {
             etag: etag.clone(),
             last_modified: ::std::time::SystemTime::now(),
@@ -667,6 +688,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the ACL every object starts with, the owner's `FULL_CONTROL`, which a reader
             // derives rather than this writing.
             acl,
+            checksum,
+            // A one-shot write is not assembled from parts: "an object here is never
+            // assembled from parts" unless `CompleteMultipartUpload` assembled it, which is
+            // also what AWS reports for an object a single `PutObject` wrote.
+            parts: Vec::new(),
             body: input.body,
         };
 
@@ -762,10 +788,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // configuration applied to the object just stored — computed from it rather
             // than stamped on it, so the same answer comes back from every later read.
             expiration: expiration_of(&store, &input.bucket, &input.key),
+            // The checksum this write computed over the bytes it stored, under the member
+            // its algorithm names, with the `ChecksumType` beside it — the same values every
+            // later read of the object reports, because they are read off one record
+            // ([`crate::state::reported_checksums`]). A write that named no algorithm
+            // reports none of them.
+            checksum_crc32: reported.crc32,
+            checksum_crc32_c: reported.crc32c,
+            checksum_crc64_nvme: reported.crc64nvme,
+            checksum_sha1: reported.sha1,
+            checksum_sha256: reported.sha256,
+            checksum_sha512: reported.sha512,
+            checksum_md5: reported.md5,
+            checksum_xxhash64: reported.xxhash64,
+            checksum_xxhash3: reported.xxhash3,
+            checksum_xxhash128: reported.xxhash128,
+            checksum_type: reported.checksum_type,
             // Everything else this output can carry describes a feature no stored object
-            // here has, so none of it is reported rather than being invented: the checksum
-            // members need a checksum this handler did not compute, the SSE-C members are
-            // refused above, `Size` is for appends in directory buckets, and
+            // here has, so none of it is reported rather than being invented: the SSE-C
+            // members are refused above, `Size` is for appends in directory buckets, and
             // `RequestCharged` reports a Requester Pays charge this emulator does not
             // model.
             ..PutObjectOutput::default()

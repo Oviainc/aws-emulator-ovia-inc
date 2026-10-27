@@ -76,7 +76,11 @@ const FUNCTION_IN_USE_MESSAGE: &str =
 
 /// `DELETE /2020-05-31/function/{Name}`, carrying `if_match` as the `If-Match` header the
 /// operation binds its required `IfMatch` member to.
-async fn delete_function(router: &MultiServiceRouter, name: &str, if_match: &str) -> Answer {
+pub(crate) async fn delete_function(
+    router: &MultiServiceRouter,
+    name: &str,
+    if_match: &str,
+) -> Answer {
     call(
         router,
         "DELETE",

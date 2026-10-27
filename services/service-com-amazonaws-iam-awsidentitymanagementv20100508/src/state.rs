@@ -303,6 +303,13 @@ pub const MAX_MANAGED_POLICIES_PER_ROLE: usize = 10;
 /// attachment set growing without end.
 pub const MAX_MANAGED_POLICIES_PER_USER: usize = 10;
 
+/// How many managed policies one IAM group may carry. AWS's "IAM and STS quotas"
+/// page gives the quota "Managed policies attached to an IAM group: 10", and an
+/// attach past it is refused with `LimitExceededException`, exactly as a role's
+/// quota ([`MAX_MANAGED_POLICIES_PER_ROLE`]) is. It is also what stops a group's
+/// attachment set growing without end.
+pub const MAX_MANAGED_POLICIES_PER_GROUP: usize = 10;
+
 /// The scheme an OIDC provider's URL must carry.
 /// `CreateOpenIDConnectProvider$Url`'s documentation: "The URL must begin with
 /// https://".
@@ -1131,6 +1138,12 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// attached to a user at most once, and the total ARN order is what lets a
     /// reader of the set page over it.
     pub user_attached_policies: BTreeMap<String, BTreeSet<String>>,
+    /// The managed policies attached to each group: [`name_key`] of the group name
+    /// -> the attached policies' ARNs. Keyed and ordered exactly as
+    /// [`Self::role_attached_policies`] is, and for the same reasons: a policy is
+    /// attached to a group at most once, and the total ARN order is what lets a
+    /// reader of the set page over it. `AttachGroupPolicy` is what fills it.
+    pub group_attached_policies: BTreeMap<String, BTreeSet<String>>,
     /// The persisted IAM OpenID Connect (OIDC) identity providers, keyed by their
     /// ARN — the handle every operation on one takes, and the value
     /// [`open_id_connect_provider_arn`] derives from the provider's URL. Keying by
@@ -1460,15 +1473,15 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// ([`AWS_MANAGED_POLICIES`]) — what is counted is the attachments, not the
     /// policy's owner.
     ///
-    /// Roles and users can hold an attachment; a group cannot while
-    /// `AttachGroupPolicy` is still scaffolded, so no group carries one. When it is
-    /// implemented its attachment sets join this count, which is why the policy's
-    /// own record does not cache it.
+    /// All three identity kinds the measure names can hold an attachment, so all
+    /// three attachment sets are counted — which is why the policy's own record does
+    /// not cache the number.
     pub fn policy_attachment_count(&self, arn: &str) -> i32 {
         let attachments = self
             .role_attached_policies
             .values()
             .chain(self.user_attached_policies.values())
+            .chain(self.group_attached_policies.values())
             .filter(|attached| attached.contains(arn))
             .count();
         i32::try_from(attachments).unwrap_or(i32::MAX)
@@ -1630,10 +1643,10 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
                 if group.arn != arn {
                     return None;
                 }
-                // `AttachGroupPolicy` is still scaffolded, so a group the account
-                // holds carries no managed policy attachment; when it is
-                // implemented, those documents join this collection.
-                Vec::new()
+                self.group_attached_policies
+                    .get(&key)
+                    .map(|attached| attached.iter().cloned().collect())
+                    .unwrap_or_default()
             }
         };
 

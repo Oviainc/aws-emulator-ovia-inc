@@ -212,16 +212,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Which ENTITY TYPES the request asks about: "if it is not included, all
         // attached entities (users, groups, and roles) are returned", and naming one
-        // of those three narrows the answer to it. Filtering by `Group` leaves only
-        // the group list, which is empty for the reason given below;
-        // `LocalManagedPolicy` and `AWSManagedPolicy` are values of the shared
-        // `EntityType` enum that name no user, group or role, so a request filtering
-        // by one relates no entity at all.
-        let (want_roles, want_users) = match input.entity_filter.as_deref() {
-            None => (true, true),
-            Some(crate::state::ENTITY_FILTER_ROLE) => (true, false),
-            Some(crate::state::ENTITY_FILTER_USER) => (false, true),
-            Some(_) => (false, false),
+        // of those three narrows the answer to it. `LocalManagedPolicy` and
+        // `AWSManagedPolicy` are values of the shared `EntityType` enum that name no
+        // user, group or role, so a request filtering by one relates no entity at all.
+        let (want_groups, want_roles, want_users) = match input.entity_filter.as_deref() {
+            None => (true, true, true),
+            Some(crate::state::ENTITY_FILTER_GROUP) => (true, false, false),
+            Some(crate::state::ENTITY_FILTER_ROLE) => (false, true, false),
+            Some(crate::state::ENTITY_FILTER_USER) => (false, false, true),
+            Some(_) => (false, false, false),
         };
         // Which USAGE of the policy counts as relating an entity to it: "to list only
         // permissions policies, set PolicyUsageFilter to PermissionsPolicy. To list
@@ -300,11 +299,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // them (`paginated { inputToken: Marker, outputToken: Marker }`).
         let mut related: Vec<(String, RelatedEntity)> = Vec::new();
 
-        // Groups: this account can hold none while `CreateGroup` is a scaffolded 501,
-        // so there is no group store to read — the group list is empty rather than
-        // invented, and gains its entries from the same key order
-        // (`crate::state::ENTITY_KEY_TAG_GROUP`, which sorts before the role and user
-        // tags) once groups are persisted.
+        // Groups: a group relates this policy exactly when `AttachGroupPolicy`
+        // recorded the attachment on it. A group carries no permissions boundary —
+        // `AttachedPermissionsBoundary` is a member of a user and a role only — so an
+        // attachment is the only way a group relates a policy. The group tag sorts
+        // before the role and user tags (`crate::state::ENTITY_KEY_TAG_GROUP`), so
+        // the groups come first in the one enumeration order.
+        if want_groups && want_permissions_policy {
+            for (group_key, group) in &store.groups {
+                let attached = store
+                    .group_attached_policies
+                    .get(group_key)
+                    .is_some_and(|attached| attached.contains(&input.policy_arn));
+                if !attached || !group.path.starts_with(&path_prefix) {
+                    continue;
+                }
+                related.push((
+                    crate::state::entity_page_key(crate::state::ENTITY_KEY_TAG_GROUP, group_key),
+                    RelatedEntity::Group(PolicyGroup {
+                        group_name: Some(group.group_name.clone()),
+                        group_id: Some(group.group_id.clone()),
+                    }),
+                ));
+            }
+        }
 
         if want_roles {
             for (role_key, role) in &store.roles {
@@ -358,10 +376,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is only every remaining entity if the keys ascend.
         related.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        // The group list the response carries: empty for the reason given above, and
-        // typed here because no group can be constructed from state that does not
-        // exist yet.
-        let policy_groups: Vec<PolicyGroup> = Vec::new();
+        let mut policy_groups = Vec::new();
         let mut policy_roles = Vec::new();
         let mut policy_users = Vec::new();
         let mut is_truncated = false;
@@ -377,6 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 break;
             }
             match entity {
+                RelatedEntity::Group(group) => policy_groups.push(group),
                 RelatedEntity::Role(role) => policy_roles.push(role),
                 RelatedEntity::User(user) => policy_users.push(user),
             }
@@ -401,10 +417,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// One entity this policy relates to, carried beside its page key so the three
 /// modelled lists are filled from ONE enumeration order.
-///
-/// A group variant is absent because no group can be persisted yet (`CreateGroup`
-/// answers 501), so nothing could construct one.
 enum RelatedEntity {
+    /// An IAM group, reported in `PolicyGroups`.
+    Group(PolicyGroup),
     /// An IAM role, reported in `PolicyRoles`.
     Role(PolicyRole),
     /// An IAM user, reported in `PolicyUsers`.

@@ -327,7 +327,9 @@ struct Refusal {
     /// The environment the update names; `None` means the created one.
     reference: Option<&'static str>,
     members: Value,
-    /// A fragment the refusal must name, so a caller learns WHICH member is wrong.
+    /// A fragment the refusal must name, so a caller learns WHICH rule fired: the member
+    /// at fault where AWS names it, and the rule's own words where it states those
+    /// instead.
     names: &'static str,
 }
 
@@ -350,7 +352,9 @@ async fn a_member_outside_its_documented_kind_or_range_is_refused() {
             create: unmanaged.clone(),
             reference: None,
             members: json!({"computeResources": {"minvCpus": 1, "maxvCpus": 4}}),
-            names: "computeResources",
+            // AWS states this rule in words rather than naming the member
+            // (`state::unmanaged_compute_resources_message`).
+            names: "compute resources not supported on unmanaged compute environment",
         },
         Refusal {
             case: "unmanagedvCpus on a MANAGED environment",

@@ -289,7 +289,11 @@ async fn a_point_the_arithmetic_cannot_compute_is_dropped_and_reported() {
     publish_fixtures(&router, base).await;
 
     // m2's middle point is 0, so the middle quotient is not a number at all; the two points
-    // either side of it are.
+    // either side of it are. Every row carries the SAME message: the sentence CloudWatch
+    // reports a dropped point with is fixed text, interpolating nothing from the request.
+    const DROPPED: &str =
+        "One or more data-points have been dropped due to non-numeric values (NaN, -Infinite, \
+         +Infinite)";
     for (expression, expected) in [
         ("m1 / m2", vec![10.0, 7.5]),
         ("LOG(m2)", vec![0.0, 4.0_f64.ln()]),
@@ -303,12 +307,10 @@ async fn a_point_the_arithmetic_cannot_compute_is_dropped_and_reported() {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        assert!(
-            messages
-                .iter()
-                .any(|message| message.get("Code").and_then(Value::as_str)
-                    == Some("ArithmeticError")),
-            "case {expression:?}: expected an arithmetic error message, got {result}"
+        assert_eq!(
+            messages,
+            vec![json!({"Code": "ArithmeticError", "Value": DROPPED})],
+            "case {expression:?}: expected exactly the arithmetic-error message, got {result}"
         );
     }
 

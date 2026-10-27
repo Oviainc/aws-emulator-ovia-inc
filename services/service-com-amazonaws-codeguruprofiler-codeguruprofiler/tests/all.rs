@@ -21,6 +21,8 @@ mod findings_reports_listing;
 mod frame_metric_data;
 #[path = "all/get_profile_interval.rs"]
 mod get_profile_interval;
+#[path = "all/instant_comparison_resolution.rs"]
+mod instant_comparison_resolution;
 #[path = "all/interval_resolution.rs"]
 mod interval_resolution;
 #[path = "all/interval_validation.rs"]

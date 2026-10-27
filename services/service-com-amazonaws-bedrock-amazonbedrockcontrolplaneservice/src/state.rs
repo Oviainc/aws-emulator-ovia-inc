@@ -2620,6 +2620,43 @@ pub struct AccountDataRetention {
     pub updated_at: SystemTime,
 }
 
+/// Amazon Bedrock's answer when it is asked to take on a role the caller supplied, and the
+/// principal that would take it on is not a principal of that role's account.
+///
+/// The one sentence, with no variable part: the denial names neither the role nor the
+/// destination, so there is nothing of the request to fill in. It is spelled the way the
+/// rest of this tree records AWS spelling the same denial. It is answered with the modelled
+/// `AccessDeniedException` (`@httpError(403)`).
+pub const CROSS_ACCOUNT_PASS_ROLE_DENIED: &str = "Cross-account pass role is not allowed.";
+
+/// Why Amazon Bedrock may not be passed the role a model invocation logging `config` names,
+/// or `None` when `config` needs no role passed to it.
+///
+/// A destination that names a role the CALLER supplied needs an `iam:PassRole` step before
+/// any log event can be written, and the only such destination is CloudWatch Logs: its
+/// `roleArn` is `@required` and is the role Bedrock must take on to write into the log
+/// group the same structure names
+/// (`smithy_query(query="shape",shape="CloudWatchConfig")`). `S3Config` declares no role
+/// member at all, so an S3-only configuration — and one naming no destination — passes no
+/// role, has no `iam:PassRole` step to authorize, and is admitted; whether the account may
+/// write to a named bucket is not a decision about a passed role, and the corpus records
+/// those puts being accepted.
+///
+/// The decision for the CloudWatch destination compares the role's account against the
+/// principal the role would be passed TO, and that side is fixed: the log events of that
+/// destination are written by Amazon Bedrock's own log-delivery principal, which is a
+/// principal of no caller's account. So the two sides differ for every value the member can
+/// carry — including a role of the very account making the call, which the corpus records
+/// being refused all the same — and reading the ARN could not change the answer. Hence a
+/// denial for that destination and no role-ARN parse: 403 `AccessDeniedException`, and no
+/// configuration installed, which is what every recording of such a put shows.
+pub fn pass_role_denial(config: &LoggingConfig) -> Option<String> {
+    if config.cloud_watch_config.is_some() {
+        return Some(CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string());
+    }
+    None
+}
+
 /// Per-service state for com-amazonaws-bedrock-amazonbedrockcontrolplaneservice. A handler reaches it through [`service_state`].
 ///
 /// Every map here is bounded, and each bound holds by construction rather than by

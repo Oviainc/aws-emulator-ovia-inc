@@ -15,9 +15,18 @@
 //!
 //! Every constraint the model states — `logGroupName` 1..512, the `roleArn` IAM role
 //! pattern, `bucketName` 3..63, `keyPrefix` ..1024 — is refused by the centralized
-//! validation walk BEFORE this handler runs, so a request that reaches here is one
-//! this emulator stores as given. Whether the named role may actually write to the
-//! named log group or bucket is an IAM decision this emulator does not take.
+//! validation walk BEFORE this handler runs, so a request that reaches here carries a
+//! well-formed configuration.
+//!
+//! A well-formed configuration is still not an installable one. A destination that names
+//! a role the CALLER supplied can only be installed by passing Amazon Bedrock that role,
+//! and [`crate::state::pass_role_denial`] takes that decision — for the CloudWatch Logs
+//! destination, the one whose `roleArn` is `@required` — BEFORE anything is stored. A
+//! denied pass is answered with the modelled `AccessDeniedException` (HTTP 403) and leaves
+//! the account singleton exactly as it was, so an independent
+//! `GetModelInvocationLoggingConfiguration` reports no part of the refused configuration.
+//! A configuration that passes no role (`s3Config` only, or no destination at all) has no
+//! such decision to take and is stored as given.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -127,6 +136,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ctx` carries request metadata this operation has no use for: the
         // configuration it sets is account-level.
         let _ = ctx;
+        // The PassRole step first, ahead of the store: a destination whose role may not be
+        // passed to Amazon Bedrock is refused, and a refused put installs nothing.
+        if let Some(denial) = crate::state::pass_role_denial(&input.logging_config) {
+            return Err(
+                PutModelInvocationLoggingConfigurationErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(denial),
+                    },
+                )
+                .into(),
+            );
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 PutModelInvocationLoggingConfigurationErrorModeled::InternalServerException(

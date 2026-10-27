@@ -29,6 +29,8 @@ mod published_controls;
 mod published_ontology;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/single_resource_filter.rs"]
+mod single_resource_filter;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_messages.rs"]

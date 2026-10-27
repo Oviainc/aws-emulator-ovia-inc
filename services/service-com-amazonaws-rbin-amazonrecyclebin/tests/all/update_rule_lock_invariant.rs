@@ -73,8 +73,10 @@ const LOCK_HOLDING_REQUIREMENT: &str =
 /// also carried a description is shown not to have applied it.
 const CREATED_DESCRIPTION: &str = "created description";
 
-/// The retention period every rule in this suite is created with, in days.
-const CREATED_RETENTION: i64 = 30;
+/// The retention period every rule in this suite is created with, in days — one every
+/// modelled resource type supports, so the rule under test is never confounded with the
+/// per-type retention bound.
+const CREATED_RETENTION: i64 = 7;
 
 /// The shared engine and the router built on it: the engine is kept so a test can move
 /// the instant a clock-owed lock transition falls due, which no request can bring forward.
@@ -441,7 +443,8 @@ async fn update_rule_still_changes_what_a_rule_holding_a_lock_may_change() {
             "description and retention period together",
             json!({
                 "Description": "both at once",
-                "RetentionPeriod": { "RetentionPeriodValue": 3650, "RetentionPeriodUnit": "DAYS" },
+                // The longest period the rule's own resource type supports.
+                "RetentionPeriod": { "RetentionPeriodValue": 365, "RetentionPeriodUnit": "DAYS" },
             }),
         ),
         ("an empty resource-tag list", json!({ "ResourceTags": [] })),

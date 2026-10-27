@@ -693,6 +693,76 @@ pub fn lock_holding_selection_not_allowed(blocker: UnlockableRule) -> Validation
     member_validation_failed(blocker.selection_member(), LOCK_HOLDING_MEMBER_REQUIREMENT)
 }
 
+/// The member path a refused `RetentionPeriodValue` is named by — the nested member, as a
+/// validation clause spells a path: each modelled member name in lower camel case, joined
+/// by dots.
+pub const RETENTION_PERIOD_VALUE_MEMBER: &str = "retentionPeriod.retentionPeriodValue";
+
+/// `ResourceType`'s values, so every rule read off a rule's type names one spelling.
+/// Source: smithy_query(query="shape", shape="ResourceType") — the same value set
+/// [`crate::ops::types::RESOURCE_TYPE_VALUES`] enumerates for the boundary validator.
+pub const RESOURCE_TYPE_EBS_SNAPSHOT: &str = "EBS_SNAPSHOT";
+pub const RESOURCE_TYPE_EBS_VOLUME: &str = "EBS_VOLUME";
+pub const RESOURCE_TYPE_EC2_IMAGE: &str = "EC2_IMAGE";
+
+/// The longest retention period, in days, Recycle Bin retains a deleted EBS VOLUME for.
+///
+/// Source: smithy_query(query="doc", shape="RetentionPeriod",
+/// member="RetentionPeriodValue") — "The supported retention periods are: EBS volumes:
+/// 1 - 7 days".
+pub const MAX_RETENTION_DAYS_EBS_VOLUME: i32 = 7;
+
+/// The longest retention period, in days, Recycle Bin retains a deleted EBS SNAPSHOT or
+/// EBS-backed AMI for.
+///
+/// Source: the same member documentation — "EBS snapshots and EBS-backed AMIs: 1 - 365
+/// days".
+pub const MAX_RETENTION_DAYS_SNAPSHOT_OR_IMAGE: i32 = 365;
+
+/// The longest retention period, in days, the service retains `resource_type` for — the
+/// per-type bound the member's own documentation publishes, which is tighter than the
+/// `@range` the model declares (that range is the union over every type, so it admits a
+/// period no single type supports).
+///
+/// `None` for a resource type this catalog does not name, which leaves such a type held
+/// to the modelled range alone rather than to a bound nothing publishes.
+pub fn max_retention_period_days(resource_type: &str) -> Option<i32> {
+    match resource_type {
+        RESOURCE_TYPE_EBS_VOLUME => Some(MAX_RETENTION_DAYS_EBS_VOLUME),
+        RESOURCE_TYPE_EBS_SNAPSHOT | RESOURCE_TYPE_EC2_IMAGE => {
+            Some(MAX_RETENTION_DAYS_SNAPSHOT_OR_IMAGE)
+        }
+        _ => None,
+    }
+}
+
+/// The modelled 400 for a retention period longer than the resource type it would be
+/// retained for supports, or `None` when the period is one that type supports.
+///
+/// `RetentionPeriodUnit` models `DAYS` alone — "Currently, only `DAYS` is supported" — so
+/// the period's value IS its length in days and is read against the per-type maximum
+/// directly. The clause is worded the way a range the boundary validator refuses is
+/// worded, so a caller reads one form whichever bound a period failed, and it names the
+/// bound rather than echoing the value the request sent.
+///
+/// Every door onto a rule's retention period goes through this: `CreateRule`, where the
+/// type is the one the request names, and `UpdateRule`, where it is the stored one (the
+/// type cannot be updated), so no sequence of calls leaves a rule holding a period the
+/// service could not retain.
+pub fn retention_period_unsupported(
+    resource_type: &str,
+    retention_period: &RetentionPeriod,
+) -> Option<ValidationException> {
+    let max = max_retention_period_days(resource_type)?;
+    if retention_period.retention_period_value <= max {
+        return None;
+    }
+    Some(member_validation_failed(
+        RETENTION_PERIOD_VALUE_MEMBER,
+        &format!("Member must have value less than or equal to {max}"),
+    ))
+}
+
 /// The modelled 409 for a lock, modify or delete the rule's own state forbids.
 ///
 /// Composed from the identifier the request addressed and the condition that blocks it,

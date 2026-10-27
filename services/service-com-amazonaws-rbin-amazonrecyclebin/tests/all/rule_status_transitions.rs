@@ -27,7 +27,8 @@ use serde_json::{json, Value};
 
 use crate::resource_tags::list_tags;
 use crate::retention_rule_lifecycle::{
-    create_rule, get_rule, lock_configuration, retention, router, update_rule,
+    create_rule, get_rule, lock_configuration, retention, router, supported_retention,
+    supported_retention_max, update_rule,
 };
 use service_com_amazonaws_rbin_amazonrecyclebin::ops::types::RULE_STATUS_VALUES;
 use service_com_amazonaws_rbin_amazonrecyclebin::state::{
@@ -40,8 +41,9 @@ const RESOURCE_TYPES: [&str; 3] = ["EBS_SNAPSHOT", "EBS_VOLUME", "EC2_IMAGE"];
 
 /// Published bounds of `RetentionPeriod$RetentionPeriodValue`.
 /// Source: smithy_query(query="shape", shape="RetentionPeriod") — range {min: 1, max: 3650}.
+/// The upper bound a request is held to is the one its resource type publishes
+/// ([`supported_retention_max`]), the model's range being the union over the types.
 const RETENTION_VALUE_MIN: i64 = 1;
-const RETENTION_VALUE_MAX: i64 = 3650;
 
 /// Published bounds of `UnlockDelay$UnlockDelayValue`.
 /// Source: smithy_query(query="shape", shape="UnlockDelay") — range {min: 7, max: 30}.
@@ -92,11 +94,11 @@ fn create_bodies() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "region-level volume rule at the maximum retention period",
+            "region-level volume rule at the maximum retention period its type supports",
             json!({
                 "ResourceType": RESOURCE_TYPES[1],
-                "RetentionPeriod": retention(RETENTION_VALUE_MAX),
-                "Description": "keep volumes for ten years",
+                "RetentionPeriod": retention(supported_retention_max(RESOURCE_TYPES[1])),
+                "Description": "keep volumes as long as volumes can be kept",
             }),
         ),
         (
@@ -120,7 +122,7 @@ fn create_bodies() -> Vec<(&'static str, Value)> {
             "volume rule locked at creation",
             json!({
                 "ResourceType": RESOURCE_TYPES[1],
-                "RetentionPeriod": retention(366),
+                "RetentionPeriod": retention(supported_retention(RESOURCE_TYPES[1], 5)),
                 "LockConfiguration": lock_configuration(UNLOCK_DELAY_MIN),
             }),
         ),
@@ -228,8 +230,8 @@ async fn update_rule_returns_the_rule_to_pending_until_the_clock_settles_it_agai
             json!({ "RetentionPeriod": retention(RETENTION_VALUE_MIN) }),
         ),
         (
-            "retention period at the maximum",
-            json!({ "RetentionPeriod": retention(RETENTION_VALUE_MAX) }),
+            "retention period at the maximum its type supports",
+            json!({ "RetentionPeriod": retention(supported_retention_max(RESOURCE_TYPES[0])) }),
         ),
         ("description only", json!({ "Description": "renamed" })),
         (

@@ -31,8 +31,30 @@ pub(crate) const RESOURCE_TYPES: [&str; 3] = ["EBS_SNAPSHOT", "EBS_VOLUME", "EC2
 
 /// Published bounds of `RetentionPeriod$RetentionPeriodValue`.
 /// Source: smithy_query(query="shape", shape="RetentionPeriod") — range {min: 1, max: 3650}.
+///
+/// The range is the UNION over the resource types, so a value inside it can still be one
+/// the requested type does not support; the per-type maximum is
+/// [`supported_retention_max`], and `tests/all/retention_period_resource_type_bounds.rs`
+/// owns the rule that reads one off the other.
 pub(crate) const RETENTION_VALUE_MIN: i64 = 1;
 pub(crate) const RETENTION_VALUE_MAX: i64 = 3650;
+
+/// The longest retention period, in days, `resource_type` supports — the bound the
+/// member's own documentation publishes per type, as the service applies it.
+pub(crate) fn supported_retention_max(resource_type: &str) -> i64 {
+    let max = service_com_amazonaws_rbin_amazonrecyclebin::state::max_retention_period_days(
+        resource_type,
+    );
+    i64::from(
+        max.unwrap_or_else(|| panic!("resource type {resource_type:?} publishes no maximum")),
+    )
+}
+
+/// A retention period `resource_type` supports, varying with `nth` so a run of rules does
+/// not all carry the same period.
+pub(crate) fn supported_retention(resource_type: &str, nth: usize) -> i64 {
+    RETENTION_VALUE_MIN + (nth as i64 % supported_retention_max(resource_type))
+}
 
 /// Published bounds of `UnlockDelay$UnlockDelayValue`.
 /// Source: smithy_query(query="shape", shape="UnlockDelay") — range {min: 7, max: 30}.
@@ -182,11 +204,11 @@ fn create_cases() -> Vec<CreateCase> {
             }),
         },
         CreateCase {
-            case: "region-level rule at the maximum retention period",
+            case: "region-level rule at the maximum retention period its type supports",
             body: serde_json::json!({
                 "ResourceType": "EBS_VOLUME",
-                "RetentionPeriod": retention(RETENTION_VALUE_MAX),
-                "Description": "keep volumes for ten years",
+                "RetentionPeriod": retention(supported_retention_max("EBS_VOLUME")),
+                "Description": "keep volumes as long as volumes can be kept",
             }),
         },
         CreateCase {
@@ -214,7 +236,7 @@ fn create_cases() -> Vec<CreateCase> {
             case: "locked rule at the minimum unlock delay",
             body: serde_json::json!({
                 "ResourceType": "EBS_VOLUME",
-                "RetentionPeriod": retention(366),
+                "RetentionPeriod": retention(supported_retention("EBS_VOLUME", 5)),
                 "LockConfiguration": lock_configuration(UNLOCK_DELAY_MIN),
             }),
         },
@@ -225,7 +247,7 @@ fn create_cases() -> Vec<CreateCase> {
             case: "plain rule, one per modelled resource type",
             body: serde_json::json!({
                 "ResourceType": resource_type,
-                "RetentionPeriod": retention(30),
+                "RetentionPeriod": retention(supported_retention(resource_type, 30)),
             }),
         });
     }
@@ -355,11 +377,12 @@ async fn every_created_rule_gets_its_own_identifier_and_arn() {
     let mut arns = std::collections::BTreeSet::new();
     for index in 0..25 {
         let case = format!("create #{index}");
+        let resource_type = RESOURCE_TYPES[index % RESOURCE_TYPES.len()];
         let (status, created) = create_rule(
             &router,
             serde_json::json!({
-                "ResourceType": RESOURCE_TYPES[index % RESOURCE_TYPES.len()],
-                "RetentionPeriod": retention(1 + (index as i64)),
+                "ResourceType": resource_type,
+                "RetentionPeriod": retention(supported_retention(resource_type, index)),
             }),
         )
         .await;
@@ -384,18 +407,25 @@ async fn every_created_rule_gets_its_own_identifier_and_arn() {
 #[tokio::test]
 async fn retention_period_is_refused_outside_its_published_range() {
     let router = router();
-    // Each published bound is accepted, and the value just past it is refused.
-    let rows: [(&str, i64, u16); 4] = [
+    // Each published bound is accepted, and the value just past it is refused. The upper
+    // bound a request is held to is the one its resource type publishes — the model's own
+    // range endpoint is the union over the types, so no type accepts it — and
+    // `tests/all/retention_period_resource_type_bounds.rs` asserts that coupling over
+    // every type.
+    let resource_type = "EBS_SNAPSHOT";
+    let supported_max = supported_retention_max(resource_type);
+    let rows: [(&str, i64, u16); 5] = [
         ("minimum bound", RETENTION_VALUE_MIN, 201),
-        ("maximum bound", RETENTION_VALUE_MAX, 201),
+        ("maximum bound for this resource type", supported_max, 201),
         ("one below the minimum", RETENTION_VALUE_MIN - 1, 400),
-        ("one above the maximum", RETENTION_VALUE_MAX + 1, 400),
+        ("one above this resource type's maximum", supported_max + 1, 400),
+        ("one above the model's own range", RETENTION_VALUE_MAX + 1, 400),
     ];
     for (case, value, expected) in rows {
         let (status, body) = create_rule(
             &router,
             serde_json::json!({
-                "ResourceType": "EBS_SNAPSHOT",
+                "ResourceType": resource_type,
                 "RetentionPeriod": retention(value),
             }),
         )
@@ -446,7 +476,7 @@ async fn list_rules_reports_only_the_rules_of_the_requested_type() {
                 &router,
                 serde_json::json!({
                     "ResourceType": resource_type,
-                    "RetentionPeriod": retention(10 + nth),
+                    "RetentionPeriod": retention(supported_retention(resource_type, 10 + nth as usize)),
                 }),
             )
             .await;
@@ -644,7 +674,10 @@ async fn update_rule_applies_only_the_supplied_members_and_persists_them() {
         ),
         (
             "retention period and description together",
-            serde_json::json!({ "RetentionPeriod": retention(3650), "Description": "both" }),
+            serde_json::json!({
+                "RetentionPeriod": retention(supported_retention_max("EBS_SNAPSHOT")),
+                "Description": "both",
+            }),
         ),
         ("nothing at all", serde_json::json!({})),
         (
@@ -833,11 +866,12 @@ async fn create_rule_is_refused_once_the_region_holds_its_quota_of_rules() {
     let router = router();
     // Fill the Region to its quota; every one of these must be accepted.
     for nth in 0..MAX_RULES {
+        let resource_type = RESOURCE_TYPES[nth % RESOURCE_TYPES.len()];
         let (status, body) = create_rule(
             &router,
             serde_json::json!({
-                "ResourceType": RESOURCE_TYPES[nth % RESOURCE_TYPES.len()],
-                "RetentionPeriod": retention(1 + (nth as i64 % RETENTION_VALUE_MAX)),
+                "ResourceType": resource_type,
+                "RetentionPeriod": retention(supported_retention(resource_type, nth)),
             }),
         )
         .await;

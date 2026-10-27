@@ -213,10 +213,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that still holds a subordinate entity is NOT deleted, and the caller is told
         // with the modelled `DeleteConflictException` ("attempted to delete a resource
         // that has attached subordinate entities") so nothing is removed behind its
-        // back. A membership `AddUserToGroup` wrote is such an entity, and so is an
-        // inline policy `PutGroupPolicy` embedded; a managed-policy attachment
-        // (`AttachGroupPolicy`) is still scaffolded and so persists nothing, and the
-        // check for it belongs with the operation that first writes one.
+        // back. A membership `AddUserToGroup` wrote is such an entity, and so are an
+        // inline policy `PutGroupPolicy` embedded and a managed policy
+        // `AttachGroupPolicy` attached. Each kind names its own remedy, because they are
+        // removed by different operations: a member is REMOVED (`RemoveUserFromGroup`),
+        // an inline policy is DELETED (`DeleteGroupPolicy`) and an attachment is
+        // DETACHED (`DetachGroupPolicy`), so the caller can tell from the message which
+        // call it has to make. The two policy kinds are reported in the order
+        // `crate::ops::delete_user` reports the same two, so a group and a user carrying
+        // both are refused alike.
         let holds_users = store
             .group_members
             .get(&key)
@@ -243,12 +248,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        let carries_attachments = store
+            .group_attached_policies
+            .get(&key)
+            .is_some_and(|attached| !attached.is_empty());
+        if carries_attachments {
+            return Err(DeleteGroupErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some(
+                        "Cannot delete entity, must detach all policies first.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
 
         store.groups.remove(&key);
-        // The group embedded no policy and held no member, so this only drops empty
-        // leftover entries: a later group of the same name must not look as though it
-        // inherited either.
+        // The group embedded and carried no policy and held no member, so this only
+        // drops empty leftover entries: a later group of the same name must not look as
+        // though it inherited any of them.
         store.group_inline_policies.remove(&key);
+        store.group_attached_policies.remove(&key);
         store.group_members.remove(&key);
 
         // Audit record for the change: the acting principal, the operation and what it

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutTenantSuppressionAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutTenantSuppressionAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutTenantSuppressionAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes one tenant's suppression-list preferences: the reasons an address is added
+//! to the tenant's list automatically, and whether the tenant keeps its own list or
+//! uses the account-level one. The preferences the request states replace the stored
+//! pair wholesale, so a member it omits takes its documented default; what was
+//! persisted is read back with `GetTenant`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +147,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutTenantSuppressionAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutTenantSuppressionAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutTenantSuppressionAttributes"))
+        // Request metadata selects nothing: the tenant is keyed by name within the one
+        // emulated account, and the preferences carry no region-dependent value.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutTenantSuppressionAttributes without the shared emulator state",
+            ));
+        };
+
+        let name = input.tenant_name;
+        // The model binds only `length 1..` on `TenantName`; the documented form is the
+        // handler's to enforce, with the `BadRequestException` the model binds for "the
+        // input you provided is invalid" — the same check every operation that names a
+        // tenant makes.
+        if !crate::state::tenant_name_is_well_formed(&name) {
+            return Err(bad_request(crate::state::invalid_tenant_name(&name)));
+        }
+
+        // Both members are resolved — and any value outside the modelled set refused —
+        // before the store is touched, so a refused request leaves the tenant's
+        // preferences exactly as they were.
+        let (suppressed_reasons, suppression_scope) = crate::state::tenant_suppression_preferences(
+            input.suppressed_reasons,
+            input.suppression_scope,
+        )
+        .map_err(bad_request)?;
+
+        let mut store = state.lock();
+        let Some(record) = store.tenants.get_mut(&name) else {
+            return Err(
+                PutTenantSuppressionAttributesErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::tenant_not_found(&name)),
+                })
+                .into(),
+            );
+        };
+        record.set_suppression_preferences(suppressed_reasons, suppression_scope);
+
+        // `PutTenantSuppressionAttributesResponse` carries no members: what was
+        // persisted is read back with `GetTenant`.
+        Ok(PutTenantSuppressionAttributesOutput {})
     }
+}
+
+/// This operation's input error, carrying `message`.
+///
+/// The wording comes from the service's shared refusals, so every operation that
+/// names a tenant or one of these enums refuses the same condition the same way.
+fn bad_request(message: String) -> PutTenantSuppressionAttributesError {
+    PutTenantSuppressionAttributesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
 }

@@ -895,9 +895,6 @@ fn write_alarm(
             // still reports the state it left behind, and the first evaluation against
             // the stored metric data becomes due at its end.
             evaluation_due_secs: now + crate::state::alarm_evaluation::EVALUATION_DELAY_SECS,
-            // A configuration write leaves the alarm reporting its own evaluated state: it
-            // is not holding one a caller forced.
-            forced_state_until_secs: None,
         },
     );
     store.record_history(

@@ -65,6 +65,8 @@ mod data_catalog;
 mod data_catalog_encryption_settings;
 #[path = "all/data_quality_rule_recommendation_runs.rs"]
 mod data_quality_rule_recommendation_runs;
+#[path = "all/database_listing.rs"]
+mod database_listing;
 #[path = "all/error_messages.rs"]
 mod error_messages;
 #[path = "all/etl_connections.rs"]
