@@ -54,7 +54,8 @@
 //! having to remember to.
 //!
 //! A cluster's configuration also changes after creation: an update operation
-//! (`UpdateConnectivity`, `UpdateStorage`, `UpdateBrokerStorage`) records a
+//! (`UpdateConnectivity`, `UpdateStorage`, `UpdateBrokerStorage`,
+//! `UpdateClusterKafkaVersion`) records a
 //! [`PendingUpdate`] on the cluster, and [`Cluster::settle`] folds it into the
 //! record once the clock owes its completion — so one place decides what every
 //! reader then reports. The operation itself is kept in the cluster-operation
@@ -183,6 +184,10 @@ pub const OPERATION_TYPE_UPDATE_BROKER_STORAGE: &str = "UPDATE_BROKER_STORAGE";
 
 /// The `OperationType` an `UpdateConnectivity` call records, in the same form.
 pub const OPERATION_TYPE_UPDATE_CONNECTIVITY: &str = "UPDATE_CONNECTIVITY";
+
+/// The `OperationType` an `UpdateClusterKafkaVersion` call records, in the same
+/// form.
+pub const OPERATION_TYPE_UPDATE_CLUSTER_KAFKA_VERSION: &str = "UPDATE_CLUSTER_KAFKA_VERSION";
 
 /// The state MSK reports for a cluster operation that is still running.
 pub const OPERATION_STATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
@@ -1102,6 +1107,13 @@ pub enum ClusterChange {
     /// `UpdateBrokerType`: the EC2 instance type every broker of the cluster
     /// runs on.
     BrokerType { instance_type: String },
+    /// `UpdateClusterKafkaVersion`: the Apache Kafka version the brokers run,
+    /// and the custom configuration to apply on that new version when the
+    /// request named one — `None` leaves the cluster's configuration as it is.
+    KafkaVersion {
+        kafka_version: String,
+        configuration_info: Option<ConfigurationInfo>,
+    },
 }
 
 /// The storage attributes one update call asked to change. A member left `None`
@@ -1317,6 +1329,21 @@ pub fn configuration_arn_not_found() -> BadRequestException {
         invalid_parameter: Some("Arn".to_string()),
         message: Some(CONFIGURATION_ARN_NOT_FOUND_MESSAGE.to_string()),
     }
+}
+
+/// How a request naming a revision a stored configuration does not hold is
+/// described: the configuration it named, and the revision number that resolves
+/// to nothing in it.
+///
+/// One wording, built here, so every operation that resolves a configuration
+/// REVISION — the revision reader and the cluster updates that apply a
+/// configuration to a cluster — says the same thing about that condition. Each
+/// reports it in the envelope its own resource class answers with: the reader,
+/// whose `Revision` is the resource it was asked for, as a not-found; a cluster
+/// update, whose resource is the cluster and whose configuration reference is a
+/// request member, as a bad request.
+pub fn configuration_revision_missing_message(arn: &str, revision: i64) -> String {
+    format!("Configuration {arn} has no revision {revision}")
 }
 
 /// How this emulator refuses a delete of a configuration a cluster still uses:
@@ -3029,6 +3056,43 @@ impl ComAmazonawsKafkaKafkaState {
         )
     }
 
+    /// Start an Apache Kafka version update: the brokers move to
+    /// `kafka_version`, together with the custom configuration the request
+    /// named for that version, once the clock owes the operation its
+    /// completion.
+    pub fn start_kafka_version_update(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+        kafka_version: String,
+        configuration_info: Option<ConfigurationInfo>,
+    ) -> Option<String> {
+        self.start_cluster_update(
+            region,
+            arn,
+            now,
+            OPERATION_TYPE_UPDATE_CLUSTER_KAFKA_VERSION,
+            |cluster| {
+                let source_cluster_info = cluster.kafka_version_cluster_info();
+                let target_cluster_info = kafka_version_cluster_info(
+                    &kafka_version,
+                    configuration_info
+                        .clone()
+                        .or_else(|| cluster.configuration_info.clone()),
+                );
+                (
+                    source_cluster_info,
+                    target_cluster_info,
+                    ClusterChange::KafkaVersion {
+                        kafka_version,
+                        configuration_info,
+                    },
+                )
+            },
+        )
+    }
+
     /// Start a connectivity update: the broker access configuration, the
     /// ZooKeeper access setting, or both, as the request named them.
     pub fn start_connectivity_update(
@@ -4657,6 +4721,14 @@ impl Cluster {
         broker_type_cluster_info(&self.broker_node_group_info.instance_type)
     }
 
+    /// The Apache Kafka version the brokers run and the configuration revision
+    /// they run it with, as the `MutableClusterInfo` a cluster operation
+    /// reports: the attributes an `UpdateClusterKafkaVersion` call changes, and
+    /// only those — the same rule [`Self::storage_cluster_info`] follows.
+    pub fn kafka_version_cluster_info(&self) -> MutableClusterInfo {
+        kafka_version_cluster_info(&self.kafka_version, self.configuration_info.clone())
+    }
+
     /// The cluster's broker access configuration and ZooKeeper access setting
     /// as the `MutableClusterInfo` a cluster operation reports: the attributes
     /// an `UpdateConnectivity` call changes, and only those — the same rule
@@ -4735,6 +4807,20 @@ impl Cluster {
                 // named, which is what `BrokerNodeGroupInfo$InstanceType` is: the
                 // type of the group's nodes, not of one node.
                 self.broker_node_group_info.instance_type = instance_type;
+            }
+            ClusterChange::KafkaVersion {
+                kafka_version,
+                configuration_info,
+            } => {
+                // The brokers now run the target version, which is what every
+                // reader derives `BrokerSoftwareInfo$KafkaVersion` from.
+                self.kafka_version = kafka_version;
+                // A custom configuration is applied ON the new version, so a
+                // request that named one leaves the cluster running it; one that
+                // named none keeps the configuration the cluster already had.
+                if let Some(info) = configuration_info {
+                    self.configuration_info = Some(info);
+                }
             }
         }
     }
@@ -5173,6 +5259,23 @@ fn storage_cluster_info(
 fn broker_type_cluster_info(instance_type: &str) -> MutableClusterInfo {
     MutableClusterInfo {
         instance_type: Some(instance_type.to_string()),
+        ..MutableClusterInfo::default()
+    }
+}
+
+/// The software attributes a cluster operation reports, as `MutableClusterInfo`:
+/// the Apache Kafka version the brokers run and the configuration revision they
+/// run it with.
+///
+/// Those are what an Apache Kafka version update touches, so they are the only
+/// members set — the same rule [`storage_cluster_info`] follows.
+fn kafka_version_cluster_info(
+    kafka_version: &str,
+    configuration_info: Option<ConfigurationInfo>,
+) -> MutableClusterInfo {
+    MutableClusterInfo {
+        kafka_version: Some(kafka_version.to_string()),
+        configuration_info,
         ..MutableClusterInfo::default()
     }
 }
