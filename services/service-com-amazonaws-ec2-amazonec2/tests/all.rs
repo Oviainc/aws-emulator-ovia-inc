@@ -414,6 +414,8 @@ mod security_groups;
 mod snapshot_block_public_access;
 #[path = "all/spot_datafeed_subscription.rs"]
 mod spot_datafeed_subscription;
+#[path = "all/spot_fleet_requests.rs"]
+mod spot_fleet_requests;
 #[path = "all/spot_instance_requests.rs"]
 mod spot_instance_requests;
 #[path = "all/spot_placement_scores.rs"]

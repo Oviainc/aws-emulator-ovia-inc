@@ -14,11 +14,12 @@
 //! The marker STAYS here, and deliberately: this operation's success response is the
 //! extraction itself (`semanticModality` and the `outputSegments` read out of the
 //! submitted asset), which is model inference the emulator cannot perform and must not
-//! synthesise. What IS enforced is the one thing that does not need inference — the
-//! cross-member request rule this service shares with `InvokeDataAutomationAsync`: a
-//! submission must name EXACTLY one of a data-automation project or an inline blueprint,
-//! and one naming neither or both is refused with the modelled `ValidationException`
-//! (HTTP 400) rather than the 501, because a malformed request is a client error, not
+//! synthesise. What IS enforced is everything that does not need inference — the request
+//! rules this service shares with `InvokeDataAutomationAsync`: a submission must name
+//! EXACTLY one of a data-automation project or an inline blueprint, and the resource it
+//! names must RESOLVE against the build-time service that owns it. A submission failing
+//! either rule is refused with the modelled `ValidationException` (HTTP 400) rather than
+//! the 501, because a request no implementation could accept is a client error, not
 //! unwritten code.
 //!
 //! ## Shape of an operation
@@ -170,8 +171,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Neither is needed to refuse a malformed submission.
-        let _ = (ctx, &self.engine);
+        // request metadata.
+        let _ = ctx;
 
         // A submission has to say WHAT to extract, in exactly one of two members: a
         // data-automation project or an inline `blueprints` list. The model marks both
@@ -182,6 +183,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::extraction_target_refusal`, which the asynchronous
         // `InvokeDataAutomationAsync` calls too.
         if let Some(message) = crate::state::extraction_target_refusal(
+            input.data_automation_configuration.as_ref(),
+            input.blueprints.as_deref(),
+        ) {
+            return Err(InvokeDataAutomationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The resources the submission REFERENCES are resolved against the build-time
+        // service that owns them, on the same footing and for the same reason: a project
+        // or blueprint that resolves to nothing describes no extraction, whichever invoke
+        // operation was asked for it.
+        if let Some(message) = crate::state::unresolved_reference_refusal(
+            &*self.engine,
             input.data_automation_configuration.as_ref(),
             input.blueprints.as_deref(),
         ) {

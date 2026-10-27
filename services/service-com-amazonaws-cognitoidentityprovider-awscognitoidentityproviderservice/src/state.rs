@@ -470,6 +470,9 @@ pub const REPLICA_STATUS_ACTIVE: &str = "ACTIVE";
 /// (`UserPoolReplicaType.Status`).
 pub const REPLICA_STATUS_INACTIVE: &str = "INACTIVE";
 
+/// "`DELETING`: The replica is being deleted" (`UserPoolReplicaType.Status`).
+pub const REPLICA_STATUS_DELETING: &str = "DELETING";
+
 /// "`PRIMARY`: The primary replica supports all end user and administrator
 /// operations" (`UserPoolReplicaType.Role`): the role the pool holds in the
 /// Region it was created in.
@@ -481,7 +484,7 @@ pub const REPLICA_ROLE_PRIMARY: &str = "PRIMARY";
 pub const REPLICA_ROLE_SECONDARY: &str = "SECONDARY";
 
 /// How long a created secondary replica stays `CREATING` before the clock owes
-/// it `ACTIVE`.
+/// it the status it settles into.
 ///
 /// A chosen span, not a documented duration: the model gives a replica that
 /// "is being created" its own status without saying how long creating takes, so
@@ -491,11 +494,46 @@ pub const REPLICA_ROLE_SECONDARY: &str = "SECONDARY";
 /// `CREATING`.
 pub const REPLICA_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
 
+/// How long a deleted replica stays [`REPLICA_STATUS_DELETING`] before the
+/// clock owes its removal. A chosen span, on the same grounds as
+/// [`REPLICA_ACTIVATION_SPAN`]: `DELETING` means "The replica is being
+/// deleted", so the replica is still reported, as `DELETING`, right after the
+/// call.
+pub const REPLICA_DELETION_SPAN: Duration = Duration::from_millis(500);
+
 /// The feature a tier refusal names for a replica: replicating a user pool to
 /// another Region needs a feature plan other than [`LITE_USER_POOL_TIER`], and
 /// a refusal reports it through [`feature_unavailable_in_tier_message`] the way
 /// every other tier refusal does.
 pub const REPLICATION_FEATURE: &str = "Multi-Region user pool replication";
+
+/// How much of a caller-supplied value a refusal message echoes before it
+/// elides: the bound the framework's own constraint messages use, so a long
+/// submitted value cannot amplify a small request into a large response.
+const MAX_ECHOED_VALUE: usize = 256;
+
+/// `value` as a refusal message echoes it: itself when short, else a
+/// character-boundary-safe prefix of [`MAX_ECHOED_VALUE`] bytes with the
+/// elision the framework's constraint messages render — `<prefix>... [<n>
+/// bytes]` — so a refusal this service states by hand reads exactly like one
+/// the framework stated for the same value. Rendering only: the caller checks
+/// the ORIGINAL value, because eliding before a check would compare text the
+/// caller never sent.
+#[must_use]
+pub fn echoed_value(value: &str) -> String {
+    if value.len() <= MAX_ECHOED_VALUE {
+        return value.to_string();
+    }
+    let mut end = MAX_ECHOED_VALUE;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}... [{} bytes]",
+        value.get(..end).unwrap_or_default(),
+        value.len()
+    )
+}
 
 // ---------------------------------------------------------------------------
 // User import jobs
@@ -2343,11 +2381,17 @@ impl UserPool {
         }
     }
 
-    /// Every Region this pool holds a replica in, ASCENDING: its own Region,
-    /// where the primary lives, beside every secondary a create added. The
-    /// stable order a page token indexes into.
-    pub fn replica_regions(&self) -> Vec<String> {
-        let mut regions: Vec<String> = self.replicas.keys().cloned().collect();
+    /// Every Region this pool holds a replica in as of `now`, ASCENDING: its
+    /// own Region, where the primary lives, beside every secondary a create
+    /// added and a delete has not finished removing. The stable order a page
+    /// token indexes into.
+    pub fn replica_regions(&self, now: SystemTime) -> Vec<String> {
+        let mut regions: Vec<String> = self
+            .replicas
+            .values()
+            .filter(|replica| !replica.removed(now))
+            .map(|replica| replica.region_name.clone())
+            .collect();
         regions.push(self.region.clone());
         regions.sort();
         regions.dedup();
@@ -2355,12 +2399,30 @@ impl UserPool {
     }
 
     /// The modelled view of this pool's replica in `region` as of `now`, or
-    /// `None` when the pool holds none there.
+    /// `None` when the pool holds none there. A secondary replica whose
+    /// deletion the clock has finished is gone, whether or not anything has
+    /// pruned it from the store yet.
     pub fn to_replica_in(&self, region: &str, now: SystemTime) -> Option<UserPoolReplicaType> {
-        if let Some(replica) = self.replicas.get(region) {
+        if let Some(replica) = self.live_replica(region, now) {
             return Some(replica.to_user_pool_replica_type(now));
         }
         (region == self.region).then(|| self.to_primary_replica())
+    }
+
+    /// The stored SECONDARY replica in `region`, unless the clock has already
+    /// made its removal due.
+    pub fn live_replica(&self, region: &str, now: SystemTime) -> Option<&UserPoolReplica> {
+        self.replicas
+            .get(region)
+            .filter(|replica| !replica.removed(now))
+    }
+
+    /// Drop the replicas whose removal the clock has already made due, so a
+    /// later create can use the Region again. A write only an operation that
+    /// mutates this pool's replicas performs; a read computes the same
+    /// disappearance with [`UserPool::live_replica`] instead.
+    pub fn prune_removed_replicas(&mut self, now: SystemTime) {
+        self.replicas.retain(|_, replica| !replica.removed(now));
     }
 
     /// The modelled view of this pool, rendered from what is stored.
@@ -2414,7 +2476,7 @@ impl UserPool {
     /// pool", `UserPoolDescriptionType`). Every member it shares with
     /// [`UserPool::to_user_pool_type`] renders the same stored value, so a
     /// listing entry and a read of the one pool never disagree.
-    pub fn to_user_pool_description_type(&self) -> UserPoolDescriptionType {
+    pub fn to_user_pool_description_type(&self, now: SystemTime) -> UserPoolDescriptionType {
         UserPoolDescriptionType {
             id: Some(self.id.clone()),
             name: Some(self.name.clone()),
@@ -2428,8 +2490,13 @@ impl UserPool {
             // "A list of Amazon Web Services Regions where replicas of this
             // user pool exist": exactly the Regions `ListUserPoolReplicas`
             // reports a replica in, so the two readers never disagree. A pool
-            // nothing replicated reports none rather than its own Region alone.
-            replica_regions: (!self.replicas.is_empty()).then(|| self.replica_regions()),
+            // nothing replicated reports none rather than its own Region alone,
+            // and so does one whose only replica the clock has already removed.
+            replica_regions: self
+                .replicas
+                .values()
+                .any(|replica| !replica.removed(now))
+                .then(|| self.replica_regions(now)),
         }
     }
 }
@@ -2567,7 +2634,7 @@ pub struct UserPoolReplica {
     pub tags: HashMap<String, String>,
     /// When the replica was created.
     pub creation_date: SystemTime,
-    /// The instant the clock owes this replica's `CREATING` -> `ACTIVE` move.
+    /// The instant the clock owes this replica's `CREATING` -> `INACTIVE` move.
     /// Stored, never slept on: a read computes the status from it.
     pub active_at: SystemTime,
     /// The status an `UpdateUserPoolReplica` call last wrote, which SUPERSEDES
@@ -2575,6 +2642,10 @@ pub struct UserPoolReplica {
     /// status to activate or deactivate the replica", so the status it set is
     /// the status every later read reports. `None` until a call sets one.
     pub requested_status: Option<String>,
+    /// The instant the clock owes this replica's removal, once a delete has
+    /// started; until then the replica reports [`REPLICA_STATUS_DELETING`], and
+    /// from then on it is gone.
+    pub removal_due: Option<SystemTime>,
 }
 
 impl UserPoolReplica {
@@ -2593,21 +2664,41 @@ impl UserPoolReplica {
             creation_date: now,
             active_at: now + REPLICA_ACTIVATION_SPAN,
             requested_status: None,
+            removal_due: None,
         }
     }
 
-    /// This replica's `ReplicaStatusType` as of `now`: the status a call last
-    /// set, else `CREATING` until the clock has made its activation due and
-    /// `ACTIVE` from then on.
+    /// This replica's `ReplicaStatusType` as of `now`: `DELETING` once a delete
+    /// has started, else the status a call last set, else `CREATING` until the
+    /// clock has made its activation due and `INACTIVE` from then on — "The
+    /// replica has been created, but is not accepting requests for end-users"
+    /// (`UserPoolReplicaType.Status`), which `UpdateUserPoolReplica` is what
+    /// activates.
     pub fn status(&self, now: SystemTime) -> &str {
+        if self.removal_due.is_some() {
+            return REPLICA_STATUS_DELETING;
+        }
         if let Some(status) = &self.requested_status {
             return status;
         }
         if now >= self.active_at {
-            REPLICA_STATUS_ACTIVE
+            REPLICA_STATUS_INACTIVE
         } else {
             REPLICA_STATUS_CREATING
         }
+    }
+
+    /// Whether the clock has made this replica's removal due, which is when a
+    /// started deletion has finished.
+    pub fn removed(&self, now: SystemTime) -> bool {
+        self.removal_due.is_some_and(|due| now >= due)
+    }
+
+    /// Start this replica's deletion: it reports [`REPLICA_STATUS_DELETING`]
+    /// until the clock makes [`REPLICA_DELETION_SPAN`] elapse, and is gone from
+    /// then on.
+    pub fn start_deletion(&mut self, now: SystemTime) {
+        self.removal_due = Some(now + REPLICA_DELETION_SPAN);
     }
 
     /// The modelled view of this replica, rendered from what is stored.

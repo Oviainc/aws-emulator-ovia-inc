@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSpotFleetRequests
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSpotFleetRequests`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSpotFleetRequests::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Spot Fleet requests `RequestSpotFleet` stored in
+//! [`crate::state`], narrowed by `SpotFleetRequestIds` and cut into `MaxResults`-sized pages
+//! in `SpotFleetRequestId` order. It reports the ONE stored view of each fleet, so a request
+//! and a describe cannot describe one fleet differently. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +138,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSpotFleetRequests` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSpotFleetRequestsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSpotFleetRequests"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            MAX_PAGE_SIZE, MAX_RESOURCE_IDS, decode_page_token, encode_page_token,
+            invalid_pagination_token_for, invalid_spot_fleet_request_id_malformed,
+            invalid_spot_fleet_request_id_not_found, require_service_state,
+            spot_fleet_request_id_is_well_formed,
+        };
+
+        // `ctx` carries request metadata only; the store holds Spot Fleet requests per
+        // account, so the Region a request was signed for does not narrow them. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        let requested_ids = input.spot_fleet_request_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "SpotFleetRequestIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+        // Something that is not a Spot Fleet request id at all is refused BEFORE the store is
+        // read, so a caller can tell a typo from a fleet the account does not hold. The ids go
+        // into a SET, so narrowing one stored fleet is a logarithmic lookup rather than a scan
+        // of up to `MAX_RESOURCE_IDS` ids per fleet under the state lock.
+        let mut named_ids: ::std::collections::BTreeSet<&str> =
+            ::std::collections::BTreeSet::new();
+        for request_id in &requested_ids {
+            if !spot_fleet_request_id_is_well_formed(request_id) {
+                return Err(invalid_spot_fleet_request_id_malformed(request_id));
+            }
+            named_ids.insert(request_id.as_str());
+        }
+
+        // "The maximum number of items to return for this request"
+        // (`DescribeSpotFleetRequestsRequest$MaxResults`) carries no modelled `@range`, so the
+        // handler is the only place a page size can be bounded — and an unbounded one is how a
+        // caller asks for the whole store in one answer.
+        if input.max_results.is_some_and(|max_results| max_results < 1) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for maxResults. It must be at least 1",
+                input.max_results.unwrap_or_default()
+            )));
+        }
+        if input
+            .max_results
+            .is_some_and(|max_results| usize::try_from(max_results).unwrap_or(0) > MAX_PAGE_SIZE)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for maxResults. It must be at most {MAX_PAGE_SIZE}",
+                input.max_results.unwrap_or_default()
+            )));
+        }
+
+        // "The token to include in another request to get the next page of items"
+        // (`$NextToken`) — anything else is refused rather than read as an id.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // A reporting operation may materialise the moves the CLOCK already owed — a
+        // `submitted` fleet's `active`, and the capacity its Spot Instance requests have
+        // fulfilled by now — because each was due at this instant whether or not anybody
+        // called, so applying them changes nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // "The IDs of the Spot Fleet requests" names fleets to report, so a well-formed id no
+        // fleet of the account has is an error rather than an absent row — the answer this
+        // service gives for every named-resource describe.
+        if let Some(unknown) = requested_ids
+            .iter()
+            .find(|request_id| !store.spot_fleet_requests.contains_key(request_id.as_str()))
+        {
+            return Err(invalid_spot_fleet_request_id_not_found(unknown));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named fleet resolved:
+        // the flag asks whether the request WOULD have succeeded, so one that would have been
+        // refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let selected: Vec<SpotFleetRequestConfig> = store
+            .spot_fleet_requests
+            .values()
+            .filter(|record| {
+                named_ids.is_empty() || named_ids.contains(record.spot_fleet_request_id())
+            })
+            .map(|record| record.view.clone())
+            .collect();
+
+        // The store is an ordered map, so its iteration order is already
+        // `SpotFleetRequestId` order — the order the cursor below names a position in.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|fleet| {
+                fleet.spot_fleet_request_id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this service serves, so the
+        // `NextToken` path behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // A token only when a fleet follows this page: "this value is `null` when there are no
+        // more items to return" (`DescribeSpotFleetRequestsResponse$NextToken`).
+        let next_token = page
+            .get(limit)
+            .and_then(|fleet| fleet.spot_fleet_request_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeSpotFleetRequestsOutput {
+            spot_fleet_request_configs: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
 }
