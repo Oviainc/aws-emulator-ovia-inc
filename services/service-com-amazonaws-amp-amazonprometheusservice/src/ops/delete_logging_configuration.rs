@@ -236,8 +236,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removal is owed at. The record's own `DELETING` status is that evidence, so no
         // token has to be remembered to recognise the replay.
         if logging.status_code == crate::state::LOGGING_STATUS_DELETING {
-            drop(guard);
-            crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
+            // The replay writes nothing, so it records nothing: the audit seam records a
+            // call that CHANGED this service's state (see
+            // [`crate::state::record_state_change`]), and the record this call would
+            // name is the one the first delete already left.
             return Ok(DeleteLoggingConfigurationOutput);
         }
 
@@ -278,9 +280,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         logging.update_token = None;
         drop(guard);
 
-        // The call changed stored state (or replayed the call that did), so it leaves an
-        // access record naming the operation, the resource and the key id the request
-        // presented — see `crate::state::record_state_change`.
+        // The call changed stored state, so it leaves an access record naming the
+        // operation, the resource and the key id the request presented — see
+        // `crate::state::record_state_change`.
         crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
 
         Ok(DeleteLoggingConfigurationOutput)

@@ -372,11 +372,12 @@ async fn a_request_naming_no_stored_monitor_is_not_found() {
     )
     .await;
 
-    // The rule generalises over the operation and over how the monitor is named: by
-    // name for the control plane, by minted id for the data plane. Every row names
-    // something no stored monitor is.
-    let unknown_id = "00000000-0000-4000-8000-000000000000";
-    let rows: [(&str, &str, &str, Option<Value>); 4] = [
+    // The rule generalises over the operation: every CONTROL-PLANE call that resolves a
+    // monitor by name answers a name no stored monitor holds the same way. The data
+    // plane's `PutRumEvents` is not a row here — it is authorized against the monitor its
+    // `Id` names, so an id resolving to nothing is an authorization failure rather than a
+    // missing resource (`put_rum_events_unresolvable_id`).
+    let rows: [(&str, &str, &str, Option<Value>); 3] = [
         ("GetAppMonitor", "GET", "/appmonitor/absent", None),
         (
             "UpdateAppMonitor",
@@ -385,12 +386,6 @@ async fn a_request_naming_no_stored_monitor_is_not_found() {
             Some(json!({"Domain": "other.example.com"})),
         ),
         ("DeleteAppMonitor", "DELETE", "/appmonitor/absent", None),
-        (
-            "PutRumEvents",
-            "POST",
-            "/appmonitors/00000000-0000-4000-8000-000000000000/",
-            Some(rum_events_body(unknown_id)),
-        ),
     ];
     for (case, method, path, body) in rows {
         let reply = call(&router, method, path, body).await;
@@ -730,20 +725,14 @@ async fn deleting_a_monitor_removes_it_from_every_index() {
         String::from_utf8_lossy(&reply.body)
     );
 
-    // Gone from the name index, from the id index, and with it the stored events.
-    let rows: [(&str, &str, String, Option<Value>); 3] = [
+    // Gone from the name index: every control-plane call naming it is a 404.
+    let rows: [(&str, &str, String, Option<Value>); 2] = [
         ("GetAppMonitor", "GET", format!("/appmonitor/{name}"), None),
         (
             "DeleteAppMonitor again",
             "DELETE",
             format!("/appmonitor/{name}"),
             None,
-        ),
-        (
-            "PutRumEvents with the old id",
-            "POST",
-            format!("/appmonitors/{id}/"),
-            Some(rum_events_body(&id)),
         ),
     ];
     for (case, method, path, body) in rows {
@@ -761,6 +750,28 @@ async fn deleting_a_monitor_removes_it_from_every_index() {
             String::from_utf8_lossy(&reply.body)
         );
     }
+
+    // Gone from the id index too, and with it the stored events: the data plane refuses
+    // the retired id, as an authorization failure rather than as a missing resource.
+    let retired = call(
+        &router,
+        "POST",
+        &format!("/appmonitors/{id}/"),
+        Some(rum_events_body(&id)),
+    )
+    .await;
+    assert_eq!(
+        retired.status, 403,
+        "case \"PutRumEvents with the old id\": expected HTTP 403, got {} {:?}",
+        retired.status,
+        String::from_utf8_lossy(&retired.body)
+    );
+    assert_eq!(
+        retired.error_code("PutRumEvents with the old id"),
+        "AccessDeniedException",
+        "case \"PutRumEvents with the old id\": expected AccessDeniedException, got {:?}",
+        String::from_utf8_lossy(&retired.body)
+    );
 
     {
         let state = engine.state::<ComAmazonawsRumRumState>();

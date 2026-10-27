@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the user the request names to a new name, a new path, or both, keeping the user
+//! it already is: "the user's unique identifier remains the same", so its `UserId`, its
+//! credentials, its policies, its group memberships and its console password travel with
+//! it, while the ARN — built from the path and the name — follows the new values. A name
+//! the account holds no user under is a `NoSuchEntityException`, and a new name the
+//! account already holds is an `EntityAlreadyExistsException`.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +188,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUser"))
+        // `ctx` carries request metadata only; nothing here depends on it — IAM is global
+        // and the user is named by the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateUserErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // One writer at a time: the read of the user, the conflict check on the new name
+        // and the move are one critical section, so two racing updates cannot both decide
+        // the name is free.
+        let mut store = state.lock();
+
+        // IAM entity names "are not distinguished by case", so the user is found under
+        // the case-folded name whatever case the request spelled it in; a name the account
+        // holds no user under "referenced a resource entity that does not exist".
+        let key = crate::state::name_key(&input.user_name);
+        let Some(held) = store.users.get(&key) else {
+            return Err(UpdateUserErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Include this parameter only if you're changing the user's name" / "… the
+        // user's path": a member the request leaves out changes nothing, so the user keeps
+        // the value it holds.
+        let user_name = input.new_user_name.unwrap_or_else(|| held.user_name.clone());
+        let path = input.new_path.unwrap_or_else(|| held.path.clone());
+
+        // "IAM user, group, role, and policy names must be unique within the account.
+        // Names are not distinguished by case" (`$NewUserName`): a new name the account
+        // already holds a DIFFERENT user under is a name this update cannot take, and
+        // nothing is moved. A request that spells the name the user already has — in any
+        // case — is no rename at all and is not a conflict with itself.
+        let to_key = crate::state::name_key(&user_name);
+        if to_key != key && store.users.contains_key(&to_key) {
+            return Err(UpdateUserErrorModeled::EntityAlreadyExistsException(
+                EntityAlreadyExistsException {
+                    message: Some(format!(
+                        "User with name {user_name} already exists."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The move itself, including everything the account holds ABOUT the user, so a
+        // renamed user keeps its identifier, its credentials, its policies, its
+        // memberships and its password (`crate::state::rename_user`).
+        store.rename_user(&key, &user_name, &path);
+
+        Ok(UpdateUserOutput)
     }
 }

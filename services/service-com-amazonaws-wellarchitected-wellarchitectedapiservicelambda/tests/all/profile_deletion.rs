@@ -21,6 +21,10 @@
 //! 4. An association names a profile that has to resolve, so deleting a profile a workload
 //!    is associated with drops that association and leaves the workload's other
 //!    associations exactly as they stood.
+//! 5. That dropped association is a member OF the holding workload (`Workload$Profiles`),
+//!    so every workload the delete takes one from reports the change through its
+//!    `Workload$UpdatedAt` — exactly as `DisassociateProfiles` does for the same mutation —
+//!    while a workload the delete changed nothing on keeps the instant it stood at.
 //!
 //! The `@idempotencyToken` rule on the delete's own `ClientRequestToken` — a retry under
 //! the ORIGINAL token replays the completed delete, a token spent on another target is a
@@ -32,11 +36,14 @@
 //! (de)serialization, boundary constraint validation and the handler all run as they do
 //! in production. The HTTP client lives in `super::workload_harness`.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 
 use super::profile_lifecycle::{absent_profile_arn, created};
 use super::workload_harness::{
-    assert_not_found, created_id, created_profile, minimal_create, profiles_of, Answer, Client,
+    age_workload, assert_not_found, created_id, created_profile, minimal_create, profiles_of,
+    updated_at_of, Answer, Client,
 };
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
@@ -439,6 +446,130 @@ async fn deleting_an_associated_profile_drops_that_association() {
                 .unwrap_or_default(),
             bystander_profile,
             "case {case:?}: the kept profile must report its own ARN, got {fetched:?}"
+        );
+    }
+}
+
+/// Rule 5. The rows differ along how many workloads lose an association to the delete —
+/// none, one, and several — because the instant is written per workload CHANGED, not per
+/// request. Every row also stands up two workloads the delete takes nothing from (one
+/// holding another profile, one holding none), so what moves `UpdatedAt` is the dropped
+/// association and not the delete having happened.
+#[tokio::test]
+async fn deleting_an_associated_profile_moves_every_holding_workloads_updated_at() {
+    for holders_count in [0usize, 1, 2, 3] {
+        let case = format!("{holders_count}-workloads-lose-the-association");
+        let client = Client::new();
+        let (target, _) = created_profile(&client, "updated-at-target").await;
+
+        let mut holders: Vec<String> = Vec::new();
+        for index in 0..holders_count {
+            let workload_id = created_id(
+                &client
+                    .create(minimal_create(
+                        &format!("updated-at-holder-{index}"),
+                        &format!("tok-holder-{index}"),
+                    ))
+                    .await,
+                &case,
+            );
+            let associated =
+                associate_profiles(&client, &workload_id, std::slice::from_ref(&target)).await;
+            assert_eq!(
+                associated.status, 200,
+                "case {case:?}/holder-{index}: expected AssociateProfiles 200, \
+                 got {associated:?}"
+            );
+            holders.push(workload_id);
+        }
+
+        let (other_profile, _) = created_profile(&client, "updated-at-bystander").await;
+        let holding_another = created_id(
+            &client
+                .create(minimal_create(
+                    "updated-at-holds-another",
+                    "tok-holds-another",
+                ))
+                .await,
+            &case,
+        );
+        let associated =
+            associate_profiles(&client, &holding_another, std::slice::from_ref(&other_profile))
+                .await;
+        assert_eq!(
+            associated.status, 200,
+            "case {case:?}: the bystander must take its own association, got {associated:?}"
+        );
+        let holding_none = created_id(
+            &client
+                .create(minimal_create("updated-at-holds-none", "tok-holds-none"))
+                .await,
+            &case,
+        );
+        let untouched = [
+            ("holds-another-profile", holding_another.clone()),
+            ("holds-no-profile", holding_none),
+        ];
+
+        // Every workload's instant is moved an hour into the past first, so a write the
+        // handler makes has to ADVANCE it rather than merely not go backwards — and one it
+        // must NOT make cannot hide behind the clock's granularity between two requests.
+        let mut before: Vec<(String, f64)> = Vec::new();
+        for workload_id in holders
+            .iter()
+            .chain(untouched.iter().map(|(_, workload_id)| workload_id))
+        {
+            age_workload(&client, workload_id, Duration::from_secs(3_600));
+            before.push((
+                workload_id.clone(),
+                updated_at_of(&client, workload_id, &case).await,
+            ));
+        }
+        let recorded = |workload_id: &str| {
+            before
+                .iter()
+                .find(|(key, _)| key == workload_id)
+                .map(|(_, at)| *at)
+                .unwrap_or_else(|| panic!("case {case:?}: {workload_id} must have been recorded"))
+        };
+
+        assert_deleted(
+            &client.delete_profile(&target, &format!("del-{case}")).await,
+            &case,
+        );
+
+        for (index, workload_id) in holders.iter().enumerate() {
+            assert_eq!(
+                associated_arns(&client, workload_id, &case).await,
+                Vec::<String>::new(),
+                "case {case:?}/holder-{index}: the deleted profile's association must go \
+                 with it"
+            );
+            let after = updated_at_of(&client, workload_id, &case).await;
+            let was = recorded(workload_id);
+            assert!(
+                after > was,
+                "case {case:?}/holder-{index}: losing its profile changes the workload, so \
+                 its UpdatedAt must advance, got {after} after {was}"
+            );
+        }
+
+        for (label, workload_id) in &untouched {
+            let after = updated_at_of(&client, workload_id, &case).await;
+            let was = recorded(workload_id);
+            assert_eq!(
+                after, was,
+                "case {case:?}/{label}: the delete took no association from this workload, \
+                 so its UpdatedAt must not move, got {after} after {was}"
+            );
+        }
+
+        // The bystander's own association is still there, so the instant it kept reports a
+        // workload the delete really left alone.
+        assert_eq!(
+            associated_arns(&client, &holding_another, &case).await,
+            vec![other_profile.clone()],
+            "case {case:?}: a workload holding another profile keeps its association"
         );
     }
 }

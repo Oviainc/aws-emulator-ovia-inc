@@ -194,6 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "ProfileArn": &input.profile_arn,
         }));
 
+        // The instant this request is served at, read once so every workload the delete
+        // changes carries one reading of the clock.
+        let now = std::time::SystemTime::now();
+
         let mut store = state.lock();
 
         // Read before the ARN is resolved: the original request dropped the profile, so the
@@ -215,8 +219,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // uses, so an ARN that names no stored profile — never created, already deleted
         // under another token, or belonging to another account — is that lookup's 404 and
         // nothing is removed. `remove_profile` takes the record and everything keyed to it
-        // with it, exactly as `DeleteWorkload` and `DeleteReviewTemplate` remove theirs.
-        if store.remove_profile(&input.profile_arn).is_none() {
+        // with it, exactly as `DeleteWorkload` and `DeleteReviewTemplate` remove theirs —
+        // including the association every workload held it by, which is a member of those
+        // workloads (`Workload$Profiles`), so each one that loses it records this instant
+        // as its `UpdatedAt`, the same way `DisassociateProfiles` reports that change.
+        if store.remove_profile(&input.profile_arn, now).is_none() {
             return Err(DeleteProfileErrorModeled::ResourceNotFoundException(
                 crate::state::profile_not_found(&input.profile_arn),
             )

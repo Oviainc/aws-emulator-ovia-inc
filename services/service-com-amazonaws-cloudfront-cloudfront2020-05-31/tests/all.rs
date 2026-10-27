@@ -209,6 +209,8 @@ mod tenant_distribution_and_method_order;
 mod tenant_domain_admission;
 #[path = "all/tenant_domain_certificate_gate.rs"]
 mod tenant_domain_certificate_gate;
+#[path = "all/tenant_invalidation_batch_quantity.rs"]
+mod tenant_invalidation_batch_quantity;
 #[path = "all/tenant_invalidations.rs"]
 mod tenant_invalidations;
 #[path = "all/tenant_web_acl_association.rs"]

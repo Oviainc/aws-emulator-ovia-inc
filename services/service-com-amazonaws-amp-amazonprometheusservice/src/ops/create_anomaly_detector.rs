@@ -365,6 +365,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         workspace
             .anomaly_detectors
             .insert(anomaly_detector_id, detector);
+        // This call CHANGED this service's state, so it leaves the audit record every
+        // mutating handler of this crate leaves: the operation, the resource it changed
+        // and the access-key id the REQUEST presented — see
+        // [`crate::state::record_state_change`]. The replayed `clientToken` above wrote
+        // nothing, so it records nothing.
+        crate::state::record_state_change(Self::NAME, &response.arn, ctx.parts());
         Ok(response)
     }
 }

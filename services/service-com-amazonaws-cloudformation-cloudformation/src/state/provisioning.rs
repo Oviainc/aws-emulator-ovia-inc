@@ -903,7 +903,7 @@ pub async fn reconcile(
                         // value carrying it carries it because a reference to this resource
                         // put it there — see [`Minted::composed`].
                         composed: super::declared_name(&resource).as_deref() != Some(&*computed),
-                        stand_in: computed,
+                        stand_in: computed.clone(),
                         assigned: resource.physical_resource_id.clone(),
                     });
                 }
@@ -918,6 +918,17 @@ pub async fn reconcile(
                     let Some(assigned) = resource.attributes.get(attribute) else {
                         continue;
                     };
+                    // An attribute whose computed value IS the identifier `Ref` resolved
+                    // to is NOT re-pointed: the uniform convention gives every resource an
+                    // `Id`/`<Type>Id` and a `Name`/`<Type>Name` read off its physical id,
+                    // so for a type whose id is a NAME those stand-ins are that name — and
+                    // another resource's property carrying it (an `AWS::IAM::ManagedPolicy`
+                    // naming the role it is attached to) carries the name on purpose. Only
+                    // the physical id's own pair above may rewrite it, which it does when
+                    // the owning service assigned a different identity.
+                    if stand_in == &computed {
+                        continue;
+                    }
                     if !stand_in.is_empty() && assigned != stand_in {
                         minted.push(Minted {
                             stand_in: stand_in.clone(),

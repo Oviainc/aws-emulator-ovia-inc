@@ -53,6 +53,8 @@ mod metrics_destinations;
 mod not_found_and_conflict_bodies;
 #[path = "all/platform_domain_authority.rs"]
 mod platform_domain_authority;
+#[path = "all/put_rum_events_unresolvable_id.rs"]
+mod put_rum_events_unresolvable_id;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_tagging.rs"]

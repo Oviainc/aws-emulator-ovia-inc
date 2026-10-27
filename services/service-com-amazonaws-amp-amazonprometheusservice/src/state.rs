@@ -1415,6 +1415,18 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// way CloudTrail makes a real one: the operation, the resource it changed and the
 /// access-key id the REQUEST presented.
 ///
+/// EVERY handler of this crate calls this on each path where it writes to the store, and
+/// only there: a reporting operation changes nothing to account for, and a path that
+/// answers from the stored record without writing — an idempotency replay, a refusal —
+/// has nothing to record either. So the stream holds one record per completed change,
+/// and an operator reading it sees every change the run made rather than the subset of
+/// handlers that happened to be written with the call.
+///
+/// A resource the service gives no ARN of its own — a logging or query logging
+/// configuration, an alert manager definition, a resource-based policy — is recorded
+/// under the ARN of the workspace or scraper it hangs off, which is the resource the
+/// change is addressed to.
+///
 /// Carries request metadata ONLY — `emulator_server::extract_akid` reads the id out of
 /// the presented `Authorization` header. The emulator's own credentials, the caller's
 /// secrets and the stored document itself stay out of it, so the record names what
