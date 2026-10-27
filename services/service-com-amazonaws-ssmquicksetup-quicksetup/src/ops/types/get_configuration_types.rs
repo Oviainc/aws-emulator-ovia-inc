@@ -17,7 +17,10 @@ pub struct GetConfigurationInput {
     pub configuration_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ssmquicksetup#GetConfigurationOutput")]
+/// `CreatedAt` and `LastModifiedAt` carry `@timestampFormat("date-time")`, so this shape's
+/// schema comes from `qs_schema_and_codec!` rather than the derive — see
+/// `types/date_time_wire.rs`. Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="GetConfigurationOutput")`.
 #[derive(Debug, Clone, Default)]
 pub struct GetConfigurationOutput {
     pub id: Option<String>,
@@ -32,4 +35,37 @@ pub struct GetConfigurationOutput {
     pub status_summaries: Option<Vec<StatusSummary>>,
     pub parameters: Option<std::collections::HashMap<String, String>>,
 }
+
+qs_schema_and_codec!(
+    GetConfigurationOutput,
+    GET_CONFIGURATION_OUTPUT_SCHEMA,
+    "com.amazonaws.ssmquicksetup#GetConfigurationOutput",
+    "com.amazonaws.ssmquicksetup",
+    "GetConfigurationOutput",
+    (M_ID, id, "Id", 0, opt, string),
+    (M_MANAGER_ARN, manager_arn, "ManagerArn", 1, opt, string),
+    (
+        M_CONFIGURATION_DEFINITION_ID,
+        configuration_definition_id,
+        "ConfigurationDefinitionId",
+        2,
+        opt,
+        string
+    ),
+    (M_TYPE, r#type, "Type", 3, opt, string),
+    (M_TYPE_VERSION, type_version, "TypeVersion", 4, opt, string),
+    (M_ACCOUNT, account, "Account", 5, opt, string),
+    (M_REGION, region, "Region", 6, opt, string),
+    (M_CREATED_AT, created_at, "CreatedAt", 7, opt, date_time),
+    (M_LAST_MODIFIED_AT, last_modified_at, "LastModifiedAt", 8, opt, date_time),
+    (
+        M_STATUS_SUMMARIES,
+        status_summaries,
+        "StatusSummaries",
+        9,
+        opt,
+        list_of(StatusSummary)
+    ),
+    (M_PARAMETERS, parameters, "Parameters", 10, opt, map_of_string),
+);
 
