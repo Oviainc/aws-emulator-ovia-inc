@@ -29,7 +29,10 @@ use serde_json::{json, Value};
 use crate::configuration_sets::{Reply, Ses};
 
 /// Convenience calls for the event-destination surface, over the shared harness.
-trait EventDestinations {
+///
+/// Shared with the sibling suites of this test target, so every case drives the same
+/// wire path for a given operation.
+pub(crate) trait EventDestinations {
     async fn create_destination(&self, set: &str, name: &str, definition: Value) -> Reply;
     async fn get_destinations(&self, set: &str) -> Reply;
     async fn delete_destination(&self, set: &str, name: &str) -> Reply;
@@ -75,7 +78,10 @@ impl EventDestinations for Ses {
 }
 
 /// The reported destinations of `set`, which must be a 200.
-async fn reported_destinations(ses: &Ses, set: &str) -> Vec<Value> {
+///
+/// Shared with the sibling suites of this test target, so every case reads a set's
+/// destinations the same way.
+pub(crate) async fn reported_destinations(ses: &Ses, set: &str) -> Vec<Value> {
     let reply = ses.get_destinations(set).await;
     assert_eq!(
         reply.status,
@@ -145,10 +151,10 @@ const EVENT_TYPES: &[&str] = &[
 
 /// One row of the create-and-read table: the definition a create carries, and what a
 /// read of the stored destination must report afterwards.
-struct DestinationCase {
-    case: &'static str,
-    name: &'static str,
-    definition: Value,
+pub(crate) struct DestinationCase {
+    pub(crate) case: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) definition: Value,
     enabled: bool,
     matching_event_types: Vec<String>,
     /// The destination member a read must report, as `(member, value)`.
@@ -157,7 +163,7 @@ struct DestinationCase {
 
 /// The rows of the create-and-read table: one per modelled destination kind, differing
 /// also in the enabled flag and in how many event types they match.
-fn destination_cases() -> Vec<DestinationCase> {
+pub(crate) fn destination_cases() -> Vec<DestinationCase> {
     let every_event_type: Vec<String> = EVENT_TYPES.iter().map(|value| value.to_string()).collect();
     vec![
         DestinationCase {
@@ -671,7 +677,7 @@ async fn a_name_or_enum_value_outside_its_documented_rule_is_refused() {
 
 /// The names `set` reports, sorted, so a case compares sets of names and not an order
 /// the map does not promise.
-async fn reported_names(ses: &Ses, set: &str) -> Vec<String> {
+pub(crate) async fn reported_names(ses: &Ses, set: &str) -> Vec<String> {
     let mut names: Vec<String> = reported_destinations(ses, set)
         .await
         .iter()
@@ -703,7 +709,7 @@ async fn attach_every_destination(ses: &Ses, set: &str) {
 }
 
 /// Create `set`, which must answer 200.
-async fn create_set(ses: &Ses, set: &str) {
+pub(crate) async fn create_set(ses: &Ses, set: &str) {
     let created = ses.create_set(json!({"ConfigurationSetName": set})).await;
     assert_eq!(
         created.status,
