@@ -4552,6 +4552,18 @@ impl ComAmazonawsCloudformationCloudformationState {
         self.stack_sets.push(stack_set);
     }
 
+    /// Every stack set of one Region, in creation order: the set `ListStackSets` answers
+    /// from, since a stack set belongs to the Region the call that created it was signed
+    /// for and nothing outside that Region is addressable (see [`stack_sets`]).
+    pub fn stack_sets_in<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a stack_sets::StoredStackSet> {
+        self.stack_sets
+            .iter()
+            .filter(move |stack_set| stack_set.region == region)
+    }
+
     /// [`Self::resolve_stack_set`], for a caller that mutates the stack set it resolved.
     pub fn resolve_stack_set_mut(
         &mut self,
@@ -5798,6 +5810,8 @@ pub enum PageOf {
     TypeSummaries,
     /// `ListStackInstances`'s `Summaries`.
     StackInstanceSummaries,
+    /// `ListStackSets`'s `Summaries`.
+    StackSetSummaries,
     /// `ListStackSetOperations`'s `Summaries`.
     StackSetOperationSummaries,
     /// `ListStackSetAutoDeploymentTargets`'s `Summaries`.
@@ -5830,6 +5844,7 @@ impl PageOf {
             Self::AccountLimits => "account-limits",
             Self::TypeSummaries => "type-summaries",
             Self::StackInstanceSummaries => "stack-instance-summaries",
+            Self::StackSetSummaries => "stack-set-summaries",
             Self::StackSetOperationSummaries => "stack-set-operation-summaries",
             Self::StackSetAutoDeploymentTargetSummaries => {
                 "stack-set-auto-deployment-target-summaries"
