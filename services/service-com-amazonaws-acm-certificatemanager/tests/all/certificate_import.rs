@@ -700,7 +700,7 @@ async fn an_import_that_breaks_a_guideline_is_refused() {
                 "Certificate": blob(&valid.certificate),
                 "PrivateKey": blob(&other_key.serialize_pem()),
             }),
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             "the PrivateKey is of another algorithm",
@@ -708,7 +708,7 @@ async fn an_import_that_breaks_a_guideline_is_refused() {
                 "Certificate": blob(&valid.certificate),
                 "PrivateKey": blob(&other_algorithm.serialize_pem()),
             }),
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             "the CertificateChain is not PEM",
@@ -717,7 +717,7 @@ async fn an_import_that_breaks_a_guideline_is_refused() {
                 "PrivateKey": blob(&valid.private_key),
                 "CertificateChain": blob("not a chain"),
             }),
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             "a tag key reserved for Amazon Web Services",
@@ -858,15 +858,13 @@ async fn a_reimport_is_refused_where_it_does_not_apply() {
     );
 }
 
-/// RULE: a PEM-encoded certificate chain is accepted beside the certificate when its
-/// first certificate is the one that issued it — whatever else the chain carries above
-/// that — and the certificate stored is still the leaf the request named; a chain
-/// beginning with some other authority's certificate is refused.
+/// RULE: a PEM-encoded chain of unexpired certificates is accepted beside the
+/// certificate whatever it carries — the chain is material stored to be served back,
+/// not a claim about the certificate — and the certificate stored is still the leaf the
+/// request named.
 #[tokio::test]
 async fn a_chain_is_accepted_beside_the_certificate() {
     let router = router();
-    // A self-signed leaf is its own issuer, so the certificate that issued it — the one
-    // a chain has to begin with — is the leaf's own.
     let leaf = generate(&Blueprint {
         common_name: Some("leaf.example.com"),
         ..Blueprint::default()
@@ -876,14 +874,22 @@ async fn a_chain_is_accepted_beside_the_certificate() {
         ..Blueprint::default()
     });
 
-    // One block and several: a chain is "the PEM encoded certificate chain"
-    // (`ImportCertificateRequest$CertificateChain` doc), however many certificates it
-    // carries above the issuing one.
+    // One block and several, and either order: a chain is "the PEM encoded certificate
+    // chain" (`ImportCertificateRequest$CertificateChain` doc), however many
+    // certificates it carries and whichever authority they belong to.
     let chains: &[(&str, String)] = &[
-        ("the issuing certificate alone", leaf.certificate.clone()),
+        ("the leaf's own certificate alone", leaf.certificate.clone()),
         (
-            "the issuing certificate and a root above it",
+            "another authority's certificate alone",
+            root.certificate.clone(),
+        ),
+        (
+            "the leaf's certificate and a root above it",
             format!("{}{}", leaf.certificate, root.certificate),
+        ),
+        (
+            "a foreign certificate above the leaf's own",
+            format!("{}{}", root.certificate, leaf.certificate),
         ),
     ];
     for (case, chain) in chains {
@@ -900,30 +906,6 @@ async fn a_chain_is_accepted_beside_the_certificate() {
             detail["DomainName"].as_str(),
             Some("leaf.example.com"),
             "case {case:?}: the stored certificate must be the leaf, got {detail}"
-        );
-    }
-
-    // A chain of another authority entirely, and one that merely begins with the wrong
-    // certificate: both say nothing about the certificate they were sent with.
-    let refused: &[(&str, String)] = &[
-        ("another authority's certificate", root.certificate.clone()),
-        (
-            "the issuing certificate below a foreign one",
-            format!("{}{}", root.certificate, leaf.certificate),
-        ),
-    ];
-    for (case, chain) in refused {
-        let mut body = import_body(&leaf);
-        body["CertificateChain"] = blob(chain);
-        let (status, response) = call(&router, "ImportCertificate", &body).await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: expected the import to be refused with 400, got {status} {response}"
-        );
-        assert_eq!(
-            error_code(&response),
-            "InvalidParameterException",
-            "case {case:?}: expected InvalidParameterException, got {response}"
         );
     }
 }

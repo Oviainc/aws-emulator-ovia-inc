@@ -87,6 +87,8 @@ mod refusal_and_rotation_contracts;
 mod replicate_key;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/signature_verification.rs"]
+mod signature_verification;
 #[path = "all/signatures.rs"]
 mod signatures;
 #[path = "all/state_roundtrip.rs"]

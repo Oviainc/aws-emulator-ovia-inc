@@ -30,6 +30,62 @@ use smithy_server_runtime::{Violation, ViolationKind};
 /// is stored on the record; nothing ever sleeps for it.
 pub const VERIFICATION_SETTLE: Duration = Duration::from_millis(500);
 
+/// How long after one search of an identity's DNS records the next one falls due.
+///
+/// Real SES re-queries the records it was told to look for on a schedule nothing
+/// here can observe, so the cadence is CHOSEN, not documented: it is short enough
+/// that `VerificationInfo$LastCheckedTimestamp` is a live instant and long enough
+/// that two reads of one identity in the same breath report the same one. The due
+/// instant is stored on the record; nothing ever sleeps for it.
+pub const VERIFICATION_PROBE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Top-level domains the DNS root does not delegate, so no name under one of them
+/// can carry a DNS record for anybody.
+///
+/// `invalid` is the name RFC 6761 section 6.4 reserves for "domain names that are
+/// sure to be invalid": a query for a name under it answers "no such name", whatever
+/// its owner does, so the records SES looks for can never be published there. The
+/// reserved SECOND-level names (`example.com` and its siblings) are deliberately NOT
+/// here, and neither are the other special-use top-level names: those stand for a
+/// zone a resolver may well answer for.
+const UNDELEGATED_TOP_LEVEL_DOMAINS: [&str; 1] = ["invalid"];
+
+/// Whether a DNS zone covering `domain` can exist at all.
+///
+/// `false` for a name whose top-level domain the root does not delegate
+/// ([`UNDELEGATED_TOP_LEVEL_DOMAINS`]): a query for such a name answers "no such
+/// name" however its owner configures DNS, so the records SES looks for can never be
+/// published there. `true` otherwise — a zone that may exist, whose owner may or may
+/// not have published them.
+///
+/// The name is compared the way DNS compares one ([`domain_key`]).
+pub fn dns_zone_can_exist(domain: &str) -> bool {
+    let name = domain_key(domain);
+    let top_level = name
+        .trim_end_matches('.')
+        .rsplit('.')
+        .next()
+        .unwrap_or_default();
+    !top_level.is_empty() && !UNDELEGATED_TOP_LEVEL_DOMAINS.contains(&top_level)
+}
+
+/// The `VerificationError` a search for `domain`'s DKIM records reports while they
+/// have not been found.
+///
+/// The model's own two readings of a failed lookup: `HOST_NOT_FOUND` is "the queried
+/// hostname does not exist or was not reachable at the time of the request", which is
+/// what a name no DNS zone can cover answers; `TYPE_NOT_FOUND` is "the queried
+/// hostname exists but does not have the requested type of DNS record", which is what
+/// a name under a zone that may exist answers while the records it was told to publish
+/// are not there.
+pub fn dkim_lookup_error(domain: &str) -> &'static str {
+    if dns_zone_can_exist(domain) {
+        "TYPE_NOT_FOUND"
+    } else {
+        "HOST_NOT_FOUND"
+    }
+}
+
 /// How long after a custom MAIL FROM domain is configured the search for that
 /// domain's MX record is reported as having found it.
 ///
@@ -941,6 +997,15 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
         if let Some(exact) = self.identities.get(&key) {
             return Some(exact);
         }
+        self.covering_domain_identity(&key)
+    }
+
+    /// The most specific domain identity that covers the address `key` names, if any.
+    ///
+    /// `key` is an [`identity_key`]: the domain part is compared without regard to
+    /// case, and a key that names no address (a domain identity's own key) is covered
+    /// by nothing, since a domain identity publishes the records for its own name.
+    fn covering_domain_identity(&self, key: &str) -> Option<&EmailIdentityRecord> {
         let (_, domain) = key.rsplit_once('@')?;
         // Walk the domain and each of its parent domains: `a.b.example.com` is
         // covered by an identity for `a.b.example.com`, `b.example.com` or
@@ -957,6 +1022,49 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
             candidate = suffix.split_once('.').map(|(_, parent)| parent);
         }
         None
+    }
+
+    /// The identity whose DNS zone publishes the DKIM records `record`'s messages are
+    /// signed with: the domain identity that covers an address identity, else the
+    /// record itself.
+    ///
+    /// DKIM keys are published in a DOMAIN's DNS, so an email-address identity under a
+    /// domain identity has no DKIM configuration of its own — it is the domain's
+    /// configuration that signs its mail, and the domain's DNS that SES searches for
+    /// it. An address with no covering domain identity is its own authority, which
+    /// reports the unconfigured state it was created with.
+    pub fn dkim_authority<'a>(&'a self, record: &'a EmailIdentityRecord) -> &'a EmailIdentityRecord {
+        if record.identity_kind == IdentityKind::Domain {
+            return record;
+        }
+        self.covering_domain_identity(&identity_key(&record.name))
+            .unwrap_or(record)
+    }
+
+    /// The modelled `DkimAttributes` of `record`, resolved from the identity whose DNS
+    /// zone publishes its DKIM records ([`Self::dkim_authority`]).
+    ///
+    /// Every operation that reports an identity's DKIM configuration goes through
+    /// here, so a create and the reads after it cannot disagree.
+    pub fn dkim_attributes_of(
+        &self,
+        record: &EmailIdentityRecord,
+    ) -> crate::ops::types::DkimAttributes {
+        self.dkim_authority(record).dkim_attributes()
+    }
+
+    /// The modelled `VerificationInfo` of `record`: the search of the DNS zone that
+    /// publishes its DKIM records ([`Self::dkim_authority`]).
+    ///
+    /// `None` when there is no such zone to search — an email-address identity that no
+    /// domain identity covers is verified by the recipient following the link in the
+    /// verification message, so no DNS search reports on it.
+    pub fn verification_info_of(
+        &self,
+        record: &EmailIdentityRecord,
+    ) -> Option<crate::ops::types::VerificationInfo> {
+        let authority = self.dkim_authority(record);
+        (authority.identity_kind == IdentityKind::Domain).then(|| authority.verification_info())
     }
 
     /// Recipients charged against the sending quota within the trailing
@@ -1402,6 +1510,17 @@ pub struct EmailIdentityRecord {
     pub created_at: SystemTime,
     /// When the `PENDING` -> `SUCCESS` verification transition falls due.
     pub verification_due_at: SystemTime,
+    /// When the last search of this identity's DNS records was made, which
+    /// `VerificationInfo$LastCheckedTimestamp` reports. `None` until the first one
+    /// has been materialised.
+    pub last_checked_at: Option<SystemTime>,
+    /// When the next search falls due, [`VERIFICATION_PROBE_INTERVAL`] after the last
+    /// one; the first is owed at creation, so it is the instant the identity was
+    /// created.
+    pub next_check_due_at: SystemTime,
+    /// When this identity's verification last succeeded, which
+    /// `VerificationInfo$LastSuccessTimestamp` reports. `None` while it never has.
+    pub last_success_at: Option<SystemTime>,
     /// The S/MIME certificate associations this identity holds, keyed by
     /// [`identity_key`] of the address each applies to — "each email address can have
     /// only one certificate association". Ordered, so
@@ -1433,6 +1552,11 @@ impl EmailIdentityRecord {
             policies: BTreeMap::new(),
             created_at: now,
             verification_due_at: now.checked_add(VERIFICATION_SETTLE).unwrap_or(now),
+            // SES starts looking for the records it told the caller to publish as
+            // soon as verification starts, so the first search is owed at once.
+            last_checked_at: None,
+            next_check_due_at: now,
+            last_success_at: None,
             certificates: BTreeMap::new(),
         }
     }
@@ -1480,13 +1604,26 @@ impl EmailIdentityRecord {
             .collect()
     }
 
-    /// Apply the transitions the clock owes this identity at `now`: its verification
-    /// transition, its custom MAIL FROM domain's MX search, and each certificate
-    /// association's own.
+    /// Apply the transitions the clock owes this identity at `now`: the next search
+    /// of its DNS records, its verification transition, its custom MAIL FROM domain's
+    /// MX search, and each certificate association's own.
     pub fn settle(&mut self, now: SystemTime) {
-        if self.verification_status == SesStatus::Pending && now >= self.verification_due_at {
+        // The search for the records SES told the caller to publish: SES re-runs it
+        // on its own schedule, so one owed at `now` has been made whether or not
+        // anybody called, and the instant it was made is what a read reports.
+        if now >= self.next_check_due_at {
+            self.last_checked_at = Some(now);
+            self.next_check_due_at = now
+                .checked_add(VERIFICATION_PROBE_INTERVAL)
+                .unwrap_or(now);
+        }
+        if self.verification_status == SesStatus::Pending
+            && now >= self.verification_due_at
+            && self.verification_can_complete()
+        {
             self.verification_status = SesStatus::Success;
             self.verified_for_sending = true;
+            self.last_success_at = Some(now);
             if self.dkim.status == SesStatus::Pending {
                 self.dkim.status = SesStatus::Success;
             }
@@ -1496,6 +1633,40 @@ impl EmailIdentityRecord {
         }
         self.certificates
             .retain(|_, certificate| certificate.settle(now));
+    }
+
+    /// Whether this identity's verification can ever complete.
+    ///
+    /// A domain identity is verified by records published in that domain's own DNS
+    /// zone, so one whose name no DNS zone can cover ([`dns_zone_can_exist`]) can
+    /// never be verified however long the caller waits: the search keeps answering
+    /// "no such name", and the identity stays in the state it started in with
+    /// `VerificationInfo` saying why (SES gives up on it after days, a span this
+    /// emulator does not model). An email-address identity is verified by the
+    /// recipient following the link in the verification message, which no DNS name
+    /// decides.
+    fn verification_can_complete(&self) -> bool {
+        self.identity_kind != IdentityKind::Domain || dns_zone_can_exist(identity_domain(&self.name))
+    }
+
+    /// The modelled `VerificationInfo` view of the search for this identity's DNS
+    /// records: when it last ran, when it last succeeded, and the reason the last one
+    /// failed while it is failing.
+    ///
+    /// `ErrorType` is reported only while the records have not been found —
+    /// "the reason for the failure describing why Amazon SES was not able to
+    /// successfully verify the identity" — and is which of the model's two readings
+    /// of a failed lookup applies to this name ([`dkim_lookup_error`]). No
+    /// `SOARecord`: SES reports the start-of-authority record it read out of the
+    /// zone, and nothing here reads a zone.
+    pub fn verification_info(&self) -> crate::ops::types::VerificationInfo {
+        crate::ops::types::VerificationInfo {
+            last_checked_timestamp: self.last_checked_at.map(::aws_smithy_types::DateTime::from),
+            last_success_timestamp: self.last_success_at.map(::aws_smithy_types::DateTime::from),
+            error_type: (self.verification_status != SesStatus::Success)
+                .then(|| dkim_lookup_error(identity_domain(&self.name)).to_string()),
+            soa_record: None,
+        }
     }
 
     /// Configure `domain` as this identity's custom MAIL FROM domain.
@@ -1932,6 +2103,16 @@ pub fn contact_not_found(contact_list_name: &str, email_address: &str) -> String
         "Contact with email address: {email_address} doesn't exist in list: \
          {contact_list_name}."
     )
+}
+
+/// How this service words the refusal of a topic the named list does not publish.
+///
+/// One wording for every operation that names a `TopicName` within a list — the
+/// contact writes and the send that resolves its list-management options — so a
+/// client sees the same sentence whichever call first tells it the topic is not
+/// there.
+pub fn contact_list_topic_not_found(contact_list_name: &str, topic_name: &str) -> String {
+    format!("Topic with name: {topic_name} doesn't exist in list: {contact_list_name}.")
 }
 
 /// One email template in the account's template store.
@@ -2502,11 +2683,12 @@ const CONSTRAINT_SEPARATOR: &str = " failed to satisfy constraint: ";
 /// The message this service answers a refusal the constraint walk made at the request
 /// boundary with: one clause per violation, in the envelope AWS counts them in.
 ///
-/// Every clause is the framework's own, with ONE difference: a value outside a
-/// modelled enum's value set is stated WITHOUT the value. SES names the member and
-/// the value set that member had to satisfy and withholds what was sent, while a
-/// length, range, pattern or absent-member clause quotes the value the way the
-/// framework renders it.
+/// Every clause is the framework's own, with ONE difference: a value refused for its
+/// FORM — outside a modelled enum's value set, or outside a modelled `@pattern` — is
+/// stated WITHOUT the value. SES names the member and the value set or the pattern
+/// that member had to satisfy and withholds what was sent. A length, range or
+/// absent-member clause quotes the value the way the framework renders it, which is
+/// how AWS's own validation renders those.
 ///
 /// `None` when there is nothing to state, which keeps the framework's own wording.
 pub fn boundary_refusal_message(violations: &[Violation]) -> Option<String> {
@@ -2525,11 +2707,14 @@ pub fn boundary_refusal_message(violations: &[Violation]) -> Option<String> {
 ///
 /// The requirement half is always the framework's own words — the clause is cut at
 /// the separator rather than rebuilt — so a constraint class the framework learns to
-/// check cannot drift from this wording, and only the SUBJECT of an enum clause
-/// changes: from the value-quoting form to the member on its own.
+/// check cannot drift from this wording, and only the SUBJECT of a clause about a
+/// value's form changes: from the value-quoting form to the member on its own.
 fn boundary_clause(violation: &Violation) -> String {
     let rendered = violation.message();
-    if !matches!(violation.kind, ViolationKind::EnumValue(_)) {
+    if !matches!(
+        violation.kind,
+        ViolationKind::EnumValue(_) | ViolationKind::Pattern(_)
+    ) {
         return rendered;
     }
     match rendered.split_once(CONSTRAINT_SEPARATOR) {

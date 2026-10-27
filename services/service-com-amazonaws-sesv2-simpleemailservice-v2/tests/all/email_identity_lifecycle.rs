@@ -305,9 +305,12 @@ const IDENTITY_CASES: &[IdentityCase] = &[
         dkim_tokens: 3,
     },
     // Case is not what tells an address from a domain — the local part is — and the
-    // store keys an identity by the value it was created with.
+    // store keys an identity by the value it was created with. The domain is one no
+    // other row creates an identity for, so this row reports the address identity's
+    // OWN (unconfigured) DKIM state: an address under a domain identity reports that
+    // domain's instead, which `email_identity_dkim_inheritance` covers.
     IdentityCase {
-        identity: "Mixed.Case@Example.COM",
+        identity: "Mixed.Case@Example.ORG",
         identity_type: "EMAIL_ADDRESS",
         dkim_signing_enabled: false,
         dkim_status: "NOT_STARTED",
@@ -1727,10 +1730,12 @@ async fn send_refuses_what_it_cannot_accept() {
 
     // Members that select a resource no implemented operation can create yet are
     // answered as unwritten, not accepted as if they had not been sent.
+    // `ListManagementOptions` is NOT one of them: it names a contact list, which this
+    // slice holds, so it is resolved against the contact-list table (see
+    // `send_list_management_options`).
     for member in [
         json!({"TenantName": "tenant-a"}),
         json!({"EndpointId": "endpoint-a"}),
-        json!({"ListManagementOptions": {"ContactListName": "list-a"}}),
     ] {
         let mut request = json!({
             "FromEmailAddress": "solo@example.net",
