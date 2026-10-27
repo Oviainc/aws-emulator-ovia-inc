@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBackupPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBackupPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBackupPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the plan `CreateBackupPlan` stored under the requested
+//! `BackupPlanId`, projected through
+//! [`crate::state::BackupPlanRecord::backup_plan`] so the body read back is the
+//! body that was stored. A `VersionId` naming a version the plan does not have
+//! is the same condition as an unknown plan id and answers the same modelled
+//! refusal.
+//!
+//! `ScheduledRunsPreview` is reported only for a caller that asks for one
+//! (`MaxScheduledRunsPreview` defaults to 0, and the model documents the member
+//! as "only included when MaxScheduledRunsPreview parameter is greater than
+//! 0"); this reader computes no upcoming runs, so it leaves the member unset
+//! rather than reporting execution times nothing worked out. That one member is
+//! what keeps this operation's own issue open.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +183,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBackupPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBackupPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBackupPlan"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetBackupPlanErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
+                message: Some("the backup vault store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let store = state.lock();
+        // A read, so nothing here writes: the plan is reported exactly as it was
+        // stored. `MaxScheduledRunsPreview`'s range is enforced by the framework
+        // before this handler runs.
+        let plan = store
+            .backup_plan(&input.backup_plan_id, input.version_id.as_deref())
+            .map_err(GetBackupPlanErrorModeled::ResourceNotFoundException)?;
+
+        Ok(GetBackupPlanOutput {
+            backup_plan: Some(plan.backup_plan()),
+            backup_plan_id: Some(plan.plan_id.clone()),
+            backup_plan_arn: Some(plan.arn.clone()),
+            version_id: Some(plan.version_id.clone()),
+            creator_request_id: plan.creator_request_id.clone(),
+            creation_date: Some(::aws_smithy_types::DateTime::from(plan.creation_date)),
+            deletion_date: plan.deletion_date.map(::aws_smithy_types::DateTime::from),
+            last_execution_date: plan
+                .last_execution_date
+                .map(::aws_smithy_types::DateTime::from),
+            advanced_backup_settings: plan.advanced_backup_settings_view(),
+            // See the module docs: no upcoming run is computed, so none is
+            // reported, whatever preview size the caller asked for.
+            scheduled_runs_preview: None,
+        })
     }
 }

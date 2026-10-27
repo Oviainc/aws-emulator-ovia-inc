@@ -33,3 +33,15 @@ _simparity_dyn_check_backup__kms__s3_refarch_bkp_e2e_review_backup_plan_cross_re
 Boot the backup emulator
 Call GetBackupPlan and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Note from the CreateBackupPlan fix (still open)
+Implementing `CreateBackupPlan` needed a reader to prove the create persisted, so
+`get_backup_plan.rs` now answers from the stored plan record and its SCAFFOLDED marker is
+gone — the handler is no longer a stub. This issue stays OPEN for the one member that is
+still unimplemented: `ScheduledRunsPreview`. `MaxScheduledRunsPreview` (range 0..10,
+default 0) is accepted and the member is left unset whatever it names, so a caller asking
+for N upcoming runs gets a 200 with no preview in it. Reporting the upcoming runs means
+reading each rule's `ScheduleExpression` (and its `ScheduleExpressionTimezone`) and
+computing the next executions from the clock; nothing does that yet, and run times nothing
+computed must not be invented. Whoever closes this issue owns that member, and the unit
+above, which the fix did not replay.
