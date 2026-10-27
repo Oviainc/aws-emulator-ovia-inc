@@ -203,10 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `Tier` "sets the maximum bitrate, in Mbps, for the router output", so a request
         // asking for more than its tier allows is a semantic error. The rule and the
-        // per-tier ceiling live in `crate::state` with the documentation they come from, so
-        // UpdateRouterOutput judges the same pair the same way.
-        if let Some(rejection) =
-            crate::state::router_output_bitrate_rejection(&input.tier, input.maximum_bitrate)
+        // per-tier ceiling live in `crate::state::RouterTierLadder` with the documentation
+        // they come from, so UpdateRouterOutput judges the same pair the same way.
+        if let Some(rejection) = crate::state::ROUTER_OUTPUT_TIERS
+            .bitrate_rejection(&input.tier, input.maximum_bitrate)
         {
             return Err(bad_request(rejection));
         }

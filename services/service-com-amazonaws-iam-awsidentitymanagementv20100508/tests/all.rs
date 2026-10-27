@@ -203,6 +203,8 @@ mod service_specific_credentials;
 mod signing_certificates;
 #[path = "all/simulated_decision_attribution.rs"]
 mod simulated_decision_attribution;
+#[path = "all/simulated_policy_composition.rs"]
+mod simulated_policy_composition;
 #[path = "all/simulated_principal_sources.rs"]
 mod simulated_principal_sources;
 #[path = "all/simulated_resource_policy.rs"]

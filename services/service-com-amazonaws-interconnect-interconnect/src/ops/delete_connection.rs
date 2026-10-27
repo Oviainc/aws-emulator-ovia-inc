@@ -167,11 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // @idempotent: a connection already in one of those two states is left
         // exactly as it is, and the same record is returned — a retried delete
         // neither restarts the transition nor fails.
-        if stored.connection.state != "deleting" && stored.connection.state != "deleted" {
-            stored.connection.state = "deleting".to_string();
+        if !crate::state::is_deleted_or_deleting(&stored.connection.state) {
+            stored.connection.state = crate::state::DELETING_CONNECTION_STATE.to_string();
             stored.pending_transition = Some(crate::state::PendingTransition {
                 due: now + crate::state::PROVISIONING_SPAN,
-                state: "deleted".to_string(),
+                state: crate::state::DELETED_CONNECTION_STATE.to_string(),
             });
         }
 

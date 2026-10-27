@@ -33,6 +33,10 @@
 //! operation creates a task instance — only executing a workflow definition does, and
 //! this emulator has no Apache Airflow engine ([`NO_AIRFLOW_ENGINE`]) — so the map is
 //! bounded by the number of runs that hold it.
+//! The definition content a version freezes ([`WorkflowSnapshot::workflow_definition`])
+//! is caller-driven data held per version, and is capped at
+//! [`workflow_definition::MAX_DEFINITION_BYTES`] before a byte of the object is
+//! buffered, so the versions x content product is finite too.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::LazyLock;
@@ -47,9 +51,13 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Code, DefinitionS3Location, EncryptionConfiguration, LoggingConfiguration,
-    NetworkConfiguration, ResourceNotFoundException, ValidationException,
+    NetworkConfiguration, ResourceNotFoundException, ScheduleConfiguration, ValidationException,
     ValidationExceptionField, ENCRYPTION_TYPE_VALUES,
 };
+
+/// Reading the workflow definition file a version snapshots out of Amazon S3, and the
+/// schedule that definition declares.
+pub mod workflow_definition;
 
 /// The region used in minted ARNs when the request carries no usable SigV4
 /// credential scope. Every generated emulator defaults to `us-east-1`.
@@ -170,11 +178,11 @@ pub const TRIGGER_MODE_SCHEDULED: &str = "SCHEDULED";
 /// due, and the period between firings after that.
 ///
 /// The cadence is the emulator's own choice, not a fidelity claim about any cron
-/// expression: the firing instants a real schedule would have come from the workflow's
-/// definition body, which this emulator never fetches from Amazon S3. It is
-/// deliberately non-zero, so a caller that lists a freshly created workflow's runs
-/// still sees the empty history its create left behind, and short, so a caller that
-/// waits sees the automated runs the trigger owes.
+/// expression: a workflow's declared schedule is reported as the definition writes it
+/// ([`workflow_definition::declared_schedule`]), but nothing here evaluates that
+/// expression into firing instants. It is deliberately non-zero, so a caller that lists
+/// a freshly created workflow's runs still sees the empty history its create left
+/// behind, and short, so a caller that waits sees the automated runs the trigger owes.
 pub const SCHEDULED_RUN_EVERY: Duration = Duration::from_millis(500);
 
 /// How many workflows this emulator will hold for the account.
@@ -229,6 +237,20 @@ pub const MAX_IDEMPOTENCY_TOKENS: usize = 1_024;
 #[derive(Debug, Clone)]
 pub struct WorkflowSnapshot {
     pub definition_s3_location: DefinitionS3Location,
+    /// The definition CONTENT the object at [`Self::definition_s3_location`] held when
+    /// this version was created — what `WorkflowDefinition` reports.
+    ///
+    /// The service "takes a snapshot of the definition at creation time, so subsequent
+    /// changes to the Amazon S3 object will not affect the workflow unless you create a
+    /// new version", so the content is read ONCE, here, and never re-read: a read of
+    /// this version reports these bytes however the object has changed since. `None`
+    /// when there was nothing to snapshot (see
+    /// [`workflow_definition::snapshot_definition`]).
+    pub workflow_definition: Option<String>,
+    /// The schedule the snapshotted definition declares — what `ScheduleConfiguration`
+    /// reports. Derived from [`Self::workflow_definition`] when the version froze it, so
+    /// it describes the same immutable definition.
+    pub schedule_configuration: Option<ScheduleConfiguration>,
     pub code: Option<Code>,
     pub role_arn: String,
     pub description: Option<String>,

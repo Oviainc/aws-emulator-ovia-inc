@@ -40,14 +40,13 @@ use serde_json::{json, Value};
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::state::{
     ApplicationComponentRecord,
     ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState, ServerRecord,
-    COMPLETION_SPAN,
 };
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::import_and_assess::{
-    at, call, get_assessment, minimal_assessment, register_collector_in, start_assessment,
-    stop_assessment, Answer, TEST_REGION,
+    at, bring_every_completion_forward, call, get_assessment, minimal_assessment,
+    register_collector_in, start_assessment, stop_assessment, Answer, TEST_REGION,
 };
 
 /// `StrategyRecommendation`'s value for a strategy the service itself recommends, from
@@ -357,7 +356,8 @@ fn server_record(seeded: &Seeded) -> ServerRecord {
 /// the Region every request here is signed for — the same maps an ingestion writes.
 ///
 /// The engine is handed back beside the router so a case can bring the completion the
-/// clock owes an assessment forward ([`complete_the_span`]) instead of sleeping through it.
+/// clock owes an assessment forward ([`bring_every_completion_forward`]) instead of
+/// sleeping through it.
 fn portfolio() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     {
@@ -383,32 +383,12 @@ fn portfolio() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     (engine, router)
 }
 
-/// Move the instant the clock owes every assessment of this portfolio its completion into
-/// the PAST, so the next read materialises it.
-///
-/// It is the same thing the passing of the completion span does — the due instant is what
-/// the store compares `now` against — without a case spending that span asleep. The
-/// completion the reads then observe is still the stored one, timestamps included.
-///
-/// `pub(crate)` so the suite beside this one brings the same completion forward the same
-/// way.
-pub(crate) fn complete_the_span(engine: &Arc<engine::InMemoryEngine>) {
-    let state =
-        engine.state::<ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState>();
-    let mut store = state.lock();
-    let region = store.region_entry(TEST_REGION);
-    for assessment in region.assessments.values_mut() {
-        if let Some(due) = assessment.completion_due {
-            assessment.completion_due = Some(due - COMPLETION_SPAN - Duration::from_millis(100));
-        }
-    }
-}
-
 /// Push the instant the clock owes every assessment of this portfolio its completion a
 /// long way into the FUTURE, so a case can act on an assessment that is certainly still
 /// collecting however slow the run is.
 ///
-/// The counterpart of [`complete_the_span`], and the same mechanism: the due instant is
+/// The counterpart of [`bring_every_completion_forward`], and the same mechanism: the due
+/// instant is
 /// what the store compares `now` against.
 fn delay_the_span(engine: &Arc<engine::InMemoryEngine>) {
     let state =
@@ -480,7 +460,7 @@ async fn analyze(
         started.status, started.body
     );
     let assessment_id = started.string("/assessmentId");
-    complete_the_span(engine);
+    bring_every_completion_forward(engine);
 
     let reported = get_assessment(router, &assessment_id).await;
     assert_eq!(
