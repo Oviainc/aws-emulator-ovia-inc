@@ -18,9 +18,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::{
     CAMPAIGN_NOT_FOUND_MESSAGE, ONBOARDING_JOB_DURATION,
 };
-use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router};
+use super::common::{call, error_code, router, Harness};
 
 /// The region every case here signs for.
 const REGION: &str = "us-east-1";
@@ -30,7 +29,10 @@ const INSTANCE: &str = "not-found-control-instance";
 
 /// Onboard `INSTANCE` so `CreateCampaign` has a campaign target, then create one
 /// campaign and hand back its id.
-async fn a_stored_campaign(router: &MultiServiceRouter) -> String {
+async fn a_stored_campaign(router: &Harness) -> String {
+    // Onboarding resolves the `connectInstanceId` against the account's Connect
+    // instance registry, so the instance is registered there first.
+    router.register_connect_instance(REGION, INSTANCE);
     let (status, body) = call(
         router,
         REGION,

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteContainerService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteContainerService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes one of this store's container services, with everything the record it
+//! lives on carries.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteContainerService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +145,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteContainerService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteContainerServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteContainerService"))
+        // A container service is a REGIONAL resource whose name is unique within
+        // one region of the account, so the region the request is signed for is
+        // what that name is resolved in — the same way `CreateContainerService`
+        // stores it and `GetContainerServices` reports it.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `serviceName` is a modelled `@required` member carrying the modelled
+        // length and pattern, so the centralized walk refused anything outside
+        // them before this body ran. What is left is what the model cannot
+        // express: the name has to address a container service this account
+        // holds in this region.
+        crate::state::with_state(&*self.engine, |store| {
+            // "Deletes your Amazon Lightsail container service": the whole
+            // record goes, and with it everything that lives on it — the
+            // current and next deployments, the container images registered to
+            // the service, its public domain names, its tags and the access its
+            // image puller role held — so no later read reports any of them,
+            // the published public URL stops answering, and the name is free
+            // for a service that inherits nothing from this one. The removal IS
+            // the lookup, so a name that addresses nothing (never created,
+            // created in another region, or deleted a moment ago) is this
+            // service's `DoesNotExist` rejection rather than a reported
+            // deletion that did not happen, and two deletes of one service
+            // cannot both report having removed it.
+            store
+                .remove_container_service(&region, &input.service_name)
+                .ok_or_else(|| not_found(&input.service_name))?;
+            // The record is gone as this call returns, so the modelled result
+            // carries nothing to report: `DeleteContainerServiceResult` declares
+            // no member at all, which is what this operation's 204 answers.
+            Ok(DeleteContainerServiceOutput {})
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No container service of that name is stored in that region: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// identifier the request carried. The region scopes the LOOKUP, but it is not
+/// part of the message: the identifier the message names is the one the request
+/// carried.
+fn not_found(name: &str) -> DeleteContainerServiceError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DeleteContainerServiceError {
+    DeleteContainerServiceErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail container service store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

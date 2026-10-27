@@ -31,9 +31,12 @@
 //!   approver has accepted their invitation is `ACTIVE`; until then it is `PENDING`
 //!   with status code `PENDING_ACTIVATION`, which is what AWS reports for a team whose
 //!   approvers have not all answered.
-//! * The end of a pending deletion window ([`DEFAULT_PENDING_WINDOW_DAYS`]). Once it
-//!   elapses the team is gone, so `GetApprovalTeam` answers 404 and
-//!   `ListApprovalTeams` omits it.
+//! * The approval of an active team's DELETION ([`DELETION_APPROVAL_DELAY`]) and, after
+//!   it, the end of the pending window that approval starts
+//!   ([`DEFAULT_PENDING_WINDOW_DAYS`]). Until the approval the team reports
+//!   `DELETE_PENDING_APPROVAL`; once the window elapses the team is gone, so
+//!   `GetApprovalTeam` answers 404 and `ListApprovalTeams` omits it. A deletion the team
+//!   never approved removes nothing.
 //! * The activation of a new identity source ([`IDENTITY_SOURCE_ACTIVATION_DELAY`]). A
 //!   source is `CREATING` until it comes due and `ACTIVE` afterwards, which is what
 //!   `IdentitySourceStatus`' non-terminal `CREATING` token stands for. The approval
@@ -57,14 +60,16 @@
 //! # Sessions
 //!
 //! A session is an approval request put to ONE team's approvers.
-//! `StartApprovalTeamBaseline` starts a baseline session and `UpdateApprovalTeam` puts
-//! the change it was asked for to the team that has to approve it ([`SessionKind`]), and
-//! `GetSession` reports either out of its one record
+//! `StartApprovalTeamBaseline` starts a baseline session, `UpdateApprovalTeam` puts the
+//! change it was asked for to the team that has to approve it and
+//! `StartActiveApprovalTeamDeletion` puts the deletion of an active team to it
+//! ([`SessionKind`]), and `GetSession` reports any of them out of its one record
 //! ([`ComAmazonawsMpaAwsfluffycoreserviceState::session`]). No operation of this model
 //! records an approver's vote, so a baseline session waits in `PENDING` until either its
-//! expiration comes due or `CancelSession` ends it ([`Session::cancel`]); the one answer
-//! this store records is the one the CLOCK owes, the approval of a requested team update
-//! ([`UPDATE_APPROVAL_DELAY`]). A team's
+//! expiration comes due or `CancelSession` ends it ([`Session::cancel`]); the answers
+//! this store records are the ones the CLOCK owes, the approval of a requested team update
+//! ([`UPDATE_APPROVAL_DELAY`]) and of a requested deletion
+//! ([`DELETION_APPROVAL_DELAY`]). A team's
 //! outstanding baseline session is also what `GetApprovalTeam` reports for each approver
 //! ([`ComAmazonawsMpaAwsfluffycoreserviceState::pending_baseline_session_arn`]), so the
 //! two reads cannot disagree.
@@ -79,6 +84,16 @@
 //! ([`ApprovalTeam::activate_pending_update`]). A team whose configuration has never been
 //! activated takes the change in place ([`ApprovalTeam::bump_version`]): it has no
 //! approved configuration to protect.
+//!
+//! # A deletion an active team has to approve
+//!
+//! The deletion of an ACTIVE team is the same handshake: `StartActiveApprovalTeamDeletion`
+//! records it as a REQUESTED deletion ([`PendingTeamDeletion`],
+//! [`ApprovalTeam::request_deletion`]) and puts it to the team in a deletion session, so
+//! the team is removed only once that session carries the team's approval
+//! ([`ApprovalTeam::record_deletion_approval`]) and the pending window measured from that
+//! approval has elapsed. A session that ended without one is a deletion the team refused,
+//! so the team stays ([`ApprovalTeam::record_deletion_failure`]).
 //!
 //! # Approver MFA devices
 //!
@@ -219,6 +234,21 @@ pub const UPDATE_APPROVAL_DELAY: Duration = Duration::from_millis(500);
 /// the transient `UPDATE_PENDING_ACTIVATION` state the model declares a token for.
 pub const UPDATE_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
+/// How long after the deletion of an ACTIVE team is requested the team reports its
+/// approvers' approval of that deletion (and therefore how long the team waits in
+/// `DELETE_PENDING_APPROVAL`).
+///
+/// CHOSEN, not documented: a real approver answers an approval request whenever they
+/// answer it, and this model carries no operation that records a vote — the approvers'
+/// answer is modelled by the clock, exactly as their answer to a requested update is
+/// ([`UPDATE_APPROVAL_DELAY`]). It sits inside the 250–750 ms window this project fixes
+/// for a clock-owed transition, so a caller that reads the team back immediately still
+/// observes the deletion waiting on its approval.
+///
+/// It is NOT the pending window: that window is [`DEFAULT_PENDING_WINDOW_DAYS`] long by
+/// default and starts where this delay ends, at the approval.
+pub const DELETION_APPROVAL_DELAY: Duration = Duration::from_millis(500);
+
 /// How long after `CreateIdentitySource` the emulator reports the new source as
 /// `ACTIVE` (and therefore how long it stays `CREATING`).
 ///
@@ -276,7 +306,7 @@ pub const MAX_SESSIONS: usize = 1_000;
 /// `<prefix>.amazonaws.com` form every AWS service principal takes.
 pub const SERVICE_PRINCIPAL: &str = "mpa.amazonaws.com";
 
-/// Days between the delete request and the team's removal when
+/// Days between the team's APPROVAL of a delete request and the team's removal when
 /// `StartActiveApprovalTeamDeletion` omits `PendingWindowDays`.
 ///
 /// `PendingWindowDays` is documented as "Number of days between when the team
@@ -540,6 +570,33 @@ pub fn deletion_completion(start: SystemTime, days: i32) -> Option<SystemTime> {
     start.checked_add(pending_window(days)?)
 }
 
+/// The two instants a delete request schedules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeletionSchedule {
+    /// Instant the team's answer to the deletion session comes due
+    /// ([`DELETION_APPROVAL_DELAY`]).
+    pub approval_due: SystemTime,
+    /// Instant the removal the approved deletion owes becomes due: the pending window
+    /// measured from the APPROVAL, which is where `PendingWindowDays` counts from.
+    pub completion_time: SystemTime,
+}
+
+/// What a delete request made at `start` schedules, or `None` when `days` names no window
+/// this service can record and report.
+///
+/// The pending window runs from the team's APPROVAL of the request, not from the request,
+/// so the completion instant is [`DELETION_APPROVAL_DELAY`] (the span after which that
+/// approval is owed, and the instant it is stamped with) plus `days` days. Every step is
+/// checked, so no request can make this arithmetic panic a handler.
+#[must_use]
+pub fn deletion_schedule(start: SystemTime, days: i32) -> Option<DeletionSchedule> {
+    let approval_due = start.checked_add(DELETION_APPROVAL_DELAY)?;
+    Some(DeletionSchedule {
+        approval_due,
+        completion_time: deletion_completion(approval_due, days)?,
+    })
+}
+
 /// Status of an approval team, in the tokens `ApprovalTeamStatus` declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TeamStatus {
@@ -568,6 +625,7 @@ impl TeamStatus {
 pub enum TeamStatusCode {
     PendingActivation,
     DeletePendingApproval,
+    DeleteFailedApproval,
     UpdatePendingApproval,
     UpdatePendingActivation,
     UpdateFailedApproval,
@@ -580,6 +638,7 @@ impl TeamStatusCode {
         match self {
             Self::PendingActivation => "PENDING_ACTIVATION",
             Self::DeletePendingApproval => "DELETE_PENDING_APPROVAL",
+            Self::DeleteFailedApproval => "DELETE_FAILED_APPROVAL",
             Self::UpdatePendingApproval => "UPDATE_PENDING_APPROVAL",
             Self::UpdatePendingActivation => "UPDATE_PENDING_ACTIVATION",
             Self::UpdateFailedApproval => "UPDATE_FAILED_APPROVAL",
@@ -841,6 +900,65 @@ impl PendingTeamUpdate {
     }
 }
 
+/// The deletion of an ACTIVE team that its approvers have been asked to approve: the
+/// request `StartActiveApprovalTeamDeletion` recorded, and the two instants it answers
+/// with.
+///
+/// A team is removed only once this record carries the team's APPROVAL
+/// ([`PendingTeamDeletion::approval_time`]) and the pending window measured from it has
+/// elapsed ([`PendingTeamDeletion::removal_due`]), so a deletion nobody approved removes
+/// nothing.
+#[derive(Debug, Clone)]
+pub struct PendingTeamDeletion {
+    /// `PendingWindowDays` as the request named it (or the default): the number of days
+    /// between the team's approval of the request and the team's removal.
+    pub pending_window_days: i32,
+    /// The approval session the request was put to the team's approvers in.
+    pub session_arn: String,
+    /// Instant the deletion process was initiated, as `DeletionStartTime` reports it.
+    pub start_time: SystemTime,
+    /// Instant the approvers' answer to that session comes due
+    /// ([`DELETION_APPROVAL_DELAY`]). `None` once it has been materialised.
+    pub approval_due: Option<SystemTime>,
+    /// Instant the team APPROVED the deletion, and so the instant the pending window
+    /// starts. `None` until the approval is recorded.
+    pub approval_time: Option<SystemTime>,
+    /// Instant the deletion is scheduled to complete, as `DeletionCompletionTime` reports
+    /// it: the approval instant plus the pending window. It is fixed when the request is
+    /// recorded and never moves, because the approval the clock owes is stamped with the
+    /// instant it was DUE.
+    pub completion_time: SystemTime,
+}
+
+impl PendingTeamDeletion {
+    /// A freshly requested deletion: waiting on the team's approval, with the window that
+    /// approval starts already scheduled ([`deletion_schedule`]).
+    #[must_use]
+    pub fn requested(
+        pending_window_days: i32,
+        session_arn: String,
+        start: SystemTime,
+        schedule: DeletionSchedule,
+    ) -> Self {
+        Self {
+            pending_window_days,
+            session_arn,
+            start_time: start,
+            approval_due: Some(schedule.approval_due),
+            approval_time: None,
+            completion_time: schedule.completion_time,
+        }
+    }
+
+    /// Instant the team's removal is due, or `None` while the deletion carries no
+    /// approval: the window `PendingWindowDays` names runs from the APPROVAL, so an
+    /// unapproved deletion owes no removal at any instant.
+    #[must_use]
+    pub fn removal_due(&self) -> Option<SystemTime> {
+        self.approval_time.map(|_| self.completion_time)
+    }
+}
+
 /// A stored approval team: everything the lifecycle operations report.
 #[derive(Debug, Clone)]
 pub struct ApprovalTeam {
@@ -864,9 +982,10 @@ pub struct ApprovalTeam {
     pub status_message: Option<String>,
     pub creation_time: SystemTime,
     pub last_update_time: Option<SystemTime>,
-    pub deletion_start_time: Option<SystemTime>,
-    /// Instant at which the pending deletion window ends and the team is removed.
-    pub deletion_completion_time: Option<SystemTime>,
+    /// The deletion the team's approvers were asked to approve, if any — the record
+    /// `StartActiveApprovalTeamDeletion` writes, and the only thing that can make the
+    /// clock remove this team.
+    pub pending_deletion: Option<PendingTeamDeletion>,
     /// The change the team's approvers were last asked to approve, if any. It is the
     /// requested version `GetApprovalTeam` reports in `PendingUpdate`, and it is cleared
     /// once that version becomes the team's live one.
@@ -1002,6 +1121,56 @@ impl ApprovalTeam {
         for approver in &mut self.approvers {
             approver.synchronize_mfa_devices();
         }
+    }
+
+    /// Put a requested DELETION to the team's approvers: the team reports `DELETING` with
+    /// `DELETE_PENDING_APPROVAL` and keeps everything it has, because a deletion the team
+    /// has not approved yet removes nothing.
+    pub fn request_deletion(&mut self, requested: PendingTeamDeletion) {
+        self.status = TeamStatus::Deleting;
+        self.status_code = Some(TeamStatusCode::DeletePendingApproval);
+        self.pending_deletion = Some(requested);
+    }
+
+    /// The deletion that is still waiting on the team's approval, if there is one.
+    #[must_use]
+    pub fn unapproved_deletion(&self) -> Option<&PendingTeamDeletion> {
+        self.pending_deletion
+            .as_ref()
+            .filter(|deletion| deletion.approval_time.is_none())
+    }
+
+    /// Record the approvers' approval of the requested deletion: from here the pending
+    /// window runs, so the removal is owed at its end, and each approver who answered has
+    /// voting as their last activity.
+    ///
+    /// Nothing is pending the team's approval afterwards, so the team reports `DELETING`
+    /// with no status code: `ApprovalTeamStatusCode` carries no token for an approved
+    /// deletion inside its window.
+    pub fn record_deletion_approval(&mut self, at: SystemTime, answered: &[String]) {
+        let Some(deletion) = self.pending_deletion.as_mut() else {
+            return;
+        };
+        deletion.approval_due = None;
+        deletion.approval_time = Some(at);
+        self.status_code = None;
+        for approver in &mut self.approvers {
+            if answered.iter().any(|id| id == &approver.approver_id) {
+                approver.last_activity = Some(ApproverLastActivity::Voted);
+                approver.last_activity_time = Some(at);
+            }
+        }
+    }
+
+    /// Record that the requested deletion was NOT approved: the session it was put in
+    /// ended without the team's approval, so the team is not deleted and is active again,
+    /// reporting the failed approval.
+    pub fn record_deletion_failure(&mut self) {
+        if self.pending_deletion.take().is_none() {
+            return;
+        }
+        self.status = TeamStatus::Active;
+        self.status_code = Some(TeamStatusCode::DeleteFailedApproval);
     }
 }
 
@@ -1250,10 +1419,12 @@ impl SessionExecutionStatus {
 /// (`APPROVED | REJECTED | NO_RESPONSE`).
 ///
 /// `NO_RESPONSE` is where every approver starts. No operation of this model records a
-/// vote, so the one answer this emulator records is the one the CLOCK owes: the approval
+/// vote, so the answers this emulator records are the ones the CLOCK owes: the approval
 /// an approver gives the change `UpdateApprovalTeam` put to them
-/// ([`UPDATE_APPROVAL_DELAY`], [`Session::approve`]), the same way the clock owes their
-/// answer to an invitation. `REJECTED` stands for a refusal nothing here produces.
+/// ([`UPDATE_APPROVAL_DELAY`]) and the one they give the deletion
+/// `StartActiveApprovalTeamDeletion` put to them ([`DELETION_APPROVAL_DELAY`],
+/// [`Session::approve`]), the same way the clock owes their answer to an invitation.
+/// `REJECTED` stands for a refusal nothing here produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionResponse {
     Approved,
@@ -1310,17 +1481,21 @@ impl AdditionalSecurityRequirement {
 
 /// What a session was started FOR, which is what fixes the action it reports.
 ///
-/// Two operations of this model put a request to a team's approvers:
-/// `StartApprovalTeamBaseline` starts a baseline session, and `UpdateApprovalTeam` puts
-/// the change it was asked for to the team that has to approve it; a session a protected
-/// operation of another service starts is not reachable from this API at all. The kind
-/// is what [`SessionKind::action_name`] reports as `ActionName` and what tells a team's
-/// outstanding BASELINE session from any other session of the same team
+/// Three operations of this model put a request to a team's approvers:
+/// `StartApprovalTeamBaseline` starts a baseline session, `UpdateApprovalTeam` puts the
+/// change it was asked for to the team that has to approve it, and
+/// `StartActiveApprovalTeamDeletion` puts the deletion of an active team to it — the
+/// model documents that both an update and a deletion of an active team require the
+/// team's approval; a session a protected operation of another service starts is not
+/// reachable from this API at all. The kind is what [`SessionKind::action_name`] reports
+/// as `ActionName` and what tells a team's outstanding BASELINE session from any other
+/// session of the same team
 /// ([`ComAmazonawsMpaAwsfluffycoreserviceState::pending_baseline_session_arn`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
     Baseline,
     Update,
+    Deletion,
 }
 
 impl SessionKind {
@@ -1331,6 +1506,7 @@ impl SessionKind {
         match self {
             Self::Baseline => "StartApprovalTeamBaseline",
             Self::Update => "UpdateApprovalTeam",
+            Self::Deletion => "StartActiveApprovalTeamDeletion",
         }
     }
 }
@@ -2080,24 +2256,11 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     /// Apply every change the clock already owes at `now`, so each handler reads a
     /// store that is current. Idempotent, and a no-op when nothing is due.
     ///
-    /// Only clock-owed changes happen here: a deletion window that has run out, an
-    /// invitation response that has come due, and the approval and activation of a change
-    /// a team was asked for. Nothing a caller has to ask for.
+    /// Only clock-owed changes happen here: an invitation response that has come due, the
+    /// approval and activation of a change a team was asked for, the approval of a
+    /// deletion it was asked for, and the removal an APPROVED deletion owes once its
+    /// pending window has run out. Nothing a caller has to ask for.
     pub fn materialize_due(&mut self, now: SystemTime) {
-        // A team whose pending deletion window has elapsed is gone.
-        let elapsed: Vec<String> = self
-            .approval_teams
-            .values()
-            .filter(|team| {
-                team.deletion_completion_time
-                    .is_some_and(|due| due <= now)
-            })
-            .map(|team| team.arn.clone())
-            .collect();
-        for arn in elapsed {
-            self.remove_team(&arn);
-        }
-
         for team in self.approval_teams.values_mut() {
             // The approvers of the team AND of the change it has been asked to approve:
             // an approver that change ADDS is invited when the change is requested, so
@@ -2272,6 +2435,88 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
                     team.activate_pending_update(due);
                 }
             }
+        }
+
+        // The deletion a team's approvers were asked to approve. Their approval is what
+        // STARTS the pending window, so it is recorded first and the removal below is owed
+        // only afterwards. A session that ended without an approval — cancelled, or
+        // expired unanswered — is a deletion the team refused, so the team stays.
+        let requested_deletions: Vec<String> = self
+            .approval_teams
+            .values()
+            .filter(|team| team.unapproved_deletion().is_some())
+            .map(|team| team.arn.clone())
+            .collect();
+        for team_arn in requested_deletions {
+            let Some((session_arn, Some(due))) = self
+                .approval_teams
+                .get(&team_arn)
+                .and_then(ApprovalTeam::unapproved_deletion)
+                .map(|deletion| (deletion.session_arn.clone(), deletion.approval_due))
+            else {
+                continue;
+            };
+            match self
+                .sessions
+                .get(&session_arn)
+                .map(|session| (session.status, session.completion_time))
+            {
+                // Still outstanding: the approvers' answer is owed at `due`, and the
+                // answer is stamped with that instant rather than with `now`, so a
+                // materialised value does not move between reads — which is also why the
+                // completion instant the request was answered with stays true.
+                Some((status, _)) if status.is_outstanding() => {
+                    if due <= now {
+                        let answered = self
+                            .sessions
+                            .get_mut(&session_arn)
+                            .map_or_else(Vec::new, |session| session.approve(due));
+                        if let Some(team) = self.approval_teams.get_mut(&team_arn) {
+                            team.record_deletion_approval(due, &answered);
+                        }
+                    }
+                }
+                // The session already carries the team's approval, which is only ever
+                // recorded at the instant it was DUE, so it is read back under the same
+                // gate rather than on trust.
+                Some((SessionStatus::Approved, completed)) if due <= now => {
+                    let answered = self
+                        .sessions
+                        .get_mut(&session_arn)
+                        .map_or_else(Vec::new, |session| session.approve(due));
+                    if let Some(team) = self.approval_teams.get_mut(&team_arn) {
+                        team.record_deletion_approval(completed.unwrap_or(due), &answered);
+                    }
+                }
+                // Nothing is owed yet: an approval that has not come due.
+                Some((SessionStatus::Approved, _)) => {}
+                // The session ended without an approval, or no longer exists: this is a
+                // deletion the team did not approve, and an unapproved deletion deletes
+                // nothing.
+                _ => {
+                    if let Some(team) = self.approval_teams.get_mut(&team_arn) {
+                        team.record_deletion_failure();
+                    }
+                }
+            }
+        }
+
+        // A team whose APPROVED deletion's pending window has elapsed is gone. The window
+        // runs from the approval ([`PendingTeamDeletion::removal_due`]), so a team that
+        // was asked to be deleted and never approved it is never removed here.
+        let elapsed: Vec<String> = self
+            .approval_teams
+            .values()
+            .filter(|team| {
+                team.pending_deletion
+                    .as_ref()
+                    .and_then(PendingTeamDeletion::removal_due)
+                    .is_some_and(|due| due <= now)
+            })
+            .map(|team| team.arn.clone())
+            .collect();
+        for arn in elapsed {
+            self.remove_team(&arn);
         }
     }
 

@@ -33,7 +33,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::sta
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router};
+use super::common::{call, error_code, router, Harness};
 
 /// The region every case here signs for; nothing in an integration record is
 /// region-dependent — the ARNs it holds are the caller's — so one is enough.
@@ -117,7 +117,11 @@ pub fn integration_configs() -> Vec<(&'static str, Value)> {
 /// instant the job is due at: an instance is a target for integrations only once its
 /// onboarding job has finished. Nothing in the emulator sleeps for the transition —
 /// the record stores the instant — so a case only has to let the clock pass it.
-pub async fn onboard(router: &MultiServiceRouter, instance_id: &str) {
+///
+/// The instance is registered in the account's Connect registry first, since
+/// onboarding resolves the `connectInstanceId` against it.
+pub async fn onboard(router: &Harness, instance_id: &str) {
+    router.register_connect_instance(REGION, instance_id);
     let (status, body) = call(
         router,
         REGION,
@@ -491,6 +495,7 @@ async fn only_an_onboarded_instance_has_integrations() {
 
     // An instance whose onboarding job has only just started has not finished
     // onboarding, so it is not a target for integrations yet.
+    router.register_connect_instance(REGION, "in-progress-instance");
     let (status, body) = call(
         &router,
         REGION,

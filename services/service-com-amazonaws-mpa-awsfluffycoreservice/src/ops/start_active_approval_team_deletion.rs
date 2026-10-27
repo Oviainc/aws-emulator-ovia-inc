@@ -1,12 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartActiveApprovalTeamDeletion
-//! Starts the pending-window deletion of an ACTIVE approval team: the stored team moves
-//! to `DELETING` / `DELETE_PENDING_APPROVAL`, its `DeletionStartTime` is recorded and its
-//! `DeletionCompletionTime` is set `PendingWindowDays` days later. Both are returned, and
-//! a following `GetApprovalTeam` reports `DELETING`. Once the window elapses the team is
-//! gone, so `GetApprovalTeam` answers 404 and `ListApprovalTeams` omits it — see
-//! [`crate::state`] for who materialises that.
+//! REQUESTS the deletion of an ACTIVE approval team: "Deletions require team approval",
+//! so the request is put to the team's approvers in a deletion session
+//! ([`crate::state::SessionKind::Deletion`]) rather than carried out, exactly as the
+//! sibling `UpdateApprovalTeam` puts a change to them. The stored team moves to
+//! `DELETING` / `DELETE_PENDING_APPROVAL` and keeps everything it has, its
+//! `DeletionStartTime` is recorded, and its `DeletionCompletionTime` is the end of the
+//! pending window — which `PendingWindowDays` measures from the team's APPROVAL of the
+//! request, not from the request. Both instants are returned, a following
+//! `GetApprovalTeam` reports `DELETING` and `ListSessions` reports the session the team
+//! has to answer.
+//!
+//! * The team is removed only once that session carries the team's approval and the
+//!   window measured from it has elapsed; then `GetApprovalTeam` answers 404 and
+//!   `ListApprovalTeams` omits it — see [`crate::state`] for who materialises both. A
+//!   session that ended without an approval (`CancelSession`, or an expiration nobody
+//!   answered) is a deletion the team refused: the team stays, active again and reporting
+//!   `DELETE_FAILED_APPROVAL`.
 //!
 //! * An ARN outside the caller's own account is refused with `AccessDeniedException`
 //!   (403) BEFORE the lookup ([`crate::state::authorize_resource_arn`]), so an
@@ -20,9 +31,14 @@
 //! * `PendingWindowDays` is a count of days, so a value below one names no window, and a
 //!   value past [`crate::state::MAX_PENDING_WINDOW_DAYS`] names a completion instant this
 //!   service could not report: `ValidationException` (400). The model gives the member no
-//!   `range` to close either end. The whole window is computed with checked arithmetic
-//!   before anything is mutated, so no request can panic the handler or leave a team
-//!   half-moved into `DELETING`.
+//!   `range` to close either end. The whole schedule is computed with checked arithmetic
+//!   before anything is mutated ([`crate::state::deletion_schedule`]), so no request can
+//!   panic the handler, start a session for a deletion that is then refused, or leave a
+//!   team half-moved into `DELETING`.
+//! * A caller looping on this operation cannot grow this process's memory without end:
+//!   the store's session ceiling ([`crate::state::MAX_SESSIONS`]) is reported with the
+//!   `ValidationException` (400) this operation declares, since it declares no quota
+//!   error.
 //!
 //! ## Shape of an operation
 //!
@@ -169,7 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The one message this service answers every resource lookup that resolves to
+        // nothing with (`crate::state::resource_not_found`).
+        let not_found = || -> Self::Error {
+            StartActiveApprovalTeamDeletionErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into()
+        };
         // The account boundary is evaluated BEFORE the resource is resolved: a
         // destructive call on an ARN outside the caller's account is refused with the
         // modelled `AccessDeniedException` (403) rather than reported as "already
@@ -190,13 +213,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         state.materialize_due(now);
 
-        // The whole window is computed BEFORE anything is mutated, with checked
+        // The whole schedule — when the team's answer comes due, and when the window that
+        // answer starts ends — is computed BEFORE anything is mutated, with checked
         // arithmetic throughout, so a request can neither panic this handler nor leave a
         // team half-moved into DELETING.
         let days = input
             .pending_window_days
             .unwrap_or(crate::state::DEFAULT_PENDING_WINDOW_DAYS);
-        let Some(completion) = crate::state::deletion_completion(now, days) else {
+        let Some(schedule) = crate::state::deletion_schedule(now, days) else {
             return Err(
                 StartActiveApprovalTeamDeletionErrorModeled::ValidationException(
                     ValidationException {
@@ -210,25 +234,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        let Some(team) = state.team_mut(&input.arn) else {
-            // The one message this service answers every resource lookup that
-            // resolves to nothing with (`crate::state::resource_not_found`).
-            return Err(
-                StartActiveApprovalTeamDeletionErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(),
-                )
-                .into(),
-            );
+        // The session this request is put in asks the team as it stands, so the record is
+        // read once and the team is only written to when the request is accepted.
+        let Some(team_record) = state.team(&input.arn).cloned() else {
+            return Err(not_found());
         };
 
-        match team.status {
-            // Already in the pending window: answer with what was recorded.
+        match team_record.status {
+            // Already requested: `@idempotent`, so the caller is answered with the window
+            // the first request recorded and nothing is started twice.
             crate::state::TeamStatus::Deleting => {}
             crate::state::TeamStatus::Active => {
-                team.status = crate::state::TeamStatus::Deleting;
-                team.status_code = Some(crate::state::TeamStatusCode::DeletePendingApproval);
-                team.deletion_start_time = Some(now);
-                team.deletion_completion_time = Some(completion);
+                // The store is bounded, so a caller looping on this operation cannot grow
+                // this process's memory without end
+                // (`crate::state::MAX_SESSIONS`). This operation declares no quota error,
+                // so the ceiling is reported with the `ValidationException` (400) it does
+                // declare.
+                if state.sessions.len() >= crate::state::MAX_SESSIONS {
+                    return Err(
+                        StartActiveApprovalTeamDeletionErrorModeled::ValidationException(
+                            ValidationException {
+                                message: format!(
+                                    "The account has reached its quota of {} approval \
+                                     sessions.",
+                                    crate::state::MAX_SESSIONS
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+
+                // The session asks the approvers the team has NOW: they are the ones whose
+                // approval the deletion needs.
+                let session_approvers: Vec<crate::state::SessionApprover> = team_record
+                    .approvers
+                    .iter()
+                    .map(|approver| crate::state::SessionApprover {
+                        approver_id: approver.approver_id.clone(),
+                        identity_id: approver.primary_identity_id.clone(),
+                        identity_source_arn: approver.primary_identity_source_arn.clone(),
+                        // Nothing records a vote, so every approver starts unanswered; the
+                        // approval the clock owes is what answers for them.
+                        response: crate::state::SessionResponse::NoResponse,
+                        response_time: None,
+                    })
+                    .collect();
+                // The one path every session of this service is recorded through
+                // (`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::start_session`),
+                // so a deletion session and an update session differ only in their kind —
+                // and a session that cannot be built writes nothing.
+                let Some(session_arn) = state.start_session(
+                    crate::state::SessionKind::Deletion,
+                    &team_record,
+                    session_approvers,
+                    crate::state::request_region(ctx.parts()),
+                    now,
+                ) else {
+                    return Err(
+                        StartActiveApprovalTeamDeletionErrorModeled::InternalServerException(
+                            InternalServerException {
+                                message: "the session's expiration instant could not be \
+                                          computed"
+                                    .to_string(),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+
+                let team = state.team_mut(&input.arn).ok_or_else(not_found)?;
+                team.request_deletion(crate::state::PendingTeamDeletion::requested(
+                    days,
+                    session_arn,
+                    now,
+                    schedule,
+                ));
             }
             other => {
                 return Err(StartActiveApprovalTeamDeletionErrorModeled::ConflictException(
@@ -245,13 +326,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Answered out of the recorded request, so the repeat of an `@idempotent` call
+        // reports the same two instants the first one did.
+        let recorded = state
+            .team(&input.arn)
+            .and_then(|team| team.pending_deletion.as_ref());
         Ok(StartActiveApprovalTeamDeletionOutput {
-            deletion_start_time: team
-                .deletion_start_time
-                .map(::aws_smithy_types::DateTime::from),
-            deletion_completion_time: team
-                .deletion_completion_time
-                .map(::aws_smithy_types::DateTime::from),
+            deletion_start_time: recorded
+                .map(|deletion| ::aws_smithy_types::DateTime::from(deletion.start_time)),
+            deletion_completion_time: recorded
+                .map(|deletion| ::aws_smithy_types::DateTime::from(deletion.completion_time)),
         })
     }
 }

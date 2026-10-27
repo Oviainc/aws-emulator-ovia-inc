@@ -172,6 +172,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle_due();
 
+        // A value that is not a kafkaconnect ARN at all names no connector, so
+        // it is incorrect input rather than a resource that is absent: the
+        // modelled 400, blaming the member that carried it. Refused before any
+        // state is touched, so nothing is recorded.
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "connectorArn",
+            &input.connector_arn,
+            crate::state::ARN_SERVICE,
+        ) {
+            return Err(RestartConnectorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into());
+        }
+
         // A regional endpoint acts only on its own region's connectors, so a
         // connectorArn minted in another region restarts nothing and is
         // answered exactly as an ARN this service never minted.

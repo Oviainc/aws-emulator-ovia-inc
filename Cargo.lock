@@ -7869,6 +7869,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-connect-amazonconnectservice",
  "sha2 0.10.9",
  "tokio",
  "tracing",

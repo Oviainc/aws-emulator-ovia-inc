@@ -2,9 +2,11 @@
 
 //! @op DeleteConnector
 //! Starts the deletion of the stored connector the ARN names: the connector moves to
-//! `DELETING` and the clock drops it `crate::state::TRANSITION_SPAN` later. An ARN no
-//! stored connector carries is a `NotFoundException`; a `currentVersion` that is not the
-//! connector's current one is a `BadRequestException`. Idempotent: a repeat while the
+//! `DELETING` and the clock drops it `crate::state::TRANSITION_SPAN` later. A
+//! `connectorArn` that is not a well-formed ARN of this service, and a `currentVersion`
+//! that is not the connector's current one, are both a `BadRequestException`; a
+//! well-formed ARN no stored connector carries is a `NotFoundException`. Idempotent: a
+//! repeat while the
 //! connector is already `DELETING` answers the same state without moving the due instant.
 //!
 //! ## Shape of an operation
@@ -166,6 +168,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
         state.settle_due();
+
+        // A value that is not a kafkaconnect ARN at all names no connector, so
+        // it is incorrect input rather than a resource that is absent: the
+        // modelled 400, blaming the member that carried it. Refused before any
+        // state is touched, so nothing is marked for deletion.
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "connectorArn",
+            &input.connector_arn,
+            crate::state::ARN_SERVICE,
+        ) {
+            return Err(DeleteConnectorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into());
+        }
 
         // A regional endpoint resolves only its own region's connectors, so a
         // connectorArn minted in another region deletes nothing and is answered

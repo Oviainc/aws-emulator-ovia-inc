@@ -199,15 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `bucketArn` that is not an ARN at all names no bucket, so the request
         // is refused rather than stored. The model types the member as a plain
         // `__string`, so the framework cannot refuse it at the boundary.
-        if !crate::state::is_arn_for(
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "bucketArn",
             &input.location.s3_location.bucket_arn,
             crate::state::S3_ARN_SERVICE,
         ) {
             return Err(CreateCustomPluginErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::invalid_parameter_because(
-                    "bucketArn",
-                    crate::state::INVALID_ARN,
-                )),
+                message: Some(message),
             })
             .into());
         }

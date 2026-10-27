@@ -271,6 +271,12 @@ pub const LIST_BY_SYSTEM: &str = "SYSTEM";
 pub const ACCELERATION_MODE_DISABLED: &str = "DISABLED";
 /// See [`ACCELERATION_MODE_DISABLED`].
 pub const ACCELERATION_STATUS_NOT_APPLICABLE: &str = "NOT_APPLICABLE";
+/// The `AccelerationStatus` of a job whose mode is any OTHER `AccelerationMode` than
+/// [`ACCELERATION_MODE_DISABLED`] — one that asked for accelerated transcoding, and whose
+/// compatibility the service has not decided yet: "AccelerationStatus is IN_PROGRESS
+/// initially, while the service determines whether the input files and job settings are
+/// compatible with accelerated transcoding."
+pub const ACCELERATION_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 
 /// `BillingTagsSource` values (`smithy_query(query="shape",shape="BillingTagsSource")`):
 /// "The tag type that AWS Billing and Cost Management will use to sort your AWS Elemental
@@ -3078,7 +3084,7 @@ impl JobRecord {
     pub fn view(&self, region: &str) -> Job {
         Job {
             acceleration_settings: Some(self.acceleration_settings.clone()),
-            acceleration_status: self.acceleration_status(),
+            acceleration_status: Some(self.acceleration_status().to_string()),
             arn: Some(job_arn(region, &self.id)),
             billing_tags_source: Some(self.billing_tags_source.clone()),
             client_request_token: self.client_request_token.clone(),
@@ -3142,12 +3148,26 @@ impl JobRecord {
         }
     }
 
-    /// `NOT_APPLICABLE` whenever acceleration is off, per `AccelerationStatus`'s doc.
-    /// For a job that asked for acceleration the status is decided by probing the
-    /// input, which never happens here, so it stays absent.
-    fn acceleration_status(&self) -> Option<String> {
-        (self.acceleration_settings.mode == ACCELERATION_MODE_DISABLED)
-            .then(|| ACCELERATION_STATUS_NOT_APPLICABLE.to_string())
+    /// The job's `AccelerationStatus`, read off its OWN `AccelerationSettings.Mode`, which
+    /// is the only thing the member's doc derives it from.
+    ///
+    /// `NOT_APPLICABLE` whenever acceleration is off ("For jobs that have Acceleration
+    /// (AccelerationMode) set to DISABLED, AccelerationStatus is always NOT_APPLICABLE").
+    /// Every other mode asks for accelerated transcoding, and such a job reports
+    /// `IN_PROGRESS` "initially, while the service determines whether the input files and
+    /// job settings are compatible with accelerated transcoding" — so the member is always
+    /// one of those two states and never absent. The later states the doc names,
+    /// `ACCELERATED` and `NOT_ACCELERATED`, both describe the OUTCOME of that compatibility
+    /// determination; nothing here makes it, so no job reports an outcome of it. The status
+    /// is therefore independent of the job's own status by design: it does not move when the
+    /// job leaves `SUBMITTED`, because what decides it is the compatibility check, not how
+    /// far the job has got.
+    fn acceleration_status(&self) -> &'static str {
+        if self.acceleration_settings.mode == ACCELERATION_MODE_DISABLED {
+            ACCELERATION_STATUS_NOT_APPLICABLE
+        } else {
+            ACCELERATION_STATUS_IN_PROGRESS
+        }
     }
 }
 
