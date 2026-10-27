@@ -1610,8 +1610,12 @@ impl DatasetRecord {
 /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::put_dataset_data_segment`] — the
 /// entry point every producer path (`BatchAssociateDataSegmentsToDataset`, the
 /// bulk import of time series data into a session dataset, or a test seeding a
-/// dataset) calls — and the only remover is
-/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::delete_dataset_data_segment`].
+/// dataset) calls — and the removers are
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::delete_dataset_data_segment`]
+/// and
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::disassociate_dataset_data_segment`],
+/// which differ only in whether the caller also deletes the data the segment
+/// covered.
 #[derive(Debug, Clone)]
 pub struct DataSegmentRecord {
     /// The dataset the segment's data came from: the holding dataset itself for a
@@ -4464,20 +4468,63 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         start: &TimeInNanos,
         end: &TimeInNanos,
     ) -> bool {
-        let Some(held) = self.dataset_data_segments.get_mut(dataset_id) else {
+        let Some(held) = self.dataset_data_segments.get(dataset_id) else {
             return false;
         };
-        let wanted = (time_series_id, timestamp_key(start), timestamp_key(end));
-        let Ok(at) = held.binary_search_by(|stored| data_segment_key(stored).cmp(&wanted)) else {
+        let Some(at) = data_segment_at(held, time_series_id, start, end) else {
             return false;
+        };
+        self.forget_dataset_data_segment_at(dataset_id, at);
+        true
+    }
+
+    /// Forget the segment of `dataset_id` that `source_dataset_id`,
+    /// `time_series_id` and the span `[start, end)` name EXACTLY, answering
+    /// whether one was held.
+    ///
+    /// What `BatchDisassociateDataSegmentsFromDataset` does to one entry: the
+    /// time series and the span are the segment's identity inside the dataset
+    /// that holds it, and the source names the dataset the segment's data came
+    /// from, so a segment the dataset holds under a different source is not the
+    /// one addressed and nothing is removed. Only the association goes: the
+    /// data the segment covered belongs to the source dataset and is untouched
+    /// here, which is what separates this from
+    /// [`Self::delete_dataset_data_segment`], whose caller deletes that data
+    /// too.
+    pub fn disassociate_dataset_data_segment(
+        &mut self,
+        dataset_id: &str,
+        source_dataset_id: &str,
+        time_series_id: &str,
+        start: &TimeInNanos,
+        end: &TimeInNanos,
+    ) -> bool {
+        let Some(held) = self.dataset_data_segments.get(dataset_id) else {
+            return false;
+        };
+        let Some(at) = data_segment_at(held, time_series_id, start, end) else {
+            return false;
+        };
+        if held[at].source_dataset_id != source_dataset_id {
+            return false;
+        }
+        self.forget_dataset_data_segment_at(dataset_id, at);
+        true
+    }
+
+    /// Drop the segment `dataset_id` holds at `at` in its sorted log — the one
+    /// remover both paths above go through, so a dataset emptied by either is
+    /// left in the same shape.
+    fn forget_dataset_data_segment_at(&mut self, dataset_id: &str, at: usize) {
+        let Some(held) = self.dataset_data_segments.get_mut(dataset_id) else {
+            return;
         };
         held.remove(at);
         // A dataset that holds no segments holds no entry either, so the map does
-        // not grow an empty vector per dataset a deletion has emptied.
+        // not grow an empty vector per dataset a removal has emptied.
         if held.is_empty() {
             self.dataset_data_segments.remove(dataset_id);
         }
-        true
     }
 
     /// The stored data stream whose own `TimeSeriesId` is `time_series_id`, or
@@ -6010,6 +6057,23 @@ fn data_segment_key(segment: &DataSegmentRecord) -> (&str, (i64, i32), (i64, i32
         timestamp_key(&segment.start_timestamp),
         timestamp_key(&segment.end_timestamp),
     )
+}
+
+/// Where in a dataset's sorted segment log the segment `time_series_id` and the
+/// span `[start, end)` name EXACTLY sits, or `None` when the log holds none.
+///
+/// The one lookup every operation addressing a single segment goes through —
+/// the read and the removal alike — so a segment is found by its identity in
+/// exactly one place.
+fn data_segment_at(
+    held: &[DataSegmentRecord],
+    time_series_id: &str,
+    start: &TimeInNanos,
+    end: &TimeInNanos,
+) -> Option<usize> {
+    let wanted = (time_series_id, timestamp_key(start), timestamp_key(end));
+    held.binary_search_by(|stored| data_segment_key(stored).cmp(&wanted))
+        .ok()
 }
 
 /// A wall-clock instant as the modelled `TimeInNanos`: whole seconds since the

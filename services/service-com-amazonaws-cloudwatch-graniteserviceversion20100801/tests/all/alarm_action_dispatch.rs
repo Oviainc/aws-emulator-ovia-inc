@@ -22,7 +22,8 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    element, emulator, grant_sns_delivery, now_secs, rpc, sns, wait_for_evaluation, Emulator,
+    document_instant_secs, element, emulator, grant_sns_delivery, now_secs, rpc, sns,
+    wait_for_evaluation, Emulator,
 };
 
 /// The customer namespace every alarm in this suite watches.
@@ -682,12 +683,12 @@ async fn a_notification_reports_the_transition_the_alarm_made() {
         .get("StateTransitionedTimestamp")
         .and_then(Value::as_f64)
         .expect("DescribeAlarms reports when the state last changed");
-    let parsed = ::aws_smithy_types::DateTime::from_str(
-        change_time,
-        ::aws_smithy_types::date_time::Format::DateTime,
-    )
-    .expect("the notification's StateChangeTime is an RFC 3339 instant")
-    .as_secs_f64();
+    let parsed = document_instant_secs(change_time).unwrap_or_else(|| {
+        panic!(
+            "the notification's StateChangeTime must be the form a document writes an instant \
+             in (yyyy-MM-dd'T'HH:mm:ss.SSSZ), got {change_time:?}"
+        )
+    });
     assert!(
         (parsed - transitioned).abs() < 0.001,
         "the notification's StateChangeTime must be the instant DescribeAlarms reports as \

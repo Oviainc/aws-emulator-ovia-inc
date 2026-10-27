@@ -198,104 +198,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The bounds the input members' target shapes carry in their names
-        // (`__stringMin1Max255PatternS`, `__stringMin0Max1024`,
-        // `__stringMin1Max256PatternS`, `__stringMax64`). The modelled
-        // constraints are refused before this handler runs where the model
-        // declares them; these checks are what makes the bound hold either way,
-        // and each names the member and the bound it broke.
-        bounded(
-            "name",
-            Some(input.name.as_str()),
-            1,
-            crate::state::MAX_RESOURCE_NAME_LEN,
-        )?;
-        bounded(
-            "description",
-            input.description.as_deref(),
-            0,
-            crate::state::MAX_RESOURCE_DESCRIPTION_LEN,
-        )?;
-        bounded(
-            "requestId",
-            input.request_id.as_deref(),
-            1,
-            crate::state::MAX_REQUEST_ID_LEN,
-        )?;
-        bounded(
-            "metricName",
-            Some(input.metric_name.as_str()),
-            0,
-            crate::state::MAX_METRIC_NAME_LEN,
-        )?;
-
-        // Each of the four enum members is a CLOSED set ("The comparison
-        // operator used to compare the specified statistic and the threshold",
-        // "The statistic to apply to the alarm's metric data", "The resource type
-        // this template should dynamically generate cloudwatch metric alarms
-        // for", "Specifies how missing data points are treated"), so a value
-        // outside its catalog names nothing the service can evaluate. The
-        // catalogs are the model's own, generated into `super::types`.
-        for (member, values, value) in [
-            (
-                "comparisonOperator",
-                CLOUD_WATCH_ALARM_TEMPLATE_COMPARISON_OPERATOR_VALUES,
-                input.comparison_operator.as_str(),
-            ),
-            (
-                "statistic",
-                CLOUD_WATCH_ALARM_TEMPLATE_STATISTIC_VALUES,
-                input.statistic.as_str(),
-            ),
-            (
-                "targetResourceType",
-                CLOUD_WATCH_ALARM_TEMPLATE_TARGET_RESOURCE_TYPE_VALUES,
-                input.target_resource_type.as_str(),
-            ),
-            (
-                "treatMissingData",
-                CLOUD_WATCH_ALARM_TEMPLATE_TREAT_MISSING_DATA_VALUES,
-                input.treat_missing_data.as_str(),
-            ),
-        ] {
-            if !values.contains(&value) {
-                return Err(bad_request(format!(
-                    "{member} must be one of {}, but was {value}",
-                    values.join(", ")
-                )));
-            }
-        }
-
-        // The numeric bounds the same way: `Period` is
-        // `__integerMin10Max86400`, and `EvaluationPeriods` and
-        // `DatapointsToAlarm` are both `__integerMin1`.
-        in_range(
-            "period",
-            Some(input.period),
-            crate::state::MIN_ALARM_PERIOD_SECONDS,
-            crate::state::MAX_ALARM_PERIOD_SECONDS,
-        )?;
-        in_range(
-            "evaluationPeriods",
-            Some(input.evaluation_periods),
-            crate::state::MIN_ALARM_DATAPOINTS,
-            i32::MAX,
-        )?;
-        in_range(
-            "datapointsToAlarm",
-            input.datapoints_to_alarm,
-            crate::state::MIN_ALARM_DATAPOINTS,
-            i32::MAX,
-        )?;
-
-        // `Threshold` is a `__double` with no modelled bound, but a value that is
-        // not a real number is no threshold to compare a statistic against.
-        if !input.threshold.is_finite() {
-            return Err(bad_request(format!(
-                "threshold must be a finite number, but was {}",
-                input.threshold
-            )));
-        }
+        // The settings this request asks the template to carry, against the ONE
+        // rule set the alarm template slice states for them — the length bounds,
+        // the closed enum catalogs, the numeric ranges and the finite threshold —
+        // so this create and the update beside it cannot read one constraint on
+        // one member of this resource two ways. A create names every setting, so
+        // every rule applies here.
+        crate::state::check_alarm_template_settings(&crate::state::AlarmTemplateSettings {
+            name: Some(input.name.as_str()),
+            description: input.description.as_deref(),
+            request_id: input.request_id.as_deref(),
+            metric_name: Some(input.metric_name.as_str()),
+            comparison_operator: Some(input.comparison_operator.as_str()),
+            statistic: Some(input.statistic.as_str()),
+            target_resource_type: Some(input.target_resource_type.as_str()),
+            treat_missing_data: Some(input.treat_missing_data.as_str()),
+            period: Some(input.period),
+            evaluation_periods: Some(input.evaluation_periods),
+            datapoints_to_alarm: input.datapoints_to_alarm,
+            threshold: Some(input.threshold),
+        })
+        .map_err(bad_request)?;
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
@@ -394,46 +317,6 @@ fn refused(
             .into()
         }
     }
-}
-
-/// Refuse a member whose length is outside the bounds its target shape names,
-/// with the operation's own modelled client error and a message built from the
-/// request: the member, the bound and the length that broke it.
-fn bounded(
-    member: &str,
-    value: Option<&str>,
-    min: usize,
-    max: usize,
-) -> Result<(), CreateCloudWatchAlarmTemplateError> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let len = value.chars().count();
-    if len >= min && len <= max {
-        return Ok(());
-    }
-    Err(bad_request(format!(
-        "{member} must be between {min} and {max} characters long, but was {len}"
-    )))
-}
-
-/// Refuse a numeric member outside the range its target shape names, the same
-/// way [`bounded`] refuses a string outside its length bounds.
-fn in_range(
-    member: &str,
-    value: Option<i32>,
-    min: i32,
-    max: i32,
-) -> Result<(), CreateCloudWatchAlarmTemplateError> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    if value >= min && value <= max {
-        return Ok(());
-    }
-    Err(bad_request(format!(
-        "{member} must be between {min} and {max}, but was {value}"
-    )))
 }
 
 /// This operation's modelled 400, for a request the model's own constraints do

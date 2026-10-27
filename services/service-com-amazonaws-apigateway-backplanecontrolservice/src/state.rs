@@ -3265,12 +3265,18 @@ pub fn invalid_model_content_type(content_type: &str) -> String {
     format!("Invalid content type specified {content_type}")
 }
 
-/// The `BadRequestException` message for a `schema` that is not a schema document,
-/// carrying WHY it could not be read so the caller can fix the request from this text
-/// alone.
-pub fn invalid_model_schema(reason: &str) -> String {
-    format!("Invalid model schema specified: {reason}")
-}
+/// The `BadRequestException` message for a `schema` that is not a schema document for the
+/// content type the model is typed with.
+///
+/// API Gateway answers this whole condition with ONE sentence of entirely fixed text — the
+/// result of validating the document, with the one error that the schema is not a schema —
+/// naming neither the rejected document, nor the member that carried it, nor how the
+/// document failed to read, as a recorded refusal of a malformed schema shows. One copy
+/// for every operation that stores a model's schema, so a client classifying this refusal
+/// against the operation's other bad requests reads the same sentence whether a create or
+/// an update made it.
+pub const INVALID_MODEL_SCHEMA: &str = "Invalid model specified: Validation Result: \
+     warnings : [], errors : [Invalid model schema specified]";
 
 /// The `NotFoundException` message for a `vpcLinkId` that names no stored VPC link, in
 /// the shape of the sibling identifier messages above.

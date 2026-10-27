@@ -83,6 +83,16 @@ pub(crate) fn tags(key: &str, value: &str) -> Value {
     json!([{ "Key": key, "Value": value }])
 }
 
+/// The pairs a listing must answer for the collection `expected` describes: a
+/// resource's tags are reported in KEY order, which is the order a [`BTreeMap`]
+/// enumerates in. ONE statement of that order, shared with the sibling suites.
+pub(crate) fn pairs(expected: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 /// The tags `ListTagsForResource` reports for `arn`, as `(key, value)` pairs in the
 /// order the listing answers them.
 pub(crate) async fn listed_tags(waf: &Waf, arn: &str) -> Vec<(String, String)> {
@@ -184,7 +194,7 @@ async fn an_accepted_tag_key_is_stored_and_read_back() {
                 let listed = listed_tags(&waf, &arn).await;
                 assert_eq!(
                     listed,
-                    expected.clone().into_iter().collect::<Vec<_>>(),
+                    pairs(&expected),
                     "case {case:?}: the accepted key must be surfaced by the listing, \
                      got {listed:?}"
                 );
@@ -200,7 +210,7 @@ async fn an_accepted_tag_key_is_stored_and_read_back() {
                 let listed = listed_tags(&waf, &arn).await;
                 assert_eq!(
                     listed,
-                    expected.clone().into_iter().collect::<Vec<_>>(),
+                    pairs(&expected),
                     "case {case:?}: re-tagging a key must replace its value, got {listed:?}"
                 );
             }

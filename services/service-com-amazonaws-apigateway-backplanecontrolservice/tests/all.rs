@@ -234,3 +234,5 @@ mod documentation_part_import_atomicity;
 mod delete_model;
 #[path = "all/update_base_path_mapping.rs"]
 mod update_base_path_mapping;
+#[path = "all/update_model.rs"]
+mod update_model;
