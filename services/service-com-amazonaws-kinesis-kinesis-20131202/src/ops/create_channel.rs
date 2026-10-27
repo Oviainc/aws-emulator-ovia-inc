@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts the channel into `crate::state`'s `channels` store under the region the request
+//! was signed for and the `ChannelName` it carried ([`crate::state::RegionalName`]), and
+//! answers with the stored record projected onto `ChannelDescription`. The create resolves
+//! every documented destination and logging default once — the data-freshness window, the
+//! storage class, the dead-letter queue a general purpose bucket gets, the log group and
+//! log stream names — so what it accepted is exactly what `DescribeChannel` reports, and
+//! stores the instant the channel's `CREATING` -> `ACTIVE` transition falls due.
+//!
+//! A channel is identified by its name inside one region, so a create for a name that
+//! region already holds a channel under is refused with the modelled `ResourceInUseException`
+//! and leaves the stored channel untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -140,7 +143,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `CreateChannelError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#CreateChannel")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#CreateChannel",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models
+    // it ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer
+    // for a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum CreateChannelErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -155,6 +165,7 @@ pub enum CreateChannelErrorModeled {
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -180,6 +191,374 @@ impl From<CreateChannelErrorModeled> for CreateChannelError {
 /// concrete engine where it mounts the service, not here.
 pub struct CreateChannel<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the channel was created in, and how
+/// the call ended. No channel name and no ARN: a log sink needs neither to attribute the
+/// change.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "CreateChannel",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// Refuse the request with the error this operation models for a parameter that "exceeds
+/// its restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> CreateChannelError {
+    CreateChannelErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request with the error this operation models for an input the service
+/// validates before it provisions anything — the capacity mode of a source stream, and the
+/// KMS key a channel is encrypted with.
+fn validation(message: String) -> CreateChannelError {
+    CreateChannelErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request because a resource it names is "not available for this operation"
+/// — the channel name this account and region already hold, or a source stream that is not
+/// `ACTIVE`: "For successful operation, the resource must be in the ACTIVE state".
+fn resource_in_use(message: String) -> CreateChannelError {
+    CreateChannelErrorModeled::ResourceInUseException(ResourceInUseException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request because a source stream it names is one this account and region do
+/// not hold: "The requested resource could not be found. The stream might not be specified
+/// correctly".
+fn not_found(message: String) -> CreateChannelError {
+    CreateChannelErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request because serving it would take this emulator past a ceiling it keeps
+/// on itself — the error the model names for "the requested resource exceeds the maximum
+/// number allowed".
+fn limit_exceeded(message: String) -> CreateChannelError {
+    CreateChannelErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The destination a create names, as the channel will report it.
+struct Destination {
+    /// `ChannelDestinationType`, which decides the record formats the source streams may
+    /// carry.
+    kind: &'static str,
+    /// The general purpose bucket destination, when that is the one named.
+    s3: Option<S3DestinationDescription>,
+    /// The streaming table destination, when that is the one named.
+    s3_tables: Option<S3TablesDestinationDescription>,
+}
+
+/// The general purpose bucket destination the channel reports, with each documented default
+/// resolved: the 300-second data-freshness window, the `STANDARD` storage class, and the
+/// dead-letter queue that "defaults to the destination bucket with an error prefix".
+fn s3_description(configuration: &S3DestinationConfiguration) -> S3DestinationDescription {
+    let storage = &configuration.storage_configuration;
+    let dead_letter_queue = configuration
+        .dead_letter_queue_s3_configuration
+        .clone()
+        .unwrap_or_else(|| DeadLetterQueueS3Configuration {
+            bucket_arn: storage.bucket_arn.clone(),
+            expected_bucket_owner: storage.expected_bucket_owner.clone(),
+            error_output_prefix: Some(crate::state::DEFAULT_ERROR_OUTPUT_PREFIX.to_string()),
+        });
+    S3DestinationDescription {
+        data_freshness_in_seconds: configuration
+            .data_freshness_in_seconds
+            .unwrap_or(crate::state::DEFAULT_DATA_FRESHNESS_SECONDS),
+        dead_letter_queue_s3_configuration: dead_letter_queue,
+        storage_configuration: S3StorageConfiguration {
+            storage_class: Some(
+                storage
+                    .storage_class
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_S3_STORAGE_CLASS.to_string()),
+            ),
+            ..storage.clone()
+        },
+    }
+}
+
+/// The streaming table destination the channel reports, with the data-freshness default
+/// resolved. Its dead-letter queue and its table list are modelled required, so the
+/// boundary validator has already refused a request carrying neither.
+fn s3_tables_description(
+    configuration: &S3TablesDestinationConfiguration,
+) -> S3TablesDestinationDescription {
+    S3TablesDestinationDescription {
+        data_freshness_in_seconds: configuration
+            .data_freshness_in_seconds
+            .unwrap_or(crate::state::DEFAULT_DATA_FRESHNESS_SECONDS),
+        dead_letter_queue_s3_configuration: configuration
+            .dead_letter_queue_s3_configuration
+            .clone(),
+        s3_tables_configuration_list: configuration.s3_tables_configuration_list.clone(),
+    }
+}
+
+/// The destination the create names, or the modelled refusal for a request that names none
+/// or both: "You must specify either S3DestinationConfiguration or
+/// S3TablesDestinationConfiguration, but not both" (`CreateChannel`).
+fn destination(input: &CreateChannelInput) -> Result<Destination, CreateChannelError> {
+    match (
+        input.s3_destination_configuration.as_ref(),
+        input.s3_tables_destination_configuration.as_ref(),
+    ) {
+        (Some(s3), None) => Ok(Destination {
+            kind: crate::state::CHANNEL_DESTINATION_S3,
+            s3: Some(s3_description(s3)),
+            s3_tables: None,
+        }),
+        (None, Some(tables)) => Ok(Destination {
+            kind: crate::state::CHANNEL_DESTINATION_S3_TABLES,
+            s3: None,
+            s3_tables: Some(s3_tables_description(tables)),
+        }),
+        _ => Err(invalid_argument(
+            crate::state::CHANNEL_DESTINATION_REQUIRED_MESSAGE.to_string(),
+        )),
+    }
+}
+
+/// The CloudWatch Logs configuration the channel reports: the one the create named, with
+/// the documented default names resolved for a channel that logs ("Defaults to
+/// /aws/kinesis/{channelName}/{channelId}", `CloudWatchLogs$LogGroupName`; "Defaults to
+/// DestinationDelivery", `CloudWatchLogs$LogStreamName`). A create that names no logging
+/// configuration leaves the channel logging nothing, so it names no log group either.
+fn logging_description(
+    configuration: Option<&ChannelLoggingConfiguration>,
+    channel_name: &str,
+    channel_id: &str,
+) -> ChannelLoggingConfiguration {
+    let logs = configuration.map_or_else(CloudWatchLogs::default, |configuration| {
+        configuration.cloud_watch_logs.clone()
+    });
+    if !logs.enabled {
+        return ChannelLoggingConfiguration {
+            cloud_watch_logs: CloudWatchLogs {
+                enabled: false,
+                ..logs
+            },
+        };
+    }
+    ChannelLoggingConfiguration {
+        cloud_watch_logs: CloudWatchLogs {
+            enabled: true,
+            log_group_name: Some(logs.log_group_name.unwrap_or_else(|| {
+                crate::state::channel_log_group_name(channel_name, channel_id)
+            })),
+            log_stream_name: Some(
+                logs.log_stream_name
+                    .unwrap_or_else(|| crate::state::DEFAULT_CHANNEL_LOG_STREAM_NAME.to_string()),
+            ),
+        },
+    }
+}
+
+/// The modelled refusal the request's `EncryptionConfiguration` earns, if any.
+///
+/// A channel is encrypted with "the identifier of the customer managed Amazon Web Services
+/// KMS key" (`ChannelEncryptionConfiguration$KeyId`), so a value shaped like no KMS key
+/// identifier and the service's own key are both refused — before anything is provisioned,
+/// and whatever this emulator holds.
+fn encryption_refusal(
+    configuration: &ChannelEncryptionConfiguration,
+) -> Option<CreateChannelError> {
+    // `ChannelEncryptionType` admits one value, so a value outside the catalog is a client
+    // error rather than a stored record. The model's own constraint walk refuses one before
+    // this handler runs; this states the same refusal for a caller that reaches it another
+    // way.
+    let encryption_type = configuration.encryption_type.as_str();
+    if !CHANNEL_ENCRYPTION_TYPE_VALUES.contains(&encryption_type) {
+        return Some(invalid_argument(format!(
+            "EncryptionType {encryption_type} is not supported; the supported values are {}",
+            CHANNEL_ENCRYPTION_TYPE_VALUES.join(" | ")
+        )));
+    }
+    let key_id = configuration.key_id.as_str();
+    if !crate::state::is_kms_key_identifier(key_id) {
+        return Some(validation(crate::state::invalid_kms_key_message(key_id)));
+    }
+    if crate::state::names_the_service_key(key_id) {
+        return Some(validation(crate::state::SERVICE_KMS_KEY_MESSAGE.to_string()));
+    }
+    None
+}
+
+/// The source streams the channel reports, resolved against the STORED streams the request
+/// names, or the modelled refusal that stands in the way.
+///
+/// Each configuration names a stream by ARN, so the stream has to be one this account and
+/// region hold ("The requested resource could not be found. The stream might not be
+/// specified correctly"), it has to be ready to serve ("the resource must be in the ACTIVE
+/// state"), and its capacity mode has to be the one a channel supports ("This operation is
+/// only supported for data streams with the on-demand capacity mode"). The record format
+/// has to be one the destination admits, and a streaming table destination needs the schema
+/// its records are validated against.
+fn channel_streams(
+    store: &crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &CreateChannelInput,
+    destination_kind: &str,
+) -> Result<Vec<ChannelStreamDescription>, CreateChannelError> {
+    // "Currently, one stream is supported per channel"
+    // (`CreateChannelInput$StreamConfigurationList`) — narrower than the modelled
+    // `@length` of 1..10000 the boundary validator enforces, so the documented ceiling is
+    // applied here, BEFORE any stream is read.
+    let requested = input.stream_configuration_list.len();
+    if requested > crate::state::MAX_STREAMS_PER_CHANNEL {
+        return Err(invalid_argument(
+            crate::state::one_stream_per_channel_message(requested),
+        ));
+    }
+
+    let mut streams = Vec::with_capacity(requested);
+    for configuration in &input.stream_configuration_list {
+        let stream_arn = configuration.stream_arn.as_str();
+        let stream = store
+            .stream_by_arn(now, region, stream_arn)
+            .ok_or_else(|| not_found(crate::state::stream_not_found_message(stream_arn)))?;
+
+        let status = stream.status(now);
+        if status != crate::state::STREAM_ACTIVE {
+            return Err(resource_in_use(crate::state::stream_not_active_message(
+                stream_arn, status,
+            )));
+        }
+        if stream.stream_mode != crate::state::STREAM_MODE_ON_DEMAND {
+            return Err(validation(crate::state::stream_not_on_demand_message(
+                stream_arn,
+                &stream.stream_mode,
+            )));
+        }
+
+        let record_configuration = &configuration.record_configuration;
+        let record_format_type = record_configuration.record_format_type.as_str();
+        if !crate::state::record_format_types_for(destination_kind).contains(&record_format_type) {
+            return Err(invalid_argument(
+                crate::state::record_format_unsupported_message(
+                    record_format_type,
+                    destination_kind,
+                ),
+            ));
+        }
+        // "Required when the channel destination is a streaming table"
+        // (`RecordConfiguration$GSRSchemaARN`).
+        if destination_kind == crate::state::CHANNEL_DESTINATION_S3_TABLES
+            && record_configuration.gsr_schema_arn.is_none()
+        {
+            return Err(invalid_argument(
+                crate::state::GSR_SCHEMA_REQUIRED_MESSAGE.to_string(),
+            ));
+        }
+
+        streams.push(ChannelStreamDescription {
+            // The ARN and the creation instant come from the STORED stream, so what the
+            // channel reports about its source is what the stream itself reports.
+            stream_arn: stream.arn.clone(),
+            stream_creation_timestamp: crate::state::timestamp(stream.created_at),
+            record_configuration: record_configuration.clone(),
+        });
+    }
+    Ok(streams)
+}
+
+/// Insert the channel the request names, or answer the modelled refusal that stands in the
+/// way. The whole write lives here so the caller holds the store's lock for exactly this
+/// long, which is what serialises two overlapping creates of one name: exactly one of them
+/// inserts a record and the other is told the name is taken.
+fn create_channel(
+    store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &CreateChannelInput,
+) -> Result<ChannelDescription, CreateChannelError> {
+    // The order the refusals are taken in: what the request says on its own first, then the
+    // name and the room this store has, then what the request says ABOUT stored streams. So
+    // a create that is wrong in two ways is refused for the request's own fault before the
+    // store's, which keeps a refusal the same whatever the store happens to hold. AWS
+    // documents no precedence between them.
+    let destination = destination(input)?;
+    if let Some(refusal) = input
+        .encryption_configuration
+        .as_ref()
+        .and_then(encryption_refusal)
+    {
+        return Err(refusal);
+    }
+
+    // A channel is addressed by its name inside its region, so a name the region already
+    // holds a channel under is a conflict rather than a second record, and the stored
+    // channel is left exactly as it was.
+    if store.channel_in(region, &input.channel_name).is_some() {
+        return Err(resource_in_use(
+            crate::state::channel_already_exists_message(&input.channel_name),
+        ));
+    }
+
+    // The store is bounded, so a create past a ceiling is refused rather than grown into:
+    // the region's own ceiling, and the one no request can partition beside it.
+    let held_in_region = store.channels_held_in(region);
+    let held = store.channels_held();
+    if held_in_region >= crate::state::MAX_CHANNELS_PER_REGION
+        || held >= crate::state::MAX_CHANNELS_TOTAL
+    {
+        return Err(limit_exceeded(
+            crate::state::channel_ceiling_exceeded_message(held_in_region, held),
+        ));
+    }
+
+    let streams = channel_streams(store, region, now, input, destination.kind)?;
+
+    let id = crate::state::channel_id(region, &input.channel_name, now);
+    let channel = crate::state::Channel {
+        name: input.channel_name.clone(),
+        region: region.to_string(),
+        arn: crate::state::channel_arn(region, &input.channel_name),
+        logging_configuration: logging_description(
+            input.logging_configuration.as_ref(),
+            &input.channel_name,
+            &id,
+        ),
+        id,
+        created_at: now,
+        // CREATING is not terminal: the channel is owed ACTIVE, and the instant that is due
+        // is stored rather than slept on.
+        active_at: now + crate::state::CHANNEL_ACTIVATION_DELAY,
+        service_execution_role_arn: input.service_execution_role_arn.clone(),
+        streams,
+        s3_destination: destination.s3,
+        s3_tables_destination: destination.s3_tables,
+        encryption_configuration: input.encryption_configuration.clone(),
+        tags: input.tags.clone().unwrap_or_default(),
+    };
+
+    let description = channel.to_description(now);
+    store.channels.insert(
+        crate::state::RegionalName::new(region, &input.channel_name),
+        channel,
+    );
+    Ok(description)
 }
 
 impl<Eng> CreateChannel<Eng> {
@@ -208,18 +587,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannel"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region this channel is created in, since a
+        // channel name "is unique within your Amazon Web Services account and Amazon Web
+        // Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            CreateChannelError::from(CreateChannelErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the channel store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let created = create_channel(&mut state.lock(), &region, now, &input);
+        match created {
+            Ok(channel_description) => {
+                audit(&akid, &region, "created");
+                // "Upon receiving the request, Amazon Kinesis Data Streams returns
+                // immediately with the channel in the CREATING state" (`CreateChannel`).
+                Ok(CreateChannelOutput {
+                    channel_description,
+                })
+            }
+            Err(refusal) => {
+                audit(&akid, &region, "refused");
+                Err(refusal)
+            }
+        }
     }
 }
