@@ -47,6 +47,8 @@ mod deployment_pagination;
 mod deployment_stage_release;
 #[path = "all/domain_name_deletion.rs"]
 mod domain_name_deletion;
+#[path = "all/domain_name_deletion_identity.rs"]
+mod domain_name_deletion_identity;
 #[path = "all/domain_name_endpoint_required.rs"]
 mod domain_name_endpoint_required;
 #[path = "all/domain_name_lifecycle.rs"]

@@ -66,6 +66,27 @@ pub fn build_router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEn
     (router, engine)
 }
 
+/// Publish one managed Contributor Insights rule template into this account's catalog, for the
+/// vendor and resource type `resource_arn` names.
+///
+/// The catalog is the SERVICE's side of the managed rules — "The template name for the managed
+/// Contributor Insights rule, as returned by `ListManagedInsightRules`."
+/// (`ManagedRule$TemplateName`) — so a suite that needs a template a caller CAN enable publishes
+/// it through the store, the way the service publishes one, rather than through any operation.
+pub fn publish_managed_rule_template(
+    engine: &engine::InMemoryEngine,
+    template_name: &str,
+    resource_arn: &str,
+) {
+    use service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as cloudwatch;
+    let template = cloudwatch::ManagedRuleTemplate::for_resource(template_name, resource_arn)
+        .unwrap_or_else(|| panic!("{resource_arn} is the ARN a template is published for"));
+    cloudwatch::service_state(engine)
+        .expect("the CloudWatch store exists")
+        .lock()
+        .publish_managed_rule_template(template);
+}
+
 /// The emulator the end-to-end alarm-action tests drive: CloudWatch, SNS and SQS on ONE
 /// engine, because an alarm's action is an SNS topic and the notification is asserted where a
 /// client sees it — on the queue subscribed to that topic.

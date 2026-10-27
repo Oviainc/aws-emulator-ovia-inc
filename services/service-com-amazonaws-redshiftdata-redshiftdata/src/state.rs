@@ -30,13 +30,16 @@
 //!   database's one connection, so what a session gives a caller is a
 //!   connection target and a lifetime, not an isolated transaction of its own.
 //!
-//! The asynchronous status timeline is modelled with a stored due instant and
-//! never with a sleep: a statement is `SUBMITTED` when `ExecuteStatement`
-//! returns and the clock owes it its terminal status [`COMPLETION_SPAN`] later,
-//! so a caller that cancels straight away still finds a cancellable statement.
-//! A session's close is on the clock the same way, through the `SessionTtl` it
-//! carries. Every operation materialises the transitions the clock has already
-//! made due before it reads.
+//! The asynchronous status timeline is the ENGINE's, not a clock's: a statement
+//! is `SUBMITTED` when the submit operation returns, its execution runs on the
+//! blocking pool, and it reaches its terminal status when that execution really
+//! finishes — so a statement reports `SUBMITTED` for exactly as long as its work
+//! takes, a caller that cancels while it runs stops the engine itself, and
+//! nothing is ever reported for work that has not been done. A submission the
+//! caller asked to wait for ([`wait_budget`]) is awaited inside its own request;
+//! one it did not is left to finish on its own, which is what makes two
+//! concurrently submitted statements concurrent. A session's close is on the
+//! clock, through the `SessionTtl` it carries.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,24 +51,6 @@ use crate::ops::types::{ColumnMetadata, Field, SqlParameter};
 /// Whether the cluster or workgroup a submit request names exists at all — a
 /// fact the services that OWN those resources answer, not this one.
 pub mod warehouse;
-
-/// How long after `ExecuteStatement` the statement's move out of `SUBMITTED`
-/// falls due.
-///
-/// A real cluster takes anywhere from milliseconds to hours; what matters for an
-/// emulator is that the span is never zero, so a caller acting immediately after
-/// `ExecuteStatement` still observes the transient `SUBMITTED` state and the
-/// state-dependent behaviour that goes with it (`CancelStatement` succeeds,
-/// `GetStatementResult` refuses). This is an emulator-chosen span, not a
-/// duration Redshift documents.
-///
-/// The SQL itself runs during `ExecuteStatement`, and only the STATUS is owed
-/// later: the execution is not deferred to a background task because a result
-/// nothing has computed cannot be reported honestly, and because a task
-/// outliving its request would run on an engine no request is bounding. A caller
-/// that sends no `WaitTimeSeconds` therefore still pays the statement's
-/// execution latency, which the engine's own deadline bounds.
-pub const COMPLETION_SPAN: Duration = Duration::from_millis(300);
 
 /// Page size `ListStatements` uses when the request leaves `MaxResults` at its
 /// modelled default of 0 — the modelled maximum, so an unparameterised call
@@ -142,20 +127,30 @@ pub const ONE_TARGET_MESSAGE: &str =
 /// workgroup that could not be resolved.
 pub const ABSENT_ENDPOINT_MESSAGE: &str = "Redshift endpoint doesn't exist in this region.";
 
-/// Wall-clock bound on one statement's execution. The SQL engine runs
-/// in-process with no isolation boundary, so a statement that never terminates
-/// would take the whole emulator down rather than just its own request.
-const SQL_TIMEOUT: Duration = Duration::from_secs(2);
+/// Ceiling on the wall-clock bound one submission's execution runs under. The
+/// SQL engine runs in-process with no isolation boundary, so a statement that
+/// never terminates would take the whole emulator down rather than just its own
+/// request.
+///
+/// It bounds the EXECUTION and not the request: a submission runs on the
+/// blocking pool, independently of the request that submitted it, so the
+/// statement reaches a terminal status whatever the caller does with its
+/// response — and reaches it because the engine stopped, never because a caller
+/// stopped waiting. A caller's own patience is `WaitTimeSeconds`
+/// ([`wait_budget`]), which is shorter or longer than this and changes nothing
+/// about the statement.
+pub const MAX_ENGINE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Step budget for one statement's execution, counted in SQLite virtual-machine
-/// instructions. A wall-clock timeout cannot preempt a CPU-bound query running
-/// on the request thread; this can.
-const SQL_STEP_BUDGET: u64 = 20_000_000;
-
-/// How much longer than [`SQL_TIMEOUT`] a request waits when it named no
-/// `WaitTimeSeconds`: enough for a statement queued behind one other statement
-/// on the same database, and no more.
-const SQL_QUEUE_GRACE: Duration = Duration::from_secs(3);
+/// Step budget per second of an execution's wall-clock deadline, counted in
+/// SQLite virtual-machine instructions. A wall-clock timeout cannot preempt a
+/// CPU-bound query if the host clock stalls or the process is suspended; this
+/// can.
+///
+/// Scaled to the deadline rather than fixed, and set well above the instruction
+/// rate the engine actually sustains, so it is the BACKSTOP it is meant to be:
+/// work that fits inside the deadline is never cut short by it, and work that
+/// does not is stopped by whichever bound is reached first.
+const SQL_STEPS_PER_SECOND: u64 = 150_000_000;
 
 /// How many virtual-machine instructions pass between two consecutive checks of
 /// the timeout and the step budget.
@@ -225,6 +220,20 @@ const MAX_ENGINE_HEAP_BYTES: i64 = 256 * 1024 * 1024;
 /// emulator open connections and handles without limit.
 pub const MAX_OPEN_DATABASES: usize = 16;
 
+/// How many submissions may be running or queued at once.
+///
+/// Every accepted submission runs independently of the request that made it, so
+/// without this bound a caller could make the emulator hold executions — and
+/// the tasks and the SQL text carrying them — without limit. It is what the
+/// modelled `ActiveStatementsExceededException` ("the number of active
+/// statements exceeds the limit") reports; Amazon Redshift publishes a quota of
+/// 200 active statements per cluster, and this emulator's bound is lower than
+/// that because a submission in flight is also a statement in the history
+/// ([`MAX_RETAINED_STATEMENTS`]), which is never evicted while its execution has
+/// not reported. Half of that history, so admitting the bound's worth of
+/// submissions still leaves room for the statements a caller can read back.
+pub const MAX_ACTIVE_STATEMENTS: usize = MAX_RETAINED_STATEMENTS / 2;
+
 /// How long an unused database is kept open. A database no statement has touched
 /// for this long is closed, which releases the connection and everything a
 /// statement committed to it — otherwise memory a single statement allocated
@@ -286,11 +295,11 @@ const FIRST_PID: i64 = 1_000;
 ///
 /// The wire spellings are the ones `StatementStatusString` declares
 /// (`shared_types::STATEMENT_STATUS_STRING_VALUES`): ABORTED, FAILED, FINISHED,
-/// PICKED, STARTED, SUBMITTED. A statement here is SUBMITTED until the clock
-/// owes its outcome and then FINISHED, FAILED or ABORTED; PICKED and STARTED
-/// describe a real cluster's scheduling queue, which this emulator does not
-/// model, so no statement ever reports them (a `ListStatements` filter naming
-/// one therefore matches nothing, which is correct rather than an error).
+/// PICKED, STARTED, SUBMITTED. A statement here is SUBMITTED while its
+/// execution is queued or running and then FINISHED, FAILED or ABORTED; PICKED
+/// and STARTED describe a real cluster's scheduling queue, which this emulator
+/// does not model, so no statement ever reports them (a `ListStatements` filter
+/// naming one therefore matches nothing, which is correct rather than an error).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatementStatus {
     /// The query was submitted, but not yet processed.
@@ -557,14 +566,20 @@ pub struct Statement {
     /// The statements of a batch, in submission order. Empty for a single
     /// statement.
     pub sub_statements: Vec<Statement>,
-    /// The status as of the last materialised transition.
+    /// The status as of the last read.
     pub status: StatementStatus,
-    /// The status the clock owes this statement at [`Statement::due_at`].
+    /// The status this statement's execution reported, once it has reported.
     terminal_status: StatementStatus,
-    /// When that owed transition falls due, on the monotonic clock.
-    due_at: Instant,
-    /// The wall-clock instant of that owed transition, reported as `UpdatedAt`.
+    /// When that reported transition fell due on the monotonic clock: the
+    /// instant the execution finished. `None` while the execution is still
+    /// queued or running, which is what SUBMITTED means.
+    due_at: Option<Instant>,
+    /// The wall-clock instant of that transition, reported as `UpdatedAt`.
     completed_at: SystemTime,
+    /// Abandons this submission's execution at the engine's next progress
+    /// callback, so `CancelStatement` stops work that is really running. Dropped
+    /// once the execution has reported.
+    interrupt: Option<Interrupt>,
     /// The engine's own error text, once the statement has FAILED.
     error: Option<String>,
     /// `CreatedAt`.
@@ -599,21 +614,41 @@ pub struct Statement {
 }
 
 impl Statement {
-    /// Materialise the transition the clock owes this statement, if `now` has
-    /// reached its due instant. Idempotent, and a no-op for a statement that is
-    /// already terminal: a read calls this so that a status the clock made due
-    /// is reported even when nothing else has touched the statement since.
+    /// Materialise the transition this statement's execution reported, if `now`
+    /// has reached the instant it finished. Idempotent, and a no-op for a
+    /// statement that is already terminal or whose execution has not reported:
+    /// a read calls this so that an outcome the engine has produced is reported
+    /// even when nothing else has touched the statement since.
     fn advance(&mut self, now: Instant) {
-        // A batch's statements share its due instant, so one call materialises
-        // the whole batch's timeline.
+        // A batch's statements report through their batch, so one call
+        // materialises the whole submission.
         for sub_statement in &mut self.sub_statements {
             sub_statement.advance(now);
         }
-        if self.status.is_terminal() || now < self.due_at {
+        let Some(due_at) = self.due_at else {
+            return;
+        };
+        if self.status.is_terminal() || now < due_at {
             return;
         }
         self.status = self.terminal_status;
         self.updated_at = self.completed_at;
+    }
+
+    /// Record what this statement's execution produced: its outcome falls due at
+    /// the instant the execution finished, which is `now`.
+    fn apply(&mut self, execution: Execution, now: Instant, now_wall: SystemTime) {
+        self.terminal_status = execution.status;
+        self.error = execution.error;
+        self.duration_nanos = execution.duration_nanos;
+        self.has_result_set = execution.has_result_set;
+        self.result_rows = execution.result_rows;
+        self.result_size = execution.result_size;
+        self.result = execution.result;
+        self.due_at = Some(now);
+        self.completed_at = now_wall;
+        self.interrupt = None;
+        self.advance(now);
     }
 
     /// The `Error` to report: the engine's own message, and only once the
@@ -722,14 +757,11 @@ impl Statement {
     /// Stop a still-running statement, as `CancelStatement` does. Returns false
     /// when the statement had already stopped, which is not a cancellation.
     ///
-    /// The statement's result set is discarded, because an aborted query has no
-    /// rows to fetch. Its WRITES, however, are not undone: the SQL ran during
-    /// `ExecuteStatement` and the engine committed it there, so a cancelled
-    /// `CREATE TABLE` or `INSERT` reports ABORTED while its effect stays visible
-    /// to the next statement on that database. That is the cost of running the
-    /// statement during the call that submits it, which is in turn what keeps
-    /// the reported result something the engine actually produced; a real
-    /// cluster, which cancels work still in flight, does not have it.
+    /// The engine itself is abandoned: the execution is told to stop at its next
+    /// progress callback, so a cancelled statement's remaining work does not
+    /// run and a transaction it had opened is rolled back rather than committed.
+    /// Its result set is discarded with it, because an aborted query has no rows
+    /// to fetch.
     fn cancel(&mut self, now_wall: SystemTime) -> bool {
         if self.status.is_terminal() {
             return false;
@@ -739,8 +771,13 @@ impl Statement {
         for sub_statement in &mut self.sub_statements {
             sub_statement.cancel(now_wall);
         }
+        if let Some(interrupt) = self.interrupt.take() {
+            interrupt.now();
+        }
         self.status = StatementStatus::Aborted;
         self.terminal_status = StatementStatus::Aborted;
+        self.due_at = Some(Instant::now());
+        self.completed_at = now_wall;
         self.updated_at = now_wall;
         self.duration_nanos = now_wall
             .duration_since(self.created_at)
@@ -1009,7 +1046,7 @@ fn authorize(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Auth
 
 /// What one execution produced. Opaque to a handler, which only carries it from
 /// [`run_on`] or [`run_batch_on`] to
-/// [`ComAmazonawsRedshiftdataRedshiftdataState::record`].
+/// [`ComAmazonawsRedshiftdataRedshiftdataState::complete`].
 #[derive(Debug)]
 pub struct Execution {
     status: StatementStatus,
@@ -1056,8 +1093,7 @@ impl Execution {
     }
 
     /// Report a statement whose work did not land after all, because the
-    /// transaction holding it could not be closed. Its rows are dropped with
-    /// it: a result computed inside a transaction that was never committed is
+    /// transaction holding it could not be closed. Its rows are dropped with    /// it: a result computed inside a transaction that was never committed is
     /// not a result a caller may fetch.
     fn mark_uncommitted(&mut self, message: &str) {
         if self.status != StatementStatus::Finished {
@@ -1157,6 +1193,19 @@ impl ExecutionFailure {
     }
 }
 
+/// One `Execution` per submitted statement for a submission whose execution
+/// task did not return a verdict at all (its thread panicked, or the runtime
+/// dropped it). Each statement FAILED, with the only thing that can honestly be
+/// said about it: the engine reported nothing.
+pub fn unreported_executions(statements: usize) -> Vec<Execution> {
+    (0..statements)
+        .map(|_| Execution::failed(UNREPORTED_EXECUTION_MESSAGE.to_string()))
+        .collect()
+}
+
+/// The `Error` a statement whose execution never reported carries.
+const UNREPORTED_EXECUTION_MESSAGE: &str = "the SQL engine did not report a result for this statement";
+
 /// Run `sql` on the engine `handle` guards.
 ///
 /// BLOCKING, deliberately: the engine is synchronous, so a caller must put this
@@ -1186,8 +1235,7 @@ pub fn run_on(
     )
 }
 
-/// Run `sqls` serially, in submission order, on the engine `handle` guards, and
-/// report one [`Execution`] per submitted statement in that same order.
+/// Run `sqls` serially, in submission order, on the engine `handle` guards, and/// report one [`Execution`] per submitted statement in that same order.
 ///
 /// BLOCKING for the same reason [`run_on`] is, and it takes the same single
 /// database lock — held for the whole batch, which is what lets
@@ -1306,7 +1354,7 @@ fn run_sql(
     );
 
     let started = Instant::now();
-    guard.arm(timeout, SQL_STEP_BUDGET);
+    guard.arm(timeout, step_budget(timeout));
     let produced = execute_once(&database.connection, sql, parameters, binding, budget);
     guard.disarm();
     let duration_nanos = i64::try_from(started.elapsed().as_nanos()).unwrap_or(i64::MAX);
@@ -1902,7 +1950,7 @@ pub fn catalog_on(
         PROGRESS_HANDLER_OPS,
         Some(move || handler_guard.should_interrupt()),
     );
-    guard.arm(timeout, SQL_STEP_BUDGET);
+    guard.arm(timeout, step_budget(timeout));
     let read = read_catalog(connection, table);
     guard.disarm();
     read.map_err(|error| scrub_paths(&error.to_string()))
@@ -2067,8 +2115,6 @@ pub struct Submission {
     pub session_keep_alive_seconds: Option<i32>,
     /// The caller's `ClientToken`, for an idempotent replay.
     pub client_token: Option<String>,
-    /// Whether the caller asked to wait for completion (`WaitTimeSeconds`).
-    pub wait_for_completion: bool,
 }
 
 /// The connection members of a submit request, as the wire carried them.
@@ -2287,6 +2333,58 @@ struct OpenDatabase {
     target: ConnectionTarget,
     /// This database's name within that warehouse, held for the same reason.
     database: String,
+    /// Resolves when the submission queued LAST on this database has reported,
+    /// so the next one queued waits for it and the database's submissions run
+    /// in submission order. See [`QueueSlot`].
+    tail: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+/// The place one submission holds in its database's queue.
+///
+/// Statements of one database run ONE AT A TIME — a transactional batch holds
+/// the database for all of its statements — and they run in the order they were
+/// submitted: a submission waits for [`wait_for_turn`](Self::wait_for_turn),
+/// which resolves once every submission queued earlier on that database has
+/// finished with it. The chain is built while the state lock is held, so the
+/// order is the SUBMISSION order and never the order in which the executions
+/// happen to be scheduled.
+///
+/// The turn is handed on when the slot is DROPPED, so every way out releases
+/// it: an execution that finished, one whose task panicked or was cancelled,
+/// and a submission that was never admitted at all. Nothing waits behind a slot
+/// whose holder is gone.
+#[derive(Debug)]
+pub struct QueueSlot {
+    /// Resolves when the submission queued immediately before this one on the
+    /// same database has finished. `None` for the first submission on it.
+    after: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Dropped when this slot is, which releases the next submission queued on
+    /// the same database.
+    _done: tokio::sync::oneshot::Sender<()>,
+}
+
+impl QueueSlot {
+    /// Wait for this submission's turn on its database.
+    ///
+    /// A sender dropped without a send (a submission that was never admitted,
+    /// or an execution whose task panicked) is the same answer as a send: the
+    /// queue moves on rather than stalling behind a submission that will never
+    /// report.
+    pub async fn wait_for_turn(&mut self) {
+        if let Some(after) = self.after.take() {
+            let _ = after.await;
+        }
+    }
+}
+
+/// Take the next place in a database's queue: this submission waits for the one
+/// queued before it, and becomes the one the next submission waits for.
+fn queue_slot(tail: &mut Option<tokio::sync::oneshot::Receiver<()>>) -> QueueSlot {
+    let (done, next) = tokio::sync::oneshot::channel();
+    QueueSlot {
+        after: tail.replace(next),
+        _done: done,
+    }
 }
 
 /// Per-service state for com-amazonaws-redshiftdata-redshiftdata. A handler reaches it through [`service_state`].
@@ -2294,8 +2392,9 @@ struct OpenDatabase {
 /// Every map here grows on request, so every map here is bounded:
 /// [`MAX_RETAINED_STATEMENTS`] and [`STATEMENT_RETENTION`] bound the statement
 /// history (and the result sets it holds, and the client tokens that point into
-/// it), and [`MAX_OPEN_DATABASES`] bounds the engines and handles a caller can
-/// make the emulator open.
+/// it), [`MAX_ACTIVE_STATEMENTS`] bounds the submissions — and so the executions
+/// and the tasks carrying them — in flight at once, and [`MAX_OPEN_DATABASES`]
+/// bounds the engines and handles a caller can make the emulator open.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsRedshiftdataRedshiftdataState {
     /// The retained statement history, by `Id`.
@@ -2319,16 +2418,26 @@ pub struct ComAmazonawsRedshiftdataRedshiftdataState {
 }
 
 impl ComAmazonawsRedshiftdataRedshiftdataState {
-    /// Materialise every status transition the clock has already made due.
+    /// Materialise every outcome a submission's execution has already reported.
     ///
-    /// Every operation calls this before it reads, so a status change that was
-    /// owed at a given instant is reported from that instant on, whether or not
+    /// Every operation calls this before it reads, so an outcome the engine
+    /// produced is reported from the instant it produced it, whether or not
     /// anyone called in between.
     pub fn materialise_due_transitions(&mut self) {
         let now = Instant::now();
         for statement in self.statements.values_mut() {
             statement.advance(now);
         }
+    }
+
+    /// How many submissions are running or queued: those whose execution has not
+    /// reported yet. Counts SUBMISSIONS, since a batch's statements run inside
+    /// the one execution its batch carries.
+    pub fn active_statements(&self) -> usize {
+        self.statements
+            .values()
+            .filter(|statement| !statement.status.is_terminal())
+            .count()
     }
 
     /// The statement with this `Id`.
@@ -2538,7 +2647,8 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
     }
 
     /// Resolve the database a submission will run on, opening and confining it on
-    /// first use, and report the `RedshiftPid` of its connection.
+    /// first use, and report the `RedshiftPid` of its connection and the
+    /// submission's place in that database's queue.
     ///
     /// Returns a handle, not a borrow, so the caller can release the state lock
     /// before running anything on it.
@@ -2546,7 +2656,7 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
         &mut self,
         target: &ConnectionTarget,
         database: &str,
-    ) -> Result<(DatabaseHandle, i64), NoDatabase> {
+    ) -> Result<(DatabaseHandle, i64, QueueSlot), NoDatabase> {
         let now = SystemTime::now();
         // Close what nothing has used for a full retention span first, so memory
         // a statement committed inside the engine is reclaimed rather than held
@@ -2558,7 +2668,11 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
             open.last_used = now;
             // No engine lock is taken here: the pid is cached on the entry, so
             // resolving a database never waits on an execution.
-            return Ok((std::sync::Arc::clone(&open.handle), open.pid));
+            return Ok((
+                std::sync::Arc::clone(&open.handle),
+                open.pid,
+                queue_slot(&mut open.tail),
+            ));
         }
         // The key is built from caller-chosen names, so a new name must not be
         // able to open another engine without limit.
@@ -2573,17 +2687,17 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
             .map_err(|error| NoDatabase::EngineUnavailable(scrub_paths(&error.to_string())))?;
         self.next_pid += 1;
         let handle: DatabaseHandle = std::sync::Arc::new(Mutex::new(opened));
-        self.databases.insert(
-            key,
-            OpenDatabase {
-                handle: std::sync::Arc::clone(&handle),
-                pid,
-                last_used: now,
-                target: target.clone(),
-                database: database.to_string(),
-            },
-        );
-        Ok((handle, pid))
+        let mut entry = OpenDatabase {
+            handle: std::sync::Arc::clone(&handle),
+            pid,
+            last_used: now,
+            target: target.clone(),
+            database: database.to_string(),
+            tail: None,
+        };
+        let slot = queue_slot(&mut entry.tail);
+        self.databases.insert(key, entry);
+        Ok((handle, pid, slot))
     }
 
     /// Close every database no statement has run on for
@@ -2662,72 +2776,50 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
                     last_used: now,
                     target: target.clone(),
                     database,
+                    tail: None,
                 },
             );
         }
     }
 
-    /// Record a finished submission as a new statement, as SUBMITTED with the
-    /// clock owing its outcome, and return its `Id`.
+    /// Record a submission whose execution is about to run, as SUBMITTED, and
+    /// return its `Id`.
     ///
-    /// `executions` carries one entry per statement of the submission, in
-    /// submission order, exactly as [`run_on`] and [`run_batch_on`] report
-    /// them. A batch is recorded as ONE statement with one substatement per
-    /// statement it submitted, and the batch's own status, error, duration and
-    /// `HasResultSet` are its statements' — never values of its own.
-    pub fn record(
+    /// Nothing about the outcome is recorded here, because nothing has run yet:
+    /// the statement reports SUBMITTED until its execution reports through
+    /// [`Self::complete`]. A batch is recorded as ONE statement with one
+    /// substatement per statement it submitted, so every statement of it is
+    /// readable from the moment the batch is accepted.
+    ///
+    /// `interrupt` abandons that execution, so `CancelStatement` stops the
+    /// engine rather than only relabelling the record.
+    pub fn record_pending(
         &mut self,
         submission: Submission,
         pid: i64,
-        executions: Vec<Execution>,
+        interrupt: Interrupt,
     ) -> String {
         let id = new_uuid();
         let created_at = SystemTime::now();
         self.next_seq += 1;
 
-        // The session this submission ran in: the one it asked to keep alive,
+        // The session this submission runs in: the one it asked to keep alive,
         // opened here, or the one it named, whose expiry now runs from this
         // statement. The statements record what the SESSION STORE says, so a
         // `SessionId` on a statement is one this service really holds.
         let session_id = self.touch_session(&submission, created_at);
 
-        // The statement answers SUBMITTED now and owes its terminal status
-        // later; a caller that asked to wait for completion has already waited
-        // longer than the span, so for that caller it is due immediately.
-        let (due_at, completed_at) = if submission.wait_for_completion {
-            (Instant::now(), created_at)
-        } else {
-            (
-                Instant::now() + COMPLETION_SPAN,
-                created_at + COMPLETION_SPAN,
-            )
-        };
-
-        // One entry per submitted statement, whatever the engine reported.
-        let mut executions = executions;
-        executions.truncate(submission.statements.len());
-        while executions.len() < submission.statements.len() {
-            executions.push(Execution::never_ran());
-        }
-
         let shared = Shared {
             submission: &submission,
             session_id,
             created_at,
-            due_at,
-            completed_at,
             seq: self.next_seq,
             pid,
         };
 
-        let mut statement = if submission.kind.is_batch() {
-            let mut sub_statements = Vec::with_capacity(executions.len());
-            for (index, (sql, execution)) in submission
-                .statements
-                .iter()
-                .zip(executions)
-                .enumerate()
-            {
+        let statement = if submission.kind.is_batch() {
+            let mut sub_statements = Vec::with_capacity(submission.statements.len());
+            for (index, sql) in submission.statements.iter().enumerate() {
                 self.next_query_id += 1;
                 sub_statements.push(build_statement(
                     &shared,
@@ -2738,14 +2830,13 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
                         sql: sql.clone(),
                         query_uuid: Some(new_uuid()),
                         redshift_query_id: self.next_query_id,
-                        execution,
                         client_token: None,
                         is_batch: false,
                         sub_statements: Vec::new(),
+                        interrupt: None,
                     },
                 ));
             }
-            let outcome = batch_outcome(&sub_statements);
             build_statement(
                 &shared,
                 Recorded {
@@ -2757,10 +2848,10 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
                     // carries none of the identifiers a query gets.
                     query_uuid: None,
                     redshift_query_id: 0,
-                    execution: outcome,
                     client_token: submission.client_token.clone(),
                     is_batch: true,
                     sub_statements,
+                    interrupt: Some(interrupt),
                 },
             )
         } else {
@@ -2772,14 +2863,13 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
                     sql: submission.statements.first().cloned().unwrap_or_default(),
                     query_uuid: Some(new_uuid()),
                     redshift_query_id: self.next_query_id,
-                    execution: executions.into_iter().next().unwrap_or_else(Execution::never_ran),
                     client_token: submission.client_token.clone(),
                     is_batch: false,
                     sub_statements: Vec::new(),
+                    interrupt: Some(interrupt),
                 },
             )
         };
-        statement.advance(Instant::now());
 
         if let Some(token) = submission.client_token {
             self.client_tokens.insert(token, id.clone());
@@ -2789,12 +2879,67 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
         id
     }
 
+    /// Record what a submission's execution produced.
+    ///
+    /// `executions` carries one entry per statement of the submission, in
+    /// submission order, exactly as [`run_on`] and [`run_batch_on`] report them.
+    /// A batch's own status, error, duration and `HasResultSet` are its
+    /// statements' — never values of its own.
+    ///
+    /// A statement a caller already cancelled keeps the ABORTED it was given:
+    /// the engine was abandoned, so whatever it managed to report is not an
+    /// outcome the caller may read as this statement's.
+    pub fn complete(&mut self, id: &str, executions: Vec<Execution>) {
+        let Some(statement) = self.statements.get_mut(id) else {
+            return;
+        };
+        if statement.status.is_terminal() {
+            return;
+        }
+        let now = Instant::now();
+        let now_wall = SystemTime::now();
+
+        // One entry per submitted statement, whatever the engine reported.
+        let wanted = if statement.is_batch {
+            statement.sub_statements.len()
+        } else {
+            1
+        };
+        let mut executions = executions;
+        executions.truncate(wanted);
+        while executions.len() < wanted {
+            executions.push(Execution::never_ran());
+        }
+
+        if statement.is_batch {
+            let outcome = batch_outcome(&executions);
+            for (sub_statement, execution) in
+                statement.sub_statements.iter_mut().zip(executions)
+            {
+                sub_statement.apply(execution, now, now_wall);
+            }
+            statement.apply(outcome, now, now_wall);
+        } else {
+            let execution = executions
+                .into_iter()
+                .next()
+                .unwrap_or_else(Execution::never_ran);
+            statement.apply(execution, now, now_wall);
+        }
+    }
+
     /// Drop the statements this service no longer retains: those past
-    /// [`STATEMENT_RETENTION`], then the oldest submissions while more than
-    /// [`MAX_RETAINED_STATEMENTS`] statements remain — a batch counting as
-    /// itself plus each of its statements, since each of those holds a result
-    /// set of its own. Each eviction drops that submission's result sets and
-    /// its client token with it, so neither map outgrows the history.
+    /// [`STATEMENT_RETENTION`], then the oldest submissions that have REPORTED
+    /// while more than [`MAX_RETAINED_STATEMENTS`] statements remain — a batch
+    /// counting as itself plus each of its statements, since each of those holds
+    /// a result set of its own. Each eviction drops that submission's result
+    /// sets and its client token with it, so neither map outgrows the history.
+    ///
+    /// A submission whose execution has not reported is not evicted to make
+    /// room: it is the record that reports and cancels that execution, and it is
+    /// what [`MAX_ACTIVE_STATEMENTS`] counts, so dropping it would leave work
+    /// running that nothing could report, cancel or count. Past the retention
+    /// span it IS dropped, and [`Self::forget`] abandons its execution with it.
     fn evict_expired_statements(&mut self, now: SystemTime) {
         let expired: Vec<String> = self
             .statements
@@ -2813,6 +2958,7 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
             let Some(oldest) = self
                 .statements
                 .values()
+                .filter(|statement| statement.status.is_terminal())
                 .min_by_key(|statement| statement.seq)
                 .map(|statement| statement.id.clone())
             else {
@@ -2834,8 +2980,16 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
 
     /// Remove one statement and everything that points at it. A batch's
     /// statements go with the batch they belong to, since they are held on it.
+    ///
+    /// A submission dropped while its execution has not reported has that
+    /// execution ABANDONED: the engine stops it at its next progress callback,
+    /// so no work keeps running once the record that could report or cancel it
+    /// is gone.
     fn forget(&mut self, id: &str) {
-        if let Some(statement) = self.statements.remove(id) {
+        if let Some(mut statement) = self.statements.remove(id) {
+            if let Some(interrupt) = statement.interrupt.take() {
+                interrupt.now();
+            }
             if let Some(token) = statement.client_token {
                 self.client_tokens.remove(&token);
             }
@@ -2844,34 +2998,33 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
 }
 
 /// What every statement of ONE submission shares: its connection, its database,
-/// its parameters and its clock.
+/// its parameters and its submission instant.
 struct Shared<'a> {
     submission: &'a Submission,
     session_id: Option<String>,
     created_at: SystemTime,
-    due_at: Instant,
-    completed_at: SystemTime,
     seq: u64,
     pid: i64,
 }
 
 /// What is a statement's OWN: its `Id`, its text, the identifiers Redshift
-/// generated for it, what its execution produced, and — for a batch — the
-/// statements it submitted.
+/// generated for it, the handle that abandons its execution, and — for a batch —
+/// the statements it submitted.
 struct Recorded {
     id: String,
     sql: String,
     query_uuid: Option<String>,
     redshift_query_id: i64,
-    execution: Execution,
     client_token: Option<String>,
     is_batch: bool,
     sub_statements: Vec<Statement>,
+    interrupt: Option<Interrupt>,
 }
 
-/// Assemble one stored statement from what its submission shares and what is
-/// its own. A batch and each statement of it are built through here, so neither
-/// can drift from the other on the connection they ran under.
+/// Assemble one stored statement, as SUBMITTED and with nothing reported about
+/// its outcome, from what its submission shares and what is its own. A batch and
+/// each statement of it are built through here, so neither can drift from the
+/// other on the connection they run under.
 fn build_statement(shared: &Shared<'_>, recorded: Recorded) -> Statement {
     let submission = shared.submission;
     Statement {
@@ -2885,44 +3038,45 @@ fn build_statement(shared: &Shared<'_>, recorded: Recorded) -> Statement {
         secret_arn: submission.secret_arn.clone(),
         target: submission.target.clone(),
         status: StatementStatus::Submitted,
-        terminal_status: recorded.execution.status,
-        due_at: shared.due_at,
-        completed_at: shared.completed_at,
-        error: recorded.execution.error,
+        terminal_status: StatementStatus::Submitted,
+        due_at: None,
+        completed_at: shared.created_at,
+        interrupt: recorded.interrupt,
+        error: None,
         created_at: shared.created_at,
         updated_at: shared.created_at,
-        duration_nanos: recorded.execution.duration_nanos,
+        duration_nanos: 0,
         redshift_pid: shared.pid,
         redshift_query_id: recorded.redshift_query_id,
-        has_result_set: recorded.execution.has_result_set,
-        result_rows: recorded.execution.result_rows,
-        result_size: recorded.execution.result_size,
+        has_result_set: false,
+        result_rows: 0,
+        result_size: 0,
         with_event: submission.with_event,
         result_format: submission.result_format.clone(),
         parameters: submission.parameters.clone(),
         session_id: shared.session_id.clone(),
         client_token: recorded.client_token,
-        result: recorded.execution.result,
+        result: None,
         is_batch: recorded.is_batch,
         execution_mode: submission.kind.execution_mode(),
         sub_statements: recorded.sub_statements,
     }
 }
 
-/// What a batch as a whole did, from the statements it ran.
+/// What a batch as a whole did, from what its statements' executions reported.
 ///
 /// A batch computes nothing of its own: it FAILED if any of its statements
 /// failed, it stopped short if any of them never ran, and "the value [of
 /// `HasResultSet`] is true if any substatement returns a result set". Its
 /// `ResultRows` and `ResultSize` belong to its statements, so the batch reports
 /// the modelled `-1` null marker for both.
-fn batch_outcome(sub_statements: &[Statement]) -> Execution {
-    let failed = sub_statements
+fn batch_outcome(executions: &[Execution]) -> Execution {
+    let failed = executions
         .iter()
-        .any(|sub| sub.terminal_status == StatementStatus::Failed);
-    let stopped = sub_statements
+        .any(|execution| execution.status == StatementStatus::Failed);
+    let stopped = executions
         .iter()
-        .any(|sub| sub.terminal_status == StatementStatus::Aborted);
+        .any(|execution| execution.status == StatementStatus::Aborted);
     let status = match (failed, stopped) {
         (true, _) => StatementStatus::Failed,
         (false, true) => StatementStatus::Aborted,
@@ -2932,11 +3086,13 @@ fn batch_outcome(sub_statements: &[Statement]) -> Execution {
         status,
         // The engine's own message from the statement that failed — never a
         // message this service wrote about the batch.
-        error: sub_statements.iter().find_map(|sub| sub.error.clone()),
-        duration_nanos: sub_statements
+        error: executions
             .iter()
-            .fold(0_i64, |total, sub| total.saturating_add(sub.duration_nanos)),
-        has_result_set: sub_statements.iter().any(|sub| sub.has_result_set),
+            .find_map(|execution| execution.error.clone()),
+        duration_nanos: executions.iter().fold(0_i64, |total, execution| {
+            total.saturating_add(execution.duration_nanos)
+        }),
+        has_result_set: executions.iter().any(|execution| execution.has_result_set),
         result_rows: -1,
         result_size: -1,
         result: None,
@@ -2950,28 +3106,46 @@ fn split_batch_member(id: &str) -> Option<(&str, usize)> {
     Some((batch_id, suffix.parse().ok()?))
 }
 
-/// How long a request waits for the engine before giving up.
+/// How long a request waits for the statement it submitted before answering.
 ///
 /// `WaitTimeSeconds` is modelled with the range 1..30, and its documentation
 /// ("the number of seconds to wait for the SQL statement to complete execution
 /// before returning the response. ... The maximum value is 30 seconds") makes it
 /// the caller's own ceiling, so a caller that named one is held to it. A request
-/// that named none still waits no longer than the engine's own deadline plus a
-/// grace period for a statement queued behind another on the same database.
-pub fn wait_budget(wait_time_seconds: Option<i32>) -> Duration {
-    match wait_time_seconds {
-        Some(seconds) => Duration::from_secs(u64::from(seconds.clamp(1, 30).unsigned_abs())),
-        None => SQL_TIMEOUT + SQL_QUEUE_GRACE,
-    }
+/// that named none waits for NOTHING: it answers with the statement as
+/// SUBMITTED and the execution finishes on its own, which is what makes the
+/// Data API asynchronous and two concurrent submissions concurrent.
+pub fn wait_budget(wait_time_seconds: Option<i32>) -> Option<Duration> {
+    wait_time_seconds
+        .map(|seconds| Duration::from_secs(u64::from(seconds.clamp(1, 30).unsigned_abs())))
 }
 
-/// The engine's own wall-clock deadline for a request that waits `budget`.
+/// The engine's own wall-clock deadline for one submission's execution.
 ///
-/// Kept to half the request's budget, and never above [`SQL_TIMEOUT`], so the
-/// engine always interrupts a runaway statement — turning it into a FAILED
-/// statement the caller can read — BEFORE the request gives up waiting for it.
-pub fn engine_timeout(budget: Duration) -> Duration {
-    SQL_TIMEOUT.min(budget / 2)
+/// [`MAX_ENGINE_DEADLINE`] for every submission: the execution runs
+/// independently of the request that submitted it, so what bounds it is the
+/// engine's own deadline and never a caller's patience.
+pub fn engine_timeout() -> Duration {
+    MAX_ENGINE_DEADLINE
+}
+
+/// How long a REQUEST waits for a catalog read: the engine's own deadline plus a
+/// grace period, so what ends the read is that deadline and not the request's
+/// patience — a catalog read answers from the database the request named, so it
+/// is served inside the request rather than left to finish on its own.
+pub const CATALOG_REQUEST_BUDGET: Duration =
+    MAX_ENGINE_DEADLINE.saturating_add(Duration::from_secs(3));
+
+/// The step budget one execution runs under, given its wall-clock `deadline`.
+///
+/// Derived from the deadline at [`SQL_STEPS_PER_SECOND`], so the two bounds
+/// scale together and the instruction count stays the backstop for a clock that
+/// does not advance rather than a second, tighter limit of its own.
+fn step_budget(deadline: Duration) -> u64 {
+    let millis = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+    millis
+        .saturating_mul(SQL_STEPS_PER_SECOND / 1_000)
+        .max(u64::try_from(PROGRESS_HANDLER_OPS).unwrap_or(1))
 }
 
 /// An optional string member's value, treating an all-whitespace value as
@@ -3003,14 +3177,13 @@ const COPY_PAGES_PER_STEP: i32 = 256;
 /// Wall-clock bound on ONE whole warehouse copy, from the moment the blocking task
 /// starts: it bounds both the wait for a database a statement is running on and the
 /// copying itself, so a copy can never run unbounded on a blocking-pool thread.
-/// Generous beside [`SQL_TIMEOUT`], which is how long a statement can be holding a
-/// database this copy needs.
-pub const COPY_TIMEOUT: Duration = Duration::from_secs(8);
+/// Generous beside [`MAX_ENGINE_DEADLINE`], which is how long a statement can be
+/// holding a database this copy needs.
+pub const COPY_TIMEOUT: Duration = MAX_ENGINE_DEADLINE.saturating_add(Duration::from_secs(8));
 
 /// How long a REQUEST waits for a copy: [`COPY_TIMEOUT`] plus a grace period, so
-/// what ends a copy is its own deadline and not the request's patience — the same
-/// relationship [`engine_timeout`] has with [`wait_budget`].
-pub const COPY_REQUEST_BUDGET: Duration = COPY_TIMEOUT.saturating_add(SQL_QUEUE_GRACE);
+/// what ends a copy is its own deadline and not the request's patience.
+pub const COPY_REQUEST_BUDGET: Duration = COPY_TIMEOUT.saturating_add(Duration::from_secs(3));
 
 /// How long the copy sleeps between attempts on a database another statement is
 /// running on. It runs on a blocking-pool thread, never on an async worker, so
@@ -3226,7 +3399,7 @@ pub fn restore_warehouse<Eng: Send + Sync + 'static>(
 }
 
 /// Lock a database, giving up at `deadline` rather than waiting for a statement
-/// that may be running on it for as long as [`SQL_TIMEOUT`] allows.
+/// that may be running on it for as long as [`MAX_ENGINE_DEADLINE`] allows.
 ///
 /// Polls rather than blocking: a `Mutex` has no timed acquire, and a copy must have
 /// a point at which it gives up. The sleeps run on a blocking-pool thread.

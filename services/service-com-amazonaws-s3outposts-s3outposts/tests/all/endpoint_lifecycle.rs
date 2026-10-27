@@ -942,9 +942,11 @@ async fn a_new_endpoint_reports_pending_until_the_clock_owes_it_available() {
     );
 }
 
-/// `DeleteEndpoint` removes the record: the endpoint is gone from `ListEndpoints`, the
-/// endpoints beside it are untouched, and a pair naming no endpoint of this account — a
-/// deleted one included — is the modelled 404.
+/// `DeleteEndpoint` accepts the teardown rather than performing it: the endpoint is still
+/// reported, with the modelled `Deleting` status, until the clock completes the teardown —
+/// then it is gone from `ListEndpoints`, the endpoints beside it untouched throughout, and
+/// a pair naming no endpoint of this account — one whose teardown has completed included —
+/// is the modelled 404.
 #[tokio::test]
 async fn deleting_an_endpoint_removes_it_and_leaves_the_others() {
     let router = emulator();
@@ -983,6 +985,30 @@ async fn deleting_an_endpoint_removes_it_and_leaves_the_others() {
             deleted.status, deleted.body
         );
 
+        // The teardown is still running: the endpoint is reported as before, with the
+        // status the deletion put it in.
+        let tearing_down = list_endpoints(&router, "?maxResults=100").await;
+        let reported: Vec<String> = tearing_down
+            .endpoints()
+            .iter()
+            .map(|endpoint| string_at(endpoint, "EndpointArn"))
+            .collect();
+        assert_eq!(
+            reported,
+            ordered[index..].to_vec(),
+            "case {index}: an accepted delete must leave every endpoint reported"
+        );
+        assert_eq!(
+            endpoint_with_arn(&tearing_down, &arn)["Status"],
+            json!("Deleting"),
+            "case {index}: the endpoint under teardown must report Deleting, got {:?}",
+            endpoint_with_arn(&tearing_down, &arn)["Status"]
+        );
+
+        // The completion is owed by the clock, not by a call: nothing is done here but
+        // wait for the teardown span to pass.
+        std::thread::sleep(ENDPOINT_TRANSITION + Duration::from_millis(200));
+
         let listed = list_endpoints(&router, "?maxResults=100").await;
         let remaining: Vec<String> = listed
             .endpoints()
@@ -999,7 +1025,8 @@ async fn deleting_an_endpoint_removes_it_and_leaves_the_others() {
         assert_eq!(
             (again.status, again.error_code()),
             (404, "ResourceNotFoundException"),
-            "case {index}: a repeated delete must answer 404, got {} with {:?}",
+            "case {index}: a delete of an endpoint whose teardown completed must answer \
+             404, got {} with {:?}",
             again.status,
             again.body
         );
@@ -1518,8 +1545,8 @@ async fn derived_endpoint_members_keep_their_invariants() {
 
 /// Nothing a client can repeat grows the store without end: the side table that maps a
 /// subnet to its VPC holds an entry only for a subnet a stored endpoint sits in, so a
-/// create/delete sequence with a fresh subnet every time leaves nothing behind, and the
-/// CIDR a deleted endpoint committed is offered again.
+/// create/delete sequence with a fresh subnet every time leaves nothing behind once the
+/// teardowns complete, and the CIDR a removed endpoint committed is offered again.
 ///
 /// This case looks at the store directly, because what it pins is the absence of a
 /// leak — which no response can show.
@@ -1574,6 +1601,13 @@ async fn a_create_delete_sequence_leaves_no_subnet_mapping_behind() {
                 200,
                 "case {case:?}: delete {index} must answer 200"
             );
+            // What an endpoint holds is released when its teardown completes, not when
+            // the delete is accepted. This case looks at the store directly, so it
+            // settles the store past the teardown span rather than sleeping for it: the
+            // instant is an argument, and the change is owed at it either way.
+            store
+                .lock()
+                .settle_all(SystemTime::now() + ENDPOINT_TRANSITION);
             let expected = seeded_mappings + usize::from(index + 1 < live.len());
             assert_eq!(
                 store.lock().subnet_vpcs.len(),

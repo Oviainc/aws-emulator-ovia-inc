@@ -44,22 +44,22 @@ use super::client_error_envelopes::message;
 
 /// The error every write that establishes a subscriber answers a malformed address with:
 /// "An error on the client occurred. Typically, the cause is an invalid input value."
-const REFUSAL: &str = "InvalidParameterException";
+pub(crate) const REFUSAL: &str = "InvalidParameterException";
 
 /// One row of the malformed table: the subscriber a write would establish, and the way
 /// its address fails the rule.
-struct Malformed {
-    case: &'static str,
-    subscriber: Value,
+pub(crate) struct Malformed {
+    pub(crate) case: &'static str,
+    pub(crate) subscriber: Value,
 }
 
-fn subscriber(subscription_type: &str, address: &str) -> Value {
+pub(crate) fn subscriber(subscription_type: &str, address: &str) -> Value {
     json!({"SubscriptionType": subscription_type, "Address": address})
 }
 
 /// The malformed table. Every row is a value the modelled `@pattern` and `@length` admit,
 /// so each one reaches the handler.
-fn malformed_rows() -> Vec<Malformed> {
+pub(crate) fn malformed_rows() -> Vec<Malformed> {
     let rows: Vec<(&'static str, &'static str, &'static str)> = vec![
         ("EMAIL with no @ at all", "EMAIL", "not-an-email"),
         ("EMAIL with an empty local part", "EMAIL", "@example.com"),
@@ -143,7 +143,7 @@ fn malformed_rows() -> Vec<Malformed> {
 }
 
 /// The well-formed table: the address forms each subscription type admits.
-fn well_formed_rows() -> Vec<(&'static str, Value)> {
+pub(crate) fn well_formed_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
             "an email address",
@@ -182,7 +182,7 @@ fn well_formed_rows() -> Vec<(&'static str, Value)> {
 
 /// The notification at `position` of a table: what a notification alerts on identifies
 /// it, so each row gets its own threshold and so its own notification.
-fn notification(position: usize) -> Value {
+pub(crate) fn notification(position: usize) -> Value {
     json!({
         "NotificationType": "ACTUAL",
         "ComparisonOperator": "GREATER_THAN",
@@ -192,14 +192,14 @@ fn notification(position: usize) -> Value {
 
 /// The subscriber every seeded notification and action starts with — `Subscribers` is
 /// `@length(min: 1)`, so neither can be established without one.
-fn seed_subscriber() -> Value {
+pub(crate) fn seed_subscriber() -> Value {
     subscriber("EMAIL", "seed@example.com")
 }
 
 /// Every subscriber the STORE holds for a budget, as `(SubscriptionType, Address)` per
 /// notification in notification order — read from the state struct directly, so what a
 /// refused write did to the store is asserted independently of any read's projection.
-fn stored_subscribers(
+pub(crate) fn stored_subscribers(
     engine: &Arc<engine::InMemoryEngine>,
     account_id: &str,
     budget_name: &str,
@@ -243,7 +243,7 @@ fn budget_is_stored(
 }
 
 /// The subscribers `DescribeSubscribersForNotification` reports for one notification.
-async fn reported_subscribers(
+pub(crate) async fn reported_subscribers(
     router: &MultiServiceRouter,
     account_id: &str,
     budget_name: &str,
@@ -269,7 +269,7 @@ async fn reported_subscribers(
 /// Assert one refused write: HTTP 400, the modelled client error, and a message that does
 /// not echo the address — `Subscriber$Address` is `@sensitive`, so a refusal that repeated
 /// it would put a caller's mailbox or topic in every error body and log.
-fn assert_refused(case: &str, address: &str, status: u16, body: &Value) {
+pub(crate) fn assert_refused(case: &str, address: &str, status: u16, body: &Value) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected the write to be refused at 400, got {status} {body}"
@@ -288,7 +288,7 @@ fn assert_refused(case: &str, address: &str, status: u16, body: &Value) {
 
 /// The subscription types these tables span are the model's own catalog, so a catalog
 /// that grew a third type fails the suite instead of going silently untested.
-fn assert_catalog_spanned() {
+pub(crate) fn assert_catalog_spanned() {
     assert_eq!(
         SUBSCRIPTION_TYPE_VALUES,
         &["EMAIL", "SNS"],

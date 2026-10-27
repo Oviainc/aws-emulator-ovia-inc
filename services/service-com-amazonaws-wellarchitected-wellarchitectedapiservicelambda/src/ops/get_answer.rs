@@ -206,10 +206,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A question belongs to the LENS under review — the questions that lens's own
-        // content defines (`crate::state::...::lens_review_question`) — so a `QuestionId`
+        // content defines (`crate::state::...::lens_review_question`), as of the lens
+        // VERSION this review is against — so a `QuestionId`
         // that lens does not ask names no answer of this lens review to report.
         let question = store
-            .lens_review_question(&input.lens_alias, &input.question_id)
+            .lens_review_question(
+                &input.lens_alias,
+                workload.lens_review_version(&input.lens_alias),
+                &input.question_id,
+            )
             .ok_or_else(|| {
                 GetAnswerErrorModeled::ResourceNotFoundException(crate::state::question_not_found(
                     &input.workload_id,

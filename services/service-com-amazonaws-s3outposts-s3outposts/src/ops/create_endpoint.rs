@@ -188,6 +188,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller = crate::state::caller_account();
         let mut store = state.lock();
 
+        // Everything the clock already owes is materialised first, so this
+        // create resolves against the endpoints that exist at `now`: an
+        // endpoint whose teardown has completed holds neither its subnet and
+        // security group nor its CIDR any more. Each of those changes was owed
+        // at this instant whether or not this call happened.
+        store.settle_all(now);
+
         // The endpoint hangs off an Outpost: one this caller owns, or one shared
         // with it — and one installed in the Region this request was signed for,
         // since that is the only Region an Outpost and its endpoints are reached
@@ -252,10 +259,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "it can take up to 5 minutes for this action to finish" — so it
             // reports `Pending` until the clock owes it `Available`.
             status: crate::state::ENDPOINT_STATUS_PENDING.to_string(),
-            pending: Some(crate::state::PendingTransition {
-                due: now + crate::state::ENDPOINT_TRANSITION,
-                status: crate::state::ENDPOINT_STATUS_AVAILABLE.to_string(),
-            }),
+            pending: Some(crate::state::PendingTransition::to_status(
+                now + crate::state::ENDPOINT_TRANSITION,
+                crate::state::ENDPOINT_STATUS_AVAILABLE,
+            )),
             creation_time: now,
             network_interfaces: vec![network_interface_id],
             vpc_id,

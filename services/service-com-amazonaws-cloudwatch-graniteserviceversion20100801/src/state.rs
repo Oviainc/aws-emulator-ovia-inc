@@ -849,6 +849,69 @@ pub struct ManagedRuleOrigin {
     pub resource_arn: String,
 }
 
+/// One managed Contributor Insights rule template this account can enable a rule from.
+///
+/// "The template name for the managed Contributor Insights rule, as returned by
+/// `ListManagedInsightRules`." (`ManagedRule$TemplateName`) — the template a caller names is one
+/// the SERVICE publishes for a kind of resource ("When you enable a managed rule, you create a
+/// Contributor Insights rule that collects data from Amazon Web Services services.",
+/// `PutManagedInsightRules`), so a template is held as the name it is published under and the
+/// resources it collects data for, and nothing a caller sends adds one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRuleTemplate {
+    /// The name the template is published under, which a `ManagedRule` entry names it by.
+    pub template_name: String,
+    /// The ARN vendor whose resources this template collects data for — the third field of
+    /// their ARNs (`::service_common::arn::Arn::vendor`).
+    pub resource_vendor: String,
+    /// The resource type inside that vendor the template applies to
+    /// (`::service_common::arn::Arn::resource_type`), or `None` when it applies to every
+    /// resource the vendor holds.
+    pub resource_type: Option<String>,
+}
+
+impl ManagedRuleTemplate {
+    /// The template published under `template_name` for every resource of the same vendor and
+    /// type as `resource_arn`, or `None` when `resource_arn` is not an ARN.
+    #[must_use]
+    pub fn for_resource(template_name: &str, resource_arn: &str) -> Option<Self> {
+        let arn = parse_resource_arn(resource_arn)?;
+        Some(Self {
+            template_name: template_name.to_string(),
+            resource_vendor: arn.vendor.to_string(),
+            resource_type: Some(arn.resource_type().to_string()),
+        })
+    }
+
+    /// Whether this template is one of the managed rules available for `resource_arn`: the
+    /// ARN's vendor is the one the template collects data for, and its resource type is the one
+    /// the template applies to when the template names a type at all.
+    #[must_use]
+    pub fn available_for(&self, resource_arn: &str) -> bool {
+        parse_resource_arn(resource_arn).is_some_and(|arn| {
+            self.resource_vendor == arn.vendor
+                && self
+                    .resource_type
+                    .as_deref()
+                    .is_none_or(|resource_type| resource_type == arn.resource_type())
+        })
+    }
+}
+
+/// One managed rule `ListManagedInsightRules` reports for a resource: the template it is
+/// available from, and the Contributor Insights rule enabled from that template when one is
+/// enabled for the resource.
+#[derive(Debug, Clone, Copy)]
+pub struct AvailableManagedRule<'a> {
+    /// The template the rule is (or would be) enabled from.
+    pub template_name: &'a str,
+    /// The rule enabled from the template for this resource — its name and record — or `None`
+    /// when the template is available but nothing has enabled it: "If present, it contains
+    /// information about the Contributor Insights rule that contains information about the
+    /// related Amazon Web Services resource." (`ManagedRuleDescription$RuleState`)
+    pub rule: Option<(&'a String, &'a StoredInsightRule)>,
+}
+
 /// A stored dashboard: the `DashboardBody` document `PutDashboard` was given, when that
 /// write happened, and the tags the dashboard was created with.
 ///
@@ -1336,6 +1399,23 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     pub metric_streams: HashMap<String, StoredMetricStream>,
     /// Contributor Insights rules by rule name.
     pub insight_rules: HashMap<String, StoredInsightRule>,
+    /// The managed Contributor Insights rule templates this account can enable rules from, as
+    /// the service publishes them.
+    ///
+    /// The catalog is the SERVICE's side of `ManagedRule$TemplateName` ("as returned by
+    /// `ListManagedInsightRules`"): a caller names a template, it never adds one. It starts
+    /// EMPTY, which is the state the recorded service answers from for every resource this
+    /// emulator can hold — `ListManagedInsightRules` reports no available managed rule for a
+    /// live DynamoDB table or a live CloudWatch alarm, and every template name tried for either
+    /// is answered "could not find template" — so a `PutManagedInsightRules` entry is reported
+    /// back among the rules that could not be enabled until a template of that name is
+    /// published for the entry's resource through [`Self::publish_managed_rule_template`].
+    ///
+    /// An empty catalog therefore says that THIS emulator publishes no managed-rule template,
+    /// not that no template exists anywhere: a template enters the catalog through that seam,
+    /// for the vendor and resource type it collects data for, when a service this emulator
+    /// serves publishes one.
+    pub managed_rule_templates: Vec<ManagedRuleTemplate>,
     /// Anomaly detection models by their unique identifier
     /// ([`AnomalyDetectorForm::detector_id`]), which is what identifies the metric and
     /// statistic (or the queries) a model was created for, so a second write for the same
@@ -2626,6 +2706,90 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
                 .then_with(|| left_name.cmp(right_name))
         });
         rules
+    }
+
+    /// Publish `template` into this account's managed-rule catalog, replacing a template
+    /// already published under the same name for the same resources.
+    ///
+    /// The seam the SERVICE side of the catalog is written through: "The template name for the
+    /// managed Contributor Insights rule, as returned by `ListManagedInsightRules`."
+    /// (`ManagedRule$TemplateName`) — a caller names a published template, so nothing a
+    /// `PutManagedInsightRules` request carries reaches this.
+    pub fn publish_managed_rule_template(&mut self, template: ManagedRuleTemplate) {
+        match self.managed_rule_templates.iter_mut().find(|held| {
+            held.template_name == template.template_name
+                && held.resource_vendor == template.resource_vendor
+                && held.resource_type == template.resource_type
+        }) {
+            Some(held) => *held = template,
+            None => self.managed_rule_templates.push(template),
+        }
+    }
+
+    /// The published template `template_name` names for `resource_arn`, or `None` when the
+    /// catalog publishes no template of that name for that resource.
+    ///
+    /// Exact match on the name: a template is named as it is published, so a name that differs
+    /// in case or punctuation names a different template — and, when none is published under
+    /// it, no template at all.
+    pub fn managed_rule_template(
+        &self,
+        template_name: &str,
+        resource_arn: &str,
+    ) -> Option<&ManagedRuleTemplate> {
+        self.managed_rule_templates.iter().find(|template| {
+            template.template_name == template_name && template.available_for(resource_arn)
+        })
+    }
+
+    /// Every managed rule available for `resource_arn`: ONE entry per template the catalog
+    /// publishes for it or a rule is enabled from, carrying that rule when one is enabled,
+    /// ordered by template name.
+    ///
+    /// "The managed rules that are available for the specified Amazon Web Services resource."
+    /// (`ListManagedInsightRulesOutput$ManagedRules`) — available is what the catalog publishes
+    /// for the resource, and whether a rule has been enabled from a template is what its
+    /// `RuleState` says ("If present, it contains information about the Contributor Insights
+    /// rule…", `ManagedRuleDescription$RuleState`). A rule whose template the catalog no longer
+    /// publishes is still reported: the rule exists.
+    ///
+    /// One entry per template is what makes the template name identify the entry — which is
+    /// what a listing's page token is, so it has to hold however the store got into its current
+    /// shape. A resource holds at most one rule per template by construction (the rule's name
+    /// is derived from the (template, resource) pair, so enabling the same template again names
+    /// the same rule), and a second rule that reached the same template anyway is reported
+    /// once, under the first of them in rule-name order.
+    pub fn managed_rules_available_for(&self, resource_arn: &str) -> Vec<AvailableManagedRule<'_>> {
+        let enabled = self.managed_insight_rules_for(resource_arn);
+        let mut available: Vec<AvailableManagedRule<'_>> = Vec::new();
+        for (name, stored) in &enabled {
+            let template_name = template_name_of(stored);
+            if available
+                .iter()
+                .any(|reported| reported.template_name == template_name)
+            {
+                continue;
+            }
+            available.push(AvailableManagedRule {
+                template_name,
+                rule: Some((*name, *stored)),
+            });
+        }
+        for template in &self.managed_rule_templates {
+            let name = template.template_name.as_str();
+            if template.available_for(resource_arn)
+                && !available
+                    .iter()
+                    .any(|reported| reported.template_name == name)
+            {
+                available.push(AvailableManagedRule {
+                    template_name: name,
+                    rule: None,
+                });
+            }
+        }
+        available.sort_by(|left, right| left.template_name.cmp(right.template_name));
+        available
     }
 
     /// Move every Contributor Insights rule `rule_names` names to `rule_state`, reporting back

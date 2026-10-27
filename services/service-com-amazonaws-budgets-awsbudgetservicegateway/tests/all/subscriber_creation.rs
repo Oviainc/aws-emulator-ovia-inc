@@ -129,7 +129,9 @@ async fn seed(
 }
 
 /// One `CreateSubscriber` call.
-async fn create_subscriber(
+///
+/// `pub(crate)` so every suite that drives the growth path calls it the same way.
+pub(crate) async fn create_subscriber(
     router: &MultiServiceRouter,
     account_id: &str,
     budget_name: &str,
@@ -206,7 +208,7 @@ fn stored_subscribers(
 
 /// A subscriber as `(SubscriptionType, Address)`, for comparing a reported or stored set
 /// against the one the table supplied.
-fn pair(subscriber: &Value) -> (String, String) {
+pub(crate) fn pair(subscriber: &Value) -> (String, String) {
     (
         subscriber["SubscriptionType"].as_str().unwrap_or_default().to_string(),
         subscriber["Address"].as_str().unwrap_or_default().to_string(),

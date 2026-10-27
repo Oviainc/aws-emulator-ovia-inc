@@ -107,6 +107,8 @@ mod merge_pull_request_three_way;
 mod object_store_bounds;
 #[path = "all/path_depth_bound.rs"]
 mod path_depth_bound;
+#[path = "all/pull_request_approval_rule_evaluation.rs"]
+mod pull_request_approval_rule_evaluation;
 #[path = "all/pull_request_approval_rules.rs"]
 mod pull_request_approval_rules;
 #[path = "all/pull_request_approval_state.rs"]

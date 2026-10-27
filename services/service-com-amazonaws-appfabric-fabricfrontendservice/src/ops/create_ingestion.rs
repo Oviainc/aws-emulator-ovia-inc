@@ -12,7 +12,10 @@
 //! tenant, so the bundle must already hold an app authorization for that
 //! (`app`, `tenantId`) pair that has completed the connect handshake
 //! (`Connected`). A pair with no such authorization is refused with the modelled
-//! `ValidationException` and nothing is written.
+//! `ValidationException` and nothing is written. That dependency is a fact about
+//! the STORE rather than about the request, so — like the quota guard — it is
+//! judged only AFTER the `clientToken` replay: a retry whose ingestion already
+//! exists replays it, whatever the authorization has become since.
 //!
 //! ## Shape of an operation
 //!
@@ -235,32 +238,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // AppFabric's resource chain is authorize → connect → ingest: an
-        // ingestion reads one application's data for one tenant, which it can
-        // only do through an app authorization of that (app, tenant) pair that
-        // has completed the connect handshake — the lookup
-        // `crate::state::AppBundleRecord::connected_authorization` is. A pair
-        // the bundle holds no CONNECTED authorization for — whether it holds
-        // none at all or one still `PendingConnect` — cannot be ingested, and
-        // the refusal is the modelled `ValidationException` (HTTP 400): the
-        // request names a dependency that is not satisfied, so nothing is
-        // written. Only that refusal needs the status the bundle DOES hold for
-        // the pair, which is what tells the caller whether it still has to
-        // create the authorization or only to connect it.
-        let parent = store.app_bundles.get(&bundle_key);
-        if parent
-            .and_then(|bundle| bundle.connected_authorization(&input.app, &input.tenant_id))
-            .is_none()
-        {
-            let held_status = parent
-                .and_then(|bundle| bundle.authorization_for(&input.app, &input.tenant_id))
-                .map(|authorization| authorization.status.clone());
-            return Err(CreateIngestionErrorModeled::ValidationException(
-                crate::state::app_authorization_not_connected(&input.app, held_status.as_deref()),
-            )
-            .into());
-        }
-
         // The PARENT is one of this request's parameters, so it belongs in the
         // fingerprint: the same token under a different bundle is a different
         // request, not a retry of this one.
@@ -304,6 +281,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // nothing, so this call creates a new one under a new token.
                 store.client_tokens.remove(&key);
             }
+        }
+
+        // AppFabric's resource chain is authorize → connect → ingest: an
+        // ingestion reads one application's data for one tenant, which it can
+        // only do through an app authorization of that (app, tenant) pair that
+        // has completed the connect handshake — the lookup
+        // `crate::state::AppBundleRecord::connected_authorization` is. A pair
+        // the bundle holds no CONNECTED authorization for — whether it holds
+        // none at all or one still `PendingConnect` — cannot be ingested, and
+        // the refusal is the modelled `ValidationException` (HTTP 400): the
+        // request names a dependency that is not satisfied, so nothing is
+        // written. Only that refusal needs the status the bundle DOES hold for
+        // the pair, which is what tells the caller whether it still has to
+        // create the authorization or only to connect it.
+        //
+        // This is a STATE-DEPENDENT precondition, so it is checked AFTER the
+        // idempotent replay above, exactly like the quota guard below: the
+        // authorization can fall out of `Connected` after the ingestion was
+        // created (any applied `UpdateAppAuthorization` re-pends it, and a
+        // changed tenant moves the pair), and a retry of an ingestion that
+        // already exists must never be refused by it.
+        let parent = store.app_bundles.get(&bundle_key);
+        if parent
+            .and_then(|bundle| bundle.connected_authorization(&input.app, &input.tenant_id))
+            .is_none()
+        {
+            let held_status = parent
+                .and_then(|bundle| bundle.authorization_for(&input.app, &input.tenant_id))
+                .map(|authorization| authorization.status.clone());
+            return Err(CreateIngestionErrorModeled::ValidationException(
+                crate::state::app_authorization_not_connected(&input.app, held_status.as_deref()),
+            )
+            .into());
         }
 
         let sequence = store.next_sequence();

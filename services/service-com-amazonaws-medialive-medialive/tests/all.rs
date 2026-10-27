@@ -131,6 +131,9 @@ mod event_bridge_rule_template_listing;
 #[path = "all/event_bridge_rule_template_not_found.rs"]
 mod event_bridge_rule_template_not_found;
 
+#[path = "all/event_bridge_rule_template_targets.rs"]
+mod event_bridge_rule_template_targets;
+
 #[path = "all/event_bridge_rule_templates.rs"]
 mod event_bridge_rule_templates;
 

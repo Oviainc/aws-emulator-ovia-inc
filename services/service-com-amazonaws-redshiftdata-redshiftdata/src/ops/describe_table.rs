@@ -309,9 +309,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The catalog is read on the blocking pool with only this database's
         // lock held, bounded exactly as a statement's execution is, so a catalog
-        // read queued behind a slow statement cannot pin this request.
-        let budget = crate::state::wait_budget(None);
-        let engine_timeout = crate::state::engine_timeout(budget);
+        // read queued behind a slow statement cannot pin this request: the
+        // engine gives up at its own deadline, and the request waits a grace
+        // period longer than that for the answer.
+        let engine_timeout = crate::state::engine_timeout();
+        let budget = crate::state::CATALOG_REQUEST_BUDGET;
         let bound = crate::state::ExecutionBound::new();
         let interrupt = bound.interrupt();
         let wanted = table.clone();

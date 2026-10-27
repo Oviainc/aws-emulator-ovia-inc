@@ -217,7 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Each recorded workload's roll-up is counted over the content of the lenses IT
             // reviews, resolved from the whole lens catalog.
             .map(|record| {
-                record.to_summary(&store.reviewed_lens_content(&record.workload.lenses))
+                record.to_summary(
+                    &store.reviewed_lens_content(&record.workload.reviewed_lens_versions()),
+                )
             })
             .collect();
 

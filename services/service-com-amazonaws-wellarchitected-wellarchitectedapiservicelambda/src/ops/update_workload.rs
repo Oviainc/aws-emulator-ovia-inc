@@ -397,7 +397,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(UpdateWorkloadOutput {
-            workload: Some(record.to_workload(&store.reviewed_lens_content(&record.lenses))),
+            workload: Some(record.to_workload(
+                &store.reviewed_lens_content(&record.reviewed_lens_versions()),
+            )),
         })
     }
 }

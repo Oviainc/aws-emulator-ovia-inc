@@ -208,10 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &crate::state::request_region(ctx.parts()),
                 ),
                 // The content of the lenses this workload reviews, resolved from the whole
-                // lens catalog: what a lens asks is that lens's own content, so the
-                // roll-ups below count the imported questions of a custom lens exactly as
-                // they count an official lens's catalog questions.
-                &store.reviewed_lens_content(&workload.lenses),
+                // lens catalog for the version each of its reviews is against: what a lens
+                // asks is that lens's own content, so the roll-ups below count the imported
+                // questions of the published version of a custom lens this review is
+                // against exactly as they count an official lens's catalog questions.
+                &store.reviewed_lens_content(&workload.reviewed_lens_versions()),
             )),
         })
     }
