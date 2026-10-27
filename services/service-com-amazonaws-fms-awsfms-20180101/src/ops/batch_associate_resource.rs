@@ -14,6 +14,14 @@
 //! the authorization refusal rather than `ResourceNotFoundException` or a
 //! per-item `FailedItems` result.
 //!
+//! The administrative scope governing the resource set decides whether its
+//! membership may be changed at all: changing which resources a set holds is
+//! editing the set, and one reported `OUT_OF_ADMIN_SCOPE` is a set the
+//! administrator "can view … but they can't edit or delete", so the whole batch
+//! is refused with the modelled `InvalidOperationException`
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::resource_set_mutation_refusal`])
+//! and the membership is left as it was.
+//!
 //! With an administrator associated, an identifier that names no stored resource
 //! set is `ResourceNotFoundException`, and each item is classified
 //! INDEPENDENTLY: one that cannot be associated is reported in `FailedItems`
@@ -239,6 +247,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // Changing which resources a set holds is editing the set, so it is the
+        // administrator's to do only while the administrative scope governing
+        // that set covers it: a set reported `OUT_OF_ADMIN_SCOPE` is one "the
+        // administrator can view … but they can't edit or delete"
+        // ([`crate::state::ComAmazonawsFmsAwsfms20180101State::resource_set_mutation_refusal`]),
+        // so the whole batch is refused before any item is classified and the
+        // membership is left exactly as it was.
+        if let Some(refusal) = store
+            .resource_sets
+            .get(&id)
+            .and_then(|existing| store.resource_set_mutation_refusal(existing))
+        {
+            return Err(
+                BatchAssociateResourceErrorModeled::InvalidOperationException(refusal).into(),
+            );
+        }
 
         // Classified against the resource set's own `ResourceTypeList` and the
         // store, all read ONCE before the membership is written.
