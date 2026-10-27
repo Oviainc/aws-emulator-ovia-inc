@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchAssociateScramSecret
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchAssociateScramSecret`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Associates AWS Secrets Manager secrets with the cluster an ARN names, so its
+//! SASL/SCRAM clients can authenticate with them and `ListScramSecrets` reports
+//! them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchAssociateScramSecret::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The secrets are stored as a SET on the cluster record
+//! ([`crate::state::Cluster::associate_scram_secrets`]), so a secret this
+//! cluster already holds is not a second entry and re-associating one leaves
+//! every listing of the cluster's secrets unchanged.
+//!
+//! Three conditions refuse the whole batch and store nothing, because each is
+//! about the request or the cluster rather than about one secret: a `ClusterArn`
+//! that is not an MSK cluster ARN at all and a `SecretArnList` entry that is not
+//! a Secrets Manager secret ARN are `BadRequestException`, a well-formed cluster
+//! ARN this endpoint's region holds no cluster for is `NotFoundException`, and a
+//! cluster whose client authentication does not turn SASL/SCRAM on has nothing
+//! to authenticate with those secrets ([`crate::state::SASL_SCRAM_NOT_ENABLED_MESSAGE`]).
+//! `UnprocessedScramSecrets` is therefore empty on every accepted call: each
+//! secret of a batch this handler admits is associated. The real service also
+//! reports a PER-SECRET failure there, with a 200, for a secret only AWS
+//! Secrets Manager can judge — one it does not hold, or one encrypted with the
+//! service's own key rather than a customer-managed one. This emulator keeps no
+//! Secrets Manager state to ask, so it cannot decide those and associates the
+//! secret instead of reporting it unprocessed.
+//!
+//! A batch that would take the cluster past
+//! [`crate::state::MAX_SCRAM_SECRETS_PER_CLUSTER`] is refused whole, as
+//! `TooManyRequestsException` — the error class the other per-cluster ceilings
+//! of this crate answer with (`CreateTopic`, `CreateChannel`). Both the ceiling
+//! and that choice of class are this emulator's, for a bound AWS states as no
+//! quota of this API.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +172,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchAssociateScramSecret` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchAssociateScramSecretErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchAssociateScramSecret"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchAssociateScramSecretErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // A value that is not a cluster ARN at all is a request the service
+        // cannot act on; `NotFoundException` is reserved for a well-formed ARN
+        // this endpoint holds no cluster for.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                BatchAssociateScramSecretErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // Every entry must name a Secrets Manager secret, since that is what the
+        // member carries and what a SASL/SCRAM client's credentials live in.
+        // Checked before the lock and before anything is stored: it depends on
+        // the request alone, so a batch carrying one unusable ARN associates
+        // none of its secrets.
+        if let Some(not_a_secret) = input
+            .secret_arn_list
+            .iter()
+            .find(|arn| !crate::state::is_secrets_manager_secret_arn(arn))
+        {
+            return Err(
+                BatchAssociateScramSecretErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("SecretArnList".to_string()),
+                    message: Some(format!(
+                        "{not_a_secret} is not a valid AWS Secrets Manager secret ARN."
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let mut state = state.lock();
+        // Resolved through the settling lookup, as every operation that reaches
+        // a cluster does, so this writer and the readers agree about which
+        // clusters this endpoint holds and about what the clock already owed
+        // them.
+        let Some(cluster) = state.settled_cluster_in_mut(
+            &region,
+            &input.cluster_arn,
+            std::time::SystemTime::now(),
+        ) else {
+            return Err(
+                BatchAssociateScramSecretErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+
+        // A cluster authenticates SASL/SCRAM clients only where its client
+        // authentication says so, so a cluster that does not (a serverless one
+        // among them, which authenticates with IAM) holds no secrets at all.
+        if !cluster.sasl_scram_enabled() {
+            return Err(
+                BatchAssociateScramSecretErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::SASL_SCRAM_NOT_ENABLED_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // The record enforces its own ceiling on the one association path, so a
+        // refused batch stores nothing.
+        if let Err(rejected) = cluster.associate_scram_secrets(&input.secret_arn_list) {
+            return Err(
+                BatchAssociateScramSecretErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        invalid_parameter: Some("SecretArnList".to_string()),
+                        message: Some(format!(
+                            "The cluster {} holds {} SCRAM secret(s) and the request adds {} more, \
+                             which would give it {}; a cluster may hold at most {} SCRAM secrets.",
+                            input.cluster_arn,
+                            rejected.held,
+                            rejected.added,
+                            rejected.resulting,
+                            crate::state::MAX_SCRAM_SECRETS_PER_CLUSTER
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(BatchAssociateScramSecretOutput {
+            // The STORED cluster's ARN, so the answer names the record the
+            // secrets were associated with rather than echoing the request.
+            cluster_arn: Some(cluster.arn.clone()),
+            // Nothing was left unprocessed: every condition that stops a secret
+            // being associated refuses the whole call above.
+            unprocessed_scram_secrets: Some(Vec::new()),
+        })
     }
 }
