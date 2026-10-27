@@ -212,7 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         )
                         .into());
                     };
-                    domain_filter = Some(arn.clone());
+                    // A filter ARN names a domain by the identifier it carries, not by
+                    // the partition it is written in, so it is read as the ARN the
+                    // catalog stores for that domain before anything is compared with
+                    // it — the identity rule GetControl applies to a control ARN.
+                    domain_filter = Some(crate::state::canonical_catalog_arn("domain", arn));
                 }
             }
         }
