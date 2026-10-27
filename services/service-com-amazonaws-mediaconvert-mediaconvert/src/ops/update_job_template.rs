@@ -226,11 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request would leave behind is the one it carries, and it takes the same test a
         // graph takes on the way in: a template is "all the transcode settings ... that
         // will be applied to jobs created from it", so it can only be left in a state a
-        // job can be built from.
+        // job can be built from — including the presets its outputs name, resolved under
+        // the same guard the queue references above are.
         let settings_problem = input
             .settings
             .as_ref()
-            .and_then(crate::state::job_template_settings_problem);
+            .and_then(|settings| state.job_template_settings_problem(settings));
 
         // The ADDRESSED resource is checked first: the template must exist, and a
         // built-in one cannot be changed at all — "System or built-in job templates can't
