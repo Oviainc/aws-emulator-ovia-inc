@@ -227,7 +227,6 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
             "AES256",
         ),
         ("a requester-pays read", "x-amz-request-payer", "requester"),
-        ("a checksum read", "x-amz-checksum-mode", "ENABLED"),
     ] {
         let answer = head_object(&router, bucket, "held.txt", &[(header, value)]).await;
         assert_eq!(
@@ -242,6 +241,43 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
             "NotImplemented",
             "case {case:?}: expected NotImplemented, got {:?}",
             answer.error_code()
+        );
+    }
+
+    // `x-amz-checksum-mode` IS served: "to retrieve the checksum, this parameter must be
+    // enabled" (`HeadObjectRequest$ChecksumMode`) asks for the checksum the object was
+    // STORED with, and this object was written under no checksum algorithm — so the read is
+    // answered with the 200 S3 answers it with, reporting no checksum rather than being
+    // refused. A read of an object that WAS stored with one reports its value and type (see
+    // `multipart_upload_completion`).
+    let enabled = head_object(
+        &router,
+        bucket,
+        "held.txt",
+        &[("x-amz-checksum-mode", "ENABLED")],
+    )
+    .await;
+    assert_eq!(
+        enabled.status, 200,
+        "case \"a checksum read of an object stored without one\": expected HTTP 200, got {} \
+         with body {:?}",
+        enabled.status,
+        String::from_utf8_lossy(&enabled.body)
+    );
+    for member in [
+        "x-amz-checksum-crc32",
+        "x-amz-checksum-crc32c",
+        "x-amz-checksum-crc64nvme",
+        "x-amz-checksum-sha1",
+        "x-amz-checksum-sha256",
+        "x-amz-checksum-type",
+    ] {
+        assert_eq!(
+            enabled.header(member),
+            None,
+            "case {member:?}: an object stored under no checksum algorithm reports no \
+             checksum, got {:?}",
+            enabled.header(member)
         );
     }
 
