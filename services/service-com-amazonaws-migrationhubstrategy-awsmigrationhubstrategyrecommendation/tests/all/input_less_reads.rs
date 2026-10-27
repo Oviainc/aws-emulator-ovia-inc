@@ -36,8 +36,8 @@ use crate::import_and_assess::{
 /// `GetPortfolioPreferences` (`GET /get-portfolio-preferences`, likewise).
 ///
 /// `GetPortfolioSummary` takes no input either, but it reports a SUMMARY of the portfolio
-/// rather than a record that can be absent, and it is still a scaffold stub — so it is
-/// not a row here.
+/// rather than a record that can be absent — an account holding nothing summarises as the
+/// empty portfolio it is — so it is not a row here; `portfolio_summary.rs` is its suite.
 const INPUT_LESS_READS: &[(&str, &str)] = &[
     ("GetLatestAssessmentId", "/get-latest-assessment-id"),
     ("GetPortfolioPreferences", "/get-portfolio-preferences"),

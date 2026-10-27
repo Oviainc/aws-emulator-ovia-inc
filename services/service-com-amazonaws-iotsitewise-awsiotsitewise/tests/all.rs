@@ -584,3 +584,9 @@ mod update_asset_model_composite_model;
 #[path = "all/list_access_policies.rs"]
 mod list_access_policies;
 
+// Declared last, for the same reason the suites above it are: both stretches
+// higher up are where every concurrent iotsitewise change inserts a declaration
+// of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/dataset_data_segment_disassociation.rs"]
+mod dataset_data_segment_disassociation;
+

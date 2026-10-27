@@ -445,9 +445,104 @@ fn projected(
                 redrive_count: stored.details.redrive_count,
             });
         }
+        // A `Task` state's own work: every one of its events names the work, so a
+        // record that does not carry what names it reports no detail at all — the two
+        // members are required.
+        crate::state::EVENT_TASK_SCHEDULED => {
+            if let Some((resource_type, resource)) = named_work(stored) {
+                event.task_scheduled_event_details = Some(TaskScheduledEventDetails {
+                    resource_type,
+                    resource,
+                    region: crate::state::arn_region(&execution.arn),
+                    parameters: data(stored.details.input.clone()).unwrap_or_default(),
+                    timeout_in_seconds: seconds(stored.details.timeout_seconds),
+                    heartbeat_in_seconds: seconds(stored.details.heartbeat_seconds),
+                    task_credentials: None,
+                });
+            }
+        }
+        crate::state::EVENT_TASK_STARTED => {
+            if let Some((resource_type, resource)) = named_work(stored) {
+                event.task_started_event_details = Some(TaskStartedEventDetails {
+                    resource_type,
+                    resource,
+                });
+            }
+        }
+        crate::state::EVENT_TASK_SUCCEEDED => {
+            if let Some((resource_type, resource)) = named_work(stored) {
+                event.task_succeeded_event_details = Some(TaskSucceededEventDetails {
+                    resource_type,
+                    resource,
+                    output: data(stored.details.output.clone()),
+                    output_details: included
+                        .filter(|_| with_data && stored.details.output.is_some()),
+                });
+            }
+        }
+        crate::state::EVENT_TASK_FAILED => {
+            if let Some((resource_type, resource)) = named_work(stored) {
+                event.task_failed_event_details = Some(TaskFailedEventDetails {
+                    resource_type,
+                    resource,
+                    error: stored.details.error.clone(),
+                    cause: stored.details.cause.clone(),
+                });
+            }
+        }
+        crate::state::EVENT_TASK_TIMED_OUT => {
+            if let Some((resource_type, resource)) = named_work(stored) {
+                event.task_timed_out_event_details = Some(TaskTimedOutEventDetails {
+                    resource_type,
+                    resource,
+                    error: stored.details.error.clone(),
+                    cause: stored.details.cause.clone(),
+                });
+            }
+        }
+        // "The size of the array for Map state iterations", which the state knew when
+        // it started iterating.
+        crate::state::EVENT_MAP_STATE_STARTED => {
+            event.map_state_started_event_details = Some(MapStateStartedEventDetails {
+                length: stored.details.length.unwrap_or_default(),
+            });
+        }
+        // One iteration of a `Map` state, which reports "the name of the iteration's
+        // parent Map state" and "the index of the array" it was handed.
+        crate::state::EVENT_MAP_ITERATION_STARTED => {
+            event.map_iteration_started_event_details = Some(iteration(stored));
+        }
+        crate::state::EVENT_MAP_ITERATION_SUCCEEDED => {
+            event.map_iteration_succeeded_event_details = Some(iteration(stored));
+        }
+        crate::state::EVENT_MAP_ITERATION_FAILED => {
+            event.map_iteration_failed_event_details = Some(iteration(stored));
+        }
+        crate::state::EVENT_MAP_ITERATION_ABORTED => {
+            event.map_iteration_aborted_event_details = Some(iteration(stored));
+        }
         _ => {}
     }
     event
+}
+
+/// The work a `Task` state's event names: "the service name of the resource in a task
+/// state" and "the action of the resource called by a task state", both of which the
+/// model makes required — so an event whose record names neither reports no detail
+/// rather than an empty one.
+fn named_work(stored: &crate::state::HistoryEvent) -> Option<(String, String)> {
+    let resource_type = stored.details.resource_type.clone()?;
+    let resource = stored.details.resource.clone()?;
+    Some((resource_type, resource))
+}
+
+/// One `Map` iteration's own detail: the state the iteration belongs to and the index
+/// of the item it was handed.
+fn iteration(stored: &crate::state::HistoryEvent) -> MapIterationEventDetails {
+    MapIterationEventDetails {
+        name: stored.state_name.clone(),
+        index: stored.details.index.unwrap_or_default(),
+    }
 }
 
 /// The suffix every `<Type>StateEntered` event's type carries, which is what makes

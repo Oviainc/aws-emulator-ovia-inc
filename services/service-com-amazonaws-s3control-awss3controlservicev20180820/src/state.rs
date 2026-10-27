@@ -307,8 +307,8 @@ pub type StorageLensConfigurationKey = (String, String);
 /// claim about any account's limit. It is set far above any workflow an
 /// emulator serves, and together with [`MAX_STORAGE_LENS_TAGS`] it is what
 /// stops this part of the state growing without end. (The record a put adds is
-/// released by `DeleteStorageLensConfiguration`, which is still a scaffold with
-/// its own gap issue; until it is written the bound is the only limit.)
+/// released by `DeleteStorageLensConfiguration`, so a caller that deletes what
+/// it no longer needs never reaches the bound.)
 pub const STORAGE_LENS_CONFIGURATION_QUOTA: usize = 1_000;
 
 /// The largest tag set an S3 Storage Lens configuration carries.
@@ -2058,11 +2058,14 @@ pub fn public_access_block_store_full<E>(account_id: &str) -> crate::scaffolded:
 /// as for the access point refusals above — the refusal is carried in the
 /// S3-style XML `<Code>`/`<Message>` envelope with the code and status the real
 /// service answers a missing configuration with.
-pub fn no_such_storage_lens_configuration<E>(config_id: &str) -> crate::scaffolded::Scaffolded<E> {
+///
+/// The message is fixed text, naming no configuration id: it is what the
+/// service answers for every id the account holds no configuration under.
+pub fn no_such_storage_lens_configuration<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_failure(
         "NoSuchConfiguration",
         404,
-        format!("The specified configuration does not exist: {config_id}"),
+        "The specified configuration does not exist.".to_string(),
     )
 }
 

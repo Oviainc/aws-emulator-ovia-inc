@@ -53,6 +53,8 @@ mod email_identity_policies;
 mod email_templates;
 #[path = "all/list_tenants.rs"]
 mod list_tenants;
+#[path = "all/message_insights.rs"]
+mod message_insights;
 #[path = "all/metric_data.rs"]
 mod metric_data;
 #[path = "all/multi_region_endpoints.rs"]

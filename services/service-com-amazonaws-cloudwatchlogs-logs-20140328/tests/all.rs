@@ -151,6 +151,8 @@ mod resource_tag_removal;
 mod resource_tags;
 #[path = "all/retention_policy.rs"]
 mod retention_policy;
+#[path = "all/s3_table_integration_sources.rs"]
+mod s3_table_integration_sources;
 #[path = "all/scheduled_queries.rs"]
 mod scheduled_queries;
 #[path = "all/scheduled_query_enumeration.rs"]

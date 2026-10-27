@@ -15,6 +15,8 @@
 mod account_attributes;
 #[path = "all/authentication_profiles.rs"]
 mod authentication_profiles;
+#[path = "all/batch_delete_cluster_snapshots.rs"]
+mod batch_delete_cluster_snapshots;
 #[path = "all/batch_modify_cluster_snapshots.rs"]
 mod batch_modify_cluster_snapshots;
 #[path = "all/cluster_iam_roles.rs"]
@@ -33,6 +35,8 @@ mod cluster_structure;
 mod cluster_transition_convergence;
 #[path = "all/cluster_versions.rs"]
 mod cluster_versions;
+#[path = "all/copy_cluster_snapshot.rs"]
+mod copy_cluster_snapshot;
 #[path = "all/default_cluster_parameters.rs"]
 mod default_cluster_parameters;
 #[path = "all/error_envelope.rs"]

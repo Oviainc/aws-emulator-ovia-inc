@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTrustedTokenIssuers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTrustedTokenIssuers`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: reports the trusted token issuers stored under the instance the request
+//! names, ordered by `TrustedTokenIssuerArn` and paged by this service's own cursor, each
+//! projected through the same stored record `DescribeTrustedTokenIssuer` reports. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTrustedTokenIssuers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORT: it writes nothing of its own. The only change it lets the store make is what
+//! the CLOCK already owes — an instance whose deletion instant has passed is gone, and the
+//! trusted token issuers held inside it with it.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +164,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTrustedTokenIssuers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTrustedTokenIssuersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTrustedTokenIssuers"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTrustedTokenIssuersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The cursor is scoped to THIS enumeration: the operation and the instance whose
+        // issuers it walks. The enumeration takes no filter, so nothing else narrows it.
+        let scope = crate::state::cursor_trusted_token_issuers(&input.instance_arn);
+        // A `NextToken` this service did not issue for THIS enumeration is a bad request,
+        // not an empty page: answering an empty page would silently end a caller's
+        // enumeration early.
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListTrustedTokenIssuersErrorModeled::ValidationException(ValidationException {
+                    message: Some(message.to_string()),
+                    // The model's `ValidationExceptionReason` enum carries only KMS key
+                    // states, none of which this refusal is.
+                    reason: None,
+                })
+            },
+        )?;
+
+        let ordered: Vec<(String, TrustedTokenIssuerMetadata)> = {
+            let mut store = state.lock();
+            // A READ, except for what the CLOCK already owes: an instance whose deletion
+            // instant has passed is gone, and the trusted token issuers held inside it
+            // with it, whether or not anybody listed them. The account's ambient instance
+            // is enabled here too if nothing has decided the account's enablement yet, so
+            // this read resolves the instance every other read at this instant resolves.
+            store.on_request(
+                &crate::state::request_region(ctx.parts()),
+                ::std::time::SystemTime::now(),
+            );
+            // Issuers are enumerated UNDER an instance, so an `InstanceArn` this account
+            // holds no instance for is refused rather than answered with an empty page
+            // that would read as "this instance has no trusted token issuers". This
+            // operation models no `ResourceNotFoundException`, and an instance this
+            // account does not hold is one the caller may not act on, so the refusal goes
+            // on the modelled `AccessDeniedException` channel — the same channel, with the
+            // same wording, `CreateTrustedTokenIssuer` answers an unheld `InstanceArn`
+            // with.
+            if store.instance(&input.instance_arn).is_none() {
+                return Err(ListTrustedTokenIssuersErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(format!(
+                            "No instance found with the ARN {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into());
+            }
+            // Exactly the issuers stored under this instance, keyed and ordered by
+            // `TrustedTokenIssuerArn` — both the page order and the cursor order — and
+            // projected through the SAME record `DescribeTrustedTokenIssuer` reports, so a
+            // listed issuer and a described one agree member for member.
+            store
+                .trusted_token_issuers
+                .values()
+                .filter(|record| record.instance_arn == input.instance_arn)
+                .map(|record| {
+                    (
+                        record.trusted_token_issuer_arn.clone(),
+                        record.to_metadata(),
+                    )
+                })
+                .collect()
+        };
+
+        // The model gives the response's `TrustedTokenIssuerList` no length of its own, so
+        // a page carries as many items as `MaxResults` asks for, up to the `MaxResults`
+        // shape's own maximum, which the paging helper clamps to.
+        let (trusted_token_issuers, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), input.max_results);
+        Ok(ListTrustedTokenIssuersOutput {
+            trusted_token_issuers: Some(trusted_token_issuers),
+            next_token,
+        })
     }
 }

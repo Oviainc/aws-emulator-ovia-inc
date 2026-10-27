@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFirewallRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFirewallRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFirewallRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. The DNS Firewall rule-group slice
+//! (`CreateFirewallRuleGroup`, `GetFirewallRuleGroup`) computes every response
+//! from the records in [`crate::state`]. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +142,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFirewallRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFirewallRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFirewallRuleGroup"))
+        // The engine is reachable from `&self` (constructor-injected); this
+        // operation mints no ARN, so it takes nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetFirewallRuleGroupErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Retrieves the specified firewall rule group": a pure read, so the
+        // store is only locked for the lookup and nothing is written.
+        let now = ::std::time::Instant::now();
+        let stored = state
+            .lock()
+            .firewall_rule_groups
+            .get(&input.firewall_rule_group_id)
+            .map(|record| record.to_rule_group(now));
+
+        match stored {
+            Some(rule_group) => Ok(GetFirewallRuleGroupOutput {
+                firewall_rule_group: Some(rule_group),
+            }),
+            None => Err(GetFirewallRuleGroupErrorModeled::ResourceNotFoundException(
+                crate::state::firewall_rule_group_not_found(&input.firewall_rule_group_id),
+            )
+            .into()),
+        }
     }
 }

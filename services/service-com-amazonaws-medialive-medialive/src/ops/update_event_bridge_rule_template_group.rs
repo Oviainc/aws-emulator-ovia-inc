@@ -211,29 +211,20 @@ fn not_found() -> UpdateEventBridgeRuleTemplateGroupError {
 }
 
 /// Refuse a member whose length is outside the bounds its target shape names,
-/// with the operation's own modelled client error and a message built from the
-/// request: the member, the bound and the length that broke it.
+/// with the operation's own modelled client error carrying the message the
+/// shared length rule ([`crate::state::bounded_length`]) states.
 fn bounded(
     member: &str,
     value: Option<&str>,
     min: usize,
     max: usize,
 ) -> Result<(), UpdateEventBridgeRuleTemplateGroupError> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let len = value.chars().count();
-    if len >= min && len <= max {
-        return Ok(());
-    }
-    Err(
+    crate::state::bounded_length(member, value, min, max).map_err(|message| {
         UpdateEventBridgeRuleTemplateGroupErrorModeled::BadRequestException(BadRequestException {
-            message: Some(format!(
-                "{member} must be between {min} and {max} characters long, but was {len}"
-            )),
+            message: Some(message),
         })
-        .into(),
-    )
+        .into()
+    })
 }
 
 /// The engine this operation was built from is not the shared in-memory engine,

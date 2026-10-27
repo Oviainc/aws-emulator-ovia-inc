@@ -190,9 +190,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `NextToken` is this listing's own cursor, under the one cursor rule every paged
         // listing of this service shares: the count of entries already returned.
-        let start =
-            crate::state::count_cursor("NextToken", input.next_token.as_deref(), names.len())
-                .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
+        let start = crate::state::count_cursor(input.next_token.as_deref(), names.len())
+            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
         let page_size = input
             .max_results
             // Inside the range checked above, so the conversion holds.

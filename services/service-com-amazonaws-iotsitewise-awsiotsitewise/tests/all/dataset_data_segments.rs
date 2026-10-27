@@ -498,7 +498,10 @@ pub(crate) async fn time_series_id(router: &MultiServiceRouter, alias: &str) -> 
 }
 
 /// The table seconds `GetAssetPropertyValueHistory` still reports for `alias`.
-async fn history_seconds(router: &MultiServiceRouter, alias: &str) -> Vec<i64> {
+///
+/// Shared with the disassociation suite, which pins that removing an association
+/// leaves exactly the samples a deletion would have taken.
+pub(crate) async fn history_seconds(router: &MultiServiceRouter, alias: &str) -> Vec<i64> {
     let (status, body) = call(
         router,
         "GET",

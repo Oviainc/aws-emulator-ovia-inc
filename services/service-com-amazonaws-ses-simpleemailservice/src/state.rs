@@ -3,8 +3,9 @@
 //! Engine state for the com-amazonaws-ses-simpleemailservice service.
 //!
 //! One store per emulator: the identity list SES keys every send against — each
-//! identity carrying the sending-authorization policies it holds and where its
-//! notifications go ([`NotificationSettings`]) — the send log the sending quota
+//! identity carrying the sending-authorization policies it holds, where its
+//! notifications go ([`NotificationSettings`]) and its custom MAIL FROM setup
+//! ([`MailFromSettings`]) — the send log the sending quota
 //! is derived from, the account's sending limits, and the configuration sets a
 //! send may name.
 //!
@@ -178,6 +179,18 @@ pub const MAX_IDENTITY_POLICIES: usize = 20;
 /// it; it is not a mailbox, and no operation serves the stored text back. A
 /// message may be 10 MB, so a bounded prefix is kept rather than a whole body.
 pub const MAX_LOGGED_TEXT: usize = 1024;
+
+/// How long a custom MAIL FROM setup stays [`CustomMailFromStatus::Pending`]
+/// before the clock owes it its move to [`CustomMailFromStatus::Success`].
+///
+/// SES reports the setup `Pending` until it has read the MAIL FROM domain's MX
+/// record, and nothing a caller does moves it on: the move is the service's own,
+/// so it is owed by the CLOCK from the moment
+/// `SetIdentityMailFromDomain` records the setup. The span is this emulator's
+/// choice — AWS takes as long as its DNS lookup takes — and it is not zero, so a
+/// caller reading the setup straight after writing it still sees `Pending`, the
+/// state whose behaviour `BehaviorOnMXFailure` describes.
+pub const MAIL_FROM_SETUP_SPAN: Duration = Duration::from_secs(3);
 
 /// The class of an identity, as SES's `IdentityType` enum names it.
 ///
@@ -383,6 +396,130 @@ impl NotificationSettings {
     }
 }
 
+/// The state of an identity's custom MAIL FROM setup, as SES's
+/// `CustomMailFromStatus` enum names it (wire spellings published as
+/// `crate::ops::types::CUSTOM_MAIL_FROM_STATUS_VALUES`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomMailFromStatus {
+    /// SES has not read the required MX record yet.
+    Pending,
+    /// SES read the MX record: the custom MAIL FROM domain is in use.
+    Success,
+    /// Reading the MX record failed.
+    Failed,
+    /// Reading the MX record failed for a reason that may clear on its own.
+    TemporaryFailure,
+}
+
+impl CustomMailFromStatus {
+    /// The wire value for this status.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Success => "Success",
+            Self::Failed => "Failed",
+            Self::TemporaryFailure => "TemporaryFailure",
+        }
+    }
+}
+
+/// What SES does with a message when it cannot read the MAIL FROM domain's MX
+/// record, as SES's `BehaviorOnMXFailure` enum names it (wire spellings published
+/// as `crate::ops::types::BEHAVIOR_ON_M_X_FAILURE_VALUES`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BehaviorOnMxFailure {
+    /// SES sends the message with amazonses.com (or a subdomain of it) as the
+    /// MAIL FROM domain.
+    ///
+    /// The default, because `IdentityMailFromDomainAttributes$BehaviorOnMXFailure`
+    /// is `@required` while `SetIdentityMailFromDomainRequest$BehaviorOnMXFailure`
+    /// is optional, so a setup recorded without one still has a behaviour to
+    /// report — and it is the one that still delivers the message.
+    #[default]
+    UseDefaultValue,
+    /// SES answers `MailFromDomainNotVerified` and does not send the message.
+    RejectMessage,
+}
+
+impl BehaviorOnMxFailure {
+    /// The wire value for this behaviour.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::UseDefaultValue => "UseDefaultValue",
+            Self::RejectMessage => "RejectMessage",
+        }
+    }
+
+    /// Parse a wire `BehaviorOnMXFailure`; `None` for a value the model does not
+    /// declare.
+    ///
+    /// The value set this accepts is pinned against the model's own published one:
+    /// `tests/all/identity_mail_from_domain.rs` drives EVERY entry of
+    /// `crate::ops::types::BEHAVIOR_ON_M_X_FAILURE_VALUES` through the operation
+    /// that parses it here, and refuses values outside it.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "UseDefaultValue" => Some(Self::UseDefaultValue),
+            "RejectMessage" => Some(Self::RejectMessage),
+            _ => None,
+        }
+    }
+}
+
+/// One identity's custom MAIL FROM setup, as `SetIdentityMailFromDomain` writes
+/// it and `GetIdentityMailFromDomainAttributes` reports it.
+///
+/// An identity with no custom MAIL FROM domain holds NO settings at all
+/// ([`Identity::mail_from`] is `None`): "A value of null disables the custom MAIL
+/// FROM setting for the identity"
+/// (`SetIdentityMailFromDomainRequest$MailFromDomain`).
+#[derive(Debug, Clone)]
+pub struct MailFromSettings {
+    /// The custom MAIL FROM domain, as the request named it.
+    pub domain: String,
+    /// Whether SES has read the domain's MX record yet.
+    pub status: CustomMailFromStatus,
+    /// What a send does while the status is not
+    /// [`CustomMailFromStatus::Success`].
+    pub behavior_on_mx_failure: BehaviorOnMxFailure,
+    /// The INSTANT the move out of [`CustomMailFromStatus::Pending`] is due, and
+    /// `None` once there is no move left to make. An instant rather than a timer:
+    /// nothing sleeps for it, and a reader materialises the move only once the
+    /// clock has already made it due ([`Self::settle`]).
+    pub status_due: Option<SystemTime>,
+}
+
+impl MailFromSettings {
+    /// A freshly recorded setup for `domain`: `Pending`, with its move to
+    /// `Success` due [`MAIL_FROM_SETUP_SPAN`] after the call that recorded it.
+    pub fn pending(
+        domain: String,
+        behavior_on_mx_failure: BehaviorOnMxFailure,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            domain,
+            status: CustomMailFromStatus::Pending,
+            behavior_on_mx_failure,
+            status_due: Some(now + MAIL_FROM_SETUP_SPAN),
+        }
+    }
+
+    /// Materialise the status move the clock already owes at `now`, and answer
+    /// the status to report.
+    ///
+    /// This is the ONLY write a reporting operation makes: the move was owed at
+    /// `now` whether or not anyone called, so applying it changes nothing a
+    /// later caller would otherwise have seen.
+    pub fn settle(&mut self, now: SystemTime) -> CustomMailFromStatus {
+        if self.status_due.is_some_and(|due| now >= due) {
+            self.status = CustomMailFromStatus::Success;
+            self.status_due = None;
+        }
+        self.status
+    }
+}
+
 /// One identity in the account's identity list.
 #[derive(Debug, Clone)]
 pub struct Identity {
@@ -403,6 +540,11 @@ pub struct Identity {
     /// `SetIdentityNotificationTopic` writes it and
     /// `GetIdentityNotificationAttributes` reports it.
     pub notifications: NotificationSettings,
+    /// This identity's custom MAIL FROM setup, when one is set:
+    /// `SetIdentityMailFromDomain` records it and
+    /// `GetIdentityMailFromDomainAttributes` reports it. `None` is custom MAIL
+    /// FROM DISABLED for the identity, which is how every identity starts.
+    pub mail_from: Option<MailFromSettings>,
     /// The sending-authorization policies attached to this identity, keyed by
     /// policy name.
     ///
@@ -679,6 +821,7 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     verification_token,
                     dkim_tokens: Vec::new(),
                     notifications: NotificationSettings::default(),
+                    mail_from: None,
                     policies: BTreeMap::new(),
                     verified_at: SystemTime::now(),
                 }),
@@ -1354,13 +1497,13 @@ pub fn region_from_request(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// The identities ONE call may ask about, shared by the two operations that
-/// report per-identity attributes: each is documented as being able to "only
-/// get … attributes for up to 100 identities at a time"
-/// (`GetIdentityNotificationAttributes` and
-/// `GetIdentityVerificationAttributes`). The model carries no `@length` for
-/// either list, so the boundary validator passes a longer one and the operation
-/// refuses it itself.
+/// The identities ONE call may ask about, shared by the operations that report
+/// per-identity attributes: each is documented as being able to "only get …
+/// attributes for up to 100 identities at a time"
+/// (`GetIdentityNotificationAttributes`, `GetIdentityVerificationAttributes` and
+/// `GetIdentityMailFromDomainAttributes`). The model carries no `@length` for
+/// any of those lists, so the boundary validator passes a longer one and the
+/// operation refuses it itself.
 pub const MAX_IDENTITIES_PER_CALL: usize = 100;
 
 /// The characters an Amazon SNS topic name is made of, and the length it may
@@ -1471,6 +1614,67 @@ pub fn resolve_identity<'value>(value: &'value str, region: &str) -> Result<&'va
 /// internationalised (`xn--…`) TLD and refuses an all-numeric one.
 pub fn is_domain_name(value: &str) -> bool {
     ::service_common::email_address::is_domain_name(value)
+}
+
+/// The domain an identity's mail comes from: the identity itself for a domain
+/// identity, and the domain half of the address for an email-address identity.
+///
+/// Both forms are what `SetIdentityMailFromDomainRequest$MailFromDomain` is read
+/// against — the member documents the identity as "an email address or a domain"
+/// — so the rule is stated once, here.
+pub fn identity_domain(identity: &str) -> &str {
+    match identity.split_once('@') {
+        Some((_, domain)) => domain,
+        None => identity,
+    }
+}
+
+/// Whether `candidate` is a domain strictly BELOW `parent`: it ends in `parent`
+/// after a label separator, so it carries at least one more label.
+///
+/// Compared case-insensitively, because a domain name is: two spellings that
+/// differ only in case name the same domain.
+fn is_subdomain_of(candidate: &str, parent: &str) -> bool {
+    let Some(prefix) = candidate
+        .len()
+        .checked_sub(parent.len())
+        .filter(|prefix| *prefix > 1)
+    else {
+        return false;
+    };
+    candidate[prefix..].eq_ignore_ascii_case(parent) && candidate.as_bytes()[prefix - 1] == b'.'
+}
+
+/// The custom MAIL FROM domain `identity` may be configured with, or the message
+/// SES refuses the request as naming an unusable one with.
+///
+/// `SetIdentityMailFromDomainRequest$MailFromDomain` states the rule: "The MAIL
+/// FROM domain must 1) be a subdomain of the verified identity" — so it has to be
+/// a domain name at all ([`is_domain_name`]) and to sit strictly below the
+/// identity's own domain ([`identity_domain`]), which for an email-address
+/// identity is the domain of the address. A name that IS the identity's domain is
+/// not a subdomain of it, and so is not one SES accepts.
+///
+/// Only a single trailing dot is taken off — the root label of a fully qualified
+/// name, which names the same domain — exactly as `VerifyDomainIdentity` reads
+/// the domain it records.
+pub fn mail_from_domain_for(identity: &str, value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    let domain = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    if !is_domain_name(domain) {
+        return Err(format!(
+            "MailFromDomain must be a domain name of the form \
+             [SubDomain.]Domain.TopLevelDomain, got {value:?}"
+        ));
+    }
+    let parent = identity_domain(identity);
+    if !is_subdomain_of(domain, parent) {
+        return Err(format!(
+            "Provided MAIL-FROM domain <{domain}> is not subdomain of the domain of the \
+             identity <{identity}>."
+        ));
+    }
+    Ok(domain.to_string())
 }
 
 /// Whether `name` is a configuration set name of the form the model documents.

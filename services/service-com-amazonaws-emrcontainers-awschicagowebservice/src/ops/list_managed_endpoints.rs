@@ -81,12 +81,11 @@ fn matches_filters(
     record: &crate::state::ManagedEndpointRecord,
     input: &ListManagedEndpointsInput,
 ) -> bool {
-    // `states` keeps the endpoints in any listed `EndpointState`. An empty list names no
-    // state to keep out, so it constrains nothing.
-    if let Some(states) = input.states.as_ref().filter(|states| !states.is_empty()) {
-        if !states.contains(&record.state) {
-            return false;
-        }
+    // `states` keeps the endpoints in any listed `EndpointState` — one of the filters every
+    // paginated listing in this service shares, so it is applied out of the one place that
+    // holds it ([`crate::state::within_listed_states`]).
+    if !crate::state::within_listed_states(&record.state, input.states.as_deref()) {
+        return false;
     }
     // `types` is the same, over the endpoint's `type`: an `EndpointType` is a free-form
     // string in the model, so a row matches exactly rather than by pattern.
@@ -95,24 +94,13 @@ fn matches_filters(
             return false;
         }
     }
-    // `createdBefore` / `createdAfter` bound `createdAt` strictly, so the two together
-    // name an open interval and neither ever returns the endpoint created exactly at a
-    // bound.
-    if input
-        .created_before
-        .as_ref()
-        .is_some_and(|bound| record.created_at_millis >= crate::state::millis_of(bound))
-    {
-        return false;
-    }
-    if input
-        .created_after
-        .as_ref()
-        .is_some_and(|bound| record.created_at_millis <= crate::state::millis_of(bound))
-    {
-        return false;
-    }
-    true
+    // The `createdBefore` / `createdAfter` window is shared the same way
+    // ([`crate::state::within_created_bounds`]).
+    crate::state::within_created_bounds(
+        record.created_at_millis,
+        input.created_before.as_ref(),
+        input.created_after.as_ref(),
+    )
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative

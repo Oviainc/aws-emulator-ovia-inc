@@ -232,28 +232,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// Refuse a member whose length is outside the bounds every named MediaLive
-/// resource holds it to, with this operation's own modelled client error.
+/// resource holds it to, with this operation's own modelled client error
+/// carrying the message the shared length rule
+/// ([`crate::state::bounded_length`]) states.
 fn bounded(
     member: &str,
     value: Option<&str>,
     min: usize,
     max: usize,
 ) -> Result<(), UpdateClusterError> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let len = value.chars().count();
-    if len >= min && len <= max {
-        return Ok(());
-    }
-    Err(
+    crate::state::bounded_length(member, value, min, max).map_err(|message| {
         UpdateClusterErrorModeled::BadRequestException(BadRequestException {
-            message: Some(format!(
-                "{member} must be between {min} and {max} characters long, but was {len}"
-            )),
+            message: Some(message),
         })
-        .into(),
-    )
+        .into()
+    })
 }
 
 /// The modelled error a [`crate::state::ClusterUpdateRefusal`] is answered with.

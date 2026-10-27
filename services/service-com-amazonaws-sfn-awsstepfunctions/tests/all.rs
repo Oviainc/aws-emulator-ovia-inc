@@ -47,6 +47,8 @@ mod execution_alias_routing;
 mod execution_history;
 #[path = "all/execution_history_outcomes.rs"]
 mod execution_history_outcomes;
+#[path = "all/execution_history_state_lifecycle.rs"]
+mod execution_history_state_lifecycle;
 #[path = "all/execution_interpreter.rs"]
 mod execution_interpreter;
 #[path = "all/execution_redrive.rs"]

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +79,83 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use super::create_model::{validated_schema, MAX_MODEL_SCHEMA_CHARS};
+use crate::state::{patch_optional_string, ModelEntry, Patch, PatchFailure, MAX_STRING_CHARS};
+
+// The `path` values `UpdateModel` accepts are the ones `apply_patch` below has an arm
+// for: the two members of a `Model` that describe the payload rather than identify the
+// record. `name` is the model's identity — the URI label addressing this very record, and
+// what a `Method`'s `requestModels` and a `MethodResponse`'s `responseModels` entry names
+// — and `id` and `contentType` are likewise reported but not patchable, exactly as
+// `UpdateRequestValidator` treats a validator's `id`.
+
+/// Apply one patch to a COPY of a stored model.
+fn apply_patch(entry: &mut ModelEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // `Model$description` is optional — a model created without one carries none — so
+        // it can be set and also cleared.
+        "description" => patch_optional_string(&mut entry.description, patch, MAX_STRING_CHARS),
+        // `Model$schema` is optional for the same reason, and is bounded by the maximum
+        // the member's own documentation publishes rather than by the generic string
+        // bound: "The maximum size of the model is 400 KB."
+        "schema" => {
+            patch_optional_string(&mut entry.schema, patch, MAX_MODEL_SCHEMA_CHARS)?;
+            // A schema has to describe the payload the model is typed for, so the value a
+            // patch leaves on the record is read by the same check the create runs: a
+            // document that is not a schema for this content type is refused and the
+            // stored model is left as it was.
+            let patched = entry.schema.take();
+            entry.schema = stored_schema(patched, &entry.content_type)?;
+            Ok(())
+        }
+        _ => Err(patch.unsupported_path()),
+    }
+}
+
+/// The schema as the updated record stores it, checked against the content type the
+/// stored model is typed with — a model's `contentType` is not patchable, so that is the
+/// same media type the create checked the original schema against.
+fn stored_schema(
+    schema: Option<String>,
+    content_type: &str,
+) -> Result<Option<String>, PatchFailure> {
+    let media_type: ::mime::Mime = content_type.parse().map_err(|_| {
+        PatchFailure::BadRequest(crate::state::invalid_model_content_type(content_type))
+    })?;
+    validated_schema(schema, &media_type).map_err(PatchFailure::BadRequest)
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateModelError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateModelErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateModelErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateModelErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: String) -> UpdateModelError {
+    UpdateModelErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -161,18 +229,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateModel"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches =
+            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+
+        let mut store = state.lock();
+        // Every identifier the request carries is resolved against stored state, each
+        // naming its own record so the refusal says which one was not found. A model
+        // belongs to ONE API, so the name is resolved inside the API that holds it and
+        // never account-wide.
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        // Patched on a COPY: a list whose later op is refused leaves the stored model
+        // untouched, rather than keeping the ops before it.
+        let mut updated = api
+            .models
+            .get(&input.model_name)
+            .ok_or_else(|| not_found(crate::state::no_such_model(&input.model_name)))?
+            .clone();
+
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+
+        // Rendered through the one `Model` body this crate builds, so the update reports
+        // the record exactly as `GetModel` will read it back. The record keeps its key:
+        // a model's name is its identity under the API and no patch path changes it.
+        let body = super::create_model::model_body(&updated);
+        api.models.insert(updated.name.clone(), updated);
+        // Everything below is owned, so the lock is released before the audit record is
+        // emitted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome, as
+        // `crate::state::AUDIT_TARGET` documents it. Metadata only — the identifiers the
+        // request carried and how many ops it applied, never the schema or the model's
+        // description.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api_id = ?input.rest_api_id,
+            model_name = ?input.model_name,
+            patch_operations = patches.len(),
+            outcome = "updated",
+            "model updated",
+        );
+        Ok(body.into())
+    }
+}
+
+/// The same `Model` the create reports, as THIS operation's output shape.
+///
+/// Both shapes are the model's `Model` (`smithy_query(query="operation",
+/// operation="CreateModel,UpdateModel")`: one output shape, generated once per
+/// operation), so the conversion is member for member and lives in ONE place — a member
+/// added to the modelled shape fails to compile here instead of being quietly dropped
+/// from the update's answer.
+impl From<CreateModelOutput> for UpdateModelOutput {
+    fn from(body: CreateModelOutput) -> Self {
+        let CreateModelOutput {
+            id,
+            name,
+            description,
+            schema,
+            content_type,
+        } = body;
+        Self {
+            id,
+            name,
+            description,
+            schema,
+            content_type,
+        }
     }
 }

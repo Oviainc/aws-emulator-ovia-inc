@@ -669,7 +669,21 @@ pub struct Deployment {
     pub created_at: SystemTime,
     pub modified_at: SystemTime,
     pub deleted_at: Option<SystemTime>,
+    /// The events this deployment's history still holds, oldest first — at most
+    /// [`MAX_EVENTS_PER_DEPLOYMENT`] of them, because [`Deployment::append_event`]
+    /// drops the oldest once the log is over that ceiling.
     pub events: Vec<DeploymentEvent>,
+    /// How many events this deployment has appended over its WHOLE life, counting the
+    /// oldest ones the ceiling has since dropped.
+    ///
+    /// This is what gives an event an identity the log cannot reassign: the nth event
+    /// ever appended keeps the ordinal `n` whether or not the events before it are
+    /// still held, so a pagination cursor built from it (see
+    /// [`Deployment::events_with_cursors`]) names the same event for as long as the log
+    /// holds it and names nothing once it has been dropped — never a different, newer
+    /// event, which is what a position in the KEPT slice would come to mean as soon as
+    /// the log is trimmed.
+    pub events_appended: u64,
     /// Status steps the clock still owes, oldest due first.
     pub pending: VecDeque<PendingTransition>,
 }
@@ -700,10 +714,41 @@ impl Deployment {
     /// happens rather than at each caller.
     pub fn append_event(&mut self, event: DeploymentEvent) {
         self.events.push(event);
+        // Counted BEFORE any trimming, so the count is of appends rather than of what
+        // is still held: this is the ordinal every kept event's identity is read from.
+        self.events_appended = self.events_appended.saturating_add(1);
         if self.events.len() > MAX_EVENTS_PER_DEPLOYMENT {
             let overflow = self.events.len() - MAX_EVENTS_PER_DEPLOYMENT;
             self.events.drain(..overflow);
         }
+    }
+
+    /// This deployment's kept events, oldest first, each paired with the opaque
+    /// pagination cursor a page resumes AFTER it on.
+    ///
+    /// The cursor is the event's append ordinal (see
+    /// [`Deployment::events_appended`]), not its position in the kept slice: trimming
+    /// drops events from the front, so a position is reassigned to a different, newer
+    /// event while an ordinal belongs to one event for good. The deployment id is folded
+    /// in, so a token one deployment's event list issued is not accepted on another's.
+    pub fn events_with_cursors(&self) -> Vec<(String, &DeploymentEvent)> {
+        // The ordinal of the oldest event still held: every append so far, less the ones
+        // that survived the trimming. Saturating, so the arithmetic cannot panic even if
+        // a future caller ever grew `events` without going through
+        // [`Deployment::append_event`].
+        let oldest_kept = self
+            .events_appended
+            .saturating_sub(self.events.len() as u64);
+        self.events
+            .iter()
+            .enumerate()
+            .map(|(offset, event)| {
+                (
+                    format!("{}:{}", self.id, oldest_kept + offset as u64),
+                    event,
+                )
+            })
+            .collect()
     }
 
     /// Materialise every status step whose `due_at` has already passed.
@@ -2331,10 +2376,15 @@ fn decode_token(token: &str) -> Option<String> {
 /// `max_results`, plus the token for the following page when items remain.
 ///
 /// `cursor_of` names an item's stable cursor, so a page resumes exactly where the
-/// previous one ended rather than at a remembered offset. The error is the message for
-/// the operation's own `ValidationException` ([`INVALID_NEXT_TOKEN_MESSAGE`]); a token
-/// this service did not issue, or one naming an item the result set no longer holds, is
-/// a client error rather than a silent restart from the top.
+/// previous one ended rather than at a remembered offset. "Stable" is a REQUIREMENT on
+/// the caller: the cursor has to be an identity of the item itself that this service
+/// never reassigns to another item (a `deploymentId`, a `workloadName`, a
+/// `deploymentPatternName`, an event's append ordinal) and never a position in a
+/// sequence the store can renumber, so a token either names the item it was issued for
+/// or names none. The error is the message for the operation's own `ValidationException`
+/// ([`INVALID_NEXT_TOKEN_MESSAGE`]); a token this service did not issue, or one naming an
+/// item the result set no longer holds, is a client error rather than a silent restart
+/// from the top — or, worse, a silent jump past the items in between.
 pub fn paginate<T>(
     items: Vec<T>,
     max_results: Option<i32>,

@@ -15,8 +15,9 @@
 //! end of its retention period, are [`crate::state`]'s — see its "Recycle Bin" module
 //! docs. Nothing in this service's implemented surface puts a volume IN the bin: a deleted
 //! resource is retained only when a Recycle Bin retention rule covers it, retention rules
-//! are the `rbin` service's resources rather than EC2's, and `DeleteVolume` (its own
-//! scaffold-stub issue) is the operation that will consult one.
+//! are the `rbin` service's resources rather than EC2's, and `DeleteVolume` — which has no
+//! rule of its own to find, so it deletes permanently — is the operation that will consult
+//! one.
 //!
 //! ## Shape of an operation
 //!

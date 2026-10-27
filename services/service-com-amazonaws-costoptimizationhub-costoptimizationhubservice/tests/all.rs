@@ -19,6 +19,8 @@ mod management_account_gating;
 mod max_results_bounds;
 #[path = "all/preference_gates.rs"]
 mod preference_gates;
+#[path = "all/preference_state_consistency.rs"]
+mod preference_state_consistency;
 #[path = "all/preference_writes.rs"]
 mod preference_writes;
 #[path = "all/recommendation_summaries.rs"]

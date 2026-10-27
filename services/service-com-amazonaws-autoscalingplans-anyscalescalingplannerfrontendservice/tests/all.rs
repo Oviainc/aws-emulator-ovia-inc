@@ -43,6 +43,8 @@ mod scaling_mode_conditional_members;
 mod scaling_plan_lifecycle;
 #[path = "all/scaling_plan_resource_policies.rs"]
 mod scaling_plan_resource_policies;
+#[path = "all/scheduled_action_buffer_time.rs"]
+mod scheduled_action_buffer_time;
 #[path = "all/stack_arn_predicate_consistency.rs"]
 mod stack_arn_predicate_consistency;
 #[path = "all/state_roundtrip.rs"]

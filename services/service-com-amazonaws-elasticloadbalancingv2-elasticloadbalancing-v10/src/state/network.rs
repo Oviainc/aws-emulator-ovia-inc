@@ -518,9 +518,9 @@ async fn vpc_of_subnets(
     subnet_ids: &[String],
 ) -> Option<String> {
     let subnets = subnets_by_id(ctx, region, subnet_ids).await?;
-    let mut vpcs = subnets.iter().filter_map(|subnet| subnet.vpc_id.as_deref());
-    let first = vpcs.next()?;
-    vpcs.all(|vpc| vpc == first).then(|| first.to_string())
+    // The one reading of "these subnets agree on one VPC", which the operations that place
+    // a load balancer apply to the subnets a request names.
+    super::subnets_vpc(Some(&subnets))
 }
 
 /// What EC2 says about every instance id a request named, read in as few calls as EC2's

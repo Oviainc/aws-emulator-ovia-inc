@@ -250,7 +250,7 @@ fn resolve(state: &State, input: &GetClientTokenInput) -> Result<Grant, GetClien
     // that holds no secret has nothing a request could prove it knows, and a presented
     // value that is not the stored secret proves nothing either. `Secret` is a required
     // member, so the request always presents one.
-    if client.client_secret.is_none() || !client.accepts_client_secret(Some(&input.secret)) {
+    if client.client_secrets.is_empty() || !client.accepts_client_secret(Some(&input.secret)) {
         return Err(not_authorized("Invalid client secret."));
     }
 

@@ -322,6 +322,16 @@ async fn after_discounts_follows_the_organizations_discount_visibility() {
     ];
 
     for (case, visibility, available) in &cases {
+        // Start every row from the unrestricted mode, so what the row shows is
+        // whether the move to the discounted mode is allowed — and so the move
+        // of the visibility below leaves a state the rule allows, which is a
+        // condition of the visibility write itself.
+        ok(
+            &router,
+            "UpdatePreferences",
+            &json!({"savingsEstimationMode": BEFORE_DISCOUNTS}),
+        )
+        .await;
         if let Some(visibility) = visibility {
             ok(
                 &router,
@@ -330,14 +340,6 @@ async fn after_discounts_follows_the_organizations_discount_visibility() {
             )
             .await;
         }
-        // Start every row from the unrestricted mode, so what the row shows is
-        // whether the move to the discounted mode is allowed.
-        ok(
-            &router,
-            "UpdatePreferences",
-            &json!({"savingsEstimationMode": BEFORE_DISCOUNTS}),
-        )
-        .await;
 
         let request = json!({"savingsEstimationMode": AFTER_DISCOUNTS});
         if *available {

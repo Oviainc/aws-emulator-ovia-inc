@@ -222,35 +222,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// Refuse a member whose length is outside the bounds every caller-chosen string
-/// of this service is held to, with this operation's own modelled client error.
+/// of this service is held to, with this operation's own modelled client error
+/// carrying the message the shared length rule
+/// ([`crate::state::bounded_length`]) states.
 fn bounded(
     member: &str,
     value: Option<&str>,
     min: usize,
     max: usize,
 ) -> Result<(), UpdateReservationError> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let len = value.chars().count();
-    if len >= min && len <= max {
-        return Ok(());
-    }
-    Err(bad_request(format!(
-        "{member} must be between {min} and {max} characters long, but was {len}"
-    )))
+    crate::state::bounded_length(member, value, min, max).map_err(bad_request)
 }
 
 /// Refuse a count below the one the model's `__integerMin1` sets as its floor,
-/// with this operation's own modelled client error. A member the request did not
-/// carry is not a count at all, so it is not refused.
+/// with this operation's own modelled client error carrying the message the
+/// shared floor rule ([`crate::state::at_least_one`]) states.
 fn at_least_one(member: &str, value: Option<i32>) -> Result<(), UpdateReservationError> {
-    match value {
-        Some(count) if count < 1 => Err(bad_request(format!(
-            "{member} must be at least 1, got {count}"
-        ))),
-        _ => Ok(()),
-    }
+    crate::state::at_least_one(member, value).map_err(bad_request)
 }
 
 /// A request this operation cannot serve as asked, as the 400
