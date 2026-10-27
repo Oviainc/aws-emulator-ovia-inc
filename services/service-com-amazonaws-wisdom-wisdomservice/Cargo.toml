@@ -23,6 +23,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `service-common` carries the workspace's ONE rendering of a `@pattern` as the service
+# publishes it, which this crate's constraint-violation messages state.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

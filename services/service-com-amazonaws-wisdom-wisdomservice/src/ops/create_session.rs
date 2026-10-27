@@ -169,23 +169,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A retried create carrying the same `clientToken` answers with the
-        // session the first call created, rather than opening a second one. The
-        // token is scoped to the parent assistant: the same token under another
-        // assistant is a different create.
-        if let Some(token) = input.client_token.as_deref() {
-            let replayed = state
-                .replayed_resource_id(Self::NAME, &assistant_id, token)
-                .cloned()
-                .and_then(|session_id| state.session(&assistant_id, &session_id))
-                .map(crate::state::Session::to_data);
-            if let Some(session) = replayed {
-                return Ok(CreateSessionOutput {
-                    session: Some(session),
-                });
-            }
-        }
-
         // The model puts no bound on the `tags` map, so the store does: AWS's
         // tagging restrictions allow at most 50 tags on a resource. Every input
         // refusal happens before an id is minted, and the count is taken from
@@ -203,6 +186,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let tags: ::std::collections::BTreeMap<String, String> =
             requested_tags.into_iter().collect();
+
+        // What this create's `clientToken` identifies: every member the record below is
+        // built from, with the tag map fingerprinted in key order
+        // (`crate::state::tags_fingerprint`).
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.name.clone(),
+            input.description.clone().unwrap_or_default(),
+            crate::state::tags_fingerprint(&tags),
+        ]);
+
+        // A retried create carrying the same `clientToken` answers with the
+        // session the first call created, rather than opening a second one — while the
+        // same token carrying a DIFFERENT request is the modelled idempotency conflict
+        // rather than a record the caller did not ask for. The token is scoped to the
+        // parent assistant: the same token under another assistant is a different create.
+        match state.replayed_create(
+            Self::NAME,
+            &assistant_id,
+            input.client_token.as_deref(),
+            &fingerprint,
+        ) {
+            crate::state::Replay::Conflict => {
+                return Err(CreateSessionErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT.to_string()),
+                })
+                .into())
+            }
+            crate::state::Replay::Retry(created) => {
+                if let Some(session) = state
+                    .session(&assistant_id, &created)
+                    .map(crate::state::Session::to_data)
+                {
+                    return Ok(CreateSessionOutput {
+                        session: Some(session),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
+        }
 
         let session_id = crate::state::new_resource_id();
         let session_arn = crate::state::session_arn(&region, &assistant_id, &session_id);
@@ -243,9 +265,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
-        if let Some(token) = input.client_token.as_deref() {
-            state.remember_client_token(Self::NAME, &assistant_id, token, &session_id);
-        }
+        state.remember_client_token(
+            Self::NAME,
+            &assistant_id,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &session_id,
+        );
 
         // Answer from what was just persisted, so this response and a later
         // `GetSession` cannot disagree.
