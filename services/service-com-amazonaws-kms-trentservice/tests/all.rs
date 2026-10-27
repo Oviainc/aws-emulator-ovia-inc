@@ -73,6 +73,8 @@ mod list_resource_tags_reads;
 mod message_authentication_codes;
 #[path = "all/multi_region_primary.rs"]
 mod multi_region_primary;
+#[path = "all/multi_region_primary_serialization.rs"]
+mod multi_region_primary_serialization;
 #[path = "all/public_key.rs"]
 mod public_key;
 #[path = "all/random_bytes.rs"]

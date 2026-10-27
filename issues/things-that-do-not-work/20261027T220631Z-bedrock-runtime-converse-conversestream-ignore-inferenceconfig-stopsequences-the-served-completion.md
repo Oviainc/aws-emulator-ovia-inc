@@ -1,0 +1,49 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: bedrock-runtime.converse-stop-sequence-halts-generation
+Issue-Shape-Id: com.amazonaws.bedrockruntime#AmazonBedrockFrontendService
+Issue-Key: bedrock-runtime.converse-stop-sequence-halts-generation|run#6|AssertionError|assert text.strip().endswith("7"), f"expected generation to end right at the stop sequence, got: {text!r}"
+Issue-Commit: 326708a0d8b45e4d2cf673f880aa81410a3f18f4
+
+# Converse/ConverseStream ignore inferenceConfig.stopSequences: the served completion is never truncated at a configured stop sequence
+
+> _Note: this issue was identified against the code base at commit `326708a0d8b45e4d2cf673f880aa81410a3f18f4`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+Converse
+
+## Description
+ONE CAUSE on the bedrock-runtime synchronous/streaming inference surface. It is NOT covered by any open issue: 20261023T232022Z-bedrock-runtime-synchronous-inference-guardrailconfig-and-toolconfig-silently.md covers guardrailConfig/toolConfig/stream-framing/authorization/not-found-class, and 20261027T061233Z-bedrock-runtime-synchronous-and-async-inference-input-validation.md covers empty Message.content, out-of-range temperature, context-window overflow and the async terminal state. Neither mentions stopSequences. It is the direct analogue of the already-FIXED issue 20261024T085515Z-bedrock-runtime-converse-conversestream-report-stopreason-max-tokens-on-a.md, which established that the emulator's synthesized completion MUST honour inferenceConfig: that fix wired maxTokens through, and left stopSequences unwired.
+
+This cause does not depend on what text a model would generate: it is a contract on how whatever text is served must be terminated, and it holds for the emulator's own synthesized completion exactly as it holds for a live generation.
+
+Cause 1 of 1 — inferenceConfig.stopSequences is accepted and then discarded; the served assistant text runs past the stop sequence to its natural end.
+AWS: Smithy (services/service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice/smithy-model/com-amazonaws-bedrockruntime-amazonbedrockfrontendservice.json) — InferenceConfiguration.stopSequences targets NonEmptyStringList (list, @length max 2500) and is documented "A list of stop sequences. A stop sequence is a sequence of characters that causes the model to stop generating the response." InferenceConfiguration is the shape bound to both Converse.inferenceConfig and ConverseStream.inferenceConfig, so the rule is shared. The contract is that generation HALTS at the first occurrence of any configured stop sequence: the returned text terminates at that sequence and carries nothing after it, and no amount of remaining maxTokens budget lets the turn continue past it. Recorded behavior only for the stop-reason value: for Amazon Nova models Bedrock reports this forced halt with stopReason='end_turn' rather than the StopReason enum's distinct 'stop_sequence' value (the failing check states this is empirically confirmed for Nova, not inferred from the generic docs), so stopReason is NOT the observable here — the truncation of the text is.
+Emulator: the parameter has no effect whatsoever. Converse returns its full synthesized completion with text running well past the first occurrence of the configured stop sequence. The handler shows why it cannot work: the only member of inferenceConfig forwarded into the turn builder is max_tokens (`input.inference_config.as_ref().and_then(|config| config.max_tokens)` is the sole inference argument passed to `crate::state::converse_turn`), so stop_sequences is dropped at the handler boundary and the completion synthesizer never sees it. Replayed request: Converse(modelId='amazon.nova-lite-v1:0', one user text block, inferenceConfig={'maxTokens': 400, 'temperature': 0, 'stopSequences': ['7']}) — observed a 200 whose assistant text ends in '... input token(s).', i.e. several characters beyond the first '7' it contains.
+Why: a client that uses stopSequences as its output delimiter — the standard way to bound a completion so it can be parsed, to stop a model before it starts a new section, or to cap cost — is served unbounded text here and correctly-cut text in production. The divergence is silent in both directions: there is no error, no changed stopReason and no flag saying the sequence was ignored, so the parser downstream either over-reads (consuming content AWS would never have returned) or the client ships a prompt whose safety depends on a stop sequence that the emulator proves "works" while never applying it. Any test suite that validates stop-sequence handling against this emulator passes vacuously.
+Fix: the Converse/ConverseStream completion-synthesis stage — the handler must forward inferenceConfig.stopSequences alongside maxTokens into the turn builder, and the turn builder must truncate the completion it emits at the first occurrence of any supplied sequence (leaving the sequence as the last thing returned, with nothing after it, and leaving stopReason as the model family dictates — 'end_turn' for Nova). ConverseStream shares the same builder, so its reassembled deltas must terminate identically, and the per-delta framing must not emit text past the cut.
+Traces: bedrock-runtime.converse-stop-sequence-halts-generation. Handler citation: services/service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice/src/ops/converse.rs lines 348-359 (the `crate::state::converse_turn(...)` call site, which passes only `config.max_tokens` out of the whole InferenceConfiguration).
+
+## Evidence
+Behavioral suite simparity-behavioral-ga-prod-v1. bedrock-runtime answered this call with HTTP 200, so the service is up and answering wrongly, not unbootstrapped. (Per-service rate in this run: bedrock-runtime 20/60.)
+
+Check bedrock-runtime.converse-stop-sequence-halts-generation [mismatch]:
+  Request: Converse(modelId='amazon.nova-lite-v1:0', messages=[{'role':'user','content':[{'text':'Output exactly the following, separated by single spaces and nothing else, no punctuation, no preamble: count from 1 to 100'}]}], inferenceConfig={'maxTokens': 400, 'temperature': 0, 'stopSequences': ['7']})
+  Assertions that PASSED first, which localise the failure to the stop sequence and not to the turn: resp['stopReason'] == 'end_turn' (the Nova-correct value), and '100' not in the returned text (nothing ran to the natural end of the asked-for task).
+  Expected (AWS): the returned text terminates at the first occurrence of the stop sequence '7' and carries nothing after it — i.e. text.strip().endswith('7').
+  Actual: AssertionError: expected generation to end right at the stop sequence, got: 'No language model runs in this emulator. amazon.nova-lite-v1:0 generated no text for this request. The request carried 1 message(s) and 37 input token(s).'
+  Note the text's own first '7' occurs inside '37 input token(s)': the served completion continues for 15 further characters past it, so the stop sequence was demonstrably not applied to the text the emulator itself chose to return. This is a truncation contract on the served text, not an assertion about what a model would write — the emulator's placeholder completion satisfies it as soon as stopSequences is honoured.
+
+Handler evidence: services/service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice/src/ops/converse.rs:348-359 — the call `crate::state::converse_turn(&model, input.system.as_ref(), input.messages.as_ref(), input.tool_config.as_ref(), input.inference_config.as_ref().and_then(|config| config.max_tokens), tool_use, cache)` forwards max_tokens only; InferenceConfiguration.stopSequences is never read.
+
+Model evidence: smithy_query query=shape shape=InferenceConfiguration on services/service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice/smithy-model/com-amazonaws-bedrockruntime-amazonbedrockfrontendservice.json — InferenceConfiguration.stopSequences -> NonEmptyStringList, type list, @length {max: 2500}, doc 'A list of stop sequences. A stop sequence is a sequence of characters that causes the model to stop generating the response.'; sibling members maxTokens (Integer, @range min 1), temperature and topP (Float, @range 0..1). StopReason enum includes 'stop_sequence', but for Nova the recorded stop reason for this halt is 'end_turn'.
+
+## Steps to Reproduce
+1. git_clone the repo and let the behavioral suite build and boot the emulator.
+2. Run the behavioral suite and re-replay the check id in trace_ids (bedrock-runtime.converse-stop-sequence-halts-generation).
+3. Call bedrock-runtime.converse(modelId='amazon.nova-lite-v1:0', messages=[{'role':'user','content':[{'text':'Output exactly the following, separated by single spaces and nothing else, no punctuation, no preamble: count from 1 to 100'}]}], inferenceConfig={'maxTokens': 400, 'temperature': 0, 'stopSequences': ['7']}).
+4. Concatenate output.message.content[*].text. Expected: the string terminates at the first '7' it would otherwise contain (text.strip().endswith('7')), with nothing after it. Observed: the full completion, ending '... and 37 input token(s).', i.e. 15 characters past that first '7'.
+5. Confirm the parameter is inert rather than mis-applied: re-issue the identical request with stopSequences omitted and compare the returned text — it is byte-identical, proving nothing was cut.
+6. Confirm the shared stage: issue the same request via converse_stream and concatenate every contentBlockDelta.delta.text fragment. The reassembled text must terminate at the same cut, and no delta may carry text past it.
+7. Confirm no regression on the already-fixed sibling parameter: stopReason must remain 'end_turn' for Nova on this halt (not 'stop_sequence', not 'max_tokens').

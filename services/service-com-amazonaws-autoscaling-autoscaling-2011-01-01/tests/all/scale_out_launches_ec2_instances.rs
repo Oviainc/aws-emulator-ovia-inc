@@ -31,7 +31,7 @@ use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 use service_com_amazonaws_ec2_amazonec2 as ec2_service;
 use service_com_amazonaws_ec2_amazonec2::state as ec2;
 
-use crate::support::{form_encode, query, tag_value, tag_values, REGION};
+use crate::support::{form_encode, query, seed_subnets, tag_value, tag_values, REGION};
 
 /// The ec2Query API version a client sends in an Amazon EC2 request body.
 const EC2_API_VERSION: &str = "2016-11-15";
@@ -135,62 +135,6 @@ async fn described_instance(
             .map(|(key, value)| format!("{key}={value}"))
             .collect(),
     })
-}
-
-/// One subnet seeded into the account's Amazon EC2 store: its id and the zone EC2 holds
-/// it in.
-#[derive(Debug, Clone)]
-struct SeededSubnet {
-    id: String,
-    zone: String,
-}
-
-/// Seed `count` subnets into the account's own Amazon EC2 store, through EC2's own
-/// writers, each in a different Availability Zone of [`REGION`] (EC2's own catalog, so
-/// no zone name is written out here).
-fn seed_subnets(engine: &Arc<engine::InMemoryEngine>, count: usize) -> Vec<SeededSubnet> {
-    let state = ec2::service_state(&**engine).expect("the EC2 store is mounted on this engine");
-    let mut store = state.lock();
-    let vpc_id = store.insert_vpc(
-        ec2::DEFAULT_VPC_CIDR_BLOCK,
-        false,
-        ec2::DEFAULT_INSTANCE_TENANCY,
-        ec2::VPC_STATE_AVAILABLE,
-        REGION,
-        Vec::new(),
-    );
-    let zones = ec2::availability_zones_in_region(REGION);
-    assert!(
-        count <= zones.len(),
-        "the Region {REGION} has {} zones, so {count} subnets cannot each be in one",
-        zones.len()
-    );
-    (0..count)
-        .map(|index| {
-            let zone = zones[index].clone();
-            let cidr_block = ec2::nth_subnet_cidr_block(
-                ec2::DEFAULT_VPC_CIDR_BLOCK,
-                ec2::DEFAULT_SUBNET_PREFIX_LENGTH,
-                u32::try_from(index).expect("the seeded subnet count fits in a u32"),
-            )
-            .expect("a default-sized block inside the VPC's own block");
-            let id = store.insert_subnet(ec2::SubnetSpec {
-                vpc_id: vpc_id.clone(),
-                cidr_block,
-                availability_zone: zone.zone_name.clone(),
-                availability_zone_id: zone.zone_id,
-                region: REGION.to_string(),
-                state: ec2::SUBNET_STATE_AVAILABLE.to_string(),
-                default_for_az: false,
-                map_public_ip_on_launch: true,
-                tags: Vec::new(),
-            });
-            SeededSubnet {
-                id,
-                zone: zone.zone_name,
-            }
-        })
-        .collect()
 }
 
 /// Create one Amazon EC2 launch template over the wire and answer its id.

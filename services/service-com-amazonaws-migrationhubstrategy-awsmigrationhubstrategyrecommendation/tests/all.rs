@@ -41,6 +41,9 @@ mod assessment_targets;
 #[path = "all/clock_owed_before_a_config_update.rs"]
 mod clock_owed_before_a_config_update;
 
+#[path = "all/clock_owed_before_an_assessment_completion.rs"]
+mod clock_owed_before_an_assessment_completion;
+
 #[path = "all/clock_owed_before_an_inventory_count.rs"]
 mod clock_owed_before_an_inventory_count;
 

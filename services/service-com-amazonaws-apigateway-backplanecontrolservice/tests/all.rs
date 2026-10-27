@@ -240,3 +240,5 @@ mod update_base_path_mapping;
 mod update_model;
 #[path = "all/model_collection.rs"]
 mod model_collection;
+#[path = "all/delete_domain_name_access_association.rs"]
+mod delete_domain_name_access_association;

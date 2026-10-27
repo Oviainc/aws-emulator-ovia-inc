@@ -45,14 +45,18 @@ use super::support::{account, error_code, expected_arn, form_encode, xml_element
 /// credential, which is the position AWS account root credentials are in.
 const OWNER_KEY: &str = "AKIDEXAMPLEOWNER";
 
+/// The session name every session [`Emulator::assumed_role`] mints carries, which is the
+/// last segment of the ARN STS reports for it.
+pub(super) const SESSION_NAME: &str = "probe";
+
 /// The emulator the suite drives: Amazon SQS beside the IAM and STS services the principals
 /// and their credentials are made with, all on one shared engine.
-struct Emulator {
+pub(super) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Nothing here signs: the `Authorization` header carries only the credential scope,
@@ -75,7 +79,12 @@ impl Emulator {
     }
 
     /// One Amazon SQS call, presenting `access_key_id`.
-    async fn sqs(&self, access_key_id: &str, operation: &str, body: &Value) -> (u16, Value) {
+    pub(super) async fn sqs(
+        &self,
+        access_key_id: &str,
+        operation: &str,
+        body: &Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -94,7 +103,13 @@ impl Emulator {
     }
 
     /// One Amazon SQS call that must succeed.
-    async fn sqs_ok(&self, case: &str, access_key_id: &str, operation: &str, body: Value) -> Value {
+    pub(super) async fn sqs_ok(
+        &self,
+        case: &str,
+        access_key_id: &str,
+        operation: &str,
+        body: Value,
+    ) -> Value {
         let (status, parsed) = self.sqs(access_key_id, operation, &body).await;
         assert_eq!(
             status, 200,
@@ -144,7 +159,7 @@ impl Emulator {
     }
 
     /// Create a queue and answer its url.
-    async fn queue(&self, case: &str, name: &str) -> String {
+    pub(super) async fn queue(&self, case: &str, name: &str) -> String {
         let created = self
             .sqs_ok(case, OWNER_KEY, "CreateQueue", json!({"QueueName": name}))
             .await;
@@ -155,7 +170,7 @@ impl Emulator {
     }
 
     /// Write `document` as the queue's `Policy`, with the owner's own credential.
-    async fn set_policy(&self, case: &str, url: &str, document: &Value) {
+    pub(super) async fn set_policy(&self, case: &str, url: &str, document: &Value) {
         self.sqs_ok(
             case,
             OWNER_KEY,
@@ -167,7 +182,7 @@ impl Emulator {
 
     /// The attributes `GetQueueAttributes` reports for the queue at `url`, read with the
     /// owner's own credential.
-    async fn attributes(&self, case: &str, url: &str) -> BTreeMap<String, String> {
+    pub(super) async fn attributes(&self, case: &str, url: &str) -> BTreeMap<String, String> {
         let reported = self
             .sqs_ok(
                 case,
@@ -191,7 +206,7 @@ impl Emulator {
     /// Create an IAM user carrying `tags` (`(key, value)` pairs), give it `policy` as an
     /// inline policy when one is supplied, mint an access key for it, and answer
     /// `(the user's ARN, the access key id)`.
-    async fn user(
+    pub(super) async fn user(
         &self,
         case: &str,
         user_name: &str,
@@ -266,7 +281,7 @@ impl Emulator {
 
     /// Create an IAM role, assume it through STS with `session_tags`, and answer
     /// `(the role's ARN, the session's access key id)`.
-    async fn assumed_role(
+    pub(super) async fn assumed_role(
         &self,
         case: &str,
         role_name: &str,
@@ -296,7 +311,7 @@ impl Emulator {
             .unwrap_or_else(|| panic!("case {case:?}: CreateRole answered {created}"));
         let mut parameters = vec![
             ("RoleArn", arn.clone()),
-            ("RoleSessionName", "probe".to_string()),
+            ("RoleSessionName", SESSION_NAME.to_string()),
         ];
         for (index, (key, value)) in session_tags.iter().enumerate() {
             parameters.push((tag_key_parameter(index), (*key).to_string()));
@@ -342,7 +357,7 @@ fn authorization(access_key_id: &str, signing_name: &str) -> String {
 }
 
 /// A policy document carrying `statements`.
-fn policy(statements: Value) -> Value {
+pub(super) fn policy(statements: Value) -> Value {
     json!({"Version": "2012-10-17", "Statement": statements})
 }
 
@@ -360,7 +375,7 @@ fn refusal_message(principal: &str, action: &str, resource: &str, reason: &str) 
 /// The refusal a request no policy allows carries, as IAM words it: the principal, the
 /// action in the lower case this service names it in, the resource, and the fact that no
 /// policy in force allows the action.
-fn implicit_denial(principal: &str, action: &str, resource: &str) -> String {
+pub(super) fn implicit_denial(principal: &str, action: &str, resource: &str) -> String {
     refusal_message(
         principal,
         action,
@@ -370,7 +385,7 @@ fn implicit_denial(principal: &str, action: &str, resource: &str) -> String {
 }
 
 /// Assert that `reply` is the `AccessDenied` refusal at HTTP 403, and answer its message.
-fn denial(case: &str, (status, body): (u16, Value)) -> String {
+pub(super) fn denial(case: &str, (status, body): (u16, Value)) -> String {
     assert_eq!(
         (status, error_code(&body).as_str()),
         (403, "AccessDenied"),

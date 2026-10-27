@@ -21,9 +21,8 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_kms_trentservice::state::REPLICA_CREATING_SPAN;
 
-use super::harness::{b64, call, create_key, ok, ok_in, router, text, REGION};
+use super::harness::{b64, call, create_key, ok, ok_in, router, settle_key_state, text, REGION};
 
 /// Every value of the model's `KeyLastUsageTrackingOperation` enum
 /// (`smithy_query(query="shape",shape="KeyLastUsageTrackingOperation")`): the
@@ -371,25 +370,7 @@ async fn each_key_of_a_multi_region_set_tracks_its_own_last_usage() {
     .await;
     // The replica reaches the caller in the transient `Creating` key state and the
     // clock alone ends it, so wait for the key it was created to be.
-    let deadline = std::time::Instant::now() + REPLICA_CREATING_SPAN * 20;
-    loop {
-        let replica = ok_in(
-            &router,
-            replica_region,
-            "DescribeKey",
-            &json!({"KeyId": key_id}),
-        )
-        .await["KeyMetadata"]
-            .clone();
-        if replica["KeyState"] != json!("Creating") {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "case replica: the transient Creating key state must end by itself, got {replica}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    settle_key_state(&router, replica_region, "replica", &key_id, "Creating").await;
 
     // Use the PRIMARY key only: the replica shares its key id, and must still report no
     // usage of its own.

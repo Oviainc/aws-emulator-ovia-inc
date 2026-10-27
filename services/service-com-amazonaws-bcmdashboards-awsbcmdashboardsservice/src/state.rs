@@ -85,6 +85,16 @@ pub const STATUS_REASON_DASHBOARD_NOT_FOUND: &str = "DASHBOARD_NOT_FOUND";
 /// the dashboard after the report was created.
 pub const STATUS_REASON_WIDGET_ID_NOT_FOUND: &str = "WIDGET_ID_NOT_FOUND";
 
+/// The `StatusReason` values this store can DERIVE from the resources a scheduled
+/// report's configuration points at, so resolving a report's health re-derives them
+/// from what the store holds now instead of repeating what an earlier refresh found.
+/// Every other reason a refresh established is carried forward from the record, because
+/// nothing in the store can re-establish it.
+const DERIVED_STATUS_REASONS: [&str; 2] = [
+    STATUS_REASON_DASHBOARD_NOT_FOUND,
+    STATUS_REASON_WIDGET_ID_NOT_FOUND,
+];
+
 /// The `StatusReason` (`STATUS_REASON_VALUES`) for an execution whose notification the
 /// account's default event bus did not take: the report's configuration resolved, so the
 /// failure is neither a missing dashboard nor a missing widget — it is the delivery
@@ -500,8 +510,11 @@ pub const MAX_SCHEDULED_REPORTS: usize = 1_000;
 /// `state` resolved — so every reader projects the stored record rather than
 /// re-deriving anything from a request. `last_execution_at` and `health_status` stay
 /// unset until an execution of this report sets them: nothing has run at create time.
-/// A reader never projects `health_status` directly — [`Self::health`] resolves the
-/// unrefreshed record's health for every view at once.
+/// A reader never projects `health_status` directly — the health every view reports is
+/// resolved from the whole store by
+/// [`ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::reported_scheduled_report_health`],
+/// because it depends on the resources this record points at and not on this record
+/// alone.
 #[derive(Debug, Clone)]
 pub struct ScheduledReportRecord {
     pub arn: String,
@@ -519,7 +532,9 @@ pub struct ScheduledReportRecord {
     pub updated_at: SystemTime,
     pub last_execution_at: Option<SystemTime>,
     /// The health this report's last refresh established, unset until one has: the
-    /// readers project [`ScheduledReportRecord::health`], never this member.
+    /// readers project
+    /// [`ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::reported_scheduled_report_health`],
+    /// never this member.
     pub health_status: Option<HealthStatus>,
     /// The tags supplied at create time, read back by `ListTagsForResource` and
     /// narrowed by `UntagResource`, in the order they were stored.
@@ -540,36 +555,17 @@ impl ScheduledReportRecord {
             .unwrap_or(SCHEDULE_STATE_ENABLED)
     }
 
-    /// The health of this report, as EVERY view of it reports it.
-    ///
-    /// Health is a property of the RESOURCE, not of the view that renders it, so the
-    /// resolution lives here once rather than in each projection: a detail read and a
-    /// listing of the same record can never disagree about it.
-    ///
-    /// A record whose health nothing has refreshed is [`HEALTH_STATUS_HEALTHY`] — the
-    /// model documents `HEALTHY` as "the scheduled report is configured properly and
-    /// has all required permissions to execute"
-    /// (`smithy_query(query="shape",shape="HealthStatus")`), which is what a report
-    /// this service accepted at create time is — with no `lastRefreshedAt` (no refresh
-    /// has happened) and no `statusReasons` (the model documents those as present only
-    /// when the status is `UNHEALTHY`).
-    pub fn health(&self) -> HealthStatus {
-        self.health_status.clone().unwrap_or_else(|| HealthStatus {
-            status_code: HEALTH_STATUS_HEALTHY.to_string(),
-            last_refreshed_at: None,
-            status_reasons: None,
-        })
-    }
-
     /// This record projected onto the modelled `ScheduledReport` shape that
     /// `GetScheduledReport` (and the other readers) return: the stored record's own
     /// fields, never request input.
     ///
     /// `healthStatus` is optional on this shape and `@required` on the summary, but it
     /// is the same property of the same record either way, so the detail view reports
-    /// exactly what [`Self::health`] resolves rather than reporting less than the
-    /// listing does.
-    pub fn report(&self) -> ScheduledReport {
+    /// exactly the `health` its caller resolved rather than reporting less than the
+    /// listing does. The resolution is the store's
+    /// ([`ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::reported_scheduled_report_health`]),
+    /// never a projection's own.
+    pub fn report(&self, health: HealthStatus) -> ScheduledReport {
         ScheduledReport {
             arn: Some(self.arn.clone()),
             name: self.name.clone(),
@@ -582,7 +578,7 @@ impl ScheduledReportRecord {
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
             last_execution_at: self.last_execution_at.map(::aws_smithy_types::DateTime::from),
-            health_status: Some(self.health()),
+            health_status: Some(health),
         }
     }
 
@@ -597,9 +593,11 @@ impl ScheduledReportRecord {
     ///   `GenericString` of length 0..1024 — so a schedule stored without an
     ///   expression summarises as the empty string rather than inventing one.
     /// * `healthStatus` is optional on the stored record until something refreshes it,
-    ///   and is resolved by [`Self::health`] — the same resolution the detail view
-    ///   uses, so both views of one record report one health.
-    pub fn summary(&self) -> ScheduledReportSummary {
+    ///   and is the `health` its caller resolved from the store
+    ///   ([`ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState::reported_scheduled_report_health`])
+    ///   — the same resolution the detail view uses, so both views of one record report
+    ///   one health.
+    pub fn summary(&self, health: HealthStatus) -> ScheduledReportSummary {
         ScheduledReportSummary {
             arn: self.arn.clone(),
             name: self.name.clone(),
@@ -610,7 +608,7 @@ impl ScheduledReportRecord {
                 .clone()
                 .unwrap_or_default(),
             state: self.schedule_state().to_string(),
-            health_status: self.health(),
+            health_status: health,
             schedule_expression_time_zone: self
                 .schedule_config
                 .schedule_expression_time_zone
@@ -1024,31 +1022,23 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
             .collect()
     }
 
-    /// The health of `report` as this store can establish it at `now`.
+    /// The reasons the resources `report`'s stored configuration points at do not resolve
+    /// in this store, in the order the status reports them and at most once each:
     ///
-    /// The model documents `HEALTHY` as "the scheduled report is configured properly and
-    /// has all required permissions to execute" and `UNHEALTHY` as the report being
-    /// unable to deliver, with the reasons in `statusReasons`
-    /// (`smithy_query(query="shape",shape="HealthStatus")`). So the status is DERIVED
-    /// from what this store holds, never from a request: a report is healthy exactly
-    /// while every resource its configuration points at still resolves —
+    /// * the dashboard its `dashboardArn` names is no longer stored
+    ///   ([`STATUS_REASON_DASHBOARD_NOT_FOUND`]), and
+    /// * an id in its `widgetIds` is no longer a widget of that dashboard
+    ///   ([`STATUS_REASON_WIDGET_ID_NOT_FOUND`]).
     ///
-    /// * the dashboard its `dashboardArn` names is still stored
-    ///   ([`STATUS_REASON_DASHBOARD_NOT_FOUND`] when it is not), and
-    /// * every id in its `widgetIds` is still a widget of that dashboard
-    ///   ([`STATUS_REASON_WIDGET_ID_NOT_FOUND`] when one is not).
+    /// Derived from what the store holds AT THE CALL, never from a request and never
+    /// from what an earlier refresh found: the dashboard and the widgets a report points
+    /// at can be deleted, replaced or repointed after any refresh, so the reasons that
+    /// name them are re-derived every time the health is resolved.
     ///
-    /// Reasons are reported in that order and at most once each. The other
-    /// `StatusReason` values name failures of resources outside this service (the
-    /// execution role, the cost data source), which this store holds nothing about and
-    /// therefore never claims.
-    ///
-    /// `lastRefreshedAt` is `now` because this call is the refresh.
-    pub fn scheduled_report_health(
-        &self,
-        report: &ScheduledReportRecord,
-        now: SystemTime,
-    ) -> HealthStatus {
+    /// The other `StatusReason` values name failures of resources outside this service
+    /// (the execution role, the cost data source), which this store holds nothing about
+    /// and therefore never claims.
+    fn unresolved_configuration_reasons(&self, report: &ScheduledReportRecord) -> Vec<String> {
         let mut status_reasons: Vec<String> = Vec::new();
         match self.dashboards.get(&report.dashboard_arn) {
             None => status_reasons.push(STATUS_REASON_DASHBOARD_NOT_FOUND.to_string()),
@@ -1068,19 +1058,94 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
                 }
             }
         }
+        status_reasons
+    }
 
-        let healthy = status_reasons.is_empty();
-        HealthStatus {
-            status_code: if healthy {
-                HEALTH_STATUS_HEALTHY.to_string()
-            } else {
-                HEALTH_STATUS_UNHEALTHY.to_string()
-            },
-            last_refreshed_at: Some(::aws_smithy_types::DateTime::from(now)),
-            // The model documents `statusReasons` as "only present when the status is
-            // UNHEALTHY", so a healthy report carries none rather than an empty list.
-            status_reasons: (!healthy).then_some(status_reasons),
+    /// The health of `report` as this store establishes it at `now`, for the refresh that
+    /// is running.
+    ///
+    /// The model documents `HEALTHY` as "the scheduled report is configured properly and
+    /// has all required permissions to execute" and `UNHEALTHY` as the report being
+    /// unable to deliver, with the reasons in `statusReasons`
+    /// (`smithy_query(query="shape",shape="HealthStatus")`). So the status is DERIVED
+    /// from what this store holds, never from a request: a report is healthy exactly
+    /// while every resource its configuration points at still resolves
+    /// ([`Self::unresolved_configuration_reasons`]).
+    ///
+    /// `lastRefreshedAt` is `now` because this call is the refresh.
+    pub fn scheduled_report_health(
+        &self,
+        report: &ScheduledReportRecord,
+        now: SystemTime,
+    ) -> HealthStatus {
+        let status_reasons = self.unresolved_configuration_reasons(report);
+        // `lastRefreshedAt` is `now`: this call IS the refresh.
+        health_status(status_reasons, Some(::aws_smithy_types::DateTime::from(now)))
+    }
+
+    /// The health EVERY view of `report` reports: `HealthStatus$statusCode` with the
+    /// reasons behind it, resolved from this store.
+    ///
+    /// Health is a property of the RESOURCE and of the resources it points at, so it is
+    /// resolved here — once, from the whole store — rather than projected out of the
+    /// record by each view: no two views of one report can disagree about it, and none
+    /// reports a status the store itself contradicts.
+    ///
+    /// * The reasons that name resources this store holds are re-derived from it
+    ///   ([`Self::unresolved_configuration_reasons`]), so a report whose dashboard was
+    ///   deleted — or whose named widget was removed from it — is reported `UNHEALTHY`
+    ///   with those reasons whether or not anything has ever refreshed the record.
+    /// * A reason the last refresh established that this store cannot re-derive (a
+    ///   notification the account's default event bus did not take,
+    ///   [`STATUS_REASON_INTERNAL_FAILURE`]) is carried forward from the record: the
+    ///   refresh is the only evidence of it.
+    /// * `lastRefreshedAt` is documented as "the timestamp when the health status was
+    ///   last refreshed", so it is the instant of the record's last refresh and stays
+    ///   absent until one has happened — resolving the health for a reader is not a
+    ///   refresh, and this call writes nothing.
+    ///
+    /// A record with no refresh and every resource resolving is therefore
+    /// [`HEALTH_STATUS_HEALTHY`] with no reasons and no refresh instant — the model's
+    /// "configured properly and has all required permissions to execute", which is what
+    /// a report this service accepted and whose resources still resolve is.
+    pub fn reported_scheduled_report_health(
+        &self,
+        report: &ScheduledReportRecord,
+    ) -> HealthStatus {
+        let mut status_reasons = self.unresolved_configuration_reasons(report);
+        let refreshed = report.health_status.as_ref();
+        let refreshed_reasons = refreshed
+            .and_then(|health| health.status_reasons.as_ref())
+            .into_iter()
+            .flatten();
+        for reason in refreshed_reasons {
+            if !DERIVED_STATUS_REASONS.contains(&reason.as_str())
+                && !status_reasons.contains(reason)
+            {
+                status_reasons.push(reason.clone());
+            }
         }
+
+        health_status(
+            status_reasons,
+            refreshed.and_then(|health| health.last_refreshed_at),
+        )
+    }
+
+    /// `report` projected onto the modelled `ScheduledReport` the detail readers answer,
+    /// with the health this store resolves for it.
+    pub fn scheduled_report_detail(&self, report: &ScheduledReportRecord) -> ScheduledReport {
+        report.report(self.reported_scheduled_report_health(report))
+    }
+
+    /// `report` projected onto the modelled `ScheduledReportSummary` the listing pages
+    /// over, with the health this store resolves for it — the SAME resolution the detail
+    /// view gets.
+    pub fn scheduled_report_summary(
+        &self,
+        report: &ScheduledReportRecord,
+    ) -> ScheduledReportSummary {
+        report.summary(self.reported_scheduled_report_health(report))
     }
 
     /// Drop every create idempotency record whose scheduled report this service no
@@ -1705,6 +1770,32 @@ pub fn scheduled_report_execution_detail(
     ::serde_json::Value::Object(detail)
 }
 
+/// A `HealthStatus` carrying `status_reasons`, refreshed at `last_refreshed_at`.
+///
+/// The one place the model's two invariants on this shape hold, so no caller can report a
+/// status that breaks them: the code is [`HEALTH_STATUS_HEALTHY`] exactly while there is
+/// no reason — the model documents `HEALTHY` as "configured properly and has all required
+/// permissions to execute" and `UNHEALTHY` as the report being unable to deliver, "the
+/// reason for the unhealthy state is captured in the health status reasons" — and
+/// `statusReasons` is documented "only present when the status is UNHEALTHY", so a healthy
+/// status carries the member absent rather than an empty list
+/// (`smithy_query(query="shape",shape="HealthStatus")`).
+fn health_status(
+    status_reasons: Vec<String>,
+    last_refreshed_at: Option<::aws_smithy_types::DateTime>,
+) -> HealthStatus {
+    let healthy = status_reasons.is_empty();
+    HealthStatus {
+        status_code: if healthy {
+            HEALTH_STATUS_HEALTHY.to_string()
+        } else {
+            HEALTH_STATUS_UNHEALTHY.to_string()
+        },
+        last_refreshed_at,
+        status_reasons: (!healthy).then_some(status_reasons),
+    }
+}
+
 /// The health of a report whose execution could NOT hand its notification to the
 /// account's default event bus.
 ///
@@ -1714,11 +1805,10 @@ pub fn scheduled_report_execution_detail(
 /// own configuration resolved and the delivery is what failed. `lastRefreshedAt` is `now`
 /// because the execution that attempted the delivery is the refresh.
 pub fn undelivered_notification_health(now: SystemTime) -> HealthStatus {
-    HealthStatus {
-        status_code: HEALTH_STATUS_UNHEALTHY.to_string(),
-        last_refreshed_at: Some(::aws_smithy_types::DateTime::from(now)),
-        status_reasons: Some(vec![STATUS_REASON_INTERNAL_FAILURE.to_string()]),
-    }
+    health_status(
+        vec![STATUS_REASON_INTERNAL_FAILURE.to_string()],
+        Some(::aws_smithy_types::DateTime::from(now)),
+    )
 }
 
 /// Deliver the notification one execution of `report` owes to the account's default

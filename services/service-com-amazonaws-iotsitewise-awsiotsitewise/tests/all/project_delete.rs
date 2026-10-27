@@ -221,7 +221,11 @@ pub(crate) fn expected_project_arn(id: &str) -> String {
 }
 
 /// The ids of every project the store holds.
-fn stored_project_ids(engine: &engine::InMemoryEngine) -> Vec<String> {
+///
+/// `pub(crate)` because the sibling `dashboard_delete` suite proves a dashboard's
+/// delete removes no project through the same reading of the store: one
+/// definition of it, so the two cannot drift.
+pub(crate) fn stored_project_ids(engine: &engine::InMemoryEngine) -> Vec<String> {
     let state = service_state(engine).expect("the iotsitewise store");
     let mut ids: Vec<String> = state.lock().projects.keys().cloned().collect();
     ids.sort();
@@ -229,7 +233,11 @@ fn stored_project_ids(engine: &engine::InMemoryEngine) -> Vec<String> {
 }
 
 /// The ids of every dashboard the store holds.
-fn stored_dashboard_ids(engine: &engine::InMemoryEngine) -> Vec<String> {
+///
+/// `pub(crate)` because the sibling `dashboard_delete` suite measures what a
+/// delete removed through the same reading of the store: one definition of it, so
+/// the two cannot drift.
+pub(crate) fn stored_dashboard_ids(engine: &engine::InMemoryEngine) -> Vec<String> {
     let state = service_state(engine).expect("the iotsitewise store");
     let mut ids: Vec<String> = state.lock().dashboards.keys().cloned().collect();
     ids.sort();

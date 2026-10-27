@@ -62,7 +62,9 @@
 //!
 //! A statement's `Condition` is evaluated only for the keys the caller puts in the
 //! [`Request::context`] it passes (`rum:alias`, say, which CloudWatch RUM documents for
-//! `PutRumEvents`) and only for the string, ARN, boolean and existence operators below. A clause this CAN decide is
+//! `PutRumEvents`) and only for the string, ARN, boolean and existence operators below, each
+//! of which may carry IAM's `IfExists` suffix ([`IF_EXISTS_SUFFIX`]), under which a key the
+//! request models and carries no value for holds instead of refusing. A clause this CAN decide is
 //! part of whether its statement applies at all, whichever effect the statement states: a
 //! `Deny` whose condition demonstrably does not hold refuses nothing. A clause this CANNOT
 //! decide — an operator it does not implement, or a key the request context does not carry
@@ -131,6 +133,18 @@ const ARN_OPERATORS: &[&str] = &["ArnEquals", "ArnNotEquals", "ArnLike", "ArnNot
 /// access based on comparing a key to `true` or `false`". The two literals are compared
 /// case-insensitively, which is how a document may spell them.
 const BOOL_OPERATOR: &str = "Bool";
+
+/// The suffix that makes a comparison hold where the request carries no value for the key:
+/// "you can add `IfExists` to the end of any condition operator name except the `Null`
+/// condition … if the condition key is present in the request context, process the key as
+/// specified in the policy; if the key is not present, evaluate the condition element as
+/// true".
+///
+/// Absence is only decidable for a key the request DECLARES it models
+/// ([`Request::published`]); for every other key the clause stays undecided, because there
+/// absence means this emulator does not model the key rather than that the request carries
+/// no value for it.
+const IF_EXISTS_SUFFIX: &str = "IfExists";
 
 /// The most bytes one policy document this evaluator reads may carry.
 ///
@@ -648,6 +662,11 @@ fn principal_values(value: &::serde_json::Value) -> Option<Vec<&str>> {
 /// key the request context does not carry — which the caller reads fail-closed in both
 /// directions.
 ///
+/// A key the request MODELS and carries no value for is a key that really is not present,
+/// which is the case IAM's `IfExists` suffix ([`IF_EXISTS_SUFFIX`]) is about: under it such
+/// a clause HOLDS, so a grant written `…IfExists` applies to a request that carries no value
+/// for the key while the same grant without the suffix does not.
+///
 /// A key the request carries SEVERAL values for (the session tag keys of an STS mint,
 /// say) is decided only under one of the set qualifiers, and then by IAM's own rule for
 /// the empty set: `ForAllValues:` "returns true if there are no request values" while
@@ -666,8 +685,14 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
     let mut held = true;
     for (clause, keys) in clauses {
         let keys = keys.as_object()?;
-        let (qualifier, operator) = split_set_qualifier(clause);
+        let (qualifier, named) = split_set_qualifier(clause);
+        let (operator, absence_holds) = split_if_exists(named);
         let existence = operator == NULL_OPERATOR;
+        // The suffix is defined for every operator BUT the existence one, so `NullIfExists`
+        // names no operator at all and decides nothing.
+        if existence && absence_holds {
+            return None;
+        }
         if !existence
             && operator != BOOL_OPERATOR
             && !STRING_OPERATORS.contains(&operator)
@@ -706,16 +731,20 @@ fn conditions_hold(statement: &::serde_json::Value, request: &Request<'_>) -> Op
                 None => match actual[..] {
                     [one] => clause_holds(operator, &expected, one),
                     // A key the request MODELS and carries no value for is one the request
-                    // really does not carry, which IAM compares nothing against: "if the
-                    // key is not present … a negated condition operator returns true",
-                    // while a positive one does not hold.
-                    [] if modelled => is_negated(operator),
+                    // really does not carry, which IAM compares nothing against: the
+                    // `IfExists` spelling holds on it, "if the key is not present … a
+                    // negated condition operator returns true", and a positive one without
+                    // the suffix does not hold.
+                    [] if modelled => absence_holds || is_negated(operator),
                     _ => return None,
                 },
                 // Under a qualifier, a key with no values is IAM's empty set — but only
                 // where the request DECLARES it models the key; otherwise its absence is
                 // this emulator not modelling it, which decides nothing.
                 Some(_) if actual.is_empty() && !modelled => return None,
+                // The suffix answers absence before the set rule does, so a key the request
+                // carries no value for holds under either qualifier.
+                Some(_) if actual.is_empty() && absence_holds => true,
                 Some(SetQualifier::ForAllValues) => actual
                     .iter()
                     .all(|value| clause_holds(operator, &expected, value)),
@@ -773,6 +802,16 @@ fn split_set_qualifier(clause: &str) -> (Option<SetQualifier>, &str) {
         }
     }
     (None, clause)
+}
+
+/// Split a condition operator into the comparison it performs and whether a key the request
+/// carries no value for holds under it: `ArnEqualsIfExists` is `ArnEquals` where absence
+/// holds. See [`IF_EXISTS_SUFFIX`].
+fn split_if_exists(operator: &str) -> (&str, bool) {
+    match operator.strip_suffix(IF_EXISTS_SUFFIX) {
+        Some(comparison) => (comparison, true),
+        None => (operator, false),
+    }
 }
 
 /// Whether an operator is a NEGATED one — the `…Not…` spelling of a comparison, which holds
@@ -1160,6 +1199,120 @@ mod tests {
                 "case {case:?}: expected {expected:?}, got {reached:?}"
             );
         }
+    }
+
+    /// IAM's `IfExists` suffix: a clause over a key the request really does not carry HOLDS
+    /// under it, where the same comparison without the suffix grants nothing — which is what
+    /// lets a resource policy state "scope this grant to the resource it came from, if it
+    /// came from one".
+    #[test]
+    fn the_if_exists_suffix_holds_where_the_request_carries_no_value_for_the_key() {
+        let source = "arn:aws:sns:us-east-1:000000000000:alarms";
+        let carried = [("aws:SourceArn".to_string(), source.to_string())];
+        let none: [(String, String); 0] = [];
+        let held = principals();
+        // The keys the request DECLARES it models, so absence from the context is the
+        // request carrying no value rather than this evaluator not knowing the key.
+        let published = ["aws:SourceArn", "aws:SecureTransport"];
+        // The rows differ along what the rule generalises over: the operator family (ARN,
+        // string, boolean, existence), whether it is negated, whether the suffix is written
+        // at all, whether the key is carried, modelled-but-absent or not modelled, and
+        // whether a set qualifier is written before it.
+        type SuffixRow<'a> = (&'a str, &'a str, &'a [(String, String)], Decision);
+        let rows: [SuffixRow<'_>; 10] = [
+            (
+                "ArnEqualsIfExists on the very ARN the request carries",
+                "{\"ArnEqualsIfExists\":{\"aws:SourceArn\":\"arn:aws:sns:us-east-1:000000000000:alarms\"}}",
+                &carried,
+                Decision::Allowed,
+            ),
+            (
+                "ArnEqualsIfExists on another ARN, with the key carried",
+                "{\"ArnEqualsIfExists\":{\"aws:SourceArn\":\"arn:aws:sns:us-east-1:000000000000:other\"}}",
+                &carried,
+                Decision::NotStated,
+            ),
+            (
+                "ArnEqualsIfExists on a modelled key the request carries no value for",
+                "{\"ArnEqualsIfExists\":{\"aws:SourceArn\":\"arn:aws:sns:us-east-1:000000000000:alarms\"}}",
+                &none,
+                Decision::Allowed,
+            ),
+            (
+                "the same clause WITHOUT the suffix, which compares nothing and grants nothing",
+                "{\"ArnEquals\":{\"aws:SourceArn\":\"arn:aws:sns:us-east-1:000000000000:alarms\"}}",
+                &none,
+                Decision::NotStated,
+            ),
+            (
+                "StringEqualsIfExists on a modelled key the request carries no value for",
+                "{\"StringEqualsIfExists\":{\"aws:SourceArn\":\"arn:aws:sns:us-east-1:000000000000:alarms\"}}",
+                &none,
+                Decision::Allowed,
+            ),
+            (
+                "StringNotEqualsIfExists on a modelled key the request carries no value for",
+                "{\"StringNotEqualsIfExists\":{\"aws:SourceArn\":\"anything\"}}",
+                &none,
+                Decision::Allowed,
+            ),
+            (
+                "BoolIfExists on a modelled key the request carries no value for",
+                "{\"BoolIfExists\":{\"aws:SecureTransport\":\"false\"}}",
+                &none,
+                Decision::Allowed,
+            ),
+            (
+                "ForAnyValue:StringEqualsIfExists, where the suffix answers the empty set \
+                 the qualifier would read as false",
+                "{\"ForAnyValue:StringEqualsIfExists\":{\"aws:SourceArn\":[\"anything\"]}}",
+                &none,
+                Decision::Allowed,
+            ),
+            (
+                "the suffix on a key the request does not model, which stays undecided",
+                "{\"ArnEqualsIfExists\":{\"aws:SourceVpc\":\"vpc-1\"}}",
+                &none,
+                Decision::NotStated,
+            ),
+            (
+                "NullIfExists, which IAM defines for no operator",
+                "{\"NullIfExists\":{\"aws:SourceArn\":\"true\"}}",
+                &none,
+                Decision::NotStated,
+            ),
+        ];
+        for (case, condition, context, expected) in rows {
+            let document = identity(&format!(
+                "{{\"Effect\":\"Allow\",\"Action\":\"rum:PutRumEvents\",\"Resource\":\"*\",\
+                 \"Condition\":{condition}}}"
+            ));
+            let request = Request::new("rum:PutRumEvents", RESOURCE, &held)
+                .with_context(context)
+                .with_published_keys(&published);
+            let reached = identity_decision(&[document], &request);
+            assert_eq!(
+                reached, expected,
+                "case {case:?}: expected {expected:?}, got {reached:?}"
+            );
+        }
+
+        // The suffix decides a DENY the same way: a clause that holds because the key is
+        // absent makes its statement apply, so the deny refuses.
+        let denial = identity(
+            "{\"Effect\":\"Deny\",\"Action\":\"rum:PutRumEvents\",\"Resource\":\"*\",\
+             \"Condition\":{\"ArnEqualsIfExists\":{\"aws:SourceArn\":\"arn:aws:sns:*\"}}}",
+        );
+        let request = Request::new("rum:PutRumEvents", RESOURCE, &held)
+            .with_context(&none)
+            .with_published_keys(&published);
+        let reached = identity_decision(&[denial], &request);
+        assert_eq!(
+            reached,
+            Decision::Denied,
+            "case 'a deny whose IfExists clause holds on an absent key': expected the deny to \
+             apply, got {reached:?}"
+        );
     }
 
     #[test]

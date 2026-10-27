@@ -154,40 +154,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let proposal = {
             let mut store = state.lock();
             store.materialise_due_transitions(::std::time::Instant::now());
-            // The `activationKey` is the proposal's only handle: the store's
-            // `activationKey` -> connection-id index is what resolves it, and an entry
-            // lives exactly as long as the record it names. The connection it names is
-            // then resolved in the Region this request was signed for, so a proposal
-            // whose connection was created through another Region's endpoint resolves
-            // to nothing here, exactly as an unknown key does.
-            let connection_id = store.activation_keys.get(&input.activation_key).cloned();
-            connection_id.and_then(|id| {
-                let stored = store.connection_in(&region, &id)?;
-                let connection = &stored.connection;
-                // `provider` and `location` are documented as belonging to "the
-                // specific Environment of the proposal", so they are read from the
-                // catalog entry the proposal names; the record's own copies (taken
-                // from that entry when it was allocated) answer for an environment
-                // that is no longer in the catalog.
-                let (provider, location) = store
-                    .environments
-                    .get(&connection.environment_id)
-                    .map_or_else(
-                        || (connection.provider.clone(), connection.location.clone()),
-                        |environment| {
-                            (environment.provider.clone(), environment.location.clone())
-                        },
-                    );
-                Some(DescribeConnectionProposalOutput {
-                    bandwidth: connection.bandwidth.clone(),
-                    environment_id: connection.environment_id.clone(),
-                    provider,
-                    location,
+            // The `activationKey` is the proposal's only handle, and
+            // `proposal_in` is what resolves it: the store's `activationKey` ->
+            // connection-id index, scoped to the Region this request was signed for
+            // and to the connections no `DeleteConnection` has been made on. A
+            // proposal whose connection was created through another Region's
+            // endpoint, or whose connectivity is being torn down or is already gone,
+            // resolves to nothing here, exactly as an unknown key does.
+            store
+                .proposal_in(&region, &input.activation_key)
+                .map(|stored| {
+                    let connection = &stored.connection;
+                    // `provider` and `location` are documented as belonging to "the
+                    // specific Environment of the proposal", so they are read from the
+                    // catalog entry the proposal names; the record's own copies (taken
+                    // from that entry when it was allocated) answer for an environment
+                    // that is no longer in the catalog.
+                    let (provider, location) = store
+                        .environments
+                        .get(&connection.environment_id)
+                        .map_or_else(
+                            || (connection.provider.clone(), connection.location.clone()),
+                            |environment| {
+                                (environment.provider.clone(), environment.location.clone())
+                            },
+                        );
+                    DescribeConnectionProposalOutput {
+                        bandwidth: connection.bandwidth.clone(),
+                        environment_id: connection.environment_id.clone(),
+                        provider,
+                        location,
+                    }
                 })
-            })
         };
 
-        // A key that resolves to no stored proposal is the modelled 404: "the request
+        // A key that resolves to no stored proposal — one never issued, one issued
+        // through another Region's endpoint, or one naming a connection a
+        // `DeleteConnection` has been made on — is the modelled 404: "the request
         // specifies a resource that does not exist on the server". `ActivationKey` is
         // `@sensitive`, so the refusal names the member, never the key's value.
         let Some(output) = proposal else {

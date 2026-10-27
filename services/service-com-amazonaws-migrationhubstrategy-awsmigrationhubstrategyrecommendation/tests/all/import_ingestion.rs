@@ -70,7 +70,10 @@ const SIGNED_FOR_S3_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
 
 /// The bucket every case puts its import file in; its name carries the
 /// `migrationhub-strategy-` prefix each bucket member's documentation requires.
-const IMPORT_BUCKET: &str = "migrationhub-strategy-import-files";
+///
+/// `pub(crate)` so a suite beside this one that needs a REAL ingestion names the bucket
+/// these helpers write to rather than standing up a second import bucket of its own.
+pub(crate) const IMPORT_BUCKET: &str = "migrationhub-strategy-import-files";
 
 /// One emulator holding the S3 service beside Strategy Recommendations over one shared
 /// engine — what the assembled emulator does.
@@ -101,7 +104,9 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: Bytes) 
 
 /// Create the import bucket through S3's own front door, as the account's owner would
 /// before naming it to an import.
-async fn create_bucket(case: &str, router: &MultiServiceRouter) {
+///
+/// `pub(crate)` for the same reason as [`IMPORT_BUCKET`].
+pub(crate) async fn create_bucket(case: &str, router: &MultiServiceRouter) {
     let payload = "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
                    <LocationConstraint>eu-west-1</LocationConstraint>\
                    </CreateBucketConfiguration>";
@@ -121,7 +126,14 @@ async fn create_bucket(case: &str, router: &MultiServiceRouter) {
 
 /// Put `document` in the import bucket under `key`, as the caller writing the import file
 /// would.
-async fn put_import_file(case: &str, router: &MultiServiceRouter, key: &str, document: &str) {
+///
+/// `pub(crate)` for the same reason as [`IMPORT_BUCKET`].
+pub(crate) async fn put_import_file(
+    case: &str,
+    router: &MultiServiceRouter,
+    key: &str,
+    document: &str,
+) {
     let (status, body) = s3(
         router,
         "PUT",

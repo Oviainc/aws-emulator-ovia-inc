@@ -166,13 +166,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names the ARN to resume at, and the page holds at most `max_results` reports
         // (the model's declared default, 50, when the client omitted it; its @range
         // 1..100 is already enforced at the boundary). Each stored record is projected
-        // onto a `ScheduledReportSummary`.
+        // onto a `ScheduledReportSummary` by the store, which resolves the health that
+        // projection reports from the resources the record points at.
         let page = crate::state::listing_page(
             &state.scheduled_reports,
             input.next_token.as_deref(),
             input.max_results,
             crate::state::SCHEDULED_REPORT_ARN_SEGMENT,
-            crate::state::ScheduledReportRecord::summary,
+            |record| state.scheduled_report_summary(record),
         )
         .map_err(|refusal| {
             ListScheduledReportsErrorModeled::ValidationException(ValidationException {
