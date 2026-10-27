@@ -74,6 +74,9 @@ mod put_data_protection_policy;
 #[path = "all/refusal_sentences.rs"]
 mod refusal_sentences;
 
+#[path = "all/request_derived_refusals.rs"]
+mod request_derived_refusals;
+
 #[path = "all/regional_listings.rs"]
 mod regional_listings;
 
@@ -109,6 +112,9 @@ mod subscription_attributes;
 
 #[path = "all/subscription_dead_letter_queue.rs"]
 mod subscription_dead_letter_queue;
+
+#[path = "all/subscription_filter_policy_delivery.rs"]
+mod subscription_filter_policy_delivery;
 
 #[path = "all/subscription_filter_policy_matching.rs"]
 mod subscription_filter_policy_matching;

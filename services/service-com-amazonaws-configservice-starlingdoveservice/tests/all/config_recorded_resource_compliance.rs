@@ -28,10 +28,10 @@ use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 /// The Region every request below is signed for, and the Region the buckets are
 /// created in: a configuration recorder records the resources of its own Region.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account every emulated resource belongs to.
-const ACCOUNT_ID: &str = "000000000000";
+pub(crate) const ACCOUNT_ID: &str = "000000000000";
 
 /// The `source` Config publishes its events under, and the `detail-type` of a
 /// compliance change (the EventBridge reference for Config).
@@ -67,13 +67,13 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(10);
 const QUIET_BUDGET: Duration = Duration::from_millis(2_500);
 
 /// Config, S3, EventBridge and SQS over one shared engine.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     callback: EmbeddedEmulator,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -92,7 +92,7 @@ impl Emulator {
     }
 
     /// One RPC call: `POST /` carrying `X-Amz-Target`, signed for `signing_name`.
-    async fn call(
+    pub(crate) async fn call(
         &self,
         signing_name: &str,
         target_prefix: &str,
@@ -127,7 +127,7 @@ impl Emulator {
     }
 
     /// A Config call (`awsJson1_1`), required to answer 200.
-    async fn config(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn config(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self
             .call("config", "StarlingDoveService", "1.1", operation, body)
             .await;
@@ -162,7 +162,7 @@ impl Emulator {
 
     /// An S3 client over the in-process callback, addressing path style exactly as the
     /// recorder's own client does.
-    fn s3(&self) -> aws_sdk_s3::Client {
+    pub(crate) fn s3(&self) -> aws_sdk_s3::Client {
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new(REGION.to_string()))
@@ -181,7 +181,7 @@ impl Emulator {
     }
 
     /// Create `bucket` in [`REGION`], with `tags` on it when it carries any.
-    async fn create_bucket(&self, bucket: &str, tags: &[(&str, &str)]) {
+    pub(crate) async fn create_bucket(&self, bucket: &str, tags: &[(&str, &str)]) {
         self.s3()
             .create_bucket()
             .bucket(bucket)
@@ -238,7 +238,7 @@ impl Emulator {
     }
 
     /// Put the recorder and the delivery channel a rule needs, and start recording.
-    async fn recording(&self) {
+    pub(crate) async fn recording(&self) {
         self.config(
             "PutConfigurationRecorder",
             &json!({
@@ -468,7 +468,7 @@ impl Emulator {
     }
 
     /// Call `operation` and require a refusal, returning its status and error code.
-    async fn refused(&self, operation: &str, body: &Value) -> (u16, String) {
+    pub(crate) async fn refused(&self, operation: &str, body: &Value) -> (u16, String) {
         let (status, parsed) = self
             .call("config", "StarlingDoveService", "1.1", operation, body)
             .await;
