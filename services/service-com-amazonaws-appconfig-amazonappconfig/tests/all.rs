@@ -71,6 +71,8 @@ mod list_deployment_strategies;
 mod list_deployments;
 #[path = "all/list_environments.rs"]
 mod list_environments;
+#[path = "all/list_experiment_definitions.rs"]
+mod list_experiment_definitions;
 #[path = "all/list_experiment_run_events.rs"]
 mod list_experiment_run_events;
 #[path = "all/list_experiment_runs.rs"]

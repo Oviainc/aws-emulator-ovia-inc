@@ -22,7 +22,10 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::user_lifecycle::{account_id, call, call_signed_by, element, error_code, router};
+use crate::user_lifecycle::{
+    account_id, assert_access_denied_message, assert_access_denied_message_in_region, call,
+    call_signed_by, call_signed_in_region, element, error_code, router,
+};
 
 /// What a row expects the signed call to answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,7 +376,8 @@ async fn identity_policies_decide_every_signed_call() {
                 );
                 // The message is built from the request: the principal that signed it,
                 // the action it named and the resource the decision was made on, plus
-                // which of the two refusals this is.
+                // which of the two refusals this is and where this one denial's
+                // authorization details are readable.
                 let reason = if case.expect == Expect::ExplicitDeny {
                     "with an explicit deny in an identity-based policy".to_string()
                 } else {
@@ -382,20 +386,13 @@ async fn identity_policies_decide_every_signed_call() {
                         case.iam_action
                     )
                 };
-                let expected = format!(
-                    "User: arn:aws:iam::{}:user/{user_name} is not authorized to perform: {} \
-                     on resource: {} {reason}",
-                    account_id(),
-                    case.iam_action,
-                    case.resource
-                );
-                assert_eq!(
-                    element(&body, "Message"),
-                    expected,
-                    "case {:?}: expected the refusal to name the principal, action and \
-                     resource, got {:?}",
-                    case.case,
-                    element(&body, "Message")
+                assert_access_denied_message(
+                    &case.case,
+                    &element(&body, "Message"),
+                    &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
+                    &case.iam_action,
+                    &case.resource,
+                    &reason,
                 );
             }
         }
@@ -576,13 +573,48 @@ async fn an_unreadable_grant_allows_but_cannot_overturn_an_explicit_deny() {
                     "case {user_name}/{action}: expected AccessDenied, got {:?}",
                     error_code(&body)
                 );
-                assert!(
-                    element(&body, "Message")
-                        .ends_with("with an explicit deny in an identity-based policy"),
-                    "case {user_name}/{action}: expected the explicit-deny refusal, got {:?}",
-                    element(&body, "Message")
+                assert_access_denied_message(
+                    &format!("{user_name}/{action}"),
+                    &element(&body, "Message"),
+                    &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
+                    &format!("iam:{action}"),
+                    &format!("arn:aws:iam::{}:group/", account_id()),
+                    "with an explicit deny in an identity-based policy",
                 );
             }
         }
+    }
+}
+
+/// RULE: the console URL a denial points the caller at names the Region the REQUEST
+/// addressed — its SigV4 credential scope is the only place a request carries one — so
+/// the same refused call signed in another Region names that Region in both halves of
+/// the sentence, and nothing else about the message moves.
+#[tokio::test]
+async fn a_denials_console_url_names_the_region_the_request_addressed() {
+    let router = router();
+    let user_name = "regional";
+    // No identity-based policy at all, so every row below is the implicit deny.
+    let access_key_id = principal(&router, "regional denial", user_name, &[]).await;
+
+    // Rows spanning Regions in three of AWS's geographies, including the one IAM's
+    // global endpoint lives in — so a Region that had been hardcoded instead of read
+    // off the request would fail on every row but the first.
+    for region in ["us-east-1", "eu-west-1", "ap-southeast-2"] {
+        let (status, body) =
+            call_signed_in_region(&router, Some(&access_key_id), region, "ListGroups", &[]).await;
+        assert_eq!(
+            status, 403,
+            "case {region:?}: expected the implicit deny to be refused, got {status}: {body}"
+        );
+        assert_access_denied_message_in_region(
+            region,
+            &element(&body, "Message"),
+            region,
+            &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
+            "iam:ListGroups",
+            &format!("arn:aws:iam::{}:group/", account_id()),
+            "because no identity-based policy allows the iam:ListGroups action",
+        );
     }
 }

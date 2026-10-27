@@ -4,8 +4,9 @@
 //!
 //! Reports the threat-protection (risk) configuration stored at the level the
 //! request names — one user pool, or one app client of it — rendered from what is
-//! stored, and refuses a pool that carries no threat-protection surface at all. A
-//! read: this operation writes nothing.
+//! stored, and reports NO configuration for a level that has never had one
+//! written. A read: this operation writes nothing, and it refuses only a level
+//! this emulator does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -175,47 +176,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .pool(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
 
-        // Threat protection is a surface the pool's add-ons carry: this operation
-        // describes the risk configuration "given an app client or user pool ID
-        // where threat protection is configured", and it models
-        // `UserPoolAddOnNotEnabledException` for the pool where it is not. A pool
-        // whose add-ons are off has no threat-protection surface to report, so it
-        // is refused rather than answered with an empty configuration. Asked AFTER
-        // the lookup, so a request that names no pool is a 404 whatever the pool it
-        // named would have reported.
-        if !pool.add_ons_enabled() {
-            return Err(add_ons_not_enabled());
-        }
-
         // "Specify ClientId to inspect client-level configuration, or UserPoolId
         // to inspect pool-level configuration": what is reported is the
-        // configuration stored at the level the request names. A level nothing
-        // has configured holds no setting and no modification instant, so it is
-        // reported as itself alone — `RiskConfiguration` is a modelled REQUIRED
-        // member of this response, so the level is always named.
+        // configuration stored at the level the request names, and nothing else
+        // is consulted. This is a pure read, so the pool's add-on state is not a
+        // precondition of it: whether the paid threat-protection add-on is on
+        // says nothing about what has been stored, and a pool that never enabled
+        // it simply holds no configuration to report.
+        //
+        // A level nothing has ever configured holds no configuration at all, so
+        // the response carries NO `RiskConfiguration` member — an absent member
+        // is what distinguishes "never configured" from "configured to defaults",
+        // which is a stored configuration with no setting in it and the instant
+        // the call that stored it ran.
         let stored = match input.client_id.as_deref() {
             Some(client_id) => {
                 let client = pool
                     .clients
                     .get(client_id)
                     .ok_or_else(|| client_not_found(client_id))?;
-                match client.risk_configuration.as_ref() {
-                    Some(configuration) => configuration
-                        .to_risk_configuration_type(&input.user_pool_id, Some(client_id)),
-                    None => crate::state::unconfigured_risk_configuration_type(
-                        &input.user_pool_id,
-                        Some(client_id),
-                    ),
-                }
+                client.risk_configuration.as_ref().map(|configuration| {
+                    configuration.to_risk_configuration_type(&input.user_pool_id, Some(client_id))
+                })
             }
-            None => match pool.risk_configuration.as_ref() {
-                Some(configuration) => {
-                    configuration.to_risk_configuration_type(&input.user_pool_id, None)
-                }
-                None => {
-                    crate::state::unconfigured_risk_configuration_type(&input.user_pool_id, None)
-                }
-            },
+            None => pool.risk_configuration.as_ref().map(|configuration| {
+                configuration.to_risk_configuration_type(&input.user_pool_id, None)
+            }),
         };
 
         Ok(DescribeRiskConfigurationOutput {
@@ -238,17 +224,6 @@ fn client_not_found(client_id: &str) -> DescribeRiskConfigurationError {
     DescribeRiskConfigurationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(format!("User pool client {client_id} does not exist.")),
     })
-    .into()
-}
-
-/// This operation's refusal on a pool whose user pool add-ons are off, so it
-/// carries no threat-protection surface to describe.
-fn add_ons_not_enabled() -> DescribeRiskConfigurationError {
-    DescribeRiskConfigurationErrorModeled::UserPoolAddOnNotEnabledException(
-        UserPoolAddOnNotEnabledException {
-            message: Some(crate::state::USER_POOL_ADD_ONS_NOT_ENABLED_MESSAGE.to_string()),
-        },
-    )
     .into()
 }
 

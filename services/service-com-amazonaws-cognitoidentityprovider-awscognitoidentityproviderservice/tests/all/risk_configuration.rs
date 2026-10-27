@@ -11,10 +11,13 @@
 //! settings at all; both that call's response and a later
 //! `DescribeRiskConfiguration` of the same level render the STORED configuration,
 //! identified by the level it is stored at, with the instant of the last call that
-//! set it, while a level of a pool whose threat protection is on but which
-//! nothing has configured is reported as itself alone. The two levels are
-//! independent, and a pool whose add-ons are off carries no threat-protection
-//! surface at all: both operations refuse it.
+//! set it, while a level nothing has ever configured is reported by NO
+//! `RiskConfiguration` member at all. The two levels are independent.
+//!
+//! The pool's threat-protection add-on gates exactly one thing: a write that
+//! carries the compromised-credentials setting. The read is never gated by it, and
+//! neither is a write that carries only the adaptive-authentication or IP-address
+//! settings.
 //!
 //! Each table row names the case it asserts and every assertion reports the actual
 //! value.
@@ -109,28 +112,48 @@ fn error_message(payload: &Value) -> &str {
         .unwrap_or("<no message>")
 }
 
-/// A pool whose threat protection is on, and its minted id. `mode` is one of the
-/// modelled `AdvancedSecurityModeType` values.
-async fn pool_with_add_ons(router: &MultiServiceRouter, case: &str, mode: &str) -> String {
-    let created = ok(
-        router,
-        "CreateUserPool",
-        &json!({
-            "PoolName": "risk-configuration-pool",
-            "UserPoolAddOns": { "AdvancedSecurityMode": mode }
-        }),
-    )
-    .await;
+/// A pool created in the add-on mode `mode` names — or with no `UserPoolAddOns`
+/// member at all when `mode` is `None` — and its minted id.
+async fn pool_in_mode(router: &MultiServiceRouter, case: &str, mode: Option<&str>) -> String {
+    let mut body = json!({ "PoolName": "risk-configuration-pool" });
+    if let Some(mode) = mode {
+        body.as_object_mut()
+            .expect("a request body is a JSON object")
+            .insert(
+                "UserPoolAddOns".to_string(),
+                json!({ "AdvancedSecurityMode": mode }),
+            );
+    }
+    let created = ok(router, "CreateUserPool", &body).await;
     created["UserPool"]["Id"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: a minted pool id: {created}"))
         .to_string()
 }
 
+/// A pool whose threat protection is on, and its minted id. `mode` is one of the
+/// modelled `AdvancedSecurityModeType` values.
+async fn pool_with_add_ons(router: &MultiServiceRouter, case: &str, mode: &str) -> String {
+    pool_in_mode(router, case, Some(mode)).await
+}
+
 /// A pool with threat protection enforced, and its minted id.
 async fn pool(router: &MultiServiceRouter, case: &str) -> String {
     pool_with_add_ons(router, case, "ENFORCED").await
 }
+
+/// Every add-on state a user pool can be in, beside whether its add-ons are on.
+///
+/// `AdvancedSecurityModeType` is AUDIT | ENFORCED | OFF (this service's model:
+/// `smithy_query(query="shape",shape="AdvancedSecurityModeType")`), and a pool
+/// that stores no `UserPoolAddOns` member at all is the fourth state — add-ons
+/// off, since there is no mode to switch them on.
+const ADD_ON_STATES: &[(Option<&str>, bool)] = &[
+    (Some("AUDIT"), true),
+    (Some("ENFORCED"), true),
+    (Some("OFF"), false),
+    (None, false),
+];
 
 /// An app client of `user_pool_id`, and its minted id.
 async fn app_client(router: &MultiServiceRouter, case: &str, user_pool_id: &str) -> String {
@@ -153,6 +176,11 @@ fn configuration(payload: &Value) -> Value {
         .get("RiskConfiguration")
         .cloned()
         .unwrap_or(Value::Null)
+}
+
+/// Whether a response carries a `RiskConfiguration` member at all.
+fn carries_configuration(payload: &Value) -> bool {
+    payload.get("RiskConfiguration").is_some()
 }
 
 /// `value` without its `LastModifiedDate`, so a comparison against the settings a
@@ -506,26 +534,24 @@ async fn the_two_levels_hold_separate_configurations() {
     // An app client that holds no settings of its own holds none: the pool-level
     // configuration is "applied to all user pool app clients that don't have
     // client-level settings" (`RiskConfigurationType.ClientId`), so it is reported
-    // at the pool's level, not at the client's.
+    // at the pool's level, not at the client's — and the client's level, which
+    // nothing configured, is reported by no member at all.
     ok(
         &router,
         "SetRiskConfiguration",
         &with_level(&user_pool_id, None, &pool_settings),
     )
     .await;
-    let inherited = configuration(
-        &ok(
-            &router,
-            "DescribeRiskConfiguration",
-            &with_level(&user_pool_id, Some(&client_id), &json!({})),
-        )
-        .await,
-    );
-    assert_eq!(
-        inherited,
-        json!({ "UserPoolId": user_pool_id, "ClientId": client_id }),
-        "case {case:?}: a client nothing configured reports no settings of its own, \
-         got {inherited}"
+    let inherited = ok(
+        &router,
+        "DescribeRiskConfiguration",
+        &with_level(&user_pool_id, Some(&client_id), &json!({})),
+    )
+    .await;
+    assert!(
+        !carries_configuration(&inherited),
+        "case {case:?}: a client nothing configured holds no configuration of its own, so \
+         the read carries no RiskConfiguration member, got {inherited}"
     );
 
     // Setting the client's own settings leaves the pool's alone, and the reverse.
@@ -565,18 +591,16 @@ async fn the_two_levels_hold_separate_configurations() {
 
     // A second app client of the same pool still holds none of its own.
     let other_client = app_client(&router, case, &user_pool_id).await;
-    let other = configuration(
-        &ok(
-            &router,
-            "DescribeRiskConfiguration",
-            &with_level(&user_pool_id, Some(&other_client), &json!({})),
-        )
-        .await,
-    );
-    assert_eq!(
-        other,
-        json!({ "UserPoolId": user_pool_id, "ClientId": other_client }),
-        "case {case:?}: one client's settings are not another's, got {other}"
+    let other = ok(
+        &router,
+        "DescribeRiskConfiguration",
+        &with_level(&user_pool_id, Some(&other_client), &json!({})),
+    )
+    .await;
+    assert!(
+        !carries_configuration(&other),
+        "case {case:?}: one client's settings are not another's, so the client nothing \
+         configured carries no RiskConfiguration member, got {other}"
     );
 
     // "To reset the threat protection settings of an app client to be inherited
@@ -611,99 +635,183 @@ async fn the_two_levels_hold_separate_configurations() {
 }
 
 #[tokio::test]
-async fn a_level_nothing_configured_reports_no_settings() {
-    let router = router();
-    let case = "a pool and a client nothing has configured";
-    let user_pool_id = pool(&router, case).await;
-    let client_id = app_client(&router, case, &user_pool_id).await;
+async fn a_level_nothing_configured_carries_no_configuration_member() {
+    // A level that has never had a configuration written holds none, so the read
+    // carries NO `RiskConfiguration` member — whatever the pool's add-on state,
+    // which says nothing about what has been stored. An absent member is what
+    // tells a caller "never configured" from "configured to defaults", which is
+    // the stored configuration a set carrying no setting leaves behind.
+    for (mode, _add_ons_on) in ADD_ON_STATES {
+        let router = router();
+        let case = format!("a pool and a client nothing has configured, add-ons {mode:?}");
+        let user_pool_id = pool_in_mode(&router, &case, *mode).await;
+        let client_id = app_client(&router, &case, &user_pool_id).await;
 
-    for (label, body, expected) in [
-        (
-            "the pool level",
-            json!({ "UserPoolId": user_pool_id }),
-            json!({ "UserPoolId": user_pool_id }),
-        ),
-        (
-            "the client level",
-            json!({ "UserPoolId": user_pool_id, "ClientId": client_id }),
-            json!({ "UserPoolId": user_pool_id, "ClientId": client_id }),
-        ),
-    ] {
-        let described = configuration(&ok(&router, "DescribeRiskConfiguration", &body).await);
-        assert_eq!(
-            described, expected,
-            "case {case:?} at {label}: a level nothing configured reports itself with no \
-             setting and no modification instant, got {described}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn the_threat_protection_surface_needs_the_pools_add_ons() {
-    let router = router();
-
-    // `AdvancedSecurityModeType` is AUDIT | ENFORCED | OFF (this service's model):
-    // both enabled modes carry the surface, and OFF does not, as a pool that
-    // stores no `UserPoolAddOns` at all does not either.
-    for mode in ["AUDIT", "ENFORCED"] {
-        let case = "add-ons enabled";
-        let user_pool_id = pool_with_add_ons(&router, case, mode).await;
-        for operation in ["SetRiskConfiguration", "DescribeRiskConfiguration"] {
-            let (status, payload) =
-                call(&router, operation, &json!({ "UserPoolId": user_pool_id })).await;
+        for (level, body) in [
+            ("the pool level", json!({ "UserPoolId": user_pool_id })),
+            (
+                "the client level",
+                json!({ "UserPoolId": user_pool_id, "ClientId": client_id }),
+            ),
+        ] {
+            let (status, payload) = call(&router, "DescribeRiskConfiguration", &body).await;
             assert_eq!(
                 status, 200,
-                "case {case:?} in mode {mode:?}: {operation} must be served, got {status} with \
-                 {payload}"
+                "case {case:?} at {level}: the read is served, got {status} with {payload}"
+            );
+            assert!(
+                !carries_configuration(&payload),
+                "case {case:?} at {level}: a level nothing configured carries no \
+                 RiskConfiguration member, got {payload}"
             );
         }
     }
 
-    for (label, create) in [
-        (
-            "add-ons switched off",
-            json!({
-                "PoolName": "no-threat-protection-pool",
-                "UserPoolAddOns": { "AdvancedSecurityMode": "OFF" }
-            }),
-        ),
-        (
-            "no add-ons at all",
-            json!({ "PoolName": "no-threat-protection-pool" }),
-        ),
-    ] {
-        let created = ok(&router, "CreateUserPool", &create).await;
-        let user_pool_id = created["UserPool"]["Id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {label:?}: a minted pool id: {created}"))
-            .to_string();
-        let client_id = app_client(&router, label, &user_pool_id).await;
+    // "Configured to defaults" is the other answer: a set carrying no setting
+    // stores a configuration, so the member is present from then on.
+    let router = router();
+    let case = "the pool level, set to its defaults";
+    let user_pool_id = pool_in_mode(&router, case, None).await;
+    ok(
+        &router,
+        "SetRiskConfiguration",
+        &json!({ "UserPoolId": user_pool_id }),
+    )
+    .await;
+    let described = ok(
+        &router,
+        "DescribeRiskConfiguration",
+        &json!({ "UserPoolId": user_pool_id }),
+    )
+    .await;
+    assert!(
+        carries_configuration(&described),
+        "case {case:?}: a level set to its defaults holds a configuration, so the read \
+         carries the member, got {described}"
+    );
+    assert_eq!(
+        without_last_modified(&configuration(&described)),
+        json!({ "UserPoolId": user_pool_id }),
+        "case {case:?}: that configuration holds no setting, got {described}"
+    );
+}
 
-        // Neither level of a pool that carries no threat-protection surface is
-        // served, by either operation: the refusal is the modelled one, not an
-        // empty configuration.
-        for operation in ["SetRiskConfiguration", "DescribeRiskConfiguration"] {
-            for (level, body) in [
-                ("the pool level", json!({ "UserPoolId": user_pool_id })),
-                (
-                    "the client level",
-                    json!({ "UserPoolId": user_pool_id, "ClientId": client_id }),
-                ),
-            ] {
-                let (status, payload) = call(&router, operation, &body).await;
+#[tokio::test]
+async fn only_a_compromised_credentials_write_needs_the_pools_add_ons() {
+    // The add-on precondition is scoped to the setting it governs: a write
+    // carrying the compromised-credentials setting is refused while the pool's
+    // add-ons are off, and every other write — and every read — is served
+    // whatever the pool's add-on state. Each row of the settings table is driven
+    // against each of the four add-on states.
+    for (mode, add_ons_on) in ADD_ON_STATES {
+        for RiskCase { case, settings } in risk_cases() {
+            let router = router();
+            let case = format!("{case} with add-ons {mode:?}");
+            let user_pool_id = pool_in_mode(&router, &case, *mode).await;
+            let gated = settings
+                .get("CompromisedCredentialsRiskConfiguration")
+                .is_some();
+
+            let (status, payload) = call(
+                &router,
+                "SetRiskConfiguration",
+                &with_level(&user_pool_id, None, &settings),
+            )
+            .await;
+
+            if gated && !add_ons_on {
                 assert_eq!(
                     (status, error_code(&payload)),
                     (400, "UserPoolAddOnNotEnabledException"),
-                    "case {label:?} at {level}: {operation} is refused while the pool's add-ons \
-                     are off, got {status} with {payload}"
+                    "case {case:?}: a compromised-credentials write is refused while the \
+                     pool's add-ons are off, got {status} with {payload}"
                 );
                 assert_eq!(
                     error_message(&payload),
                     ADD_ONS_NOT_ENABLED_MESSAGE,
-                    "case {label:?} at {level}: {operation} reports that the add-ons are not \
-                     enabled, got {payload}"
+                    "case {case:?}: the refusal reports that the add-ons are not enabled, \
+                     got {payload}"
                 );
+
+                // The refused write stored nothing, so the level still holds no
+                // configuration at all.
+                let described =
+                    ok(&router, "DescribeRiskConfiguration", &json!({ "UserPoolId": user_pool_id }))
+                        .await;
+                assert!(
+                    !carries_configuration(&described),
+                    "case {case:?}: a refused write persists nothing, got {described}"
+                );
+                continue;
             }
+
+            assert_eq!(
+                status, 200,
+                "case {case:?}: this write needs no add-on, got {status} with {payload}"
+            );
+            assert_eq!(
+                without_last_modified(&configuration(&payload)),
+                with_level(&user_pool_id, None, &settings),
+                "case {case:?}: the response renders the settings the request carried, \
+                 got {payload}"
+            );
+
+            let described = configuration(
+                &ok(
+                    &router,
+                    "DescribeRiskConfiguration",
+                    &json!({ "UserPoolId": user_pool_id }),
+                )
+                .await,
+            );
+            assert_eq!(
+                described,
+                configuration(&payload),
+                "case {case:?}: the read reports the stored configuration the write \
+                 answered, got {described}"
+            );
+        }
+    }
+
+    // The gate is the POOL's add-on state at either level, so a client-level
+    // write answers the same way: the compromised-credentials setting needs the
+    // add-on on, the adaptive-authentication setting does not.
+    for (mode, add_ons_on) in ADD_ON_STATES {
+        let router = router();
+        let case = format!("a client-level write with add-ons {mode:?}");
+        let user_pool_id = pool_in_mode(&router, &case, *mode).await;
+        let client_id = app_client(&router, &case, &user_pool_id).await;
+
+        for (gated, settings) in [
+            (
+                true,
+                json!({
+                    "CompromisedCredentialsRiskConfiguration": {
+                        "Actions": { "EventAction": "BLOCK" }
+                    }
+                }),
+            ),
+            (
+                false,
+                json!({
+                    "AccountTakeoverRiskConfiguration": {
+                        "Actions": { "HighAction": { "Notify": false, "EventAction": "BLOCK" } }
+                    }
+                }),
+            ),
+        ] {
+            let (status, payload) = call(
+                &router,
+                "SetRiskConfiguration",
+                &with_level(&user_pool_id, Some(&client_id), &settings),
+            )
+            .await;
+            let expected = if gated && !add_ons_on { 400 } else { 200 };
+            assert_eq!(
+                status, expected,
+                "case {case:?}: a client-level write carrying \
+                 {settings} expects {expected}, got {status} with {payload}"
+            );
         }
     }
 }

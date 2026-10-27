@@ -349,19 +349,19 @@ async fn tagging_an_arn_that_names_no_stored_resource_is_not_found() {
             // really takes (`state::stream_arn`) does resolve — see
             // `tagging_resolves_every_tagged_resource_by_its_own_arn` — so this row
             // is about a stream of a LIVE cluster that was never created: the
-            // cluster resolves, the stream under it does not, and the answer is the
-            // modelled 404. The parser splits the resource field at its first `/`,
-            // so the error names the `cluster` type with the compound id.
+            // cluster resolves, the stream under it does not, and the refusal names
+            // the stream that is missing by its own identifier. The identity of
+            // every nested case is pinned in `tests/all/nested_arn_not_found.rs`.
             "a stream of a live cluster, never created",
             expected_stream_arn("us-east-1", &live, &absent_identifier()),
-            "cluster",
-            format!("{live}/stream/{}", absent_identifier()),
+            "stream",
+            absent_identifier(),
         ),
         (
             "a stream of a cluster that was never created either",
             expected_stream_arn("us-east-1", &absent_identifier(), &absent_identifier()),
             "cluster",
-            format!("{}/stream/{}", absent_identifier(), absent_identifier()),
+            absent_identifier(),
         ),
         (
             "a cluster ARN written with a colon before the id",

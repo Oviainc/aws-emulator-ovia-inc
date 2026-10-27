@@ -3,7 +3,8 @@
 //! @op ListTagsForResource
 //!
 //! Reports the tags held for the resource an ARN names — the registered SAP
-//! application, or one of the SAP HANA databases of that registration. The tag set
+//! application, or one of the SAP HANA databases or components of that registration. The
+//! tag set
 //! comes from the one place this service keeps tags
 //! ([`crate::state::RegionState::tags_by_arn`]), so it is whatever the calls that write
 //! tags have left there; an ARN naming no resource of this account and Region is
@@ -170,10 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ResourceArn` is modelled `@required` with a `@pattern`, so reaching here means
         // the reference is a well-formed ARN. It still has to NAME something: the
-        // resources this service holds are the registered SAP application and the SAP
-        // HANA databases of that registration, so an ARN naming neither is the
-        // `ResourceNotFoundException` this operation models rather than an empty tag set
-        // reported for a resource that does not exist.
+        // resources this service holds are the registered SAP application and the
+        // resources derived from that registration — its SAP HANA databases and its
+        // components — so an ARN naming none of them is the `ResourceNotFoundException`
+        // this operation models rather than an empty tag set reported for a resource that
+        // does not exist.
         if !region_state.holds_resource(&region, &input.resource_arn) {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::resource_not_found_message(

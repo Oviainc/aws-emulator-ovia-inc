@@ -37,6 +37,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request here is signed for, and so the region the stack's queues and
@@ -649,11 +652,22 @@ async fn an_update_that_drops_a_declared_property_is_refused_rather_than_dropped
         "case {case:?}: expected the update to be refused rather than silently dropped, got \
          {body}"
     );
+    // The STACK's reason summarises which resource the update failed on; the property it
+    // will not reset is that resource's own diagnosis, on its event.
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::UPDATE, ["Queue"]),
+        "case {case:?}: expected the stack reason to summarise what failed, got {reason:?}"
+    );
+    let (_, events) =
+        cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
     assert!(
-        reason.contains("Queue") && reason.contains("VisibilityTimeout"),
-        "case {case:?}: expected the reason to name the resource and the property it will not \
-         reset, got {reason:?}"
+        xml_texts(&events, "ResourceStatusReason")
+            .iter()
+            .any(|reported| reported.contains("VisibilityTimeout")),
+        "case {case:?}: expected the failing resource's event to name the property it will \
+         not reset, got {events}"
     );
 
     // The queue is exactly as it was: nothing was applied by the refused update.
@@ -1050,11 +1064,22 @@ async fn a_queue_sqs_refuses_to_create_fails_the_stack() {
         "case {case:?}: expected the failed create to be rolled back rather than publish a \
          queue url nothing answers to, got {body}"
     );
+    // The STACK's reason summarises which resource failed; SQS's own refusal is reported
+    // on that resource's event.
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::CREATE, ["Queue"]),
+        "case {case:?}: expected the stack reason to summarise what failed, got {reason:?}"
+    );
+    let (_, events) =
+        cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
     assert!(
-        reason.contains("Queue") && reason.contains("InvalidAttributeValue"),
-        "case {case:?}: expected the reason to name the resource and SQS's own refusal, \
-         got {reason:?}"
+        xml_texts(&events, "ResourceStatusReason")
+            .iter()
+            .any(|reported| reported.contains("VisibilityTimeout")),
+        "case {case:?}: expected the failing resource's event to carry SQS's own refusal, \
+         got {events}"
     );
 
     // And nothing was created: the name the template asked for resolves to no queue.

@@ -35,6 +35,8 @@ mod alarm_m_of_n_directions;
 mod alarm_period_windows;
 #[path = "all/alarm_reason_datapoints.rs"]
 mod alarm_reason_datapoints;
+#[path = "all/anomaly_band_alarms.rs"]
+mod anomaly_band_alarms;
 #[path = "all/anomaly_detectors.rs"]
 mod anomaly_detectors;
 #[path = "all/composite_alarms.rs"]

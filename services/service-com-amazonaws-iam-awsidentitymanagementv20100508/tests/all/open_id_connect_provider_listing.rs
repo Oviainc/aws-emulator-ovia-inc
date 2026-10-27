@@ -30,7 +30,10 @@ use crate::identity_policy_enforcement::{principal, statement};
 use crate::open_id_connect_providers::{client_ids, expected_arn, issuer_of, list_members, thumbprint};
 use crate::role_lifecycle::{borrowed, param};
 use crate::saml_provider_listing::split_element;
-use crate::user_lifecycle::{account_id, call, call_signed_by, element, elements, error_code, router};
+use crate::user_lifecycle::{
+    account_id, assert_access_denied_message, call, call_signed_by, element, elements, error_code,
+    router,
+};
 
 /// How many characters a provider URL may carry: `OpenIDConnectProviderUrlType` is len
 /// 1..255 (`smithy_query(query="shape", shape="OpenIDConnectProviderUrlType")`), so the
@@ -581,16 +584,13 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                 } else {
                     format!("because no identity-based policy allows the {LIST_ACTION} action")
                 };
-                assert_eq!(
-                    element(&body, "Message"),
-                    format!(
-                        "User: arn:aws:iam::{}:user/{user_name} is not authorized to perform: \
-                         {LIST_ACTION} on resource: {} {reason}",
-                        account_id(),
-                        provider_collection()
-                    ),
-                    "case {case_name:?}: expected the refusal to name the principal, action and \
-                     resource, got {body}"
+                assert_access_denied_message(
+                    case_name,
+                    &element(&body, "Message"),
+                    &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
+                    LIST_ACTION,
+                    &provider_collection(),
+                    &reason,
                 );
                 assert!(
                     listed_arns(&body).is_empty(),
@@ -598,7 +598,9 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                 );
 
                 // A refusal is not a one-shot: the same call is refused the same way
-                // again, and still reports nothing.
+                // again, and still reports nothing. It reads the same except for the
+                // authorization id, which is minted per REFUSED REQUEST — so the second
+                // denial hands the caller its own, readable on its own.
                 let (again_status, again) =
                     call_signed_by(&router, Some(&access_key_id), "ListOpenIDConnectProviders", &[])
                         .await;
@@ -607,10 +609,19 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                     "case {case_name:?}: the second call must be refused too, got \
                      {again_status}: {again}"
                 );
-                assert_eq!(
+                assert_access_denied_message(
+                    case_name,
+                    &element(&again, "Message"),
+                    &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
+                    LIST_ACTION,
+                    &provider_collection(),
+                    &reason,
+                );
+                assert_ne!(
                     element(&again, "Message"),
                     element(&body, "Message"),
-                    "case {case_name:?}: the second refusal must read the same, got {again}"
+                    "case {case_name:?}: every refused request carries its OWN authorization \
+                     id, so two denials cannot read identically, got {again}"
                 );
                 assert!(
                     listed_arns(&again).is_empty(),

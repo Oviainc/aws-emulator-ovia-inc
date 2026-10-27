@@ -25,7 +25,9 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, call_in_region, create_bucket, emulator, error_code, opt_in};
+use crate::harness::{
+    call, call_in_region, create_bucket, emulator, error_code, opt_in, ACCOUNT,
+};
 
 /// The destination bucket these fixtures export to. Compute Optimizer does not create it;
 /// the request just names it.
@@ -382,7 +384,7 @@ async fn an_invalid_export_request_is_refused() {
             "accountIds together with includeMemberAccounts",
             json!({
                 "s3DestinationConfig": {"bucket": BUCKET},
-                "accountIds": ["111122223333"],
+                "accountIds": [ACCOUNT],
                 "includeMemberAccounts": true,
             }),
             "InvalidParameterValueException",
@@ -456,13 +458,15 @@ async fn an_invalid_export_request_is_refused() {
     }
 
     // Every field a valid request may carry together, accepted: the rows above refuse a
-    // VALUE, never the member.
+    // VALUE, never the member. `accountIds` names the one account this emulator presents —
+    // the only account an export of it can be asked for
+    // (`recommendation_export_admission.rs`).
     let body = export_ok(
         &router,
         "every member set to a value the model declares",
         json!({
             "s3DestinationConfig": {"bucket": BUCKET, "keyPrefix": "quarterly"},
-            "accountIds": ["111122223333"],
+            "accountIds": [ACCOUNT],
             "includeMemberAccounts": false,
             "fileFormat": "Csv",
             "fieldsToExport": ["AccountId", "ResourceArn", "Finding", "SavingsOpportunity"],

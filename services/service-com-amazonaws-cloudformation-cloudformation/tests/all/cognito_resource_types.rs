@@ -40,12 +40,12 @@ use serde_json::{json, Value};
 use service_com_amazonaws_cloudformation_cloudformation::state::resource_types::{
     is_recognized, AWS_RESOURCE_TYPES,
 };
-use service_com_amazonaws_cloudformation_cloudformation::state::status;
+use service_com_amazonaws_cloudformation_cloudformation::state::{resource_status, status};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    call, create_stack, describe_stack, member, router, wait_for_the_transition, xml_text,
-    xml_texts,
+    call, create_stack, describe_stack, member, resource_event_reason, router,
+    wait_for_the_transition, xml_text, xml_texts,
 };
 use crate::stack_resources::{resources_of, wire_resources};
 
@@ -202,7 +202,16 @@ async fn every_published_cognito_type_may_be_declared_and_is_recorded() {
                      to {:?}, got body {body}",
                     status::ROLLBACK_COMPLETE
                 );
-                let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+                // The property the type requires is the FAILING RESOURCE's diagnosis, so
+                // it is reported on that resource's own event; the stack's reason is the
+                // summary of which resources failed.
+                let reason = resource_event_reason(
+                    &router,
+                    &stack_name,
+                    "Subject",
+                    resource_status::CREATE_FAILED,
+                )
+                .await;
                 assert!(
                     reason.contains(property),
                     "case {resource_type:?}: expected the failure to name the required \

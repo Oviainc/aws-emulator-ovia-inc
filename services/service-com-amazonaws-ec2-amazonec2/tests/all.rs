@@ -128,6 +128,13 @@ mod carrier_gateways;
 // the tail.
 #[path = "all/classic_link_instances.rs"]
 mod classic_link_instances;
+// What `DeleteVpnConnection` starts on the Site-to-Site VPN connection it names, what it
+// refuses, and what the clock then owes it. Declared in the MIDDLE of the list for the
+// reason the suite above gives: the head and the tail are both where concurrent ec2
+// landings insert their two lines, and these two already lost a serialized squash merge at
+// the tail.
+#[path = "all/delete_vpn_connection.rs"]
+mod delete_vpn_connection;
 // What `CreateSnapshots` makes of the volumes one instance holds — one snapshot each, the
 // two exclusions, the tags, and the refusals. Declared in the MIDDLE of the list for the
 // reason the suite above gives: the head and the tail are both where concurrent ec2 landings

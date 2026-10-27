@@ -101,6 +101,8 @@ mod log_group_name_pattern_lists;
 mod log_group_tags;
 #[path = "all/log_stream_removal.rs"]
 mod log_stream_removal;
+#[path = "all/lookup_table_column_names.rs"]
+mod lookup_table_column_names;
 #[path = "all/lookup_table_enumeration.rs"]
 mod lookup_table_enumeration;
 #[path = "all/lookup_table_queries.rs"]

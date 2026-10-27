@@ -27,6 +27,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request here is signed for, and so the region the cluster, its access
@@ -426,13 +429,13 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// One refusal row: a declaration the owning service rejects, and the error CODE its
-/// refusal must be reported under on the failed stack.
+/// One refusal row: a declaration the owning service rejects, and the `HandlerErrorCode`
+/// class its refusal must be reported under on the failed resource's own event.
 struct RefusalRow {
     case: &'static str,
     /// The declared properties, built from the cluster name and the principal ARN.
     properties: fn(&str, &str) -> Value,
-    expected_code: &'static str,
+    expected_handler_code: &'static str,
     /// The cluster the entry must NOT exist on afterwards — the row's own cluster for a
     /// declaration Amazon EKS refused part-way, so a half-created entry would be visible.
     reads_back_on_host_cluster: bool,
@@ -451,7 +454,7 @@ const REFUSAL_ROWS: &[RefusalRow] = &[
                 }]
             })
         },
-        expected_code: "InvalidParameterException",
+        expected_handler_code: "InvalidRequest",
         reads_back_on_host_cluster: true,
     },
     RefusalRow {
@@ -466,7 +469,7 @@ const REFUSAL_ROWS: &[RefusalRow] = &[
                 }]
             })
         },
-        expected_code: "InvalidParameterException",
+        expected_handler_code: "InvalidRequest",
         reads_back_on_host_cluster: true,
     },
     RefusalRow {
@@ -481,7 +484,7 @@ const REFUSAL_ROWS: &[RefusalRow] = &[
                 }]
             })
         },
-        expected_code: "ResourceNotFoundException",
+        expected_handler_code: "NotFound",
         reads_back_on_host_cluster: false,
     },
 ];
@@ -725,8 +728,9 @@ async fn a_stack_provisions_the_eks_access_entry_its_template_declares() {
 }
 
 /// Every refusal row: a declaration the owning service rejects fails the resource and the
-/// stack — which rolls back, reporting that service's own error code — and leaves no
-/// access entry behind for it.
+/// stack — which rolls back, summarising the failed resource on the stack and reporting
+/// that service's own refusal on the resource's event — and leaves no access entry behind
+/// for it.
 #[tokio::test]
 async fn a_declaration_eks_refuses_fails_the_stack_and_leaves_no_entry() {
     let router = build_router();
@@ -749,11 +753,30 @@ async fn a_declaration_eks_refuses_fails_the_stack_and_leaves_no_entry() {
             "case {case:?}: expected the failed create to be rolled back rather than \
              completed, got {body}"
         );
+        // The STACK's reason summarises which resource failed; Amazon EKS's own refusal,
+        // and the handler class it falls in, are reported on that resource's event.
         let reason = element(&body, "StackStatusReason").unwrap_or_default();
+        assert_eq!(
+            reason,
+            resource_failure_summary(failed_action::CREATE, [LOGICAL_ID]),
+            "case {case:?}: expected the stack reason to summarise what failed, got \
+             {reason:?}"
+        );
+        let events = cloudformation(
+            &router,
+            "DescribeStackEvents",
+            &[("StackName", &stack_name)],
+        )
+        .await
+        .text;
         assert!(
-            reason.contains(LOGICAL_ID) && reason.contains(row.expected_code),
-            "case {case:?}: expected the reason to name the resource and {:?}, got {reason:?}",
-            row.expected_code
+            crate::query_wire::elements(&events, "ResourceStatusReason")
+                .iter()
+                .any(|reported| reported
+                    .contains(&format!("HandlerErrorCode: {}", row.expected_handler_code))),
+            "case {case:?}: expected the failing resource's event to report {:?}, got \
+             {events}",
+            row.expected_handler_code
         );
 
         if row.reads_back_on_host_cluster {

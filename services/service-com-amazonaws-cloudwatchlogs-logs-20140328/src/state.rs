@@ -3295,6 +3295,31 @@ pub fn lookup_table_name_from_arn(arn: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
+/// The refusal CloudWatch Logs answers when the lookup table an operation names is not one
+/// the account holds. Unlike the generic [`resource_not_found_message`] sentence, a
+/// lookup-table refusal states WHICH table and WHICH account was looked in, so a caller
+/// whose identifier crossed accounts or Regions can see what was searched for and where.
+///
+/// Both variable parts come from the request and from state: `name` is the table the request
+/// identified and `account_id` the account that identifier names.
+pub fn lookup_table_not_found_message(name: &str, account_id: &str) -> String {
+    format!("Lookup table '{name}' not found in account '{account_id}'")
+}
+
+/// The same refusal for an operation that identifies the table by its `lookupTableArn`: that
+/// ARN carries both the table's name and the account the table would belong to.
+///
+/// An ARN that carries no lookup-table name identifies no table to name in the refusal — the
+/// case [`UNIDENTIFIED_RESOURCE_NOT_FOUND_MESSAGE`] distinguishes elsewhere in this service —
+/// so it is refused with the generic [`resource_not_found_message`] sentence rather than with
+/// an empty name.
+pub fn lookup_table_not_found_message_for_arn(arn: &str) -> String {
+    match (lookup_table_name_from_arn(arn), arn_account_id(arn)) {
+        (Some(name), Some(account_id)) => lookup_table_not_found_message(name, account_id),
+        _ => resource_not_found_message("lookup table"),
+    }
+}
+
 /// What populates a lookup table: "You must specify either tableBody or queryId, but not
 /// both."
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3371,14 +3396,40 @@ pub struct TableBodyShape {
     pub records_count: i64,
 }
 
+/// The refusal for a CSV header row that names the same column name more than once: such a
+/// row names no column SET, so a data row's values name no column unambiguously and the
+/// table has no columns to be read by. The text is fixed for the error class — it
+/// interpolates neither the repeated name, nor the member, nor a position.
+pub const DUPLICATE_TABLE_FIELDS_MESSAGE: &str = "CSV header contains duplicate field names";
+
+/// Why a lookup table's CSV body builds no table, and therefore which modelled error the
+/// operation that was handed it refuses the request with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableBodyRejection {
+    /// Content this service could not read as the CSV the `tableBody` member documents: the
+    /// body names the defect and the member it was carried in, so it is refused with the
+    /// `InvalidParameterException` every lookup-table write models for a member it will not
+    /// accept.
+    Unreadable(String),
+    /// A body read as CSV whose header row declares one column name twice. The rule is about
+    /// the header row as a WHOLE rather than about a value a single member's constraint could
+    /// express, so — like the cross-member source rules of the same operations — it is
+    /// refused with the `ValidationException` they model, carrying
+    /// [`DUPLICATE_TABLE_FIELDS_MESSAGE`].
+    DuplicateFields,
+}
+
 /// Read a lookup table's CSV body: "the CSV content must include a header row with column
 /// names". The body is parsed by the `csv` crate rather than split by hand, so a quoted
 /// field carrying a comma, a newline or an escaped quote is one field, as CSV defines it.
 ///
-/// The `Err` carries the message to refuse the body with: a header row naming no column at
-/// all, and a data row whose field count disagrees with the header's, are both content this
-/// operation cannot build a table from.
-pub fn parse_table_body(body: &str) -> Result<TableBodyShape, String> {
+/// The `Err` says why the body builds no table: a header row naming no column at all, a data
+/// row whose field count disagrees with the header's, and a header row naming the same column
+/// twice are each content a table cannot be read by — the last one through its own
+/// [`TableBodyRejection::DuplicateFields`], because a repeated column name is refused as a
+/// validation failure rather than as an unreadable member.
+pub fn parse_table_body(body: &str) -> Result<TableBodyShape, TableBodyRejection> {
+    let unreadable = |error: csv::Error| TableBodyRejection::Unreadable(table_body_message(&error));
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         // A row must carry exactly the header's fields: a lookup table's rows are keyed by
@@ -3387,18 +3438,26 @@ pub fn parse_table_body(body: &str) -> Result<TableBodyShape, String> {
         .from_reader(body.as_bytes());
     let fields: Vec<String> = reader
         .headers()
-        .map_err(|error| table_body_message(&error))?
+        .map_err(unreadable)?
         .iter()
         .map(str::to_string)
         .collect();
     if fields.iter().all(|field| field.trim().is_empty()) {
-        return Err(
+        return Err(TableBodyRejection::Unreadable(
             "tableBody must begin with a header row naming the table's columns".to_string(),
-        );
+        ));
+    }
+    // "The first row must be a header row with column names": the names it declares are the
+    // columns the table is read by ([`LookupTableRecord::table_fields`]), so a name declared
+    // twice leaves every value under it ambiguous and the body names no table. Compared
+    // through a set, so a wide header costs one pass and not one per column.
+    let mut seen = std::collections::BTreeSet::new();
+    if !fields.iter().all(|field| seen.insert(field.as_str())) {
+        return Err(TableBodyRejection::DuplicateFields);
     }
     let mut records_count: i64 = 0;
     for record in reader.records() {
-        record.map_err(|error| table_body_message(&error))?;
+        record.map_err(unreadable)?;
         records_count = records_count.saturating_add(1);
     }
     Ok(TableBodyShape {
@@ -5918,6 +5977,16 @@ pub fn log_stream_arn(region: &str, group_name: &str, stream_name: &str) -> Stri
 /// slashes included, because a resource id carries its own separators.
 pub fn arn_service_and_resource(arn: &str) -> Option<(&str, &str)> {
     arn_parts(arn).map(|(_partition, service, _account, resource)| (service, resource))
+}
+
+/// The account segment of an ARN
+/// (`arn:<partition>:<service>:<region>:<account>:<resource>`), or `None` for anything that
+/// is not an ARN or that names no account — which is how a refusal states the account the
+/// identifier it was handed belongs to.
+pub fn arn_account_id(arn: &str) -> Option<&str> {
+    arn_parts(arn)
+        .map(|(_partition, _service, account, _resource)| account)
+        .filter(|account| !account.is_empty())
 }
 
 /// The `(partition, service, account, resource)` segments of an ARN

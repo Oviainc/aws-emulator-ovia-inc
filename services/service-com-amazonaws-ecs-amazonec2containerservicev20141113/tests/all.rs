@@ -53,6 +53,8 @@ mod enum_value_refusals;
 mod error_messages;
 #[path = "all/express_gateway_services.rs"]
 mod express_gateway_services;
+#[path = "all/forced_service_delete_status.rs"]
+mod forced_service_delete_status;
 #[path = "all/integer_bound_refusals.rs"]
 mod integer_bound_refusals;
 #[path = "all/invalid_request_refusals.rs"]

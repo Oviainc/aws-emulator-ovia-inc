@@ -205,6 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UntagResourceErrorModeled::ValidationException(invalid).into());
         }
 
+        let region = crate::state::request_region(ctx);
         let mut state = state.lock();
         // A status change the clock already owes is materialised first: it was due at
         // this instant even if nobody had called, and a settled deletion is what
@@ -212,15 +213,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(::std::time::SystemTime::now());
         // The same scoped resolution the other tagging operations use: an ARN of
         // another region, account or partition names a resource this endpoint does not
-        // serve, so it removes nothing and answers the modelled 404.
-        let Some(tags) = state.resource_tags_mut(&resource, &crate::state::request_region(ctx))
-        else {
+        // serve, so it removes nothing and answers the modelled 404 — naming the
+        // missing resource by its own type and its own identifier, which for a nested
+        // stream ARN is the stream rather than the cluster segment the read split at.
+        let identity = state.addressed_identity(&resource, &region);
+        let Some(tags) = state.resource_tags_mut(&resource, &region) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
-                    &input.resource_arn,
-                    &resource.resource_id,
-                    &resource.resource_type,
-                ),
+                identity.not_found(&input.resource_arn),
             )
             .into());
         };

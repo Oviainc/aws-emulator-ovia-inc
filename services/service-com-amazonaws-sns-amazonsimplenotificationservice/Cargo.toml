@@ -37,6 +37,10 @@ service-common = { path = "../common" }
 # client is needed — the emulator supplies the transport, so the SDK's own HTTPS stack and
 # runtime are left out.
 aws-sdk-sqs = { version = "1", default-features = false }
+# The `cidr` matcher of a subscription's filter policy asks whether an address lies in a
+# network, which this parses rather than splitting the text by hand
+# (`state::message_filter`).
+ipnet = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

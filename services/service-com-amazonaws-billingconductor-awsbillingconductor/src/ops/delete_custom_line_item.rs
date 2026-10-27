@@ -191,14 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The range is half-open, as its member names say, so an end at or
                 // before the start would name no billing period to delete the item
                 // from at all.
-                if !crate::state::billing_period_range_is_ordered(range) {
-                    return Err(validation(
-                        "ILLEGAL_BILLING_PERIOD_RANGE",
-                        "BillingPeriodRange.ExclusiveEndBillingPeriod",
-                        "the exclusive end billing period must be later than the inclusive \
-                         start billing period"
-                            .to_string(),
-                    ));
+                if let Err((reason, field, message)) =
+                    crate::state::check_billing_period_range_is_ordered(range)
+                {
+                    return Err(validation(reason, field, message));
                 }
                 // "Deletes the custom line item … in the current, or previous billing
                 // period": the periods this operation may take effect in are bounded

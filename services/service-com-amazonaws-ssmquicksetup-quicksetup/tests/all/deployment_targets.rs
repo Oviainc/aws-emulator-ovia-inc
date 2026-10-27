@@ -313,10 +313,10 @@ type TargetCase = (&'static str, Value, Vec<(String, String)>);
 /// A create deploys one configuration per targeted account and Region pair.
 ///
 /// Each row differs along what the rule generalises over: how many Regions are
-/// targeted, how many accounts, whether either is named at all, how the comma-separated
-/// list is written (padding, empty entries, repeats), and whether the accounts are named
-/// through `TargetAccounts` or left to the organizational units a definition may target
-/// instead.
+/// targeted, how many accounts, whether the Regions are named at all, how the
+/// comma-separated list is written (padding, empty entries, repeats), and whether the
+/// accounts are named through `TargetAccounts` or left to the organizational units a
+/// definition may target instead.
 #[tokio::test]
 async fn a_definition_deploys_one_configuration_per_targeted_account_and_region() {
     let router = emulator();
@@ -327,18 +327,21 @@ async fn a_definition_deploys_one_configuration_per_targeted_account_and_region(
     // (case, the definition's Parameters, the (account, Region) pairs it must deploy to)
     let cases: Vec<TargetCase> = vec![
         (
-            "no target parameters at all",
-            json!({}),
+            "no target Region at all",
+            json!({ "TargetOrganizationalUnits": "ou-1" }),
             vec![(local.clone(), REGION.to_string())],
         ),
         (
             "one targeted region",
-            json!({ "TargetRegions": "eu-west-1" }),
+            json!({ "TargetOrganizationalUnits": "ou-1", "TargetRegions": "eu-west-1" }),
             vec![(local.clone(), "eu-west-1".to_string())],
         ),
         (
             "three targeted regions",
-            json!({ "TargetRegions": "us-east-1,eu-central-1,ap-southeast-2" }),
+            json!({
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": "us-east-1,eu-central-1,ap-southeast-2",
+            }),
             vec![
                 (local.clone(), "us-east-1".to_string()),
                 (local.clone(), "eu-central-1".to_string()),
@@ -347,7 +350,10 @@ async fn a_definition_deploys_one_configuration_per_targeted_account_and_region(
         ),
         (
             "a region list with padding, an empty entry and a repeat",
-            json!({ "TargetRegions": " us-east-1 , ,us-east-1, ap-south-1 " }),
+            json!({
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": " us-east-1 , ,us-east-1, ap-south-1 ",
+            }),
             vec![
                 (local.clone(), "us-east-1".to_string()),
                 (local.clone(), "ap-south-1".to_string()),
@@ -429,7 +435,10 @@ async fn an_update_redeploys_the_definition_to_exactly_the_targets_it_now_names(
         &router,
         case,
         "redeployed",
-        &json!({ "TargetRegions": "us-east-1,us-west-2" }),
+        &json!({
+            "TargetOrganizationalUnits": "ou-1",
+            "TargetRegions": "us-east-1,us-west-2",
+        }),
     )
     .await;
     let definition = definition_id(&router, case, &manager_arn).await;
@@ -456,7 +465,10 @@ async fn an_update_redeploys_the_definition_to_exactly_the_targets_it_now_names(
     let steps: Vec<TargetCase> = vec![
         (
             "one region swapped for another",
-            json!({ "TargetRegions": "us-west-2,eu-west-1" }),
+            json!({
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": "us-west-2,eu-west-1",
+            }),
             vec![
                 (local.clone(), "us-west-2".to_string()),
                 (local.clone(), "eu-west-1".to_string()),
@@ -471,8 +483,8 @@ async fn an_update_redeploys_the_definition_to_exactly_the_targets_it_now_names(
             ],
         ),
         (
-            "no targets at all, back to the manager's own region",
-            json!({ "TargetRegions": "" }),
+            "no target Region at all, back to the manager's own region",
+            json!({ "TargetOrganizationalUnits": "ou-1" }),
             vec![(local.clone(), REGION.to_string())],
         ),
     ];
@@ -532,7 +544,10 @@ async fn a_target_the_update_still_names_keeps_its_configuration_id() {
         &router,
         case,
         "stable",
-        &json!({ "TargetRegions": "us-east-1,us-west-2" }),
+        &json!({
+            "TargetOrganizationalUnits": "ou-1",
+            "TargetRegions": "us-east-1,us-west-2",
+        }),
     )
     .await;
     let definition = definition_id(&router, case, &manager_arn).await;
@@ -546,7 +561,10 @@ async fn a_target_the_update_still_names_keeps_its_configuration_id() {
         &definition,
         &json!({
             "TypeVersion": "2.0",
-            "Parameters": { "TargetRegions": "us-west-2,eu-west-1" },
+            "Parameters": {
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": "us-west-2,eu-west-1",
+            },
         }),
     )
     .await;
@@ -685,19 +703,28 @@ async fn a_definition_past_the_deployment_bound_is_refused() {
     let cases: Vec<(&str, Value, u16, usize)> = vec![
         (
             "one region under the bound",
-            json!({ "TargetRegions": regions(MAX_DEPLOYMENT_TARGETS - 1) }),
+            json!({
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": regions(MAX_DEPLOYMENT_TARGETS - 1),
+            }),
             200,
             MAX_DEPLOYMENT_TARGETS - 1,
         ),
         (
             "exactly the bound, in regions",
-            json!({ "TargetRegions": regions(MAX_DEPLOYMENT_TARGETS) }),
+            json!({
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": regions(MAX_DEPLOYMENT_TARGETS),
+            }),
             200,
             MAX_DEPLOYMENT_TARGETS,
         ),
         (
             "one region past the bound",
-            json!({ "TargetRegions": regions(MAX_DEPLOYMENT_TARGETS + 1) }),
+            json!({
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": regions(MAX_DEPLOYMENT_TARGETS + 1),
+            }),
             400,
             0,
         ),

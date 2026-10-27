@@ -18,9 +18,70 @@ pub struct DescribeRiskConfigurationInput {
     pub client_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cognitoidentityprovider#DescribeRiskConfigurationResponse")]
+/// `DescribeRiskConfigurationResponse`, with its schema written out instead of
+/// derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the shapes beside
+/// it: the one member of this shape, `RiskConfiguration`, is `@required` in the
+/// model (`smithy_query(query="shape",shape="DescribeRiskConfigurationResponse")`),
+/// and the derive forces a `@required` member to a bare (non-`Option`) field that
+/// is therefore ALWAYS written. The wire answer Amazon Cognito sends for a level
+/// that has never had a threat-protection configuration written carries no
+/// `RiskConfiguration` member at all, which is what lets a caller tell "never
+/// configured" from "configured to defaults" — the latter being a stored
+/// configuration with no setting in it and the instant the call that stored it
+/// ran. Holding the member as `Option` is the only way to leave it out, so the
+/// shape's single member schema and its serializer are written here, member for
+/// member as the model declares it: same shape id, same name, same index, and no
+/// `@jsonName` (the model declares none).
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this
+/// shape is an operation OUTPUT, which the server only ever serializes
+/// (`Operation::Output` requires `SerializableStruct`; only `Input` is
+/// deserialized), so a hand-written read path would be untested code with no
+/// caller.
 #[derive(Debug, Clone, Default)]
 pub struct DescribeRiskConfigurationOutput {
-    pub risk_configuration: RiskConfigurationType,
+    pub risk_configuration: Option<RiskConfigurationType>,
+}
+
+#[allow(non_upper_case_globals)]
+impl DescribeRiskConfigurationOutput {
+    const M_RISK_CONFIGURATION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.cognitoidentityprovider#DescribeRiskConfigurationResponse$RiskConfiguration",
+                "com.amazonaws.cognitoidentityprovider",
+                "RiskConfiguration",
+            ),
+            ::aws_smithy_schema::ShapeType::Structure,
+            "RiskConfiguration",
+            0,
+        );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.cognitoidentityprovider#DescribeRiskConfigurationResponse",
+            "com.amazonaws.cognitoidentityprovider",
+            "DescribeRiskConfigurationResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_RISK_CONFIGURATION],
+    );
+}
+
+pub static DESCRIBE_RISK_CONFIGURATION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &DescribeRiskConfigurationOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DescribeRiskConfigurationOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.risk_configuration.as_ref() {
+            serializer.write_struct(&Self::M_RISK_CONFIGURATION, value)?;
+        }
+        Ok(())
+    }
 }
 

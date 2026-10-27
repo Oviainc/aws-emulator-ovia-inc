@@ -30,6 +30,9 @@ use serde_json::Value;
 // the body — is the same job this crate's `transfer_user_with_iam_role` suite already
 // publishes, so that one is reused rather than copied.
 use crate::transfer_user_with_iam_role::form_encode;
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
 const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
@@ -627,10 +630,28 @@ fn a_stack_whose_resource_the_owning_service_refuses_fails_instead_of_reporting_
                 "ROLLBACK_COMPLETE",
                 "case DescribeStacks(no encryption policy): the failed create must have been rolled back, got {described}"
             );
+            // The STACK's reason summarises which resource failed; the service's own
+            // refusal is reported on that resource's event.
             let reason = xml_text(&described, "StackStatusReason");
+            assert_eq!(
+                reason,
+                resource_failure_summary(failed_action::CREATE, ["Collection"]),
+                "case DescribeStacks(no encryption policy): the reason must summarise what failed, got {reason:?}"
+            );
+            let (_, events) = cloudformation(
+                &router,
+                &runtime,
+                "DescribeStackEvents",
+                &[("StackName", stack_name)],
+            );
             assert!(
-                reason.contains("Collection") && reason.contains("encryption"),
-                "case DescribeStacks(no encryption policy): the reason must name the resource and the service's refusal, got {reason:?}"
+                crate::cloudformation_provisions_ecr_public_repository::xml_texts(
+                    &events,
+                    "ResourceStatusReason"
+                )
+                .iter()
+                .any(|reported| reported.contains("encryption")),
+                "case DescribeStackEvents(no encryption policy): the failing resource's event must carry the service's refusal, got {events}"
             );
             // Nothing was created, so no collection carries the declared name.
             let (status, code, read) = aoss(
