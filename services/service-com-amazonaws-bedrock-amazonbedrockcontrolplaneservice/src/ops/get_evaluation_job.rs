@@ -5,9 +5,11 @@
 //! ## What this handler does
 //!
 //! Reports one stored evaluation job, read out of the record `CreateEvaluationJob` wrote.
-//! A pure read: an evaluation job has no transition the clock owes (see
-//! [`crate::state::EVALUATION_JOB_STATUS_IN_PROGRESS`]), so this handler writes nothing
-//! and two reads of one job answer alike.
+//! A reporting operation: the only write it makes is to materialise the status transition
+//! the clock had already made due — a running job's move to `Completed` after
+//! [`crate::state::EVALUATION_JOB_COMPLETE_AFTER`], or a stopping job's move to `Stopped` —
+//! which was owed at that instant even if nobody had called, so two reads inside one span
+//! answer alike.
 //!
 //! ## Shape of an operation
 //!
@@ -219,8 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             output_data_config: job.output_data_config.clone(),
             creation_time: crate::state::date_time(job.created_at),
             last_modified_time: Some(crate::state::date_time(job.last_modified_at)),
-            // "A list of strings detailing why this evaluation job failed": a job that is
-            // running has none, and this emulator mints no failed job.
+            // "A list of strings that specify why the evaluation job failed to create": a
+            // job that is running or that ran to completion has none, and nothing here
+            // fails an accepted job, so no stored job carries any.
             failure_messages: None,
         })
     }

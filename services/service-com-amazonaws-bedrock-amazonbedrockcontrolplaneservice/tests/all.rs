@@ -43,6 +43,8 @@ mod enforced_guardrail_configuration;
 mod enum_value_set_listing;
 #[path = "all/enum_value_set_order.rs"]
 mod enum_value_set_order;
+#[path = "all/evaluation_job_completion.rs"]
+mod evaluation_job_completion;
 #[path = "all/evaluation_jobs.rs"]
 mod evaluation_jobs;
 #[path = "all/foundation_models.rs"]

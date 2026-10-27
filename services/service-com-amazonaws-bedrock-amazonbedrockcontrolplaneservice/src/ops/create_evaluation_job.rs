@@ -6,8 +6,9 @@
 //!
 //! Mints one evaluation job in the store and answers its `jobArn`. The job is accepted and
 //! runs asynchronously, so it is stored `InProgress`, which is the only status this
-//! operation mints: see [`crate::state::EVALUATION_JOB_STATUS_IN_PROGRESS`] for why no
-//! clock transition moves it. `GetEvaluationJob` reads the job back.
+//! operation mints: the clock owes that non-terminal status its move to `Completed` after
+//! [`crate::state::EVALUATION_JOB_COMPLETE_AFTER`], materialised by the next call that
+//! reads the record. `GetEvaluationJob` reads the job back.
 //!
 //! ## Shape of an operation
 //!
@@ -304,8 +305,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             output_data_config: input.output_data_config,
             tags: input.job_tags.unwrap_or_default(),
             // The evaluation runs after this call returns, so the job is reported running
-            // from here onwards.
+            // from here onwards, and the clock owes it its move to the terminal status the
+            // run ends in.
             status: crate::state::EVALUATION_JOB_STATUS_IN_PROGRESS,
+            completed_due_at: Some(now + crate::state::EVALUATION_JOB_COMPLETE_AFTER),
             // Nothing has asked for a stop yet, so the clock owes this job no transition.
             stopped_due_at: None,
             // And nothing has asked for its deletion, so it is owed no removal either.
