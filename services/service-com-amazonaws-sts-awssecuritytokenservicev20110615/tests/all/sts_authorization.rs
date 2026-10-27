@@ -597,7 +597,9 @@ async fn a_session_is_refused_past_the_roles_maximum_the_chaining_cap_and_the_po
 /// source identity — and each needs, on the TARGET role's trust policy, the grant for the
 /// value this mint SETS on the new session: `sts:TagSession` for the tags it sets, carried
 /// forward or not, and `sts:SetSourceIdentity` for the source identity it sets, named by
-/// the chained request or carried by the calling session.
+/// the chained request or carried by the calling session. The refusal names the action the
+/// CALLER asked to perform, which for a source identity the request did not name is
+/// `sts:AssumeRole`.
 ///
 /// The rows differ in which actions the target's trust policy lists and whether the
 /// chained request names a source identity of its own.
@@ -639,11 +641,14 @@ async fn transitive_tags_and_a_source_identity_travel_the_chain_under_the_target
             Some("sts:TagSession"),
         ),
         (
+            // The chained request names NO source identity: STS carries the calling
+            // session's forward, so the caller asked only to assume the role and the
+            // refusal names that action rather than the grant the target withholds.
             "a carried source identity against a target that allows the assume and tagging",
             &["sts:AssumeRole", "sts:TagSession"],
             None,
             403,
-            Some("sts:SetSourceIdentity"),
+            Some("sts:AssumeRole"),
         ),
         (
             "a chained request that names a source identity without that grant",

@@ -165,26 +165,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The 1 KB `attributes` limit is documented, not modeled, so it is refused
         // here — before anything is persisted, so a refused request leaves no stage.
         for (index, configuration) in configurations.iter().enumerate() {
-            let size = configuration
-                .attributes
-                .as_ref()
-                .map_or(0, crate::state::attributes_size);
-            if size > crate::state::MAX_ATTRIBUTES_BYTES {
-                return Err(crate::state::validation_failed(
+            let Some(attributes) = configuration.attributes.as_ref() else {
+                // A configuration carrying no map sends no attribute bytes at all, so it
+                // is within the bound whatever the bound is.
+                continue;
+            };
+            crate::state::check_attributes_size(
+                Self::NAME,
+                // The member path names the list position the way the framework's own
+                // constraint walk does.
+                &format!("participantTokenConfigurations.{}.member.attributes", index + 1),
+                attributes,
+            )
+            .map_err(|message| {
+                crate::state::validation_failed(
                     CreateStageErrorModeled::ValidationException,
-                    // Worded in the construction this service states every constraint
-                    // refusal with (`crate::state::violation_clause`): the operation, the
-                    // dotted member path and the bound, with what the request sent. The
-                    // path names the list position the way the framework's own walk does.
-                    format!(
-                        "{}.participantTokenConfigurations.{}.member.attributes is required to \
-                         have a maximum size of {} bytes, found {size}",
-                        Self::NAME,
-                        index + 1,
-                        crate::state::MAX_ATTRIBUTES_BYTES,
-                    ),
-                ));
-            }
+                    message,
+                )
+            })?;
         }
 
         // A tag key in the reserved `aws:` namespace is AWS's own to write (see

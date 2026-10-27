@@ -22,6 +22,15 @@
 //! [`ComAmazonawsMedialiveMedialiveState::update_reservation`]. Nothing else
 //! moves: a reservation reserves what it was bought to reserve.
 //!
+//! A reservation leaves the account through
+//! [`ComAmazonawsMedialiveMedialiveState::delete_reservation`], which is what
+//! `DeleteReservation` ("Delete an expired reservation") answers from: only a
+//! lease that has run out is deletable, so a reservation still under lease is
+//! refused on its state and nothing is written. As everywhere else in this
+//! service, the delete keeps the record — in the terminal `DELETED` its own
+//! state enum declares — so a reader goes on reporting it there instead of
+//! losing it, while every mutation of that id is refused from then on.
+//!
 //! Reading the store back is either one reservation by its id
 //! ([`ComAmazonawsMedialiveMedialiveState::reservation_description`], which
 //! `DescribeReservation` answers from) or a page of them
@@ -37,13 +46,12 @@
 //! — a transition the clock makes due whether or not anybody calls, which is why
 //! reporting it writes nothing.
 //!
-//! `CANCELED` and `DELETED`, the other two states the enum declares
-//! (`smithy_query(query="shape", shape="ReservationState")`: ACTIVE | EXPIRED |
-//! CANCELED | DELETED), are not reachable from what is implemented here: no
-//! operation of this service cancels a reservation, and deleting an expired one
-//! is `DeleteReservation`, still a scaffold with an issue of its own
-//! (`20261024T010738Z-medialive-deletereservation-stub.md`), which is where that
-//! state lands.
+//! `DELETED` is the one state of the enum that is NOT the clock's: it is where a
+//! reservation lands once this account has deleted it, and it is terminal, so it
+//! wins over the lease the dates describe. `CANCELED`, the fourth state the enum
+//! declares (`smithy_query(query="shape", shape="ReservationState")`: ACTIVE |
+//! EXPIRED | CANCELED | DELETED), is not reachable from what is implemented
+//! here: no operation of this service cancels a reservation.
 
 use std::collections::HashMap;
 use std::ops::Bound;
@@ -65,6 +73,7 @@ use super::{
 pub mod reservation_state {
     pub const ACTIVE: &str = "ACTIVE";
     pub const EXPIRED: &str = "EXPIRED";
+    pub const DELETED: &str = "DELETED";
 }
 
 /// The automatic-renewal status a reservation whose purchase asked for none
@@ -143,6 +152,14 @@ pub struct ReservationRecord {
     /// operations read and write this one map through
     /// [`ComAmazonawsMedialiveMedialiveState::resource_tags`].
     pub tags: HashMap<String, String>,
+    /// Whether `DeleteReservation` has deleted this reservation, which puts it in
+    /// the terminal `DELETED` state it then keeps.
+    ///
+    /// PRIVATE: the only way it is set is
+    /// [`ComAmazonawsMedialiveMedialiveState::delete_reservation`], which refuses
+    /// a lease that is still running, so no caller can delete a reservation past
+    /// that rule. Read it through [`ReservationRecord::is_deleted`].
+    deleted: bool,
 }
 
 impl ReservationRecord {
@@ -157,13 +174,26 @@ impl ReservationRecord {
     }
 
     /// The reservation's `State` as of `now`: `ACTIVE` while the lease runs,
-    /// `EXPIRED` from its `End` on.
+    /// `EXPIRED` from its `End` on, and the terminal `DELETED` once this account
+    /// has deleted it — which outranks the lease, because a deleted reservation
+    /// reserves nothing whatever its dates say.
     pub fn state(&self, now: SystemTime) -> &'static str {
-        if now < self.end {
+        if self.deleted {
+            reservation_state::DELETED
+        } else if now < self.end {
             reservation_state::ACTIVE
         } else {
             reservation_state::EXPIRED
         }
+    }
+
+    /// Whether `DeleteReservation` has deleted this reservation.
+    ///
+    /// What tells a record a reader still reports from one a caller may still
+    /// change: a deleted reservation is READABLE (its record stays in the
+    /// account) but no longer writable.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted
     }
 
     /// Whether this reservation is one `filters` asks for: it reserves the
@@ -245,6 +275,33 @@ pub struct ReservationUpdate {
 pub enum ReservationRefusal {
     /// The store already holds [`MAX_RESERVATIONS`] reservations.
     StoreFull,
+}
+
+/// Why [`ComAmazonawsMedialiveMedialiveState::delete_reservation`] deleted
+/// nothing.
+#[derive(Debug)]
+pub enum ReservationDeleteRefusal {
+    /// The account holds no reservation with that id.
+    Unknown,
+    /// The lease has not run out, so there is nothing expired to delete.
+    /// Carries the state the reservation is in, which is the state the refusal
+    /// reports.
+    NotExpired { state: &'static str },
+}
+
+/// The message a delete refused because the reservation's lease is still
+/// running carries: the id the REQUEST named, the state the reservation is in,
+/// and the state a delete acts from.
+///
+/// The same request-composed shape as this service's other state refusals
+/// ([`super::not_idle_message`], [`super::channel_not_running_message`]), with
+/// this operation's own required state: "Delete an expired reservation", so
+/// `EXPIRED` is the one state it deletes from.
+pub fn reservation_not_expired_message(id: &str, state: &str) -> String {
+    format!(
+        "Reservation {id} is in state {state} and can only be deleted from {}",
+        reservation_state::EXPIRED
+    )
 }
 
 /// Why a requested `Start` is not one this service can lease from.
@@ -400,6 +457,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 end: reservation_end(new.start),
                 renewal_settings: renewal_settings(new.renewal_settings),
                 tags: new.tags,
+                deleted: false,
             },
         );
         Ok(id)
@@ -467,8 +525,13 @@ impl ComAmazonawsMedialiveMedialiveState {
     }
 
     /// Apply `update` to the reservation `id` names and answer it as of `now`,
-    /// or `None` when the account holds none with that id — in which case
-    /// nothing is written.
+    /// or `None` when the account holds no reservation with that id that is
+    /// still live — in which case nothing is written.
+    ///
+    /// A reservation this account has DELETED is not live: its record stays
+    /// readable but names no reservation a caller may still change, so an
+    /// update of it writes nothing and the handler refuses it, exactly as it
+    /// refuses an id the account never held.
     ///
     /// A setting the update CARRIES replaces the stored one; a setting it omits
     /// leaves that one exactly as it was, so an update changes only what the
@@ -486,7 +549,10 @@ impl ComAmazonawsMedialiveMedialiveState {
         update: ReservationUpdate,
         now: SystemTime,
     ) -> Option<Reservation> {
-        let record = self.reservations.get_mut(id)?;
+        let record = self
+            .reservations
+            .get_mut(id)
+            .filter(|record| !record.is_deleted())?;
         if let Some(name) = update.name {
             record.name = Some(name);
         }
@@ -494,5 +560,38 @@ impl ComAmazonawsMedialiveMedialiveState {
             record.renewal_settings = renewal_settings(Some(settings));
         }
         Some(record.reservation(now))
+    }
+
+    /// Delete the reservation `id` names and answer it as of `now`, or refuse.
+    ///
+    /// "Delete an expired reservation": a lease that has run out is the one a
+    /// delete acts on, so a reservation the clock still has `ACTIVE` is refused
+    /// on its state and nothing is written. The rule is read off the SAME
+    /// derived state every reader reports
+    /// ([`ReservationRecord::state`]), so what a delete is judged against is
+    /// what `DescribeReservation` reported a moment earlier.
+    ///
+    /// The record is KEPT, in the terminal `DELETED` state its own enum
+    /// declares, so a reader goes on reporting the reservation there instead of
+    /// losing it, and the delete is idempotent: a reservation already in that
+    /// state is the state the caller asked for, so a repeat writes nothing and
+    /// answers the same reservation.
+    pub fn delete_reservation(
+        &mut self,
+        id: &str,
+        now: SystemTime,
+    ) -> Result<Reservation, ReservationDeleteRefusal> {
+        let record = self
+            .reservations
+            .get_mut(id)
+            .ok_or(ReservationDeleteRefusal::Unknown)?;
+        if !record.is_deleted() {
+            let state = record.state(now);
+            if state != reservation_state::EXPIRED {
+                return Err(ReservationDeleteRefusal::NotExpired { state });
+            }
+            record.deleted = true;
+        }
+        Ok(record.reservation(now))
     }
 }

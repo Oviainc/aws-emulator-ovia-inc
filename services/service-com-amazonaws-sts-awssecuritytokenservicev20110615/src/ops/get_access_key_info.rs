@@ -160,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+        let caller_akid = ::service_common::request_access_key_id(ctx.parts());
         let long_term = {
             let iam = crate::state::iam_state(&*self.engine);
             match iam.as_ref() {

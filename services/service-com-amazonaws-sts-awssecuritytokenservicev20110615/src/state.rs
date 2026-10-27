@@ -855,7 +855,10 @@ pub fn resolve_role(iam: &IamState, role_arn: &str) -> Option<ResolvedRole> {
 
 impl ResolvedRole {
     /// Whether this role's trust policy lets `principals` perform `action` on it, given
-    /// the condition keys `context` carries.
+    /// the condition keys `context` carries and the keys `published` says the request
+    /// ANSWERS for (see [`assume_role_published_condition_keys`] and
+    /// [`web_identity_published_condition_keys`] — a web identity's keys are named after
+    /// the provider that issued its token, so they cannot be a constant).
     ///
     /// The DECISION is [`::service_common::iam_authorization`], the tree's one evaluation
     /// of IAM policy documents against a request, read as the RESOURCE-based policy it is
@@ -863,25 +866,6 @@ impl ResolvedRole {
     /// they grant to and a statement naming no resource covers the role itself. A role
     /// whose trust policy this cannot read as a policy, or which carries none at all,
     /// grants nothing: nothing is assumed on evidence the account does not hold.
-    #[must_use]
-    pub fn trust_policy_allows(
-        &self,
-        action: &str,
-        principals: &[String],
-        context: &[(String, String)],
-    ) -> bool {
-        self.trust_policy_admits(
-            action,
-            principals,
-            context,
-            ASSUME_ROLE_PUBLISHED_CONDITION_KEYS,
-        )
-    }
-
-    /// [`Self::trust_policy_allows`] with the condition keys the REQUEST publishes stated
-    /// explicitly, for a mint whose published keys are not the `AssumeRole` ones: a web
-    /// identity's keys are named after the provider that issued the token
-    /// ([`web_identity_condition_context`]), so they cannot be a constant.
     #[must_use]
     pub fn trust_policy_admits(
         &self,
@@ -955,6 +939,42 @@ pub const ASSUME_ROLE_PUBLISHED_CONDITION_KEYS: &[&str] = &[
     "aws:userid",
     "aws:TagKeys",
 ];
+
+/// The `aws:RequestTag/` family: every session tag THIS mint sets, which is exactly the
+/// set the request named plus the ones the calling session carries forward. A mint knows
+/// all of them, so the family is published and a clause over a tag key the mint does not
+/// set is decided — as absent — rather than left undecided.
+const REQUEST_TAG_CONDITION_KEY_FAMILY: &str = "aws:RequestTag/";
+
+/// The `aws:PrincipalTag/` family: the session tags the CALLING principal carries.
+const PRINCIPAL_TAG_CONDITION_KEY_FAMILY: &str = "aws:PrincipalTag/";
+
+/// The condition keys an `AssumeRole` mint by `caller` publishes
+/// ([`ASSUME_ROLE_PUBLISHED_CONDITION_KEYS`]), plus the tag key FAMILIES whose values are
+/// known in full for this caller.
+///
+/// A family is published only by a caller that can answer for EVERY key in it, including
+/// answering that it carries none ([`::service_common::iam_authorization`]). The tags one
+/// mint sets are whatever this request determines, so `aws:RequestTag/` is always
+/// answerable; the tags the CALLING principal carries are answerable only for a principal
+/// whose tags this registry holds, which is a session it minted — an IAM user's own tags
+/// live in IAM and are not read here, so a long-term caller publishes no principal-tag
+/// family and a clause over one stays undecided rather than claiming the caller is
+/// untagged.
+///
+/// Publishing them is what makes the multi-tenancy pattern decide: a clause that tests
+/// whether a session carries a tag at all (`Null`), or that every value satisfies it
+/// (`ForAllValues:`), or that a value differs from one (`StringNotEquals`), needs the
+/// request to answer for an ABSENT key, which an unpublished key cannot.
+#[must_use]
+pub fn assume_role_published_condition_keys(caller: &Caller) -> Vec<&'static str> {
+    let mut published = ASSUME_ROLE_PUBLISHED_CONDITION_KEYS.to_vec();
+    published.push(REQUEST_TAG_CONDITION_KEY_FAMILY);
+    if caller.kind.is_some() {
+        published.push(PRINCIPAL_TAG_CONDITION_KEY_FAMILY);
+    }
+    published
+}
 
 /// The condition keys STS publishes about one role-session mint, for a trust policy's
 /// `Condition` to be decided against.
@@ -1368,6 +1388,34 @@ pub fn packed_policy_too_large_message(packed: usize) -> String {
          maximum allowed limit of {SESSION_TOKEN_SIZE_LIMIT} bytes."
     )
 }
+
+/// How STS words a request that names more managed session policies than one mint may
+/// carry ([`MAX_MANAGED_SESSION_POLICIES`]).
+///
+/// The cap is the SERVICE's own rule — `policyDescriptorListType` carries no `@length`,
+/// so the framework's member-constraint renderer has nothing to state here — and STS
+/// states it as its own sentence: fixed text naming the parameter and the limit, and
+/// nothing of the request, so a refusal never echoes the ARNs the caller sent. One
+/// wording for every operation that carries `PolicyArns`, so two of them cannot word the
+/// same refusal differently.
+pub fn policy_arns_over_limit_message() -> String {
+    format!(
+        "The limit of ARNs for the PolicyArns parameter was exceeded. \
+         {MAX_MANAGED_SESSION_POLICIES} ARNs can be requested at most in an API request."
+    )
+}
+
+/// How AWS words an attempt to replace the source identity a role session already
+/// carries.
+///
+/// "The source identity value persists across chained role sessions"
+/// (`AssumeRoleRequest$SourceIdentity`, this service's model), so a chained mint made
+/// from a session that already carries one cannot name a different value: the value is
+/// already set on the session this mint continues. Fixed text — it names no request
+/// value, because the conflict is about the session rather than about any one of the two
+/// values.
+pub const SOURCE_IDENTITY_ALREADY_SET_MESSAGE: &str =
+    "The source identity is already set for this assume role session";
 
 /// The ARNs of the managed session policies a request named.
 pub fn policy_arns(policy_arns: Option<&[crate::ops::types::PolicyDescriptorType]>) -> Vec<String> {

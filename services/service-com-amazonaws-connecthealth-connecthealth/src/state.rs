@@ -8,7 +8,8 @@
 //! record. Nothing is echoed straight from a request.
 //!
 //! Helpers several operations share (id minting, ARN building, the opaque pagination
-//! cursor, the `SubscriptionDescription` projection) live here rather than being copied
+//! cursor, and every response projection — `SubscriptionDescription`,
+//! `WebAppConfiguration`, `EncryptionContext`) live here rather than being copied
 //! into each `src/ops/*.rs`: `src/lib.rs` is generated, so this module is the crate's
 //! one shared, editable home.
 
@@ -18,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    CreateWebAppConfiguration, InputDataConfig, InsightsContext, InsightsOutput,
+    CreateWebAppConfiguration, EncryptionContext, InputDataConfig, InsightsContext, InsightsOutput,
     MedicalScribeChannelDefinition, MedicalScribeListeningSessionDetails,
     MedicalScribePostStreamActionSettingsResponse, MedicalScribePostStreamActionsResult,
     OutputDataConfig, PatientInsightsEncounterContext, PatientInsightsPatientContext,
@@ -373,6 +374,24 @@ impl Domain {
     /// completes within the call and is reported in the terminal `DELETED`.
     pub fn deletion_completes_in_call(&self) -> bool {
         self.web_app_configuration.is_none()
+    }
+
+    /// This domain as the modelled `EncryptionContext` every Domain response reports
+    /// (`smithy_query(query="shape", shape="EncryptionContext")`: `encryptionType`
+    /// required, `kmsKeyArn` "Only present when encryptionType is
+    /// CUSTOMER_MANAGED_KEY").
+    ///
+    /// Defined once, here, and called from each handler that reports a domain, so the
+    /// create response and every later read cannot describe one stored record's
+    /// encryption differently. The reported key is the one the record holds, which a
+    /// domain has exactly when its type is `CUSTOMER_MANAGED_KEY`: the type is derived
+    /// from the key when the domain is created, so the model's rule holds by the
+    /// record's own invariant rather than by a second test here.
+    pub fn encryption_context(&self) -> EncryptionContext {
+        EncryptionContext {
+            encryption_type: self.encryption_type.as_wire().to_string(),
+            kms_key_arn: self.kms_key_arn.clone(),
+        }
     }
 }
 

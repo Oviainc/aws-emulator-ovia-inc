@@ -284,18 +284,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Managed login requires that your user pool be configured for any
-        // feature plan other than `Lite`" (`ManagedLoginVersion`).
-        if managed_login_version == crate::state::MANAGED_LOGIN_BRANDING
-            && pool.user_pool_tier == crate::state::LITE_USER_POOL_TIER
-        {
-            return Err(feature_unavailable_in_tier(
-                crate::state::feature_unavailable_in_tier_message(
-                    &pool.user_pool_tier,
-                    &crate::state::managed_login_feature_name(
-                        crate::state::MANAGED_LOGIN_BRANDING,
-                    ),
-                ),
-            ));
+        // feature plan other than `Lite`" (`ManagedLoginVersion`), so the
+        // cheapest plan that includes it is the one above that.
+        if managed_login_version == crate::state::MANAGED_LOGIN_BRANDING {
+            if let Some(message) = crate::state::feature_plan_refusal(
+                &pool.user_pool_tier,
+                crate::state::ESSENTIALS_USER_POOL_TIER,
+                &crate::state::managed_login_feature_name(crate::state::MANAGED_LOGIN_BRANDING),
+            ) {
+                return Err(feature_unavailable_in_tier(message));
+            }
         }
 
         // `UserPoolType.Domain` and `UserPoolType.CustomDomain` are single
