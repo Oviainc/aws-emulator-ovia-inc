@@ -79,7 +79,14 @@ async fn get_table(emulator: &Emulator, keyspace: &str, table: &str) -> Value {
 
 /// The tags of one resource, read back through `ListTagsForResource`. Every resource
 /// here holds far fewer than one page, so one call reports them all.
-async fn tags_of(case: &str, emulator: &Emulator, resource_arn: &str) -> Vec<(String, String)> {
+///
+/// Shared with `tests/all/reserved_tag_key_stage.rs`, so there is ONE tag reader for the
+/// suites that read a resource's tags back rather than a copy per file.
+pub(crate) async fn tags_of(
+    case: &str,
+    emulator: &Emulator,
+    resource_arn: &str,
+) -> Vec<(String, String)> {
     let body = assert_ok(
         case,
         emulator
