@@ -74,6 +74,17 @@ fn is_tag_violation(violation: &Violation) -> bool {
     violation.path == TAGS_MEMBER || violation.path.starts_with(&format!("{TAGS_MEMBER}."))
 }
 
+/// Whether `violation` is the tag map carrying MORE entries than its declared maximum —
+/// the one tag-map rule the tagging layer states in its own words
+/// ([`crate::state::tag_set_limit_message`]) rather than as a constraint clause.
+///
+/// It is the MEMBER's own length that fires this, so a key or a value inside the map is not
+/// one of these: those are bounds of the key and value shapes, which the layer reports as
+/// the framework words them.
+fn is_tag_count_violation(violation: &Violation) -> bool {
+    violation.path == TAGS_MEMBER && matches!(violation.kind, ViolationKind::MaxLength(_))
+}
+
 /// The message Batch answers an ENUM-MEMBERSHIP refusal with, and `None` for a violation
 /// of any other class.
 ///
@@ -179,10 +190,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         match refusal {
             Refusal::Invalid(violations) => {
                 if violations.iter().any(is_tag_violation) {
+                    // A tag map longer than the maximum it declares is the ONE tag-plane
+                    // rule the tagging layer words itself: it states the ceiling it holds a
+                    // resource's resultant tag set to
+                    // ([`crate::state::tag_set_limit_message`]) and not the entry count of
+                    // the request, which is what the framework's constraint clause would
+                    // report. Every other refusal of the map keeps that clause: it names
+                    // the member and the bound it failed, which is what the caller fixes.
+                    let message = if violations.iter().any(is_tag_count_violation) {
+                        crate::state::tag_set_limit_message()
+                    } else {
+                        aws_smithy_schema_server::envelope(violations)
+                            .unwrap_or_else(|| "invalid request".to_string())
+                    };
                     return Some(Refused {
                         code: TAGGING_REFUSAL_CODE.to_string(),
-                        message: aws_smithy_schema_server::envelope(violations)
-                            .unwrap_or_else(|| "invalid request".to_string()),
+                        message,
                     });
                 }
                 // A member outside its enum's value set is a rule Batch words itself, in

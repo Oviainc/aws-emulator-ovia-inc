@@ -8432,9 +8432,10 @@ pub fn invalid_max_items() -> crate::ops::types::InvalidArgument {
 
 /// The sentence a read of a key value store the store does not hold answers with: the
 /// CONDITION, carrying nothing from the request, as every other not-found sentence of this
-/// service states its own condition.
-pub const KEY_VALUE_STORE_NOT_FOUND_MESSAGE: &str =
-    "The specified key value store does not exist.";
+/// service states its own condition. CloudFront names the resource by its MODELLED shape
+/// name (`KeyValueStore`) in this one, as the recorded contract carries it, rather than in
+/// the prose form the other sentences use.
+pub const KEY_VALUE_STORE_NOT_FOUND_MESSAGE: &str = "The specified KeyValueStore does not exist.";
 
 /// The modelled `EntityNotFound` (HTTP 404) for a key value store name the store does
 /// not hold — "The entity was not found."
@@ -8447,6 +8448,24 @@ pub fn key_value_store_not_found() -> EntityNotFound {
         message: Some(KEY_VALUE_STORE_NOT_FOUND_MESSAGE.to_string()),
     }
 }
+
+/// The modelled `CannotDeleteEntityWhileInUse` (HTTP 409) for a delete of a resource
+/// something this store holds still names.
+///
+/// FIXED service text ([`ENTITY_IN_USE_MESSAGE`]), as the model states it on the shape
+/// itself and for the reason [`function_in_use`] carries one: what the refusal states is a
+/// property of the CONDITION — the resource is still in use — rather than of the request,
+/// so nothing from the request or from the store belongs in the sentence and every delete
+/// this condition refuses reads the same.
+pub fn entity_in_use() -> crate::ops::types::CannotDeleteEntityWhileInUse {
+    crate::ops::types::CannotDeleteEntityWhileInUse {
+        message: Some(ENTITY_IN_USE_MESSAGE.to_string()),
+    }
+}
+
+/// `CannotDeleteEntityWhileInUse`'s message, as the model documents the shape: "The entity
+/// cannot be deleted while it is in use."
+pub const ENTITY_IN_USE_MESSAGE: &str = "The entity cannot be deleted while it is in use.";
 
 /// The modelled `EntityAlreadyExists` (HTTP 409) for a key value store name that is
 /// already taken — "The entity already exists. You must provide a unique entity."

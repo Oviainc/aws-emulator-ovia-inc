@@ -5,9 +5,10 @@
 //! Lists the tags of the resource `resourceArn` names — the stored map `TagResource`
 //! writes and `UntagResource` deletes from, not a copy. A resource that holds no tag
 //! answers an EMPTY map rather than no map at all, so a caller can tell "nothing is
-//! tagged" from "no such resource": the latter is the modelled `ClientException`
-//! (HTTP 400). A `resourceArn` that is not an ARN at all never reaches that lookup — it
-//! is refused on its SYNTAX by the tag frontend, HTTP 400
+//! tagged" from "no such resource": the latter is the tag layer's not-found,
+//! [`crate::scaffolded::TAGGING_NOT_FOUND_CODE`]
+//! ([`crate::state::unknown_resource_arn`]). A `resourceArn` that is not an ARN at all
+//! never reaches that lookup — it is refused on its SYNTAX by the tag frontend, HTTP 400
 //! [`crate::scaffolded::TAGGING_REFUSAL_CODE`]
 //! ([`crate::state::malformed_resource_arn`]), the same layer this service answers a
 //! refusal of a tag MAP with.
@@ -174,10 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(tags) = state.resource_tags(&input.resource_arn) else {
-            return Err(ListTagsForResourceErrorModeled::ClientException(
-                batch::not_found_exception("Resource", &input.resource_arn),
-            )
-            .into());
+            // A well-formed ARN that resolves to nothing is the tag layer's not-found,
+            // which is a different classification from the malformed ARN above.
+            return Err(batch::unknown_resource_arn());
         };
 
         Ok(ListTagsForResourceOutput {

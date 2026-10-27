@@ -259,19 +259,43 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
                 MAX_KEY_VALUE_STORE_ASSOCIATIONS
             ));
         }
-        for association in associations {
-            if self
-                .key_value_store_by_arn(&association.key_value_store_arn)
-                .is_none()
-            {
-                return Some(format!(
-                    "the key value store {} does not exist",
-                    association.key_value_store_arn
-                ));
+        for arn in associated_key_value_store_arns(config) {
+            if self.key_value_store_by_arn(arn).is_none() {
+                return Some(format!("the key value store {arn} does not exist"));
             }
         }
 
         None
+    }
+
+    /// Whether any function this store holds associates the key value store `arn`.
+    ///
+    /// A key value store is attached to a CloudFront function — or to a connection
+    /// function, whose configuration is the same shape — by a
+    /// `KeyValueStoreAssociation$KeyValueStoreARN`, so the question is answered against the
+    /// STORED configurations rather than against any request, and EVERY stage of each
+    /// function counts: a stage carries its own configuration, so a store the `DEVELOPMENT`
+    /// stage names is as much in use as one the `LIVE` stage names. It is what decides
+    /// whether the store may be deleted, the way [`Self::function_is_associated`] decides
+    /// the same question for the other direction of the attachment.
+    pub fn key_value_store_is_associated(&self, arn: &str) -> bool {
+        let function_configs = self
+            .functions
+            .values()
+            .flat_map(|function| {
+                std::iter::once(&function.development).chain(function.live.as_ref())
+            })
+            .map(|stage| &stage.config);
+        let connection_function_configs = self
+            .connection_functions
+            .values()
+            .flat_map(|function| {
+                std::iter::once(&function.development).chain(function.live.as_ref())
+            })
+            .map(|stage| &stage.config);
+        function_configs
+            .chain(connection_function_configs)
+            .any(|config| associated_key_value_store_arns(config).any(|it| it == arn))
     }
 
     /// Replace the code and the configuration of the `DEVELOPMENT` stage of the function
@@ -379,6 +403,22 @@ fn associated_function_arns(config: &DistributionConfig) -> impl Iterator<Item =
         .flatten()
         .flat_map(|associations| associations.items.as_deref().unwrap_or_default())
         .map(|association| association.function_arn.as_str())
+}
+
+/// Every key value store ARN the configuration `config` associates.
+///
+/// A function carries its stores in a LIST wrapper (`KeyValueStoreAssociations`), so one
+/// configuration contributes zero or more ARNs. The walk is stated once here because both
+/// directions need it: the check that every associated store EXISTS, and the check that a
+/// store is still associated by something before it may be deleted.
+fn associated_key_value_store_arns(config: &FunctionConfig) -> impl Iterator<Item = &str> + '_ {
+    config
+        .key_value_store_associations
+        .as_ref()
+        .and_then(|associations| associations.items.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .map(|association| association.key_value_store_arn.as_str())
 }
 
 /// The ARN of a CloudFront function. CloudFront is a GLOBAL service, so the ARN's region

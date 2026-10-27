@@ -192,44 +192,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let state = state.lock();
 
-        // `CommonControlFilter.Objectives` is modeled as a list —
-        // `ObjectiveResourceFilterList` carries no `@length`, so the boundary validator
-        // admits several entries — but its documentation is explicit that it carries
-        // one objective ARN at a time and that passing several is not supported, which
-        // is the constraint enforced here. An entry without an ARN names no objective
-        // to filter on. Either way the filter is one this operation does not accept, so
-        // both are refused with the service's one fixed invalid-filter sentence — the
-        // same text ListObjectives answers its own filter with, because the sentence
-        // belongs to the class and not to the member at fault.
-        let mut objective_filter: Option<String> = None;
-        if let Some(filter) = input.common_control_filter.as_ref() {
-            if let Some(objectives) = filter.objectives.as_ref() {
-                if objectives.len() > 1 {
-                    return Err(ListCommonControlsErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(crate::service::INVALID_FILTER_MESSAGE.to_string()),
-                        },
-                    )
-                    .into());
-                }
-                if let Some(entry) = objectives.first() {
-                    let Some(arn) = entry.arn.as_ref() else {
-                        return Err(ListCommonControlsErrorModeled::ValidationException(
-                            ValidationException {
-                                message: Some(crate::service::INVALID_FILTER_MESSAGE.to_string()),
-                            },
-                        )
-                        .into());
-                    };
-                    // A filter ARN names an objective by the identifier it carries, not
-                    // by the partition it is written in, so it is read as the ARN the
-                    // catalog stores for that objective before anything is compared
-                    // with it — the identity rule GetControl applies to a control ARN.
-                    objective_filter =
-                        Some(crate::state::canonical_catalog_arn("objective", arn));
-                }
-            }
-        }
+        // `CommonControlFilter.Objectives` is one of this service's single-ARN resource
+        // filters: it carries one objective ARN at a time and that entry must name an
+        // objective. Which entry counts and which entries are acceptable, the sentence
+        // a filter outside that is refused with, and reading the accepted ARN by the
+        // objective's identity rather than by the partition it is written in, are all
+        // the one rule in `crate::state::single_resource_filter_arn` — shared with the
+        // filter ListObjectives takes, because the rule, and the sentence it refuses
+        // with, belong to the class and not to the member at fault.
+        let objective_filter = crate::state::single_resource_filter_arn(
+            "objective",
+            input
+                .common_control_filter
+                .as_ref()
+                .and_then(|filter| filter.objectives.as_deref()),
+        )
+        .map_err(|refusal| {
+            ListCommonControlsErrorModeled::ValidationException(ValidationException {
+                message: Some(refusal),
+            })
+        })?;
 
         let fingerprint = crate::state::filter_fingerprint(&[(
             "objectives",

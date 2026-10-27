@@ -1767,12 +1767,29 @@ pub struct OriginEndpointRecord {
     pub channel_id: String,
     pub description: Option<String>,
     pub manifest_name: Option<String>,
-    /// The playback URL, derived once at creation and stored, so every read returns it.
+    /// The playback URL, derived from the endpoint's effective [`Self::manifest_name`] and
+    /// its packaging format by [`playback_url`], and re-derived by every write of the
+    /// record, so every read returns the URL the endpoint serves NOW.
     pub url: String,
     pub created_at: String,
     pub hls_package: Option<HlsPackage>,
     pub dash_package: Option<DashPackage>,
+    /// The stored CMAF package, every member of it that the SERVICE derives included —
+    /// which is why it is not the request's own shape but the materialisation of
+    /// [`Self::cmaf_package_parameters`] ([`stored_cmaf_package`]).
     pub cmaf_package: Option<CmafPackage>,
+    /// The CMAF packaging configuration exactly as the write that stored it sent it.
+    ///
+    /// A child HLS manifest sent without a `ManifestName` of its own takes the endpoint's
+    /// effective one, and its playback `Url` is derived from whichever name it ends up
+    /// with, so the stored package is a value DERIVED from these parameters and the
+    /// endpoint's own `ManifestName`. Keeping the parameters is what lets a later write
+    /// that moves the endpoint's `ManifestName` re-derive the children from what the
+    /// caller actually sent ([`rederive_cmaf_package`]) instead of guessing, from a
+    /// materialised child, whether its name was sent or inherited. It costs no unbounded
+    /// memory: these are the members a write already had bounded
+    /// ([`bound_origin_endpoint_members`]) before it was stored.
+    pub cmaf_package_parameters: Option<CmafPackageCreateOrUpdateParameters>,
     pub mss_package: Option<MssPackage>,
     pub authorization: Option<Authorization>,
     pub origination: Option<String>,
@@ -2652,6 +2669,34 @@ pub fn stored_cmaf_package(
         ),
         stream_selection: params.stream_selection.clone(),
     }
+}
+
+/// Re-derive the endpoint's stored CMAF package from the parameters its last write
+/// carried, for the endpoint's CURRENT effective `ManifestName`.
+///
+/// The members of a stored child HLS manifest that the SERVICE supplies — the name an
+/// unnamed child inherits from the endpoint and the playback `Url` built from whichever
+/// name the child ends up with — are derived from the endpoint's own effective
+/// `ManifestName`. That name is decided afresh by every write of the endpoint, so a write
+/// that does not resend the packaging configuration still moves what the children are
+/// derived FROM; calling this after the record's `ManifestName` is settled is what keeps
+/// the stored children, and therefore every later read of them, derived from the name the
+/// endpoint actually reports. An endpoint that stores no CMAF package keeps none.
+pub fn rederive_cmaf_package(record: &mut OriginEndpointRecord) {
+    let manifest_name = record
+        .manifest_name
+        .clone()
+        .unwrap_or_else(|| DEFAULT_MANIFEST_NAME.to_string());
+    let package = record.cmaf_package_parameters.as_ref().map(|params| {
+        stored_cmaf_package(
+            params,
+            &record.region,
+            &record.channel_id,
+            &record.id,
+            &manifest_name,
+        )
+    });
+    record.cmaf_package = package;
 }
 
 /// Encode a paging token: the key the NEXT page starts at.
