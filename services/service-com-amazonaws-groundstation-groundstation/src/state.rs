@@ -2097,6 +2097,25 @@ pub fn config_in_use_message(mission_profile_arns: &[String]) -> String {
     )
 }
 
+/// What `DeleteMissionProfile` answers while a contact still to be flown names the
+/// profile: the refusal names the contacts that hold it, which is what tells a caller
+/// what has to be flown or released first.
+///
+/// The status (431) and the error code (`InvalidParameterException`) are the contract —
+/// this operation models no `ResourceInUseException` (`smithy_query(query="operation",
+/// operation="DeleteMissionProfile")`), so the in-use refusal is the bad-parameter one
+/// the sibling config delete already answers. This is the wording that goes with it, and
+/// the ids in it are the ones the store holds rather than anything echoed from the
+/// request — the same composition as [`config_in_use_message`] and
+/// [`ephemeris_in_use_message`].
+pub fn mission_profile_in_use_message(contact_ids: &[String]) -> String {
+    format!(
+        "Mission Profile cannot be deleted; it is currently being used by the following \
+         contacts: {}",
+        contact_ids.join(", ")
+    )
+}
+
 /// Why an ARN-valued reference that admits exactly ONE config capability type cannot be
 /// used, when it cannot.
 ///
@@ -3984,6 +4003,29 @@ impl ComAmazonawsGroundstationGroundstationState {
             .collect();
         referencing.sort();
         referencing
+    }
+
+    /// The ids of the contacts still to be flown that name the mission profile
+    /// `mission_profile_arn` names, in a stable order; empty when nothing holds it.
+    ///
+    /// A contact carries the ARN of the profile it was reserved against
+    /// ([`Contact::mission_profile_arn`]) and reads the wiring of its pass back out of
+    /// that profile ([`Self::contact_dataflow_list`]), so a contact holds its profile for
+    /// as long as it is NOT terminal ([`Contact::is_non_terminal`]) — once its pass is
+    /// over or its reservation released, nothing of it is still to be flown and it no
+    /// longer depends on the profile. Sorted, so a refusal listing them reads the same on
+    /// every call whatever order the map iterates in.
+    pub fn contacts_using_mission_profile(&self, mission_profile_arn: &str) -> Vec<String> {
+        let mut holding: Vec<String> = self
+            .contacts
+            .values()
+            .filter(|contact| {
+                contact.is_non_terminal() && contact.mission_profile_arn == mission_profile_arn
+            })
+            .map(|contact| contact.contact_id.clone())
+            .collect();
+        holding.sort();
+        holding
     }
 
     /// Remove the config the `(configType, configId)` pair addresses, along with the ARN
