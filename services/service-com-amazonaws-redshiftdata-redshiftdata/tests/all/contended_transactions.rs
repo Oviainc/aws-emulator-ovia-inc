@@ -18,21 +18,12 @@
 //! first, a single statement), and whether the callers asked to wait.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::emulator::{error_code, id_of, list, Emulator, SLOW_SQL, WAIT_SECONDS};
+use super::emulator::{error_code, id_of, list, wait_for_terminal, Emulator, SLOW_SQL, WAIT_SECONDS};
 
 use service_com_amazonaws_redshiftdata_redshiftdata::state::MAX_ACTIVE_STATEMENTS;
-
-/// How long the assertions below give a submitted statement to reach a terminal
-/// status. Far longer than the work any row below does, so a row fails because
-/// a statement never terminated and never because the builder was slow.
-const TERMINAL_STATUS_BUDGET: Duration = Duration::from_secs(30);
-
-/// How long to wait between two polls of a statement's status.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Rows the filler table holds, so a transaction that aggregates over it does
 /// real work between its read and its write.
@@ -67,28 +58,6 @@ async fn seed(emulator: &Emulator) {
             response["Status"], "FINISHED",
             "seeding [{sql}] must FINISH, got {response}"
         );
-    }
-}
-
-/// Poll `id` until it reports a terminal status, and answer the record it
-/// reported. Fails once [`TERMINAL_STATUS_BUDGET`] has passed, because a
-/// submission that never reaches a decision is exactly what this suite is
-/// about.
-async fn wait_for_terminal(emulator: &Emulator, case: &str, id: &str) -> Value {
-    let started = Instant::now();
-    loop {
-        let described = emulator.ok("DescribeStatement", &json!({"Id": id})).await;
-        let status = described["Status"].as_str().unwrap_or_default().to_string();
-        if ["FINISHED", "FAILED", "ABORTED"].contains(&status.as_str()) {
-            return described;
-        }
-        assert!(
-            started.elapsed() < TERMINAL_STATUS_BUDGET,
-            "case {case}: {id} reported {status:?} for {:?} and never reached a terminal \
-             status: {described}",
-            started.elapsed()
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 

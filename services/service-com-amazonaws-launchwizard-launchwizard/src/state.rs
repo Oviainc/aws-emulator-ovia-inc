@@ -298,12 +298,12 @@ impl SpecificationField {
                 }
                 .to_string(),
             ),
-            conditionals: (!self.conditionals.is_empty()).then(|| {
+            conditionals: non_empty_member(
                 self.conditionals
                     .iter()
                     .map(SpecificationConditional::to_field)
-                    .collect()
-            }),
+                    .collect(),
+            ),
         }
     }
 }
@@ -444,7 +444,7 @@ impl DeploymentPattern {
             status: Some(self.status.clone()),
             status_message: self.status_message.clone(),
             account_constraints: None,
-            specifications: Some(
+            specifications: non_empty_member(
                 self.specifications
                     .iter()
                     .map(SpecificationField::to_field)
@@ -738,10 +738,10 @@ impl Deployment {
             status: Some(self.status.clone()),
             created_at: Some(to_date_time(self.created_at)),
             modified_at: Some(to_date_time(self.modified_at)),
-            specifications: Some(to_hash_map(&self.specifications)),
+            specifications: to_hash_map_member(&self.specifications),
             resource_group: self.resource_group.clone(),
             deleted_at: self.deleted_at.map(to_date_time),
-            tags: (!self.tags.is_empty()).then(|| to_hash_map(&self.tags)),
+            tags: to_hash_map_member(&self.tags),
             deployment_arn: Some(self.deployment_arn.clone()),
         }
     }
@@ -2256,6 +2256,24 @@ pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
 /// A stored map as the `HashMap` the generated shapes carry.
 pub fn to_hash_map(map: &BTreeMap<String, String>) -> HashMap<String, String> {
     map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// A stored map as the modelled map member it fills, LEFT OUT when the map is empty.
+///
+/// Every map member this service reports (`Tags`, `DeploymentSpecifications`) is
+/// modelled with a floor of one entry, so a map of zero entries is not a value the
+/// member can take: having nothing to report is said by leaving the member out, not by
+/// serialising an empty map. Every reader of such a member goes through here, so two
+/// readers of one stored map cannot answer "there is nothing here" two different ways.
+pub fn to_hash_map_member(map: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
+    (!map.is_empty()).then(|| to_hash_map(map))
+}
+
+/// A built list as the modelled list member it fills, LEFT OUT when the list is empty —
+/// [`to_hash_map_member`] for a member whose floor is one ITEM
+/// (`DeploymentSpecificationsData`, `SpecificationsConditionalData`).
+pub fn non_empty_member<T>(items: Vec<T>) -> Option<Vec<T>> {
+    (!items.is_empty()).then_some(items)
 }
 
 /// Encode an opaque pagination token over the cursor it resumes after.

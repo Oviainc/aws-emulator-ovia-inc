@@ -11,19 +11,27 @@
 //!   carries is refused with `WebhookNotFoundException`, the only outcome besides
 //!   `ValidationException` either operation models, and never with an error code they do
 //!   not declare;
-//! * both are supported only for a webhook of the third party they connect it to ("an
-//!   action type of GitHub"), so a webhook whose target action declares any other
-//!   provider is refused with `ValidationException`;
+//! * the connection either operation makes or breaks is the GitHub HMAC one the
+//!   webhook's shared secret authenticates, so a webhook whose stored
+//!   `WebhookDefinition$authentication` is any other `WebhookAuthenticationType` is
+//!   refused with `ValidationException` stating the requirement and the authentication
+//!   type the store holds for that webhook;
 //! * the webhook itself is left where it is: deregistering is not deleting.
 //!
 //! The rows span what the rules generalise over: the operation, names at both ends of
 //! `WebhookName`'s modelled 1..100 length and over its pattern's character classes,
-//! names that were never stored, and the provider the target action declares.
+//! names that were never stored, every authentication type the model declares, and the
+//! provider the target action declares (which this rule does NOT turn on).
 //!
 //! The harness comes from `tests/all/pipeline_lifecycle.rs`, so every assertion goes
 //! through the same router the production emulator builds.
 
 use serde_json::{json, Value};
+
+use service_com_amazonaws_codepipeline_codepipeline_20150709::state::{
+    webhook_authentication_unsupported_message, AUTHENTICATION_GITHUB_HMAC, AUTHENTICATION_IP,
+    AUTHENTICATION_UNAUTHENTICATED,
+};
 
 use crate::pipeline_lifecycle::{Emulator, ROLE_ARN};
 
@@ -35,6 +43,10 @@ const DEREGISTER: &str = "DeregisterWebhookWithThirdParty";
 /// status the model defaults it to.
 const NOT_FOUND: &str = "WebhookNotFoundException";
 const REFUSAL_STATUS: u16 = 400;
+
+/// A `SecretToken` satisfying `WebhookAuthConfigurationSecretToken`'s modelled 1..100
+/// length — what a GITHUB_HMAC webhook is configured with.
+const SECRET_TOKEN: &str = "s3cr3t-token";
 
 /// The pipeline whose source action a webhook targets, per provider under test.
 fn pipeline_name(provider: &str) -> String {
@@ -68,15 +80,28 @@ fn pipeline(provider: &str, owner: &str) -> Value {
     })
 }
 
-/// A `WebhookDefinition` named `name`, targeting `provider`'s pipeline.
-fn definition(name: &str, provider: &str) -> Value {
+/// The `authenticationConfiguration` each authentication type is configured with, as
+/// `WebhookAuthConfiguration` documents it: "For GITHUB_HMAC, only the SecretToken
+/// property must be set. For IP, only the AllowedIPRange property must be set to a
+/// valid CIDR range. For UNAUTHENTICATED, no properties can be set."
+fn authentication_configuration(authentication: &str) -> Value {
+    match authentication {
+        AUTHENTICATION_GITHUB_HMAC => json!({"SecretToken": SECRET_TOKEN}),
+        AUTHENTICATION_IP => json!({"AllowedIPRange": "10.0.0.0/8"}),
+        _ => json!({}),
+    }
+}
+
+/// A `WebhookDefinition` named `name`, targeting `provider`'s pipeline and configured
+/// with `authentication`.
+fn definition(name: &str, provider: &str, authentication: &str) -> Value {
     json!({
         "name": name,
         "targetPipeline": pipeline_name(provider),
         "targetAction": "Src",
         "filters": [{"jsonPath": "$.ref", "matchEquals": "refs/heads/main"}],
-        "authentication": "UNAUTHENTICATED",
-        "authenticationConfiguration": {},
+        "authentication": authentication,
+        "authenticationConfiguration": authentication_configuration(authentication),
     })
 }
 
@@ -121,12 +146,15 @@ async fn a_name_no_stored_webhook_carries_is_refused_as_not_found() {
         }
     }
 
-    // The same names, once the webhook IS stored against a GitHub-targeted action, are
-    // accepted — so what the refusal reports is the store and not the shape of the
-    // name.
+    // The same names, once the webhook IS stored and configured with the
+    // authentication the connection is made with, are accepted — so what the refusal
+    // reports is the store and not the shape of the name.
     for (case, name) in &cases {
         emulator
-            .ok("PutWebhook", &json!({"webhook": definition(name, "GitHub")}))
+            .ok(
+                "PutWebhook",
+                &json!({"webhook": definition(name, "GitHub", AUTHENTICATION_GITHUB_HMAC)}),
+            )
             .await;
         for operation in [REGISTER, DEREGISTER] {
             let (status, answer) = emulator
@@ -165,55 +193,96 @@ async fn a_name_no_stored_webhook_carries_is_refused_as_not_found() {
     }
 }
 
+/// RULE: both operations serve only a webhook configured with the GitHub HMAC
+/// authentication, and a webhook carrying any other `WebhookAuthenticationType` is
+/// refused with `ValidationException` naming the webhook and the authentication type
+/// the store holds for it.
+///
+/// The rows are every value `WebhookAuthenticationType` declares, each against both
+/// providers a target action can declare here — so the rule is shown to turn on the
+/// stored AUTHENTICATION and not on what the webhook targets.
 #[tokio::test]
-async fn a_webhook_that_targets_another_action_type_is_not_supported() {
+async fn a_webhook_not_configured_with_github_hmac_is_not_supported() {
     let emulator = emulator().await;
-    // The same name, the same pipeline shape, the same filters: only the provider the
-    // target action declares differs, which is what the rule turns on.
-    emulator
-        .ok("PutWebhook", &json!({"webhook": definition("s3-hook", "S3")}))
-        .await;
-    for operation in [REGISTER, DEREGISTER] {
-        let (status, code) = emulator
-            .expect_error(operation, &json!({"webhookName": "s3-hook"}))
-            .await;
-        assert_eq!(
-            (status, code.as_str()),
-            (REFUSAL_STATUS, "ValidationException"),
-            "{operation}: a webhook targeting an action type it does not serve is \
-             refused as the model declares"
-        );
+    // (authentication, whether the operations serve a webhook carrying it)
+    let authentications = [
+        (AUTHENTICATION_GITHUB_HMAC, true),
+        (AUTHENTICATION_IP, false),
+        (AUTHENTICATION_UNAUTHENTICATED, false),
+    ];
+
+    for (authentication, served) in authentications {
+        for provider in ["GitHub", "S3"] {
+            let name = format!("hook-{}-{authentication}", provider.to_lowercase());
+            let case = format!("{authentication} targeting a {provider} action");
+            emulator
+                .ok(
+                    "PutWebhook",
+                    &json!({"webhook": definition(&name, provider, authentication)}),
+                )
+                .await;
+
+            for operation in [REGISTER, DEREGISTER] {
+                let (status, response) = emulator
+                    .call(operation, &json!({"webhookName": name}))
+                    .await;
+                if served {
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?} through {operation}: a webhook configured with \
+                         {AUTHENTICATION_GITHUB_HMAC} is served, got {status} with {response}"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    (
+                        status,
+                        response["__type"].as_str().unwrap_or_default().to_string()
+                    ),
+                    (REFUSAL_STATUS, "ValidationException".to_string()),
+                    "case {case:?} through {operation}: expected the refusal the model \
+                     declares, got {status} with {response}"
+                );
+                // The requirement and the authentication that blocked the call are what
+                // the message states, built from the request's own name and the stored
+                // webhook's authentication.
+                let expected = webhook_authentication_unsupported_message(&name, authentication);
+                assert_eq!(
+                    response["message"].as_str(),
+                    Some(expected.as_str()),
+                    "case {case:?} through {operation}: expected {expected:?}, got {response}"
+                );
+                // The wording itself, written out here so a reword of the handler's
+                // text fails this suite rather than following it.
+                assert_eq!(
+                    expected,
+                    format!(
+                        "Webhook {name} must be configured with GITHUB_HMAC authentication \
+                         type. Type is {authentication}."
+                    ),
+                    "case {case:?}: the refusal states the requirement AWS states"
+                );
+            }
+        }
     }
 
-    emulator
-        .ok(
-            "PutWebhook",
-            &json!({"webhook": definition("github-hook", "GitHub")}),
-        )
-        .await;
-    let (status, answer) = emulator
-        .call(DEREGISTER, &json!({"webhookName": "github-hook"}))
-        .await;
-    assert_eq!(
-        status, 200,
-        "the same call for a GitHub-targeted webhook is supported, got {status} with \
-         {answer}"
-    );
-
-    // A webhook whose target pipeline is gone targets no action type at all, so it is
-    // refused the same way rather than accepted.
+    // A webhook whose target pipeline is gone is served all the same: what the
+    // connection needs is the webhook's authentication, which deleting a pipeline does
+    // not change.
     emulator
         .ok("DeletePipeline", &json!({"name": pipeline_name("GitHub")}))
         .await;
     for operation in [REGISTER, DEREGISTER] {
-        let (status, code) = emulator
-            .expect_error(operation, &json!({"webhookName": "github-hook"}))
+        let (status, answer) = emulator
+            .call(
+                operation,
+                &json!({"webhookName": format!("hook-github-{AUTHENTICATION_GITHUB_HMAC}")}),
+            )
             .await;
         assert_eq!(
-            (status, code.as_str()),
-            (REFUSAL_STATUS, "ValidationException"),
-            "{operation}: a webhook whose target action cannot be read targets no \
-             supported action type"
+            status, 200,
+            "{operation}: a stored GITHUB_HMAC webhook is served whatever became of its \
+             target pipeline, got {status} with {answer}"
         );
     }
 }

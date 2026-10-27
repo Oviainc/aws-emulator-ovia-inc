@@ -2282,6 +2282,19 @@ pub fn export_not_allowed_message(certificate_arn: &str) -> String {
     format!("Export not allowed for certificate {certificate_arn}")
 }
 
+/// The `ValidationException` message `ExportCertificate` answers for a certificate
+/// export was never allowed for, built from the ARN the request asked for.
+///
+/// `ValidationException` carries one modelled member (`message: String`) and the model
+/// documents no text for it, so the sentence comes from ACM's recorded behaviour for
+/// this error class: `Certificate ARN: ` and the requested ARN, followed by ` is not an
+/// export enabled certificate`. It is the export surface's own sentence, distinct from
+/// the one [`export_not_allowed_message`] renders for an operation that requires a
+/// certificate to have BEEN exported.
+pub fn not_export_enabled_message(certificate_arn: &str) -> String {
+    format!("Certificate ARN: {certificate_arn} is not an export enabled certificate")
+}
+
 /// A wall-clock instant as the modelled `TStamp`.
 pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at
