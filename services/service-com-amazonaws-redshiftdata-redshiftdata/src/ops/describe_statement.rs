@@ -6,8 +6,9 @@
 //! statement of a batch, whose record reports the batch's `Id` — the suffix is the
 //! address that reaches it, not the identity of the submission it belongs to. A
 //! reporting operation, so the only thing it
-//! writes is the status transition the clock has already made due — the move out of
-//! `SUBMITTED` that was owed at a given instant whether or not anyone called.
+//! writes is the outcome the statement's execution has already reported — the move
+//! out of `SUBMITTED` that happened when that execution finished, whether or not
+//! anyone called.
 //!
 //! ## Shape of an operation
 //!
