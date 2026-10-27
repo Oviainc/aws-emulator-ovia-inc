@@ -6,9 +6,9 @@
 //! automation rule, of an automation event and of a recommended action, the
 //! enrollment configuration and the service-wide enrollment pre-check every
 //! action goes through, the client-token (idempotency) ledger, and the pure
-//! helpers that mint a rule id, build an opaque page token, bound a queried time
-//! range and decide whether a rule, an event or a recommended action matches a
-//! list filter. Handlers live in `src/ops/`, one file per operation, and build
+//! helpers that mint a rule id, build an opaque page token, size one page of a
+//! paginated listing, bound a queried time range and decide whether a rule, an
+//! event or a recommended action matches a list filter. Handlers live in `src/ops/`, one file per operation, and build
 //! their own output shapes from what they read back out of here.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -110,9 +110,15 @@ pub const MAX_ACCOUNT_IDS_PER_REQUEST: usize = 50;
 pub const MAX_ENROLLED_ACCOUNTS: usize = 1_000;
 
 /// The page size a paginated list uses when the caller sends no `maxResults`.
-/// The model bounds every `maxResults` member at `range(min: 1, max: 100)`
-/// (`ListAutomationRules`, `ListAutomationRulePreview`, …), so the largest page
-/// a caller may ask for is also the default.
+///
+/// Most of this service's `maxResults` members are bounded at
+/// `range(min: 1, max: 100)` (`ListAutomationRules`,
+/// `ListAutomationRulePreview`, …), so for those the largest page a caller may
+/// ask for is also the default; `ListAccounts` is bounded at
+/// `range(min: 1, max: 1000)`
+/// (`smithy_query(query="operation",operation="ListAccounts")`), so there a
+/// caller may ask for a larger page than the default. Reach it through
+/// [`page_size`], which is where the default is taken.
 pub const DEFAULT_MAX_RESULTS: i32 = 100;
 
 /// The number of characters in a minted id. `RuleId`, `EventId` and
@@ -3490,6 +3496,22 @@ pub fn decode_page_token(token: &str) -> Option<PageCursor> {
         offset: offset.parse().ok()?,
         filter_fingerprint: fingerprint.to_string(),
     })
+}
+
+/// How many items one page of a paginated listing serves, from the caller's
+/// `maxResults`.
+///
+/// One rule for every paginated operation of this service: a caller that sends
+/// no `maxResults` gets [`DEFAULT_MAX_RESULTS`], and the size is floored at one,
+/// because a zero page would return nothing while still carrying a token whose
+/// offset never advances, so a walk would never terminate. Nothing is bounded
+/// above here: each operation's own `maxResults` `@range` is enforced by the
+/// generated request walk BEFORE its handler runs, so only the values that range
+/// admits ever reach this.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    usize::try_from(max_results.unwrap_or(DEFAULT_MAX_RESULTS))
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
