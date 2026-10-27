@@ -35,18 +35,18 @@ use crate::cloudformation_provisions_stack_resources::{outputs_of, xml_text, xml
 
 /// The region every request here is signed for, and so the region the stack's resources
 /// and their endpoints belong to.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT_ID: &str = "000000000000";
 
 /// Long enough for the stack's own clock-owed span (`STATUS_TRANSITION_DELAY`, 500 ms) to
 /// come due.
-const PAST_THE_STACK: Duration = Duration::from_millis(1_200);
+pub(crate) const PAST_THE_STACK: Duration = Duration::from_millis(1_200);
 
 /// The emulator with the two services this suite exercises, mounted on ONE engine exactly
 /// as `core/router/src/lib.rs` mounts them.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -72,7 +72,7 @@ fn authorization(service: &str) -> String {
 }
 
 /// Call one CloudFormation operation over its awsQuery wire.
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     action: &str,
     members: &[(&str, &str)],
@@ -100,7 +100,7 @@ async fn cloudformation(
 
 /// Call one API Gateway v2 operation over its restJson1 wire: this service signs as
 /// `apigateway` and binds every operation under `/v2/…`.
-async fn apigatewayv2(
+pub(crate) async fn apigatewayv2(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -125,7 +125,7 @@ async fn apigatewayv2(
 }
 
 /// Create a stack from `template` and answer its id.
-async fn create_stack(
+pub(crate) async fn create_stack(
     router: &MultiServiceRouter,
     case: &str,
     stack_name: &str,
@@ -145,7 +145,11 @@ async fn create_stack(
 }
 
 /// The one stack `stack_name` names, as the response body.
-async fn describe_stack(router: &MultiServiceRouter, case: &str, stack_name: &str) -> String {
+pub(crate) async fn describe_stack(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack_name: &str,
+) -> String {
     let (status, body) =
         cloudformation(router, "DescribeStacks", &[("StackName", stack_name)]).await;
     assert_eq!(
@@ -156,7 +160,7 @@ async fn describe_stack(router: &MultiServiceRouter, case: &str, stack_name: &st
 }
 
 /// A string member of an answered document.
-fn member(case: &str, body: &Value, name: &str) -> String {
+pub(crate) fn member(case: &str, body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: expected a {name} in {body}"))
@@ -360,7 +364,7 @@ fn expected_scheme(protocol_type: &str) -> &'static str {
 /// Every output of a `DescribeStacks` answer carries BOTH its key and its value: an entry
 /// with a key and no value is what makes a stack's outputs unreadable, so the two lists
 /// are compared before anything is read out of them.
-fn every_output_has_a_value(case: &str, body: &str) -> BTreeMap<String, String> {
+pub(crate) fn every_output_has_a_value(case: &str, body: &str) -> BTreeMap<String, String> {
     let keys = xml_texts(body, "OutputKey");
     let values = xml_texts(body, "OutputValue");
     assert_eq!(

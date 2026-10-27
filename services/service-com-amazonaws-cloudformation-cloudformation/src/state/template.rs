@@ -4091,9 +4091,15 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// An API Gateway v2 api and an api mapping are two more: `CreateApi` and
 /// `CreateApiMapping` take no identifier and answer the `ApiId` / `ApiMappingId` that
 /// service assigned, and each type's `Ref` returns that id — the `Name` an api declares is
-/// only what the api is called, and a mapping declares no name at all. (A custom
-/// `AWS::ApiGatewayV2::DomainName` is NOT one of them: its identifier is the domain name
-/// the template states.)
+/// only what the api is called, and a mapping declares no name at all. The integration, the
+/// route, the deployment and the authorizer of an api are in exactly that position
+/// ([`APIGATEWAYV2_INTEGRATION`] and its siblings): each create answers the id that service
+/// minted, which is what the type's `Ref` returns and what the api's other resources name it
+/// by — a route's `Target` names its integration as `integrations/<IntegrationId>` and its
+/// `AuthorizerId` names an authorizer by the minted id, and no name could stand in for
+/// either. (A custom `AWS::ApiGatewayV2::DomainName` is NOT one of them: its identifier is
+/// the domain name the template states; nor is an `AWS::ApiGatewayV2::Stage`, whose
+/// identifier is the stage name it states.)
 ///
 /// An AWS Transfer Family server is one more: `CreateServer` takes no identifier and
 /// answers the `ServerId` it assigned, and that type's `Ref` returns the server's ARN,
@@ -4117,6 +4123,10 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == APIGATEWAYV2_API
         || resource_type == APIGATEWAYV2_API_MAPPING
+        || resource_type == APIGATEWAYV2_INTEGRATION
+        || resource_type == APIGATEWAYV2_ROUTE
+        || resource_type == APIGATEWAYV2_DEPLOYMENT
+        || resource_type == APIGATEWAYV2_AUTHORIZER
         // An Amazon SNS subscription's identity is the ARN `Subscribe` answers with: it
         // carries an id SNS mints per subscription, which no naming rule could compute.
         || resource_type == SNS_SUBSCRIPTION
@@ -4656,6 +4666,24 @@ pub const APIGATEWAY_DEPLOYMENT: &str = "AWS::ApiGateway::Deployment";
 pub const APIGATEWAYV2_API: &str = "AWS::ApiGatewayV2::Api";
 pub const APIGATEWAYV2_API_MAPPING: &str = "AWS::ApiGatewayV2::ApiMapping";
 pub const APIGATEWAYV2_DOMAIN_NAME: &str = "AWS::ApiGatewayV2::DomainName";
+
+/// The Amazon API Gateway v2 resource types whose resources live INSIDE an api — the ones a
+/// stack declares to make the api it deployed serve anything at all.
+///
+/// `AWS::ApiGatewayV2::Integration`: "Ref returns the integration ID",
+/// `AWS::ApiGatewayV2::Route`: "Ref returns the route ID",
+/// `AWS::ApiGatewayV2::Deployment`: "Ref returns the deployment ID" and
+/// `AWS::ApiGatewayV2::Authorizer`: "Ref returns the authorizer ID" — each of those ids is
+/// MINTED by API Gateway v2 (its create takes no identifier and answers the one it
+/// assigned), which is why [`identity_is_service_assigned`] names all four.
+///
+/// `AWS::ApiGatewayV2::Stage` is not one of them: "Ref returns the stage name", the name the
+/// template states, which is this type's own identifier.
+pub const APIGATEWAYV2_INTEGRATION: &str = "AWS::ApiGatewayV2::Integration";
+pub const APIGATEWAYV2_ROUTE: &str = "AWS::ApiGatewayV2::Route";
+pub const APIGATEWAYV2_STAGE: &str = "AWS::ApiGatewayV2::Stage";
+pub const APIGATEWAYV2_DEPLOYMENT: &str = "AWS::ApiGatewayV2::Deployment";
+pub const APIGATEWAYV2_AUTHORIZER: &str = "AWS::ApiGatewayV2::Authorizer";
 
 /// How many characters follow the `E` of a CloudFront-assigned identifier.
 ///
