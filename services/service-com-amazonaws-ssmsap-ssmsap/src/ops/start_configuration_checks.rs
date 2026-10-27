@@ -11,6 +11,11 @@
 //! results of the rules its catalogue entry names
 //! ([`crate::state::ConfigurationCheckEntry::evaluate`]).
 //!
+//! Starting checks is a control call on the application, so it is refused with
+//! `ConflictException` while an operation is already under way on that application —
+//! either a check of the same kind still running, or a change the clock still owes the
+//! application itself, exactly as the other control calls of this service refuse it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -157,11 +162,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         state.settle(now);
 
-        let Some(application_id) = state
+        let Some(application) = state
             .region(&region)
             .applications
             .get(&input.application_id)
-            .map(|application| application.id.clone())
+            .cloned()
         else {
             return Err(
                 StartConfigurationChecksErrorModeled::ResourceNotFoundException(
@@ -172,6 +177,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        let application_id = application.id.clone();
+
+        // A change the clock still owes this application is an operation already under
+        // way on it, which is what `ConflictException` reports — so no run is filed
+        // against an application whose own state is still moving, and in particular none
+        // against one whose deregistration is in flight, whose records would stop
+        // existing the instant the removal falls due.
+        if application.pending.is_some() {
+            return Err(StartConfigurationChecksErrorModeled::ConflictException(
+                crate::state::conflict(format!(
+                    "Application {} has an operation in progress and configuration checks \
+                     cannot be started until that operation completes",
+                    application.id
+                )),
+            )
+            .into());
+        }
 
         // How many checks one request may name, re-stated in this crate before the
         // checks are resolved or any record is filed, so the work this request causes is
