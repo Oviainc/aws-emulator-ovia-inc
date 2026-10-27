@@ -17,6 +17,7 @@ use crate::ops::types::{
     AccountRecoverySettingType, AccountTakeoverRiskConfigurationType, AcrLevelConfigType,
     AdminCreateUserConfigType,
     AnalyticsConfigurationType, AttributeType, AuthenticationResultType,
+    ClientAuthenticationResultType,
     CodeDeliveryDetailsType, CompromisedCredentialsRiskConfigurationType, CustomDomainConfigType,
     DeviceConfigurationType, DeviceSecretVerifierConfigType, DeviceType, DomainDescriptionType,
     EmailConfigurationType, EmailMfaConfigType, GroupType, IdentityProviderType,
@@ -161,6 +162,22 @@ pub fn exclusive_auth_flow_violation(flows: &[String]) -> Option<&'static str> {
 pub fn auth_flow_not_enabled_message(auth_flow: &str) -> String {
     format!("{auth_flow} flow not enabled for this client")
 }
+
+/// The scope an access token has to carry to authorize the user self-service
+/// operations: each one is authorized "with a signed-in user's access token. It
+/// must include the scope `aws.cognito.signin.user.admin`" (`GetUser`,
+/// `UpdateUserAttributes` and the rest of the self-service surface in this
+/// service's model), and `CreateUserPoolClient.AllowedOAuthScopes` names it as
+/// "the `aws.cognito.signin.user.admin` scope" that "authorizes user
+/// self-service operations".
+pub const USER_ADMIN_SCOPE: &str = "aws.cognito.signin.user.admin";
+
+/// The message a self-service operation owes a live access token whose scopes do
+/// not authorize it ([`TokenRejection::MissingRequiredScopes`]). It names no
+/// value from the request, so every such refusal carries this one sentence, and
+/// every operation that checks a token's scopes reads it here so the two cannot
+/// disagree.
+pub const MISSING_REQUIRED_SCOPES_MESSAGE: &str = "Access Token does not have required scopes";
 
 /// `UserPoolTierType` defaults to `ESSENTIALS` (`CreateUserPool.UserPoolTier`).
 const DEFAULT_USER_POOL_TIER: &str = "ESSENTIALS";
@@ -814,6 +831,14 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// access token answers — an id or refresh token names its user too, but it
     /// is not the token the member asks for.
     ///
+    /// An access token the pool issued is then checked against what it
+    /// AUTHORIZES: each of these operations "must include the scope
+    /// `aws.cognito.signin.user.admin`" (this service's model), so a live access
+    /// token whose scopes do not carry it — the machine-to-machine token of an
+    /// app client, whose scopes authorize resource servers — is told apart from a
+    /// value that resolves to no access token at all
+    /// ([`TokenRecord::authorizes_user_self_service`]).
+    ///
     /// A PURE read: a token the clock has already expired is refused where it
     /// stands rather than swept, so asking changes nothing a later caller sees.
     pub fn signed_in_user(
@@ -825,11 +850,17 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
             .issued_tokens
             .get(access_token)
             .ok_or(TokenRejection::NotAnAccessToken)?;
-        if record.kind != TokenKind::Access || record.revoked {
+        if !record.is_access_token() || record.revoked {
             return Err(TokenRejection::NotAnAccessToken);
         }
         if record.expires_at <= now {
             return Err(TokenRejection::Expired);
+        }
+        // A live access token still has to AUTHORIZE this half of the API: one
+        // whose scopes do not include the self-service scope identifies no
+        // signed-in user here, whoever it was issued to.
+        if !record.authorizes_user_self_service() {
+            return Err(TokenRejection::MissingRequiredScopes);
         }
         let pool = self
             .pool(&record.user_pool_id)
@@ -891,6 +922,106 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         self.mint_tokens(user_pool_id, client_id, username, now, false)
     }
 
+    /// Issue the machine-to-machine access token of the app client `client_id`
+    /// in `user_pool_id`, carrying `scopes`, record it, and return the modelled
+    /// result.
+    ///
+    /// "Issues an access token for machine-to-machine (M2M) authorization. Your
+    /// app client provides its client ID and secret, and receives an access
+    /// token that authorizes requests to your resource servers"
+    /// (`GetClientToken` in this service's model): the token is issued to the
+    /// APP CLIENT, so its subject is that client's id, it carries no user claim
+    /// and no id or refresh token is minted beside it. Its lifetime is the app
+    /// client's own configured access-token validity — the same setting that
+    /// bounds every other access token this client issues — and it is signed
+    /// with the POOL's key pair and names that key by `kid`, so a resource
+    /// server verifies it against the key set that pool publishes.
+    ///
+    /// `None` when the pool or the app client is gone, or when the signature
+    /// could not be computed — never a token nothing signed.
+    ///
+    /// Tokens the clock has already expired are swept first, and the oldest are
+    /// evicted if the store is still at [`MAX_ISSUED_TOKENS`], exactly as a
+    /// sign-in's are.
+    pub fn issue_client_token(
+        &mut self,
+        user_pool_id: &str,
+        client_id: &str,
+        scopes: &[String],
+        now: SystemTime,
+    ) -> Option<ClientAuthenticationResultType> {
+        let (issuer, signing_key, access_ttl) = {
+            let pool = self.user_pools.get(user_pool_id)?;
+            let client = pool.clients.get(client_id)?;
+            (
+                pool.issuer(),
+                pool.signing_key.clone(),
+                client.access_token_ttl(),
+            )
+        };
+
+        let issued_at = unix_seconds(now);
+        // The expiry is derived from the app client's configured validity, which
+        // a caller chose, so both sums are CHECKED and computed before anything
+        // is stored: a validity whose expiry cannot be represented issues no
+        // token at all rather than storing half a record.
+        let expires_at = now.checked_add(access_ttl)?;
+        let exp = expiry_claim(issued_at, access_ttl)?;
+        let claims = serde_json::json!({
+            "sub": client_id,
+            "iss": issuer,
+            "client_id": client_id,
+            "token_use": "access",
+            // An access token's granted scopes are carried as "a list of
+            // space-delimited, case-sensitive strings" (RFC 6749 §3.3), in the
+            // order the grant authorized them.
+            "scope": scopes.join(" "),
+            "iat": issued_at,
+            "exp": exp,
+            "jti": new_uuid(),
+        });
+        let access_token = signed_jws(&claims, &signing_key)?;
+
+        self.issued_tokens
+            .retain(|_, record| record.expires_at > now);
+        evict_oldest_until(
+            &mut self.issued_tokens,
+            MAX_ISSUED_TOKENS.saturating_sub(1),
+            |record| record.expires_at,
+        );
+        self.issued_tokens.insert(
+            access_token.clone(),
+            TokenRecord {
+                user_pool_id: user_pool_id.to_string(),
+                client_id: client_id.to_string(),
+                // Issued to the app client, not to a user: the record names the
+                // client as its subject and no user at all.
+                username: String::new(),
+                sub: client_id.to_string(),
+                kind: TokenKind::ClientCredentials,
+                // The scopes this grant authorized, which are what the token's
+                // `scope` claim above carries.
+                scopes: scopes.to_vec(),
+                issued_at: now,
+                expires_at,
+                revoked: false,
+                rotated_out_at: None,
+            },
+        );
+
+        Some(ClientAuthenticationResultType {
+            access_token: Some(access_token),
+            // "The number of seconds until the access token expires"
+            // (`ClientAuthenticationResultType.ExpiresIn` in this service's
+            // model).
+            expires_in: i32::try_from(access_ttl.as_secs()).unwrap_or(i32::MAX),
+            // "The type of the token. For example, `Bearer`"
+            // (`ClientAuthenticationResultType.TokenType`), which is the type a
+            // bearer access token of this API is presented as.
+            token_type: Some("Bearer".to_string()),
+        })
+    }
+
     /// The one token-minting path behind [`issue_tokens`] and [`refresh_tokens`]:
     /// `with_refresh_token` decides whether a refresh token is minted beside the access
     /// and id tokens, so the two entry points cannot disagree about a claim.
@@ -947,13 +1078,17 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         let access_exp = expiry_claim(issued_at, access_ttl)?;
         let id_exp = expiry_claim(issued_at, id_ttl)?;
 
+        // An access token of a sign-in authorizes the user self-service
+        // operations, so it carries the one scope those operations require, and
+        // the claim and the record read it from the same place.
+        let access_scopes = vec![USER_ADMIN_SCOPE.to_string()];
         let mut access_claims = serde_json::json!({
             "sub": sub,
             "iss": issuer,
             "client_id": client_id,
             "username": stored_username,
             "token_use": "access",
-            "scope": "aws.cognito.signin.user.admin",
+            "scope": access_scopes.join(" "),
             "auth_time": issued_at,
             "iat": issued_at,
             "exp": access_exp,
@@ -1055,6 +1190,12 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                     username: stored_username.clone(),
                     sub: sub.clone(),
                     kind,
+                    // Only the access token of the triple carries a `scope`
+                    // claim, so only its record holds scopes.
+                    scopes: match kind {
+                        TokenKind::Access => access_scopes.clone(),
+                        _ => Vec::new(),
+                    },
                     issued_at: now,
                     expires_at,
                     revoked: false,
@@ -1919,6 +2060,30 @@ impl UserPool {
             .and_then(Option::take)
     }
 
+    /// Whether `scope` is a custom scope of a resource server of this pool.
+    ///
+    /// "Amazon Cognito represents scopes in the access token in the format
+    /// `$resource-server-identifier/$scope`" (`CreateResourceServer.Identifier`
+    /// in this service's model), so a scope value names the stored resource
+    /// server and one of ITS scope names. The value is matched against the
+    /// STORED identifier and then against that server's own scope names, rather
+    /// than split on the separator, because a resource server identifier may
+    /// itself carry one.
+    pub fn defines_scope(&self, scope: &str) -> bool {
+        self.resource_servers.values().any(|server| {
+            let Some(name) = scope
+                .strip_prefix(server.identifier.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+            else {
+                return false;
+            };
+            server
+                .scopes
+                .iter()
+                .any(|defined| defined.scope_name == name)
+        })
+    }
+
     /// This pool's terms documents that app client `client_id` holds under
     /// `terms_name`, or `None` when the client holds none of that name.
     ///
@@ -2515,6 +2680,16 @@ impl UserPoolClient {
     /// Whether `AuthFlow=USER_AUTH` is enabled for this client.
     pub fn allows_user_auth(&self) -> bool {
         self.allows_any_of(&USER_AUTH_FLOWS)
+    }
+
+    /// Whether this app client's stored `ExplicitAuthFlows` enable
+    /// machine-to-machine authorization: "to use this operation, you must
+    /// configure the app client with a client secret and enable the
+    /// `ALLOW_CLIENT_TOKEN_AUTH` authentication flow" (`GetClientToken` in this
+    /// service's model). The client secret is the other half of that
+    /// configuration, and it is what authenticates the request.
+    pub fn allows_client_token_auth(&self) -> bool {
+        self.allows_any_of(&[CLIENT_TOKEN_AUTH_FLOW])
     }
 
     /// Whether this client's stored `ExplicitAuthFlows` carry any of `flows`.
@@ -3551,6 +3726,9 @@ pub enum TokenRejection {
     NotAnAccessToken,
     /// An access token whose lifetime the clock is past.
     Expired,
+    /// A live access token whose scopes do not authorize the user self-service
+    /// operations ([`TokenRecord::authorizes_user_self_service`]).
+    MissingRequiredScopes,
     /// The token names a user pool this emulator no longer holds.
     PoolGone,
     /// The token names a user its pool no longer holds.
@@ -4391,12 +4569,20 @@ pub enum SessionLookup {
     Unknown,
 }
 
-/// Which token of the triple a [`TokenRecord`] records.
+/// Which token a [`TokenRecord`] records: one of a sign-in's triple, or the
+/// machine-to-machine token an app client gets for itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     Access,
     Id,
     Refresh,
+    /// An access token issued to an APP CLIENT rather than to a user, "for
+    /// machine-to-machine (M2M) authorization" (`GetClientToken` in this
+    /// service's model). It "authorizes requests to your resource servers", so
+    /// it is not the access token "that Amazon Cognito issued to the currently
+    /// signed-in user" the self-service operations ask for, and the record of
+    /// it names no user.
+    ClientCredentials,
 }
 
 /// One issued token, so a later operation can resolve it back to its user.
@@ -4404,13 +4590,24 @@ pub enum TokenKind {
 pub struct TokenRecord {
     pub user_pool_id: String,
     pub client_id: String,
+    /// The user this token was issued to, and EMPTY for a token that was issued
+    /// to the app client itself ([`TokenKind::ClientCredentials`]), which names
+    /// no user: a username is at least one character long, so no user-scoped
+    /// lookup or revocation matches such a record.
     pub username: String,
     /// The `sub` claim this token carries: the immutable id of the user it was
     /// issued to. A user created later under the same username is a different
     /// user with a different id, so recording the id beside the name is what
-    /// keeps a token of a deleted user from resolving to its namesake.
+    /// keeps a token of a deleted user from resolving to its namesake. A
+    /// [`TokenKind::ClientCredentials`] token is issued to the app client
+    /// itself, so its subject is that client's id.
     pub sub: String,
     pub kind: TokenKind,
+    /// The scopes this token's `scope` claim carries, in the order it carries
+    /// them: the self-service scope for an access token of a sign-in, and the
+    /// scopes the grant authorized for a client-credentials one. An id or
+    /// refresh token carries no `scope` claim, so it holds none.
+    pub scopes: Vec<String>,
     pub issued_at: SystemTime,
     pub expires_at: SystemTime,
     pub revoked: bool,
@@ -4423,6 +4620,26 @@ pub struct TokenRecord {
 }
 
 impl TokenRecord {
+    /// Whether this record is of an ACCESS token: the one a sign-in issued to a
+    /// user, or the one a client-credentials grant issued to an app client. Both
+    /// state `token_use` `access`; an id or refresh token does not.
+    pub fn is_access_token(&self) -> bool {
+        matches!(self.kind, TokenKind::Access | TokenKind::ClientCredentials)
+    }
+
+    /// Whether this token authorizes the user self-service operations: it has to
+    /// be an access token a USER's sign-in issued, carrying the
+    /// [`USER_ADMIN_SCOPE`] those operations require.
+    ///
+    /// A client-credentials token authorizes "requests to your resource servers"
+    /// (`GetClientToken` in this service's model) and identifies an app client
+    /// rather than a signed-in user, so it authorizes none of them whatever its
+    /// granted scopes are.
+    pub fn authorizes_user_self_service(&self) -> bool {
+        self.kind == TokenKind::Access
+            && self.scopes.iter().any(|scope| scope == USER_ADMIN_SCOPE)
+    }
+
     /// Whether refresh token rotation has already invalidated this token as of
     /// `now`: a rotation recorded the instant it stops being accepted, and up to
     /// that instant it still authorizes a retry.

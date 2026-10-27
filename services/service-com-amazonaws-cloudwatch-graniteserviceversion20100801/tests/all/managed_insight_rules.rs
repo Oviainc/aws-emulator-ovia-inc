@@ -17,8 +17,17 @@
 //! resource —, whether the request carries tags, how many templates one resource has enabled,
 //! and how many rules a page holds), so the happy path is one row among many rather than the
 //! specification.
+//!
+//! Each row publishes the template it enables into the account's managed-rule catalog first: a
+//! caller names a template the service publishes ("as returned by `ListManagedInsightRules`",
+//! `ManagedRule$TemplateName`), so what a caller may enable is set up through the store, the way
+//! the service sets it up. Which templates may be named, and what the operation answers for one
+//! it cannot find, is `managed_insight_rule_catalog.rs`.
 
-use crate::harness::{build_router, call, error_code, error_message, ok};
+use crate::harness::{
+    build_router, build_router_with_engine, call, error_code, error_message, ok,
+    publish_managed_rule_template,
+};
 use serde_json::{json, Value};
 
 /// The `Schema` a managed rule carries: "For managed rules, this is `{"Name":
@@ -123,8 +132,11 @@ async fn every_enabled_managed_rule_is_reported_for_its_own_resource() {
         for (template_case, template, tags) in &templates {
             let case = format!("{resource_case} / {template_case}");
             // A fresh emulator per row, so the row's own call is the only thing that could
-            // have enabled a rule.
-            let router = build_router();
+            // have enabled a rule, with the row's template published for the row's resource:
+            // a caller may only enable a template the service publishes
+            // (`ManagedRule$TemplateName`).
+            let (router, engine) = build_router_with_engine();
+            publish_managed_rule_template(&engine, template, resource_arn);
 
             let put = ok(
                 &router,
@@ -199,17 +211,28 @@ async fn every_enabled_managed_rule_is_reported_for_its_own_resource() {
                 "case {case:?}: expected the described rule enabled, got {described}"
             );
 
-            // Another resource holds none of it, and reading twice reports the same thing.
+            // Another resource holds no RULE of it: the row's template is published for the
+            // vendor and resource type of the row's resource, so it is available for the other
+            // DynamoDB table exactly when the row's resource is a DynamoDB table too — and
+            // there it carries neither a resource nor a rule state, because nothing enabled it.
             let other = ok(
                 &router,
                 "ListManagedInsightRules",
                 &json!({"ResourceARN": "arn:aws:dynamodb:us-east-1:123456789012:table/Other"}),
             )
             .await;
+            let available_for_other: Vec<Value> = if resource_arn.starts_with("arn:aws:dynamodb:")
+                && resource_arn.contains(":table/")
+            {
+                vec![json!({"TemplateName": template})]
+            } else {
+                Vec::new()
+            };
             assert_eq!(
-                descriptions(&other).len(),
-                0,
-                "case {case:?}: a resource no rule was enabled for must report none, got {other}"
+                descriptions(&other),
+                available_for_other,
+                "case {case:?}: a resource no rule was enabled for must report only the \
+                 templates available for it, with no rule state, got {other}"
             );
             let again = ok(
                 &router,
@@ -244,7 +267,10 @@ async fn several_templates_on_one_resource_are_reported_by_template_name() {
     ];
 
     for (case, templates) in &cases {
-        let router = build_router();
+        let (router, engine) = build_router_with_engine();
+        for template in templates {
+            publish_managed_rule_template(&engine, template, resource);
+        }
         let rules: Vec<Value> = templates
             .iter()
             .map(|template| managed_rule(template, resource, None))
@@ -283,7 +309,8 @@ async fn several_templates_on_one_resource_are_reported_by_template_name() {
 #[tokio::test]
 async fn enabling_the_same_template_again_names_the_same_rule() {
     let resource = "arn:aws:dynamodb:us-east-1:123456789012:table/Orders";
-    let router = build_router();
+    let (router, engine) = build_router_with_engine();
+    publish_managed_rule_template(&engine, "Rule-A", resource);
 
     let first = ok(
         &router,
@@ -350,7 +377,10 @@ async fn a_page_holds_at_most_max_results_rules_and_the_token_continues_it() {
     ];
 
     for (case, rule_count, max_results) in &cases {
-        let router = build_router();
+        let (router, engine) = build_router_with_engine();
+        for index in 0..*rule_count {
+            publish_managed_rule_template(&engine, &format!("Rule-{index:02}"), resource);
+        }
         let rules: Vec<Value> = (0..*rule_count)
             .map(|index| managed_rule(&format!("Rule-{index:02}"), resource, None))
             .collect();
@@ -411,7 +441,8 @@ async fn a_page_holds_at_most_max_results_rules_and_the_token_continues_it() {
 #[tokio::test]
 async fn a_next_token_this_service_did_not_issue_is_refused() {
     let resource = "arn:aws:dynamodb:us-east-1:123456789012:table/Orders";
-    let router = build_router();
+    let (router, engine) = build_router_with_engine();
+    publish_managed_rule_template(&engine, "Rule-A", resource);
     ok(
         &router,
         "PutManagedInsightRules",
@@ -555,7 +586,9 @@ async fn more_tags_than_a_rule_may_carry_are_refused() {
             .collect()
     };
 
-    let router = build_router();
+    let (router, engine) = build_router_with_engine();
+    publish_managed_rule_template(&engine, "Rule-A", resource);
+    publish_managed_rule_template(&engine, "Rule-B", resource);
     let put = ok(
         &router,
         "PutManagedInsightRules",
@@ -585,13 +618,19 @@ async fn more_tags_than_a_rule_may_carry_are_refused() {
         &json!({"ResourceARN": resource}),
     )
     .await;
-    let reported: Vec<String> = descriptions(&listed)
+    let reported: Vec<(String, bool)> = descriptions(&listed)
         .iter()
-        .map(|description| member(description, "TemplateName"))
+        .map(|description| {
+            (
+                member(description, "TemplateName"),
+                description.get("RuleState").is_some(),
+            )
+        })
         .collect();
     assert_eq!(
         reported,
-        vec!["Rule-A".to_string()],
-        "case 51 tags: the refused request must have enabled nothing, got {listed}"
+        vec![("Rule-A".to_string(), true), ("Rule-B".to_string(), false)],
+        "case 51 tags: the refused request must have enabled nothing, leaving the published \
+         Rule-B merely available, got {listed}"
     );
 }

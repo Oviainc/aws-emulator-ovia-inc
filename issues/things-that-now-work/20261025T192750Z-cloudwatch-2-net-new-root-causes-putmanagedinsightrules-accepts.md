@@ -10,6 +10,39 @@ Issue-Commit: 8c118d1d43e9fad6226f410894186130d2b1ac53
 
 > _Note: this issue was identified against the code base at commit `8c118d1d43e9fad6226f410894186130d2b1ac53`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+Cause 1 of 2 — FIXED. `PutManagedInsightRules` now resolves every `ManagedRule` entry's
+`TemplateName` against the account's managed-rule catalog (`managed_rule_templates` in
+`services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/src/state.rs`, the same
+catalog `ListManagedInsightRules` reports from) and reports an entry naming no published template
+back on the HTTP 200 as one `PartialFailure` — the submitted template name as `FailureResource`,
+`ExceptionType` `ResourceNotFoundException`, `FailureCode` `TEMPLATE_NAME`, `FailureDescription`
+"Could not find template with the specified templateName." — while enabling only the entries that
+resolve. Covered end to end by `tests/all/managed_insight_rule_catalog.rs`.
+
+Cause 2 of 2 — NOT fixed, and SPLIT OUT so its record stays filed where work that does not work
+yet is tracked: `issues/things-that-do-not-work/20261027T120000Z-lambda-cloudwatch-aws-lambda-concurrency-metering-is-never-published.md`
+carries this cause, its Issue-Trace-Id and its Issue-Key verbatim, so nothing about it is closed by
+this report. It is a lambda-side cause with a platform blocker in front of it. Every observable it
+reads — `ConcurrentExecutions` for the reserved function across its 4-way burst, `Invocations`, the
+absence of `Throttles`, and `UnreservedConcurrentExecutions` tracking the unreserved function's
+burst — exists only if three python3.12 deployment packages actually run, concurrently, for ten
+seconds. In this checkout `lambda` `Invoke(RequestResponse)` cannot run a deployment package at all:
+`services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/invoke.rs:521` refuses it with
+`NotImplemented` because that crate carries no in-process interpreter (its `src/` holds only
+`lib.rs`, `scaffolded.rs`, `service.rs`, `state.rs`), which is tracked by the open issue
+`20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md`. Publishing
+those datapoints with no run behind them would be metering for work nothing performed, so none was
+published and nothing in the lambda crate was changed. The prerequisite this cause hypothesised is
+already not the stall: `PutProvisionedConcurrencyConfig` stores the allocation `IN_PROGRESS` with a
+due instant and `GetProvisionedConcurrencyConfig` materialises the move to `READY`
+(`src/ops/put_provisioned_concurrency_config.rs`, `src/ops/get_provisioned_concurrency_config.rs`),
+covered by that crate's `tests/all/provisioned_concurrency.rs` and
+`tests/all/provisioned_concurrency_resolution.rs`. The cause's replay key
+(`cloudwatch__lambda.obs-lambda-1-…|_poll_until#24|Timeout`) therefore still fails, and it reopens
+with the Lambda invocation runtime rather than with any CloudWatch work.
+
 ## Operation
 PutManagedInsightRules
 

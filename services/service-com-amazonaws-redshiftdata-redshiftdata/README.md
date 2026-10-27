@@ -42,6 +42,15 @@ rationale is recorded here so it is visible with the code rather than only in a 
   enabled feature of the dependency, so it is not reachable from this crate at all.
   `tests/all/statement_lifecycle.rs` asserts that statements which would reach the host
   are refused and that statements outside those bounds end FAILED.
+* **Where it runs.** A submission's execution belongs to the SUBMISSION, not to the
+  request that made it: the statement is recorded as `SUBMITTED` before anything runs,
+  its SQL runs on a blocking pool under the bounds above, and its outcome is written
+  back by the task that produced it — so a statement reaches a terminal status because
+  the engine stopped and never because a caller stopped waiting, and two statements
+  submitted at once are really concurrent. The statements of ONE database run one at a
+  time and in submission order (`QueueSlot`), which is what makes a transactional batch
+  a transaction and what serializes two submissions contending for the same row.
+  `tests/all/contended_transactions.rs` asserts it over a table of contention shapes.
 * **Alternatives considered.** A pure-Rust SQL engine would remove the native component,
   at the cost of a different SQL dialect and far less exercised code on the same
   untrusted-input path; the engine already linked by the workspace was preferred. If the

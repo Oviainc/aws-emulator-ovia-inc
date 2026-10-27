@@ -105,6 +105,8 @@ mod job_updates;
 mod jobs;
 #[path = "all/ml_transform_reads.rs"]
 mod ml_transform_reads;
+#[path = "all/ml_transform_updates.rs"]
+mod ml_transform_updates;
 #[path = "all/ml_transforms.rs"]
 mod ml_transforms;
 #[path = "all/partitions.rs"]

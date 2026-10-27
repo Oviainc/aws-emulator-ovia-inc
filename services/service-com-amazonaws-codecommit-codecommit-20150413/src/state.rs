@@ -2626,6 +2626,29 @@ impl PullRequestRecord {
         self.revision_id() == revision_id
     }
 
+    /// The names of the approval rules applied to this pull request, split into
+    /// the ones whose conditions its approvals MEET and the ones they do not, each
+    /// in the order the rules were applied.
+    ///
+    /// Each rule is read the one way this crate reads an approval rule document
+    /// ([`approval_rule_satisfied`]), and the split is made in this ONE place, so
+    /// the rules an evaluation of this pull request reports as met are exactly the
+    /// ones it does not report as unmet, and exactly the ones a merge is not
+    /// refused for.
+    pub fn approval_rules_by_condition(&self) -> (Vec<String>, Vec<String>) {
+        let approvers = self.approvers();
+        let mut satisfied = Vec::new();
+        let mut not_satisfied = Vec::new();
+        for rule in &self.approval_rules {
+            if approval_rule_satisfied(&rule.content, &approvers) {
+                satisfied.push(rule.approval_rule_name.clone());
+            } else {
+                not_satisfied.push(rule.approval_rule_name.clone());
+            }
+        }
+        (satisfied, not_satisfied)
+    }
+
     /// The names of the approval rules applied to this pull request whose
     /// conditions its approvals do not meet, in the order the rules were applied.
     ///
@@ -2633,12 +2656,7 @@ impl PullRequestRecord {
     /// ([`approval_rule_satisfied`]), so the rules a merge is refused for are the
     /// same ones an evaluation of this pull request reports.
     pub fn approval_rules_not_satisfied(&self) -> Vec<String> {
-        let approvers = self.approvers();
-        self.approval_rules
-            .iter()
-            .filter(|rule| !approval_rule_satisfied(&rule.content, &approvers))
-            .map(|rule| rule.approval_rule_name.clone())
-            .collect()
+        self.approval_rules_by_condition().1
     }
 
     /// Does every approval rule applied to this pull request state conditions its

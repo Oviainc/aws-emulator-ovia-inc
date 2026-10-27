@@ -193,7 +193,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.lens_arn_of(&input.lens_alias, &crate::state::request_region(ctx.parts()));
 
         // A question belongs to the LENS under review — the questions that lens's own
-        // content defines (`crate::state::...::lens_review_question`) — so a `QuestionId`
+        // content defines (`crate::state::...::lens_review_question`), as of the lens
+        // VERSION this review is against — so a `QuestionId`
         // that lens does not ask names no answer of this lens review to write, and every
         // question it DOES ask is answerable here. This is the lookup every READ of these
         // answers resolves through, so the questions a client just listed are exactly the
@@ -201,7 +202,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // content the SAME store holds, which the workload cannot be borrowed for writing
         // across; the refusal it produces is still raised below, after the resource the
         // question belongs to has been resolved.
-        let question = store.lens_review_question(&input.lens_alias, &input.question_id);
+        let pinned = store
+            .workloads
+            .get(&input.workload_id)
+            .and_then(|workload| workload.lens_review_version(&input.lens_alias))
+            .map(str::to_string);
+        let question = store.lens_review_question(
+            &input.lens_alias,
+            pinned.as_deref(),
+            &input.question_id,
+        );
 
         // The resource is resolved BEFORE the request's values are judged, so a request
         // that names a workload, a lens review or a question that does not exist is

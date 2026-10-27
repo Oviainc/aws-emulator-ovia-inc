@@ -11,8 +11,9 @@
 //! stream still serves reads and writes. It is served only for a stream in the provisioned
 //! capacity mode (`ValidationException` otherwise), only while that stream is `ACTIVE`
 //! (`ResourceInUseException` otherwise), and only inside the documented scaling limits:
-//! no more than double and no less than half the current count, and no more than ten
-//! changes per rolling 24-hour period per stream (`LimitExceededException` otherwise).
+//! no more than double and no less than half the current open count
+//! (`InvalidArgumentException` otherwise), and no more than ten changes per rolling 24-hour
+//! period per stream (`LimitExceededException` otherwise).
 //!
 //! The recorded flows this was derived from scale ONE stream once, double and then halve
 //! one stream, and scale an on-demand stream (which fails); each is one row of the tables
@@ -30,10 +31,10 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    stream_not_found_message, stream_on_demand_message, MAX_RESHARDS_PER_WINDOW,
-    MAX_SHARDS_PER_STREAM, RESHARD_DELAY, STREAM_ACTIVE, STREAM_IDENTIFIER_MISMATCH_MESSAGE,
-    STREAM_IDENTIFIER_REQUIRED_MESSAGE, STREAM_MODE_ON_DEMAND, STREAM_MODE_PROVISIONED,
-    STREAM_UPDATING,
+    scale_down_below_half_message, scale_up_over_double_message, stream_not_found_message,
+    stream_on_demand_message, MAX_RESHARDS_PER_WINDOW, MAX_SHARDS_PER_STREAM, RESHARD_DELAY,
+    STREAM_ACTIVE, STREAM_IDENTIFIER_MISMATCH_MESSAGE, STREAM_IDENTIFIER_REQUIRED_MESSAGE,
+    STREAM_MODE_ON_DEMAND, STREAM_MODE_PROVISIONED, STREAM_UPDATING,
 };
 
 use crate::stream_tags::{
@@ -46,7 +47,7 @@ const UNIFORM_SCALING: &str = "UNIFORM_SCALING";
 
 /// How long a case waits before treating a scaled stream as ready: past the instant the
 /// change armed the `UPDATING` -> `ACTIVE` transition for.
-fn past_reshard() -> Duration {
+pub(crate) fn past_reshard() -> Duration {
     RESHARD_DELAY + Duration::from_millis(400)
 }
 
@@ -61,7 +62,7 @@ fn scale_to(name: &str, target: u32) -> Value {
 
 /// The shard map `ListShards` reports for `name`, in map order. Every stream a case here
 /// holds fits in one page, so the listing never has to be followed.
-async fn shard_map(emulator: &Emulator, case: &str, name: &str) -> Vec<Value> {
+pub(crate) async fn shard_map(emulator: &Emulator, case: &str, name: &str) -> Vec<Value> {
     let listed = emulator
         .ok(case, "ListShards", &json!({ "StreamName": name }))
         .await;
@@ -73,7 +74,7 @@ async fn shard_map(emulator: &Emulator, case: &str, name: &str) -> Vec<Value> {
 }
 
 /// The `StreamStatus` and `OpenShardCount` `DescribeStreamSummary` reports for `name`.
-async fn summary(emulator: &Emulator, case: &str, name: &str) -> (String, u64) {
+pub(crate) async fn summary(emulator: &Emulator, case: &str, name: &str) -> (String, u64) {
     let described = emulator
         .ok(
             case,
@@ -97,7 +98,7 @@ async fn summary(emulator: &Emulator, case: &str, name: &str) -> (String, u64) {
 }
 
 /// A shard's id.
-fn shard_id(case: &str, shard: &Value) -> String {
+pub(crate) fn shard_id(case: &str, shard: &Value) -> String {
     shard
         .get("ShardId")
         .and_then(Value::as_str)
@@ -106,7 +107,7 @@ fn shard_id(case: &str, shard: &Value) -> String {
 }
 
 /// A shard's `HashKeyRange`, as the pair of integers it names.
-fn hash_key_range(case: &str, shard: &Value) -> (u128, u128) {
+pub(crate) fn hash_key_range(case: &str, shard: &Value) -> (u128, u128) {
     let bound = |member: &str| -> u128 {
         shard
             .get("HashKeyRange")
@@ -123,7 +124,7 @@ fn hash_key_range(case: &str, shard: &Value) -> (u128, u128) {
 
 /// Whether the shard is still open: "shards that are in the OPEN state have an ending
 /// sequence number of null" (`SequenceNumberRange$EndingSequenceNumber`).
-fn is_open(case: &str, shard: &Value) -> bool {
+pub(crate) fn is_open(case: &str, shard: &Value) -> bool {
     let range = shard
         .get("SequenceNumberRange")
         .unwrap_or_else(|| panic!("case {case}: a shard must carry a SequenceNumberRange, got {shard}"));
@@ -133,7 +134,7 @@ fn is_open(case: &str, shard: &Value) -> bool {
 }
 
 /// A shard's lineage, as `Shard$ParentShardId` and `Shard$AdjacentParentShardId` name it.
-fn parents(shard: &Value) -> Vec<String> {
+pub(crate) fn parents(shard: &Value) -> Vec<String> {
     ["ParentShardId", "AdjacentParentShardId"]
         .into_iter()
         .filter_map(|member| shard.get(member).and_then(Value::as_str))
@@ -402,15 +403,15 @@ async fn update_shard_count_refuses_what_the_limits_forbid() {
             case: "more-than-double",
             subject: Subject::Active(2),
             body: |name| scale_to(name, 5),
-            code: "LimitExceededException",
-            says: |_| "double".to_string(),
+            code: "InvalidArgumentException",
+            says: |_| scale_up_over_double_message(2, 5),
         },
         Refusal {
             case: "below-half",
             subject: Subject::Active(4),
             body: |name| scale_to(name, 1),
-            code: "LimitExceededException",
-            says: |_| "half".to_string(),
+            code: "InvalidArgumentException",
+            says: |_| scale_down_below_half_message(4, 1),
         },
         Refusal {
             case: "past-the-shard-ceiling",
