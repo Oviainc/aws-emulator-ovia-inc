@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCodeSigningConfigs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCodeSigningConfigs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCodeSigningConfigs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the code-signing configurations this account holds, each one exactly as
+//! `GetCodeSigningConfig` reports it, out of
+//! [`crate::state::ComAmazonawsLambdaAwsgirapiserviceState::code_signing_configs`] — the
+//! single slice `CreateCodeSigningConfig` persists into. The store keys a configuration
+//! by its ARN, so the iteration order is a stable order to page through, and the
+//! pagination token is the ARN of the last configuration the previous page reported.
+//!
+//! This operation only reports: nothing it answers is written anywhere.
 //!
 //! ## Shape of an operation
 //!
@@ -141,20 +141,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCodeSigningConfigs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCodeSigningConfigsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCodeSigningConfigs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCodeSigningConfigsErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `MaxItems` is modelled `MaxListItems`, `@range(min: 1, max: 10000)`, so the
+        // boundary validator has already refused anything outside it; this handler
+        // enforces the same floor itself rather than letting a page size of zero reach
+        // the pagination arithmetic below.
+        if let Some(requested) = input.max_items.filter(|requested| *requested < 1) {
+            return Err(
+                ListCodeSigningConfigsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(format!(
+                            "1 validation error detected: Value '{requested}' at 'maxItems' \
+                             failed to satisfy constraint: Member must have value greater \
+                             than or equal to 1"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let page_size = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(MAX_CODE_SIGNING_CONFIGS_PER_PAGE)
+            .clamp(1, MAX_CODE_SIGNING_CONFIGS_PER_PAGE);
+
+        let store = state.lock();
+        // The store keys a configuration by its ARN, so its own order is the order the
+        // entries are reported and paginated in.
+        let entries: Vec<(&String, &crate::state::CodeSigningConfigRecord)> =
+            store.code_signing_configs.iter().collect();
+
+        // The marker is the ARN of the last configuration the previous page reported, so
+        // the next page starts at the first configuration ordered after it and no
+        // configuration is ever reported twice.
+        let start = match input.marker.as_deref() {
+            Some(marker) => entries
+                .iter()
+                .position(|(arn, _)| arn.as_str() > marker)
+                .unwrap_or(entries.len()),
+            None => 0,
+        };
+        let page = match entries.get(start..) {
+            Some(remaining) => &remaining[..page_size.min(remaining.len())],
+            None => &[][..],
+        };
+        let truncated = start + page.len() < entries.len();
+
+        Ok(ListCodeSigningConfigsOutput {
+            // Every member reported comes out of the stored record, through the same
+            // [`crate::state::CodeSigningConfigRecord::to_wire`] that
+            // `GetCodeSigningConfig` reports one configuration with.
+            code_signing_configs: Some(page.iter().map(|(_, record)| record.to_wire()).collect()),
+            // "The pagination token that's included if more results are available" — so
+            // it is absent on the last page, and it is the ARN of the last configuration
+            // THIS page reported, which is what the next page continues after.
+            next_marker: page
+                .last()
+                .filter(|_| truncated)
+                .map(|(arn, _)| (*arn).clone()),
+        })
     }
 }
+
+/// The most configurations one page reports: the operation documents it itself ("A
+/// request returns up to 10,000 configurations per call. You can use the MaxItems
+/// parameter to return fewer configurations per call"), which is also the ceiling the
+/// model puts on `MaxItems` (`MaxListItems`, `@range(min: 1, max: 10000)`). It is
+/// therefore both the page size a caller that names no `MaxItems` gets and the ceiling
+/// on the one who does.
+const MAX_CODE_SIGNING_CONFIGS_PER_PAGE: usize = 10_000;
