@@ -268,7 +268,7 @@ fn endpoint_fixtures() -> Vec<EndpointFixture> {
             vpc_id: "vpc-0000000000000000b",
             service_name: "com.amazonaws.vpce.us-west-2.vpce-svc-abc",
             service_region: "us-west-2",
-            state: "Deleting",
+            state: "deleting",
             ip_address_type: Some("ipv6"),
             tags: Vec::new(),
         },
@@ -277,7 +277,7 @@ fn endpoint_fixtures() -> Vec<EndpointFixture> {
             vpc_id: "vpc-0000000000000000b",
             service_name: "com.amazonaws.us-east-1.rds",
             service_region: REGION,
-            state: "Failed",
+            state: "failed",
             ip_address_type: Some("dualstack"),
             tags: vec![tag("Tier", "private")],
         },
@@ -399,7 +399,7 @@ async fn each_documented_filter_selects_the_endpoints_whose_attribute_matches() 
     let seeded = seed_endpoints(&engine);
 
     // One row per filter name `DescribeVpcEndpointsRequest$Filters` documents, with rows
-    // for the value counts, the wildcards, the two spellings of a state and the tag family.
+    // for the value counts, the wildcards, each documented state and the tag family.
     let cases: Vec<(&str, Vec<&str>, Vec<usize>)> = vec![
         ("ip-address-type", vec!["ipv4"], vec![0]),
         ("ip-address-type", vec!["ipv6"], vec![2]),
@@ -422,8 +422,7 @@ async fn each_documented_filter_selects_the_endpoints_whose_attribute_matches() 
         ("vpc-endpoint-id", vec![seeded[1].as_str()], vec![1]),
         // EC2's own `*` wildcard, which every endpoint id matches.
         ("vpc-endpoint-id", vec!["vpce-*"], vec![0, 1, 2, 3]),
-        // The modelled spelling of the state, and the one the filter documents.
-        ("vpc-endpoint-state", vec!["Available"], vec![0]),
+        // Each state EC2 reports, in the spelling the filter's own doc list publishes.
         ("vpc-endpoint-state", vec!["available"], vec![0]),
         ("vpc-endpoint-state", vec!["pendingAcceptance"], vec![1]),
         ("vpc-endpoint-state", vec!["deleting"], vec![2]),

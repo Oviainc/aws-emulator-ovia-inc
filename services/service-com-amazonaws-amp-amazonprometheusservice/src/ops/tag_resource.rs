@@ -178,12 +178,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: an ARN naming another Region's resource
+        // resolves to nothing here, as it does for that resource's own operations.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.materialize_due(::std::time::SystemTime::now());
 
         // The ARN names ONE of the service's taggable resources, and the merge is applied
         // to that resource's own stored tag map — the same map its readers report.
-        let Some(tags) = store.tags_of_arn_mut(&input.resource_arn) else {
+        let Some(tags) = store
+            .held_region_mut(&region)
+            .and_then(|store| store.tags_of_arn_mut(&input.resource_arn))
+        else {
             // An ARN that resolves to no live resource: 404 with the code aps answers on
             // the ARN-addressed tagging path, whatever resource type the ARN names (see
             // `crate::state::arn_not_found`).

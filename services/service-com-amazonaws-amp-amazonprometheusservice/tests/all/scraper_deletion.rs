@@ -49,10 +49,12 @@ async fn delete(
     amp.call("DELETE", &uri, region, "").await
 }
 
-/// The stored status of one scraper, or `None` once the store no longer holds it.
-fn stored_status(amp: &Amp, scraper_id: &str) -> Option<String> {
+/// The stored status of one scraper in `region`, or `None` once that store no longer
+/// holds it.
+fn stored_status(amp: &Amp, region: &str, scraper_id: &str) -> Option<String> {
     amp.store()
         .lock()
+        .region(region)
         .scrapers
         .get(scraper_id)
         .map(|record| record.status_code.clone())
@@ -104,7 +106,7 @@ async fn deleting_an_active_scraper_moves_it_to_deleting_then_the_clock_removes_
 
     for (case, seeded, client_token) in cases {
         let amp = Amp::new();
-        seed(&amp, &seeded);
+        seed(&amp, region, &seeded);
         let scraper_id = seeded.scraper_id.as_str();
 
         let reply = delete(&amp, region, scraper_id, client_token).await;
@@ -123,11 +125,11 @@ async fn deleting_an_active_scraper_moves_it_to_deleting_then_the_clock_removes_
             "case {case:?}: expected the status the call wrote, got {reply:?}"
         );
         assert_eq!(
-            stored_status(&amp, scraper_id).as_deref(),
+            stored_status(&amp, region, scraper_id).as_deref(),
             Some(STATUS_DELETING),
             "case {case:?}: the stored record must have moved to {STATUS_DELETING}, got \
              {:?}",
-            stored_status(&amp, scraper_id)
+            stored_status(&amp, region, scraper_id)
         );
 
         // While the removal is pending the scraper is still listed, in `DELETING` —
@@ -158,10 +160,10 @@ async fn deleting_an_active_scraper_moves_it_to_deleting_then_the_clock_removes_
              got {settled:?}"
         );
         assert_eq!(
-            stored_status(&amp, scraper_id),
+            stored_status(&amp, region, scraper_id),
             None,
             "case {case:?}: the store must no longer hold the scraper, got {:?}",
-            stored_status(&amp, scraper_id)
+            stored_status(&amp, region, scraper_id)
         );
 
         // The record is gone, so the very same call is now a not-found rather than a
@@ -194,7 +196,7 @@ async fn a_delete_is_refused_for_every_status_but_active() {
             eks_source("status-cluster"),
             workspace_destination("ws-33333333-3333-3333-3333-333333333333"),
         );
-        seed(&amp, &seeded);
+        seed(&amp, region, &seeded);
         let scraper_id = seeded.scraper_id.as_str();
 
         let reply = delete(&amp, region, scraper_id, None).await;
@@ -231,10 +233,10 @@ async fn a_delete_is_refused_for_every_status_but_active() {
             "case {status:?}: the refusal must name the resource type, got {reply:?}"
         );
         assert_eq!(
-            stored_status(&amp, scraper_id).as_deref(),
+            stored_status(&amp, region, scraper_id).as_deref(),
             Some(*status),
             "case {status:?}: a refused delete must change nothing, got {:?}",
-            stored_status(&amp, scraper_id)
+            stored_status(&amp, region, scraper_id)
         );
     }
 }
@@ -253,7 +255,7 @@ async fn a_scraper_the_store_does_not_hold_is_not_found() {
         eks_source("bystander-cluster"),
         workspace_destination("ws-44444444-4444-4444-4444-444444444444"),
     );
-    seed(&amp, &seeded);
+    seed(&amp, region, &seeded);
 
     let absent = [
         ("a minted-looking id nothing holds", "s-99999999-9999-9999-9999-999999999999"),
@@ -291,10 +293,10 @@ async fn a_scraper_the_store_does_not_hold_is_not_found() {
     }
 
     assert_eq!(
-        stored_status(&amp, &seeded.scraper_id).as_deref(),
+        stored_status(&amp, region, &seeded.scraper_id).as_deref(),
         Some(STATUS_ACTIVE),
         "a delete that named another scraper must leave this one {STATUS_ACTIVE}, got {:?}",
-        stored_status(&amp, &seeded.scraper_id)
+        stored_status(&amp, region, &seeded.scraper_id)
     );
 }
 
@@ -319,6 +321,7 @@ async fn replaying_the_delete_with_its_client_token_is_the_same_request() {
         let amp = Amp::new();
         seed(
             &amp,
+            region,
             &scraper(
                 scraper_id,
                 Some("idempotent"),
@@ -336,6 +339,7 @@ async fn replaying_the_delete_with_its_client_token_is_the_same_request() {
         let owed = amp
             .store()
             .lock()
+            .region(region)
             .scrapers
             .get(scraper_id)
             .and_then(|record| record.transition_due);
@@ -365,6 +369,7 @@ async fn replaying_the_delete_with_its_client_token_is_the_same_request() {
         let still_owed = amp
             .store()
             .lock()
+            .region(region)
             .scrapers
             .get(scraper_id)
             .and_then(|record| record.transition_due);
@@ -391,6 +396,7 @@ async fn a_delete_touches_only_the_scraper_it_names() {
     for id in ids {
         seed(
             &amp,
+            region,
             &scraper(
                 id,
                 Some("fleet"),
@@ -414,10 +420,10 @@ async fn a_delete_touches_only_the_scraper_it_names() {
             STATUS_ACTIVE
         };
         assert_eq!(
-            stored_status(&amp, id).as_deref(),
+            stored_status(&amp, region, id).as_deref(),
             Some(expected),
             "case {id:?}: expected the stored status {expected:?}, got {:?}",
-            stored_status(&amp, id)
+            stored_status(&amp, region, id)
         );
     }
 

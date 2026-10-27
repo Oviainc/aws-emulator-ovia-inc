@@ -116,5 +116,8 @@ mod start_call_preconditions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/strategy_option_acceptance.rs"]
+mod strategy_option_acceptance;
+
 #[path = "all/whole_value_patterns.rs"]
 mod whole_value_patterns;

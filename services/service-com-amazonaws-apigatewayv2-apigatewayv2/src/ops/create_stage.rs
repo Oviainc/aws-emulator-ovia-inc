@@ -2,7 +2,9 @@
 
 //! @op CreateStage
 //! IMPLEMENTED: mints a `Stage` under the api that owns it, keyed by its `StageName`,
-//! and reports the stored record back; `GetStage` reads that same record.
+//! resolving the members the service itself supplies — the route settings the stage's
+//! routes are served under — and reports the stored record back; `GetStage` reads that
+//! same record.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -252,6 +254,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ];
         crate::state::validate_protocol_restricted_members(&api.protocol_type, &restricted)
             .map_err(bad_request)?;
+        // The protocol decides which route settings the service materialises for the
+        // stage, so it is read out of the api record before the record below borrows it.
+        let protocol_type = api.protocol_type.clone();
 
         // A stage is identified by its name within its api, so one api cannot carry two
         // stages with the same name.
@@ -322,7 +327,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deployment_id,
             access_log_settings: input.access_log_settings,
             client_certificate_id: input.client_certificate_id,
-            default_route_settings: input.default_route_settings,
+            // Every stage is served under route settings, so each member of them the
+            // request did not name is the service's to supply, merged into the ones it
+            // did (see `crate::state::resolve_route_settings`, which reports the members
+            // this api's protocol supports).
+            default_route_settings: Some(crate::state::resolve_route_settings(
+                &protocol_type,
+                input.default_route_settings,
+            )),
             route_settings: input.route_settings.unwrap_or_default().into_iter().collect(),
             stage_variables,
             last_deployment_status_message,

@@ -476,6 +476,8 @@ mod vpc_block_public_access_exclusions;
 mod vpc_endpoint_connection_notifications;
 #[path = "all/vpc_endpoint_connections.rs"]
 mod vpc_endpoint_connections;
+#[path = "all/vpc_endpoint_state.rs"]
+mod vpc_endpoint_state;
 #[path = "all/vpc_endpoints_and_byoip.rs"]
 mod vpc_endpoints_and_byoip;
 #[path = "all/vpc_lifecycle.rs"]

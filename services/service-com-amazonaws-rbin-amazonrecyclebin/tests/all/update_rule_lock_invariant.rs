@@ -80,12 +80,15 @@ const CREATED_RETENTION: i64 = 7;
 
 /// The shared engine and the router built on it: the engine is kept so a test can move
 /// the instant a clock-owed lock transition falls due, which no request can bring forward.
-struct Fixture {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+///
+/// `pub(crate)` with [`fixture`] so the sibling suites of this one test target drive a
+/// clock-owed lock transition through the same harness.
+pub(crate) struct Fixture {
+    pub(crate) router: MultiServiceRouter,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
-fn fixture() -> Fixture {
+pub(crate) fn fixture() -> Fixture {
     // The single shared engine the production router builds and hands to every operation
     // of this service.
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -110,8 +113,11 @@ enum Door {
 /// The delay is at least 7 days, so it cannot elapse inside a test: the instant the
 /// transition falls due is moved into the past instead, and the next request settles the
 /// rule to `unlocked` by itself — exactly as it would once the delay had really run out.
-fn end_unlock_delay(fixture: &Fixture, case: &str, identifier: &str) {
-    let state = service_state(&*fixture.engine)
+///
+/// Takes the shared engine rather than this suite's fixture, and is `pub(crate)`, so the
+/// sibling suites of this one test target reach an expired unlock delay the same way.
+pub(crate) fn end_unlock_delay(engine: &engine::InMemoryEngine, case: &str, identifier: &str) {
+    let state = service_state(engine)
         .unwrap_or_else(|| panic!("case {case:?}: the rbin retention-rule store is unavailable"));
     let mut store = state.lock();
     let rule = store
@@ -177,7 +183,7 @@ async fn unlocked_rule_holding_a_lock(
         "case {case:?}: expected LockState=pending_unlock from UnlockRule, got {:?}",
         unlocking["LockState"]
     );
-    end_unlock_delay(fixture, case, &identifier);
+    end_unlock_delay(&fixture.engine, case, &identifier);
 
     // The rule is now what the guard under test is about: `unlocked`, so no longer
     // lock-protected, and still holding the lock configuration it was locked under.

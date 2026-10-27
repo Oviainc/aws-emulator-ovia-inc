@@ -173,6 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let caller = crate::state::caller_account();
         let mut store = state.lock();
+        let inventory = crate::state::outpost_inventory(&*self.engine, &store);
 
         // Everything the clock already owes is materialised first, so this
         // delete resolves against the endpoints that exist at `now`: one whose
@@ -187,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region's endpoint does not reach — is the modelled 404 before any
         // endpoint under it is looked at, and its text is the one the caller
         // sees.
-        if store.outpost_in(&region, &input.outpost_id).is_none() {
+        if crate::state::outpost_in(&inventory, &region, &input.outpost_id).is_none() {
             return Err(DeleteEndpointErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(),
             )

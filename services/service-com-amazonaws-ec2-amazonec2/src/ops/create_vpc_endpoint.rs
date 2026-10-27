@@ -4,8 +4,8 @@
 //! IMPLEMENTED: creates the VPC endpoint the request describes in the VPC it names, stores
 //! it as the modelled [`VpcEndpoint`] shape — the endpoint service it connects to, the
 //! subnets and security groups the request named, the policy attached to it, and the
-//! endpoint network interface created in each subnet — and answers it in `Pending` with the
-//! instant the clock owes it `Available` recorded beside it (see
+//! endpoint network interface created in each subnet — and answers it in `pending` with the
+//! instant the clock owes it `available` recorded beside it (see
 //! [`crate::state::ComAmazonawsEc2Amazonec2State::vpc_endpoint_moves`]).
 //! `DescribeVpcEndpoints` reports the record this operation stored.
 //!
@@ -15,7 +15,7 @@
 //! asked for — the same rule the siblings of this operation follow. The account's OWN
 //! endpoint services are created by `CreateVpcEndpointServiceConfiguration`, still a
 //! scaffold, so no name resolves to one yet: when it lands, an endpoint to one of them also
-//! owes the `PendingAcceptance` state and a `VpcEndpointConnection` row, which is that
+//! owes the `pendingAcceptance` state and a `VpcEndpointConnection` row, which is that
 //! operation's change rather than this one's.
 //!
 //! This is the ONLY file to touch for this operation.
@@ -765,7 +765,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The record itself. The endpoint is stored `Pending` — the non-terminal state this
+        // The record itself. The endpoint is stored `pending` — the non-terminal state this
         // call ANSWERS with — and "Indicates whether the endpoint is being managed by its
         // service" (`RequesterManaged`) is false for one a caller created. Only the members
         // the endpoint's own TYPE has are set, so a gateway endpoint does not report an
@@ -824,10 +824,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_or(0, str::len)
                 .saturating_add(service_name.len()),
         );
-        // What the clock now owes this endpoint: `Available`, one TRANSITION_DELAY from now
+        // What the clock now owes this endpoint: `available`, one TRANSITION_DELAY from now
         // — the same span, off the same monotonic clock, as every other move this store
         // owes. The span is never zero, so a caller that reads the endpoint straight after
-        // this call still sees it `Pending`.
+        // this call still sees it `pending`.
         store.vpc_endpoint_moves.insert(
             endpoint_id.clone(),
             state::PendingStateMove::starting_now(state::VPC_ENDPOINT_STATE_AVAILABLE),

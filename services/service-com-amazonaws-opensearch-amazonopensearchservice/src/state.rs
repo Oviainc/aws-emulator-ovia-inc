@@ -5607,6 +5607,13 @@ pub const PACKAGE_STATUS_COPYING: &str = "COPYING";
 /// can be associated with a domain.
 pub const PACKAGE_STATUS_AVAILABLE: &str = "AVAILABLE";
 
+/// `PackageStatus`'s `DELETING`: the package is being removed from this account.
+///
+/// The status a delete leaves the record in, which is the last status any read reports
+/// it in: once the clock has taken the record out of the store there is nothing left to
+/// report, so `PackageStatus`'s `DELETED` is a status no stored package rests in.
+pub const PACKAGE_STATUS_DELETING: &str = "DELETING";
+
 /// `PackageType`'s `ZIP-PLUGIN` value: the only type an engine version may be given
 /// for, because `CreatePackageRequest$EngineVersion` "can only be specified for
 /// package type ZIP-PLUGIN".
@@ -5719,6 +5726,14 @@ pub struct Package {
     pub status: String,
     /// The status move the clock owes this package, if any is outstanding.
     pub owed: Option<OwedStatus>,
+    /// When the clock owes this record's REMOVAL from the account's packages, set by
+    /// the delete that asked for it and `None` for every package no delete has
+    /// addressed — the package mirror of [`PackageAssociation::removal_due`].
+    ///
+    /// A status move the record survives is [`Self::owed`]; a removal leaves no record
+    /// to carry a status at all, so it is held apart and performed by the store that
+    /// holds the record ([`ComAmazonawsOpensearchAmazonopensearchserviceState::settle_packages`]).
+    pub removal_due: Option<SystemTime>,
     /// Which numbered version of its content the package currently has IN PLACE —
     /// the version a read reports as available and an association puts on a domain,
     /// counting from [`FIRST_PACKAGE_VERSION`]. A version whose content is still
@@ -5774,6 +5789,33 @@ impl Package {
                 self.version = latest.version;
             }
         }
+    }
+
+    /// Start this package's deletion, as the call that asked for it leaves the record.
+    ///
+    /// The package is not gone the instant that call returns: it is being deleted, so
+    /// it rests in [`PACKAGE_STATUS_DELETING`] and the clock owes the record's removal
+    /// one [`PROVISIONING`] span later, which
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::settle_packages`] performs
+    /// when it falls due. Whatever status move was outstanding is dropped: a package on
+    /// its way out is on its way to no other status.
+    ///
+    /// Idempotent — a package whose removal the clock already owes keeps the instant it
+    /// was owed at, so repeating the call cannot push the removal back.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        if self.removal_due.is_some() {
+            return;
+        }
+        self.status = PACKAGE_STATUS_DELETING.to_string();
+        self.owed = None;
+        self.removal_due = Some(now + PROVISIONING);
+        self.updated_at = now;
+    }
+
+    /// Whether the removal the clock owed this package has fallen due by `now`, so the
+    /// account no longer holds it.
+    pub fn removal_landed(&self, now: SystemTime) -> bool {
+        self.removal_due.is_some_and(|due| now >= due)
     }
 
     /// Record the NEXT numbered version of this package's content, as the call that
@@ -6068,6 +6110,19 @@ pub fn package_not_available(package_id: &str, status: &str) -> ConflictExceptio
         message: Some(format!(
             "Package {package_id} is {status}, not {PACKAGE_STATUS_AVAILABLE}."
         )),
+    }
+}
+
+/// The `ValidationException` payload for deleting a package a domain still holds.
+///
+/// `DeletePackageRequest` states the constraint the delete is judged by — the package
+/// "can't be associated with any OpenSearch Service domain" — so a package still in
+/// place somewhere is not one this call can remove, and the refusal is the service's
+/// fixed sentence for a package that cannot be let go while it is in use
+/// ([`PACKAGE_IN_USE`]), which carries no value of the request.
+pub fn package_in_use() -> ValidationException {
+    ValidationException {
+        message: Some(PACKAGE_IN_USE.to_string()),
     }
 }
 
@@ -6641,11 +6696,17 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     }
 
     /// Materialise the status move the clock owes every stored package, for a caller
-    /// about to report on all of them.
+    /// about to report on all of them — and release the record of every package whose
+    /// deletion has fallen due.
     pub fn settle_packages(&mut self, now: SystemTime) {
         for package in self.packages.values_mut() {
             package.settle(now);
         }
+        // A package the clock owed a removal is no longer one the account holds, so no
+        // read reports it again and the quota slot it counted is free. Done here rather
+        // than in [`Package::settle`] because a record cannot take itself out of the
+        // map that holds it.
+        self.packages.retain(|_, package| !package.removal_landed(now));
     }
 
     /// The insights the entity a request names holds.
@@ -6776,6 +6837,21 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     pub fn insert_package(&mut self, package: Package) -> &Package {
         let id = package.package_id.clone();
         self.packages.entry(id).or_insert(package)
+    }
+
+    /// Whether any domain of this account holds the package `package_id` — the
+    /// condition that keeps the package from being deleted.
+    ///
+    /// A link is held ON the domain under the package's id, so this is the same set
+    /// `ListDomainsForPackage` reports: an association the clock has not taken off the
+    /// domain yet still counts, because the package is still in place there.
+    ///
+    /// Reads ONLY, and is read AFTER [`Domain::settle_package_associations`], so a link
+    /// whose removal has already fallen due is not counted.
+    pub fn package_is_associated(&self, package_id: &str) -> bool {
+        self.domains
+            .values()
+            .any(|domain| domain.package_associations.contains_key(package_id))
     }
 
     /// Decide whether `request` can be served on `domain_name` and, where it can,

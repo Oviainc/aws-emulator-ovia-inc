@@ -181,10 +181,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // This service is REGIONAL, so the store this call acts on is the one of the
+        // Region the request was signed for: a workspace created in another Region is not
+        // reachable from this endpoint and is not found here.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         store.materialize_due(now);
 
-        if !store.workspaces.contains_key(&input.workspace_id) {
+        // A Region this account holds nothing in holds no workspace either, so the one
+        // refusal answers both.
+        let Some(store) = store
+            .held_region_mut(&region)
+            .filter(|store| store.workspaces.contains_key(&input.workspace_id))
+        else {
             return Err(
                 DeleteQueryLoggingConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -195,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
+        };
 
         let Some(configuration) = store.query_logging.get_mut(&input.workspace_id) else {
             return Err(

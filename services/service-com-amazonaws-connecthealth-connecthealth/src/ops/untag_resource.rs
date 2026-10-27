@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: REMOVES from the tag set [`crate::state`] records for the resource the
+//! ARN names exactly the keys the request lists — a key it names is dropped, a key it
+//! does not name keeps the value it had — so every reader of that resource's tags
+//! (`GetDomain`, `ListTagsForResource`) reports the reduced set. Naming a key the
+//! resource does not carry removes nothing and is still a success, which is what
+//! `@idempotent` asks of a removal. An ARN that names no resource this service holds is a
+//! 404 `ResourceNotFoundException`, and a key this service does not accept is refused
+//! with nothing written.
 //!
 //! ## Shape of an operation
 //!
@@ -56,6 +55,24 @@
 //! * `resourceArn` (String) **required** — The ARN of the resource to untag
 //! * `tagKeys` (TagKeyList, len 1..50) **required** — The tag keys to remove from the
 //!   resource
+//!
+//! ## Errors
+//!
+//! The model lists NONE for this operation
+//! (`smithy_query(query="operation",operation="UntagResource")` reports `errors: []`), so
+//! the shape below is widened in through `extra_errors`; it is a shape this SERVICE
+//! models and other operations declare:
+//!
+//! * `ResourceNotFoundException` (HTTP 404) — `resourceArn` names no resource of this
+//!   service, resolved exactly as `TagResource` and `ListTagsForResource` resolve the
+//!   same label.
+//!
+//! A tag key this service does not accept — one outside the modelled `TagKey` length, or
+//! one in the reserved `crate::state::RESERVED_TAG_KEY_PREFIX` namespace, which names a
+//! tag no caller may set OR remove — is refused as a 400 `ValidationException`
+//! (`crate::scaffolded::Scaffolded::validation`), through the same per-key check
+//! `CreateDomain` and `TagResource` apply to the keys THEY name
+//! ([`crate::service::tag_bounds::removed_key_violation`]).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -95,9 +112,15 @@ impl ::aws_smithy_schema::serde::SerializableStruct for UntagResourceOutput {
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.connecthealth#UntagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.connecthealth#UntagResource",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
+    /// Declared on the service (and on `GetDomain`), not on this operation: the ARN
+    /// names no resource this service holds.
+    ResourceNotFoundException(ResourceNotFoundException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -151,18 +174,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The store is unreachable only when this service was mounted on a foreign
+        // engine; a refusal is the only channel this operation has for that.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "UntagResource could not reach this service's store",
+            ));
+        };
+        // This service's endpoint is regional: the ARN has to name a resource of the
+        // Region the request was signed for.
+        let region = crate::state::region_of(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // Every handler materialises the deletions the CLOCK already made due first, so
+        // the ARN of a resource whose deletion has fallen due no longer resolves here.
+        store.purge_due_deletions(now);
+
+        // The ARN has to name a resource this service HOLDS, in THIS REGION: a tag set
+        // lives beside the resource, so there is nothing to remove a key from otherwise,
+        // and a resource of another Region is not this endpoint's to change. The same
+        // resolution `TagResource` writes through and `ListTagsForResource` reads
+        // through, so the removal and the readers never disagree about whether the ARN
+        // names a resource.
+        if !store.holds_resource_arn(&region, &input.resource_arn) {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::service::error_detail::resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A key named for REMOVAL is subject to the same per-key rules as a key named
+        // for a write: the modelled `TagKey` length, and the namespace the service
+        // reserves for the tags it sets itself — a tag no caller may set or remove.
+        // Refused before anything is dropped, so a refused call writes nothing.
+        if let Some(violation) =
+            crate::service::tag_bounds::removed_key_violation(input.tag_keys.iter())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(violation));
+        }
+
+        // Removal is a set difference on the set the resource holds TODAY: a key the
+        // request names is dropped and every other key keeps the value it had. A key the
+        // resource does not carry drops nothing, so `@idempotent` holds — repeating the
+        // call leaves the same set — and the result is stored through the one writer
+        // `CreateDomain` and `TagResource` store through, which is what gives "no tags
+        // left" the single representation every reader projects an empty map from.
+        let mut remaining = store.tags_for(&input.resource_arn);
+        for key in &input.tag_keys {
+            remaining.remove(key);
+        }
+        store.set_tags(&input.resource_arn, remaining);
+        Ok(UntagResourceOutput)
     }
 }

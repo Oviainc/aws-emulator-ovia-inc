@@ -62,11 +62,12 @@ async fn describe(amp: &Amp, region: &str, scraper_id: &str) -> Reply {
         .await
 }
 
-/// The whole stored scraper table, rendered so two snapshots compare member for member —
-/// what a reporting operation must leave untouched.
-fn store_snapshot(amp: &Amp) -> Vec<String> {
+/// The whole stored scraper table of one Region, rendered so two snapshots compare member
+/// for member — what a reporting operation must leave untouched.
+fn store_snapshot(amp: &Amp, region: &str) -> Vec<String> {
     amp.store()
         .lock()
+        .region(region)
         .scrapers
         .values()
         .map(|record| format!("{record:?}"))
@@ -417,7 +418,7 @@ async fn a_describe_reports_every_member_of_the_stored_record() {
     records.push(("a failed scraper, which carries a statusReason", failed));
 
     for (_, record) in &records {
-        seed(&amp, record);
+        seed(&amp, region, record);
     }
 
     for (case, record) in &records {
@@ -433,10 +434,10 @@ async fn a_describe_reports_every_member_of_the_stored_record() {
     // The control: the store still holds every record, each exactly as it was seeded, so
     // none of those reads reported another record's members or wrote anything.
     assert_eq!(
-        store_snapshot(&amp).len(),
+        store_snapshot(&amp, region).len(),
         records.len(),
         "every seeded scraper must still be held, got {:?}",
-        store_snapshot(&amp)
+        store_snapshot(&amp, region)
     );
 }
 
@@ -455,8 +456,8 @@ async fn an_id_the_store_holds_nothing_for_is_the_modelled_not_found() {
         eks_source("held-cluster"),
         workspace_destination("ws-55555555-5555-5555-5555-555555555555"),
     );
-    seed(&amp, &held);
-    let before = store_snapshot(&amp);
+    seed(&amp, region, &held);
+    let before = store_snapshot(&amp, region);
 
     let rows: Vec<(&str, String)> = vec![
         (
@@ -491,10 +492,10 @@ async fn an_id_the_store_holds_nothing_for_is_the_modelled_not_found() {
     let after = describe(&amp, region, &held.scraper_id).await;
     assert_reports_the_record("the held scraper after the refusals", &after, &held);
     assert_eq!(
-        store_snapshot(&amp),
+        store_snapshot(&amp, region),
         before,
         "a refused describe must leave the store untouched, got {:?}",
-        store_snapshot(&amp)
+        store_snapshot(&amp, region)
     );
 }
 
@@ -514,8 +515,8 @@ async fn an_id_outside_its_modelled_constraint_is_refused() {
         eks_source("bounds-cluster"),
         dataset_destination("bounds"),
     );
-    seed(&amp, &held);
-    let before = store_snapshot(&amp);
+    seed(&amp, region, &held);
+    let before = store_snapshot(&amp, region);
 
     let pattern_requirement = "Member must satisfy regular expression pattern: \
                                [0-9A-Za-z][-.0-9A-Z_a-z]*";
@@ -598,10 +599,10 @@ async fn an_id_outside_its_modelled_constraint_is_refused() {
     }
 
     assert_eq!(
-        store_snapshot(&amp),
+        store_snapshot(&amp, region),
         before,
         "a refused describe must leave the store untouched, got {:?}",
-        store_snapshot(&amp)
+        store_snapshot(&amp, region)
     );
 }
 
@@ -650,9 +651,9 @@ async fn describing_a_scraper_changes_nothing_a_later_caller_sees() {
         ("a scraper being updated", updating),
     ];
     for (_, record) in &records {
-        seed(&amp, record);
+        seed(&amp, region, record);
     }
-    let before = store_snapshot(&amp);
+    let before = store_snapshot(&amp, region);
 
     let mut answers: Vec<(&str, serde_json::Value)> = Vec::new();
     for (case, record) in &records {
@@ -675,10 +676,10 @@ async fn describing_a_scraper_changes_nothing_a_later_caller_sees() {
     }
 
     assert_eq!(
-        store_snapshot(&amp),
+        store_snapshot(&amp, region),
         before,
         "a describe must leave the store untouched, got {:?}",
-        store_snapshot(&amp)
+        store_snapshot(&amp, region)
     );
 }
 
@@ -743,7 +744,7 @@ async fn a_describe_materialises_only_the_transition_the_clock_already_owed() {
         ),
     ];
     for (_, record, _) in &rows {
-        seed(&amp, record);
+        seed(&amp, region, record);
     }
 
     for (case, record, expected_status) in &rows {
@@ -774,10 +775,15 @@ async fn a_describe_materialises_only_the_transition_the_clock_already_owed() {
             None => {
                 assert_not_found(case, &reply, &record.scraper_id);
                 assert!(
-                    !amp.store().lock().scrapers.contains_key(&record.scraper_id),
+                    !amp
+                        .store()
+                        .lock()
+                        .region(region)
+                        .scrapers
+                        .contains_key(&record.scraper_id),
                     "case {case:?}: the clock's removal must have dropped the record, got \
                      {:?}",
-                    store_snapshot(&amp)
+                    store_snapshot(&amp, region)
                 );
             }
         }
@@ -787,8 +793,9 @@ async fn a_describe_materialises_only_the_transition_the_clock_already_owed() {
     // and the settled ones carry no pending transition any more.
     let store = amp.store();
     let held = store.lock();
+    let records = held.region(region);
     for (case, record, expected_status) in &rows {
-        let Some(stored) = held.scrapers.get(&record.scraper_id) else {
+        let Some(stored) = records.scrapers.get(&record.scraper_id) else {
             continue;
         };
         let pending_transition = stored.transition_due.is_some();

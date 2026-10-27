@@ -42,7 +42,12 @@ fn inventory_size() -> usize {
 /// A router with this service mounted, with the calling account opted in the way
 /// a client opts in: `UpdateEnrollmentConfiguration` over the wire, read back
 /// through `GetEnrollmentConfiguration`.
-async fn opted_in_emulator(case: &str) -> MultiServiceRouter {
+///
+/// `pub(crate)` so another suite that needs the calling account's ANALYSED
+/// inventory drives the opt-in through this one harness: the inventory is
+/// recorded by the enrollment call, so a suite that seeds the enrollment
+/// directly has none.
+pub(crate) async fn opted_in_emulator(case: &str) -> MultiServiceRouter {
     let router = unenrolled_emulator_with_engine().0;
     let updated = call_ok(
         &router,

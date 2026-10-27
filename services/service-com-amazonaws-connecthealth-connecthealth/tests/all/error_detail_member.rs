@@ -6,8 +6,8 @@
 //! The RULE under test, asserted over a table rather than one recorded response: every
 //! error this service answers carries the exception's detail text in a body member spelled
 //! `Message` — the spelling ConnectHealth uses on the wire — whichever layer produced the
-//! failure (a handler's modelled exception, the boundary validator's refusal, or the
-//! scaffold's 501), and the body carries that text under no other key. The text itself is
+//! failure (a handler's modelled exception, or the boundary validator's refusal), and the
+//! body carries that text under no other key. The text itself is
 //! built from the REQUEST:
 //!
 //! * a not-found names the identifiers the request asked for — the subscription and its
@@ -344,27 +344,37 @@ async fn an_error_the_framework_renders_reports_its_text_in_the_message_member_t
         );
     }
 
-    // The scaffold's 501 is rendered by the framework as well, from a synthetic shape of
-    // its own; it reports which operation is unimplemented, in the same member.
-    // `UntagResource` is one of this service's remaining stubs
-    // (`src/ops/untag_resource.rs`); `ListTagsForResource`, at the same URI, is
-    // implemented and answers this unresolvable ARN with a modelled 404 instead.
+    // Every operation at the ARN-addressed tagging URI renders its refusal through the
+    // same wrapper, whichever method the request used: this service has no scaffolded
+    // operation left, so the framework's own 501 body is unreachable over HTTP here and
+    // the rename of that body is pinned by the unit test beside the wrapper
+    // (`src/service/error_detail.rs`).
     let arn = "arn:aws:health-agent:us-west-2:000000000000:domain/dom-zzzzzzzzzzzzzzzz";
     let encoded = arn.replace(':', "%3A").replace('/', "%2F");
     // `tagKeys` is a required `@httpQuery` list of 1..50 keys
-    // (`smithy_query(query="operation",operation="UntagResource")`), so a request that
-    // omits it is refused at the boundary and never reaches the stub.
-    let (status, body) = emulator
-        .send("DELETE", &format!("/tags/{encoded}?tagKeys=env"), None)
-        .await;
-    assert_eq!(
-        (status, error_code(&body).as_str()),
-        (501, "NotImplemented"),
-        "a stub answers 501 NotImplemented, got {status} with {body}"
-    );
-    let text = detail_text("the scaffold's 501", &body);
-    assert!(
-        text.contains("UntagResource"),
-        "the 501 must name the unimplemented operation, got {text:?}"
-    );
+    // (`smithy_query(query="operation",operation="UntagResource")`), so a removal names at
+    // least one.
+    for (case, method, path) in [
+        ("ListTagsForResource", "GET", format!("/tags/{encoded}")),
+        ("TagResource", "POST", format!("/tags/{encoded}")),
+        (
+            "UntagResource",
+            "DELETE",
+            format!("/tags/{encoded}?tagKeys=env"),
+        ),
+    ] {
+        let body = (method == "POST").then(|| json!({ "tags": { "env": "prod" } }));
+        let (status, answered) = emulator.send(method, &path, body.as_ref()).await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: an unresolvable ARN must answer the modelled 404, got {status} \
+             with {answered}"
+        );
+        let text = detail_text(case, &answered);
+        assert!(
+            text.contains(arn),
+            "case {case:?}: the 404 must name the ARN the request asked for, got {text:?}"
+        );
+    }
 }

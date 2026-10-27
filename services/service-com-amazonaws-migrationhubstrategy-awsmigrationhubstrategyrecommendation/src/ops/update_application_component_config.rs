@@ -171,7 +171,7 @@ fn refused() -> UpdateApplicationComponentConfigError {
 /// member names no value, so it is accepted); this wrapper only lifts its
 /// `ValidationException` into this operation's error channel. Enum membership is checked
 /// in the handler because the boundary validator does not enforce it — the same reason
-/// `UpdateServerConfig` checks its `strategyOption` and `PutPortfolioPreferences` its
+/// `ListServers` checks its `serverCriteria` and `PutPortfolioPreferences` its
 /// `applicationMode`.
 fn check_enum(
     value: Option<&str>,
@@ -183,22 +183,13 @@ fn check_enum(
 /// The strategy option this request stores against the component, or `None` when it names
 /// none to store.
 ///
-/// `isPreferred` alone selects no strategy, no destination and no tool, so an option
-/// carrying nothing else is nothing to store: this operation updates the members the
-/// request names, and that request names none.
+/// The rule itself is the service's [`crate::state::preferred_strategy_option`], one for
+/// every config update that holds a preference against a resource; this wrapper only
+/// lifts its `ValidationException` into this operation's error channel.
 fn preference_of(
     option: Option<StrategyOption>,
 ) -> Result<Option<StrategyOption>, UpdateApplicationComponentConfigError> {
-    let Some(option) = option else {
-        return Ok(None);
-    };
-    check_enum(option.strategy.as_deref(), STRATEGY_VALUES)?;
-    check_enum(option.target_destination.as_deref(), TARGET_DESTINATION_VALUES)?;
-    check_enum(option.tool_name.as_deref(), TRANSFORMATION_TOOL_NAME_VALUES)?;
-    let names_a_strategy = option.strategy.is_some()
-        || option.target_destination.is_some()
-        || option.tool_name.is_some();
-    Ok(names_a_strategy.then_some(option))
+    crate::state::preferred_strategy_option(option).map_err(|_| refused())
 }
 
 /// One source code configuration the request named, as the component record holds it.
