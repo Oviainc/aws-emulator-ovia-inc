@@ -2,7 +2,9 @@
 
 //! @op ListPackageVersions
 //! Lists the versions the addressed package HOLDS as `PackageVersionSummary`, filtered by
-//! `status` and `originType` (both exact, both closed enums), ordered by `sortBy`
+//! `status` and `originType` (both exact, both closed enums; a `status` naming a state no
+//! stored version carries is `ValidationException` (400), not an empty page — see
+//! [`crate::state::input_package_version_status_refusal`]), ordered by `sortBy`
 //! ([`crate::state::package_version_order_key`]) and paginated with the opaque cursor
 //! [`crate::state::encode_token`] mints, beside the package's own coordinate and its
 //! `defaultDisplayVersion` ([`crate::state::Package::default_display_version`]). A pure
@@ -203,6 +205,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // `status` is modelled as the whole `PackageVersionStatus` enum, so the boundary
+        // validator admits every value a RESPONSE can report — including the one no stored
+        // version ever carries. Filtering on that value is a bad request, not a filter that
+        // matches nothing, so it is refused from the shared input/report split
+        // (`crate::state::input_package_version_status_refusal`) BEFORE the coordinate is
+        // resolved: a request a client cannot fix by creating a resource is answered the
+        // same way whatever this emulator holds.
+        if let Some(status) = input.status.as_deref() {
+            if let Some(refusal) = crate::state::input_package_version_status_refusal(status) {
+                return Err(ListPackageVersionsErrorModeled::ValidationException(refusal).into());
+            }
+        }
+
         // A read: the guard is taken immutably, so no later caller sees anything move
         // because this package's versions were listed.
         let store = state.lock();
@@ -289,7 +304,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that excludes most of the package does not return short pages.
         //
         // Both filters the model declares are ANDed and matched EXACTLY against the stored
-        // record — `status` and `originType` are closed enums, and each selects the versions
+        // record — `status` (already narrowed to the values a request may supply, above) and
+        // `originType` are closed enums, and each selects the versions
         // carrying that value ("only package versions with the provided originType will be
         // returned"). Neither is defaulted: "package versions of all statuses will be
         // returned by default when calling list-package-versions with no status parameter".
