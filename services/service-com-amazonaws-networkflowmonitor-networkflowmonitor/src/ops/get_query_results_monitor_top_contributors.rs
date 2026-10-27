@@ -8,7 +8,10 @@
 //! `unit` is the `MetricUnit` the queried metric's values are counted in, derived
 //! from the `metricName` the query was STARTED with
 //! ([`crate::state::metric_unit`]) rather than from this request, which carries no
-//! metric.
+//! metric. The model leaves it OPTIONAL here, and it describes the result SET, so it
+//! is reported only when that set has rows: a caller can tell a window with no data
+//! in it from data counted in some unit by whether `unit` is there at all. (The
+//! sibling DATA reader's `unit` is `@required`, so that one always carries it.)
 //!
 //! `topContributors` is EMPTY, and that is the computed answer rather than a
 //! placeholder: a top contributor is a network flow a Network Flow Monitor agent
@@ -217,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(
                 GetQueryResultsMonitorTopContributorsErrorModeled::ResourceNotFoundException(
-                    crate::state::not_found(crate::state::QUERY_RESOURCE, &input.query_id),
+                    crate::state::query_not_found(&input.query_id),
                 )
                 .into(),
             );
@@ -244,9 +247,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // `topContributors` is the result SET and `unit` is the dimension of its
+        // rows: the model leaves `unit` optional here, so it is reported only when
+        // there is a row set to dimension, and then in the unit of the metric the
+        // query was STARTED with. With no observed network flow in the window there
+        // are no rows, so a caller can tell "no data in the window" from "data
+        // measured in bytes" by whether `unit` is there at all.
+        let top_contributors: Vec<MonitorTopContributorsRow> = Vec::new();
+        let unit = (!top_contributors.is_empty())
+            .then(|| crate::state::metric_unit(&query.metric_name).to_string());
+
         Ok(GetQueryResultsMonitorTopContributorsOutput {
-            unit: Some(crate::state::metric_unit(&query.metric_name).to_string()),
-            top_contributors: Some(Vec::new()),
+            unit,
+            top_contributors: Some(top_contributors),
             next_token: None,
         })
     }

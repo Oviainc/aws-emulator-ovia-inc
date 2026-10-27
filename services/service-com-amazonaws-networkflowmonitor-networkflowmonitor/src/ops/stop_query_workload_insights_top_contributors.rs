@@ -4,12 +4,13 @@
 //! Stops one workload-insights top-contributors query of a scope.
 //!
 //! A query that has not finished is moved to the terminal `CANCELED`, which
-//! `GetQueryStatusWorkloadInsightsTopContributors` reports from then on. Stopping an
-//! already canceled query succeeds without changing anything, while stopping one
-//! that already finished is refused with the modelled `ValidationException`
-//! (HTTP 400): there is nothing left to stop. A `queryId` that is not a
-//! workload-insights top-contributors query of THIS scope is refused the same way,
-//! that being the only client refusal this operation models.
+//! `GetQueryStatusWorkloadInsightsTopContributors` reports from then on. A query
+//! that already reached a terminal status keeps the outcome it reached and the stop
+//! succeeds anyway — the output shape is EMPTY and no absence is modelled, so the
+//! stop is a fire-and-forget asking only that the query not go on running. A
+//! `queryId` that is not a workload-insights top-contributors query of THIS scope
+//! is refused with the modelled `ValidationException` (HTTP 400), that being the
+//! only client refusal this operation models for an id.
 //!
 //! ## Shape of an operation
 //!
@@ -193,24 +194,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(
                 StopQueryWorkloadInsightsTopContributorsErrorModeled::ValidationException(
-                    crate::state::field_validation(
-                        "queryId",
-                        format!(
-                            "query {} was not found for scope {}",
-                            input.query_id, input.scope_id
-                        ),
-                    ),
+                    crate::state::unknown_query(&input.query_id),
                 )
                 .into(),
             );
         };
 
-        if let Err(refusal) = query.stop() {
-            return Err(
-                StopQueryWorkloadInsightsTopContributorsErrorModeled::ValidationException(refusal)
-                    .into(),
-            );
-        }
+        // The stop asks only that the query not go on running, and reports no
+        // status of its own (the output shape is EMPTY): a query still QUEUED or
+        // RUNNING is canceled, and one that already reached a terminal status keeps
+        // the outcome it reached while this call succeeds.
+        query.stop();
 
         Ok(StopQueryWorkloadInsightsTopContributorsOutput {})
     }
