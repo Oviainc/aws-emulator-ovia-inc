@@ -199,12 +199,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Most modelled constraints (the name's pattern and length, the domain's pattern,
-        // the domain list's 1..5 length, a tag VALUE's length) are refused before this
-        // handler runs. What is left are the rules the model states in prose only, and the
-        // constraints on a tag KEY, which the boundary validator leaves unapplied (applied
-        // with the tag rules below).
-        //
+        // Most modelled constraints (the name's and the domain's length, the domain list's
+        // 1..5 length, a tag VALUE's length) are refused before this handler runs. What is
+        // left are the rules the model states in prose only, the constraints on a tag KEY,
+        // and the `@pattern`s the boundary validator cannot apply at all because they are
+        // written with look-around (`crate::state::validation`) — `AppMonitorName` and
+        // `AppMonitorDomain`, which `Name`, `Domain` and `DomainList`'s member target.
+        // Every one of them is applied before anything is written, and all of them in ONE
+        // refusal: a request that breaks two members is two validation errors.
+        if let Some(message) = crate::state::validation::app_monitor_refusal(
+            Some(&input.name),
+            input.domain.as_deref(),
+            input.domain_list.as_deref(),
+        ) {
+            return Err(
+                CreateAppMonitorErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
         // `AppMonitorDomainList`: "The CreateAppMonitor requires either the domain or the
         // domain list." A monitor's domain authority is held in at most ONE of the two
         // forms, so naming both is refused whatever the platform; whether naming NEITHER
@@ -330,6 +343,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         if enables_delivery {
+            // The vended log group is created by CALLING the emulated CloudWatch Logs
+            // service, over this emulator's OWN transport: the client is built with
+            // `ctx.callback().http_client()` and the emulator's own credentials
+            // (`crate::state::cw_log_delivery::logs_client`), so the request is dispatched
+            // in process to the service mounted beside this one and nothing leaves the
+            // process. No socket is opened and no host is resolved: the endpoint URL and
+            // `region` only name which emulated regional endpoint that in-process
+            // dispatch resolves, and `region` is the one the request was signed for.
+            // That is also why this step is `async` and takes no engine of its own —
+            // CloudWatch Logs owns its own state in the shared engine and its handler
+            // writes it, rather than this service reaching into another service's store.
             if let Err(detail) =
                 crate::state::cw_log_delivery::provision_log_group(ctx, &region, &input.name)
                     .await
