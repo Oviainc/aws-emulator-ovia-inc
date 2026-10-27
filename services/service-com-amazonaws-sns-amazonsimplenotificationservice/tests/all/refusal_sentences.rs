@@ -129,6 +129,12 @@ async fn a_refused_condition_answers_the_services_sentence_for_it() {
     let long_subject = "s".repeat(MAX_SUBJECT_CHARS + 1);
     let long_ordering_id = "d".repeat(MAX_ORDERING_ID_CHARS + 1);
     let long_entry_id = "e".repeat(81);
+    // The two sentences a refused entry `Id` answers: each names the rule the id broke
+    // and the id that broke it, built from the request.
+    let long_entry_id_refusal =
+        format!("The Id of a batch entry in the batch request is too long: {long_entry_id}");
+    let spaced_entry_id_refusal = "The Id of a batch entry in the batch request contains an \
+                                   impermissible character: not valid";
     // Two entries of 200 KiB each: publishable one at a time, past the 256 KiB
     // ceiling together.
     let half_batch_body = "h".repeat(204_800);
@@ -247,8 +253,7 @@ async fn a_refused_condition_answers_the_services_sentence_for_it() {
             ]),
             status: 400,
             code: "InvalidBatchEntryId",
-            message: "The Id of a batch entry in a batch request doesn't abide by the \
-                      specification.",
+            message: &long_entry_id_refusal,
         },
         Refusal {
             case: "PublishBatch with an entry Id carrying a character the rule excludes",
@@ -260,8 +265,7 @@ async fn a_refused_condition_answers_the_services_sentence_for_it() {
             ]),
             status: 400,
             code: "InvalidBatchEntryId",
-            message: "The Id of a batch entry in a batch request doesn't abide by the \
-                      specification.",
+            message: spaced_entry_id_refusal,
         },
         Refusal {
             case: "PublishBatch whose entries are longer together than the ceiling",
@@ -407,7 +411,8 @@ async fn a_refused_condition_answers_the_services_sentence_for_it() {
             ]),
             status: 400,
             code: "InvalidParameter",
-            message: "Invalid parameter: AttributeName",
+            message: "Invalid parameter: Attributes Reason: Unknown attribute \
+                      RawMessgeDelivery",
         },
         Refusal {
             case: "Subscribe with a FilterPolicy that is not JSON",
@@ -666,13 +671,15 @@ async fn a_write_past_the_tag_quota_answers_the_quota_sentence() {
     );
 }
 
-/// The `Subject` rule: at most 100 CHARACTERS (not bytes), carrying no line break and
-/// no control character — one sentence for every value it turns away.
+/// The `Subject` rule: at most 100 CHARACTERS (not bytes), carrying text rather than
+/// blank space alone, and no line break or control character other than a horizontal
+/// tab — one sentence for every value it turns away.
 ///
 /// The rows differ along what the rule generalises over: the character count against
 /// the published bound, the SCRIPT (so the count is characters and not UTF-8 bytes),
-/// and each class of character the rule excludes — the ASCII C0 controls, DEL, a C1
-/// control, and the two Unicode line breaks that are not control characters.
+/// each class of character the rule excludes — the ASCII C0 controls, DEL, a C1
+/// control, and the two Unicode line breaks that are not control characters — and
+/// whether the value carries any text at all.
 #[tokio::test]
 async fn the_subject_rule_holds_over_lengths_scripts_and_control_characters() {
     let sns = Sns::new();
@@ -689,20 +696,24 @@ async fn the_subject_rule_holds_over_lengths_scripts_and_control_characters() {
     let cases: &[(&str, &str, bool)] = &[
         ("a plain subject", "Daily report", true),
         ("inner spaces", "a  b   c", true),
+        ("leading and trailing spaces", "  padded  ", true),
         ("punctuation only", "!?-", true),
         ("a non-ascii subject", "Résumé — ☃", true),
         ("at the character bound", &at_bound, true),
         ("at the character bound in a two-byte script", &multibyte_at_bound, true),
+        ("a tab", "col\tumn", true),
         ("one character past the bound", &past_bound, false),
         (
             "one character past the bound in a two-byte script",
             &multibyte_past_bound,
             false,
         ),
+        ("no subject at all", "", false),
+        ("spaces alone", "   ", false),
+        ("a tab alone", "\t", false),
         ("a line feed", "first\nsecond", false),
         ("a carriage return", "first\rsecond", false),
         ("a windows line break", "first\r\nsecond", false),
-        ("a tab", "first\tsecond", false),
         ("a vertical tab", "first\u{000b}second", false),
         ("a form feed", "first\u{000c}second", false),
         ("a null", "first\u{0000}second", false),

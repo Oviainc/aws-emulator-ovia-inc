@@ -733,7 +733,7 @@ async fn observed_s3_buckets(
 /// (its operations are bound under a `{Bucket}` path label), and the host is built from
 /// the fixed service label and [`super::DEFAULT_REGION`], never from anything a caller
 /// sent.
-fn s3_client(
+pub(crate) fn s3_client(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_s3::Client {

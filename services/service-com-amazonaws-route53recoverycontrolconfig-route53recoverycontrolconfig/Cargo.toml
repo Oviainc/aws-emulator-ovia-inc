@@ -8,6 +8,7 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

@@ -27,6 +27,8 @@ mod app_bundle_region_quota;
 mod chain_read_not_found_attribution;
 #[path = "all/client_token_region_scope.rs"]
 mod client_token_region_scope;
+#[path = "all/connected_authorization_rule.rs"]
+mod connected_authorization_rule;
 #[path = "all/create_app_authorization_contract.rs"]
 mod create_app_authorization_contract;
 #[path = "all/create_app_authorization_credential_idempotency.rs"]

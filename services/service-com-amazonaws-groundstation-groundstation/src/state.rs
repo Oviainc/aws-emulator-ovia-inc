@@ -35,11 +35,14 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     AgentDetails, AggregateStatus, AntennaDemodDecodeDetails, AzElSegments, ComponentStatusData,
-    ConfigDetails, ConfigTypeData, ContactVersion, AzElSegmentsData, DataflowDetail, Destination,
-    DiscoveryData, Eirp, Elevation, EndpointDetails, EphemerisData, EphemerisMetaData, Frequency,
+    ConfigDetails, ConfigTypeData, ConnectionDetails, ContactVersion, AzElSegmentsData,
+    DataflowDetail, Destination,
+    DiscoveryData, DownlinkDataflowDetails, Eirp, Elevation, EndpointDetails, EphemerisData,
+    EphemerisMetaData, Frequency,
     FrequencyBandwidth,
-    InvalidParameterException, KmsKey, S3Object, S3RecordingDetails, Source, SpectrumConfig,
-    TrackingOverrides,
+    InvalidParameterException, KmsKey, RangedConnectionDetails, S3Object, S3RecordingDetails,
+    Source, SpectrumConfig,
+    TrackingOverrides, UplinkDataflowDetails,
 };
 
 /// Region used in minted ARNs when the request carries no usable SigV4 credential
@@ -2063,6 +2066,174 @@ pub fn endpoint_name(details: &EndpointDetails) -> Option<&str> {
         .downlink_aws_ground_station_agent_endpoint
         .as_ref()
         .map(|endpoint| endpoint.name.as_str())
+}
+
+/// Refuse an endpoint of a group that carries no name, or one an endpoint already accepted
+/// into the SAME group took.
+///
+/// "The `name` field in each endpoint is used in your mission profile
+/// `DataflowEndpointConfig` to specify which endpoints to use during a contact. When a
+/// contact uses multiple `DataflowEndpointConfig` objects, each `Config` must match a
+/// `DataflowEndpoint` in the same group" (`smithy_query(query="operation",
+/// operation="CreateDataflowEndpointGroup")`). That match is by name, so an endpoint
+/// carrying none, and two endpoints of one group carrying the same one, describe nothing a
+/// `dataflowEndpointConfig` can single out (see
+/// [`ComAmazonawsGroundstationGroundstationState::dataflow_endpoint`]).
+///
+/// `path` is how a refusal spells this item (`endpointDetails[0]`, `endpoints[0]`) and
+/// `member` the endpoint member that describes it, so the refusal names the exact member at
+/// fault; `taken` maps each name already accepted to the `path` of the item that took it,
+/// and this call adds the accepted name to it. Written here rather than in a handler
+/// because every create of a dataflow endpoint group holds its endpoints to the same rule,
+/// whichever member its request carries them in.
+pub fn claim_endpoint_name<'a>(
+    path: &str,
+    member: &str,
+    details: &'a EndpointDetails,
+    taken: &mut HashMap<&'a str, String>,
+) -> Result<(), InvalidParameterException> {
+    let Some(name) = endpoint_name(details) else {
+        return Err(invalid_parameter(
+            &format!("{path}.{member}.name"),
+            format!(
+                "{path} carries no endpoint name; a mission profile's dataflowEndpointConfig \
+                 selects an endpoint of a group by its name, so every endpoint in a dataflow \
+                 endpoint group must have one"
+            ),
+        ));
+    };
+    if let Some(first) = taken.insert(name, path.to_string()) {
+        return Err(invalid_parameter(
+            &format!("{path}.{member}.name"),
+            format!(
+                "{path} and {first} are both named {name:?}; a mission profile's \
+                 dataflowEndpointConfig selects an endpoint of a group by its name, so two \
+                 endpoints of one dataflow endpoint group cannot share one"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The ports a socket address of an endpoint can name.
+///
+/// A dataflow endpoint's address is the TCP/UDP socket Ground Station connects a contact's
+/// stream to, so the only values it can carry are the transport's own port numbers: 1
+/// through 65535, port 0 being the "any port" placeholder a listener asks the kernel to
+/// choose and never an address a stream can be sent to. `SocketAddress$port` and the two
+/// bounds of `IntegerRange` are plain modelled `Integer`s with no `range` of their own
+/// (`smithy_query(query="shape", shape="SocketAddress")`, `smithy_query(query="shape",
+/// shape="IntegerRange")`), so nothing upstream of a handler bounds them.
+pub const PORT_MIN: i32 = 1;
+/// See [`PORT_MIN`].
+pub const PORT_MAX: i32 = 65535;
+
+/// Refuse an endpoint any of whose addresses names a port no socket can be addressed by.
+///
+/// Walks every port-valued member reachable from one `EndpointDetails`, whichever endpoint
+/// member describes it: a `DataflowEndpoint`'s own `address`, an agent endpoint's
+/// `egressAddress`/`ingressAddress`, and the connection pair an uplink or downlink agent
+/// endpoint's `dataflowDetails` carries (`smithy_query(query="closure",
+/// operation="CreateDataflowEndpointGroup")`). `path` is how a refusal spells the item, and
+/// each member is appended to it, so the message names the exact address at fault.
+///
+/// Written here rather than in a handler because every create of a dataflow endpoint group
+/// holds its endpoints' addresses to the same rule.
+pub fn check_endpoint_ports(
+    path: &str,
+    details: &EndpointDetails,
+) -> Result<(), InvalidParameterException> {
+    if let Some(endpoint) = details.endpoint.as_ref() {
+        if let Some(address) = endpoint.address.as_ref() {
+            check_port(&format!("{path}.endpoint.address.port"), address.port)?;
+        }
+    }
+    if let Some(agent) = details.aws_ground_station_agent_endpoint.as_ref() {
+        let agent_path = format!("{path}.awsGroundStationAgentEndpoint");
+        check_connection(&format!("{agent_path}.egressAddress"), &agent.egress_address)?;
+        check_ranged_connection(
+            &format!("{agent_path}.ingressAddress"),
+            &agent.ingress_address,
+        )?;
+    }
+    if let Some(uplink) = details.uplink_aws_ground_station_agent_endpoint.as_ref() {
+        let UplinkDataflowDetails::agentConnectionDetails(connection) = &uplink.dataflow_details;
+        let connection_path = format!(
+            "{path}.uplinkAwsGroundStationAgentEndpoint.dataflowDetails.agentConnectionDetails"
+        );
+        check_connection(
+            &format!("{connection_path}.ingressAddressAndPort"),
+            &connection.ingress_address_and_port,
+        )?;
+        check_ranged_connection(
+            &format!("{connection_path}.agentIpAndPortAddress"),
+            &connection.agent_ip_and_port_address,
+        )?;
+    }
+    if let Some(downlink) = details.downlink_aws_ground_station_agent_endpoint.as_ref() {
+        let DownlinkDataflowDetails::agentConnectionDetails(connection) = &downlink.dataflow_details;
+        let connection_path = format!(
+            "{path}.downlinkAwsGroundStationAgentEndpoint.dataflowDetails.agentConnectionDetails"
+        );
+        check_connection(
+            &format!("{connection_path}.egressAddressAndPort"),
+            &connection.egress_address_and_port,
+        )?;
+        check_ranged_connection(
+            &format!("{connection_path}.agentIpAndPortAddress"),
+            &connection.agent_ip_and_port_address,
+        )?;
+    }
+    Ok(())
+}
+
+/// Refuse a `ConnectionDetails` whose socket address names an unusable port.
+fn check_connection(
+    path: &str,
+    connection: &ConnectionDetails,
+) -> Result<(), InvalidParameterException> {
+    check_port(
+        &format!("{path}.socketAddress.port"),
+        connection.socket_address.port,
+    )
+}
+
+/// Refuse a `RangedConnectionDetails` whose socket address names an unusable port range:
+/// either bound outside the ports a socket can be addressed by, or a range that runs
+/// backwards and so holds no port at all.
+fn check_ranged_connection(
+    path: &str,
+    connection: &RangedConnectionDetails,
+) -> Result<(), InvalidParameterException> {
+    let range_path = format!("{path}.socketAddress.portRange");
+    let range = &connection.socket_address.port_range;
+    check_port(&format!("{range_path}.minimum"), range.minimum)?;
+    check_port(&format!("{range_path}.maximum"), range.maximum)?;
+    if range.minimum > range.maximum {
+        return Err(invalid_parameter(
+            &range_path,
+            format!(
+                "{range_path} has minimum {} above maximum {}; a port range's minimum must \
+                 not exceed its maximum",
+                range.minimum, range.maximum
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse one port value outside [`PORT_MIN`]..=[`PORT_MAX`], naming where it was carried.
+fn check_port(path: &str, port: i32) -> Result<(), InvalidParameterException> {
+    if (PORT_MIN..=PORT_MAX).contains(&port) {
+        return Ok(());
+    }
+    Err(invalid_parameter(
+        path,
+        format!(
+            "{path} is {port}; a dataflow endpoint's port must be between {PORT_MIN} and \
+             {PORT_MAX}"
+        ),
+    ))
 }
 
 /// The `EndpointStatus` a dataflow endpoint carries while the service is still attaching

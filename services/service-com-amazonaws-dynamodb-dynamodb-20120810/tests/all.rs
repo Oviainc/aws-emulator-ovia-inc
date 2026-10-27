@@ -55,6 +55,8 @@ mod key_schema_element_refusals;
 mod kinesis_streaming_destinations;
 #[path = "all/list_imports.rs"]
 mod list_imports;
+#[path = "all/new_table_polling.rs"]
+mod new_table_polling;
 #[path = "all/number_canonicalization.rs"]
 mod number_canonicalization;
 #[path = "all/on_demand_backups.rs"]

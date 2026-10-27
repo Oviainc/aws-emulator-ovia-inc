@@ -409,6 +409,13 @@ pub fn validate_api_mapping_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The refusal an operation addressing a routing rule its domain name does not hold
+/// takes: the message of the modelled `NotFoundException`. Fixed text, naming no value
+/// from the request — the rule the caller asked for is already the resource it
+/// addressed. Shared by every reader and writer of a single routing rule, so the same
+/// identifier is never reported two ways.
+pub const ROUTING_RULE_NOT_FOUND: &str = "Unable to find RoutingRule.";
+
 /// The most routing rules one custom domain name may hold, after which
 /// `CreateRoutingRule` is refused.
 ///
@@ -560,7 +567,6 @@ pub fn routing_rule_arn(domain_name: &str, routing_rule_id: &str, region: &str) 
         &format!("/domainnames/{domain_name}/routingrules/{routing_rule_id}"),
     )
 }
-
 /// The most authorizers one api may hold, after which CreateAuthorizer is refused.
 ///
 /// API Gateway publishes a quota of 10 authorizers per API, so this is the faithful
