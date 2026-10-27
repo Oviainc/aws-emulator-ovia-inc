@@ -222,36 +222,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             summaries.push(summary);
         }
 
-        // `nextToken` is this enumeration's resume point: the id of the first
-        // composite model of the next page, hex-encoded so the token matches the
-        // modelled `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this
-        // enumeration is refused rather than answered with an empty page, which
-        // would report absence as success.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                summaries
-                    .iter()
-                    .position(|summary| summary.id == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime
-        // validates BEFORE this handler runs, so a value that arrives here is
-        // already in range and nothing is being coerced; `max(1)` only keeps the
-        // slice arithmetic below total. The default is the one AWS documents for
-        // this operation.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(summaries.len());
-
-        let next_token = summaries
-            .get(end)
-            .map(|summary| ::hex::encode(summary.id.as_bytes()));
+        // This enumeration's resume point is a composite model's id, and the page walk
+        // every paginated listing of this service shares takes it from there: it
+        // resumes at the token's composite model, refusing a token whose resume point
+        // is not in this enumeration rather than answering an empty page, which would
+        // report absence as success; it cuts the page at `maxResults`, defaulting to
+        // the size AWS documents for this operation; and it mints the next token from
+        // the composite model that follows the page.
+        let page = crate::state::page_of(
+            &summaries,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |summary| summary.id.clone(),
+        )
+        .ok_or_else(invalid_token)?;
 
         Ok(ListAssetModelCompositeModelsOutput {
-            asset_model_composite_model_summaries: summaries[start..end].to_vec(),
-            next_token,
+            asset_model_composite_model_summaries: summaries[page.start..page.end].to_vec(),
+            next_token: page.next_token,
         })
     }
 }
@@ -259,14 +248,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The page size AWS documents for this operation when the caller gives no
 /// `maxResults`.
 const DEFAULT_MAX_RESULTS: i32 = 50;
-
-/// Decode a `nextToken` back into the composite model id it names.
-fn decode_token(token: &str) -> Result<String, ListAssetModelCompositeModelsError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
-}
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
 /// issued.

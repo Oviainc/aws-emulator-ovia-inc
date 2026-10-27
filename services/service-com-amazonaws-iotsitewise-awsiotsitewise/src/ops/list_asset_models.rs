@@ -209,39 +209,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        // `nextToken` is this enumeration's resume point: the id of the first asset
-        // model of the next page, hex-encoded so the token matches the modelled
-        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration
-        // is refused rather than answered with an empty page, which would report
-        // absence as success.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                matching
-                    .iter()
-                    .position(|model| model.id == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime validates
-        // BEFORE this handler runs, so a value that arrives here is already in range
-        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
-        // total. The default is the one AWS documents for this operation.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(matching.len());
+        // This enumeration's resume point is an asset model's id, and the page walk
+        // every paginated listing of this service shares takes it from there: it
+        // resumes at the token's model, refusing a token whose resume point is not in
+        // this enumeration rather than answering an empty page, which would report
+        // absence as success; it cuts the page at `maxResults`, defaulting to the size
+        // AWS documents for this operation; and it mints the next token from the model
+        // that follows the page.
+        let page = crate::state::page_of(
+            &matching,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |model| model.id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
 
-        let next_token = matching
-            .get(end)
-            .map(|model| ::hex::encode(model.id.as_bytes()));
-        let asset_model_summaries = matching[start..end]
+        let asset_model_summaries = matching[page.start..page.end]
             .iter()
             .map(|model| summary(model, now))
             .collect();
 
         Ok(ListAssetModelsOutput {
             asset_model_summaries,
-            next_token,
+            next_token: page.next_token,
         })
     }
 }
@@ -273,14 +264,6 @@ fn summary(
         status: record.status(now),
         version: Some(record.version.to_string()),
     }
-}
-
-/// Decode a `nextToken` back into the asset model id it resumes from.
-fn decode_token(token: &str) -> Result<String, ListAssetModelsError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.

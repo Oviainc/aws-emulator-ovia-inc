@@ -211,36 +211,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.query_id.cmp(&right.query_id))
         });
 
-        // `nextToken` is this enumeration's resume point: the id of the first query
-        // of the next page, hex-encoded so the token stays opaque to the caller. A
-        // token whose resume point is not in this enumeration is refused rather than
-        // answered with an empty page.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                selected
-                    .iter()
-                    .position(|record| record.query_id == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..10000, which the runtime
-        // validates BEFORE this handler runs, so a value that arrives here is
-        // already in range and nothing is being coerced; `max(1)` only keeps the
-        // slice arithmetic below total.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(selected.len());
-        let next_token = selected
-            .get(end)
-            .map(|record| ::hex::encode(record.query_id.as_bytes()));
+        // This enumeration's resume point is a query's `queryId`, and the page walk
+        // every paginated listing of this service shares takes it from there: it
+        // resumes at the token's query, refusing a token whose resume point is not in
+        // this enumeration rather than answering an empty page; it cuts the page at
+        // `maxResults`, defaulting to this service's page size; and it mints the next
+        // token off the query that follows the page.
+        let page = crate::state::page_of(
+            &selected,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |record| record.query_id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
 
         Ok(ListQueriesOutput {
-            queries: selected[start..end]
+            queries: selected[page.start..page.end]
                 .iter()
                 .map(|record| record.summary(now))
                 .collect(),
-            next_token,
+            next_token: page.next_token,
         })
     }
 }
@@ -252,14 +243,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// other paginated listings already use, so a client that pages without asking for
 /// a size sees one page size across the service.
 const DEFAULT_MAX_RESULTS: i32 = 50;
-
-/// Decode a `nextToken` back into the `queryId` it resumes from.
-fn decode_token(token: &str) -> Result<String, ListQueriesError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
-}
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
 /// issued.

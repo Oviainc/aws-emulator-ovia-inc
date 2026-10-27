@@ -192,32 +192,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        // `nextToken` is this enumeration's resume point: the `assetModelId` of the
-        // first summary of the next page, hex-encoded so the token matches the
-        // modelled `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this
-        // enumeration is refused rather than answered with an empty page, which
-        // would report absence as success.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                applied_to
-                    .iter()
-                    .position(|record| record.id == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime validates
-        // BEFORE this handler runs, so a value that arrives here is already in range
-        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
-        // total. The default is the one this operation documents.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(applied_to.len());
+        // This enumeration's resume point is a summary's `assetModelId`, and the page
+        // walk every paginated listing of this service shares takes it from there: it
+        // resumes at the token's model, refusing a token whose resume point is not in
+        // this enumeration rather than answering an empty page, which would report
+        // absence as success; it cuts the page at `maxResults`, defaulting to the size
+        // this operation documents; and it mints the next token off the model that
+        // follows the page.
+        let page = crate::state::page_of(
+            &applied_to,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |record| record.id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
 
-        let next_token = applied_to
-            .get(end)
-            .map(|record| ::hex::encode(record.id.as_bytes()));
-        let interface_relationship_summaries = applied_to[start..end]
+        let interface_relationship_summaries = applied_to[page.start..page.end]
             .iter()
             .map(|record| InterfaceRelationshipSummary {
                 id: record.id.clone(),
@@ -226,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListInterfaceRelationshipsOutput {
             interface_relationship_summaries,
-            next_token,
+            next_token: page.next_token,
         })
     }
 }
@@ -235,14 +226,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// ("The maximum number of results to return for each paginated request. Default:
 /// 50").
 const DEFAULT_MAX_RESULTS: i32 = 50;
-
-/// Decode a `nextToken` back into the `assetModelId` it resumes from.
-fn decode_token(token: &str) -> Result<String, ListInterfaceRelationshipsError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
-}
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
 fn invalid_token() -> ListInterfaceRelationshipsError {

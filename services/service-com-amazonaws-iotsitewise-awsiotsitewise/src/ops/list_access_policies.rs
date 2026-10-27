@@ -202,38 +202,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        // `nextToken` is this enumeration's resume point: the id of the first policy of
-        // the next page, hex-encoded so the token deterministically matches the modelled
-        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration is
-        // refused rather than answered with an empty page, which would report a lost
-        // resume point as success.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                selected
-                    .iter()
-                    .position(|record| record.id == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime validates
-        // BEFORE this handler runs, so a value that arrives here is already in range and
-        // nothing is being coerced; `max(1)` only keeps the slice arithmetic below
-        // total. The default is the one this operation's `maxResults` documents.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(selected.len());
+        // This enumeration's resume point is a policy's id, and the page walk every
+        // paginated listing of this service shares takes it from there: it resumes at
+        // the token's policy, refusing a token whose resume point is not in this
+        // enumeration rather than answering an empty page, which would report a lost
+        // resume point as success; it cuts the page at `maxResults`, defaulting to the
+        // size this operation's `maxResults` documents; and it mints "the token for the
+        // next set of results, or null if there are no additional results" from the
+        // policy that follows the page.
+        let page = crate::state::page_of(
+            &selected,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |record| record.id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
 
-        // "The token for the next set of results, or null if there are no additional
-        // results": issued only when a policy follows this page.
-        let next_token = selected
-            .get(end)
-            .map(|record| ::hex::encode(record.id.as_bytes()));
-        let access_policy_summaries = selected[start..end].iter().copied().map(summary).collect();
+        let access_policy_summaries = selected[page.start..page.end]
+            .iter()
+            .copied()
+            .map(summary)
+            .collect();
 
         Ok(ListAccessPoliciesOutput {
             access_policy_summaries,
-            next_token,
+            next_token: page.next_token,
         })
     }
 }
@@ -412,14 +406,6 @@ fn summary(record: &crate::state::AccessPolicyRecord) -> AccessPolicySummary {
         creation_date: Some(crate::state::to_date_time(record.creation_date)),
         last_update_date: Some(crate::state::to_date_time(record.last_update_date)),
     }
-}
-
-/// Decode a `nextToken` back into the access-policy id it resumes from.
-fn decode_token(token: &str) -> Result<String, ListAccessPoliciesError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
 }
 
 /// HTTP 500 `InternalFailureException`: the store this operation needs is not there.

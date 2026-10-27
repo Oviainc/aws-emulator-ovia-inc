@@ -6227,6 +6227,83 @@ impl BatchCursor {
 /// What joins the two halves of a token [`BatchCursor::encode`] builds.
 const BATCH_CURSOR_SEPARATOR: char = ':';
 
+/// One page of an ordered enumeration: the half-open `[start, end)` span of it
+/// this call answers with, and the token the next call resumes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page {
+    /// Index of the first entry of this page in the ordered enumeration.
+    pub start: usize,
+    /// Index one past the last entry of this page.
+    pub end: usize,
+    /// The token that resumes at the entry after this page, or `None` when the
+    /// page exhausts the enumeration — "the token for the next set of results,
+    /// or null if there are no additional results".
+    pub next_token: Option<String>,
+}
+
+/// The page of `items` a paginated listing answers with: resume where
+/// `next_token` names, take at most `max_results` entries (or
+/// `default_max_results` when the caller sends none), and mint the next token
+/// from the entry that follows.
+///
+/// ONE recipe for every listing of this service that pages by a resume KEY taken
+/// off its entries, so the token format, the page size and what counts as a
+/// token this service never issued cannot drift between operations. `key` is the
+/// entry's resume key — unique within the enumeration and stable across calls,
+/// which is what makes a token resumable; it is carried in the token hex-encoded,
+/// keeping the text inside the `^[A-Za-z0-9+/=]+$` pattern the paging members of
+/// this service carry.
+///
+/// `None` for a `next_token` this service never issued — text that is not the hex
+/// of a resume key, or a key no entry of this enumeration carries. Its caller
+/// answers that with the modelled refusal for an invalid `nextToken`, rather than
+/// with an empty page, which would report absence as success.
+pub fn page_of<T, K, S>(
+    items: &[T],
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+    default_max_results: i32,
+    key: K,
+) -> Option<Page>
+where
+    K: Fn(&T) -> S,
+    S: AsRef<str>,
+{
+    let start = match next_token {
+        Some(token) => {
+            let resume = decode_page_token(token)?;
+            items.iter().position(|item| key(item).as_ref() == resume)?
+        }
+        None => 0,
+    };
+    // A page size the model's own range forbids cannot reach a handler — the
+    // runtime validates `maxResults` before one runs — so `max(1)` only keeps
+    // the slice arithmetic below total.
+    let max_results = max_results.unwrap_or(default_max_results).max(1) as usize;
+    let end = start.saturating_add(max_results).min(items.len());
+    let next_token = items
+        .get(end)
+        .map(|item| encode_page_token(key(item).as_ref()));
+    Some(Page {
+        start,
+        end,
+        next_token,
+    })
+}
+
+/// A resume key as the opaque `nextToken` that resumes at it.
+pub fn encode_page_token(resume: &str) -> String {
+    ::hex::encode(resume.as_bytes())
+}
+
+/// The resume key `token` encodes, or `None` for text this service never issued
+/// as a token.
+pub fn decode_page_token(token: &str) -> Option<String> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
 /// The `Quality` a TQV that names none carries.
 ///
 /// `AssetPropertyValue$quality` is optional and the enum's values are `GOOD`,

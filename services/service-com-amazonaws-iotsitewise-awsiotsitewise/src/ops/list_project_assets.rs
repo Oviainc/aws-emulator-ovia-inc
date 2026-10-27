@@ -171,35 +171,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // asset id. A stable total order is what makes `nextToken` resumable.
         let asset_ids: Vec<String> = project.asset_ids.iter().cloned().collect();
 
-        // `nextToken` is this enumeration's resume point: the asset id the next page
-        // starts at, hex-encoded so the token matches the modelled
-        // `^[A-Za-z0-9+/=]+$` and stays opaque to the caller. A token whose resume
-        // point is not in this enumeration is refused rather than answered with an
-        // empty page.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                asset_ids
-                    .iter()
-                    .position(|asset_id| *asset_id == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime validates
-        // BEFORE this handler runs, so a value that arrives here is already in range
-        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
-        // total. The default is the one AWS documents for this operation.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(asset_ids.len());
-
-        // "The token for the next set of results, or null if there are no additional
-        // results": issued only when an asset follows this page.
-        let next_token = asset_ids.get(end).map(::hex::encode);
+        // This enumeration's resume point is an asset id, and the page walk every
+        // paginated listing of this service shares takes it from there: it resumes at
+        // the token's asset, refusing a token whose resume point is not in this
+        // enumeration rather than answering an empty page; it cuts the page at
+        // `maxResults`, defaulting to the size AWS documents for this operation; and it
+        // mints "the token for the next set of results, or null if there are no
+        // additional results" from the asset that follows the page.
+        let page = crate::state::page_of(
+            &asset_ids,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |asset_id| asset_id.clone(),
+        )
+        .ok_or_else(invalid_token)?;
 
         Ok(ListProjectAssetsOutput {
-            asset_ids: asset_ids[start..end].to_vec(),
-            next_token,
+            asset_ids: asset_ids[page.start..page.end].to_vec(),
+            next_token: page.next_token,
         })
     }
 }
@@ -207,14 +197,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The page size AWS documents for this operation when the caller gives no
 /// `maxResults`: "Default: 50".
 const DEFAULT_MAX_RESULTS: i32 = 50;
-
-/// Decode a `nextToken` back into the asset id it resumes from.
-fn decode_token(token: &str) -> Result<String, ListProjectAssetsError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
-}
 
 /// HTTP 500 `InternalFailureException`: the store this operation needs is not there.
 fn internal_failure() -> ListProjectAssetsError {

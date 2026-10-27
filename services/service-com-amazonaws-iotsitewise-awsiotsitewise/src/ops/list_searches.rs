@@ -258,39 +258,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.search_id.cmp(&right.search_id))
         });
 
-        // `nextToken` is this enumeration's resume point: the id of the first search of
-        // the next page, hex-encoded so the token stays opaque to the caller and keeps
-        // the `^[A-Za-z0-9+/=]+$` form the member models. A token whose resume point is
-        // not in this enumeration is refused rather than answered with an empty page.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                selected
-                    .iter()
-                    .position(|record| record.search_id == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // "The maximum number of searches to return in a single page. Valid range is 1
-        // to 1,000; if omitted, a service-defined default is used." The modelled range
-        // is validated BEFORE this handler runs, so a value that arrives here is
-        // already in range and nothing is being coerced; `max(1)` only keeps the slice
-        // arithmetic below total.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(selected.len());
-        let next_token = selected
-            .get(end)
-            .map(|record| ::hex::encode(record.search_id.as_bytes()));
+        // This enumeration's resume point is a search's id, and the page walk every
+        // paginated listing of this service shares takes it from there: it resumes at
+        // the token's search, refusing a token whose resume point is not in this
+        // enumeration rather than answering an empty page; it cuts the page at "the
+        // maximum number of searches to return in a single page", defaulting to this
+        // service's page size when the member is omitted; and it mints the next token
+        // off the search that follows the page.
+        let page = crate::state::page_of(
+            &selected,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |record| record.search_id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
 
         // `get` rather than a slice index: the bounds above are derived from the
         // request, so the page is taken in a form that cannot panic whatever they
         // resolve to.
-        let page = selected.get(start..end).unwrap_or_default();
+        let searches = selected.get(page.start..page.end).unwrap_or_default();
 
         Ok(ListSearchesOutput {
-            search_summaries: page.iter().map(|record| summary(record, now)).collect(),
-            next_token,
+            search_summaries: searches.iter().map(|record| summary(record, now)).collect(),
+            next_token: page.next_token,
         })
     }
 }
@@ -325,14 +316,6 @@ fn summary(record: &crate::state::SearchRecord, now: ::std::time::SystemTime) ->
 /// instant and a modelled `Timestamp` bound compare at one precision.
 fn started_nanos(record: &crate::state::SearchRecord) -> i128 {
     crate::state::date_time_nanos(&crate::state::to_date_time(record.started_at))
-}
-
-/// Decode a `nextToken` back into the `searchId` it resumes from.
-fn decode_token(token: &str) -> Result<String, ListSearchesError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.

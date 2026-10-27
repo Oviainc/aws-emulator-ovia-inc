@@ -590,3 +590,10 @@ mod list_access_policies;
 #[path = "all/dataset_data_segment_disassociation.rs"]
 mod dataset_data_segment_disassociation;
 
+// Declared at the very END of this file, after every suite above, for the reason
+// the notes higher up give: the sorted list and the stretches of declarations
+// ahead of it are where every concurrent iotsitewise change inserts a
+// declaration of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/shared_page_walk.rs"]
+mod shared_page_walk;
+

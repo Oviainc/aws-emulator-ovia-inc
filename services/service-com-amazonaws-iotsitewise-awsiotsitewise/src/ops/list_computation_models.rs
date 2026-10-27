@@ -192,39 +192,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        // `nextToken` is this enumeration's resume point: the id of the first
-        // computation model of the next page, hex-encoded so the token matches the
-        // modelled `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this
-        // enumeration is refused rather than answered with an empty page, which would
-        // report absence as success.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                matching
-                    .iter()
-                    .position(|(model, _)| model.id == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime validates
-        // BEFORE this handler runs, so a value that arrives here is already in range
-        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
-        // total.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(matching.len());
+        // This enumeration's resume point is a computation model's id, and the page
+        // walk every paginated listing of this service shares takes it from there: it
+        // resumes at the token's model, refusing a token whose resume point is not in
+        // this enumeration rather than answering an empty page, which would report
+        // absence as success; it cuts the page at `maxResults`, defaulting to this
+        // service's page size; and it mints "the token for the next set of results, or
+        // null if there are no additional results" off the model that follows the page,
+        // so a page that leaves nothing to resume from reports no token at all.
+        let page = crate::state::page_of(
+            &matching,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |(model, _)| model.id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
 
         Ok(ListComputationModelsOutput {
-            computation_model_summaries: matching[start..end]
+            computation_model_summaries: matching[page.start..page.end]
                 .iter()
                 .map(|(model, model_type)| summary(model, model_type, now))
                 .collect(),
-            // "The token for the next set of results, or null if there are no
-            // additional results": a page that leaves nothing to resume from reports
-            // no token at all.
-            next_token: matching
-                .get(end)
-                .map(|(model, _)| ::hex::encode(model.id.as_bytes())),
+            next_token: page.next_token,
         })
     }
 }
@@ -258,14 +248,6 @@ fn summary(
         status: record.status(now),
         version: record.version_label(),
     }
-}
-
-/// Decode a `nextToken` back into the computation model id it resumes from.
-fn decode_token(token: &str) -> Result<String, ListComputationModelsError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never

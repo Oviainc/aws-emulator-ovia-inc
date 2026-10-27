@@ -297,39 +297,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        // `nextToken` is this enumeration's resume point: the id of the first asset of
-        // the next page, hex-encoded so the token matches the modelled
-        // `^[A-Za-z0-9+/=]+$`, exactly as `ListAssets` encodes its own. A token whose
-        // resume point is not in this enumeration is refused rather than answered with
-        // an empty page.
-        let start = match input.next_token.as_deref() {
-            Some(token) => {
-                let resume = decode_token(token)?;
-                matching
-                    .iter()
-                    .position(|asset| asset.id == resume)
-                    .ok_or_else(invalid_token)?
-            }
-            None => 0,
-        };
-        // `maxResults` carries the modelled range 1..250, which the runtime validates
-        // BEFORE this handler runs, so a value that arrives here is already in range
-        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
-        // total. The default is the one this operation's docs publish.
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
-        let end = start.saturating_add(max_results).min(matching.len());
+        // This enumeration's resume point is an asset's id, and the page walk every
+        // paginated listing of this service shares takes it from there, exactly as
+        // `ListAssets` pages its own: it resumes at the token's asset, refusing a token
+        // whose resume point is not in this enumeration rather than answering an empty
+        // page; it cuts the page at `maxResults`, defaulting to the size this
+        // operation's docs publish; and it mints the next token from the asset that
+        // follows the page.
+        let page = crate::state::page_of(
+            &matching,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |asset| asset.id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
 
-        let next_token = matching
-            .get(end)
-            .map(|asset| ::hex::encode(asset.id.as_bytes()));
-        let asset_summaries = matching[start..end]
+        let asset_summaries = matching[page.start..page.end]
             .iter()
             .map(|asset| associated_summary(asset, now))
             .collect();
 
         Ok(ListAssociatedAssetsOutput {
             asset_summaries,
-            next_token,
+            next_token: page.next_token,
         })
     }
 }
@@ -409,14 +400,6 @@ fn hierarchy_not_found(label: &str) -> ListAssociatedAssetsError {
             message: crate::state::hierarchy_not_found_message(label),
         }),
     )
-}
-
-/// Decode a `nextToken` back into the asset id it resumes from.
-fn decode_token(token: &str) -> Result<String, ListAssociatedAssetsError> {
-    ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(invalid_token)
 }
 
 /// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
