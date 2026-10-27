@@ -14,7 +14,7 @@
 //! listed for it holds — the matching Amazon SNS documents for its filter policies. The
 //! grammar is Amazon's own and no crate implements it, so it is read here: a condition
 //! is a value to equal, or one of the documented operator objects (`prefix`, `suffix`,
-//! `equals-ignore-case`, `anything-but`, `numeric`, `exists`, `$or`).
+//! `equals-ignore-case`, `anything-but`, `numeric`, `cidr`, `exists`, `$or`).
 //!
 //! Nothing here reads the subscription's own records: the decision is a function of the
 //! stored policy, the stored scope and the published message, so the same message is
@@ -115,6 +115,13 @@ const ANYTHING_BUT_OPERATOR: &str = "anything-but";
 
 /// The operator that compares a numeric value against a list of relations.
 const NUMERIC_OPERATOR: &str = "numeric";
+
+/// The operator that matches an IP ADDRESS against a network: "IP address matching" (Amazon
+/// SNS Developer Guide, "Amazon SNS subscription filter policy"), whose argument is the CIDR
+/// block the address has to lie in. The comparison itself is
+/// [`super::message_filter::matches_cidr`], because an address in a network is not a string
+/// comparison.
+const CIDR_OPERATOR: &str = "cidr";
 
 /// The operator that matches on a property being present, or being absent.
 const EXISTS_OPERATOR: &str = "exists";
@@ -365,6 +372,9 @@ fn matches_operator(
                 .any(|value| matches_numeric(relations, value)),
             _ => false,
         },
+        CIDR_OPERATOR => values
+            .iter()
+            .any(|value| super::message_filter::matches_cidr(value, argument)),
         // An operator this service does not read matches nothing: a message is withheld
         // rather than delivered to a subscriber whose condition was not applied.
         _ => false,

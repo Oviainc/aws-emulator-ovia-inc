@@ -42,6 +42,9 @@ use smithy_server_runtime::MultiServiceRouter;
 // The awsQuery wire helpers this test crate publishes ONCE, in `query_wire`: a suite that
 // writes its own percent-encoder or element reader drifts from the others.
 use crate::query_wire::{elements, form_encode, opt_element};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 
 /// The region every request here is signed for, and so the region the stack's IPSets
 /// belong to.
@@ -772,11 +775,23 @@ async fn an_ip_set_waf_regional_refuses_to_configure_fails_the_stack() {
             "case {case:?}: expected the failed create to be rolled back rather than \
              publish an IPSet that is not the one declared, got {body}"
         );
+        // The STACK's reason summarises which resource failed; AWS WAF Regional's own
+        // refusal is reported on that resource's event.
         let reason = opt_element(&body, "StackStatusReason").unwrap_or_default();
+        assert_eq!(
+            reason,
+            resource_failure_summary(failed_action::CREATE, ["Blocked"]),
+            "case {case:?}: expected the stack reason to summarise what failed, got \
+             {reason:?}"
+        );
+        let (_, events) =
+            cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
         assert!(
-            reason.contains("Blocked") && reason.contains(expected_code),
-            "case {case:?}: expected the reason to name the resource and the refusal \
-             {expected_code}, got {reason:?}"
+            elements(&events, "ResourceStatusReason")
+                .iter()
+                .any(|reported| reported.contains("Resource handler returned message:")),
+            "case {case:?}: expected the failing resource's event to carry the refusal \
+             {expected_code}, got {events}"
         );
 
         // And nothing was left behind in the service: the IPSet the first call created was

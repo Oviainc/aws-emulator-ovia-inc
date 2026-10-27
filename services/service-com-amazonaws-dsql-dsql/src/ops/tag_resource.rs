@@ -215,10 +215,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(TagResourceErrorModeled::ValidationException(invalid).into());
         }
 
+        let region = crate::state::request_region(ctx);
         let mut state = state.lock();
         // Materialise what the clock already owes before the lookup, so a cluster
         // whose deletion came due is not found here either.
         state.settle(std::time::SystemTime::now());
+
+        // The identity every modelled error below reports for the addressed resource:
+        // its own type segment and its own identifier, so a stream of a cluster is
+        // named as a stream rather than as the cluster segment the ARN read split at.
+        let identity = state.addressed_identity(&resource, &region);
 
         // The one resolution of a tagging ARN, shared with `ListTagsForResource` and
         // `UntagResource`: it walks every tagged resource of this service — a cluster,
@@ -228,14 +234,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN naming nothing this store holds answers the modelled 404, whichever of
         // the two it names — and an ARN of another region, account or partition names
         // a resource this endpoint neither reads nor writes, so it is absent here too.
-        let Some(held) = state.resource_tags_mut(&resource, &crate::state::request_region(ctx))
-        else {
+        let Some(held) = state.resource_tags_mut(&resource, &region) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
-                    &input.resource_arn,
-                    &resource.resource_id,
-                    &resource.resource_type,
-                ),
+                identity.not_found(&input.resource_arn),
             )
             .into());
         };
@@ -258,8 +259,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          the maximum of {} tags per resource.",
                         crate::state::MAX_TAGS_PER_RESOURCE
                     ),
-                    resource_id: resource.resource_id.clone(),
-                    resource_type: resource.resource_type.clone(),
+                    resource_id: identity.resource_id.clone(),
+                    resource_type: identity.resource_type.clone(),
                     service_code: crate::state::ARN_SERVICE.to_string(),
                     quota_code: "tags-per-resource".to_string(),
                 },

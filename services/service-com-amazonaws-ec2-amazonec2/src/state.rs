@@ -6189,7 +6189,23 @@ impl ComAmazonawsEc2Amazonec2State {
         // `available` once its due instant has passed, whether or not anybody called — the
         // same contract as a `pending` VPC's move above.
         for record in self.vpn_connections.values_mut() {
-            let VpnConnectionRecord { view, route_moves } = record;
+            let VpnConnectionRecord {
+                view,
+                route_moves,
+                pending: connection_move,
+            } = record;
+            // A connection `DeleteVpnConnection` left `deleting` reaches the terminal
+            // `deleted` at the instant that write recorded for it, whether or not anybody
+            // called again — the same contract as the virtual private gateway's own move
+            // below.
+            if let Some(state) = connection_move
+                .as_ref()
+                .and_then(|owed| owed.due_by(now))
+                .map(str::to_string)
+            {
+                view.state = Some(state);
+                *connection_move = None;
+            }
             route_moves.retain(|destination_cidr_block, pending| {
                 let Some(state) = pending.due_by(now).map(str::to_string) else {
                     return true;
@@ -30839,6 +30855,17 @@ pub const VPN_STATIC_ROUTE_SOURCE_STATIC: &str = "Static";
 /// The code EC2 answers for a VPN connection id this account holds no connection for.
 pub const INVALID_VPN_CONNECTION_ID: &str = "InvalidVpnConnectionId";
 
+/// The code EC2 answers a request that DELETES the connection a VPN connection id names when
+/// this account holds no connection for it.
+///
+/// NOT [`INVALID_VPN_CONNECTION_ID`], and the recorded wire corpus is why: the STATIC ROUTE
+/// surface of this resource answers `InvalidVpnConnectionId` with its own wording
+/// ([`invalid_vpn_connection_id`]), while the delete of the connection itself answers this
+/// `.NotFound` code worded the way this module words every missing resource id. A client
+/// branches on the code it is actually answered, so the two are kept apart rather than folded
+/// into one.
+pub const INVALID_VPN_CONNECTION_ID_NOT_FOUND: &str = "InvalidVpnConnectionID.NotFound";
+
 /// The code EC2 answers for a request that would take a VPN connection past the number of
 /// static routes it can hold — EC2's own `RouteLimitExceeded`, "you've reached the limit on
 /// the number of routes that you can add" (EC2 API error codes).
@@ -30866,6 +30893,21 @@ pub fn invalid_vpn_connection_id<E>(vpn_connection_id: &str) -> Scaffolded<E> {
              does not exist",
             owner = ::engine::emulator_account_id(),
         ),
+    )
+}
+
+/// Refuse a request that named a VPN connection id this account holds no connection for, as
+/// the operations that act on the CONNECTION ITSELF answer it: HTTP 400
+/// [`INVALID_VPN_CONNECTION_ID_NOT_FOUND`], worded by the one place this module words a
+/// missing resource id ([`id_not_found`]).
+///
+/// Reached through [`ComAmazonawsEc2Amazonec2State::require_vpn_connection_mut`], which is
+/// what those operations resolve an id through.
+pub fn invalid_vpn_connection_id_not_found<E>(vpn_connection_id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_VPN_CONNECTION_ID_NOT_FOUND,
+        "vpnConnection ID",
+        vpn_connection_id,
     )
 }
 
@@ -30916,6 +30958,9 @@ pub struct VpnConnectionRecord {
     /// The move the clock owes one static route, by destination CIDR block, while one is
     /// owed. A route that has reached its terminal state has no entry here.
     pub route_moves: BTreeMap<String, PendingStateMove>,
+    /// The `VpnState` the clock owes the CONNECTION itself while it is in a non-terminal one:
+    /// `deleted` after a delete has been asked for. `None` once nothing is owed.
+    pub pending: Option<PendingStateMove>,
 }
 
 impl VpnConnectionRecord {
@@ -30950,6 +30995,28 @@ impl VpnConnectionRecord {
             .map(|route| route.destination_cidr_block.as_deref().unwrap_or_default().len())
             .sum();
         tag_list_bytes(self.view.tags.as_deref().unwrap_or_default()).saturating_add(routes)
+    }
+
+    /// Start this connection's deletion: move it into the non-terminal `deleting` state, the
+    /// `VpnState` of a connection whose tunnels are being torn down, and record the
+    /// [`VPN_STATE_DELETED`] the clock then owes it one [`TRANSITION_DELAY`] later.
+    ///
+    /// `deleting` and `deleted` are both `VpnState` members, so a connection a delete has
+    /// been asked for is still a connection the API reports rather than a record that
+    /// vanishes. One already on its way out is left exactly as it is — the deletion this call
+    /// asks for is the one already under way, so repeating the request neither reports a
+    /// second deletion nor postpones the first by restarting its due instant. The static
+    /// routes it carries keep the state their own operations left them in: what a delete
+    /// moves is the connection, which is what a caller branches on.
+    ///
+    /// Reach it through [`ComAmazonawsEc2Amazonec2State::require_vpn_connection_mut`], the
+    /// one place an operation resolves the connection it is about.
+    pub fn begin_deletion(&mut self) {
+        if matches!(self.state(), VPN_STATE_DELETING | VPN_STATE_DELETED) {
+            return;
+        }
+        self.view.state = Some(VPN_STATE_DELETING.to_string());
+        self.pending = Some(PendingStateMove::starting_now(VPN_STATE_DELETED));
     }
 
     /// Put the static route for `destination_cidr_block` into this connection and answer it
@@ -31008,6 +31075,29 @@ impl ComAmazonawsEc2Amazonec2State {
         self.vpn_connections.get(vpn_connection_id)
     }
 
+    /// The VPN connection `vpn_connection_id` names, for a writer — or the one refusal the
+    /// operations that act on the CONNECTION ITSELF answer for a value they cannot resolve:
+    /// [`invalid_vpn_connection_id_not_found`].
+    ///
+    /// The static-route surface of the same resource resolves its `VpnConnectionId` through
+    /// [`Self::vpn_connection`] and [`invalid_vpn_connection_id`] instead, which is a
+    /// deliberate second wording rather than a violated invariant: the recorded corpus shows
+    /// EC2 answering the two surfaces with different codes.
+    ///
+    /// There is no second refusal for an id that is not shaped like a `VpnConnectionId`:
+    /// `smithy_query(query="shape",shape="VpnConnectionId")` is a plain string with no
+    /// pattern, so nothing here knows the form of an id this service did not mint, and every
+    /// value that resolves to no connection is answered the same way — as it is on that
+    /// static-route surface.
+    pub fn require_vpn_connection_mut<E>(
+        &mut self,
+        vpn_connection_id: &str,
+    ) -> Result<&mut VpnConnectionRecord, Scaffolded<E>> {
+        self.vpn_connections
+            .get_mut(vpn_connection_id)
+            .ok_or_else(|| invalid_vpn_connection_id_not_found(vpn_connection_id))
+    }
+
     /// Store a VPN connection and answer the `VpnConnectionId` it was given — or `None`
     /// when the store is at [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored.
     ///
@@ -31026,6 +31116,9 @@ impl ComAmazonawsEc2Amazonec2State {
         let record = VpnConnectionRecord {
             view,
             route_moves: BTreeMap::new(),
+            // A connection is stored in the state its writer gave it, with nothing owed: the
+            // move a delete owes is recorded by [`VpnConnectionRecord::begin_deletion`].
+            pending: None,
         };
         self.add_stored_bytes(STORED_RECORD_OVERHEAD_BYTES + record.payload_bytes());
         self.vpn_connections

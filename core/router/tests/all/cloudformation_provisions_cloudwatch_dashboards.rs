@@ -43,6 +43,9 @@ use smithy_server_runtime::MultiServiceRouter;
 // a suite that writes its own drifts from the others, so this one calls them.
 use crate::query_wire::{elements, form_encode, opt_element};
 use crate::rds_docdb_neptune_signing_name_routing::authorization;
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 
 /// The region every request here is signed for, and so the region the stack belongs to.
 const REGION: &str = "us-west-2";
@@ -895,8 +898,8 @@ async fn a_renamed_dashboard_replaces_the_one_it_displaces() {
 }
 
 /// One row of the refusal table: the case, the stack's name, the dashboard's declared
-/// `Properties`, the error code CloudWatch answers the create with, and the `(status, code)`
-/// the read-back then answers.
+/// `Properties`, the fragment of CloudWatch's own message the failing resource's event must
+/// carry, and the `(status, code)` the read-back then answers.
 type Refused = (
     &'static str,
     &'static str,
@@ -907,6 +910,11 @@ type Refused = (
 
 /// A dashboard CloudWatch REFUSES to create fails the stack with the refusal that service
 /// answered, and nothing is created — never a stack that completed while no dashboard exists.
+///
+/// Where each half of that failure is reported is part of the rule: the STACK's own
+/// `StackStatusReason` is the summary sentence naming the logical resources the operation
+/// could not create and nothing more, while CloudWatch's own refusal is the failing
+/// resource's diagnosis and travels on that resource's `StackEvent$ResourceStatusReason`.
 #[tokio::test]
 async fn a_dashboard_cloudwatch_refuses_fails_the_stack() {
     // Rows differ along WHICH of the operation's modelled refusals the declaration earns:
@@ -922,19 +930,19 @@ async fn a_dashboard_cloudwatch_refuses_fails_the_stack() {
                 "DashboardName": "cwdash-bad-body-board",
                 "DashboardBody": "not a dashboard document",
             }),
-            "DashboardInvalidInputError",
+            "The field DashboardBody must be a valid JSON object",
             (404, "DashboardNotFoundError"),
         ),
         (
             "a name carrying a character the rule does not admit",
             "cwdash-bad-name",
             json!({"DashboardName": "cwdash.bad.name", "DashboardBody": "{}"}),
-            "InvalidParameterValueException",
+            "The value for field DashboardName contains invalid characters",
             (400, "InvalidParameterValueException"),
         ),
     ];
 
-    for (case, stack_name, properties, code, read_back) in rows {
+    for (case, stack_name, properties, refusal, read_back) in rows {
         let router = build_router();
         let body = create_and_settle(
             &router,
@@ -951,10 +959,20 @@ async fn a_dashboard_cloudwatch_refuses_fails_the_stack() {
              a dashboard nothing holds, got {body}"
         );
         let reason = opt_element(&body, "StackStatusReason").unwrap_or_default();
+        assert_eq!(
+            reason,
+            resource_failure_summary(failed_action::CREATE, ["Dashboard"]),
+            "case {case:?}: expected the stack reason to be the summary of which resources \
+             failed, got {reason:?}"
+        );
+        let (_, events) =
+            cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
         assert!(
-            reason.contains("Dashboard") && reason.contains(code),
-            "case {case:?}: expected the reason to name the resource and CloudWatch's own \
-             {code}, got {reason:?}"
+            elements(&events, "ResourceStatusReason")
+                .iter()
+                .any(|reported| reported.contains(refusal)),
+            "case {case:?}: expected the failing resource's own event to carry CloudWatch's \
+             refusal {refusal:?}, got {events}"
         );
 
         let name = properties

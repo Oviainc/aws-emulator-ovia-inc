@@ -92,6 +92,11 @@ use super::types::*;
 ///   a parameter set past [`crate::state::MAX_PARAMETERS`] is refused rather than
 ///   stored — the same bound `CreateConfigurationManager` applies to the definitions it
 ///   stores, so an update can never put a definition past what a create may hold;
+/// * a definition is deployed where its parameters say, so the parameter set this
+///   request writes must name somewhere to deploy to and must name no more deployments
+///   than may be served; [`crate::state::deployment_targets_rejection`] is the one place
+///   that rule lives, shared with the create that stores a definition, and it reads the
+///   same parameters the fan-out below deploys from;
 /// * `LocalDeploymentAdministrationRoleArn` is an `IAMRoleArn`, whose
 ///   `@arnReference` to `AWS::IAM::Role` the model states with no `@pattern` to enforce
 ///   it; [`crate::state::iam_role_arn_rejection`] is the one place that rule lives,
