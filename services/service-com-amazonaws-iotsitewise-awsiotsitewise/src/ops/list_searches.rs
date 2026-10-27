@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSearches
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSearches`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation enumerates the searches `StartSearch` recorded for the
+//! workspace a request names, most recently started first, narrowed by every optional
+//! filter the request carried and paged by `maxResults`/`nextToken`; this is the ONLY
+//! file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSearches::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read: every member of every summary is DERIVED from the stored search and the
+//! instant the clock has reached, so a listing moves no search along.
 //!
 //! ## Shape of an operation
 //!
@@ -162,20 +160,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSearches` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSearchesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSearches"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // A read: every value reported below is DERIVED from the stored search and the
+        // instant the clock has reached, so this listing moves no search on and two
+        // readers of one search cannot disagree about where it has got to.
+        let store = state.lock();
+
+        // The listing is scoped to ONE workspace, so that workspace has to exist: a
+        // name this service does not hold is the modelled refusal rather than an empty
+        // page. Resolved BEFORE the filters are read, as every handler in this crate
+        // resolves the resource its path names first, so a request that is wrong in
+        // both ways reports the resource that is absent.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            )));
+        }
+
+        // Each entry of `statusFilter` and of `searchTypeFilter` names a value of a
+        // modelled enum, which the runtime refuses outside its value set BEFORE this
+        // handler runs, so a filter that arrives here names statuses and strategies
+        // this service can report.
+        let filters = input.list_searches_filters.clone().unwrap_or_default();
+
+        // "Returns only searches started at or after this time" / "at or before this
+        // time": the window is CLOSED at both ends, so one whose end precedes its start
+        // names no instant at all — refused the way every other range this service
+        // takes is (cf. `ListEnrichmentJobs`).
+        let after = filters
+            .started_after
+            .as_ref()
+            .map(crate::state::date_time_nanos);
+        let until = filters
+            .started_before
+            .as_ref()
+            .map(crate::state::date_time_nanos);
+        if let (Some(after), Some(until)) = (after, until) {
+            if until < after {
+                return Err(invalid_request(
+                    "The end of the range must not be earlier than its start.".to_string(),
+                ));
+            }
+        }
+
+        // Every search of the named workspace that satisfies EVERY filter the request
+        // carried: "When multiple filters are set, a search must match all of them."
+        // The status compared against is the one the CLOCK has made due, which is the
+        // same one the summary reports, so a filtered page can never disagree with the
+        // summaries in it.
+        let mut selected: Vec<&crate::state::SearchRecord> = store
+            .searches
+            .values()
+            .filter(|record| record.workspace_name == input.workspace_name)
+            .filter(|record| {
+                filters
+                    .status_filter
+                    .as_deref()
+                    .is_none_or(|wanted| wanted.iter().any(|one| one == record.status(now)))
+            })
+            .filter(|record| {
+                filters
+                    .search_type_filter
+                    .as_deref()
+                    .is_none_or(|wanted| wanted.contains(&record.search_type))
+            })
+            // A search filed under no group is in no group a filter can name, so a
+            // request that filters by group reports none of them.
+            .filter(|record| {
+                filters.group_id_filter.as_deref().is_none_or(|wanted| {
+                    record
+                        .group_id
+                        .as_ref()
+                        .is_some_and(|group| wanted.contains(group))
+                })
+            })
+            .filter(|record| {
+                let started = started_nanos(record);
+                after.is_none_or(|after| started >= after)
+                    && until.is_none_or(|until| started <= until)
+            })
+            .collect();
+
+        // "Lists the searches in a workspace, most recently started first", with ties
+        // broken by id so two searches started in the same instant still order
+        // deterministically — which is also what makes `nextToken` resumable.
+        selected.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then_with(|| left.search_id.cmp(&right.search_id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the id of the first search of
+        // the next page, hex-encoded so the token stays opaque to the caller and keeps
+        // the `^[A-Za-z0-9+/=]+$` form the member models. A token whose resume point is
+        // not in this enumeration is refused rather than answered with an empty page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                selected
+                    .iter()
+                    .position(|record| record.search_id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // "The maximum number of searches to return in a single page. Valid range is 1
+        // to 1,000; if omitted, a service-defined default is used." The modelled range
+        // is validated BEFORE this handler runs, so a value that arrives here is
+        // already in range and nothing is being coerced; `max(1)` only keeps the slice
+        // arithmetic below total.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(selected.len());
+        let next_token = selected
+            .get(end)
+            .map(|record| ::hex::encode(record.search_id.as_bytes()));
+
+        // `get` rather than a slice index: the bounds above are derived from the
+        // request, so the page is taken in a form that cannot panic whatever they
+        // resolve to.
+        let page = selected.get(start..end).unwrap_or_default();
+
+        Ok(ListSearchesOutput {
+            search_summaries: page.iter().map(|record| summary(record, now)).collect(),
+            next_token,
+        })
     }
+}
+
+/// The page size this listing answers with when the caller gives no `maxResults`.
+///
+/// CHOSEN, not documented: the member says only that "a service-defined default is
+/// used". It is the default this service's other paginated listings already answer
+/// with, so a client that pages without asking for a size sees one page size across
+/// the service.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// What this operation reports for one stored search, as of `now` — every member
+/// read off the record, so a summary carries the same values a read of that one
+/// search answers with.
+fn summary(record: &crate::state::SearchRecord, now: ::std::time::SystemTime) -> SearchSummary {
+    SearchSummary {
+        search_id: record.search_id.clone(),
+        workspace_name: record.workspace_name.clone(),
+        status: record.status(now).to_string(),
+        query_statement: record.query_statement.clone(),
+        search_type: record.search_type.clone(),
+        // "Populated when the search has FAILED": no run of this emulator fails, so no
+        // search reports a reason.
+        status_reason: None,
+        started_at: Some(crate::state::to_date_time(record.started_at)),
+        group_id: record.group_id.clone(),
+    }
+}
+
+/// When a search was started, in whole nanoseconds since the Unix epoch, so a stored
+/// instant and a modelled `Timestamp` bound compare at one precision.
+fn started_nanos(record: &crate::state::SearchRecord) -> i128 {
+    crate::state::date_time_nanos(&crate::state::to_date_time(record.started_at))
+}
+
+/// Decode a `nextToken` back into the `searchId` it resumes from.
+fn decode_token(token: &str) -> Result<String, ListSearchesError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListSearchesError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> ListSearchesError {
+    ListSearchesErrorModeled::InvalidRequestException(InvalidRequestException { message }).into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> ListSearchesError {
+    ListSearchesErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message }).into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> ListSearchesError {
+    ListSearchesErrorModeled::InternalFailureException(InternalFailureException { message }).into()
 }

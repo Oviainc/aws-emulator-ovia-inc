@@ -1,22 +1,24 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-ga-prod-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: lambda.deep-lambda-runtime-truth-stream-error-after-first-chunk-rejected-in-trailer lambda.deep-lambda-runtime-truth-stream-first-chunk-reaches-client-before-handler-finishes lambda.invoke-with-response-stream-ec2-errors lambda.stream-handler-throw-delivers-no-bytes-and-no-error-code lambda.stream-provisioned-streaming-function-streams-from-prewarmed-environment lambda.stream-response-chunks-map-onto-handler-writes lambda.alias-lifecycle lambda.alias-lifecycle-full lambda.update-alias-precondition-failed-stale-revision lambda.delete-event-source-mapping-in-use-rejected lambda.policy-length-exceeded-enforcement dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-handler-error-redelivers-whole-batch dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-invalid-item-identifier-rejected-whole-batch-redelivered dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-partial-batch-redelivers-exactly-reported-items lambda__sfn__sqs.sqs-esm-disabled-mapping-no-invocation-negative
-Issue-Key: lambda|InvokeWithResponseStream|NotImplemented
+Issue-Trace-Ids: lambda.alias-lifecycle lambda.alias-lifecycle-full lambda.update-alias-precondition-failed-stale-revision lambda.delete-event-source-mapping-in-use-rejected lambda.policy-length-exceeded-enforcement
 Issue-Key: lambda.alias-lifecycle|run#39|AssertionError|assert post_delete_update_code_msg == f"Alias not found: {alias_arn}", (
 Issue-Key: lambda.alias-lifecycle-full|run#27|AssertionError|assert update_code_msg == f"Alias not found: arn:aws:lambda:{ctx.region}:{ctx.account}:function:{fn['name']}:{alias_name}", (
 Issue-Key: lambda.update-alias-precondition-failed-stale-revision|run#27|AssertionError|assert mutate_message == f"Alias not found: {fn['arn']}:{alias_name}", (
 Issue-Key: lambda.delete-event-source-mapping-in-use-rejected|_must_fail#22|AssertionError|raise AssertionError(f"{description} unexpectedly SUCCEEDED")
 Issue-Key: lambda.policy-length-exceeded-enforcement|run#5|AssertionError|assert put_msg == expected_put_msg, f"expected the exact oversized-policy message, got {put_msg!r}"
-Issue-Key: dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-handler-error-redelivers-whole-batch|_poll_tally#5|Timeout|time.sleep(3)
-Issue-Key: dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-invalid-item-identifier-rejected-whole-batch-redelivered|_poll_tally#5|Timeout|time.sleep(3)
-Issue-Key: dynamodb__lambda__sqs.conc-limits-and-fanout-sqs-esm-partial-batch-redelivers-exactly-reported-items|_poll_tally#5|Timeout|time.sleep(3)
-Issue-Key: lambda__sfn__sqs.sqs-esm-disabled-mapping-no-invocation-negative|run#21|Timeout|resp = sqs.receive_message(QueueUrl=results["url"], MaxNumberOfMessages=10, WaitTimeSeconds=5)
 Issue-Commit: 029c92a6d753af7d483a2e508209908fa6f0a80e
 
-# lambda: InvokeWithResponseStream refused NotImplemented, UpdateAlias/PutResourcePolicy refusal messages diverge, DeleteEventSourceMapping accepted mid-Updating, and SQS ESM delivery never happens (5 causes)
+# lambda: UpdateAlias/PutResourcePolicy refusal messages diverge and DeleteEventSourceMapping is accepted mid-Updating (causes 2, 3 and 4 of 5; causes 1 and 5 re-filed)
 
 > _Note: this issue was identified against the code base at commit `029c92a6d753af7d483a2e508209908fa6f0a80e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+> _Resolution: causes 2, 3 and 4 below are FIXED, and the five replay keys and five trace ids this report still carries are theirs. The other two causes of the original bundle are UNFIXED and were re-filed, with their own `Issue-Key` and `Issue-Trace-Ids` lines, so their ten checks are not recorded as working:_
+>
+> * _cause 1 of 5 (InvokeWithResponseStream refuses every real streaming invocation) -> `issues/things-that-do-not-work/20261027T180000Z-lambda-invokewithresponsestream-refuses-every-real-streaming-invocation.md`;_
+> * _cause 5 of 5 (an SQS event source mapping never consumes or delivers) -> `issues/things-that-do-not-work/20261027T180000Z-lambda-an-sqs-event-source-mapping-never-consumes-or-delivers.md`._
+>
+> _Both rest on the same blocker — this emulator has no in-process runtime that runs a Lambda deployment package — and neither refusal was touched or re-worded by the change that fixed causes 2, 3 and 4. The cause text of all five is kept below as it was filed._
 
 ## Operation
 InvokeWithResponseStream

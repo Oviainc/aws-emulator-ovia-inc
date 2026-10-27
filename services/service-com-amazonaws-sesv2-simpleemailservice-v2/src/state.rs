@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-sesv2-simpleemailservice-v2 service.
 //!
 //! Everything the implemented operations answer with is computed from the records
-//! below: the email-identity table, the contact-list table, the configuration-set
+//! below: the email-identity table, the contact-list table, the email-template
+//! table, the configuration-set
 //! table, the suppression-list table, the multi-region-endpoint table, the
 //! dedicated-IP table, the outbound-message log, the per-account send counters and
 //! the account-level attributes. Nothing here is per-request scratch — the whole
@@ -102,6 +103,20 @@ pub const MAX_CONTACT_LISTS: usize = 1_000;
 /// CHOSEN for the same reason, and for the same growth: one record per accepted
 /// `CreateContact`.
 pub const MAX_CONTACTS_PER_LIST: usize = 10_000;
+
+/// Email templates the account may hold, and so the ceiling on the template store:
+/// SES documents a limit of 10,000 email templates per account, and
+/// `CreateEmailTemplate` refuses past it with the `LimitExceededException` its model
+/// binds rather than growing the store without end.
+pub const MAX_EMAIL_TEMPLATES: usize = 10_000;
+
+/// The largest one email template may be, counting its subject line and both body
+/// parts: SES documents a maximum size of 500 KB for an email template, and
+/// `CreateEmailTemplate` refuses past it on the input rather than holding a template
+/// no send could use. The parts are caller-sized — none of them carries a length bound
+/// in the model — so this bound and [`MAX_EMAIL_TEMPLATES`] together are what bound the
+/// template store.
+pub const MAX_EMAIL_TEMPLATE_BYTES: usize = 500 * 1024;
 
 /// Addresses the account's suppression lists may hold, across the account-level list
 /// and every tenant's own.
@@ -613,6 +628,11 @@ pub struct ComAmazonawsSesv2SimpleemailserviceV2State {
     /// opaque name the API echoes back as given, so it is keyed exactly as supplied.
     /// Ordered, so `ListContactLists` enumerates and pages deterministically.
     pub contact_lists: BTreeMap<String, ContactListRecord>,
+    /// Email templates, keyed by the `TemplateName` they were created with — the name
+    /// a send refers to and the API echoes back as given, so it is keyed exactly as
+    /// supplied. Ordered, so `ListEmailTemplates` enumerates and pages
+    /// deterministically. Bounded by [`MAX_EMAIL_TEMPLATES`].
+    pub email_templates: BTreeMap<String, EmailTemplateRecord>,
     /// Multi-region endpoints, keyed by their primary region and then by the
     /// `EndpointName` they were created with. An endpoint is managed only from its
     /// primary region, so the region is part of the key: the same name in another
@@ -1747,6 +1767,98 @@ pub fn contact_not_found(contact_list_name: &str, email_address: &str) -> String
     format!(
         "Contact with email address: {email_address} doesn't exist in list: \
          {contact_list_name}."
+    )
+}
+
+/// One email template in the account's template store.
+///
+/// The content is held as the model's own `EmailTemplateContent` — the subject line,
+/// the text part and the HTML part exactly as the request supplied them — because a
+/// template is rendered when a send names it and is never rewritten on the way in or
+/// out. `created_at` is the instant the template was recorded, which
+/// `ListEmailTemplates` reports as `EmailTemplateMetadata$CreatedTimestamp` ("the
+/// time and date the template was created").
+#[derive(Debug, Clone)]
+pub struct EmailTemplateRecord {
+    /// The `TemplateName` this record is keyed by, as the request spelled it.
+    pub name: String,
+    /// `TemplateContent`: the subject line, the HTML part and the text-only part.
+    pub content: crate::ops::types::EmailTemplateContent,
+    /// Tags, in the order they were supplied.
+    pub tags: Vec<(String, String)>,
+    /// When the template was created.
+    pub created_at: SystemTime,
+}
+
+impl EmailTemplateRecord {
+    /// A template as `CreateEmailTemplate` stores it.
+    pub fn new(
+        name: &str,
+        content: crate::ops::types::EmailTemplateContent,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            content,
+            tags: Vec::new(),
+            created_at: now,
+        }
+    }
+
+    /// The modelled `EmailTemplateMetadata` view of this record, as
+    /// `ListEmailTemplates` reports it.
+    pub fn metadata(&self) -> crate::ops::types::EmailTemplateMetadata {
+        crate::ops::types::EmailTemplateMetadata {
+            template_name: Some(self.name.clone()),
+            created_timestamp: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+        }
+    }
+
+    /// The modelled `TagList` view of this record's tags.
+    pub fn tag_list(&self) -> Vec<crate::ops::types::Tag> {
+        self.tags
+            .iter()
+            .map(|(key, value)| crate::ops::types::Tag {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+}
+
+/// How large the template content `content` is: the bytes of its subject line and of
+/// both body parts, which is what [`MAX_EMAIL_TEMPLATE_BYTES`] bounds.
+///
+/// Stated once here so every operation that writes a template's content measures it
+/// the same way.
+pub fn email_template_size(content: &crate::ops::types::EmailTemplateContent) -> usize {
+    [&content.subject, &content.text, &content.html]
+        .into_iter()
+        .filter_map(|part| part.as_deref())
+        .map(str::len)
+        .sum()
+}
+
+/// How this service words `NotFoundException` for an email template it does not hold.
+///
+/// One wording for every operation that takes an `EmailTemplateName` — the read, the
+/// update, the delete and the render — so a client sees the same sentence whichever
+/// call first tells it the template is not there.
+pub fn email_template_not_found(template_name: &str) -> String {
+    format!("Template {template_name} does not exist.")
+}
+
+/// How this service words `AlreadyExistsException` for a template name the account
+/// already holds.
+///
+/// The template store belongs to one account, so the sentence names both the template
+/// the request asked for and the account that already holds it; the account is the one
+/// this emulator serves, read from the emulator rather than from anything the request
+/// carries.
+pub fn email_template_already_exists(template_name: &str) -> String {
+    format!(
+        "Template {template_name} already exists for account id {}",
+        ::emulator_server::emulator_account_id()
     )
 }
 

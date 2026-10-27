@@ -37,6 +37,8 @@ mod job_definition_registry;
 mod job_definition_validation;
 #[path = "all/job_lifecycle.rs"]
 mod job_lifecycle;
+#[path = "all/job_phase_is_per_job.rs"]
+mod job_phase_is_per_job;
 #[path = "all/job_queue_updates.rs"]
 mod job_queue_updates;
 #[path = "all/job_rests_in_runnable.rs"]

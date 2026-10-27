@@ -494,8 +494,16 @@ mod vpc_block_public_access_exclusions;
 mod vpc_endpoint_connection_notifications;
 #[path = "all/vpc_endpoint_connections.rs"]
 mod vpc_endpoint_connections;
+// The readiness poll a client makes on a created VPC endpoint: the loop on the non-terminal
+// state terminates, at the terminal one.
+#[path = "all/vpc_endpoint_readiness_poll.rs"]
+mod vpc_endpoint_readiness_poll;
 #[path = "all/vpc_endpoint_state.rs"]
 mod vpc_endpoint_state;
+// The vocabulary of VPC endpoint states: every value the filter publishes, against the
+// members of the `State` enum the model generates.
+#[path = "all/vpc_endpoint_states.rs"]
+mod vpc_endpoint_states;
 #[path = "all/vpc_endpoints_and_byoip.rs"]
 mod vpc_endpoints_and_byoip;
 #[path = "all/vpc_lifecycle.rs"]

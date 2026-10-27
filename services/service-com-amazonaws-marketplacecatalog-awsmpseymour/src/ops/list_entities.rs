@@ -262,34 +262,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let filters = input.filter_list.unwrap_or_default();
         let mut predicates: Vec<(String, Vec<String>)> = Vec::with_capacity(filters.len());
         for filter in filters {
-            let Some(name) = filter.name else {
-                return Err(ListEntitiesErrorModeled::ValidationException(
-                    crate::state::validation("FilterList.Name", "every filter names an attribute"),
-                )
-                .into());
+            // The same shared rule `ListChangeSets` judges its filters by, over
+            // the attributes this list publishes.
+            let (name, values) = match crate::state::filter_predicate(
+                Self::NAME,
+                crate::state::ENTITY_FILTER_NAMES,
+                filter,
+            ) {
+                Ok(predicate) => predicate,
+                Err(fault) => {
+                    return Err(ListEntitiesErrorModeled::ValidationException(fault).into())
+                }
             };
-            if !crate::state::ENTITY_FILTER_NAMES.contains(&name.as_str()) {
-                return Err(ListEntitiesErrorModeled::ValidationException(
-                    crate::state::validation(
-                        "FilterList.Name",
-                        format!(
-                            "ListEntities filters on {:?}, not on {name:?}",
-                            crate::state::ENTITY_FILTER_NAMES
-                        ),
-                    ),
-                )
-                .into());
-            }
-            let values = filter.value_list.unwrap_or_default();
-            if values.is_empty() {
-                return Err(ListEntitiesErrorModeled::ValidationException(
-                    crate::state::validation(
-                        "FilterList.ValueList",
-                        format!("filter {name} carries no value to match"),
-                    ),
-                )
-                .into());
-            }
             predicates.push((name, values));
         }
 
