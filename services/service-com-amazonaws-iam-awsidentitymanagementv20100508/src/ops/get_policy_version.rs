@@ -216,16 +216,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Policy version identifiers always begin with v (always lowercase)"
         // (`PolicyVersion$VersionId`), and the version map is keyed by exactly that
         // identifier: a version the policy does not carry "referenced a resource
-        // entity that does not exist".
+        // entity that does not exist", worded through the one spelling this crate
+        // holds for a policy a request cannot be served from.
         match resolved.versions.get(&input.version_id) {
             Some(version) => Ok(GetPolicyVersionOutput {
                 policy_version: Some(version.clone()),
             }),
             None => Err(GetPolicyVersionErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!(
-                        "Policy {} version {} does not exist.",
-                        input.policy_arn, input.version_id
+                    message: Some(crate::state::policy_version_not_found(
+                        &input.policy_arn,
+                        &input.version_id,
                     )),
                 },
             )

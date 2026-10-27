@@ -254,13 +254,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The provider is named by its `Name` and its ARN is derived from it, so a held
         // ARN is a held name: "the request was rejected because it attempted to create a
         // resource that already exists" (`EntityAlreadyExistsException`).
+        //
+        // The refusal names the identity the request supplied and nothing else: IAM's
+        // fixed text is `Provider with name ` and ` already exists.` around the `Name`
+        // the caller sent. The provider's TYPE is not part of it — the identity is what
+        // collided — which is the same wording `CreateOpenIDConnectProvider` uses for
+        // the attribute that identifies one of those (`Provider with url <Url> already
+        // exists.`).
         if store.saml_providers.contains_key(&arn) {
             return Err(CreateSAMLProviderErrorModeled::EntityAlreadyExistsException(
                 EntityAlreadyExistsException {
-                    message: Some(format!(
-                        "SAML Provider with name {} already exists.",
-                        input.name
-                    )),
+                    message: Some(format!("Provider with name {} already exists.", input.name)),
                 },
             )
             .into());

@@ -85,9 +85,27 @@ pub(crate) async fn call(
 /// it is what the service reads the caller's identity from
 /// (`emulator_server::extract_akid`). `None` sends no header at all, which is the
 /// unsigned request every other suite drives.
+///
+/// The credential scope names [`HARNESS_REGION`]; a suite that varies the Region a
+/// request addressed takes [`call_signed_in_region`] instead.
 pub(crate) async fn call_signed_by(
     router: &MultiServiceRouter,
     akid: Option<&str>,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
+    call_signed_in_region(router, akid, HARNESS_REGION, action, params).await
+}
+
+/// [`call_signed_by`], with the Region the request's SigV4 credential scope names
+/// stated per call.
+///
+/// The scope is the only place a request carries the Region it addressed, so this is
+/// the one knob a suite about Region-dependent behaviour turns.
+pub(crate) async fn call_signed_in_region(
+    router: &MultiServiceRouter,
+    akid: Option<&str>,
+    region: &str,
     action: &str,
     params: &[(&str, &str)],
 ) -> (u16, String) {
@@ -107,11 +125,11 @@ pub(crate) async fn call_signed_by(
         .header("content-type", "application/x-www-form-urlencoded");
     let request = match akid {
         // The SigV4 credential scope's first component is the access key id, which
-        // is all `extract_akid` reads out of the header.
+        // is all `extract_akid` reads out of the header; its third is the Region.
         Some(akid) => request.header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={akid}/20260101/us-east-1/iam/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential={akid}/20260101/{region}/iam/aws4_request, \
                  SignedHeaders=host, Signature=0"
             ),
         ),
@@ -182,6 +200,87 @@ pub(crate) fn element(body: &str, tag: &str) -> String {
         found.len()
     );
     found.into_iter().next().expect("one element")
+}
+
+/// The Region every request this harness sends addresses unless a suite names another
+/// ([`call_signed_in_region`]).
+///
+/// A signed request names it in its SigV4 credential scope, and an unsigned one names no
+/// Region at all, which is served as the Region IAM's global endpoint is in — the same
+/// one. So a refusal's message names this Region whichever way a case presented its
+/// request.
+pub(crate) const HARNESS_REGION: &str = "us-east-1";
+
+/// The fixed path segment an `AccessDenied` message carries its authorization id
+/// after, in the console URL half of its closing sentence.
+const AUTHORIZATION_DETAILS_PATH: &str = "#/authorization-details/";
+
+/// Assert that `actual` is the whole `AccessDenied` message AWS words for a refused IAM
+/// call made in [`HARNESS_REGION`]. See
+/// [`assert_access_denied_message_in_region`], which this is the common Region of.
+pub(crate) fn assert_access_denied_message(
+    case: &str,
+    actual: &str,
+    principal: &str,
+    action: &str,
+    named_as: &str,
+    reason: &str,
+) {
+    assert_access_denied_message_in_region(
+        case,
+        actual,
+        HARNESS_REGION,
+        principal,
+        action,
+        named_as,
+        reason,
+    );
+}
+
+/// Assert that `actual` is the whole `AccessDenied` message AWS words for a refused IAM
+/// call: the clause naming the principal, the action and the resource the decision was
+/// made on, then `reason` (an explicit deny, or no policy allowing the action), then the
+/// sentence pointing the caller at that one denial's authorization details — in the IAM
+/// console for `region`, and through the `GetRequestAuthorizationDetails` API.
+///
+/// The authorization id is minted per refused request, so it is not a value a case can
+/// predict: it is read back out of `actual` and asserted to be ONE id, spelled in the
+/// alphabet `GetRequestAuthorizationDetails$authorizationId` admits, carried in both of
+/// the places the sentence names it. Every other character of the message is compared
+/// exactly.
+pub(crate) fn assert_access_denied_message_in_region(
+    case: &str,
+    actual: &str,
+    region: &str,
+    principal: &str,
+    action: &str,
+    named_as: &str,
+    reason: &str,
+) {
+    let authorization_id = actual
+        .split_once(AUTHORIZATION_DETAILS_PATH)
+        .map(|(_, after)| after.split(' ').next().unwrap_or_default().to_string())
+        .unwrap_or_default();
+    assert!(
+        !authorization_id.is_empty()
+            && authorization_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase()),
+        "case {case:?}: expected the refusal to hand the caller an authorization id spelled \
+         in lowercase alphanumerics, got {actual:?}"
+    );
+    let expected = format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
+         {reason}. Go to https://{region}.console.aws.amazon.com/iam/home\
+         ?region={region}{AUTHORIZATION_DETAILS_PATH}{authorization_id} for complete \
+         details, or call the GetRequestAuthorizationDetails API with the following \
+         authorization id: {authorization_id}"
+    );
+    assert_eq!(
+        actual, expected,
+        "case {case:?}: expected the refusal to name the principal, the action, the resource \
+         and this denial's authorization id, got {actual:?}"
+    );
 }
 
 /// Resolve the references the response serializer emits.
