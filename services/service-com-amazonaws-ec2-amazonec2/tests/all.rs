@@ -140,6 +140,13 @@ mod coip_pools;
 mod confirm_product_instance;
 #[path = "all/copy_volumes.rs"]
 mod copy_volumes;
+// What `DescribeVpcEndpointAssociations` reports out of the VPC endpoint association store,
+// and how the endpoint ids, the documented filters and the page size narrow it. Declared in
+// the MIDDLE of the list for the reason the two suites above give: the head and the tail are
+// both where concurrent ec2 landings insert their two lines, and these two lost two
+// serialized squash merges at the head.
+#[path = "all/vpc_endpoint_associations.rs"]
+mod vpc_endpoint_associations;
 // What `CreateDhcpOptions` stores: the options a request names, the ones it refuses, and
 // the set a caller created being one `AssociateDhcpOptions` resolves.
 #[path = "all/create_dhcp_options.rs"]
