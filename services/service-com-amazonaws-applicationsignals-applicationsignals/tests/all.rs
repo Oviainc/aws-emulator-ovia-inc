@@ -93,5 +93,7 @@ mod state_roundtrip;
 mod tag_attachment;
 #[path = "all/time_ranged_reads.rs"]
 mod time_ranged_reads;
+#[path = "all/unissued_next_token.rs"]
+mod unissued_next_token;
 #[path = "all/untag_resource_kinds.rs"]
 mod untag_resource_kinds;

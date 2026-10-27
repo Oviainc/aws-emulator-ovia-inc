@@ -15,6 +15,8 @@
 mod absent_plan_reads;
 #[path = "all/application_source_exclusivity.rs"]
 mod application_source_exclusivity;
+#[path = "all/applied_policies_and_status_narratives.rs"]
+mod applied_policies_and_status_narratives;
 #[path = "all/describe_scaling_plans_selector_bounds.rs"]
 mod describe_scaling_plans_selector_bounds;
 #[path = "all/error_message_wording.rs"]

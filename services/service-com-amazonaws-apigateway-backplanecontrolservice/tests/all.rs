@@ -218,3 +218,5 @@ mod base_path_mapping;
 mod delete_gateway_response;
 #[path = "all/update_usage_plan.rs"]
 mod update_usage_plan;
+#[path = "all/base_path_mapping_private_domain.rs"]
+mod base_path_mapping_private_domain;

@@ -257,12 +257,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // The stored member list is an unordered set, so the page order is
         // resource-ARN order over the union — a stable sequence a cursor can
-        // point into, as in every other list of this service. A member ARN
-        // repeated in that set contributes its resources once: the keys are
-        // resource ARNs, and one resource is one entry of this list.
-        let mut matching: Vec<(String, OrganizationRecommendationResourceSummary)> = entry
-            .member_recommendation_arns
-            .iter()
+        // point into, as in every other list of this service. The members come
+        // from
+        // [`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::member_recommendations_of`],
+        // which hands back that set ONCE per member recommendation, so a member
+        // named twice contributes its resources once: one resource is one entry
+        // of this list.
+        let mut matching: Vec<(String, OrganizationRecommendationResourceSummary)> = state
+            .member_recommendations_of(identifier)
+            .into_iter()
             .flat_map(|member_arn| state.resources_of(member_arn))
             .map(|(arn, resource)| {
                 (
@@ -290,7 +293,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
         matching.sort_by(|(left, _), (right, _)| left.cmp(right));
-        matching.dedup_by(|(left, _), (right, _)| left == right);
 
         // The cursor's scope names this organization recommendation AND this
         // read's filters, so a token issued for one organization

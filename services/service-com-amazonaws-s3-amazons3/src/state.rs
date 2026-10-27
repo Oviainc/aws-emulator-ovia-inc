@@ -549,6 +549,21 @@ pub enum PartUpload {
     TotalByteBudgetReached { would_hold: usize },
 }
 
+/// What [`ComAmazonawsS3Amazons3State::abort_multipart_upload`] did, so the caller answers
+/// each outcome without re-deriving it — and cannot discard an upload without having
+/// addressed it by both its id and its key, the way every other reach for an upload does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadAbort {
+    /// The upload was discarded with every part it held: "After a multipart upload is
+    /// aborted, no additional parts can be uploaded using that upload ID. The storage
+    /// consumed by any previously uploaded parts will be freed"
+    /// (`AbortMultipartUpload`'s own documentation).
+    Discarded,
+    /// The bucket has no such upload in progress under that id and key — never initiated,
+    /// or already discarded — so nothing was removed.
+    NoSuchUpload,
+}
+
 /// How many tags one bucket's tag set may carry.
 ///
 /// The Amazon S3 User Guide's bucket tagging restrictions ("Using cost allocation S3
@@ -7219,6 +7234,37 @@ impl ComAmazonawsS3Amazons3State {
             .insert(part.part_number, part)
             .is_some();
         Some(PartUpload::Stored { replaced })
+    }
+
+    /// Discard the multipart upload `upload_id` names in the bucket named `bucket`,
+    /// reporting what that did — or `None` when this emulator holds no such bucket (so an
+    /// abort refuses a name that is not a bucket instead of reporting success for it).
+    ///
+    /// An upload is addressed by its id AND the key it was initiated for, exactly as
+    /// [`Self::upload_part`] and a read of the upload address it, so an id named under
+    /// another key names no upload ([`UploadAbort::NoSuchUpload`]) and nothing is removed.
+    ///
+    /// The upload goes away with every part it held — "the storage consumed by any
+    /// previously uploaded parts will be freed" (`AbortMultipartUpload`'s own
+    /// documentation) — so the bytes those parts retained stop counting against the
+    /// bucket's budget ([`Bucket::retained_bytes`]) and the upload stops being listed. ONE
+    /// upload is discarded: every other upload the bucket has in progress, including
+    /// another upload of the same key, is left exactly as it was.
+    pub fn abort_multipart_upload(
+        &mut self,
+        bucket: &str,
+        upload_id: &str,
+        key: &str,
+    ) -> Option<UploadAbort> {
+        let held_bucket = self.buckets.get_mut(bucket)?;
+        if held_bucket
+            .multipart_upload(upload_id)
+            .is_none_or(|upload| upload.key != key)
+        {
+            return Some(UploadAbort::NoSuchUpload);
+        }
+        held_bucket.multipart_uploads.remove(upload_id);
+        Some(UploadAbort::Discarded)
     }
 
     /// Record `configuration` as the whole notification configuration of the bucket named
