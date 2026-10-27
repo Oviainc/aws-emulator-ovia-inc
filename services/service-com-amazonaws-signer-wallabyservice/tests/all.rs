@@ -20,6 +20,9 @@ mod error_responses;
 #[path = "all/platform_listing.rs"]
 mod platform_listing;
 
+#[path = "all/profile_lifecycle_contract.rs"]
+mod profile_lifecycle_contract;
+
 #[path = "all/profile_listing_pagination.rs"]
 mod profile_listing_pagination;
 

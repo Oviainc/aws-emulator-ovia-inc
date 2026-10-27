@@ -169,7 +169,10 @@ pub(crate) async fn wait_for_distribution_status(
 }
 
 /// The certificate names a distribution's `alternativeDomainNames` reports.
-fn string_list(value: &Value) -> Vec<String> {
+///
+/// `pub(crate)` so a sibling suite reads the same member the same way rather
+/// than carrying a second copy of the conversion.
+pub(crate) fn string_list(value: &Value) -> Vec<String> {
     value
         .as_array()
         .map(|entries| {

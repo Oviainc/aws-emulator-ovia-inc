@@ -75,11 +75,13 @@ pub const ANALYSIS_TYPE_SECURITY: &str = "Security";
 
 /// `Status`, from `types::shared_types::STATUS_VALUES` (`All | Closed | Open`).
 pub const STATUS_ALL: &str = "All";
-/// `Status`; see [`STATUS_ALL`]. The status an OPEN finding carries, which is what the
-/// metrics operations count.
+/// `Status`; see [`STATUS_ALL`]. The status a finding carries while it is still open —
+/// so a finding carrying it has been open ever since it was created
+/// ([`FindingLifetime`]).
 pub const STATUS_OPEN: &str = "Open";
-/// `Status`; see [`STATUS_ALL`]. The status a finding carries once it is no longer
-/// open, which `ListFindingsMetrics` counts as a close.
+/// `Status`; see [`STATUS_ALL`]. The status a finding carries once it is no longer open,
+/// which the metrics operations read as a close at the finding's `updatedAt`
+/// ([`FindingLifetime`]).
 pub const STATUS_CLOSED: &str = "Closed";
 
 /// `Severity`, from `types::shared_types::SEVERITY_VALUES`
@@ -1012,6 +1014,88 @@ pub fn severity_bucket(severity: Option<&str>) -> Option<&'static str> {
         SEVERITY_HIGH => Some(SEVERITY_HIGH),
         SEVERITY_CRITICAL => Some(SEVERITY_CRITICAL),
         _ => None,
+    }
+}
+
+/// When a stored finding came into existence and when it stopped being open — ALL a
+/// metric reported "as of" an instant needs in order to place that finding in time.
+///
+/// The ONE reading of a stored [`Finding`]'s instants, shared by every operation of this
+/// service that answers a question about a PAST instant (`GetMetricsSummary` for one day,
+/// `ListFindingsMetrics` for each day of an interval), so two such operations reading this
+/// one findings store cannot report different counts for the same instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FindingLifetime {
+    /// The finding's `createdAt`, when it records one.
+    pub created_at_millis: Option<i64>,
+    /// The instant this finding was closed: `Some` only for a finding whose status is
+    /// [`STATUS_CLOSED`] AND which records an `updatedAt`, since a closed finding's last
+    /// change is the change that closed it. A closed finding recording no `updatedAt`
+    /// records no close instant, so no instant can be placed either side of it.
+    pub closed_at_millis: Option<i64>,
+    /// Whether the finding's CURRENT status is [`STATUS_OPEN`] — a finding that is open
+    /// now has been open ever since it was created.
+    pub open_now: bool,
+}
+
+impl FindingLifetime {
+    /// How `finding` is placed in time, read off the instants and the status the store
+    /// keeps for it.
+    pub fn of(finding: &Finding) -> Self {
+        let status = finding.status.as_deref();
+        Self {
+            created_at_millis: finding.created_at.as_ref().map(from_timestamp),
+            closed_at_millis: if status == Some(STATUS_CLOSED) {
+                finding.updated_at.as_ref().map(from_timestamp)
+            } else {
+                None
+            },
+            open_now: status == Some(STATUS_OPEN),
+        }
+    }
+
+    /// Whether this finding was OPEN as of `as_of_millis`: it existed by then and had not
+    /// been closed by then.
+    ///
+    /// A metric reported "as of" an instant is a reading of the account AT that instant,
+    /// so a finding's CURRENT status decides nothing on its own: a finding closed after
+    /// the instant asked about was still open then, and a finding created after it existed
+    /// at no earlier instant. A finding that records no creation instant cannot be placed
+    /// after the instant asked about, so it is not excluded by it.
+    pub fn open_as_of(&self, as_of_millis: i64) -> bool {
+        if self
+            .created_at_millis
+            .is_some_and(|created| created > as_of_millis)
+        {
+            return false;
+        }
+        self.open_now
+            || self
+                .closed_at_millis
+                .is_some_and(|closed| closed > as_of_millis)
+    }
+
+    /// Whether this finding was created within `start_millis..=end_millis`.
+    pub fn created_within(&self, start_millis: i64, end_millis: i64) -> bool {
+        self.created_at_millis
+            .is_some_and(|created| created >= start_millis && created <= end_millis)
+    }
+
+    /// Whether this finding was closed within `start_millis..=end_millis`.
+    pub fn closed_within(&self, start_millis: i64, end_millis: i64) -> bool {
+        self.closed_at_millis
+            .is_some_and(|closed| closed >= start_millis && closed <= end_millis)
+    }
+
+    /// How long this finding took to close, IN DAYS, when it had been closed by
+    /// `as_of_millis` and records both the instant it was created and the instant it was
+    /// closed; `None` otherwise, since then there is no duration to measure.
+    pub fn days_to_close(&self, as_of_millis: i64) -> Option<f64> {
+        let created = self.created_at_millis?;
+        let closed = self
+            .closed_at_millis
+            .filter(|closed| *closed <= as_of_millis)?;
+        Some(closed.saturating_sub(created).max(0) as f64 / MILLIS_PER_DAY as f64)
     }
 }
 

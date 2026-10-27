@@ -715,6 +715,9 @@ pub const OPERATION_TYPE_DELETE_CERTIFICATE: &str = "DeleteCertificate";
 pub const OPERATION_TYPE_ATTACH_CERTIFICATE_TO_DISTRIBUTION: &str =
     "AttachCertificateToDistribution";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DETACH_CERTIFICATE_FROM_DISTRIBUTION: &str =
+    "DetachCertificateFromDistribution";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_RESET_DISTRIBUTION_CACHE: &str = "ResetDistributionCache";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_UPDATE_DISTRIBUTION: &str = "UpdateDistribution";
@@ -11714,6 +11717,27 @@ pub struct StoredDistribution {
 }
 
 impl StoredDistribution {
+    /// Release the SSL/TLS certificate this distribution serves HTTPS traffic
+    /// with, so it names none and publishes none of that certificate's domains —
+    /// the ONE owner of that rule.
+    ///
+    /// A distribution that serves no certificate of its own publishes no
+    /// alternate domain names: the domains it accepts HTTPS traffic for come
+    /// from the certificate attached to it ("your distribution accepts HTTPS
+    /// traffic for all of the domains that are associated with the
+    /// certificate"), so releasing the attachment clears BOTH members, never
+    /// one without the other. Every operation that releases the attachment asks
+    /// here, so the release cannot drift between them. (The reverse direction —
+    /// a certificate the request named at CREATE time, which
+    /// `CreateDistribution` records without publishing its domains — is that
+    /// operation's own business, not this release's.) Idempotent: a
+    /// distribution that has no certificate attached already
+    /// satisfies it.
+    pub fn detach_certificate(&mut self) {
+        self.certificate_name = None;
+        self.alternative_domain_names = Vec::new();
+    }
+
     /// This record as the modelled `LightsailDistribution`.
     pub fn view(&self) -> LightsailDistribution {
         LightsailDistribution {

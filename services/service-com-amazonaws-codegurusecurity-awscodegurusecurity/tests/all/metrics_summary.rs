@@ -88,8 +88,10 @@ pub(crate) fn iso(at_secs: i64) -> String {
         .unwrap_or_else(|error| panic!("unformattable instant {at_secs}: {error}"))
 }
 
-/// `GET /metrics/summary?date=<iso>`, the modelled route of `GetMetricsSummary`.
-async fn get_metrics_summary(router: &MultiServiceRouter, at_secs: i64) -> Answer {
+/// `GET /metrics/summary?date=<iso>`, the modelled route of `GetMetricsSummary`. Shared
+/// with the sibling suite that pins the close instant the summary reads
+/// (`crate::metrics_open_as_of`).
+pub(crate) async fn get_metrics_summary(router: &MultiServiceRouter, at_secs: i64) -> Answer {
     call(
         router,
         "GET",
@@ -99,8 +101,9 @@ async fn get_metrics_summary(router: &MultiServiceRouter, at_secs: i64) -> Answe
     .await
 }
 
-/// The `metricsSummary` of a successful answer.
-fn summary_of<'a>(case: &str, answer: &'a Answer) -> &'a Value {
+/// The `metricsSummary` of a successful answer. Shared with the sibling suite that pins
+/// the close instant the summary reads (`crate::metrics_open_as_of`).
+pub(crate) fn summary_of<'a>(case: &str, answer: &'a Answer) -> &'a Value {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected 200, got {} {}",
@@ -134,7 +137,7 @@ pub(crate) fn instant_secs(case: &str, value: &Value) -> i64 {
 
 /// `openFindings` as `(severity, count)` pairs, in the order
 /// `FindingMetricsValuePerSeverity` declares its members.
-fn open_findings(case: &str, summary: &Value) -> Vec<(&'static str, f64)> {
+pub(crate) fn open_findings(case: &str, summary: &Value) -> Vec<(&'static str, f64)> {
     let open = &summary["openFindings"];
     assert!(
         open.is_object(),
@@ -160,7 +163,12 @@ fn open_findings(case: &str, summary: &Value) -> Vec<(&'static str, f64)> {
 /// A ranking member (`categoriesWithMostFindings`, `scansWithMostOpenFindings`,
 /// `scansWithMostOpenCriticalFindings`) as `(name, findingNumber)` pairs, in the order
 /// the answer listed them.
-fn ranking(case: &str, summary: &Value, member: &str, name_key: &str) -> Vec<(String, i64)> {
+pub(crate) fn ranking(
+    case: &str,
+    summary: &Value,
+    member: &str,
+    name_key: &str,
+) -> Vec<(String, i64)> {
     let entries = summary[member].as_array().unwrap_or_else(|| {
         panic!("case {case:?}: {member} must be present as an array, got {summary}")
     });
