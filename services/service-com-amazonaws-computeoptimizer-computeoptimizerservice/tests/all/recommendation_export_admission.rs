@@ -5,9 +5,9 @@
 //! Each of this service's eight export operations queues ONE asynchronous export job against
 //! the destination bucket the request names, and every one of them admits the request by the
 //! same rules: the mutually exclusive `accountIds`/`includeMemberAccounts` pair, the account
-//! ids themselves, a destination bucket that is named and that the object store already
-//! holds, the enrollment gate, and the one-job-in-progress-per-Region limit the operation
-//! documents. That rule lives in `crate::state::export` once; this suite drives it END TO END
+//! ids themselves — their shape AND whose analysis they ask for — a destination bucket that is
+//! named and that the object store already holds, the enrollment gate, and the
+//! one-job-in-progress-per-Region limit the operation documents. That rule lives in `crate::state::export` once; this suite drives it END TO END
 //! through EVERY operation that reaches it, so a surface that stopped applying one of those
 //! checks — or worded one refusal differently from its siblings — fails here.
 //!
@@ -16,16 +16,20 @@
 //! to one surface. Every call goes through the same `MultiServiceRouter` dispatch a client
 //! uses, so what is asserted is what a client sees.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::export::MISSING_DESTINATION_MESSAGE;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_EBS_VOLUME, RESOURCE_TYPE_EC2_INSTANCE,
-    RESOURCE_TYPE_ECS_SERVICE, RESOURCE_TYPE_IDLE, RESOURCE_TYPE_LAMBDA_FUNCTION,
-    RESOURCE_TYPE_LICENSE, RESOURCE_TYPE_RDS_DB_INSTANCE,
+    EXPORT_JOB_STEP, RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_EBS_VOLUME,
+    RESOURCE_TYPE_EC2_INSTANCE, RESOURCE_TYPE_ECS_SERVICE, RESOURCE_TYPE_IDLE,
+    RESOURCE_TYPE_LAMBDA_FUNCTION, RESOURCE_TYPE_LICENSE, RESOURCE_TYPE_RDS_DB_INSTANCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, create_bucket, emulator, error_code, opt_in, ACCOUNT};
+use crate::harness::{
+    call, create_bucket, emulator, error_code, export_destination, get_object, opt_in, ACCOUNT,
+};
 
 /// The destination bucket these fixtures export to. Compute Optimizer does not create it; the
 /// request just names it.
@@ -380,6 +384,195 @@ async fn every_export_operation_holds_the_limit_it_documents() {
         reported, first_jobs,
         "the store holds exactly the admitted jobs, got {reported:?}"
     );
+}
+
+/// The refusal every operation of this service answers a request about another account with:
+/// the service's constant, which names neither the member nor the account — it states the
+/// permission that is missing and how an organization account gets it. Spelled out here rather
+/// than imported so the WORDING is what this suite pins.
+const CROSS_ACCOUNT_MESSAGE: &str = "Invalid permission to access another account. If this \
+     is an organization account, request the management account to enable service access.";
+
+/// Enough slack over a lifecycle step for the clock to have made it due whatever the test
+/// scheduler is doing; the steps themselves are the service's own.
+const SLACK: Duration = Duration::from_millis(150);
+
+/// Well-formed 12-digit account ids that are NOT the caller's own — the class "an account this
+/// service answers nothing about", spanned rather than named once: the extremes of the 12-digit
+/// range, the AWS documentation's own example account, and an id one digit away from this
+/// emulator's own account (derived from it, so the row stays a different account whatever that
+/// account is).
+fn other_accounts() -> Vec<String> {
+    let mut neighbour = ACCOUNT.to_string();
+    let last = neighbour.pop().unwrap_or('0');
+    neighbour.push(if last == '9' { '8' } else { '9' });
+    vec![
+        "000000000001".to_string(),
+        "999999999999".to_string(),
+        "111122223333".to_string(),
+        "210987654321".to_string(),
+        neighbour,
+    ]
+}
+
+/// The `accountIds` lists that name at least one account other than the caller's: one foreign
+/// id alone, and lists where the caller's own account is named BESIDE a foreign one, in either
+/// position — an export may carry several ids ("You can specify multiple account IDs per
+/// request"), and one id it cannot answer about is enough to refuse the whole export.
+fn cross_account_lists() -> Vec<Value> {
+    let others = other_accounts();
+    let mut rows: Vec<Value> = others.iter().map(|id| json!([id])).collect();
+    if let Some(id) = others.first() {
+        rows.push(json!([ACCOUNT, id]));
+        rows.push(json!([id, ACCOUNT]));
+    }
+    rows
+}
+
+/// The `accountIds` forms that name the caller's own account and nothing else: naming none at
+/// all, an empty list, the account once, and the account more than once — "You can specify
+/// multiple account IDs per request", so an export's list is not limited to one id the way a
+/// recommendation reader's is.
+fn own_account_lists() -> Vec<(&'static str, Option<Value>)> {
+    vec![
+        ("absent", None),
+        ("empty list", Some(json!([]))),
+        ("own account", Some(json!([ACCOUNT]))),
+        ("own account twice", Some(json!([ACCOUNT, ACCOUNT]))),
+    ]
+}
+
+/// Every export operation refuses an `accountIds` naming any account other than the one this
+/// emulator presents, with the same refusal its recommendation reader answers the same id with
+/// — rather than exporting THIS account's rows into a file whose metadata names that other
+/// account. One row per foreign-id form, crossed with every export surface.
+#[tokio::test]
+async fn every_export_operation_refuses_an_account_id_naming_another_account() {
+    let router = enrolled_emulator().await;
+
+    for surface in surfaces() {
+        for account_ids in cross_account_lists() {
+            let case = format!("{} with accountIds {account_ids}", surface.operation);
+            let mut request = export_request(&surface);
+            request["accountIds"] = account_ids.clone();
+
+            let (status, body) = call(&router, surface.operation, request).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected the export to be refused, got {status}: {body}"
+            );
+            assert!(
+                error_code(&body).contains("InvalidParameterValueException"),
+                "case {case:?}: expected InvalidParameterValueException, got {body}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some(CROSS_ACCOUNT_MESSAGE),
+                "case {case:?}: expected the cross-account refusal, got {body}"
+            );
+            assert!(
+                body["jobId"].is_null(),
+                "case {case:?}: a refused export answers no job id, got {body}"
+            );
+        }
+    }
+
+    // Not one of those calls recorded a job, so nothing was ever queued to write a file.
+    let jobs = reported_jobs(&router, "after every cross-account refusal").await;
+    assert!(
+        jobs.is_empty(),
+        "an export refused for naming another account records no job, got {jobs:?}"
+    );
+}
+
+/// The request about another account is refused BEFORE the enrollment gate, for every export
+/// surface: the refusal is about what the request asks for, not about what the store holds, so
+/// an account that never opted in gets the same 400 rather than the 403 its own export gets.
+#[tokio::test]
+async fn the_export_cross_account_refusal_precedes_the_opt_in_gate() {
+    let router = emulator();
+    create_bucket(&router, BUCKET).await;
+    let other = other_accounts().remove(0);
+
+    for surface in surfaces() {
+        let case = format!("{} not opted in, another account", surface.operation);
+        let mut request = export_request(&surface);
+        request["accountIds"] = json!([other]);
+
+        let (status, body) = call(&router, surface.operation, request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the cross-account refusal, got {status}: {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(CROSS_ACCOUNT_MESSAGE),
+            "case {case:?}: expected the cross-account refusal, got {body}"
+        );
+    }
+}
+
+/// Every export operation admits every form that names the caller's own account and nothing
+/// else — and the metadata of the file it writes names that one account, whichever form asked
+/// for it, so the file's stated owner is the account whose rows it holds.
+#[tokio::test]
+async fn every_export_operation_admits_the_caller_s_own_account_and_names_only_it() {
+    for surface in surfaces() {
+        // One emulator per admitted call: only one export job of a resource type may be in
+        // progress per Region, so the rows of one surface cannot share a store.
+        let mut written: Vec<(MultiServiceRouter, String, String, String)> = Vec::new();
+
+        for (form, account_ids) in own_account_lists() {
+            let case = format!("{} with accountIds {form}", surface.operation);
+            let router = enrolled_emulator().await;
+            let mut request = export_request(&surface);
+            if let Some(account_ids) = &account_ids {
+                request["accountIds"] = account_ids.clone();
+            }
+
+            let (status, body) = call(&router, surface.operation, request).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the export to be accepted, got {status}: {body}"
+            );
+            assert!(
+                body["jobId"].is_string(),
+                "case {case:?}: an accepted export answers a job id, got {body}"
+            );
+            let (bucket, _, metadata_key) = export_destination(&case, &body);
+            written.push((router, case, bucket, metadata_key));
+        }
+
+        // Every job above was created within milliseconds of the others, so one wait covers
+        // the whole surface's rows: the clock makes a completion due a fixed span after the
+        // call that created it.
+        tokio::time::sleep(2 * EXPORT_JOB_STEP + SLACK).await;
+
+        for (router, case, bucket, metadata_key) in &written {
+            let (status, metadata) = get_object(router, bucket, metadata_key).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: downloading {metadata_key}: got {status}: {}",
+                String::from_utf8_lossy(&metadata)
+            );
+            let metadata: Value = serde_json::from_slice(&metadata).unwrap_or_else(|error| {
+                panic!("case {case:?}: the metadata file is JSON: {error}")
+            });
+            let listed: Vec<String> = metadata["accountIds"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the metadata lists the accounts exported, got {metadata}")
+                })
+                .iter()
+                .map(|id| id.as_str().unwrap_or_default().to_string())
+                .collect();
+            assert!(
+                !listed.is_empty() && listed.iter().all(|id| id == ACCOUNT),
+                "case {case:?}: the metadata names only the account whose rows the file holds \
+                 ({ACCOUNT}), got {listed:?}"
+            );
+        }
+    }
 }
 
 /// The enrollment gate is the same for every export operation: "The account is not opted in to

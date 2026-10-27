@@ -4,13 +4,17 @@
 //!
 //! One code (`NoSuchResponseHeadersPolicy`) and one status (404) cover two different
 //! conditions, so the message is the only thing that tells them apart. The rule under test:
-//! every operation that RESOLVES a response headers policy identifier answers the same
-//! refusal for an id neither source of policies holds — the account's own records or the
-//! catalogue AWS publishes — and states in the message WHICH condition it is: an identifier
-//! outside the shape every policy id takes (the 8-4-4-4-12 lowercase hex of a UUID) is
-//! refused as an unusable identifier, while a well-formed id that names no policy is refused
-//! as an absent policy. Both sentences are fixed text: neither interpolates anything, and in
-//! particular neither echoes the submitted value back.
+//! which of the two sentences an operation answers is a property of THAT OPERATION, not of
+//! the identifier. An operation that ADDRESSES the policy resource by the id (the two reads
+//! at `/response-headers-policy/{Id}`) examines the identifier's shape before it looks
+//! anything up, so an identifier outside the shape every policy id takes (the 8-4-4-4-12
+//! lowercase hex of a UUID) is refused as an unusable identifier while a well-formed id that
+//! names no policy is refused as an absent policy. An operation that resolves the id only as
+//! a lookup KEY into another resource (`ListDistributionsByResponseHeadersPolicyId`, whose
+//! own resource is the distribution) prechecks nothing and refuses EVERY id neither source of
+//! policies holds — the account's own records or the catalogue AWS publishes — as an absent
+//! policy, whatever shape the id takes. Both sentences are fixed text: neither interpolates
+//! anything, and in particular neither echoes the submitted value back.
 //!
 //! The listing whose resume point is an identifier of this family carries the same rule for
 //! its `Marker`: a value that is no policy id at all was never a resume point this service
@@ -51,7 +55,10 @@ async fn list_policies(router: &MultiServiceRouter, query: &str) -> Answer {
 
 /// Create one policy and report `(its id, its version token)`, so the rows that perturb a
 /// LIVE identifier are built from one this service really minted.
-async fn create_one(router: &MultiServiceRouter, name: &str) -> (String, String) {
+///
+/// `pub(crate)` with the row tables below so the sibling suite that drives the by-policy
+/// listings of every family shares these rows rather than growing a copy of them.
+pub(crate) async fn create_one(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let policy = Policy {
         case: "the policy that exists",
         name: name.to_string(),
@@ -72,14 +79,14 @@ async fn create_one(router: &MultiServiceRouter, name: &str) -> (String, String)
 }
 
 /// One identifier under test, and which of the two conditions it is.
-struct Candidate {
-    case: &'static str,
-    id: String,
+pub(crate) struct Candidate {
+    pub(crate) case: &'static str,
+    pub(crate) id: String,
 }
 
 /// Identifiers outside the shape a response headers policy id takes, derived from a live
 /// `minted` id and a `published` one so the rows follow whatever those ids are.
-fn unusable_identifiers(minted: &str, published: &str) -> Vec<Candidate> {
+pub(crate) fn unusable_identifiers(minted: &str, published: &str) -> Vec<Candidate> {
     let hex_only: String = minted.chars().filter(|c| *c != '-').collect();
     let underscores: String = minted.replace('-', "_");
     // An upper-case hex digit in the first slot: outside the shape for ANY minted value,
@@ -126,7 +133,7 @@ fn unusable_identifiers(minted: &str, published: &str) -> Vec<Candidate> {
 
 /// Well-formed identifiers that name no policy — again derived from the live ids, plus one
 /// value of the shape nothing is ever minted at.
-fn absent_policy_identifiers(minted: &str, published: &str) -> Vec<Candidate> {
+pub(crate) fn absent_policy_identifiers(minted: &str, published: &str) -> Vec<Candidate> {
     // One hex digit of a live id moved: still exactly the shape a policy id takes, and still
     // an id no policy holds.
     let shift = |value: &str| -> String {
@@ -197,15 +204,30 @@ fn assert_refusal(reader: &str, candidate: &Candidate, answer: &Answer, expected
         "case {case} ({reader}, {id:?}): expected {expected:?}, got {message:?}"
     );
     assert!(
-        !message.contains(id.as_str()),
+        !echoes_the_identifier(message, id),
         "case {case} ({reader}, {id:?}): the refusal must not echo the identifier, got \
          {message:?}"
     );
 }
 
+/// Whether `message` carries the identifier SUBMITTED, which no refusal of this family may
+/// do.
+///
+/// A containment test only MEANS an echo for a value long enough not to occur in ordinary
+/// prose: a one- or two-character identifier is a substring of English words (the
+/// absent-policy sentence carries "x" inside "exist"), so for a value that short the test
+/// says nothing either way and the exact-message assertion beside it is what holds. The
+/// bound is on the IDENTIFIER's length rather than on any row, so no row has to be chosen to
+/// keep this meaningful.
+pub(crate) fn echoes_the_identifier(message: &str, id: &str) -> bool {
+    const SHORTEST_ECHOABLE_ID: usize = 4;
+    id.len() >= SHORTEST_ECHOABLE_ID && message.contains(id)
+}
+
 /// An identifier outside the shape every policy id takes is refused as an unusable
-/// identifier, by every operation that resolves such an id. The rows are the shape classes,
-/// and each is checked to really be outside the shape before it is submitted.
+/// identifier by every operation that ADDRESSES the policy resource by it, while the listing
+/// that resolves it as a lookup key refuses it as an absent policy. The rows are the shape
+/// classes, and each is checked to really be outside the shape before it is submitted.
 #[tokio::test]
 async fn an_identifier_outside_the_shape_of_a_policy_id_is_refused_as_unusable() {
     let router = emulator();
@@ -226,23 +248,21 @@ async fn an_identifier_outside_the_shape_of_a_policy_id_is_refused_as_unusable()
             (
                 "GetResponseHeadersPolicyConfig",
                 get_policy_config(&router, &candidate.id).await,
+                RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
             ),
             (
                 "GetResponseHeadersPolicy",
                 get_policy(&router, &candidate.id).await,
+                RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
             ),
             (
                 "ListDistributionsByResponseHeadersPolicyId",
                 list_by_policy(&router, &candidate.id, "").await,
+                NO_SUCH_RESPONSE_HEADERS_POLICY_MESSAGE,
             ),
         ];
-        for (reader, answer) in &answers {
-            assert_refusal(
-                reader,
-                &candidate,
-                answer,
-                RESPONSE_HEADERS_POLICY_ID_FORMAT_MESSAGE,
-            );
+        for (reader, answer, expected) in &answers {
+            assert_refusal(reader, &candidate, answer, expected);
         }
     }
 }

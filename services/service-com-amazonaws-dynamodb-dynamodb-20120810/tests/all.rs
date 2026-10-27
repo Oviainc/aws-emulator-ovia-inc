@@ -25,6 +25,8 @@ mod collection_cap_constraint_reports;
 mod continuous_backups;
 #[path = "all/contributor_insights.rs"]
 mod contributor_insights;
+#[path = "all/create_backup_source_table.rs"]
+mod create_backup_source_table;
 #[path = "all/delete_table_description_projection.rs"]
 mod delete_table_description_projection;
 #[path = "all/describe_continuous_backups_reads.rs"]

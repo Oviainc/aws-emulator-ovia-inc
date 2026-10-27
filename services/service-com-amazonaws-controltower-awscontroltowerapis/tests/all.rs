@@ -19,6 +19,8 @@ mod baseline_operations;
 mod catalog_identifier_equivalence;
 #[path = "all/control_operations.rs"]
 mod control_operations;
+#[path = "all/delete_landing_zone_idempotence.rs"]
+mod delete_landing_zone_idempotence;
 #[path = "all/disable_baseline.rs"]
 mod disable_baseline;
 #[path = "all/enable_baseline_persistence.rs"]

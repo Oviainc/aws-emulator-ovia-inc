@@ -24,7 +24,10 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::user_lifecycle::{account_id, call, call_signed_by, element, elements, error_code, router};
+use crate::user_lifecycle::{
+    account_id, assert_access_denied_message, call, call_signed_by, element, elements, error_code,
+    router,
+};
 
 /// The fixture groups: `(GroupName, Path)` rows spanning the whole `^[\w+=,.@-]+$` name
 /// alphabet, the shortest and longest names `groupNameType` admits (1 and 128
@@ -689,16 +692,13 @@ async fn a_group_call_is_decided_against_the_callers_identity_policies() {
             } else {
                 format!("because no identity-based policy allows the {iam_action} action")
             };
-            assert_eq!(
-                element(&body, "Message"),
-                format!(
-                    "User: arn:aws:iam::{}:user/{user_name} is not authorized to perform: \
-                     {iam_action} on resource: group {target} {reason}",
-                    account_id()
-                ),
-                "case {action}/{case:?}: expected the refusal to name the principal, action \
-                 and group, got {:?}",
-                element(&body, "Message")
+            assert_access_denied_message(
+                &format!("{action}/{case}"),
+                &element(&body, "Message"),
+                &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
+                &iam_action,
+                &format!("group {target}"),
+                &reason,
             );
             assert!(
                 held_groups(&router)

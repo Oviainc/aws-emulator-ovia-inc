@@ -196,9 +196,19 @@ async fn create_ok(router: &MultiServiceRouter, case: &str, body: &Value) -> Str
 }
 
 /// The minimum a create needs: one definition whose `Type` satisfies the modelled
-/// `^[a-zA-Z0-9_\-.:/]{3,200}$` pattern.
+/// `^[a-zA-Z0-9_\-.:/]{3,200}$` pattern and whose `Parameters` name somewhere to deploy
+/// to.
+///
+/// A definition that names neither the accounts nor the organizational units to deploy
+/// to is refused, and no case here is about that rule, so the organizational unit is
+/// added wherever the row's own `parameters` leave it out — which leaves the accounts
+/// the definition fans out to exactly what those parameters name.
 fn definition(type_: &str, parameters: Value) -> Value {
-    json!({ "Type": type_, "Parameters": parameters })
+    let mut parameters = parameters.as_object().cloned().unwrap_or_default();
+    parameters
+        .entry("TargetOrganizationalUnits".to_string())
+        .or_insert_with(|| json!("ou-1"));
+    json!({ "Type": type_, "Parameters": Value::Object(parameters) })
 }
 
 /// The `TypeVersion` the stored definition (and every configuration deployed from it)
@@ -414,7 +424,10 @@ async fn a_created_manager_is_read_back_exactly_as_it_was_stored() {
                 "Description": "",
                 "ConfigurationDefinitions": [{
                     "Type": "AWSQuickSetupType-ResourceExplorer",
-                    "Parameters": { "SelectedAggregatorRegion": "us-west-2" },
+                    "Parameters": {
+                        "SelectedAggregatorRegion": "us-west-2",
+                        "TargetOrganizationalUnits": "ou-1",
+                    },
                     "TypeVersion": "1.1",
                     "LocalDeploymentExecutionRoleName": "QuickSetupExecRole",
                     "LocalDeploymentAdministrationRoleArn":
@@ -424,7 +437,7 @@ async fn a_created_manager_is_read_back_exactly_as_it_was_stored() {
             }),
         ),
         (
-            "a definition with an empty parameter map",
+            "a definition with no parameter beyond its deployment target",
             json!({
                 "Name": "empty-params",
                 "ConfigurationDefinitions": [definition("AWSQuickSetupType-SSM", json!({}))],
@@ -915,7 +928,10 @@ async fn the_configuration_listing_reports_one_record_per_deployed_target() {
                 definition("AWSQuickSetupType-SSMOpsCenter", json!({ "TargetRegions": "us-east-1" })),
                 {
                     "Type": "AWSQuickSetupType-Scheduler",
-                    "Parameters": { "TargetTagKey": "Env" },
+                    "Parameters": {
+                        "TargetOrganizationalUnits": "ou-1",
+                        "TargetTagKey": "Env",
+                    },
                     "TypeVersion": "2.0",
                 },
             ],
@@ -1559,6 +1575,7 @@ async fn a_stored_configuration_is_read_back_by_its_service_generated_id() {
                         "Type": "AWSQuickSetupType-PatchPolicy",
                         "Parameters": {
                             "RateControlErrorThreshold": "10%",
+                            "TargetOrganizationalUnits": "ou-1",
                             "TargetRegions": "us-east-1",
                             "TargetType": "*",
                         },
@@ -1569,7 +1586,7 @@ async fn a_stored_configuration_is_read_back_by_its_service_generated_id() {
             }),
         ),
         (
-            "a definition with an empty parameter map",
+            "a definition with no parameter beyond its deployment target",
             json!({
                 "Name": "empty-params",
                 "ConfigurationDefinitions": [definition("AWSQuickSetupType-SSM", json!({}))],
@@ -1581,7 +1598,10 @@ async fn a_stored_configuration_is_read_back_by_its_service_generated_id() {
                 "Name": "fully-specified",
                 "ConfigurationDefinitions": [{
                     "Type": "AWSQuickSetupType-ResourceExplorer",
-                    "Parameters": { "SelectedAggregatorRegion": "us-west-2" },
+                    "Parameters": {
+                        "SelectedAggregatorRegion": "us-west-2",
+                        "TargetOrganizationalUnits": "ou-1",
+                    },
                     "TypeVersion": "1.1",
                     "LocalDeploymentExecutionRoleName": "QuickSetupExecRole",
                     "LocalDeploymentAdministrationRoleArn":
@@ -2035,7 +2055,10 @@ async fn every_published_configuration_type_is_accepted_and_read_back() {
                 "ConfigurationDefinitions": [{
                     "Type": entry.type_,
                     "TypeVersion": entry.latest_version(),
-                    "Parameters": { "TargetRegions": REGION },
+                    "Parameters": {
+                        "TargetOrganizationalUnits": "ou-1",
+                        "TargetRegions": REGION,
+                    },
                 }],
             }),
         )

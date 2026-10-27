@@ -17,6 +17,8 @@ mod access_key_deletion;
 mod access_key_listing;
 #[path = "all/access_key_status.rs"]
 mod access_key_status;
+#[path = "all/access_key_status_authentication.rs"]
+mod access_key_status_authentication;
 #[path = "all/access_keys.rs"]
 mod access_keys;
 #[path = "all/account_aliases.rs"]

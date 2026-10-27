@@ -715,6 +715,8 @@ pub const OPERATION_TYPE_RESET_DISTRIBUTION_CACHE: &str = "ResetDistributionCach
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_UPDATE_DISTRIBUTION: &str = "UpdateDistribution";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_UPDATE_DISTRIBUTION_BUNDLE: &str = "UpdateDistributionBundle";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_CONTACT_METHOD: &str = "CreateContactMethod";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_CONTACT_METHOD: &str = "DeleteContactMethod";
@@ -11506,12 +11508,33 @@ pub fn distribution_bundle_spec(bundle_id: &str) -> Option<DistributionBundleSpe
         .copied()
 }
 
-/// Whether a NEW distribution may be created on the plan `bundle_id` names: the
-/// plan has to be one this service publishes AND still active, because
-/// `DistributionBundle$isActive` is what says a bundle "can be specified for a
-/// new or existing distribution".
-pub fn distribution_bundle_is_creatable(bundle_id: &str) -> bool {
-    distribution_bundle_spec(bundle_id).is_some_and(|spec| spec.is_active)
+/// Whether a distribution may be put on the plan `bundle_id` names, out of the
+/// catalog `specs`: the plan has to be one the catalog holds AND still active,
+/// because `DistributionBundle$isActive` is what says a bundle "can be specified
+/// for a new or existing distribution".
+///
+/// Taking the catalog as an argument is what lets the rule be exercised against a
+/// catalog that holds a retired plan, which the published one does not yet — the
+/// same reason [`distribution_bundles_from`] takes one.
+pub fn distribution_bundle_is_applicable_in(
+    specs: &[DistributionBundleSpec],
+    bundle_id: &str,
+) -> bool {
+    specs
+        .iter()
+        .find(|spec| spec.bundle_id == bundle_id)
+        .is_some_and(|spec| spec.is_active)
+}
+
+/// Whether a distribution may be put on the plan `bundle_id` names:
+/// [`distribution_bundle_is_applicable_in`] over this service's published
+/// catalog, [`DISTRIBUTION_BUNDLE_SPECS`].
+///
+/// One rule over both calls that name a plan — `CreateDistribution` for a new
+/// distribution and `UpdateDistributionBundle` for one already running — so a
+/// retired plan is refused the same way whichever of them names it.
+pub fn distribution_bundle_is_applicable(bundle_id: &str) -> bool {
+    distribution_bundle_is_applicable_in(DISTRIBUTION_BUNDLE_SPECS, bundle_id)
 }
 
 /// The ARN of the distribution `id`. Every distribution is located in
@@ -11626,7 +11649,8 @@ pub struct StoredDistribution {
     /// Whether the applied bundle may still be changed. A distribution's bundle
     /// can be updated "only one time within your monthly Amazon Web Services
     /// billing cycle" (`UpdateDistributionBundle`), so one that has not been
-    /// moved yet can be.
+    /// moved yet can be, and the call that moves it is what spends the
+    /// allowance — which is the `ableToUpdateBundle` a later read reports.
     pub able_to_update_bundle: bool,
     /// The SSL/TLS certificate attached to the distribution, if the request
     /// named one or `AttachCertificateToDistribution` attached one.

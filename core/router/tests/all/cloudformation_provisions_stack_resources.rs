@@ -29,6 +29,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request here is signed for, and so the region the stack's resources
@@ -907,13 +910,23 @@ async fn a_resource_the_owning_service_refuses_fails_the_stack() {
         Some("ROLLBACK_COMPLETE"),
         "case {case:?}: expected the failed create to be rolled back, got {body}"
     );
+    // The STACK's reason summarises which resource failed; the owning service's own
+    // refusal is reported on that resource's event.
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
-    assert!(
-        reason.contains("Stream") && reason.contains("ResourceInUseException"),
-        "case {case:?}: expected the reason to name the resource and the service's \
-         refusal, got {reason:?}"
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::CREATE, ["Stream"]),
+        "case {case:?}: expected the stack reason to summarise what failed, got {reason:?}"
     );
-
+    let (_, events) =
+        cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
+    assert!(
+        xml_texts(&events, "ResourceStatusReason")
+            .iter()
+            .any(|reported| reported.contains("HandlerErrorCode: ResourceConflict")),
+        "case {case:?}: expected the failing resource's event to carry the service's \
+         refusal, got {events}"
+    );
     // The stream the client created is untouched: the stack created nothing, so its
     // deletion deletes nothing.
     let (status, body) = cloudformation(&router, "DeleteStack", &[("StackName", stack_name)]).await;
@@ -1186,11 +1199,22 @@ async fn an_update_that_would_change_an_existing_resource_in_place_fails_the_sta
         "case {case:?}: expected the update to fail rather than drop the caller's change, \
          got {body}"
     );
+    // The STACK's reason summarises which resource the update failed on; the change it
+    // will not make is that resource's own diagnosis, on its event.
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::UPDATE, ["Stream"]),
+        "case {case:?}: expected the stack reason to summarise what failed, got {reason:?}"
+    );
+    let (_, events) =
+        cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
     assert!(
-        reason.contains("Stream") && reason.contains("NotImplemented"),
-        "case {case:?}: expected the reason to name the resource and the change it will not \
-         make, got {reason:?}"
+        xml_texts(&events, "ResourceStatusReason")
+            .iter()
+            .any(|reported| reported.contains("NotImplemented")),
+        "case {case:?}: expected the failing resource's event to name the change it will \
+         not make, got {events}"
     );
 
     // The stream still has the configuration it was created with, and the stack's own
@@ -1277,11 +1301,22 @@ async fn a_deletion_the_owning_service_refuses_fails_the_stack_and_can_be_retrie
         "case {case:?}: expected the stack's deletion to fail rather than report a \
          deletion that did not happen, got {body}"
     );
+    // The STACK's reason summarises which resource the deletion failed on; the service's
+    // own refusal is reported on that resource's event.
     let reason = xml_text(&body, "StackStatusReason").unwrap_or_default();
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::DELETE, ["Stream"]),
+        "case {case:?}: expected the stack reason to summarise what failed, got {reason:?}"
+    );
+    let (_, events) =
+        cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
     assert!(
-        reason.contains("Stream") && reason.contains("ResourceInUseException"),
-        "case {case:?}: expected the reason to name the resource and the service's \
-         refusal, got {reason:?}"
+        xml_texts(&events, "ResourceStatusReason")
+            .iter()
+            .any(|reported| reported.contains("HandlerErrorCode: ResourceConflict")),
+        "case {case:?}: expected the failing resource's event to carry the service's \
+         refusal, got {events}"
     );
     let (status, surviving) = firehose(
         &router,

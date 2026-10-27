@@ -5,7 +5,8 @@
 //! resource, and answers the target's resulting policy document.
 //!
 //! The target is a resource this account and Region holds — a registered application
-//! or a SAP HANA database of one of its registrations
+//! or one of the resources derived from one of its registrations, its SAP HANA
+//! databases and its components
 //! ([`crate::state::RegionState::holds_resource`]) — so an ARN that names no such
 //! resource is refused with the modelled `ResourceNotFoundException` rather than
 //! granted a permission nothing could use.

@@ -513,6 +513,13 @@ mod describe_project_reads;
 #[path = "all/list_project_assets_paging.rs"]
 mod list_project_assets_paging;
 
+// Declared at the very end, after every suite above, for the reason the notes
+// higher up give: both stretches above are where every concurrent iotsitewise
+// change inserts a declaration of its own. Fold it into the sorted list once the
+// churn settles.
+#[path = "all/list_projects.rs"]
+mod list_projects;
+
 // Declared last, for the same reason the suites above it are: both stretches
 // higher up are where every concurrent iotsitewise change inserts a declaration
 // of its own. Fold it into the sorted list once the churn settles.

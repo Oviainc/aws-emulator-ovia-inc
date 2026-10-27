@@ -31,7 +31,10 @@ use crate::role_tags::{tags, with_tag_params};
 // The account's managed-policy ARN format has ONE definition in this crate's test tree,
 // the one `tests/all/policy_tags.rs` owns, so no suite spells that ARN a second way.
 use crate::policy_tags::account_policy_arn;
-use crate::user_lifecycle::{account_id, call, call_signed_by, element, elements, error_code, router};
+use crate::user_lifecycle::{
+    account_id, assert_access_denied_message, call, call_signed_by, element, elements, error_code,
+    router,
+};
 
 /// A managed policy document with a single statement — the form `CreatePolicy`'s own
 /// documentation describes. Every policy in this suite is created with it; none of
@@ -758,24 +761,21 @@ async fn a_signed_listing_is_decided_against_the_callers_policies() {
                 );
                 // The message is built from the request: the principal that signed it,
                 // the action it named, the policy it addressed — a managed policy being
-                // identified by its ARN — and which of the two refusals this is.
+                // identified by its ARN — which of the two refusals this is, and where
+                // this one denial's authorization details are readable.
                 let reason = if expect == Expect::ExplicitDeny {
                     "with an explicit deny in an identity-based policy".to_string()
                 } else {
                     "because no identity-based policy allows the iam:ListPolicyTags action"
                         .to_string()
                 };
-                let expected = format!(
-                    "User: arn:aws:iam::{}:user/{user_name} is not authorized to perform: \
-                     iam:ListPolicyTags on resource: {arn} {reason}",
-                    account_id()
-                );
-                assert_eq!(
-                    element(&body, "Message"),
-                    expected,
-                    "case {label:?}: expected the refusal to name the principal, action \
-                     and policy, got {:?}",
-                    element(&body, "Message")
+                assert_access_denied_message(
+                    label,
+                    &element(&body, "Message"),
+                    &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
+                    "iam:ListPolicyTags",
+                    &arn,
+                    &reason,
                 );
             }
         }

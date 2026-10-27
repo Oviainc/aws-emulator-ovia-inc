@@ -588,6 +588,16 @@ async fn get_policy_version_serves_only_the_versions_a_policy_carries() {
                 "NoSuchEntity",
                 "case {owner:?} {version:?}: the refusal must be NoSuchEntity: {body}"
             );
+            // IAM's fixed text for a policy a request cannot be served from closes with
+            // `does not exist or is not attachable.` — the same clause the attach and
+            // permissions-boundary refusals carry — around the ARN and the version id
+            // the request supplied.
+            assert_eq!(
+                element(&body, "Message"),
+                format!("Policy {arn} version {version} does not exist or is not attachable."),
+                "case {owner:?} {version:?}: expected AWS's missing-version wording, got {:?}",
+                element(&body, "Message")
+            );
         }
     }
 }

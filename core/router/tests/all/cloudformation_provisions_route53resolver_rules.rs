@@ -39,6 +39,9 @@ use smithy_server_runtime::MultiServiceRouter;
 // The awsQuery form encoder and the XML element readers this crate writes ONCE
 // (`tests/all/query_wire.rs`): "Nothing new should write another one — call this module."
 use super::query_wire::{elements, form_encode, opt_element};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 
 /// Long enough for the stack's own clock-owed span (`STATUS_TRANSITION_DELAY`, 500 ms) and
 /// for Route 53 Resolver's provisioning span (`PROVISIONING_DELAY`, 500 ms) to come due, so
@@ -875,15 +878,27 @@ async fn a_rule_through_an_inbound_endpoint_fails_the_stack() {
         Some("ROLLBACK_COMPLETE"),
         "case {case:?}: expected the failed create to be rolled back, got {described}"
     );
+    // The STACK's reason summarises which resource failed; Route 53 Resolver's own
+    // refusal is reported on that resource's event.
     let reason = opt_element(&described, "StackStatusReason").unwrap_or_default();
-    assert!(
-        reason.contains("Rule"),
-        "case {case:?}: expected the failure to name the resource, got {reason:?}"
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::CREATE, ["Rule"]),
+        "case {case:?}: expected the stack reason to summarise what failed, got {reason:?}"
     );
+    let (_, events) = cloudformation(
+        &router,
+        region,
+        "DescribeStackEvents",
+        &[("StackName", "resolver-refused")],
+    )
+    .await;
     assert!(
-        reason.contains("INBOUND") || reason.contains("OUTBOUND"),
-        "case {case:?}: expected the failure to carry Route 53 Resolver's own refusal, got \
-         {reason:?}"
+        elements(&events, "ResourceStatusReason")
+            .iter()
+            .any(|reported| reported.contains("INBOUND") || reported.contains("OUTBOUND")),
+        "case {case:?}: expected the failing resource's event to carry Route 53 Resolver's \
+         own refusal, got {events}"
     );
 
     // The rollback removed the endpoint the failed create had already made, so nothing of

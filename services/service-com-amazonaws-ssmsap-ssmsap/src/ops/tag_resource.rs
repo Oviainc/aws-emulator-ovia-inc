@@ -3,7 +3,8 @@
 //! @op TagResource
 //!
 //! Attaches tags to the resource an ARN names — the registered SAP application, or one
-//! of the SAP HANA databases of that registration. The tags are written to the one
+//! of the SAP HANA databases or components of that registration. The tags are written
+//! to the one
 //! place this service keeps tags ([`crate::state::RegionState::tags_by_arn`]), which is
 //! what `ListTagsForResource` and `GetApplication` report, so a tag this call persists
 //! is observable by every later read. Tagging MERGES into the set the resource already
@@ -166,8 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceArn` is modelled `@required` with a `@pattern` and every `TagKey` /
         // `TagValue` carries its own constraints, so reaching here means the request is
         // well formed. The ARN still has to NAME something: the resources this service
-        // holds are the registered SAP application and the SAP HANA databases of that
-        // registration, so an ARN naming neither is the `ResourceNotFoundException` this
+        // holds are the registered SAP application and the resources derived from that
+        // registration — its SAP HANA databases and its components — so an ARN naming none
+        // of them is the `ResourceNotFoundException` this
         // operation models rather than a tag persisted against a resource that does not
         // exist. Resolved through [`crate::state::RegionState::holds_resource`], the one
         // place this service decides what an ARN names, so `TagResource` and
