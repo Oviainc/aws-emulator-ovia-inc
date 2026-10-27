@@ -256,17 +256,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "To perform a PutSubscriptionFilter operation for any destination except a
-        // Lambda function, you must also have the iam:PassRole permission": every
-        // supported destination but a Lambda function is delivered to through a role
-        // CloudWatch Logs assumes, so a filter cannot be configured without one — apart
-        // from a logical destination owned by another account, which authorises the
-        // delivery with its own policy. The refusal names the vendor it was asked to
-        // deliver to.
+        // Lambda function, you must also have the iam:PassRole permission": a stream of
+        // one of the two streaming services named as a DIRECT destination is delivered to
+        // through a role CloudWatch Logs assumes, so a filter on one cannot be configured
+        // without it. The other two kinds carry their own authorisation — a Lambda
+        // function is invoked directly, and a logical destination was given its role by
+        // `PutDestination` ("You don't need to provide the ARN when you are working with a
+        // logical destination for cross-account delivery") — so neither needs `roleArn`.
+        // The refusal names the vendor it was asked to deliver to.
         //
         // This runs BEFORE the destination-kind check below because that is the order the
-        // service answers in: a recorded put of a `logs`-vendor ARN that is not a logical
-        // destination, with no roleArn, is refused for the missing role rather than for
-        // the resource the ARN names.
+        // service answers in: a put of a streaming-vendor ARN that names no stream, with
+        // no roleArn, is refused for the missing role rather than for the resource the ARN
+        // names.
         if input.role_arn.is_none() {
             if let Some(vendor) =
                 crate::state::subscription_role_required_vendor(&input.destination_arn)
@@ -326,20 +328,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "Each log group can have up to two subscription filters associated with it. If
-        // you are updating an existing filter, you must specify the correct name in
-        // filterName" — so a put under a name the group already holds is an update, and
-        // only a put that would add a filter can exceed the quota.
+        // A log group holds at most `MAX_SUBSCRIPTION_FILTERS_PER_GROUP` subscription
+        // filters at a time, and the quota counts the filters the group HOLDS rather than
+        // the puts made against it: "If you are updating an existing filter, you must
+        // specify the correct name in filterName", so a put under a name the group already
+        // holds is an update and only a put that would ADD a filter can exceed the quota.
+        // The refusal carries the service's fixed limit sentence, which names neither the
+        // quota nor anything from the request.
         if !group.subscription_filters.contains_key(&input.filter_name)
             && group.subscription_filters.len()
                 >= crate::state::MAX_SUBSCRIPTION_FILTERS_PER_GROUP
         {
             return Err(PutSubscriptionFilterErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "a log group can have up to {} subscription filters associated with it",
-                        crate::state::MAX_SUBSCRIPTION_FILTERS_PER_GROUP
-                    )),
+                    message: Some(
+                        crate::state::SUBSCRIPTION_FILTER_LIMIT_EXCEEDED.to_string(),
+                    ),
                 },
             )
             .into());
