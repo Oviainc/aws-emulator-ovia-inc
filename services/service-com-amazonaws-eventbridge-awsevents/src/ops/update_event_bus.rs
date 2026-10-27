@@ -161,19 +161,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `LogConfig`'s members are modelled enums, which the boundary validator
-        // does not narrow to their values — so a value neither enum admits is
-        // refused here rather than stored and reported back as if EventBridge had
-        // accepted it. The same check `CreateEventBus` makes, so both writers of
-        // a bus's log configuration admit exactly the same values.
-        if let Some(reason) = input
-            .log_config
-            .as_ref()
-            .and_then(crate::state::log_config_violation)
-        {
-            return Err(crate::scaffolded::Scaffolded::validation(reason));
-        }
-
         let region = crate::state::request_region(ctx.parts());
         // `Name` is "the name of the event bus" and is not required, so a request
         // naming none addresses the account's `default` bus — resolved by the one
@@ -183,7 +170,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // An update changes a bus that exists; it never brings one into being.
-        let Some(bus) = store.bus_mut(&bus_name) else {
+        // The bus is resolved BEFORE the request's own members are judged, so a
+        // caller naming a bus that is gone reads that rather than a verdict on
+        // its request body.
+        if store.bus(&region, &bus_name).is_none() {
+            return Err(UpdateEventBusErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::no_such_event_bus(&bus_name)),
+                },
+            )
+            .into());
+        }
+
+        // A submitted `LogConfig` has to name the `Level` it configures, and
+        // `LogConfig`'s members are modelled enums, which the boundary validator
+        // does not narrow to their values — so a configuration that configures no
+        // logging, or carries a value neither enum admits, is refused here rather
+        // than stored and reported back as if EventBridge had accepted it. The
+        // same check `CreateEventBus` makes, so both writers of a bus's log
+        // configuration admit exactly the same configurations.
+        if let Some(reason) = input
+            .log_config
+            .as_ref()
+            .and_then(crate::state::log_config_violation)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
+
+        let Some(bus) = store.bus_mut(&region, &bus_name) else {
             return Err(UpdateEventBusErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_event_bus(&bus_name)),

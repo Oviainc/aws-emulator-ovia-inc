@@ -144,13 +144,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
         // A pure read: nothing is created or moved by describing a rule, so the
         // store is left exactly as it was found.
         let store = state.lock();
-        let Some(rule) = store.rule(&bus_name, &input.name) else {
+        let Some(rule) = store.rule(&region, &bus_name, &input.name) else {
             return Err(DescribeRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_rule(&bus_name, &input.name)),

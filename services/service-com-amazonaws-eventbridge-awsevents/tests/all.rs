@@ -21,6 +21,8 @@ mod archive_and_api_destination;
 mod archive_registry;
 #[path = "all/archive_replay.rs"]
 mod archive_replay;
+#[path = "all/connection_authorization.rs"]
+mod connection_authorization;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
 #[path = "all/dead_letter_error_code.rs"]
@@ -33,6 +35,8 @@ mod event_bus_configuration;
 mod event_bus_deletion;
 #[path = "all/event_bus_lifecycle.rs"]
 mod event_bus_lifecycle;
+#[path = "all/event_bus_write_semantics.rs"]
+mod event_bus_write_semantics;
 #[path = "all/global_endpoint.rs"]
 mod global_endpoint;
 #[path = "all/global_endpoint_deletion.rs"]
@@ -57,6 +61,8 @@ mod pattern_and_connection_filters;
 mod pattern_preflight;
 #[path = "all/pattern_refusal_wording.rs"]
 mod pattern_refusal_wording;
+#[path = "all/regional_bus_namespace.rs"]
+mod regional_bus_namespace;
 #[path = "all/replay_cancellation.rs"]
 mod replay_cancellation;
 #[path = "all/replay_filter_arns_scoping.rs"]

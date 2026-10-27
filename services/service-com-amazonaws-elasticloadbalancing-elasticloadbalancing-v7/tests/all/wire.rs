@@ -29,9 +29,14 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     router
 }
 
-/// One wire answer: the HTTP status and the XML body.
+/// One wire answer: the HTTP status, the `Content-Type` it was answered with, and the XML
+/// body.
 pub(crate) struct Wire {
     pub(crate) status: u16,
+    /// The answer's `Content-Type` header, or an empty string when it carries none. An
+    /// awsQuery answer — success or refusal — is XML, so a suite that asserts a refusal is
+    /// readable by an awsQuery client asserts this too.
+    pub(crate) content_type: String,
     pub(crate) body: String,
 }
 
@@ -127,6 +132,12 @@ pub(crate) async fn call_at_version(
     let response = router.dispatch(request).await;
     Wire {
         status: response.status().as_u16(),
+        content_type: response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string(),
         body: String::from_utf8(response.body().to_vec()).expect("a UTF-8 XML body"),
     }
 }
@@ -267,6 +278,17 @@ pub(crate) fn find<'a>(node: &'a Element, tag: &str) -> Option<&'a Element> {
 /// The direct child whose local name is `tag`.
 pub(crate) fn kid<'a>(node: &'a Element, tag: &str) -> Option<&'a Element> {
     node.children().find(|candidate| candidate.name == tag)
+}
+
+/// The `<Message>` of an answer's `<Error>`, or an empty string.
+///
+/// Here, once, because every suite that asserts a refusal reads it.
+pub(crate) fn error_message(answer: &Wire) -> String {
+    let doc = parse(&answer.body);
+    find(doc.root_element(), "Message")
+        .and_then(Element::text)
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub(crate) fn kid_text(node: &Element, tag: &str) -> Option<String> {

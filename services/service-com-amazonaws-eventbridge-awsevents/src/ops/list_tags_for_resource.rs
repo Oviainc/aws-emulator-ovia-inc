@@ -134,7 +134,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalException(
@@ -145,10 +145,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx.parts());
         // `Arn` is a plain 1..1600 string, so text that is not the ARN of an
         // EventBridge rule or event bus reaches here: a bad request, and a different
         // answer from a well-formed ARN naming a resource that does not exist.
-        let resource = crate::state::parse_tagged_resource(&input.resource_arn)
+        let resource = crate::state::parse_tagged_resource(&input.resource_arn, &region)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         let store = state.lock();

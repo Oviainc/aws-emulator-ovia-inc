@@ -237,6 +237,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // The store holds an organization recommendation only for a prioritized
+        // recommendation, so this guards that invariant at the one write path:
+        // an entry of any other type could not have its lifecycle moved by this
+        // operation, which supports only prioritized recommendations.
         if entry.r#type != RECOMMENDATION_TYPE_PRIORITY {
             return Err(
                 UpdateOrganizationRecommendationLifecycleErrorModeled::ConflictException(

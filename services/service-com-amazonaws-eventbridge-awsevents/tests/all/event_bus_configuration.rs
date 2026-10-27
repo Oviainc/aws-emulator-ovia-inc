@@ -588,9 +588,16 @@ async fn a_granted_permission_is_reported_in_the_bus_policy() {
             json!("Allow"),
             "case {case}: a grant allows, got {statement}"
         );
+        // The policy language writes "every principal" as the bare string "*"
+        // and a NAMED principal as an object keyed by the kind of principal it
+        // is, so an account id is an Amazon Web Services principal under `AWS`.
+        let expected_principal = if grant["Principal"] == json!("*") {
+            json!("*")
+        } else {
+            json!({ "AWS": grant["Principal"].clone() })
+        };
         assert_eq!(
-            statement["Principal"],
-            json!({ "AWS": grant["Principal"].clone() }),
+            statement["Principal"], expected_principal,
             "case {case}: expected the granted principal, got {statement}"
         );
         assert_eq!(
@@ -1250,7 +1257,7 @@ async fn a_deleted_bus_is_gone_from_every_reader() {
             .lock()
             .buses
             .keys()
-            .cloned()
+            .map(|key| key.name.clone())
             .collect::<Vec<String>>(),
         vec![DEFAULT_EVENT_BUS_NAME.to_string(), "kept".to_string()],
         "a deleted bus must be gone from the store"

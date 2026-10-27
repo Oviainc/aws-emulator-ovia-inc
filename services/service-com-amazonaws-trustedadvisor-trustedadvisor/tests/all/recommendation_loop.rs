@@ -52,6 +52,18 @@ pub(crate) const CHECK_IDS: &[&str] = &[
     "rds-idle-db-instances",
 ];
 
+/// The seeded checks whose recommendation's `type` is `priority`, and those
+/// whose is `standard` — the two halves the `type` filter cuts the catalog
+/// into. Written out by hand; their source is the `SEED` table in
+/// `src/state.rs`.
+///
+/// The prioritized half is also exactly the set of checks with an ORGANIZATION
+/// recommendation: every organization operation of this service supports only
+/// prioritized recommendations, so a standard check has none.
+pub(crate) const PRIORITIZED_CHECK_IDS: &[&str] =
+    &["low-utilization-ec2-instances", "rds-idle-db-instances"];
+pub(crate) const STANDARD_CHECK_IDS: &[&str] = &["amazon-ebs-snapshots", "iam-access-key-rotation"];
+
 /// A mounted emulator with its own engine, so each test starts from the seeded
 /// store and sees only its own writes.
 ///

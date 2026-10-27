@@ -163,11 +163,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
         let mut store = state.lock();
-        let Some(bus) = store.bus_mut(&bus_name) else {
+        let Some(bus) = store.bus_mut(&region, &bus_name) else {
             return Err(DeleteRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_event_bus(&bus_name)),

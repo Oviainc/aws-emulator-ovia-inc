@@ -176,6 +176,9 @@ mod input_device_transfer_accept;
 #[path = "all/input_device_transfer_cancel.rs"]
 mod input_device_transfer_cancel;
 
+#[path = "all/input_device_transfer_independence.rs"]
+mod input_device_transfer_independence;
+
 #[path = "all/input_device_transfer_reject.rs"]
 mod input_device_transfer_reject;
 

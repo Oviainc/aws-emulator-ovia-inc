@@ -302,16 +302,20 @@ fn check_access_log(access_log: &AccessLog) -> Result<(), ModifyLoadBalancerAttr
 /// The model declares no range for `ConnectionDraining$Timeout`, so the bound is the one
 /// the Classic Load Balancers Guide publishes (see
 /// [`crate::state::CONNECTION_DRAINING_TIMEOUT_SECONDS`]) and this handler is what
-/// applies it.
+/// applies it. A value outside a bound is a VALUE this service cannot accept, not a
+/// configuration change it cannot apply, so it answers under the same code — and with the
+/// same sentence — as every other out-of-bounds timeout.
 fn check_connection_draining(
     draining: &ConnectionDraining,
 ) -> Result<(), ModifyLoadBalancerAttributesError> {
-    let (low, high) = crate::state::CONNECTION_DRAINING_TIMEOUT_SECONDS;
+    let bounds = crate::state::CONNECTION_DRAINING_TIMEOUT_SECONDS;
+    let (low, high) = bounds;
     match draining.timeout {
-        Some(timeout) if !(low..=high).contains(&timeout) => Err(invalid_configuration(format!(
-            "ConnectionDraining.Timeout must be a number from {low} through {high} \
-             seconds; got {timeout}"
-        ))),
+        Some(timeout) if !(low..=high).contains(&timeout) => Err(
+            crate::scaffolded::Scaffolded::validation_error(crate::state::timeout_bound_message(
+                bounds,
+            )),
+        ),
         _ => Ok(()),
     }
 }
