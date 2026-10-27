@@ -63,5 +63,7 @@ mod tax_exemption_types;
 mod tax_exemptions;
 #[path = "all/tax_inheritance_election.rs"]
 mod tax_inheritance_election;
+#[path = "all/tax_registration_document.rs"]
+mod tax_registration_document;
 #[path = "all/tax_registration_lifecycle.rs"]
 mod tax_registration_lifecycle;
