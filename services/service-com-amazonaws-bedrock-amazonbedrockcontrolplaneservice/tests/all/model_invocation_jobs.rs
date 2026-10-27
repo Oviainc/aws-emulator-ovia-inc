@@ -22,12 +22,14 @@
 //! 4. **`modelId` is resolved against the published catalog**: an identifier that names no
 //!    model of this account is 404 `ResourceNotFoundException`, while every model the
 //!    catalog publishes is accepted.
-//! 5. **`status` is non-terminal first and settles on the CLOCK**: `Submitted` with no
-//!    `endTime` straight after the create, `InProgress` once
-//!    `MODEL_INVOCATION_JOB_BEGINS_AFTER` has passed, `Completed` with an `endTime` once
-//!    `MODEL_INVOCATION_JOB_COMPLETE_AFTER` has passed on top of it — the same status a
-//!    listing reports and `statusEquals` filters on, and reading twice reports the same
-//!    instants.
+//! 5. **`status` walks the documented progression on the CLOCK**: `Submitted` with no
+//!    `endTime` straight after the create, then `Validating`, then `Scheduled`, then
+//!    `InProgress`, each stamped at the instant its own span fell due — the same status a
+//!    listing reports and `statusEquals` filters on — and `Completed` with an `endTime` only
+//!    once the run span has elapsed on top of them. The whole timeline is asserted at each
+//!    instant it turns on, and over the intervals a client polls a job at: at every one of
+//!    them the first status outside `{Submitted, Validating, Scheduled}` a poller reads is
+//!    the running one, and reading twice reports the same instants.
 //! 6. **A replayed `clientRequestToken` submits nothing**: the replay answers with the job
 //!    the first call minted and stores no second job, while a fresh token submits another.
 //! 7. **The listing orders, filters and pages** the stored jobs: creation order in both
@@ -57,13 +59,27 @@ use crate::support::{
 
 type State = service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState;
 
+/// One stored batch inference job, as the create wrote it into [`State`].
+type JobRecord = service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::ModelInvocationJobRecord;
+
+/// The instants a submission owes a job each of its status transitions at.
+type JobClock = service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::ModelInvocationJobClock;
+
 /// The published foundation model catalog this service serves: the rows
 /// `ListFoundationModels` reports (`state::FOUNDATION_MODELS`), so these rows follow the
 /// catalog the service serves rather than a spelling it may add to or drop.
 const CATALOG: &[service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::FoundationModel] =
     service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::FOUNDATION_MODELS;
 
-/// How long after it was submitted a job is owed its move to `InProgress`.
+/// How long after it was submitted a job is owed its move to `Validating`.
+const VALIDATES_AFTER: Duration =
+    service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::MODEL_INVOCATION_JOB_VALIDATES_AFTER;
+
+/// How long after it entered validation a job is owed its move to `Scheduled`.
+const SCHEDULES_AFTER: Duration =
+    service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::MODEL_INVOCATION_JOB_SCHEDULES_AFTER;
+
+/// How long after it was scheduled a job is owed its move to `InProgress`.
 const BEGINS_AFTER: Duration =
     service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::MODEL_INVOCATION_JOB_BEGINS_AFTER;
 
@@ -79,12 +95,87 @@ const STOPPED_AFTER: Duration =
 /// rather than exactly on it.
 const MARGIN: Duration = Duration::from_millis(150);
 
-/// `ModelInvocationJobStatus` values this emulator's lifecycle passes through.
+/// How far apart two reported instants may be and still count as the same instant: the wire
+/// form is an RFC 3339 date-time, so a stamp survives the round trip to the millisecond.
+const INSTANT_TOLERANCE: f64 = 0.002;
+
+/// `ModelInvocationJobStatus` values this emulator's lifecycle passes through, in the order
+/// the member's documentation lists the progression
+/// (`smithy_query(query="doc",shape="ModelInvocationJobSummary",member="status")`).
 const SUBMITTED: &str = "Submitted";
+const VALIDATING: &str = "Validating";
+const SCHEDULED: &str = "Scheduled";
 const IN_PROGRESS: &str = "InProgress";
 const COMPLETED: &str = "Completed";
 const STOPPING: &str = "Stopping";
 const STOPPED: &str = "Stopped";
+
+/// The statuses a job holds before it has begun: the set a client polls THROUGH while it
+/// waits for a job to start.
+const PRE_START: &[&str] = &[SUBMITTED, VALIDATING, SCHEDULED];
+
+/// How long after its submission a job is owed its start: the three pre-start spans end to
+/// end.
+fn pre_start_span() -> Duration {
+    VALIDATES_AFTER + SCHEDULES_AFTER + BEGINS_AFTER
+}
+
+/// The whole span a job nobody stops takes from its submission to `Completed`.
+fn lifespan() -> Duration {
+    pre_start_span() + COMPLETE_AFTER
+}
+
+/// The stored record of one batch inference job, cloned out of the store the handlers share.
+///
+/// Cloned rather than borrowed so a case can settle it at an instant of its own choosing:
+/// the clock rule is about spans of wall-clock time measured in minutes, which no test can
+/// sleep through.
+fn stored_job(emu: &Emulator, arn: &str) -> JobRecord {
+    let state =
+        service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::service_state(
+            &*emu.engine,
+        )
+        .expect("the shared engine carries this service's store");
+    let store = state.lock();
+    store
+        .model_invocation_jobs
+        .get(arn)
+        .cloned()
+        .unwrap_or_else(|| panic!("the store must hold the submitted job {arn}"))
+}
+
+/// Age the stored job `arn` names by `by`, as though it had been submitted that much
+/// earlier: its submission instant and every instant its clock owes a transition at move
+/// back together, so the job's own timeline is untouched and only the amount of it that has
+/// already elapsed changes.
+fn age_job(emu: &Emulator, arn: &str, by: Duration) {
+    let state =
+        service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::service_state(
+            &*emu.engine,
+        )
+        .expect("the shared engine carries this service's store");
+    let mut store = state.lock();
+    let job = store
+        .model_invocation_jobs
+        .get_mut(arn)
+        .unwrap_or_else(|| panic!("the store must hold the submitted job {arn}"));
+    job.submit_time -= by;
+    job.last_modified_at -= by;
+    if let Some(expires) = job.job_expiration_time.as_mut() {
+        *expires -= by;
+    }
+    for due in [
+        &mut job.validating_due_at,
+        &mut job.scheduled_due_at,
+        &mut job.in_progress_due_at,
+        &mut job.completed_due_at,
+        &mut job.stopped_due_at,
+    ] {
+        if let Some(instant) = due.as_mut() {
+            *instant -= by;
+        }
+    }
+}
 
 /// The `modelId` of the `index`-th model the published catalog carries.
 fn catalog_model(index: usize) -> &'static str {
@@ -640,13 +731,18 @@ async fn the_model_is_resolved_against_the_published_catalog() {
 }
 
 // ---------------------------------------------------------------------------------------
-// 5. The status is non-terminal first and settles on the clock.
+// 5. The status walks the documented progression, one stage at a time, on the clock.
 // ---------------------------------------------------------------------------------------
 
+/// Every status a stored job's lifecycle passes through, so a case can assert that the
+/// filter reports the job under the status it holds and under no other.
+const LIFECYCLE: &[&str] = &[SUBMITTED, VALIDATING, SCHEDULED, IN_PROGRESS, COMPLETED];
+
 #[tokio::test]
-async fn the_status_settles_from_submitted_through_in_progress_to_completed() {
+async fn the_status_walks_every_pre_start_stage_before_it_reports_the_job_running() {
     let emu = emulator();
 
+    let started = ::std::time::Instant::now();
     let arn = submit(
         &emu,
         "the settling job",
@@ -654,64 +750,160 @@ async fn the_status_settles_from_submitted_through_in_progress_to_completed() {
     )
     .await;
 
-    // Straight after the create, a read and a listing both report it queued: the caller
-    // observes the transient status the real service reports.
-    let read = get(&emu, &arn).await;
-    assert_eq!(
-        text("straight after the create", &read.body, "status"),
-        SUBMITTED,
-        "the read must report the queued status"
-    );
-    let submitted = instant("straight after the create", &read.body, "submitTime");
-    let rows = listed("straight after the create", &list(&emu, "").await);
-    assert_eq!(
-        text("straight after the create", &rows[0], "status"),
-        SUBMITTED,
-        "the listing must report the same status the read does"
-    );
+    // One row per stage of the progression: how much of the job's timeline has elapsed, and
+    // the status the job must then hold. Each pre-start status the model documents is a
+    // status a caller READS the job in, so none of them may be skipped.
+    let stages: &[(&str, Duration, &str)] = &[
+        ("straight after the create", Duration::ZERO, SUBMITTED),
+        (
+            "once the validation span has passed",
+            VALIDATES_AFTER,
+            VALIDATING,
+        ),
+        (
+            "once the scheduling span has passed",
+            VALIDATES_AFTER + SCHEDULES_AFTER,
+            SCHEDULED,
+        ),
+        ("once the begin span has passed", pre_start_span(), IN_PROGRESS),
+    ];
 
-    // The first move is owed by the CLOCK: once the span has passed the next call that
-    // touches the record reports the job running, stamped at the instant it was owed.
-    tokio::time::sleep(BEGINS_AFTER + MARGIN).await;
+    let mut first_submit_time: Option<f64> = None;
+    for (case, elapsed, expected) in stages {
+        if !elapsed.is_zero() {
+            tokio::time::sleep(
+                elapsed
+                    .saturating_add(MARGIN)
+                    .saturating_sub(started.elapsed()),
+            )
+            .await;
+        }
+
+        let read = get(&emu, &arn).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: the read must answer 200, got {} {:?}",
+            read.status, read.body
+        );
+        assert_eq!(
+            text(case, &read.body, "status"),
+            *expected,
+            "case {case}: the read must report {expected}, got {:?}",
+            read.body.get("status")
+        );
+
+        // A settle leaves the submission instant alone, and stamps the move at the instant
+        // the CLOCK owed it rather than at the instant of the read.
+        let submitted = instant(case, &read.body, "submitTime");
+        let first = *first_submit_time.get_or_insert(submitted);
+        assert_eq!(
+            submitted, first,
+            "case {case}: a settle must leave the submission instant alone, got {submitted} \
+             against {first}"
+        );
+        let modified = instant(case, &read.body, "lastModifiedTime");
+        let owed = submitted + elapsed.as_secs_f64();
+        assert!(
+            (modified - owed).abs() < INSTANT_TOLERANCE,
+            "case {case}: the move must be stamped at the instant it was owed ({owed}), got \
+             {modified}"
+        );
+        assert_eq!(
+            read.body.get("endTime"),
+            None,
+            "case {case}: a job that has not reached a terminal status has no endTime, got {:?}",
+            read.body.get("endTime")
+        );
+
+        // The listing agrees, and `statusEquals` filters on the status the job holds NOW.
+        let rows = listed(case, &list(&emu, "").await);
+        assert_eq!(
+            text(case, &rows[0], "status"),
+            *expected,
+            "case {case}: the listing must report the same status the read does"
+        );
+        for status in LIFECYCLE {
+            let reply = list(&emu, &format!("statusEquals={status}")).await;
+            let expected_arns = if status == expected {
+                vec![arn.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                listed_arns(case, &reply),
+                expected_arns,
+                "case {case}: statusEquals={status} must report {} while the job is {expected}",
+                if status == expected {
+                    "the job"
+                } else {
+                    "nothing"
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_job_reports_completed_only_once_its_whole_run_span_has_elapsed() {
+    let emu = emulator();
+
+    let arn = submit(
+        &emu,
+        "the completing job",
+        create_body("batch-completing", catalog_model(0)),
+    )
+    .await;
+    let lifespan = lifespan();
+    let tick = Duration::from_millis(50);
+
+    // A tick before the run span is up the job is still RUNNING, stamped at the instant it
+    // began. Ageing the stored record brings the same elapsed time a wall clock would, which
+    // is how a run span measured in minutes is asserted without sleeping through one.
+    age_job(&emu, &arn, lifespan.saturating_sub(tick));
     let running = get(&emu, &arn).await;
+    let case = "a tick before the run span is up";
     assert_eq!(
-        text("after the begin span", &running.body, "status"),
+        text(case, &running.body, "status"),
         IN_PROGRESS,
-        "the read must report the job running once the begin span has passed"
-    );
-    let began = instant("after the begin span", &running.body, "lastModifiedTime");
-    assert!(
-        began >= submitted + BEGINS_AFTER.as_secs_f64() - 0.001,
-        "the begin must be stamped at the instant it was owed ({}), got {began} against a \
-         submission at {submitted}",
-        BEGINS_AFTER.as_secs_f64()
+        "case {case}: the job must still be running, got {:?}",
+        running.body.get("status")
     );
     assert_eq!(
         running.body.get("endTime"),
         None,
-        "a running job has no endTime, got {:?}",
+        "case {case}: a running job has no endTime, got {:?}",
         running.body.get("endTime")
     );
-    assert_eq!(
-        instant("after the begin span", &running.body, "submitTime"),
-        submitted,
-        "a settle must leave the submission instant alone"
+    let began = instant(case, &running.body, "lastModifiedTime")
+        - instant(case, &running.body, "submitTime");
+    let pre_start = pre_start_span().as_secs_f64();
+    assert!(
+        (began - pre_start).abs() < INSTANT_TOLERANCE,
+        "case {case}: the begin must be stamped {pre_start} s after the submission, got {began} s"
     );
 
-    // The second move is owed the same way, and it is the job's end.
-    tokio::time::sleep(COMPLETE_AFTER + MARGIN).await;
+    // Once it is up the job is finished, stamped at the instant the completion was owed.
+    age_job(&emu, &arn, tick.saturating_mul(2));
     let done = get(&emu, &arn).await;
+    let case = "once the run span is up";
     assert_eq!(
-        text("after the complete span", &done.body, "status"),
+        text(case, &done.body, "status"),
         COMPLETED,
-        "the read must report the job completed once the run span has passed"
+        "case {case}: the job must be completed, got {:?}",
+        done.body.get("status")
     );
-    let ended = instant("after the complete span", &done.body, "endTime");
+    let submitted = instant(case, &done.body, "submitTime");
+    let ended = instant(case, &done.body, "endTime");
+    let owed = submitted + lifespan.as_secs_f64();
     assert!(
-        ended >= began + COMPLETE_AFTER.as_secs_f64() - 0.001,
-        "the completion must be stamped at the instant it was owed ({}), got {ended} against a \
-         begin at {began}",
-        COMPLETE_AFTER.as_secs_f64()
+        (ended - owed).abs() < INSTANT_TOLERANCE,
+        "case {case}: the completion must be stamped at the instant it was owed ({owed}), got \
+         {ended}"
+    );
+    assert_eq!(
+        instant(case, &done.body, "lastModifiedTime"),
+        ended,
+        "case {case}: the completion is the job's last modification"
     );
 
     // Reading again reports the SAME instants: the settle is owed by the clock, not by the
@@ -725,21 +917,238 @@ async fn the_status_settles_from_submitted_through_in_progress_to_completed() {
         );
     }
 
-    // And `statusEquals` filters on the status each job holds NOW.
-    assert_eq!(
-        listed_arns(
-            "statusEquals=Completed after the settle",
-            &list(&emu, &format!("statusEquals={COMPLETED}")).await
+    // And `statusEquals` filters on the status the job holds now.
+    for status in LIFECYCLE {
+        let reply = list(&emu, &format!("statusEquals={status}")).await;
+        let expected_arns = if *status == COMPLETED {
+            vec![arn.clone()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            listed_arns("the completed job", &reply),
+            expected_arns,
+            "statusEquals={status} must report {} once the job completed",
+            if *status == COMPLETED {
+                "the job"
+            } else {
+                "nothing"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_clock_reports_the_stage_it_has_reached_over_the_whole_timeline() {
+    let emu = emulator();
+
+    let arn = submit(
+        &emu,
+        "the clocked job",
+        create_body("batch-clocked", catalog_model(0)),
+    )
+    .await;
+    let pristine = stored_job(&emu, &arn);
+    let submit_time = pristine.submit_time;
+
+    // The submission arms every transition at once, each a span after the one before it, so
+    // no later call arms a move it can then spend at the same instant.
+    let clock = JobClock::armed_at(submit_time);
+    for (case, armed, expected) in [
+        ("validating", pristine.validating_due_at, clock.validating_at),
+        ("scheduled", pristine.scheduled_due_at, clock.scheduled_at),
+        (
+            "in progress",
+            pristine.in_progress_due_at,
+            clock.in_progress_at,
         ),
-        vec![arn.clone()],
-        "the completed filter must report the settled job"
-    );
-    for gone in [SUBMITTED, IN_PROGRESS] {
-        let reply = list(&emu, &format!("statusEquals={gone}")).await;
+        ("completed", pristine.completed_due_at, clock.completed_at),
+    ] {
+        assert_eq!(
+            armed,
+            Some(expected),
+            "case {case}: the submission must arm the move at the instant its own span falls \
+             due, got {armed:?}"
+        );
+    }
+
+    let validating_at = VALIDATES_AFTER;
+    let scheduled_at = validating_at.saturating_add(SCHEDULES_AFTER);
+    let running_at = scheduled_at.saturating_add(BEGINS_AFTER);
+    let completed_at = running_at.saturating_add(COMPLETE_AFTER);
+    let tick = Duration::from_millis(1);
+
+    // One row per instant the timeline turns on: each span's own bound, a tick before it,
+    // the middle of the run, and an instant far past the end of the whole timeline.
+    let rows: &[(&str, Duration, &str, Option<Duration>)] = &[
+        ("the submission instant", Duration::ZERO, SUBMITTED, None),
+        (
+            "a tick before the validation is due",
+            validating_at.saturating_sub(tick),
+            SUBMITTED,
+            None,
+        ),
+        (
+            "the instant the validation is due",
+            validating_at,
+            VALIDATING,
+            None,
+        ),
+        (
+            "a tick before the schedule is due",
+            scheduled_at.saturating_sub(tick),
+            VALIDATING,
+            None,
+        ),
+        (
+            "the instant the schedule is due",
+            scheduled_at,
+            SCHEDULED,
+            None,
+        ),
+        (
+            "a tick before the start is due",
+            running_at.saturating_sub(tick),
+            SCHEDULED,
+            None,
+        ),
+        ("the instant the start is due", running_at, IN_PROGRESS, None),
+        (
+            "the middle of the run",
+            running_at.saturating_add(COMPLETE_AFTER / 2),
+            IN_PROGRESS,
+            None,
+        ),
+        (
+            "a tick before the completion is due",
+            completed_at.saturating_sub(tick),
+            IN_PROGRESS,
+            None,
+        ),
+        (
+            "the instant the completion is due",
+            completed_at,
+            COMPLETED,
+            Some(completed_at),
+        ),
+        (
+            "an hour past the completion",
+            completed_at.saturating_add(Duration::from_secs(60 * 60)),
+            COMPLETED,
+            Some(completed_at),
+        ),
+    ];
+
+    for (case, elapsed, expected, ended) in rows {
+        let mut record = pristine.clone();
+        record.settle(submit_time + *elapsed);
+        assert_eq!(
+            record.status, *expected,
+            "case {case}: the job must report {expected}, got {}",
+            record.status
+        );
+        assert_eq!(
+            record.ended_at,
+            ended.map(|at| submit_time + at),
+            "case {case}: the end instant must be the one the completion was owed at, got {:?}",
+            record.ended_at
+        );
+
+        // The stamp is the due instant of the stage the clock has reached, never the instant
+        // of the call that materialised it.
+        let owed = match record.status {
+            SUBMITTED => Duration::ZERO,
+            VALIDATING => validating_at,
+            SCHEDULED => scheduled_at,
+            IN_PROGRESS => running_at,
+            _ => completed_at,
+        };
+        assert_eq!(
+            record.last_modified_at,
+            submit_time + owed,
+            "case {case}: the stage must be stamped at the instant it was owed ({owed:?} after \
+             the submission), got {:?}",
+            record.last_modified_at
+        );
+
+        // Settling again at the same instant moves nothing: what the job reports is what the
+        // clock reached, not what a read did to it.
+        let mut again = record.clone();
+        again.settle(submit_time + *elapsed);
+        assert_eq!(
+            again.status, record.status,
+            "case {case}: a second settle must report the same status"
+        );
+        assert_eq!(
+            again.last_modified_at, record.last_modified_at,
+            "case {case}: a second settle must report the same last modification"
+        );
+        assert_eq!(
+            again.ended_at, record.ended_at,
+            "case {case}: a second settle must report the same end instant"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_client_polling_at_any_interval_up_to_the_run_span_observes_the_job_running() {
+    let emu = emulator();
+
+    let arn = submit(
+        &emu,
+        "the polled job",
+        create_body("batch-polled", catalog_model(0)),
+    )
+    .await;
+    let pristine = stored_job(&emu, &arn);
+    let submit_time = pristine.submit_time;
+    let lifespan = lifespan();
+
+    // The intervals a client polls a job at, from a tight loop up to the run span itself: at
+    // every one of them the job must be observable while it is RUNNING, because that is the
+    // state a caller acts on — watching progress, stopping a job that has not finished.
+    for interval in [
+        Duration::from_millis(250),
+        Duration::from_secs(1),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+        Duration::from_secs(30),
+        COMPLETE_AFTER,
+    ] {
+        let mut record = pristine.clone();
+        let mut seen: Vec<&'static str> = Vec::new();
+        let mut elapsed = Duration::ZERO;
+        while elapsed <= lifespan.saturating_add(interval) {
+            record.settle(submit_time + elapsed);
+            seen.push(record.status);
+            elapsed = elapsed.saturating_add(interval);
+        }
+
         assert!(
-            listed_arns("a status the job has left", &reply).is_empty(),
-            "nothing is {gone} once the job completed, got {:?}",
-            reply.body
+            seen.contains(&IN_PROGRESS),
+            "case a poll every {interval:?}: a client polling from the submission must read the \
+             job running at least once, saw {seen:?}"
+        );
+        let settled = seen
+            .iter()
+            .copied()
+            .find(|status| !PRE_START.contains(status))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case a poll every {interval:?}: the job must leave the pre-start statuses, \
+                     saw {seen:?}"
+                )
+            });
+        assert_eq!(
+            settled, IN_PROGRESS,
+            "case a poll every {interval:?}: the first status outside the pre-start set must be \
+             the running one, saw {seen:?}"
+        );
+        assert_eq!(
+            seen.last().copied(),
+            Some(COMPLETED),
+            "case a poll every {interval:?}: a poller that outlasts the whole timeline must read \
+             the job finished, saw {seen:?}"
         );
     }
 }
@@ -1140,8 +1549,8 @@ struct StopRow {
 }
 
 /// The rows differ along what the rule generalises over: WHICH unfinished status the job
-/// holds when the stop arrives — this emulator's lifecycle reaches `Submitted` and
-/// `InProgress`, two of the statuses a job that has not finished carries
+/// holds when the stop arrives — this emulator's lifecycle reaches every one of the four
+/// statuses a job that has not finished carries
 /// (`state::MODEL_INVOCATION_JOB_STOPPABLE_STATUSES`, read off the `status` doc of
 /// `smithy_query(query="doc",shape="ModelInvocationJobSummary",member="status")`) — and
 /// which of the two spellings a `ModelInvocationJobIdentifier` admits addresses the job.
@@ -1160,14 +1569,26 @@ fn stop_rows() -> Vec<StopRow> {
             by_arn: false,
         },
         StopRow {
+            case: "stopped while being validated, by its ARN",
+            after: VALIDATES_AFTER + MARGIN,
+            status_at_stop: VALIDATING,
+            by_arn: true,
+        },
+        StopRow {
+            case: "stopped while queued for its turn, by its minted id",
+            after: VALIDATES_AFTER + SCHEDULES_AFTER + MARGIN,
+            status_at_stop: SCHEDULED,
+            by_arn: false,
+        },
+        StopRow {
             case: "stopped once it had begun, by its ARN",
-            after: BEGINS_AFTER + MARGIN,
+            after: pre_start_span() + MARGIN,
             status_at_stop: IN_PROGRESS,
             by_arn: true,
         },
         StopRow {
             case: "stopped once it had begun, by its minted id",
-            after: BEGINS_AFTER + MARGIN,
+            after: pre_start_span() + MARGIN,
             status_at_stop: IN_PROGRESS,
             by_arn: false,
         },
@@ -1282,20 +1703,35 @@ async fn a_stop_winds_down_a_job_that_has_not_finished() {
             );
         }
 
-        // A stopped job is owed neither its start nor its completion any more: the spans
-        // that would have carried an unstopped job to `Completed` pass and it is still the
-        // job the stop ended, at the instant the stop ended it.
-        tokio::time::sleep(COMPLETE_AFTER + MARGIN).await;
-        let later = get(&emu, &arn).await;
+        // A stopped job is owed NONE of the transitions the submission armed: the record
+        // carries no due instant any more, and settling it an hour past the instant an
+        // unstopped job would have completed leaves it the job the stop ended, at the instant
+        // the stop ended it. Settled on the record because the run span an unstopped job
+        // takes is measured in minutes, which no test can sleep through.
+        let mut stopped_record = stored_job(&emu, &arn);
+        for (field, due) in [
+            ("validating", stopped_record.validating_due_at),
+            ("scheduled", stopped_record.scheduled_due_at),
+            ("in progress", stopped_record.in_progress_due_at),
+            ("completed", stopped_record.completed_due_at),
+            ("stopped", stopped_record.stopped_due_at),
+        ] {
+            assert_eq!(
+                due, None,
+                "case {case}: a job the stop has carried to its end owes no {field} \
+                 transition, got {due:?}"
+            );
+        }
+        let stop_ended_at = stopped_record.ended_at;
+        let far_future = stopped_record.submit_time + lifespan() + Duration::from_secs(60 * 60);
+        stopped_record.settle(far_future);
         assert_eq!(
-            text(case, &later.body, "status"),
-            STOPPED,
-            "case {case}: a stopped job is owed no completion, got {:?}",
-            later.body.get("status")
+            stopped_record.status, STOPPED,
+            "case {case}: a stopped job is owed no completion, got {}",
+            stopped_record.status
         );
         assert_eq!(
-            instant(case, &later.body, "endTime"),
-            ended,
+            stopped_record.ended_at, stop_ended_at,
             "case {case}: a stopped job keeps the end the stop gave it"
         );
         assert!(
@@ -1359,7 +1795,9 @@ async fn a_stop_of_a_job_that_cannot_be_stopped_changes_nothing() {
                 tokio::time::sleep(STOPPED_AFTER + MARGIN).await;
             }
             Reach::Completed => {
-                tokio::time::sleep(BEGINS_AFTER + COMPLETE_AFTER + MARGIN).await;
+                // The run span an unstopped job takes is measured in minutes, so the elapsed
+                // time is brought by ageing the stored record rather than slept through.
+                age_job(&emu, &arn, lifespan() + MARGIN);
             }
         }
 

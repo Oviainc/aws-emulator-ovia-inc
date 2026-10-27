@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachLoadBalancerToSubnets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachLoadBalancerToSubnets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds the requested subnets to the stored load balancer's placement — with
+//! the Availability Zone EC2 reports for each, so the zone set follows the subnet set — and
+//! answers the full subnet set read back from state. This is the ONLY file to touch for
+//! this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachLoadBalancerToSubnets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +146,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachLoadBalancerToSubnets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachLoadBalancerToSubnetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachLoadBalancerToSubnets"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service's model declares no server-fault error, and a 501 would claim
+            // "not implemented", so an unreachable store is refused instead.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the Elastic Load Balancing store is unavailable",
+            ));
+        };
+        let region = crate::state::region_from_request(ctx.parts());
+
+        // A placement adds nothing unless it names a subnet, and the list is
+        // caller-sized, so it is bounded before any of it is resolved.
+        if input.subnets.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "Subnets must name at least one subnet to add",
+            ));
+        }
+        if input.subnets.len() > crate::state::MAX_PLACEMENTS_PER_LOAD_BALANCER {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "Subnets must carry at most {} entries; got {}",
+                crate::state::MAX_PLACEMENTS_PER_LOAD_BALANCER,
+                input.subnets.len()
+            )));
+        }
+
+        // Which Availability Zone — and which VPC — a subnet is in is EC2's to say, so the
+        // subnets are resolved against EC2 before the store is locked; nothing is held
+        // across that call.
+        let placement = crate::state::resolve_subnet_placement(ctx, &region, &input.subnets).await;
+
+        let mut guard = state.lock();
+        // A load balancer is a regional resource, so the name is resolved in the region
+        // this request is signed for.
+        let Some(record) = guard
+            .load_balancers_in_mut(&region)
+            .and_then(|records| records.get_mut(&input.load_balancer_name))
+        else {
+            return Err(
+                AttachLoadBalancerToSubnetsErrorModeled::AccessPointNotFoundException(
+                    AccessPointNotFoundException {
+                        message: Some(format!(
+                            "There is no ACTIVE Load Balancer named '{}'",
+                            input.load_balancer_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "You can add only one subnet per Availability Zone" (`Subnets`' own
+        // documentation), so the WHOLE request is judged against the zones the load
+        // balancer already reaches — and against the other subnets of this request — before
+        // any of it is applied, and a request that would put two subnets in one zone
+        // attaches none of them. Only a subnet EC2 reported a zone for takes part: nothing
+        // is refused on a zone this emulator never learned.
+        let mut occupied: ::std::collections::BTreeMap<&str, &str> = record
+            .subnets
+            .iter()
+            .filter_map(|held| {
+                record
+                    .subnet_zones
+                    .get(held)
+                    .map(|zone| (zone.as_str(), held.as_str()))
+            })
+            .collect();
+        for subnet_id in &input.subnets {
+            let Some(zone) = placement.zones.get(subnet_id) else {
+                continue;
+            };
+            match occupied.insert(zone.as_str(), subnet_id.as_str()) {
+                Some(held) if held != subnet_id.as_str() => {
+                    return Err(
+                        AttachLoadBalancerToSubnetsErrorModeled::InvalidConfigurationRequestException(
+                            InvalidConfigurationRequestException {
+                                message: Some(format!(
+                                    "Subnet {held} already puts load balancer {} in \
+                                     Availability Zone {zone}; you can attach only one \
+                                     subnet per Availability Zone",
+                                    input.load_balancer_name
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        // The stored placement is bounded by the same ceiling a create applies, so
+        // repeating the call cannot grow it without limit. Only the ids the record does
+        // not hold yet count, deduplicated: naming one twice attaches it once.
+        let newly_attached: ::std::collections::BTreeSet<&str> = input
+            .subnets
+            .iter()
+            .map(String::as_str)
+            .filter(|subnet_id| !record.subnets.iter().any(|held| held == subnet_id))
+            .collect();
+        if record.subnets.len() + newly_attached.len()
+            > crate::state::MAX_PLACEMENTS_PER_LOAD_BALANCER
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "a load balancer is attached to at most {} subnets; {} already attached \
+                 and {} more were requested",
+                crate::state::MAX_PLACEMENTS_PER_LOAD_BALANCER,
+                record.subnets.len(),
+                newly_attached.len()
+            )));
+        }
+
+        for subnet_id in &input.subnets {
+            let zone = placement.zones.get(subnet_id).map(String::as_str);
+            record.attach_subnet(subnet_id, zone);
+        }
+        // A load balancer attached to subnets is in the VPC those subnets belong to, as
+        // EC2 reports it; a record that already names one keeps it, and nothing is
+        // invented when there is no EC2 to ask.
+        if record.vpc_id.is_none() {
+            record.vpc_id = placement.vpc_id;
+        }
+
+        // "The IDs of the subnets attached to the load balancer" — the FULL set read back
+        // from the stored record, not just what this call added.
+        Ok(AttachLoadBalancerToSubnetsOutput {
+            subnets: Some(record.subnets.clone()),
+        })
     }
 }

@@ -450,10 +450,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_shard_iterator,
             millis_behind_latest: Some(millis_behind_latest),
             // "The list of the current shard's child shards, returned in the GetRecords
-            // API's response only when the end of the current shard is reached": a shard is
-            // closed by a reshard, and nothing in this emulator closes one yet, so no page
-            // ever reaches the end of a closed shard's records.
-            child_shards: None,
+            // API's response only when the end of the current shard is reached": a shard
+            // is closed by a reshard, and a reader that has drained a closed one reads on
+            // from the shards that reshard produced from it.
+            child_shards: (!shard.is_open() && drained)
+                .then(|| stream.child_shards_of(&shard.shard_id))
+                .filter(|children| !children.is_empty()),
         })
     }
 }

@@ -218,10 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyGlobalReplicationGroupErrorModeled::GlobalReplicationGroupNotFoundFault(
                     GlobalReplicationGroupNotFoundFault {
-                        message: Some(format!(
-                            "Global Replication Group {} not found.",
-                            input.global_replication_group_id
-                        )),
+                        message: Some(
+                            crate::state::GLOBAL_REPLICATION_GROUP_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -275,8 +274,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(node_type) = input.cache_node_type {
             group.cache_node_type = Some(node_type);
         }
-        if let Some(description) = input.global_replication_group_description {
-            group.description = Some(description);
+        if let Some(description) = input.global_replication_group_description.as_deref() {
+            group.description = Some(crate::state::stored_description(description));
         }
         // Automatic failover is a property of each member replication group,
         // which is where `GlobalReplicationGroupMember$AutomaticFailover`

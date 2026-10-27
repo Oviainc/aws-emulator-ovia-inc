@@ -164,10 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DisassociateGlobalReplicationGroupErrorModeled::GlobalReplicationGroupNotFoundFault(
                     GlobalReplicationGroupNotFoundFault {
-                        message: Some(format!(
-                            "Global Replication Group {} not found.",
-                            input.global_replication_group_id
-                        )),
+                        message: Some(
+                            crate::state::GLOBAL_REPLICATION_GROUP_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableControl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableControl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableControl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Tears one control enablement down: it starts the asynchronous operation that removes
+//! the control from its target, so the stored enablement is `UNDER_CHANGE` until
+//! [`crate::state::OPERATION_SETTLE_AFTER`] has elapsed and is then gone from
+//! [`crate::state`], while the `DISABLE_CONTROL` record it appended to the control
+//! operation log outlives it and still resolves through `GetControlOperation`.
+//!
+//! Implemented: this operation no longer answers HTTP 501. It is the counterpart of
+//! `EnableControl` and tears down what that operation persisted.
+//!
+//! The enablement it acts on is the one the request NAMES, and the model marks no member
+//! of this input required, so the handler settles which enablement that is before anything
+//! is written: `enabledControlIdentifier` is the ARN `EnableControl` minted for it, and
+//! the `controlIdentifier`/`targetIdentifier` pair is the control and the organizational
+//! unit it is enabled on. A request naming neither names no enablement at all, which is
+//! the modelled `ValidationException`; one naming an enablement this account does not hold
+//! is the modelled `ResourceNotFoundException`; and either way nothing is torn down.
 //!
 //! ## Shape of an operation
 //!
@@ -165,20 +173,224 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableControl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableControlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableControl"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DisableControlErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // WHICH enablement this call tears down is settled before anything is written. The
+        // model marks no member of this input required, so the request may name the
+        // enablement by its own ARN or by the control/target pair it is the enablement of,
+        // and a request naming neither names nothing to disable.
+        let arn = match &input.enabled_control_identifier {
+            // `enabledControlIdentifier` is modelled as an `Arn`, so the only identifier
+            // the front door lets through is the ARN `EnableControl` minted — which is this
+            // map's key, the same resolution `GetEnabledControl` and `ResetEnabledControl`
+            // do.
+            Some(identifier) => {
+                let Some(enabled) = store.enabled_controls.get(identifier) else {
+                    return Err(DisableControlErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!(
+                                "no enabled control matches enabledControlIdentifier \
+                                 {identifier}"
+                            ),
+                        },
+                    )
+                    .into());
+                };
+
+                // A request may send the pair as well, and then it has to name the SAME
+                // enablement: two members naming two different resources do not say which
+                // one to tear down. The control is compared through the catalog entry each
+                // identifier resolves to rather than as text, because one control is
+                // published under two ARN forms.
+                if let Some(control_identifier) = &input.control_identifier {
+                    let named = crate::state::resolve_control(control_identifier);
+                    if named.is_none()
+                        || named != crate::state::resolve_control(&enabled.control_identifier)
+                    {
+                        return Err(DisableControlErrorModeled::ValidationException(
+                            ValidationException {
+                                message: format!(
+                                    "enabledControlIdentifier {identifier} is the \
+                                     enablement of control {}, which controlIdentifier \
+                                     {control_identifier} does not name",
+                                    enabled.control_identifier
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                }
+                if let Some(target_identifier) = &input.target_identifier {
+                    if target_identifier != &enabled.target_identifier {
+                        return Err(DisableControlErrorModeled::ValidationException(
+                            ValidationException {
+                                message: format!(
+                                    "enabledControlIdentifier {identifier} is enabled on \
+                                     target {}, which targetIdentifier {target_identifier} \
+                                     does not name",
+                                    enabled.target_identifier
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                }
+
+                enabled.arn.clone()
+            }
+            // Without it the control and the target TOGETHER name the enablement: a
+            // control is enabled at most once per target, so the pair identifies one
+            // enablement and either member alone identifies none.
+            None => {
+                let (Some(control_identifier), Some(target_identifier)) =
+                    (&input.control_identifier, &input.target_identifier)
+                else {
+                    return Err(DisableControlErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "no enabled control is named: disabling a control takes \
+                                 either enabledControlIdentifier, the ARN of the enabled \
+                                 control, or both controlIdentifier and targetIdentifier, \
+                                 the control and the organizational unit it is enabled on; \
+                                 got {}",
+                                named_members(&input)
+                            ),
+                        },
+                    )
+                    .into());
+                };
+
+                // A control ARN that names no catalog control is a reference to a resource
+                // that does not exist; anything else is not a control reference at all,
+                // which is a malformed input rather than a missing resource — the same
+                // reading `EnableControl` gives this member.
+                let control = match crate::state::resolve_control(control_identifier) {
+                    Some(control) => control,
+                    None if crate::state::is_control_arn(control_identifier) => {
+                        return Err(DisableControlErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException {
+                                message: format!(
+                                    "no control matches controlIdentifier \
+                                     {control_identifier}"
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                    None => {
+                        return Err(DisableControlErrorModeled::ValidationException(
+                            ValidationException {
+                                message: format!(
+                                    "controlIdentifier {control_identifier:?} is not the \
+                                     ARN of an AWS Control Tower control; a control is \
+                                     named by its control ARN, \
+                                     arn:aws:controltower:<region>::control/<CONTROL_NAME>, \
+                                     or by its control catalog ARN, \
+                                     arn:aws:controlcatalog:::control/<id>"
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                };
+
+                let Some(enabled) = store.enabled_control_on_target(control, target_identifier)
+                else {
+                    return Err(DisableControlErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!(
+                                "control {control_identifier} is not enabled on target \
+                                 {target_identifier}"
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                enabled.arn.clone()
+            }
+        };
+
+        // An operation still changing this control owns it: a teardown starting now would
+        // leave that change only half applied, which is the inconsistent state
+        // `ConflictException` reports. That is a property of the control rather than of one
+        // call, so it is the rule `UpdateEnabledControl` and `ResetEnabledControl` apply
+        // too — and the model gives this operation no `@idempotent` trait, so a repeat
+        // while its own teardown is in flight is refused the same way rather than
+        // reporting that operation again.
+        let Some(enabled) = store.enabled_controls.get(&arn) else {
+            // The ARN was read out of this same locked store above, so nothing can have
+            // removed the control in between; the modelled 404 is the answer if it ever
+            // did.
+            return Err(DisableControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no enabled control matches enabledControlIdentifier {arn}"),
+                },
+            )
+            .into());
+        };
+        if enabled.status == crate::state::EnablementStatus::UnderChange {
+            let in_flight = enabled.last_operation_identifier.clone();
+            return Err(DisableControlErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "control operation {in_flight} is still in progress against {arn}; \
+                         disabling this control now would leave it in an inconsistent state"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The teardown starts an asynchronous operation, as every call acting on an enabled
+        // control does, so the identifier it returns names a record in the control
+        // operation log; the enablement stays in the store, `UNDER_CHANGE`, until the clock
+        // makes that record due and `settle` removes it.
+        let Some(operation_identifier) = store.record_enabled_control_disable(&arn, now) else {
+            return Err(DisableControlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no enabled control matches enabledControlIdentifier {arn}"),
+                },
+            )
+            .into());
+        };
+
+        Ok(DisableControlOutput {
+            operation_identifier,
+        })
     }
 }
+
+/// The members of this request that carry a value, as the refusal above lists them back to
+/// the caller — so a request that named no enablement is told what it did send.
+fn named_members(input: &DisableControlInput) -> String {
+    let named: Vec<&str> = [
+        ("enabledControlIdentifier", &input.enabled_control_identifier),
+        ("controlIdentifier", &input.control_identifier),
+        ("targetIdentifier", &input.target_identifier),
+    ]
+    .into_iter()
+    .filter(|(_, value)| value.is_some())
+    .map(|(member, _)| member)
+    .collect();
+    if named.is_empty() {
+        "no member of this request".to_string()
+    } else {
+        named.join(", ")
+    }
+}
+

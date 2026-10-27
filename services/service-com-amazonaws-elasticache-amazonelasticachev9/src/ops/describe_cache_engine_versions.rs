@@ -74,8 +74,9 @@
 //!
 //! * `InvalidParameterValueException` (HTTP 400, awsQuery code `InvalidParameterValue`) —
 //!   widened in through `extra_errors` (see below): the model lists NO error for this
-//!   operation, yet `MaxRecords` carries documented bounds and `Marker` is a token only
-//!   this service mints, so a value it cannot serve needs a refusal to answer with.
+//!   operation, yet `MaxRecords` carries documented bounds, `Marker` is a token only
+//!   this service mints, and `Engine` names an engine of the published catalog, so a
+//!   value it cannot serve needs a refusal to answer with.
 
 use std::collections::BTreeMap;
 
@@ -196,10 +197,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
 
-        // The three filters select a subset of the published catalog. Each is a
-        // free-form string with no modelled constraint, and this operation
-        // reports a published catalog rather than an account's resources, so a
-        // filter value nothing matches is an empty page — not a not-found.
+        // `Engine` is "the cache engine to return. Valid values: memcached |
+        // redis" — a NAME rather than a free-form filter, so a value that names
+        // no engine of the published catalog is refused: discovery is how a
+        // client picks an engine and version, and an empty page would leave it
+        // unable to tell a typo from an engine with no versions. The catalog this
+        // operation already reports is what the name is resolved against, so the
+        // engines it accepts and the engines it can answer with are the same set.
+        if let Some(requested) = input.engine.as_deref() {
+            if !store
+                .cache_engine_versions
+                .values()
+                .any(|version| version.engine.eq_ignore_ascii_case(requested))
+            {
+                return Err(invalid_parameter_value(
+                    crate::state::invalid_engine_name_message(requested),
+                ));
+            }
+        }
+
+        // The three filters select a subset of the published catalog. `Engine`
+        // is resolved above because it names an engine; `CacheParameterGroupFamily`
+        // and `EngineVersion` select WITHIN the catalog — a family covers versions
+        // of several engines and a version value names a whole version line — so a
+        // combination nothing matches is an empty page rather than a refusal.
         let mut selected: Vec<(&String, &crate::state::CacheEngineVersionRecord)> = store
             .cache_engine_versions
             .iter()

@@ -350,12 +350,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request carries can size the response or the allocation that builds it; a request
         // naming no size (or the range's lower bound `0`, which the service documents no
         // meaning for) gets `DEFAULT_PAGE_SIZE` plus a `nextToken` to walk the rest.
-        let page_size = input
-            .max_results
-            .and_then(|requested| usize::try_from(requested).ok())
-            .filter(|requested| *requested > 0)
-            .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
-            .min(crate::state::MAX_PAGE_SIZE);
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::DEFAULT_PAGE_SIZE,
+            crate::state::MAX_PAGE_SIZE,
+        );
 
         // The enrollment gate, ahead of every read of another service's store: an account
         // that is not opted in has no analysis at all.

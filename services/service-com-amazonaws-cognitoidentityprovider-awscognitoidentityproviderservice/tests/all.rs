@@ -23,6 +23,8 @@ mod admin_provider_links;
 mod admin_remove_user_from_group;
 #[path = "all/admin_respond_to_auth_challenge.rs"]
 mod admin_respond_to_auth_challenge;
+#[path = "all/admin_set_user_settings.rs"]
+mod admin_set_user_settings;
 #[path = "all/admin_update_user_attributes.rs"]
 mod admin_update_user_attributes;
 #[path = "all/admin_user_enabled_state.rs"]

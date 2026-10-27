@@ -1388,10 +1388,12 @@ async fn the_replica_count_operations_validate_arguments_before_resolving_the_gr
         )
         .await;
     assert!(
-        about_the_argument
-            .error_message()
-            .contains("NewReplicaCount"),
-        "argument validation runs first, so the refusal must name the member, got {:?}",
+        !about_the_argument.error_message().contains("rg-absent")
+            && about_the_argument
+                .error_message()
+                .contains("replica count must be between"),
+        "argument validation runs first, so the refusal must state the replica-count rule rather \
+         than the group, got {:?}",
         about_the_argument.error_message()
     );
 }
