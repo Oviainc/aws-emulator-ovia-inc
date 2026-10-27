@@ -79,6 +79,8 @@ mod event_source_mappings;
 mod function_aliases;
 #[path = "all/function_code_signing_association.rs"]
 mod function_code_signing_association;
+#[path = "all/function_code_signing_dissociation.rs"]
+mod function_code_signing_dissociation;
 #[path = "all/function_code_signing_removal.rs"]
 mod function_code_signing_removal;
 #[path = "all/function_code_update.rs"]

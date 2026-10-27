@@ -7,6 +7,11 @@
 //! stored on the function's record, read back out of
 //! [`crate::state::FunctionRecord::code_signing_config_arn`].
 //!
+//! The function existing is what this call reports on, so a function holding no
+//! association is reported rather than refused: the response is the same 200 with
+//! `CodeSigningConfigArn` absent from the body (see
+//! [`super::types::GetFunctionCodeSigningConfigOutput`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -209,12 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 })?;
 
-        // A function nothing has associated a configuration with has no ARN to report.
-        // The member is required, so it is always present and reported EMPTY for that
-        // function — the one value `CodeSigningConfigArn`'s own length constraint
-        // (`@length(min: 0)`) admits that names no configuration.
+        // The function exists, so this is a report of what it holds rather than a
+        // refusal: a function nothing has associated a configuration with has no ARN to
+        // report, and the member is left out of the body entirely instead of standing in
+        // a value `CodeSigningConfigArn`'s own pattern does not admit.
         Ok(GetFunctionCodeSigningConfigOutput {
-            code_signing_config_arn: record.code_signing_config_arn.clone().unwrap_or_default(),
+            code_signing_config_arn: record.code_signing_config_arn.clone(),
             function_name: record.config.name.clone(),
         })
     }
