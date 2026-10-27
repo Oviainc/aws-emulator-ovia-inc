@@ -26,7 +26,10 @@
 //! * AWS Signer (`restJson1`, endpoint `signer`) and the Signer data plane (`restJson1`,
 //!   endpoint `data-signer`, `GET /revocations`), both `sigv4Name` `signer`. Signer's own
 //!   model binds `GetRevocationStatus` to `@endpoint(hostPrefix: "data-")`, i.e. to the
-//!   data-plane endpoint the second crate emulates.
+//!   data-plane endpoint the second crate also emulates: the control plane holds the
+//!   revocation records that answer it, so it claims the shared signing name whole
+//!   (both hosts), and the data-plane crate claims the key of its OWN endpoint, which
+//!   only a request carrying no credential scope resolves to.
 //!
 //! The rows below span what the rule generalises over: both signing names, both wire
 //! protocols (an XML `awsQuery` service and three `restJson1` ones), both routing signals
@@ -296,12 +299,13 @@ fn rows() -> Vec<(Call, Expect)> {
                 contains: &["RouterProfile_1"],
             },
         ),
-        // The Signer DATA plane's path space, signed with the shared signing name: its
-        // implemented read answers 200 with an empty `revokedEntities` list, nothing
-        // having been revoked.
+        // The `/revocations` path space, signed with the shared signing name: the
+        // control plane claims it (it holds the revocation records that answer it) and
+        // its read answers 200 with an empty `revokedEntities` list, nothing having
+        // been revoked.
         (
             Call {
-                case: "signer data plane GetRevocationStatus, signed as signer",
+                case: "signer GetRevocationStatus, signed as signer",
                 method: "GET",
                 uri: format!("/revocations{}", revocations_query()),
                 host: format!("signer.{REGION}.amazonaws.com"),
@@ -316,7 +320,8 @@ fn rows() -> Vec<(Call, Expect)> {
                 contains: &["revokedEntities"],
             },
         ),
-        // The same read addressed at the data plane's OWN endpoint host, unsigned.
+        // The same read addressed at the data plane's OWN endpoint host, unsigned: that
+        // key is the data-plane crate's alone, so it is the service that answers.
         (
             Call {
                 case: "signer data plane GetRevocationStatus, host-addressed",
@@ -334,12 +339,12 @@ fn rows() -> Vec<(Call, Expect)> {
                 contains: &["revokedEntities"],
             },
         ),
-        // A data-plane request that leaves every required query parameter out: the
+        // A `/revocations` request that leaves every required query parameter out: the
         // service that claimed it refuses it with its own modeled validation error,
         // which again only the owning service can produce.
         (
             Call {
-                case: "signer data plane GetRevocationStatus with no parameters",
+                case: "signer GetRevocationStatus with no parameters",
                 method: "GET",
                 uri: "/revocations".to_string(),
                 host: format!("signer.{REGION}.amazonaws.com"),
