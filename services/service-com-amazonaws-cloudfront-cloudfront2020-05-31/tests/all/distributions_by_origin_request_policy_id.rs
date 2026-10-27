@@ -39,18 +39,21 @@ use crate::origin_request_policy_lifecycle::{create_policy, strings, Policy};
 /// cache behaviour attaches, and which one each of its ordered cache behaviours attaches. An
 /// index is into the policies [`create_policies`] creates, in order; `None` is a behaviour
 /// that attaches no origin request policy at all.
+///
+/// `pub(crate)` with [`config_xml`] so a sibling suite that needs a distribution attaching a
+/// policy builds it the same way this one does.
 #[derive(Debug, Clone, Copy)]
-struct Row {
-    case: &'static str,
-    default_policy: Option<usize>,
-    ordered: &'static [Option<usize>],
+pub(crate) struct Row {
+    pub(crate) case: &'static str,
+    pub(crate) default_policy: Option<usize>,
+    pub(crate) ordered: &'static [Option<usize>],
 }
 
 impl Row {
     /// Whether this distribution attaches the policy at `index` to any of its behaviours —
     /// the rule the listing implements, computed here from the row rather than from the
     /// handler.
-    fn attaches(&self, index: usize) -> bool {
+    pub(crate) fn attaches(&self, index: usize) -> bool {
         self.default_policy == Some(index) || self.ordered.contains(&Some(index))
     }
 }
@@ -138,7 +141,11 @@ fn policy_table() -> Vec<Policy> {
 
 /// `GET /2020-05-31/distributionsByOriginRequestPolicyId/{OriginRequestPolicyId}` plus the
 /// query the caller pages with — the route the model binds this operation to.
-async fn list_by_policy(router: &MultiServiceRouter, policy_id: &str, query: &str) -> Answer {
+pub(crate) async fn list_by_policy(
+    router: &MultiServiceRouter,
+    policy_id: &str,
+    query: &str,
+) -> Answer {
     call(
         router,
         "GET",
@@ -152,7 +159,7 @@ async fn list_by_policy(router: &MultiServiceRouter, policy_id: &str, query: &st
 /// The distribution ids of a `DistributionIdList` answer, in document order. Each item
 /// travels in the `DistributionId` element the model's `xmlName` gives
 /// `DistributionIdListSummary`'s member.
-fn listed_ids(list: &Node) -> Vec<String> {
+pub(crate) fn listed_ids(list: &Node) -> Vec<String> {
     list.child("Items")
         .map(|items| {
             items
@@ -188,7 +195,7 @@ async fn create_policies(router: &MultiServiceRouter) -> Vec<String> {
 
 /// The `DistributionConfig` a row submits: one origin, a default cache behaviour and the
 /// row's ordered cache behaviours, each attaching the policy the row names.
-fn config_xml(caller_reference: &str, row: &Row, policies: &[String]) -> String {
+pub(crate) fn config_xml(caller_reference: &str, row: &Row, policies: &[String]) -> String {
     let attachment = |index: Option<usize>| match index {
         Some(index) => format!(
             "<OriginRequestPolicyId>{}</OriginRequestPolicyId>",
