@@ -22,10 +22,11 @@
 //! * the widget maximum and the published refresh frequencies bound an update exactly
 //!   as they bound a create, and a refused update changes nothing;
 //! * a widget's `QueryStatement` has to be a query CloudTrail Lake can run — one SQL
-//!   `SELECT` — and one that is not is `InvalidQueryStatementException`;
-//! * an update leaves the dashboard's settled `DashboardStatus` alone: the model
-//!   declares `UPDATING`/`UPDATED`, but no recording shows CloudTrail putting a
-//!   dashboard back into a transient status for an update, so none is invented.
+//!   `SELECT` — and one that is not is `InvalidQueryStatementException`.
+//!
+//! The `DashboardStatus` an accepted update leaves behind — `UPDATED`, reported from
+//! the moment the call returns — is pinned by its own suite,
+//! `dashboard_update_status`.
 
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -858,12 +859,13 @@ async fn an_update_keeps_the_managed_dashboard_managed() {
     );
 }
 
-/// RULE: an update does not move the dashboard's `DashboardStatus` — the model
-/// declares `UPDATING`/`UPDATED` but no recording shows CloudTrail putting a
-/// dashboard back into a transient status for an update, so a settled dashboard stays
-/// settled and keeps reporting the same resource.
+/// RULE: an accepted update reports the stored dashboard back, and every later read
+/// reports that same resource.
+///
+/// What the update leaves `DashboardStatus` at is the subject of
+/// `dashboard_update_status`, which pins it over the whole class of updates.
 #[tokio::test]
-async fn an_update_leaves_the_settled_status_alone() {
+async fn an_update_reports_the_dashboard_it_stored() {
     let emulator = Emulator::new();
     emulator
         .create_baseline("settled-dashboard")
@@ -889,8 +891,8 @@ async fn an_update_leaves_the_settled_status_alone() {
     let after = after.expect_ok("after the update").clone();
     assert_eq!(
         after["Status"],
-        json!(state::DASHBOARD_STATUS_CREATED),
-        "an update must leave the settled status alone, got {after:?}"
+        json!(state::DASHBOARD_STATUS_UPDATED),
+        "an updated dashboard reports UPDATED, got {after:?}"
     );
     assert_eq!(
         after["Widgets"],
