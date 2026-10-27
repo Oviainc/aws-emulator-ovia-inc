@@ -14,15 +14,15 @@
 //!    the zone id); whichever one the create names, the service resolves the other
 //!    and every projection of the Outpost reports BOTH — and nothing is invented for
 //!    a value no identity can be resolved from.
-//! C. A created Outpost is still being provisioned, so it reports the non-terminal
-//!    `LifeCycleStatus`; the transition to the terminal one is owed at an instant,
-//!    and the first read at or after it reports the settled status, which later
-//!    reads do not move again.
+//! C. A created Outpost holds no hardware, so it reports the non-terminal
+//!    `LifeCycleStatus` and goes on reporting it until hardware ordered for it has
+//!    been installed; that install is owed at an instant, and the first read at or
+//!    after it reports the settled status, which later reads do not move again.
 
 use serde_json::{json, Map, Value};
 
 use crate::site_and_outpost_lifecycle::{
-    ids, query_value, settle, text, without, Outposts,
+    ids, install_hardware, query_value, settle, text, without, Outposts,
 };
 
 /// The region codes rule B is exercised over, each with the Availability-Zone-ID
@@ -394,14 +394,15 @@ async fn an_unresolvable_zone_leaves_the_other_identity_absent() {
     }
 }
 
-/// Rule C: every create reports the provisioning status, and once the clock-owed
-/// transition is due every projection reports the settled one — and keeps reporting
-/// it, while an Outpost created after that settle starts provisioning in its turn.
+/// Rule C: every create reports the provisioning status and every projection goes on
+/// reporting it while nothing has been ordered for the Outpost; once hardware ordered
+/// for it has been installed every projection reports the settled one — and keeps
+/// reporting it, while an Outpost nobody ordered hardware for is still provisioning.
 ///
 /// The rows differ along what else the create carries (tags, each zone identity, the
 /// hardware type), none of which the lifecycle depends on.
 #[tokio::test]
-async fn a_created_outpost_provisions_then_settles_on_the_clock() {
+async fn an_outpost_reports_the_status_its_ordered_hardware_gives_it() {
     let outposts = Outposts::new();
     let site = outposts
         .create_site(&json!({ "Name": "lifecycle site" }))
@@ -448,11 +449,43 @@ async fn a_created_outpost_provisions_then_settles_on_the_clock() {
         created.push((case, outpost));
     }
 
-    // Nothing sleeps inside the service: the transition is owed at an instant, so
-    // waiting past it is what makes it due.
+    // Nothing in this API installs hardware on request, so waiting changes nothing on
+    // its own: an Outpost nobody has ordered hardware for goes on provisioning.
     settle();
 
     for (case, outpost) in &created {
+        let outpost_id = text(outpost, "OutpostId");
+        let read = outposts.get_outpost(&outpost_id).await;
+        assert_eq!(
+            text(&read, "LifeCycleStatus"),
+            "PENDING",
+            "case {case:?}: an Outpost nothing has been ordered for is still \
+             provisioning, got {read:?}"
+        );
+        assert!(
+            ids(
+                &outposts
+                    .list_outposts("?LifeCycleStatusFilter=PENDING")
+                    .await,
+                "Outposts"
+            )
+            .contains(&outpost_id),
+            "case {case:?}: LifeCycleStatusFilter=PENDING must select an Outpost that is \
+             still provisioning"
+        );
+    }
+
+    // Hardware ordered for every Outpost but the last, so the settled rows and the
+    // provisioning one are both carried by records of this one store.
+    let (last_case, last_outpost) = created
+        .last()
+        .expect("the rows must hold an Outpost to leave provisioning");
+    let settling = &created[..created.len() - 1];
+    for (_, outpost) in settling {
+        install_hardware(&outposts, &text(outpost, "OutpostId")).await;
+    }
+
+    for (case, outpost) in settling {
         let outpost_id = text(outpost, "OutpostId");
         let read = outposts.get_outpost(&outpost_id).await;
         let listed = entry(&outposts.list_outposts("").await, "Outposts", &outpost_id);
@@ -496,14 +529,15 @@ async fn a_created_outpost_provisions_then_settles_on_the_clock() {
         );
     }
 
-    // The span is per-Outpost, not a one-off for the store: one created now is
-    // provisioning even though every earlier Outpost has settled.
-    let latecomer = outposts
-        .create_outpost(&json!({ "Name": "latecomer", "SiteId": site_id }))
+    // The install is per-Outpost, not a one-off for the store: the one nobody ordered
+    // hardware for is still provisioning although every other Outpost has settled.
+    let waiting = outposts
+        .get_outpost(&text(last_outpost, "OutpostId"))
         .await;
     assert_eq!(
-        text(&latecomer, "LifeCycleStatus"),
+        text(&waiting, "LifeCycleStatus"),
         "PENDING",
-        "an Outpost created after the others settled provisions in its turn, got {latecomer:?}"
+        "case {last_case:?}: an Outpost nobody ordered hardware for provisions on while \
+         the others settle, got {waiting:?}"
     );
 }

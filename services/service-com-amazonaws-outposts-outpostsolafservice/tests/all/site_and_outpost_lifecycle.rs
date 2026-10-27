@@ -93,19 +93,79 @@ pub(crate) struct Reply {
     pub(crate) body: Value,
 }
 
-/// Wait until a clock-owed Outpost lifecycle transition has fallen due.
+/// Wait until a clock-owed install has fallen due.
 ///
-/// `CreateOutpost` answers with a provisioning Outpost and the service materialises
-/// its `PENDING` -> `ACTIVE` transition at the instant it stored, so a case that
-/// wants settled Outposts waits past that span (plus a margin, so the case is not
-/// racing it). Blocking with `std::thread::sleep` rather than `tokio::time::sleep`:
-/// the workspace's `tokio` carries only the `macros`/`rt` features, so the timer
-/// driver `tokio::time` needs is not compiled in.
+/// An install the service owes an Outpost falls due one `OUTPOST_PROVISIONING` after
+/// the hardware reached the site, so a case that wants it behind the Outpost waits
+/// past that span (plus a margin, so the case is not racing it). Blocking with
+/// `std::thread::sleep` rather than `tokio::time::sleep`: the workspace's `tokio`
+/// carries only the `macros`/`rt` features, so the timer driver `tokio::time` needs
+/// is not compiled in.
 pub(crate) fn settle() {
     std::thread::sleep(
         service_com_amazonaws_outposts_outpostsolafservice::state::OUTPOST_PROVISIONING
             + std::time::Duration::from_millis(400),
     );
+}
+
+/// The smallest order this service accepts, as the suites that only need an order to
+/// exist place one: the two members `CreateOrder` marks `@required`, with one line
+/// item whose `CatalogItemId` is of the modelled `SKU` form (`^OR-[A-Z0-9]{7}$`).
+fn hardware_order(outpost_identifier: &str) -> Value {
+    json!({
+        "OutpostIdentifier": outpost_identifier,
+        "PaymentOption": "ALL_UPFRONT",
+        "LineItems": [{ "CatalogItemId": "OR-1A2B3C4", "Quantity": 1 }],
+    })
+}
+
+/// Bring every install the orders this store already holds owe due NOW.
+///
+/// The counterpart of [`install_hardware`] for a case that places its OWN orders: the
+/// steps an order owes the clock fall due over spans far longer than a case may sleep
+/// for, so their instants are moved through the same store seam, and the next call
+/// materialises what the clock then owes. An order nothing is owed on — a cancelled
+/// one, or one already installed — is left exactly as it is.
+pub(crate) fn deliver_orders(outposts: &Outposts) {
+    let store = outposts.store();
+    let mut store = store.lock();
+    let (due, at) = (std::time::Instant::now(), std::time::SystemTime::now());
+    for record in store.orders.values_mut() {
+        for transition in record.pending.iter_mut() {
+            transition.due = due;
+            transition.at = at;
+        }
+    }
+}
+
+/// Order the hardware `outpost_id` is installed with and bring the install that order
+/// owes due NOW, answering the `OrderId` it was placed under.
+///
+/// An Outpost holds no hardware, and stays in the non-terminal lifecycle status a
+/// create reports, until an order placed on it has delivered hardware to its site and
+/// that hardware has been installed — and those steps fall due over spans far longer
+/// than a case may sleep for. So the order is placed over the wire, exactly as a
+/// caller places one, and only the instants its steps fall due at are moved, through
+/// the same store seam the suites that age a stored resource use. The next call
+/// materialises what the clock then owes: the order complete, and the Outpost settled
+/// with the hardware of its configuration.
+pub(crate) async fn install_hardware(outposts: &Outposts, outpost_id: &str) -> String {
+    let placed = outposts
+        .ok("POST", "/orders", Some(&hardware_order(outpost_id)))
+        .await;
+    let order_id = text(&placed["Order"], "OrderId");
+    let store = outposts.store();
+    let mut store = store.lock();
+    let record = store
+        .orders
+        .get_mut(&order_id)
+        .unwrap_or_else(|| panic!("the create persisted order {order_id}"));
+    let (due, at) = (std::time::Instant::now(), std::time::SystemTime::now());
+    for transition in record.pending.iter_mut() {
+        transition.due = due;
+        transition.at = at;
+    }
+    order_id
 }
 
 impl Outposts {
@@ -829,10 +889,13 @@ async fn listing_filters_select_only_matching_stored_records() {
             .map(|(_, _, id)| id.clone())
             .collect()
     };
-    // Every Outpost above was created provisioning, so the cases below first let the
-    // clock-owed transition fall due: once it has, every Outpost has settled, which
-    // is what makes the status filter's two cases exact rather than racy.
-    settle();
+    // The status filter's cases are about the status each Outpost HOLDS, and an Outpost
+    // holds the provisioning status until hardware ordered for it has been installed:
+    // the first two have an order placed and installed, and the third is left waiting
+    // for one, so each of the two statuses is carried by records this list must select.
+    for (_, _, outpost_id) in by_zone.iter().take(2) {
+        install_hardware(&outposts, outpost_id).await;
+    }
 
     let outpost_cases: Vec<(&str, String, Vec<String>)> = vec![
         (
@@ -856,14 +919,14 @@ async fn listing_filters_select_only_matching_stored_records() {
             expect(&["us-east-1b"]),
         ),
         (
-            "the status every Outpost carries once it has settled",
+            "the status an Outpost whose ordered hardware is installed carries",
             "?LifeCycleStatusFilter=ACTIVE".to_string(),
-            expect(&["us-east-1a", "us-east-1b", "us-east-1c"]),
+            expect(&["us-east-1a", "us-east-1b"]),
         ),
         (
-            "a status no settled Outpost carries",
+            "the status an Outpost nothing has been ordered for carries",
             "?LifeCycleStatusFilter=PENDING".to_string(),
-            Vec::new(),
+            expect(&["us-east-1c"]),
         ),
         (
             "a status no Outpost carries",

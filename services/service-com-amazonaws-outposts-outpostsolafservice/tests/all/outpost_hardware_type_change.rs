@@ -11,10 +11,12 @@
 //! 1. `SupportedHardwareType` names the hardware configuration Amazon Web Services
 //!    installs on the Outpost, so the form factor an Outpost reports is always the one
 //!    whose configuration it holds: recording a form factor other than the one it
-//!    carries installs that form factor's configuration, and recording the one it
-//!    already carries installs nothing again. An Outpost given a form factor by an
-//!    update is therefore indistinguishable, hardware and all, from one created with
-//!    it.
+//!    carries replaces the hardware installed on it with that form factor's
+//!    configuration, and recording the one it already carries installs nothing again.
+//!    An Outpost given a form factor by an update is therefore indistinguishable,
+//!    hardware and all, from one created with it. An Outpost nothing has been installed
+//!    on yet has no hardware to replace, so the form factor an update names it is
+//!    simply the configuration the order placed on it installs.
 //! 2. Installing hardware takes the span installing an Outpost's hardware takes, so
 //!    the install an update owes is owed at an instant rather than applied on the next
 //!    read: until it falls due the Outpost holds no asset, which is what an Outpost
@@ -29,7 +31,9 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use crate::capacity_task_lifecycle::capacity_route;
-use crate::site_and_outpost_lifecycle::{query_value, segment, settle, text, Outposts};
+use crate::site_and_outpost_lifecycle::{
+    install_hardware, query_value, segment, settle, text, Outposts,
+};
 
 /// Both values the modelled `SupportedHardwareType` enum declares
 /// (`smithy_query(query="shape",shape="SupportedHardwareType")`) — the form factors
@@ -132,14 +136,14 @@ async fn supported_types(outposts: &Outposts, outpost_id: &str, query: &str) -> 
 }
 
 /// One row of rule 1: the form factor the Outpost is created with, the one the update
-/// then names for it, and whether that update lands while the Outpost is still
-/// provisioning or after it has settled holding its create-side hardware.
+/// then names for it, and whether that update lands before any hardware was ordered for
+/// the Outpost or after the order placed on it was installed.
 #[derive(Debug)]
 struct Row {
     case: &'static str,
     created: Option<&'static str>,
     updated: &'static str,
-    while_provisioning: bool,
+    before_ordering: bool,
 }
 
 /// Rules 1 and 2: over every pair of form factors an Outpost can be created with and
@@ -147,8 +151,8 @@ struct Row {
 ///
 /// The rows differ along the form factor the create recorded (none, each of the two the
 /// enum declares), the form factor the update names (each of the two, including the one
-/// the Outpost already carries), and when the update lands relative to the install the
-/// create owes.
+/// the Outpost already carries), and whether the update lands before hardware was
+/// ordered for the Outpost or after the order placed on it was installed.
 #[tokio::test]
 async fn the_hardware_an_outpost_holds_is_the_configuration_its_form_factor_names() {
     let rows = [
@@ -156,94 +160,93 @@ async fn the_hardware_an_outpost_holds_is_the_configuration_its_form_factor_name
             case: "no form factor at create, a rack named afterwards",
             created: None,
             updated: "RACK",
-            while_provisioning: false,
+            before_ordering: false,
         },
         Row {
             case: "no form factor at create, a server named afterwards",
             created: None,
             updated: "SERVER",
-            while_provisioning: false,
+            before_ordering: false,
         },
         Row {
-            case: "a settled rack given the server form factor",
+            case: "an installed rack given the server form factor",
             created: Some("RACK"),
             updated: "SERVER",
-            while_provisioning: false,
+            before_ordering: false,
         },
         Row {
-            case: "a settled server given the rack form factor",
+            case: "an installed server given the rack form factor",
             created: Some("SERVER"),
             updated: "RACK",
-            while_provisioning: false,
+            before_ordering: false,
         },
         Row {
-            case: "a settled rack given the rack form factor again",
+            case: "an installed rack given the rack form factor again",
             created: Some("RACK"),
             updated: "RACK",
-            while_provisioning: false,
+            before_ordering: false,
         },
         Row {
-            case: "a settled server given the server form factor again",
+            case: "an installed server given the server form factor again",
             created: Some("SERVER"),
             updated: "SERVER",
-            while_provisioning: false,
+            before_ordering: false,
         },
         Row {
-            case: "no form factor at create, a rack named while still provisioning",
+            case: "no form factor at create, a rack named before anything was ordered",
             created: None,
             updated: "RACK",
-            while_provisioning: true,
+            before_ordering: true,
         },
         Row {
-            case: "a provisioning rack given the server form factor",
+            case: "a rack given the server form factor before anything was ordered",
             created: Some("RACK"),
             updated: "SERVER",
-            while_provisioning: true,
+            before_ordering: true,
         },
     ];
 
     let outposts = Outposts::new();
-    // One Outpost per form factor created WITH it: the configuration the create-side
-    // install places is what each row's Outpost must end up holding, read from the
+    // One Outpost per form factor created WITH it, holding the configuration its own
+    // order installed: what each row's Outpost must end up holding, read from the
     // emulator rather than spelled out here.
     let mut reference: BTreeMap<&str, String> = BTreeMap::new();
     for form_factor in HARDWARE_TYPES {
-        reference.insert(
-            form_factor,
-            an_outpost(
-                &outposts,
-                &format!("reference-{form_factor}"),
-                Some(form_factor),
-            )
-            .await,
-        );
+        let outpost_id = an_outpost(
+            &outposts,
+            &format!("reference-{form_factor}"),
+            Some(form_factor),
+        )
+        .await;
+        install_hardware(&outposts, &outpost_id).await;
+        reference.insert(form_factor, outpost_id);
     }
 
     let mut created = Vec::new();
     for row in &rows {
         created.push(an_outpost(&outposts, row.case, row.created).await);
     }
-    // The rows whose update lands DURING provisioning name their form factor before
-    // the install the create owes has fallen due.
+    // The rows whose update lands before anything was ordered name their form factor
+    // while the Outpost holds nothing and is owed no install; the order that then
+    // installs hardware on them installs the configuration THAT form factor names.
     for (row, outpost_id) in rows.iter().zip(&created) {
-        if row.while_provisioning {
+        if row.before_ordering {
             name_hardware_type(&outposts, outpost_id, row.updated, row.case).await;
         }
+        install_hardware(&outposts, outpost_id).await;
     }
 
-    settle();
-
-    // Every install owed so far has run, so a row that patches a SETTLED Outpost now
-    // patches one holding the hardware of the form factor its create recorded.
+    // Every install an order owed has run, so a row that patches an INSTALLED Outpost
+    // now patches one holding the hardware of the form factor its create recorded.
     let mut before: Vec<Option<Vec<Value>>> = Vec::new();
     for (row, outpost_id) in rows.iter().zip(&created) {
-        before.push(match row.while_provisioning {
+        before.push(match row.before_ordering {
             true => None,
             false => Some(installed(&outposts, outpost_id).await),
         });
     }
     for ((row, outpost_id), before) in rows.iter().zip(&created).zip(&before) {
-        if row.while_provisioning {
+        if row.before_ordering {
             continue;
         }
         let case = row.case;
@@ -326,7 +329,7 @@ async fn a_form_factor_outside_the_modelled_enum_installs_nothing() {
     let outposts = Outposts::new();
     let outpost_id = an_outpost(&outposts, "unmodelled-form-factor", Some("RACK")).await;
 
-    settle();
+    install_hardware(&outposts, &outpost_id).await;
 
     let before = installed(&outposts, &outpost_id).await;
     assert!(
@@ -388,10 +391,10 @@ async fn an_asset_installed_by_an_update_is_usable_where_the_api_takes_one() {
     let outposts = Outposts::new();
     let mut created = Vec::new();
     for (case, form_factor, _) in rows {
-        created.push(an_outpost(&outposts, case, *form_factor).await);
+        let outpost_id = an_outpost(&outposts, case, *form_factor).await;
+        install_hardware(&outposts, &outpost_id).await;
+        created.push(outpost_id);
     }
-
-    settle();
 
     for ((case, _, updated), outpost_id) in rows.iter().zip(&created) {
         name_hardware_type(&outposts, outpost_id, updated, case).await;

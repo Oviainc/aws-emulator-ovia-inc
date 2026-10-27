@@ -83,27 +83,35 @@ pub const QUOTE_ID_PREFIX: &str = "oq";
 
 /// The `LifeCycleStatus` a freshly created Outpost carries.
 ///
-/// AWS answers `CreateOutpost` with an Outpost that is still being provisioned, so
-/// the status a create reports — and every read of it reports until the transition
-/// below falls due — is the non-terminal one. The model constrains
-/// `LifeCycleStatus` without declaring a value set (len 1..20, pattern
-/// `^[ A-Za-z]+$`), and both values this service uses satisfy it.
+/// `CreateOutpost` records the Outpost hardware will be installed for; it holds no
+/// hardware and no capacity of its own until an order placed on it delivers some
+/// ([`order_progression`]), so the status a create reports — and every read reports
+/// until the install that order's fulfilment owes falls due — is the non-terminal
+/// one. The model constrains `LifeCycleStatus` without declaring a value set
+/// (len 1..20, pattern `^[ A-Za-z]+$`), and both values this service uses satisfy it.
 pub const LIFE_CYCLE_STATUS_PENDING: &str = "PENDING";
 
-/// The `LifeCycleStatus` an Outpost settles in: the terminal, ready status it
-/// holds once provisioning is done, which no later call moves it out of.
+/// The `LifeCycleStatus` an Outpost settles in: the terminal, ready status it holds
+/// once the hardware ordered for it has been installed, which no later call moves it
+/// out of.
 pub const LIFE_CYCLE_STATUS_ACTIVE: &str = "ACTIVE";
 
-/// How long after `CreateOutpost` the Outpost's
-/// [`LIFE_CYCLE_STATUS_PENDING`] -> [`LIFE_CYCLE_STATUS_ACTIVE`] transition falls
-/// due.
+/// How long installing an Outpost's hardware takes: the span after which the
+/// Outpost's [`LIFE_CYCLE_STATUS_PENDING`] -> [`LIFE_CYCLE_STATUS_ACTIVE`]
+/// transition falls due, counted from the hardware reaching the site the Outpost
+/// stands at ([`ORDER_STATUS_DELIVERED`]).
 ///
-/// AWS publishes no duration for provisioning an Outpost, so this span is the
-/// emulator's own: short enough that a workflow polling for a ready Outpost
-/// finishes at once, and long enough that a caller acting straight after the create
-/// still observes the pending status the create reported. It is never zero —
-/// a transition the clock owes is owed at an instant, not on the next read.
-pub const OUTPOST_PROVISIONING: std::time::Duration = std::time::Duration::from_millis(500);
+/// Nothing in this API installs hardware on request, so the span is never counted
+/// from the call that created the Outpost: an Outpost is installed with what an order
+/// placed on it delivers ([`order_progression`]), and one nobody has ordered hardware
+/// for is owed no transition at all.
+///
+/// AWS publishes no duration for installing an Outpost, so this span is the
+/// emulator's own: short enough that a workflow waiting for a usable Outpost finishes
+/// at once, and long enough that a caller reading straight after the hardware arrived
+/// still observes the pending status. It is never zero — a transition the clock owes
+/// is owed at an instant, not on the next read.
+pub const OUTPOST_PROVISIONING: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The `PrivateConnectivityStatus` an Outpost's private connectivity carries once
 /// it has been configured.
@@ -148,17 +156,15 @@ pub const ORDER_STATUS_PREPARING: &str = "PREPARING";
 /// The `OrderStatus` an order moves to once Amazon Web Services has started on the
 /// hardware: the model's "`IN_PROGRESS` - Order is either being built or shipped. To
 /// get more details, see the line item status".
-///
-/// This is as far as the clock carries an order. The two statuses past it —
-/// `DELIVERED` ("Order was delivered to the Outpost site") and `COMPLETED` ("Order
-/// is complete") — are reached by the hardware this order's line items name
-/// physically arriving at the site and being installed, which leaves a record this
-/// emulator does not have: the assets a line item was fulfilled by
-/// (`LineItem$AssetInformationList`). The hardware an Outpost settles with is its
-/// own configuration's ([`installed_hardware`]), not any one order's, so reporting
-/// an order delivered or complete would be a claim about which hardware THAT order
-/// installed, and the emulator stops where it still has a record to show.
 pub const ORDER_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The `OrderStatus` of an order whose hardware has reached the site it was shipped
+/// to — the model's "`DELIVERED` - Order was delivered to the Outpost site".
+///
+/// Hardware at the site is hardware not yet in service, so the Outpost it was
+/// ordered for is still being installed from here: the install falls due one
+/// [`OUTPOST_PROVISIONING`] later, which is also where this order completes.
+pub const ORDER_STATUS_DELIVERED: &str = "DELIVERED";
 
 /// The `OrderStatus` of a cancelled order — the model's "`CANCELLED` - Order is
 /// cancelled". `CancelOrder` is what moves an order into it ([`OrderRecord::cancel`]),
@@ -167,8 +173,14 @@ pub const ORDER_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 pub const ORDER_STATUS_CANCELLED: &str = "CANCELLED";
 
 /// The `OrderStatus` of an order that ran to its end — the model's "`COMPLETED` -
-/// Order is complete". See [`ORDER_STATUS_IN_PROGRESS`] for why the clock does not
-/// carry an order this far, and [`ORDER_STATUS_SETTLED`].
+/// Order is complete".
+///
+/// An order is complete when what it was placed for has happened: the hardware its
+/// line items name is installed on the Outpost it was placed on. That install is the
+/// one the Outpost reaches [`LIFE_CYCLE_STATUS_ACTIVE`] with, so the two fall due
+/// together ([`ComAmazonawsOutpostsOutpostsolafserviceState::settle_orders`]), and it
+/// is what makes this order's `OrderFulfilledDate` present. See also
+/// [`ORDER_STATUS_SETTLED`].
 pub const ORDER_STATUS_COMPLETED: &str = "COMPLETED";
 
 /// Every `OrderStatus` in which an order is FINISHED: nothing more will happen to it
@@ -192,6 +204,15 @@ pub const LINE_ITEM_STATUS_PREPARING: &str = "PREPARING";
 /// `SHIPPED` is a claim about hardware in transit, which it has no record of (see
 /// [`ORDER_STATUS_IN_PROGRESS`]).
 pub const LINE_ITEM_STATUS_BUILDING: &str = "BUILDING";
+
+/// The `LineItemStatus` a line item moves to with its order's
+/// [`ORDER_STATUS_DELIVERED`]: the unit it names is at the site it was shipped to.
+pub const LINE_ITEM_STATUS_DELIVERED: &str = "DELIVERED";
+
+/// The `LineItemStatus` a line item moves to with its order's
+/// [`ORDER_STATUS_COMPLETED`]: the unit it names is installed on the Outpost the
+/// order was placed on, which is what completes the order.
+pub const LINE_ITEM_STATUS_INSTALLED: &str = "INSTALLED";
 
 /// The `LineItemStatus` of a line item of a cancelled order, the item-level
 /// counterpart of [`ORDER_STATUS_CANCELLED`]: cancelling the order cancels the items
@@ -219,6 +240,18 @@ pub const ORDER_TYPE_OUTPOST: &str = "OUTPOST";
 /// submit reported. It is never zero — a transition the clock owes is owed at an
 /// instant, not on the next read.
 pub const ORDER_PREPARATION: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long after an order is being built and shipped its hardware reaches the site
+/// it was shipped to: the order's [`ORDER_STATUS_IN_PROGRESS`] ->
+/// [`ORDER_STATUS_DELIVERED`] transition.
+///
+/// AWS publishes no duration for building and shipping Outposts hardware, so this
+/// span is the emulator's own, chosen for the reason [`ORDER_PREPARATION`]'s is and
+/// longer than it, because what it stands for is the long leg of an order: a caller
+/// that places an order and then works with the Outpost it was placed for observes
+/// the hardware still on its way and the Outpost still pending, which is what the
+/// real service answers for far longer still.
+pub const ORDER_DELIVERY: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// The `DecommissionRequestStatus` `StartOutpostDecommission` answers when a
 /// resource still associated with the Outpost stops the decommission from
@@ -410,14 +443,17 @@ pub struct OutpostRecord {
     /// here, and deleting the Outpost takes it with the Outpost.
     pub private_connectivity: Option<PrivateConnectivityConfig>,
     /// When the install this Outpost is owed falls due — its `PENDING` -> `ACTIVE`
-    /// transition for the one `CreateOutpost` starts — or `None` while it is owed
-    /// none. Stored as an instant so nothing ever sleeps for it: the transition is
-    /// applied by the first call made at or after it, which reports exactly the
-    /// status the Outpost would hold had nobody called at all.
+    /// transition — or `None` while it is owed none, which is what a just-created
+    /// Outpost is owed: nothing in this API installs hardware on request. Stored as an
+    /// instant so nothing ever sleeps for it: the transition is applied by the first
+    /// call made at or after it, which reports exactly the status the Outpost would
+    /// hold had nobody called at all.
     ///
-    /// An install is what puts the hardware of the Outpost's configuration on it
-    /// ([`Self::set_supported_hardware_type`]), so one is owed again whenever the
-    /// form factor that names that configuration changes.
+    /// An install is owed by the FULFILMENT of an order placed on this Outpost — the
+    /// hardware that order delivers is what gets installed
+    /// ([`ComAmazonawsOutpostsOutpostsolafserviceState::settle_orders`]) — and again
+    /// whenever the form factor naming the configuration an installed Outpost holds
+    /// changes ([`Self::set_supported_hardware_type`]).
     pub active_at: Option<std::time::Instant>,
     /// When `StartOutpostDecommission` started the decommission of this Outpost,
     /// or `None` for an Outpost nobody has asked to decommission.
@@ -442,9 +478,11 @@ pub struct OutpostRecord {
     /// An asset is a PHYSICAL unit — a compute or storage server, a powershelf, a
     /// switch, a networking asset — that Amazon Web Services installs for the Outpost,
     /// so no call in this API creates one: `CreateOutpost` leaves this empty, and the
-    /// hardware of the Outpost's own configuration is installed as the Outpost finishes
-    /// provisioning ([`ComAmazonawsOutpostsOutpostsolafserviceState::settle_outposts`],
-    /// [`installed_hardware`]) — the transition it reaches a settled lifecycle status
+    /// hardware of the Outpost's own configuration is installed once an order placed on
+    /// it has delivered hardware to the site
+    /// ([`ComAmazonawsOutpostsOutpostsolafserviceState::settle_orders`],
+    /// [`ComAmazonawsOutpostsOutpostsolafserviceState::settle_outposts`],
+    /// [`installed_hardware`]) — the install it reaches a settled lifecycle status
     /// by. An Outpost whose form factor names no configuration this service holds is
     /// installed with nothing and reported as holding no asset. What is installed here
     /// is always the configuration the Outpost's CURRENT form factor names: a form
@@ -501,15 +539,28 @@ impl OutpostRecord {
     /// [`OUTPOST_PROVISIONING`] from now, the span installing an Outpost's hardware
     /// takes, and materialised by
     /// [`ComAmazonawsOutpostsOutpostsolafserviceState::settle_outposts`] exactly as
-    /// the install `CreateOutpost` owes is. Until that instant the Outpost holds no
-    /// asset, which is what an Outpost whose hardware is being installed holds. Its
+    /// the install an order's fulfilment owes is. Until that instant the Outpost holds
+    /// no asset, which is what an Outpost whose hardware is being installed holds. Its
     /// `LifeCycleStatus` is left where it stands: this installs hardware, and
     /// [`LIFE_CYCLE_STATUS_ACTIVE`] is terminal.
+    ///
+    /// An Outpost nothing has been installed on, and that is owed no install, has
+    /// nothing to replace: the form factor it records names the configuration the order
+    /// placed on it will install, so recording one neither takes hardware out nor owes
+    /// an install, and the Outpost goes on waiting for the first order to deliver
+    /// ([`ComAmazonawsOutpostsOutpostsolafserviceState::settle_orders`]). Whether
+    /// anything has been installed is what the Outpost's lifecycle status says, so one
+    /// whose form factor named no configuration at all — installed, and holding nothing
+    /// — is one a newly named form factor does install hardware on.
     pub fn set_supported_hardware_type(&mut self, form_factor: String) {
         if self.outpost.supported_hardware_type.as_deref() == Some(form_factor.as_str()) {
             return;
         }
         self.outpost.supported_hardware_type = Some(form_factor);
+        let installed = self.outpost.life_cycle_status.as_deref() == Some(LIFE_CYCLE_STATUS_ACTIVE);
+        if !installed && self.active_at.is_none() {
+            return;
+        }
         self.assets.clear();
         self.active_at = Some(std::time::Instant::now() + OUTPOST_PROVISIONING);
     }
@@ -1107,8 +1158,69 @@ fn all_in_region<'a, R: RegionalRecord>(
         .filter(move |record| record.region() == region.as_str())
 }
 
-/// A persisted order: the modelled [`Order`] plus its creation order and the instant
-/// the transition the clock owes it falls due.
+/// One transition an order owes the clock: the `OrderStatus` it moves to, and the
+/// `LineItemStatus` its line items move to with it — the order's own status says the
+/// hardware is being built or shipped, and "to get more details, see the line item
+/// status".
+#[derive(Debug, Clone)]
+pub struct OrderTransition {
+    /// When the transition falls due, as a monotonic instant: nothing ever sleeps
+    /// for it, the first call made at or after it materialises it.
+    pub due: std::time::Instant,
+    /// The wall clock the transition is owed AT, which is what the fulfilment of an
+    /// order reports as its `OrderFulfilledDate` — so a late read reports when the
+    /// order really was fulfilled, not when it was read.
+    pub at: std::time::SystemTime,
+    /// The `OrderStatus` the order holds from that instant on.
+    pub status: String,
+    /// The `LineItemStatus` every line item still in flight holds from that instant
+    /// on.
+    pub line_item_status: String,
+}
+
+/// The transitions an order submitted at `now` owes the clock: one
+/// [`ORDER_PREPARATION`] to being built and shipped, one [`ORDER_DELIVERY`] to
+/// reaching the site, and one [`OUTPOST_PROVISIONING`] to being installed, which is
+/// what completes the order.
+///
+/// Every instant is fixed when the order is submitted, so the status a read reports
+/// is the one the order holds at the instant it is asked for — the same answer
+/// whether or not anybody polled in between — exactly as
+/// [`capacity_task_progression`] fixes a capacity task's.
+pub fn order_progression(now: std::time::SystemTime) -> VecDeque<OrderTransition> {
+    let submitted = std::time::Instant::now();
+    let mut elapsed = std::time::Duration::ZERO;
+    let mut progression = VecDeque::new();
+    for (span, status, line_item_status) in [
+        (
+            ORDER_PREPARATION,
+            ORDER_STATUS_IN_PROGRESS,
+            LINE_ITEM_STATUS_BUILDING,
+        ),
+        (
+            ORDER_DELIVERY,
+            ORDER_STATUS_DELIVERED,
+            LINE_ITEM_STATUS_DELIVERED,
+        ),
+        (
+            OUTPOST_PROVISIONING,
+            ORDER_STATUS_COMPLETED,
+            LINE_ITEM_STATUS_INSTALLED,
+        ),
+    ] {
+        elapsed += span;
+        progression.push_back(OrderTransition {
+            due: submitted + elapsed,
+            at: now + elapsed,
+            status: status.to_string(),
+            line_item_status: line_item_status.to_string(),
+        });
+    }
+    progression
+}
+
+/// A persisted order: the modelled [`Order`] plus its creation order and the
+/// transitions the clock still owes it.
 #[derive(Debug, Clone)]
 pub struct OrderRecord {
     /// See [`SiteRecord::sequence`].
@@ -1128,12 +1240,12 @@ pub struct OrderRecord {
     /// so this is the only place it is kept; it is absent only for an order whose
     /// Outpost named no site.
     pub site_id: Option<String>,
-    /// When this order's [`ORDER_STATUS_PREPARING`] -> [`ORDER_STATUS_IN_PROGRESS`]
-    /// transition falls due, or `None` once it has been materialised. Stored as an
-    /// instant for the reason [`OutpostRecord::active_at`] is: nothing ever sleeps
-    /// for it, and the first call made at or after it reports exactly the status the
-    /// order would hold had nobody called at all.
-    pub in_progress_at: Option<std::time::Instant>,
+    /// The transitions this order still owes the clock, soonest first, and empty once
+    /// every one of them has been materialised. Stored as instants for the reason
+    /// [`OutpostRecord::active_at`] is: nothing ever sleeps for them, and the first
+    /// call made at or after one reports exactly the status the order would hold had
+    /// nobody called at all.
+    pub pending: VecDeque<OrderTransition>,
 }
 
 impl OrderRecord {
@@ -1153,15 +1265,17 @@ impl OrderRecord {
     /// Outpost no longer — and every line item of it settles in the item-level status
     /// of the same name: the order's status is "Order is cancelled" and the items are
     /// what it was to deliver, so none of them is still being prepared or built.
-    /// The transition the clock still owed this order is dropped with it: a cancelled
-    /// order never moves on to being built, so [`Self::in_progress_at`] is cleared
-    /// rather than left to fire against a finished order.
+    /// The transitions the clock still owed this order are dropped with it: a cancelled
+    /// order never goes on to be built, delivered or installed, so [`Self::pending`] is
+    /// cleared rather than left to fire against a finished order — and the Outpost it
+    /// was placed on is installed with nothing, because nothing was ever delivered to
+    /// it.
     pub fn cancel(&mut self) {
         self.order.status = Some(ORDER_STATUS_CANCELLED.to_string());
         for item in self.order.line_items.iter_mut().flatten() {
             item.status = Some(LINE_ITEM_STATUS_CANCELLED.to_string());
         }
-        self.in_progress_at = None;
+        self.pending.clear();
     }
 }
 
@@ -2311,8 +2425,9 @@ fn compute_profile(
 ///
 /// Hardware is what an Outpost IS: Amazon Web Services installs the configuration the
 /// Outpost's form factor names once the order for it is fulfilled, and the Outpost
-/// reaches a settled lifecycle status with that hardware in it — so an Outpost that
-/// has finished provisioning holds one asset per physical unit of its configuration,
+/// reaches a settled lifecycle status with that hardware in it — so an Outpost whose
+/// ordered hardware has been installed holds one asset per physical unit of its
+/// configuration,
 /// each identified by the slot it occupies, typed by what the unit is, placed where it
 /// sits in its rack, and — for the compute units, the only ones the model carries
 /// `ComputeAttributes` for — carrying the Dedicated Host it hosts instances on and the
@@ -2853,8 +2968,8 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     ///   read off ([`Self::subscribed_capacity_vcpus`]). A line item naming a catalog
     ///   item this service publishes no configuration for contributes nothing.
     ///   Capacity is configured ON compute hardware, so an Outpost holding none —
-    ///   one still provisioning, or one whose form factor names no configuration this
-    ///   service installs — is configured with nothing.
+    ///   one whose ordered hardware is not installed yet, or one whose form factor names
+    ///   no configuration this service installs — is configured with nothing.
     pub fn configured_instance_types(
         &self,
         region: &str,
@@ -3510,8 +3625,8 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         requirements
     }
 
-    /// Materialise every Outpost lifecycle transition the clock has already made
-    /// due, and with it the hardware the Outpost settles with.
+    /// Materialise every Outpost lifecycle transition the clock has already made due,
+    /// and with it the hardware the Outpost settles with.
     ///
     /// Every operation that reports or filters on an Outpost, or that reads one of its
     /// assets, calls this FIRST, so a read answers the Outpost — and the hardware —
@@ -3520,16 +3635,22 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// nothing a later caller would not have seen anyway, and a settled Outpost is
     /// left alone.
     ///
-    /// Provisioning an Outpost is Amazon Web Services installing its hardware, so the
-    /// transition that ends it is also when that hardware arrives: the Outpost's
-    /// configuration is installed on it ([`installed_hardware`]) as it settles, and an
-    /// Outpost that already holds hardware keeps exactly the hardware it holds — one
-    /// configuration is installed once. The configuration read here is the one the
-    /// Outpost's form factor names at this instant, so an install the Outpost was owed
-    /// by a later form factor ([`OutpostRecord::set_supported_hardware_type`]) places
-    /// that form factor's hardware, exactly as the create's install places the form
-    /// factor the create recorded.
+    /// An Outpost is installed with the hardware an order placed on it delivers, so
+    /// the order transitions the clock already owed are materialised first
+    /// ([`Self::settle_orders`]): the install applied here is the one an order's
+    /// fulfilment owed, and an Outpost nobody has ordered hardware for is owed none
+    /// and goes on reporting [`LIFE_CYCLE_STATUS_PENDING`].
+    ///
+    /// The transition that ends an install is when that hardware goes into service:
+    /// the Outpost's configuration is installed on it ([`installed_hardware`]) as it
+    /// settles, and an Outpost that already holds hardware keeps exactly the hardware
+    /// it holds — one configuration is installed once. The configuration read here is
+    /// the one the Outpost's form factor names at this instant, so an install the
+    /// Outpost was owed by a later form factor
+    /// ([`OutpostRecord::set_supported_hardware_type`]) places that form factor's
+    /// hardware.
     pub fn settle_outposts(&mut self) {
+        self.settle_orders();
         let now = std::time::Instant::now();
         // What the clock owes each Outpost whose provisioning has come due: the hardware
         // to install on it, or none for one that already holds its own. Worked out
@@ -3619,27 +3740,56 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// Every operation that reports an order calls this FIRST, for the same reason
     /// [`Self::settle_outposts`] exists: a read answers the status the order holds at
     /// the instant it is asked for. It writes only what the clock already owed at
-    /// that same instant, so reading changes nothing a later caller would not have
-    /// seen anyway, and an order whose transition has been materialised is left
+    /// that same instant — every step whose due instant has passed, so a caller that
+    /// reads late sees the same status, with the same `OrderFulfilledDate`, as one
+    /// that polled all along — and an order that has run out of transitions is left
     /// alone.
     ///
     /// A line item moves with its order: the order's `IN_PROGRESS` is "being built or
     /// shipped. To get more details, see the line item status", so the item-level
-    /// status is what carries that detail. Only an item still in the status the
-    /// submit gave it is moved.
+    /// status is what carries that detail. An item a cancellation finished is left
+    /// where it stands.
+    ///
+    /// Fulfilling an order is what puts hardware on an Outpost, so the order reaching
+    /// [`ORDER_STATUS_COMPLETED`] is also when the install the Outpost it was placed
+    /// on is owed falls due ([`OutpostRecord::active_at`]) — at the instant the
+    /// completion was owed, not at the instant anybody asked. An Outpost already owed
+    /// an install keeps the instant it is already owed it at.
     pub fn settle_orders(&mut self) {
         let now = std::time::Instant::now();
+        // The installs the orders that came due owe their Outposts. Collected while
+        // the orders are walked and applied after, because both records live in this
+        // one store.
+        let mut installs: Vec<(String, std::time::Instant)> = Vec::new();
         for record in self.orders.values_mut() {
-            if record.in_progress_at.is_none_or(|due| now < due) {
-                continue;
-            }
-            record.order.status = Some(ORDER_STATUS_IN_PROGRESS.to_string());
-            for item in record.order.line_items.iter_mut().flatten() {
-                if item.status.as_deref() == Some(LINE_ITEM_STATUS_PREPARING) {
-                    item.status = Some(LINE_ITEM_STATUS_BUILDING.to_string());
+            while record.pending.front().is_some_and(|next| now >= next.due) {
+                let Some(next) = record.pending.pop_front() else {
+                    break;
+                };
+                record.order.status = Some(next.status.clone());
+                for item in record.order.line_items.iter_mut().flatten() {
+                    if item.status.as_deref() != Some(LINE_ITEM_STATUS_CANCELLED) {
+                        item.status = Some(next.line_item_status.clone());
+                    }
+                }
+                if next.status != ORDER_STATUS_COMPLETED {
+                    continue;
+                }
+                // "The fulfillment date for the order": the order is fulfilled by the
+                // hardware it was placed for being installed, which is this step.
+                record.order.order_fulfilled_date = Some(timestamp(next.at));
+                if let Some(outpost_id) = record.order.outpost_id.clone() {
+                    installs.push((outpost_id, next.due));
                 }
             }
-            record.in_progress_at = None;
+        }
+        for (outpost_id, due) in installs {
+            let Some(record) = self.outposts.get_mut(&outpost_id) else {
+                continue;
+            };
+            if record.active_at.is_none() {
+                record.active_at = Some(due);
+            }
         }
     }
 
