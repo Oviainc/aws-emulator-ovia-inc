@@ -749,9 +749,6 @@ pub enum VisibilityRefusal {
     /// It IS a receipt handle, but this queue holds no message under it: the message was
     /// deleted, purged or expired, or a later receive superseded the handle.
     NoSuchMessage,
-    /// The message the handle names is not in flight, so it has no visibility timeout to
-    /// change.
-    NotInFlight,
     /// The span asked for reaches past what ONE receive may hide the message for, counted
     /// from that receive.
     BeyondLimit,
@@ -1399,48 +1396,19 @@ impl Queue {
     /// error (or, in a batch, as that entry's own result). The handle decides the first two:
     /// a value that is not a receipt handle at all is a different fault from one that is,
     /// but names no message this queue still holds — see
-    /// [`message_for_handle_mut`](Self::message_for_handle_mut). Past it, a message that is
-    /// not IN FLIGHT has no visibility timeout to change — "the specified message isn't in
-    /// flight" — and the span is bounded by what ONE receive may hide a message for, since
-    /// "if you attempt to set the VisibilityTimeout to a value greater than the maximum time
-    /// left, Amazon SQS returns an error. Amazon SQS doesn't automatically recalculate and
-    /// increase the timeout to the maximum remaining time." The caller materialises what the
-    /// clock already owed first, so a message whose timeout has lapsed is not in flight here.
+    /// [`message_for_handle_mut`](Self::message_for_handle_mut). That is the whole of the
+    /// resolution: a handle names its message for as long as the queue HOLDS that message,
+    /// not only while the message is hidden, so a consumer whose visibility window has
+    /// already lapsed re-hides the message it is still working on rather than being
+    /// refused. Past the handle, the span is bounded by what ONE receive may hide a message
+    /// for, since "if you attempt to set the VisibilityTimeout to a value greater than the
+    /// maximum time left, Amazon SQS returns an error. Amazon SQS doesn't automatically
+    /// recalculate and increase the timeout to the maximum remaining time."
     pub fn change_visibility(
         &mut self,
         receipt_handle: &str,
         timeout: i64,
         now: SystemTime,
-    ) -> Result<(), VisibilityRefusal> {
-        let in_flight = self.in_flight_message_ids(now);
-        self.change_visibility_as_of(receipt_handle, timeout, now, &in_flight)
-    }
-
-    /// The ids of the messages this queue holds IN FLIGHT at `now`.
-    ///
-    /// A caller that makes SEVERAL changes for ONE request — a batch — takes this once,
-    /// before its first change, and judges every one of them against it: each is answered
-    /// for the message states the request arrived to, so no change of the same request can
-    /// decide another's outcome. The caller materialises what the clock already owed first,
-    /// so a message whose timeout has lapsed is not in flight here.
-    pub fn in_flight_message_ids(&self, now: SystemTime) -> BTreeSet<String> {
-        self.messages
-            .iter()
-            .filter(|message| message.visibility(now) == Visibility::InFlight)
-            .map(|message| message.message_id.clone())
-            .collect()
-    }
-
-    /// [`change_visibility`](Self::change_visibility), deciding whether the message is IN
-    /// FLIGHT from the ids `in_flight` holds rather than from what the queue looks like at
-    /// the moment this change is applied — which is what lets every change of one request
-    /// be judged against the state that request arrived to.
-    pub fn change_visibility_as_of(
-        &mut self,
-        receipt_handle: &str,
-        timeout: i64,
-        now: SystemTime,
-        in_flight: &BTreeSet<String>,
     ) -> Result<(), VisibilityRefusal> {
         let message = self
             .message_for_handle_mut(receipt_handle)
@@ -1448,9 +1416,6 @@ impl Queue {
                 ReceiptHandleRefusal::Malformed => VisibilityRefusal::MalformedHandle,
                 ReceiptHandleRefusal::NoSuchMessage => VisibilityRefusal::NoSuchMessage,
             })?;
-        if !in_flight.contains(&message.message_id) {
-            return Err(VisibilityRefusal::NotInFlight);
-        }
         // The ceiling of the span one receive may hide a message for is the ceiling of the
         // range the timeout itself takes, and it is counted from the receipt handle's own
         // receive — the LAST one, since that is the receive whose handle this call carries
