@@ -218,17 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which the generated request walk enforces BEFORE this handler runs — a
         // request for 1000 (the ceiling the member's prose names) is refused with
         // "Member must have value less than or equal to 100" and never arrives
-        // here. So the page size is only defaulted, never validated: a caller
-        // that sends none gets the model's range maximum, and the `.max(1)` is a
-        // floor against a zero page, which would return nothing while carrying a
-        // token whose offset never advances, so a walk would never terminate.
-        let page_size = usize::try_from(
-            input
-                .max_results
-                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
-        )
-        .unwrap_or(1)
-        .max(1);
+        // here. So the page size is only defaulted, never validated. One rule
+        // for every paginated listing here, including the floor against a
+        // non-advancing zero page: `crate::state::page_size`.
+        let page_size = crate::state::page_size(input.max_results);
 
         let guard = state.lock();
         // The service-wide enrollment gate, AHEAD of filter evaluation: an

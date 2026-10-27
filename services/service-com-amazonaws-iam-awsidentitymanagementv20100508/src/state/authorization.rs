@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Who a signed request to IAM speaks for, and whether that principal's own
-//! identity-based policies let it do what it asks.
+//! identity-based policies — within the boundary that caps them — let it do what it asks.
 //!
 //! IAM is itself an AWS service whose API is governed by IAM: a call to it is authorized
 //! against the calling principal's identity-based policies before the operation reports
@@ -14,7 +14,7 @@
 //! closed by the sentence naming where the details of that one denial are readable, by
 //! the authorization id the refusal mints ([`authorization_details_sentence`]).
 //!
-//! The three pieces, each held in exactly one place:
+//! The four pieces, each held in exactly one place:
 //!
 //! 1. **who** — the IAM user the request's SigV4 access key id belongs to, read out of
 //!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::access_keys`], the same
@@ -23,7 +23,13 @@
 //!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::principal_policies`],
 //!    so a policy just put grants immediately and one just deleted stops granting
 //!    immediately;
-//! 3. **the decision** — [`::service_common::iam_authorization`], the tree's ONE
+//! 3. **the ceiling on it** — the permissions boundary in force on that principal, from
+//!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::permissions_boundary_document`],
+//!    which sets the maximum permissions those documents can grant and grants nothing
+//!    itself: a call the boundary does not allow is refused even where they allow it —
+//!    and the refusal names the boundary as the document that withheld it — while a call
+//!    only the boundary allows is refused as if the boundary had allowed nothing;
+//! 4. **the decision** — [`::service_common::iam_authorization`], the tree's ONE
 //!    evaluation of IAM policy documents against `(action, resource)`, so IAM and every
 //!    other service handed the same documents decide alike.
 //!
@@ -40,7 +46,9 @@
 //!   allowed where the documents that ARE held neither grant nor deny: what that document
 //!   grants is unknown here, and refusing on evidence this emulator does not have would
 //!   deny access AWS permits. An explicit `Deny` in a document that is held still
-//!   refuses, because no grant overturns one.
+//!   refuses, because no grant overturns one. A boundary whose document is not held is
+//!   read the same way: it is a ceiling this emulator cannot measure a call against, so
+//!   it caps nothing rather than refusing what AWS would permit.
 
 use ::std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,12 +59,14 @@ use crate::scaffolded::AccessDenied;
 
 use super::{ComAmazonawsIamAwsidentitymanagementv20100508State as IamState, PrincipalPolicies};
 
-/// The Region a request that carries no SigV4 credential scope was served in.
+/// The Region the console view of a denial lives in.
 ///
-/// IAM is global and its endpoint `iam.amazonaws.com` is in `us-east-1` ("AWS Identity
-/// and Access Management endpoints and quotas", AWS General Reference), so that is the
-/// Region such a request addressed. A request that DOES carry a scope names its own
-/// Region there, and that one is used instead ([`request_region`]).
+/// IAM is a GLOBAL service: its endpoint `iam.amazonaws.com` is in `us-east-1` ("AWS
+/// Identity and Access Management endpoints and quotas", AWS General Reference), and so
+/// is the console that serves a refused request's authorization details. A request signed
+/// for another Region is still a request to that one global service, so the page its
+/// denial points at is the same one — the Region a request named in its SigV4 credential
+/// scope is not where its authorization details are read.
 const IAM_GLOBAL_REGION: &str = "us-east-1";
 
 /// The alphabet an authorization id is spelled in.
@@ -126,6 +136,9 @@ pub const LIST_GROUPS_FOR_USER: &str = "iam:ListGroupsForUser";
 
 /// `iam:ListUserTags`.
 pub const LIST_USER_TAGS: &str = "iam:ListUserTags";
+
+/// `iam:ListAccessKeys`.
+pub const LIST_ACCESS_KEYS: &str = "iam:ListAccessKeys";
 
 /// `iam:ListRoleTags`.
 pub const LIST_ROLE_TAGS: &str = "iam:ListRoleTags";
@@ -255,22 +268,47 @@ pub fn authorize_named(
     let principals = [principal.clone()];
     let request = iam::Request::new(action, resource, &principals);
     let decided = iam::identity_decision(&policies.documents, &request);
-    if iam::is_allowed(decided, Decision::NotStated) {
-        return Ok(());
-    }
-    // An attachment whose document the account does not hold is a grant this emulator
-    // cannot read, so it cannot be the basis of a refusal — but it cannot overturn one
-    // either: an explicit `Deny` in a document that IS held wins over every grant,
-    // including one whose content is unknown here.
-    if decided != Decision::Denied && !policies.uncarried.is_empty() {
+    // Whether the documents in force grant the call at all. An attachment whose
+    // document the account does not hold is a grant this emulator cannot read, so it
+    // cannot be the basis of a refusal — but it cannot overturn one either: an explicit
+    // `Deny` in a document that IS held wins over every grant, including one whose
+    // content is unknown here.
+    let granted = iam::is_allowed(decided, Decision::NotStated)
+        || (decided != Decision::Denied && !policies.uncarried.is_empty());
+    // What the permissions boundary in force on the principal says about the call. "A
+    // permissions boundary … sets the maximum permissions that an identity-based policy
+    // can grant to an entity": the boundary CAPS what those policies grant and grants
+    // nothing itself, so a call it does not allow is refused even where they allow it,
+    // and a call only it allows is refused as if it had allowed nothing. A principal
+    // carrying no boundary — or one whose document is not held, a ceiling this emulator
+    // cannot read — is capped by nothing, which is the same position as a boundary that
+    // allows the call. A call an identity-based policy explicitly DENIES is already
+    // refused on that deny, so no ceiling is read for it.
+    let capped = if decided == Decision::Denied {
+        Decision::Allowed
+    } else {
+        match store.permissions_boundary_document(&principal) {
+            Some(document) => iam::identity_decision(::std::slice::from_ref(&document), &request),
+            None => Decision::Allowed,
+        }
+    };
+    if granted && capped == Decision::Allowed {
         return Ok(());
     }
 
-    // Why the call was refused: an explicit `Deny` that is about the request, or the
-    // absence of any `Allow` for it. The two are different facts about the policies in
-    // force, and AWS words them differently, because they need different fixes.
+    // Why the call was refused: an explicit `Deny` that is about the request — stated in
+    // an identity-based policy or in the boundary, and either wins over every `Allow` —
+    // or the absence of an `Allow`, which names the DOCUMENT that withheld it: the
+    // boundary where the identity-based policies did allow the call, and the
+    // identity-based policies where nothing allowed it at all. They are different facts
+    // about the policies in force, and AWS words each of them differently, because they
+    // need different fixes.
     let reason = if decided == Decision::Denied {
         "with an explicit deny in an identity-based policy".to_string()
+    } else if capped == Decision::Denied {
+        "with an explicit deny in a permissions boundary".to_string()
+    } else if granted {
+        format!("because no permissions boundary allows the {action} action")
     } else {
         format!("because no identity-based policy allows the {action} action")
     };
@@ -285,9 +323,9 @@ pub fn authorize_named(
         principal = %principal,
         action = %action,
         resource = %resource,
-        explicit_deny = decided == Decision::Denied,
+        explicit_deny = decided == Decision::Denied || capped == Decision::Denied,
         authorization_id = %authorization_id,
-        "the caller's identity-based policies do not permit this call"
+        "the policies in force on the caller do not permit this call"
     );
     // What the decision was about, then why it went that way, then where the caller
     // reads the details of it: the three parts of AWS's `AccessDenied` text, with the
@@ -296,7 +334,7 @@ pub fn authorize_named(
     Err(AccessDenied::new(format!(
         "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
          {reason}{}",
-        authorization_details_sentence(&request_region(ctx), &authorization_id)
+        authorization_details_sentence(IAM_GLOBAL_REGION, &authorization_id)
     )))
 }
 
@@ -401,20 +439,12 @@ fn next_authorization_id() -> String {
     id
 }
 
-/// The Region the request `ctx` describes addressed: the one its SigV4 credential scope
-/// names, which is the only place a request carries a Region, and
-/// [`IAM_GLOBAL_REGION`] for a request that carries no scope to read one from.
-fn request_region(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
-    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
-        .map(|scope| scope.region)
-        .unwrap_or_else(|| IAM_GLOBAL_REGION.to_string())
-}
-
 /// The sentence that closes an `AccessDenied` message: where the caller reads the
 /// authorization details of the request that was refused.
 ///
-/// Both halves name the SAME `authorization_id` — the console view of that one denial,
-/// in the Region the request addressed, and the API that serves the same record
+/// Both halves name the SAME `authorization_id` — the console view of that one denial, in
+/// the Region IAM's console lives in ([`IAM_GLOBAL_REGION`]), and the API that serves the
+/// same record
 /// (`GetRequestAuthorizationDetails`, served by this emulator's IAM Toolbox service).
 /// It is fixed text around two values taken from the request and from the id this
 /// denial minted, so it carries nothing of any other request.

@@ -262,6 +262,27 @@ async fn an_unusable_key_is_refused_ahead_of_every_other_refusal() {
     let user = "ahead";
     let held = user_with_two_keys(&router, "ahead of dispatch", user).await;
     set_status(&router, "ahead of dispatch", user, &held[1], "Inactive").await;
+    // The key listing below is authorized against the caller's own policies, so the
+    // user is given the grant AWS requires for it: what the first row is about is the
+    // handler's MISSING-ENTITY refusal, which a caller without that grant would never
+    // reach. Nothing grants the second row's action, which is the point of that row.
+    let (status, put) = call(
+        &router,
+        "PutUserPolicy",
+        &[
+            ("UserName", user),
+            ("PolicyName", "allow-listaccesskeys"),
+            (
+                "PolicyDocument",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:ListAccessKeys","Resource":"*"}]}"#,
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"ahead of dispatch\": the fixture PutUserPolicy must succeed, got {status}: {put}"
+    );
 
     // Rows: a request the handler would refuse as a missing entity (404
     // `NoSuchEntity`), and one the caller's own policies do not permit (403
