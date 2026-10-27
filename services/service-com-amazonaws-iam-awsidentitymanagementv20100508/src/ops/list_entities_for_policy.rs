@@ -278,11 +278,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this account, so it is not account state and is taken as present, exactly as
         // `AttachRolePolicy` takes it; a customer-managed policy exists precisely when
         // this account holds it, which the policy store `CreatePolicy` writes records.
+        //
+        // What this reports is which entities the policy is ATTACHED to, so the absence is
+        // worded the way IAM words it for the attachment family: the ARN names no policy
+        // this account can relate an entity to, which is not the same claim as "no such
+        // policy resource" (`crate::state::policy_not_attachable`).
         let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;
         if !aws_managed && store.policy_by_arn(&input.policy_arn).is_none() {
             return Err(ListEntitiesForPolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
+                    message: Some(crate::state::policy_not_attachable(&input.policy_arn)),
                 },
             )
             .into());

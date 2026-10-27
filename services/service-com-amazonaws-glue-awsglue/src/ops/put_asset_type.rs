@@ -179,8 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // "Each entry references the form type that defines the form's schema": a
-        // reference resolves against the form types THIS store holds, by the identifier
-        // the catalog minted for one or by the name it was registered under
+        // reference resolves against the form types THIS store holds, by the identifier a
+        // client addresses a form type by
         // ([`crate::state::ComAmazonawsGlueAwsglueState::form_type_by_reference`]), so a
         // put naming a form type that was never registered addresses an entity that does
         // not exist and is refused with this operation's modelled
@@ -195,12 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(PutAssetTypeErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        // What is pinned is the behaviour — 400 with
-                        // `EntityNotFoundException`; the wording names the member that
-                        // resolved to nothing, taken from the request.
-                        message: Some(format!(
-                            "Form type {} not found",
-                            reference.form_type_identifier
+                        // The same miss the form type's own reader answers, worded the one
+                        // way the catalog's form type surface words it
+                        // (`crate::state::form_type_not_found_message`), with the
+                        // identifier that resolved to nothing as its variable part.
+                        message: Some(crate::state::form_type_not_found_message(
+                            &reference.form_type_identifier,
                         )),
                         from_federation_source: None,
                     },

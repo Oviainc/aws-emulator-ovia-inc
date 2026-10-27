@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteOriginRequestPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteOriginRequestPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteOriginRequestPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a stored origin request policy under its version token: the policy a later read
+//! answered from is REMOVED, so the id names nothing afterwards and the name it held is free
+//! again. A policy still attached to a cache behaviour of any stored distribution is refused
+//! with `OriginRequestPolicyInUse` and stays readable, and a policy AWS published is refused
+//! with `IllegalDelete` because nothing in this account removes one.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +171,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteOriginRequestPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteOriginRequestPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteOriginRequestPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this
+        // call reads it: whether a policy is still attached is decided against the
+        // distributions as they stand at this instant.
+        store.settle(::std::time::SystemTime::now());
+
+        // A policy AWS published is readable in this account but belongs to AWS: no call
+        // here creates, changes or removes one, so a delete aimed at one is refused for
+        // what the REQUEST asked for — deletion of a service-owned resource — rather than
+        // answered "does not exist", and the policy stays readable afterwards. Decided
+        // before the precondition, because no version of it can make the delete legal.
+        if crate::state::managed_origin_request_policy(&input.id).is_some() {
+            return Err(DeleteOriginRequestPolicyErrorModeled::IllegalDelete(
+                crate::state::illegal_delete_managed_policy(),
+            )
+            .into());
+        }
+
+        let Some(current_etag) = store
+            .origin_request_policy(&input.id)
+            .map(|stored| stored.etag.clone())
+        else {
+            return Err(
+                DeleteOriginRequestPolicyErrorModeled::NoSuchOriginRequestPolicy(
+                    crate::state::no_such_origin_request_policy(),
+                )
+                .into(),
+            );
+        };
+
+        // The precondition is checked first, the way HTTP evaluates one: a caller holding a
+        // version that is no longer current is told that before anything about what the
+        // policy is attached to.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            crate::state::IfMatch::Current => {}
+            crate::state::IfMatch::Invalid => {
+                return Err(
+                    DeleteOriginRequestPolicyErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            crate::state::IfMatch::Stale => {
+                return Err(DeleteOriginRequestPolicyErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // "You cannot delete an origin request policy if it's attached to any cache
+        // behaviors. First update your distributions to remove the origin request policy
+        // from all cache behaviors, then delete the origin request policy." So a policy any
+        // stored cache behaviour still attaches is refused here and stays readable.
+        if store
+            .distribution_using_origin_request_policy(&input.id)
+            .is_some()
+        {
+            return Err(
+                DeleteOriginRequestPolicyErrorModeled::OriginRequestPolicyInUse(
+                    crate::state::origin_request_policy_in_use(),
+                )
+                .into(),
+            );
+        }
+
+        // Gone means gone: the record a read answered from is removed, so the id names no
+        // policy and the name it held is free for a later create to claim.
+        store.origin_request_policies.remove(&input.id);
+
+        Ok(DeleteOriginRequestPolicyOutput)
     }
 }
