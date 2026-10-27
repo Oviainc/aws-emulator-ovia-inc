@@ -135,9 +135,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Nothing in this operation depends on the request's metadata: where a device has
-        // got to is a property of the job, which the request names by id.
-        let _ = ctx;
+        // The report holds the store's lock; the notification the state it moved the job to
+        // owes is published once that lock is released, because a publish is an in-process
+        // call into Amazon SNS and must not run under it.
+        let notifications = self.report(&input)?;
+
+        // The job has entered the state the finished leg left it in, which its own
+        // notification settings may select, and a subscriber of the topic they name is told
+        // about it.
+        crate::state::job_notifications::publish(ctx, &notifications).await;
+
+        Ok(UpdateJobShipmentStateOutput {})
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateJobShipmentState<Eng> {
+    /// The shipment report itself: the job-state notification it owes.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the write
+    /// ALONE and nothing is awaited while it is. Nothing in the report depends on the
+    /// request's metadata either: where a device has got to is a property of the job, which
+    /// the request names by id.
+    fn report(
+        &self,
+        input: &UpdateJobShipmentStateInput,
+    ) -> Result<
+        Vec<crate::state::job_notifications::JobStateNotification>,
+        UpdateJobShipmentStateError,
+    > {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STATE_UNAVAILABLE,
@@ -229,6 +254,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             job.job_state = reported.reported_job_state();
         }
 
-        Ok(UpdateJobShipmentStateOutput {})
+        // The job has ENTERED the state the finished leg left it in, so its own notification
+        // settings decide whether that is published onto their topic. Decided here, under the
+        // lock, over the record the store now holds, and published by the caller once the
+        // lock is released.
+        Ok(crate::state::job_notifications::owed_for_jobs(
+            &store,
+            ::std::slice::from_ref(&input.job_id),
+            ::std::time::SystemTime::now(),
+        ))
     }
 }

@@ -346,6 +346,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The create holds the store's lock; the notifications its node jobs' first states
+        // owe are published once that lock is released, because a publish is an in-process
+        // call into Amazon SNS and must not run under it.
+        let (output, notifications) = self.place_order(input)?;
+
+        // Each node job created has entered its first state, which its own notification
+        // settings may select, and a subscriber of the topic they name is told about it.
+        crate::state::job_notifications::publish(ctx, &notifications).await;
+
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng> {
+    /// The order itself: what it answers, and the job-state notifications it owes.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the write
+    /// ALONE and nothing is awaited while it is.
+    fn place_order(
+        &self,
+        input: CreateClusterInput,
+    ) -> Result<
+        (
+            CreateClusterOutput,
+            Vec<crate::state::job_notifications::JobStateNotification>,
+        ),
+        CreateClusterError,
+    > {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STATE_UNAVAILABLE,
@@ -560,6 +588,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let job_list_entries: Option<Vec<JobListEntry>> = (!nodes.is_empty())
             .then(|| nodes.iter().map(|node| node.to_job_list_entry()).collect());
 
+        // Each node job this create makes has ENTERED its first `JobState`, which is a
+        // state change like any other this API makes, so the notification settings it
+        // inherited from the cluster decide whether that is published onto their topic.
+        // Decided here, under the lock, and published by the caller once the lock is
+        // released.
+        let notifications =
+            crate::state::job_notifications::owed_for_records(nodes.iter(), created);
+
         // Both ceilings were checked above, so neither insertion can refuse here; the
         // assertions keep a later change to the ceilings from answering 200 with nothing
         // stored.
@@ -568,9 +604,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let nodes_stored = store.add_cluster_node_jobs(&cluster_id, nodes);
         debug_assert!(nodes_stored, "the job ceiling was checked above");
 
-        Ok(CreateClusterOutput {
-            cluster_id: Some(cluster_id),
-            job_list_entries,
-        })
+        Ok((
+            CreateClusterOutput {
+                cluster_id: Some(cluster_id),
+                job_list_entries,
+            },
+            notifications,
+        ))
     }
 }

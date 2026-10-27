@@ -16,6 +16,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// that places or updates an order, so one rule covers all of them.
 pub mod named_resources;
 
+/// The Amazon SNS notification a job's state change is published as: the one reading of a
+/// job's `Notification` settings, shared by every operation that moves a job, so each of
+/// them publishes the same document onto the same topic.
+pub mod job_notifications;
+
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{

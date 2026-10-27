@@ -55,6 +55,8 @@ mod job_manifest;
 mod job_order_validation;
 #[path = "all/job_shipment_state.rs"]
 mod job_shipment_state;
+#[path = "all/job_state_notifications.rs"]
+mod job_state_notifications;
 #[path = "all/job_unlock_code.rs"]
 mod job_unlock_code;
 #[path = "all/job_updates.rs"]
