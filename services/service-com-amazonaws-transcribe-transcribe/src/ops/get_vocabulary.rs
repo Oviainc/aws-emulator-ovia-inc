@@ -208,15 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vocabulary_state: Some(record.state.clone()),
             last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
             failure_reason: record.failure_reason.clone(),
-            // Where the BUILT vocabulary is reported to live, so only one whose
-            // build has FINISHED carries it: the member is absent while the service
-            // is still processing the terms and absent after a build that failed,
-            // which is every vocabulary whose terms would have had to be read from a
-            // file nothing read (`crate::state::VocabularyRecord::download_uri`).
-            // Nothing is served at that location either way — see the `crate::state`
-            // header. This answer carries no terms at all: `GetVocabularyResponse`
-            // has no member for them, so the vocabulary's content is not reported by
-            // this operation.
+            // Where the BUILT vocabulary lives, so only one whose build has FINISHED
+            // carries it: the member is absent while the service is still processing
+            // the terms and absent after a build that failed, which is every
+            // vocabulary whose terms would have had to be read from a file nothing
+            // read (`crate::state::VocabularyRecord::download_uri`). A reported
+            // location IS served: the create or update that supplied the terms wrote
+            // them as the text file there (`crate::state::store_vocabulary_content`),
+            // so a client reads the terms back by fetching it. This answer itself
+            // carries no terms: `GetVocabularyResponse` has no member for them, so the
+            // location is how the vocabulary's content is reported.
             download_uri: record.download_uri(),
             data_access_role_arn: record.data_access_role_arn.clone(),
             encryption_configuration: record.encryption_configuration.clone(),

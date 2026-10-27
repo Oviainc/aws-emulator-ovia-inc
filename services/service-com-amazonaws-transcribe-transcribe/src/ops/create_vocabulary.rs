@@ -286,93 +286,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
+        // The guard is SCOPED: the store lock is released before this handler awaits
+        // the write of the file the vocabulary's `DownloadUri` names, which is a call
+        // out to another emulated service and reaches none of this state.
+        let (output, name, content) = {
+            let mut store = state.lock();
 
-        // "must be unique within an Amazon Web Services account. If you try to create a
-        // new custom vocabulary with the same name as an existing one, you get a
-        // ConflictException error." Unique within ONE Region of that account: a regional
-        // endpoint serves only the resources created through it, so the same name is
-        // free in every other Region. Checked and inserted under one lock, so N
-        // concurrent creates of one name have exactly one winner.
-        if store.vocabularies.contains(&region, &input.vocabulary_name) {
-            return Err(CreateVocabularyErrorModeled::ConflictException(
-                ConflictException {
-                    // As `CreateVocabularyFilter`: the kind, not the caller's name.
-                    message: Some(crate::state::name_already_exists_message(
-                        crate::state::KIND_VOCABULARY,
-                    )),
-                },
-            )
-            .into());
-        }
+            // "must be unique within an Amazon Web Services account. If you try to
+            // create a new custom vocabulary with the same name as an existing one, you
+            // get a ConflictException error." Unique within ONE Region of that account:
+            // a regional endpoint serves only the resources created through it, so the
+            // same name is free in every other Region. Checked and inserted under one
+            // lock, so N concurrent creates of one name have exactly one winner.
+            if store.vocabularies.contains(&region, &input.vocabulary_name) {
+                return Err(CreateVocabularyErrorModeled::ConflictException(
+                    ConflictException {
+                        // As `CreateVocabularyFilter`: the kind, not the caller's name.
+                        message: Some(crate::state::name_already_exists_message(
+                            crate::state::KIND_VOCABULARY,
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        if store.vocabularies.len_in(&region) >= crate::state::MAX_VOCABULARIES {
-            return Err(CreateVocabularyErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(format!(
-                        "You have reached the limit of {} custom vocabularies for this \
-                         account. Delete a custom vocabulary you no longer need and try \
-                         your request again.",
-                        crate::state::MAX_VOCABULARIES
-                    )),
-                },
-            )
-            .into());
-        }
+            if store.vocabularies.len_in(&region) >= crate::state::MAX_VOCABULARIES {
+                return Err(CreateVocabularyErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "You have reached the limit of {} custom vocabularies for \
+                             this account. Delete a custom vocabulary you no longer need \
+                             and try your request again.",
+                            crate::state::MAX_VOCABULARIES
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        // The Region comes from the request's own (unauthenticated) credential scope,
-        // so the per-Region quota above bounds the store only together with a cap on how
-        // many Regions it keeps vocabularies for (see [`crate::state::MAX_REGIONS`]).
-        if store.vocabularies.region_bucket_exhausted(&region) {
-            return Err(CreateVocabularyErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(crate::state::region_capacity_message(
-                        crate::state::FAMILY_VOCABULARIES,
-                        &region,
-                    )),
-                },
-            )
-            .into());
-        }
+            // The Region comes from the request's own (unauthenticated) credential
+            // scope, so the per-Region quota above bounds the store only together with a
+            // cap on how many Regions it keeps vocabularies for (see
+            // [`crate::state::MAX_REGIONS`]).
+            if store.vocabularies.region_bucket_exhausted(&region) {
+                return Err(CreateVocabularyErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(crate::state::region_capacity_message(
+                            crate::state::FAMILY_VOCABULARIES,
+                            &region,
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        let sequence = store.next_sequence();
-        let record = crate::state::VocabularyRecord {
-            name: input.vocabulary_name.clone(),
-            sequence,
-            language_code: input.language_code,
-            phrases,
-            file_uri,
-            // "If the state is READY, you can use the custom vocabulary in a
-            // StartTranscriptionJob request": a new custom vocabulary is PENDING
-            // until the service has finished processing it.
-            state: crate::state::VOCABULARY_STATE_PENDING.to_string(),
-            failure_reason: None,
-            transition_due: Some(now + crate::state::VOCABULARY_TRANSITION_DELAY),
-            last_modified_time: now,
-            region: region.clone(),
-            data_access_role_arn: input.data_access_role_arn,
-            encryption_configuration: input.encryption_configuration,
-            tags: input.tags.unwrap_or_default(),
+            let sequence = store.next_sequence();
+            let record = crate::state::VocabularyRecord {
+                name: input.vocabulary_name.clone(),
+                sequence,
+                language_code: input.language_code,
+                phrases,
+                file_uri,
+                // "If the state is READY, you can use the custom vocabulary in a
+                // StartTranscriptionJob request": a new custom vocabulary is PENDING
+                // until the service has finished processing it.
+                state: crate::state::VOCABULARY_STATE_PENDING.to_string(),
+                failure_reason: None,
+                transition_due: Some(now + crate::state::VOCABULARY_TRANSITION_DELAY),
+                last_modified_time: now,
+                region: region.clone(),
+                data_access_role_arn: input.data_access_role_arn,
+                encryption_configuration: input.encryption_configuration,
+                tags: input.tags.unwrap_or_default(),
+            };
+
+            // The response is the record just stored, never the request echoed back.
+            let output = CreateVocabularyOutput {
+                vocabulary_name: Some(record.name.clone()),
+                language_code: Some(record.language_code.clone()),
+                vocabulary_state: Some(record.state.clone()),
+                last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+                failure_reason: record.failure_reason.clone(),
+            };
+            ::tracing::info!(
+                operation = "CreateVocabulary",
+                vocabulary = %record.name,
+                state = %record.state,
+                terms = record.phrases.len(),
+                from_file = record.file_uri.is_some(),
+                "custom vocabulary created"
+            );
+            let name = record.name.clone();
+            // The terms the build has to store, taken from the record rather than from
+            // the request: what is served is what was persisted.
+            let content = record.phrases.clone();
+            store.vocabularies.insert(&region, &name, record);
+            (output, name, content)
         };
 
-        // The response is the record just stored, never the request echoed back.
-        let output = CreateVocabularyOutput {
-            vocabulary_name: Some(record.name.clone()),
-            language_code: Some(record.language_code.clone()),
-            vocabulary_state: Some(record.state.clone()),
-            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
-            failure_reason: record.failure_reason.clone(),
-        };
-        ::tracing::info!(
-            operation = "CreateVocabulary",
-            vocabulary = %record.name,
-            state = %record.state,
-            terms = record.phrases.len(),
-            from_file = record.file_uri.is_some(),
-            "custom vocabulary created"
-        );
-        let name = record.name.clone();
-        store.vocabularies.insert(&region, &name, record);
+        // The terms this vocabulary is built from are stored as the text file its
+        // `DownloadUri` names, so a client that reads that location once the build is
+        // `READY` gets them back ("use this URI to view or download the custom
+        // vocabulary"). A vocabulary whose terms were to be read from a caller-named
+        // file carries none, and nothing is built or served for it.
+        crate::state::store_vocabulary_content(
+            ctx,
+            &region,
+            crate::state::RESOURCE_TYPE_VOCABULARY,
+            &name,
+            &content,
+        )
+        .await;
 
         Ok(output)
     }

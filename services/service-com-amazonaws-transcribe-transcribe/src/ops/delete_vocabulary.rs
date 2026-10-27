@@ -184,67 +184,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this Region's endpoint are this call's to delete.
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // The clock-owed transition is materialised FIRST, so a vocabulary whose
-        // processing was already due is deleted rather than refused for a state it had
-        // left. The stored state is copied out of the lookup so the removal below does
-        // not hold the borrow the lookup took.
-        let stored_state = store
-            .vocabulary_mut(&region, &input.vocabulary_name, now)
-            .map(|record| record.state.clone());
+        // The guard is SCOPED: the store lock is released before this handler awaits
+        // the withdrawal of the file the vocabulary's `DownloadUri` named, which is a
+        // call out to another emulated service and reaches none of this state.
+        {
+            let mut store = state.lock();
+            // The clock-owed transition is materialised FIRST, so a vocabulary whose
+            // processing was already due is deleted rather than refused for a state it
+            // had left. The stored state is copied out of the lookup so the removal
+            // below does not hold the borrow the lookup took.
+            let stored_state = store
+                .vocabulary_mut(&region, &input.vocabulary_name, now)
+                .map(|record| record.state.clone());
 
-        match stored_state {
-            // "Your request didn't pass one or more validation tests. This can occur
-            // when the entity you're trying to delete doesn't exist or if it's in a
-            // non-terminal state (such as IN PROGRESS)" (`BadRequestException`'s own
-            // documentation): a resource the service is still processing is not
-            // deletable.
-            Some(vocabulary_state)
-                if !crate::state::is_terminal_vocabulary_state(&vocabulary_state) =>
-            {
-                return Err(DeleteVocabularyErrorModeled::BadRequestException(
-                    BadRequestException {
-                        message: Some(format!(
-                            "The custom vocabulary {name} is in the {vocabulary_state} state \
-                             and can't be deleted. Wait until it is no longer being \
-                             processed and try your request again.",
-                            name = input.vocabulary_name,
-                        )),
-                    },
-                )
-                .into());
-            }
-            Some(_) => {
-                store.vocabularies.remove(&region, &input.vocabulary_name);
-                ::tracing::info!(
-                    operation = "DeleteVocabulary",
-                    vocabulary = %input.vocabulary_name,
-                    "custom vocabulary deleted"
-                );
-            }
-            // A DELETE IS NOT IDEMPOTENT: the entity has to be there. The same
-            // `BadRequestException` sentence covers it — "This can occur when the
-            // entity you're trying to delete doesn't exist OR if it's in a non-terminal
-            // state" — so a name this Region holds no vocabulary under is refused with
-            // this service's own absent-resource text
-            // (`crate::state::not_found_message`), exactly as every reader of the
-            // family answers it, and nothing is stored or removed.
-            None => {
-                ::tracing::info!(
-                    operation = "DeleteVocabulary",
-                    vocabulary = %input.vocabulary_name,
-                    "no custom vocabulary of that name; the delete is refused"
-                );
-                return Err(DeleteVocabularyErrorModeled::BadRequestException(
-                    BadRequestException {
-                        message: Some(crate::state::not_found_message(
-                            crate::state::KIND_VOCABULARY,
-                        )),
-                    },
-                )
-                .into());
+            match stored_state {
+                // "Your request didn't pass one or more validation tests. This can occur
+                // when the entity you're trying to delete doesn't exist or if it's in a
+                // non-terminal state (such as IN PROGRESS)" (`BadRequestException`'s own
+                // documentation): a resource the service is still processing is not
+                // deletable.
+                Some(vocabulary_state)
+                    if !crate::state::is_terminal_vocabulary_state(&vocabulary_state) =>
+                {
+                    return Err(DeleteVocabularyErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(format!(
+                                "The custom vocabulary {name} is in the {vocabulary_state} \
+                                 state and can't be deleted. Wait until it is no longer \
+                                 being processed and try your request again.",
+                                name = input.vocabulary_name,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Some(_) => {
+                    store.vocabularies.remove(&region, &input.vocabulary_name);
+                    ::tracing::info!(
+                        operation = "DeleteVocabulary",
+                        vocabulary = %input.vocabulary_name,
+                        "custom vocabulary deleted"
+                    );
+                }
+                // A DELETE IS NOT IDEMPOTENT: the entity has to be there. The same
+                // `BadRequestException` sentence covers it — "This can occur when the
+                // entity you're trying to delete doesn't exist OR if it's in a
+                // non-terminal state" — so a name this Region holds no vocabulary under
+                // is refused with this service's own absent-resource text
+                // (`crate::state::not_found_message`), exactly as every reader of the
+                // family answers it, and nothing is stored or removed.
+                None => {
+                    ::tracing::info!(
+                        operation = "DeleteVocabulary",
+                        vocabulary = %input.vocabulary_name,
+                        "no custom vocabulary of that name; the delete is refused"
+                    );
+                    return Err(DeleteVocabularyErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(crate::state::not_found_message(
+                                crate::state::KIND_VOCABULARY,
+                            )),
+                        },
+                    )
+                    .into());
+                }
             }
         }
+
+        // The vocabulary is gone, so the location its `DownloadUri` named serves
+        // nothing: the file the build left is withdrawn with it
+        // (`crate::state::store_vocabulary_content`).
+        crate::state::store_vocabulary_content(
+            ctx,
+            &region,
+            crate::state::RESOURCE_TYPE_VOCABULARY,
+            &input.vocabulary_name,
+            &[],
+        )
+        .await;
 
         Ok(DeleteVocabularyOutput)
     }

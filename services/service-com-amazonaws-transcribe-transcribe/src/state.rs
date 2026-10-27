@@ -56,11 +56,15 @@
 //! constants (see [`CallAnalyticsJobRecord`]). `LanguageCodeItem.DurationInSeconds` is
 //! of the second kind and stays absent: how long each language is SPOKEN is a
 //! measurement of media nothing reads.
-//! A custom vocabulary is the same: its terms are held in this state, where a
-//! `StartTranscriptionJob` that names the vocabulary would read them from, while the
-//! `DownloadUri` it reports is a location nothing serves (see
-//! [`vocabulary_download_uri`]) and no operation of this service reports the terms
-//! themselves — none of their output shapes has a member for them. A vocabulary whose
+//! A custom vocabulary is NOT the same in one respect: its terms are held in this
+//! state, where a `StartTranscriptionJob` that names the vocabulary would read them
+//! from, and no operation of this service reports the terms themselves — none of their
+//! output shapes has a member for them — but the `DownloadUri` it reports is a
+//! location this emulator SERVES. The text file of the terms a create or an update
+//! supplied is written to the service-managed object store that URI names, over the
+//! in-process callback into this same emulator, so a client that fetches the reported
+//! location reads back the terms it stored and a later update replaces them (see
+//! [`store_vocabulary_content`] and [`vocabulary_download_uri`]). A vocabulary whose
 //! terms would have to be READ from a file URI is RECORDED like any other — the
 //! control plane is real, so the create succeeds and every later operation finds the
 //! resource — and the build this emulator cannot run ends in the service's own
@@ -2854,20 +2858,207 @@ pub fn content_source<'a>(
 }
 
 /// The `DownloadUri` of a custom vocabulary or vocabulary filter: the service-managed
-/// S3 location its file is reported to live at.
+/// S3 location its text file is stored at.
 ///
-/// Reported, not served — exactly as a completed transcription job's
-/// `Transcript.TranscriptFileUri` is (see this module's header): the terms themselves
-/// live in this emulator's own state, where `GetVocabulary` and `GetVocabularyFilter`
-/// read them from, and nothing writes an object at this URI or answers a request for
-/// it. The form mirrors [`output_uri`]'s service-managed branch, so both URIs this
-/// service reports name the same service-managed bucket.
+/// REPORTED AND SERVED: the file of terms is written to that very bucket and key when
+/// a create or an update supplies them ([`store_vocabulary_content`]), so "use this
+/// URI to view or download the custom vocabulary filter" holds — a client that fetches
+/// the location reads the terms back. The URI is built from the same two pieces the
+/// write addresses ([`service_managed_bucket`], [`vocabulary_content_key`]), so the
+/// reported location and the stored object cannot drift apart. The bucket is
+/// [`service_managed_bucket`], the one [`output_uri`]'s service-managed branch names as
+/// well, so both URIs this service reports really do name the same bucket.
 pub fn vocabulary_download_uri(resource_type: &str, name: &str, region: &str) -> String {
     format!(
-        "https://s3.{region}.amazonaws.com/aws-transcribe-{region}-prod/{account}/\
-         {resource_type}/{name}",
+        "https://s3.{region}.amazonaws.com/{bucket}/{key}",
+        bucket = service_managed_bucket(region),
+        key = vocabulary_content_key(resource_type, name),
+    )
+}
+
+/// The bucket a Region's service-managed files live in: the built vocabulary and
+/// vocabulary-filter files the reported `DownloadUri` names
+/// ([`vocabulary_download_uri`]), and the transcript of a job that named no output
+/// bucket of its own ([`output_uri`]). ONE home for the name, so the two cannot drift.
+pub fn service_managed_bucket(region: &str) -> String {
+    format!("aws-transcribe-{region}-prod")
+}
+
+/// The key the built file of the resource `name` of `resource_type` is stored under in
+/// [`service_managed_bucket`] — the path part of its `DownloadUri`.
+pub fn vocabulary_content_key(resource_type: &str, name: &str) -> String {
+    format!(
+        "{account}/{resource_type}/{name}",
         account = ::engine::emulator_account_id(),
     )
+}
+
+/// The text file a custom vocabulary's or vocabulary filter's terms are stored as: one
+/// term per line, in the order the request listed them.
+///
+/// That is the form the two operations document for the file a caller may supply the
+/// same terms in — "the Amazon S3 location of the text file that contains your custom
+/// vocabulary filter terms", with one entry per line — so the file this service builds
+/// and the file a caller would upload are the same kind of text.
+pub fn vocabulary_content_file(terms: &[String]) -> String {
+    terms.iter().map(|term| format!("{term}\n")).collect()
+}
+
+/// The `Content-Type` the built text file is stored with.
+const VOCABULARY_CONTENT_TYPE: &str = "text/plain";
+
+/// The HTTP status Amazon S3 answers a `CreateBucket` for a name its one bucket
+/// namespace already holds: `BucketAlreadyOwnedByYou` and `BucketAlreadyExists`, the
+/// two errors that operation models, are both 409.
+const BUCKET_EXISTS_STATUS: u16 = 409;
+
+/// The Region a `CreateBucket` carrying NO location constraint places its bucket in,
+/// from `CreateBucketConfiguration$LocationConstraint`: "If you don't specify a Region,
+/// the bucket is created in the US East (N. Virginia) Region (us-east-1) by default."
+/// It is also why `BucketLocationConstraint` enumerates every other Region code but not
+/// this one, so a bucket in this Region is created with no configuration at all.
+const UNCONSTRAINED_BUCKET_REGION: &str = "us-east-1";
+
+/// An Amazon S3 client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's documented seam for calling another emulated
+/// service: it routes in process, so no network client is configured here and this
+/// crate names no other service's crate. `region` is the request's own signing region,
+/// so the file is written where the caller's own Amazon S3 requests go — which is the
+/// Region the reported `DownloadUri` names.
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The in-process transport routes on the request's own path, and a
+        // virtual-host bucket name is not a host this emulator resolves, so the
+        // request addresses its bucket in the path.
+        .force_path_style(true)
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch
+        // for a stalled stream, and each of those would need a sleep implementation
+        // this client is not given. The same goes for caching the identity: the
+        // credentials are handed over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Store `terms` as the text file the `DownloadUri` of the resource `name` of
+/// `resource_type` names — or WITHDRAW that file when there are no terms.
+///
+/// The reported location is the one the content really lives at: a create or an update
+/// that supplies the terms writes the file ([`vocabulary_content_file`]) at the bucket
+/// and key the URI is built from, over the in-process callback, so the location a
+/// reader reports serves this resource's CURRENT terms and a rebuild from other terms
+/// replaces them. An EMPTY list of terms is the other direction of the same rule:
+/// nothing was built (the terms were to be read from a caller-named file, or the
+/// resource is being deleted), so nothing is served there and any file an earlier
+/// build left is withdrawn.
+///
+/// Called from the mutating operations only: a read reports the location, it never
+/// writes one.
+///
+/// Object storage answering nothing says nothing about this service's record — the
+/// control plane is real whether or not the emulator was assembled with Amazon S3 — so
+/// a failed write is logged and the operation still answers; it never turns a
+/// successful create or update into a refusal.
+pub async fn store_vocabulary_content(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource_type: &str,
+    name: &str,
+    terms: &[String],
+) {
+    let bucket = service_managed_bucket(region);
+    let key = vocabulary_content_key(resource_type, name);
+    let client = s3_client(ctx, region);
+
+    if terms.is_empty() {
+        // Nothing is built, so nothing is served there. An answer saying the bucket or
+        // the object is not there already means exactly that, which is why this is not
+        // a warning.
+        if let Err(error) = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            ::tracing::debug!(
+                bucket = %bucket,
+                key = %key,
+                detail = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "no file was withdrawn for this resource; its reported location serves nothing"
+            );
+        }
+        return;
+    }
+
+    // The file needs a bucket to live in, and this one is the service's own rather
+    // than anything a caller created, so the write stands it up first. The create is
+    // idempotent in effect: a name the one bucket namespace already holds answers
+    // 409, which is this bucket already being there.
+    let configuration = (region != UNCONSTRAINED_BUCKET_REGION).then(|| {
+        ::aws_sdk_s3::types::CreateBucketConfiguration::builder()
+            .location_constraint(::aws_sdk_s3::types::BucketLocationConstraint::from(region))
+            .build()
+    });
+    if let Err(error) = client
+        .create_bucket()
+        .bucket(&bucket)
+        .set_create_bucket_configuration(configuration)
+        .send()
+        .await
+    {
+        use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+        let status = error
+            .raw_response()
+            .map(|response| response.status().as_u16());
+        if status != Some(BUCKET_EXISTS_STATUS) {
+            ::tracing::warn!(
+                bucket = %bucket,
+                code = error.code().unwrap_or_default(),
+                detail = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the service-managed bucket for custom vocabulary files was not created"
+            );
+        }
+    }
+
+    let file = vocabulary_content_file(terms);
+    match client
+        .put_object()
+        .bucket(&bucket)
+        .key(&key)
+        .body(::aws_sdk_s3::primitives::ByteStream::from(
+            file.into_bytes(),
+        ))
+        .content_type(VOCABULARY_CONTENT_TYPE)
+        .send()
+        .await
+    {
+        Ok(_) => ::tracing::info!(
+            bucket = %bucket,
+            key = %key,
+            terms = terms.len(),
+            "the file this resource's DownloadUri names was stored"
+        ),
+        Err(error) => ::tracing::warn!(
+            bucket = %bucket,
+            key = %key,
+            detail = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+            "the file this resource's DownloadUri names was not stored"
+        ),
+    }
 }
 
 /// One stored transcription job: exactly what the request asked for, plus the
@@ -3835,6 +4026,10 @@ pub fn output_object_key(output_key: Option<&str>, job_name: &str, extension: &s
 /// The URI of one output file of a job, in the caller's bucket when the request
 /// named one and in a service-managed bucket otherwise (model doc for
 /// `Transcript$TranscriptFileUri`).
+///
+/// The service-managed branch names [`service_managed_bucket`], the one bucket this
+/// service's own files live in — the same one a custom vocabulary's `DownloadUri`
+/// names ([`vocabulary_download_uri`]).
 pub fn output_uri(
     output_bucket_name: Option<&str>,
     output_key: Option<&str>,
@@ -3846,7 +4041,8 @@ pub fn output_uri(
     match output_bucket_name {
         Some(bucket) => format!("s3://{bucket}/{key}"),
         None => format!(
-            "https://s3.{region}.amazonaws.com/aws-transcribe-{region}-prod/{account}/{key}",
+            "https://s3.{region}.amazonaws.com/{bucket}/{account}/{key}",
+            bucket = service_managed_bucket(region),
             account = ::engine::emulator_account_id(),
         ),
     }

@@ -274,87 +274,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
+        // The guard is SCOPED: the store lock is released before this handler awaits
+        // the write of the file the filter's `DownloadUri` names, which is a call out to
+        // another emulated service and reaches none of this state.
+        let (output, name, content) = {
+            let mut store = state.lock();
 
-        // "must be unique within an Amazon Web Services account. If you try to create a
-        // new custom vocabulary filter with the same name as an existing one, you get a
-        // ConflictException error." Unique within ONE Region of that account, as every
-        // other family here. Checked and inserted under one lock, so N concurrent
-        // creates of one name have exactly one winner.
-        if store
-            .vocabulary_filters
-            .contains(&region, &input.vocabulary_filter_name)
-        {
-            return Err(CreateVocabularyFilterErrorModeled::ConflictException(
-                ConflictException {
-                    // The service's own text names the resource KIND and does not echo
-                    // the name asked for — see [`crate::state::name_already_exists_message`].
-                    message: Some(crate::state::name_already_exists_message(
-                        crate::state::KIND_VOCABULARY_FILTER,
-                    )),
-                },
-            )
-            .into());
-        }
+            // "must be unique within an Amazon Web Services account. If you try to
+            // create a new custom vocabulary filter with the same name as an existing
+            // one, you get a ConflictException error." Unique within ONE Region of that
+            // account, as every other family here. Checked and inserted under one lock,
+            // so N concurrent creates of one name have exactly one winner.
+            if store
+                .vocabulary_filters
+                .contains(&region, &input.vocabulary_filter_name)
+            {
+                return Err(CreateVocabularyFilterErrorModeled::ConflictException(
+                    ConflictException {
+                        // The service's own text names the resource KIND and does not
+                        // echo the name asked for — see
+                        // [`crate::state::name_already_exists_message`].
+                        message: Some(crate::state::name_already_exists_message(
+                            crate::state::KIND_VOCABULARY_FILTER,
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        if store.vocabulary_filters.len_in(&region) >= crate::state::MAX_VOCABULARIES {
-            return Err(CreateVocabularyFilterErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(format!(
-                        "You have reached the limit of {} custom vocabulary filters for this \
-                         account. Delete a custom vocabulary filter you no longer need and \
-                         try your request again.",
-                        crate::state::MAX_VOCABULARIES
-                    )),
-                },
-            )
-            .into());
-        }
+            if store.vocabulary_filters.len_in(&region) >= crate::state::MAX_VOCABULARIES {
+                return Err(CreateVocabularyFilterErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "You have reached the limit of {} custom vocabulary filters \
+                             for this account. Delete a custom vocabulary filter you no \
+                             longer need and try your request again.",
+                            crate::state::MAX_VOCABULARIES
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        // The Region comes from the request's own (unauthenticated) credential scope,
-        // so the per-Region quota above bounds the store only together with a cap on how
-        // many Regions it keeps filters for (see [`crate::state::MAX_REGIONS`]).
-        if store.vocabulary_filters.region_bucket_exhausted(&region) {
-            return Err(CreateVocabularyFilterErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(crate::state::region_capacity_message(
-                        crate::state::FAMILY_VOCABULARY_FILTERS,
-                        &region,
-                    )),
-                },
-            )
-            .into());
-        }
+            // The Region comes from the request's own (unauthenticated) credential
+            // scope, so the per-Region quota above bounds the store only together with a
+            // cap on how many Regions it keeps filters for (see
+            // [`crate::state::MAX_REGIONS`]).
+            if store.vocabulary_filters.region_bucket_exhausted(&region) {
+                return Err(CreateVocabularyFilterErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(crate::state::region_capacity_message(
+                            crate::state::FAMILY_VOCABULARY_FILTERS,
+                            &region,
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        let sequence = store.next_sequence();
-        let record = crate::state::VocabularyFilterRecord {
-            name: input.vocabulary_filter_name.clone(),
-            sequence,
-            language_code: input.language_code,
-            words,
-            file_uri,
-            last_modified_time: now,
-            region: region.clone(),
-            data_access_role_arn: input.data_access_role_arn,
-            encryption_configuration: input.encryption_configuration,
-            tags: input.tags.unwrap_or_default(),
+            let sequence = store.next_sequence();
+            let record = crate::state::VocabularyFilterRecord {
+                name: input.vocabulary_filter_name.clone(),
+                sequence,
+                language_code: input.language_code,
+                words,
+                file_uri,
+                last_modified_time: now,
+                region: region.clone(),
+                data_access_role_arn: input.data_access_role_arn,
+                encryption_configuration: input.encryption_configuration,
+                tags: input.tags.unwrap_or_default(),
+            };
+
+            // The response is the record just stored, never the request echoed back.
+            let output = CreateVocabularyFilterOutput {
+                vocabulary_filter_name: Some(record.name.clone()),
+                language_code: Some(record.language_code.clone()),
+                last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+            };
+            ::tracing::info!(
+                operation = "CreateVocabularyFilter",
+                filter = %record.name,
+                words = record.words.len(),
+                from_file = record.file_uri.is_some(),
+                "custom vocabulary filter created"
+            );
+            let name = record.name.clone();
+            // The words the build has to store, taken from the record rather than from
+            // the request: what is served is what was persisted.
+            let content = record.words.clone();
+            store.vocabulary_filters.insert(&region, &name, record);
+            (output, name, content)
         };
 
-        // The response is the record just stored, never the request echoed back.
-        let output = CreateVocabularyFilterOutput {
-            vocabulary_filter_name: Some(record.name.clone()),
-            language_code: Some(record.language_code.clone()),
-            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
-        };
-        ::tracing::info!(
-            operation = "CreateVocabularyFilter",
-            filter = %record.name,
-            words = record.words.len(),
-            from_file = record.file_uri.is_some(),
-            "custom vocabulary filter created"
-        );
-        let name = record.name.clone();
-        store.vocabulary_filters.insert(&region, &name, record);
+        // The words this filter was built from are stored as the text file its
+        // `DownloadUri` names, so a client that reads that location gets them back
+        // ("use this URI to view or download the custom vocabulary filter"). A filter
+        // whose words were to be read from a caller-named file carries none, and
+        // nothing is built or served for it.
+        crate::state::store_vocabulary_content(
+            ctx,
+            &region,
+            crate::state::RESOURCE_TYPE_VOCABULARY_FILTER,
+            &name,
+            &content,
+        )
+        .await;
 
         Ok(output)
     }

@@ -182,33 +182,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The Region this request is served in: only the filters created through this
         // Region's endpoint are this call's to delete.
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
-        // A custom vocabulary filter has no `VocabularyState` in the model, so it is
-        // never in a non-terminal state and the only thing that refuses this delete is
-        // the entity not being there: "This can occur when the entity you're trying to
-        // delete doesn't exist or if it's in a non-terminal state (such as IN
-        // PROGRESS)" (`BadRequestException`'s own documentation). A delete is NOT
-        // idempotent, so a name this Region holds no filter under takes the service's
-        // absent-resource branch (`crate::state::not_found_message`), as every reader
-        // of the family does, and removes nothing.
-        if store
-            .vocabulary_filters
-            .remove(&region, &input.vocabulary_filter_name)
-            .is_none()
+        // The guard is SCOPED: the store lock is released before this handler awaits
+        // the withdrawal of the file the filter's `DownloadUri` named, which is a call
+        // out to another emulated service and reaches none of this state.
         {
-            ::tracing::info!(
-                operation = "DeleteVocabularyFilter",
-                filter = %input.vocabulary_filter_name,
-                "no custom vocabulary filter of that name; the delete is refused"
-            );
-            return Err(DeleteVocabularyFilterErrorModeled::BadRequestException(
-                BadRequestException {
-                    message: Some(crate::state::not_found_message(
-                        crate::state::KIND_VOCABULARY_FILTER,
-                    )),
-                },
-            )
-            .into());
+            let mut store = state.lock();
+            // A custom vocabulary filter has no `VocabularyState` in the model, so it is
+            // never in a non-terminal state and the only thing that refuses this delete
+            // is the entity not being there: "This can occur when the entity you're
+            // trying to delete doesn't exist or if it's in a non-terminal state (such as
+            // IN PROGRESS)" (`BadRequestException`'s own documentation). A delete is NOT
+            // idempotent, so a name this Region holds no filter under takes the
+            // service's absent-resource branch (`crate::state::not_found_message`), as
+            // every reader of the family does, and removes nothing.
+            if store
+                .vocabulary_filters
+                .remove(&region, &input.vocabulary_filter_name)
+                .is_none()
+            {
+                ::tracing::info!(
+                    operation = "DeleteVocabularyFilter",
+                    filter = %input.vocabulary_filter_name,
+                    "no custom vocabulary filter of that name; the delete is refused"
+                );
+                return Err(DeleteVocabularyFilterErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::not_found_message(
+                            crate::state::KIND_VOCABULARY_FILTER,
+                        )),
+                    },
+                )
+                .into());
+            }
         }
 
         ::tracing::info!(
@@ -216,6 +221,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             filter = %input.vocabulary_filter_name,
             "custom vocabulary filter deleted"
         );
+
+        // The filter is gone, so the location its `DownloadUri` named serves nothing:
+        // the file the build left is withdrawn with it
+        // (`crate::state::store_vocabulary_content`).
+        crate::state::store_vocabulary_content(
+            ctx,
+            &region,
+            crate::state::RESOURCE_TYPE_VOCABULARY_FILTER,
+            &input.vocabulary_filter_name,
+            &[],
+        )
+        .await;
+
         Ok(DeleteVocabularyFilterOutput)
     }
 }

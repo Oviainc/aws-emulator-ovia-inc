@@ -251,68 +251,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
-        let mut store = state.lock();
-        // Reached through the family's single lookup, so the transition the clock
-        // already owed this record is materialised FIRST: a vocabulary whose build was
-        // due is updated rather than refused for a state it had already left.
-        let Some(record) = store.vocabulary_mut(&region, &input.vocabulary_name, now) else {
-            // A resource this Region does not hold is a `BadRequestException` on this
-            // service's wire, not the modelled `NotFoundException`: the shape's own
-            // documentation covers "the entity you're trying to delete doesn't exist",
-            // and that is the shape its recorded not-found responses carry.
-            return Err(bad_request(&crate::state::not_found_message(
-                crate::state::KIND_VOCABULARY,
-            )));
+        // The guard is SCOPED: the store lock is released before this handler awaits
+        // the write of the file the vocabulary's `DownloadUri` names, which is a call
+        // out to another emulated service and reaches none of this state.
+        let (output, name, content) = {
+            let mut store = state.lock();
+            // Reached through the family's single lookup, so the transition the clock
+            // already owed this record is materialised FIRST: a vocabulary whose build
+            // was due is updated rather than refused for a state it had already left.
+            let Some(record) = store.vocabulary_mut(&region, &input.vocabulary_name, now) else {
+                // A resource this Region does not hold is a `BadRequestException` on
+                // this service's wire, not the modelled `NotFoundException`: the shape's
+                // own documentation covers "the entity you're trying to delete doesn't
+                // exist", and that is the shape its recorded not-found responses carry.
+                return Err(bad_request(&crate::state::not_found_message(
+                    crate::state::KIND_VOCABULARY,
+                )));
+            };
+
+            // "Your custom vocabulary must be in a terminal state (READY or FAILED)
+            // before you can update it" (the operation's own doc): a build the service
+            // is still running is not overwritten, so the in-flight terms survive the
+            // call. The same refusal `DeleteVocabulary` answers for the same record in
+            // the same state — "Your request didn't pass one or more validation tests.
+            // This can occur when the entity you're trying to delete doesn't exist or if
+            // it's in a non-terminal state" (`BadRequestException`'s own documentation).
+            if !crate::state::is_terminal_vocabulary_state(&record.state) {
+                let refusal = crate::state::resource_not_updatable_message(
+                    crate::state::KIND_VOCABULARY,
+                    &record.name,
+                    &record.state,
+                );
+                return Err(bad_request(&refusal));
+            }
+
+            // "This operation overwrites all existing information with your new values;
+            // you cannot append new terms onto an existing custom vocabulary." The
+            // rebuilt vocabulary is PENDING again until the service has finished
+            // processing it — the same transition a create owes, from the instant of
+            // this call.
+            record.language_code = input.language_code;
+            record.phrases = phrases;
+            record.file_uri = file_uri;
+            record.state = crate::state::VOCABULARY_STATE_PENDING.to_string();
+            record.failure_reason = None;
+            record.transition_due = Some(now + crate::state::VOCABULARY_TRANSITION_DELAY);
+            record.last_modified_time = now;
+            // The Region a resource lives in is fixed when it is created: it is part of
+            // what identifies the record (the store is keyed by it), so an update
+            // reaches only its own Region's resource and never migrates one.
+            record.data_access_role_arn = input.data_access_role_arn;
+            record.encryption_configuration = input.encryption_configuration;
+
+            ::tracing::info!(
+                operation = "UpdateVocabulary",
+                vocabulary = %record.name,
+                state = %record.state,
+                terms = record.phrases.len(),
+                from_file = record.file_uri.is_some(),
+                "custom vocabulary updated"
+            );
+
+            let output = UpdateVocabularyOutput {
+                vocabulary_name: Some(record.name.clone()),
+                language_code: Some(record.language_code.clone()),
+                last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+                vocabulary_state: Some(record.state.clone()),
+            };
+            // The terms the rebuild has to store, taken from the record rather than from
+            // the request: what is served is what was persisted.
+            (output, record.name.clone(), record.phrases.clone())
         };
 
-        // "Your custom vocabulary must be in a terminal state (READY or FAILED) before
-        // you can update it" (the operation's own doc): a build the service is still
-        // running is not overwritten, so the in-flight terms survive the call. The same
-        // refusal `DeleteVocabulary` answers for the same record in the same state —
-        // "Your request didn't pass one or more validation tests. This can occur when
-        // the entity you're trying to delete doesn't exist or if it's in a non-terminal
-        // state" (`BadRequestException`'s own documentation).
-        if !crate::state::is_terminal_vocabulary_state(&record.state) {
-            let refusal = crate::state::resource_not_updatable_message(
-                crate::state::KIND_VOCABULARY,
-                &record.name,
-                &record.state,
-            );
-            return Err(bad_request(&refusal));
-        }
+        // "This operation overwrites all existing information with your new values":
+        // the file this vocabulary's `DownloadUri` names is rewritten from the terms
+        // just recorded, so that location serves the vocabulary's CURRENT terms. A
+        // rebuild whose terms were to be read from a caller-named file has none, which
+        // withdraws the file the previous build left
+        // (`crate::state::store_vocabulary_content`).
+        crate::state::store_vocabulary_content(
+            ctx,
+            &region,
+            crate::state::RESOURCE_TYPE_VOCABULARY,
+            &name,
+            &content,
+        )
+        .await;
 
-        // "This operation overwrites all existing information with your new values; you
-        // cannot append new terms onto an existing custom vocabulary." The rebuilt
-        // vocabulary is PENDING again until the service has finished processing it —
-        // the same transition a create owes, from the instant of this call.
-        record.language_code = input.language_code;
-        record.phrases = phrases;
-        record.file_uri = file_uri;
-        record.state = crate::state::VOCABULARY_STATE_PENDING.to_string();
-        record.failure_reason = None;
-        record.transition_due = Some(now + crate::state::VOCABULARY_TRANSITION_DELAY);
-        record.last_modified_time = now;
-        // The Region a resource lives in is fixed when it is created: it is part of
-        // what identifies the record (the store is keyed by it), so an update reaches
-        // only its own Region's resource and never migrates one.
-        record.data_access_role_arn = input.data_access_role_arn;
-        record.encryption_configuration = input.encryption_configuration;
-
-        ::tracing::info!(
-            operation = "UpdateVocabulary",
-            vocabulary = %record.name,
-            state = %record.state,
-            terms = record.phrases.len(),
-            from_file = record.file_uri.is_some(),
-            "custom vocabulary updated"
-        );
-
-        Ok(UpdateVocabularyOutput {
-            vocabulary_name: Some(record.name.clone()),
-            language_code: Some(record.language_code.clone()),
-            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
-            vocabulary_state: Some(record.state.clone()),
-        })
+        Ok(output)
     }
 }
 
