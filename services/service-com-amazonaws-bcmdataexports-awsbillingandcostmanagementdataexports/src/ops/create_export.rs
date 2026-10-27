@@ -245,14 +245,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The definition is persisted with the configuration the pass above read in force.
         export.data_query.table_configurations = table_configurations;
-        // ONE instant answers the whole request: the `CreatedAt`/`LastUpdatedAt` this
+        let mut store = state.lock();
+        // ONE instant answers the rest of the request: the `CreatedAt`/`LastUpdatedAt` this
         // create reports, the instant it materialises what the clock already owed, and the
         // instant the delivery it owes is scheduled from are all this one, so the stored
-        // schedule cannot disagree with the reported status.
+        // schedule cannot disagree with the reported status. Like every other handler of
+        // this service, it is read once the store is HELD, so it is never older than the
+        // store it is about to answer for and nothing the clock owed by then is passed
+        // over as not yet due.
         let at = ::std::time::SystemTime::now();
         let created_at = crate::state::timestamp(at);
-
-        let mut store = state.lock();
         // Whatever the clock already owes is materialised before this create is judged, so
         // a delivery owed to an EARLIER export is recorded at the instant it fell due
         // rather than waiting for a reader of it.
