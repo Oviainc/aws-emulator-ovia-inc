@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyClusterSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyClusterSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyClusterSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pins a snapshot Amazon Redshift took on its own schedule as a new MANUAL
+//! snapshot: the source record's data-describing members are copied onto a new
+//! record under the target identifier, reported in the `creating` status, which
+//! the clock moves to `available`.
+//!
+//! Only a snapshot of the kind the service itself takes can be copied, and only
+//! while it still holds its data, so a source that is manual, or one not yet
+//! finished, is refused and nothing is minted under the target identifier.
 //!
 //! ## Shape of an operation
 //!
@@ -110,7 +110,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CopyClusterSnapshotError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CopyClusterSnapshot")]
+// `DependentServiceUnavailableFault` is widened in, exactly as
+// `CreateClusterSnapshot` widens it: the model does not list it for this
+// operation, but the service declares the shape, and it is the only modelled way
+// to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CopyClusterSnapshot",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CopyClusterSnapshotErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
@@ -119,6 +126,7 @@ pub enum CopyClusterSnapshotErrorModeled {
     ClusterSnapshotQuotaExceededFault(ClusterSnapshotQuotaExceededFault),
     InvalidClusterSnapshotStateFault(InvalidClusterSnapshotStateFault),
     InvalidRetentionPeriodFault(InvalidRetentionPeriodFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -172,18 +180,303 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyClusterSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyClusterSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyClusterSnapshot"))
+        // The copy holds the store's lock; the event it raises is published once
+        // that lock is released, because a publish is an in-process call into
+        // another service and must not run under it.
+        let output = self.copy(&input, ctx)?;
+
+        // A snapshot now exists that did not before, which is the event this
+        // write raises — the same one `CreateClusterSnapshot` raises for the
+        // record it mints: every subscription scoped to it is told, on its own
+        // topic.
+        let cluster_identifier = output
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.cluster_identifier.clone())
+            .unwrap_or_default();
+        crate::state::notifications::raise(
+            ctx,
+            &*self.engine,
+            crate::state::EVENT_ID_SNAPSHOT_CREATED,
+            &input.target_snapshot_identifier,
+            &[
+                (
+                    crate::state::notifications::SNAPSHOT_NAME,
+                    &input.target_snapshot_identifier,
+                ),
+                (
+                    crate::state::notifications::CLUSTER_NAME,
+                    &cluster_identifier,
+                ),
+            ],
+        )
+        .await;
+
+        Ok(output)
+    }
+}
+
+/// The refusal a request whose source is not a snapshot Amazon Redshift took on
+/// its own schedule is answered with.
+///
+/// `CopyClusterSnapshot` "copies the specified automated cluster snapshot to a new
+/// manual cluster snapshot. The source must be an automated snapshot and it must
+/// be in the available state." The sentence is the whole message for this error
+/// class — fixed text, naming neither the snapshot the request asked for nor the
+/// cluster it was taken of — and the model declares no error shape for the rule,
+/// so it is answered with the `InvalidParameterValue` code Amazon Redshift refuses
+/// a parameter value it cannot honour with.
+const ONLY_AUTOMATED_SNAPSHOTS_CAN_BE_COPIED: &str = "Only automated snapshots can be copied.";
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyClusterSnapshot<Eng> {
+    /// The copy itself: the output it reports.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the
+    /// write ALONE and nothing is awaited while it is.
+    fn copy(
+        &self,
+        input: &CopyClusterSnapshotInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<CopyClusterSnapshotOutput, CopyClusterSnapshotError> {
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CopyClusterSnapshotErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = st::request_region(ctx);
+        let started = ::std::time::Instant::now();
+        let created_at = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        // A request carrying an empty identifier names no snapshot to copy, which
+        // is a malformed request rather than a missing snapshot.
+        let source_identifier = input.source_snapshot_identifier.as_str();
+        if source_identifier.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "SourceSnapshotIdentifier must be supplied.",
+            ));
+        }
+        // The account names the new snapshot, so the identifier it gives is held
+        // to the documented snapshot-identifier syntax — the same rule
+        // `CreateClusterSnapshot` holds the record it mints to.
+        let target_identifier = input.target_snapshot_identifier.as_str();
+        if let Err(message) = st::check_identifier(
+            st::SNAPSHOT_IDENTIFIER_RULE,
+            "TargetSnapshotIdentifier",
+            target_identifier,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // `SourceSnapshotClusterIdentifier` is "the identifier of the cluster the
+        // source snapshot was created from", and a request that leaves it blank
+        // names no cluster to hold the source to.
+        let source_cluster = input
+            .source_snapshot_cluster_identifier
+            .as_deref()
+            .filter(|value| !value.is_empty());
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        // That member's constraint is "must be the identifier for a valid
+        // cluster", so one this account holds no cluster under refers to nothing.
+        if let Some(wanted) = source_cluster {
+            if store.cluster(wanted).is_none() {
+                return Err(CopyClusterSnapshotErrorModeled::ClusterNotFoundFault(
+                    ClusterNotFoundFault {
+                        message: Some(format!("Cluster {wanted} not found.")),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(index) = store.snapshot_located_position(Some(source_identifier), None) else {
+            return Err(
+                CopyClusterSnapshotErrorModeled::ClusterSnapshotNotFoundFault(
+                    ClusterSnapshotNotFoundFault {
+                        message: Some(format!("Cluster snapshot {source_identifier} not found.")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Cloned off the store, so the record the copy is built from is the source
+        // as it stands at this instant and the push below needs no live borrow of
+        // it.
+        let source = store.snapshots[index].clone();
+        let stored_source_identifier = source
+            .snapshot
+            .snapshot_identifier
+            .clone()
+            .unwrap_or_else(|| source_identifier.to_string());
+
+        // A request naming a cluster the source snapshot was not taken of names
+        // no snapshot — the pair is the locator, exactly as it is on
+        // `AuthorizeSnapshotAccess` and `RevokeSnapshotAccess`.
+        if let Some(wanted) = source_cluster {
+            if source.snapshot.cluster_identifier.as_deref() != Some(wanted) {
+                return Err(
+                    CopyClusterSnapshotErrorModeled::ClusterSnapshotNotFoundFault(
+                        ClusterSnapshotNotFoundFault {
+                            message: Some(format!(
+                                "Cluster snapshot {stored_source_identifier} of cluster {wanted} not found."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // "The source must be an automated snapshot": this operation exists to
+        // pin a snapshot the service took on its own schedule — and deletes when
+        // its retention expires — as one the account keeps, so a snapshot that is
+        // already manual is nothing it can copy.
+        if source.snapshot.snapshot_type.as_deref() != Some(st::SNAPSHOT_TYPE_AUTOMATED) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                ONLY_AUTOMATED_SNAPSHOTS_CAN_BE_COPIED,
+            ));
+        }
+        // "and it must be in the available state": a snapshot still being taken
+        // does not hold the data a copy would carry.
+        // `InvalidClusterSnapshotStateFault` is "the specified cluster snapshot is
+        // not in the available state".
+        if source.snapshot.status.as_deref() != Some(st::STATUS_AVAILABLE) {
+            return Err(
+                CopyClusterSnapshotErrorModeled::InvalidClusterSnapshotStateFault(
+                    InvalidClusterSnapshotStateFault {
+                        message: Some(format!(
+                            "Cluster snapshot {stored_source_identifier} is in the {} state, not {}.",
+                            source.snapshot.status.as_deref().unwrap_or_default(),
+                            st::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The target identifier "must be unique for the Amazon Web Services
+        // account that is making the request", matched the way every other
+        // snapshot lookup in this service matches an identifier.
+        if store
+            .snapshot_located_position(Some(target_identifier), None)
+            .is_some()
+        {
+            return Err(
+                CopyClusterSnapshotErrorModeled::ClusterSnapshotAlreadyExistsFault(
+                    ClusterSnapshotAlreadyExistsFault {
+                        message: Some(format!(
+                            "Cluster snapshot already exists: {target_identifier}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Identity before capacity, as everywhere else in this service: a request
+        // that would create nothing keeps the more specific fault even when the
+        // store is full.
+        if store.snapshots.len() >= st::SNAPSHOT_QUOTA {
+            return Err(
+                CopyClusterSnapshotErrorModeled::ClusterSnapshotQuotaExceededFault(
+                    ClusterSnapshotQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of cluster snapshots ({}).",
+                            st::SNAPSHOT_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let cluster_identifier = source
+            .snapshot
+            .cluster_identifier
+            .clone()
+            .unwrap_or_default();
+        // Absent on the request, the new manual snapshot inherits the default
+        // manual retention period of the cluster it was taken of — the same rule
+        // `CreateClusterSnapshot` applies to the record it mints — and the
+        // documented "indefinitely" sentinel where that cluster is gone.
+        let manual_retention = input.manual_snapshot_retention_period.unwrap_or_else(|| {
+            store
+                .cluster(&cluster_identifier)
+                .and_then(|stored| stored.cluster.manual_snapshot_retention_period)
+                .unwrap_or(st::MANUAL_RETENTION_INDEFINITE)
+        });
+        // One rule for the published range, shared with `CreateClusterSnapshot`
+        // and `ModifyClusterSnapshot`: the "indefinitely" sentinel, or a day count
+        // inside the documented bounds.
+        if !st::manual_retention_admitted(manual_retention) {
+            return Err(CopyClusterSnapshotErrorModeled::InvalidRetentionPeriodFault(
+                InvalidRetentionPeriodFault {
+                    message: Some(format!(
+                        "Invalid value for ManualSnapshotRetentionPeriod: {manual_retention}. It must be either {} or an integer between {} and {}.",
+                        st::MANUAL_RETENTION_INDEFINITE,
+                        st::MANUAL_RETENTION_BOUNDS.0,
+                        st::MANUAL_RETENTION_BOUNDS.1
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every member that describes the DATA is carried over from the source
+        // record, so the copy describes the same cluster at the same instant the
+        // source did; only what identifies the new snapshot, and what the account
+        // holds it under, is its own. `SourceRegion` is left as the source carries
+        // it: it names the Region a snapshot was copied FROM when the copy crossed
+        // one, and this copy crosses none.
+        let mut copy = source.snapshot.clone();
+        copy.snapshot_identifier = Some(target_identifier.to_string());
+        // "Snapshots created using CreateClusterSnapshot and CopyClusterSnapshot
+        // are of type \"manual\"".
+        copy.snapshot_type = Some(st::SNAPSHOT_TYPE_MANUAL.to_string());
+        // "CreateClusterSnapshot and CopyClusterSnapshot returns status as
+        // \"creating\"", which `settle` moves to `available` once
+        // [`st::PROVISIONING_SPAN`] has passed.
+        copy.status = Some(st::STATUS_CREATING.to_string());
+        // "The time (in UTC format) when Amazon Redshift began the snapshot":
+        // Redshift begins THIS snapshot at this call, and it is also the instant
+        // the manual retention window the copy is kept under starts at (see
+        // `Snapshot$SnapshotRetentionStartTime`).
+        copy.snapshot_create_time = Some(created_at);
+        // "For manual snapshots, the Amazon Web Services account used to create or
+        // copy the snapshot."
+        copy.owner_account = Some(::engine::emulator_account_id().to_string());
+        // "A list of the Amazon Web Services accounts authorized to restore the
+        // snapshot. Returns null if no accounts are authorized": access granted on
+        // the source is access to the source, and nobody has been granted any to
+        // the new snapshot.
+        copy.accounts_with_restore_access = None;
+        // The operation takes no `Tags`, so the new snapshot carries none.
+        copy.tags = Some(Vec::new());
+        copy.snapshot_arn = Some(st::snapshot_arn(
+            &cluster_identifier,
+            target_identifier,
+            &region,
+        ));
+        st::apply_manual_retention(&mut copy, manual_retention, created_at);
+
+        store.snapshots.push(st::StoredSnapshot {
+            snapshot: copy.clone(),
+            available_at: started + st::PROVISIONING_SPAN,
+            // The copy holds the same data as the source, so it restores the same
+            // cluster configuration the source was taken of.
+            source: source.source,
+        });
+
+        Ok(CopyClusterSnapshotOutput {
+            snapshot: Some(copy),
+        })
     }
 }
