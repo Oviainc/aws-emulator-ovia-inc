@@ -332,6 +332,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // reports `provisioning`, exactly as it does against AWS.
             let due =
                 crate::state::DueNamedState::after(now, crate::state::LOAD_BALANCER_STATE_ACTIVE);
+            // The certificate the request asked for, if it asked for one: its
+            // own record, with its own minted id and its own validation clock —
+            // the same shape `CreateLoadBalancerTlsCertificate` stores, so
+            // `GetLoadBalancerTlsCertificates` reports a certificate asked for
+            // here exactly as it reports one added later.
+            //
+            // It exists, but is NOT attached: Lightsail validates it first and
+            // `AttachLoadBalancerTlsCertificate` is what attaches it — which is
+            // why a load balancer created with a certificate still serves plain
+            // `HTTP`. A load balancer may hold
+            // `MAX_CERTIFICATES_PER_LOAD_BALANCER` certificates, and this call
+            // describes at most one of them;
+            // `CreateLoadBalancerTlsCertificate` is what adds another.
+            let certificate = certificate.map(|(certificate_name, domain_name)| {
+                let certificate_id = store.mint_uuid();
+                // The certificate is not valid yet either, and its validation
+                // runs on its own clock: the load balancer does not wait for it
+                // and it does not wait for the load balancer.
+                let certificate_due = crate::state::DueNamedState::after(
+                    now,
+                    crate::state::LOAD_BALANCER_TLS_CERTIFICATE_STATUS_ISSUED,
+                );
+                crate::state::StoredLoadBalancerCertificate {
+                    name: certificate_name,
+                    arn: crate::state::load_balancer_tls_certificate_arn(&region, &certificate_id),
+                    support_code: crate::state::support_code(&certificate_id),
+                    created_at_ms: now,
+                    domain_name,
+                    alternative_names,
+                    is_attached: false,
+                    // `CreateLoadBalancer`'s `tags` are the LOAD BALANCER's
+                    // ("The tag keys and optional values to add to the resource
+                    // during create" — the resource this call creates), and it
+                    // exposes no tags for the certificate it was asked for.
+                    tags: Vec::new(),
+                    serial: crate::state::certificate_serial_number(&certificate_id),
+                    status: crate::state::LOAD_BALANCER_TLS_CERTIFICATE_STATUS_PENDING_VALIDATION,
+                    due: Some(certificate_due),
+                    issued_at_ms: certificate_due.at_ms,
+                }
+            });
             store.insert_load_balancer(crate::state::StoredLoadBalancer {
                 name: name.clone(),
                 arn: crate::state::load_balancer_arn(&region, &id),
@@ -346,32 +387,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 health_check_path,
                 ip_address_type,
                 tls_policy_name: input.tls_policy_name.clone(),
-                // The certificate the request asked for exists, but is NOT
-                // attached: Lightsail validates it first and
-                // `AttachLoadBalancerTlsCertificate` is what attaches it — which
-                // is why a load balancer created with a certificate still serves
-                // plain `HTTP`.
-                // A load balancer may hold
-                // `MAX_CERTIFICATES_PER_LOAD_BALANCER` certificates, and this
-                // call describes at most one of them;
-                // `CreateLoadBalancerTlsCertificate` is what adds another.
-                certificates: certificate
-                    .map(|(certificate_name, domain_name)| {
-                        crate::state::StoredLoadBalancerCertificate {
-                            name: certificate_name,
-                            domain_name,
-                            alternative_names,
-                            is_attached: false,
-                            // `CreateLoadBalancer`'s `tags` are the LOAD
-                            // BALANCER's ("The tag keys and optional values to
-                            // add to the resource during create" — the resource
-                            // this call creates), and it exposes no tags for the
-                            // certificate it was asked for.
-                            tags: Vec::new(),
-                        }
-                    })
-                    .into_iter()
-                    .collect(),
+                certificates: certificate.into_iter().collect(),
                 // Nothing is registered with a load balancer this call just
                 // created: `AttachInstancesToLoadBalancer` is what registers an
                 // instance with it.

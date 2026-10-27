@@ -483,7 +483,10 @@ async fn the_actions_result_reports_the_boundary_over_every_resource() {
 }
 
 /// An `Allow` of one action on one resource, the document every grant path above carries.
-fn allow(action: &str, resource: &str) -> String {
+///
+/// Shared with `tests/all/simulated_policy_composition.rs`, so an identity-based grant a
+/// simulation suite drives is written exactly one way.
+pub(crate) fn allow(action: &str, resource: &str) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"{resource}"}}]}}"#
     )

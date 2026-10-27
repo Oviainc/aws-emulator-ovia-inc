@@ -693,8 +693,17 @@ impl ResourceForecast {
     }
 
     /// The capacity the forecast cycles around: the middle of the band the instruction
-    /// declares, so the load it forecasts is one the instruction's own `MinCapacity` and
-    /// `MaxCapacity` bracket.
+    /// declares, which is the one capacity the instruction itself names as typical for the
+    /// resource.
+    ///
+    /// The cycle around it may leave that band, and the model says a forecast does:
+    /// `PredictiveScalingMaxCapacityBehavior` "defines the behavior that should be applied
+    /// if the forecast capacity approaches or exceeds the maximum capacity specified for
+    /// the resource", and `ScheduledActionMinCapacity` is "the larger of two values: the
+    /// capacity forecast or the minimum capacity in the scaling instruction" — neither
+    /// sentence would have anything to decide if the forecast were held inside the band.
+    /// What the band bounds is the capacity a scheduled scaling action provisions, which
+    /// [`ResourceForecast::scheduled_action_min_capacity`] keeps inside it.
     fn baseline_capacity(&self) -> f64 {
         (self.min_capacity + self.max_capacity) / 2.0
     }
@@ -712,9 +721,23 @@ impl ResourceForecast {
 
     /// "The minimum capacity for each scheduled scaling action … calculated as the larger
     /// of two values: the capacity forecast or the minimum capacity in the scaling
-    /// instruction."
+    /// instruction" — brought inside the band that scheduled scaling action provisions in.
+    ///
+    /// The capacity forecast is a prediction and is bounded by neither end of the band, but
+    /// a scheduled scaling action provisions real capacity: it never asks for less than the
+    /// instruction's `MinCapacity`, which is what the documented "larger of two values"
+    /// says, and it never asks for more than the maximum capacity that same action may
+    /// reach, which is what the instruction's `PredictiveScalingMaxCapacityBehavior`
+    /// decides — under the documented default "the maximum capacity is enforced as a hard
+    /// limit". So the two capacities one read reports for one scheduled scaling action never
+    /// contradict each other: the minimum is never above the maximum.
     fn scheduled_action_min_capacity(&self, hour: i64) -> f64 {
-        self.capacity(hour).max(self.min_capacity)
+        // The ceiling is that action's own maximum capacity, never below the instruction's
+        // `MaxCapacity`, which a stored instruction never holds below its `MinCapacity`.
+        // The floor is held at the ceiling regardless, so no band can invert it here.
+        let ceiling = self.scheduled_action_max_capacity(hour);
+        self.capacity(hour)
+            .clamp(self.min_capacity.min(ceiling), ceiling)
     }
 
     /// The maximum capacity for each scheduled scaling action, by the instruction's

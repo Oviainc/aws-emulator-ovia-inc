@@ -75,6 +75,8 @@ mod generated_template_coverage;
 mod generated_template_deletion;
 #[path = "all/generated_template_reads.rs"]
 mod generated_template_reads;
+#[path = "all/generated_template_updates.rs"]
+mod generated_template_updates;
 #[path = "all/generated_templates.rs"]
 mod generated_templates;
 #[path = "all/handler_progress_reports.rs"]

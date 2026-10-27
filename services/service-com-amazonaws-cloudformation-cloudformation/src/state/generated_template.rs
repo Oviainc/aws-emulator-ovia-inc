@@ -273,6 +273,29 @@ impl StoredGeneratedTemplate {
         }
     }
 
+    /// Start a NEW generation over a record that already exists, as
+    /// `UpdateGeneratedTemplate` does: "updates a generated template... you can check the
+    /// status of the update to the generated template using the DescribeGeneratedTemplate
+    /// API action".
+    ///
+    /// The update is asynchronous exactly as the first generation was, so the record is left
+    /// with its generation in flight and its conclusion due one [`GENERATION_DELAY`] on — a
+    /// caller reading straight after the call sees `UPDATE_IN_PROGRESS`, and the template of
+    /// the last COMPLETE generation stays the one a read of the body answers until this one
+    /// concludes.
+    pub fn begin_update(&mut self, now: SystemTime) {
+        self.status = status::UPDATE_IN_PROGRESS.to_string();
+        // The reason belongs to the status it was recorded for, and the generation this call
+        // starts has not concluded yet.
+        self.status_reason = None;
+        self.last_updated_time = now;
+        self.pending = Some(PendingGeneration {
+            status: status::COMPLETE.to_string(),
+            status_reason: Some(GENERATION_COMPLETE_REASON.to_string()),
+            due_at: now + GENERATION_DELAY,
+        });
+    }
+
     /// Materialise the status transition the clock has already made due, if any.
     ///
     /// Only ever applies a transition whose due instant has passed, so it reports what was
@@ -442,6 +465,63 @@ pub struct GenerationProgress {
 /// holds no record of, built from what the request named.
 pub fn does_not_exist(name_or_id: &str) -> String {
     format!("Generated template {name_or_id} cannot be found")
+}
+
+/// The message of the modelled `AlreadyExistsException` ("the resource with the name
+/// requested already exists") for a generated template name a record already holds — the
+/// name a create asks for, or the one an update asks to rename a record to.
+pub fn already_exists(generated_template_name: &str) -> String {
+    format!("Generated template [{generated_template_name}] already exists")
+}
+
+/// The message of the modelled `LimitExceededException` ("the quota for the resource has
+/// already been reached") for a call that would leave a generated template covering more
+/// than [`MAX_GENERATED_TEMPLATE_RESOURCES`] resources.
+pub fn resource_limit_exceeded() -> String {
+    format!(
+        "Limit for resources in a generated template exceeded: no more than {} resources \
+         can be included",
+        MAX_GENERATED_TEMPLATE_RESOURCES
+    )
+}
+
+/// Fold one resource onto the set a generated template covers.
+///
+/// A resource that names a logical id the set already carries for the same type is the SAME
+/// resource of the generated template, not a second one, so the identifier it was submitted
+/// with replaces the one that row carried rather than being appended beside it — a template
+/// keys its resources by logical id, so two rows under one id would not be a template. One
+/// that names no id the set carries is a resource of its own.
+pub fn fold(resources: &mut Vec<GeneratedResource>, incoming: GeneratedResource) {
+    let already = incoming.logical_resource_id.as_ref().and_then(|logical| {
+        resources.iter_mut().find(|resource| {
+            resource.logical_resource_id.as_ref() == Some(logical)
+                && resource.resource_type == incoming.resource_type
+        })
+    });
+    match already {
+        Some(resource) => resource.resource_identifier = incoming.resource_identifier,
+        None => resources.push(incoming),
+    }
+}
+
+/// The resources of a generated template that `logical_ids` does NOT name.
+///
+/// `UpdateGeneratedTemplateInput$RemoveResources` is "a list of logical ids for resources to
+/// remove from the generated template", and the logical id a resource of the template has is
+/// the one it is keyed by in the final template ([`final_logical_ids`]) — the same id every
+/// read of the record reports — so that is the id a removal addresses. A logical id the
+/// template carries no resource under removes nothing.
+pub fn without_logical_ids(
+    resources: &[GeneratedResource],
+    logical_ids: &[String],
+) -> Vec<GeneratedResource> {
+    final_logical_ids(resources)
+        .into_iter()
+        .zip(resources)
+        .filter(|(logical_id, _)| !logical_ids.contains(logical_id))
+        .map(|(_, resource)| resource.clone())
+        .collect()
 }
 
 /// The logical id each covered resource has IN THE FINAL GENERATED TEMPLATE, index by

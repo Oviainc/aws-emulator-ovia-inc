@@ -94,6 +94,15 @@
 //! readers cannot disagree, and a cluster that leaves the registry takes its
 //! policy with it.
 //!
+//! A cluster's SASL/SCRAM secrets are held ON the record for the same reason, as
+//! the [`Cluster::scram_secret_arns`] set: `BatchAssociateScramSecret` adds to it
+//! through [`Cluster::associate_scram_secrets`],
+//! `BatchDisassociateScramSecret` removes from it through
+//! [`Cluster::disassociate_scram_secrets`] and `ListScramSecrets` pages that one
+//! set, so the two writers and the reader cannot disagree about which secrets a
+//! cluster authenticates its clients with, and the secrets leave with the
+//! cluster.
+//!
 //! The multi-VPC (PrivateLink) connection registry lives here too:
 //! `CreateVpcConnection` mints a [`VpcConnection`] with
 //! [`VpcConnection::requested`] and `DescribeVpcConnection` reports that same
@@ -994,6 +1003,16 @@ pub struct Cluster {
     /// addresses it as `/v1/clusters/{ClusterArn}/policy` — so it is stored on
     /// the cluster record and disappears when the cluster does.
     pub policy: Option<ClusterPolicy>,
+    /// The AWS Secrets Manager secrets this cluster authenticates its SASL/SCRAM
+    /// clients with, as `BatchAssociateScramSecret` associated them.
+    ///
+    /// A SET, so associating a secret the cluster already holds changes nothing
+    /// and `ListScramSecrets` reports each secret exactly once; `BTreeSet` so
+    /// that listing has one total order to page through, the way the cluster
+    /// registry gives `ListClusters` one. Addressed as
+    /// `/v1/clusters/{ClusterArn}/scram-secrets`, hence stored on the cluster
+    /// record: the secrets leave with the cluster they authenticate clients to.
+    pub scram_secret_arns: BTreeSet<String>,
 }
 
 /// The resource-based policy a cluster carries: the document a caller attached
@@ -1360,6 +1379,38 @@ pub fn server_properties_too_large(body: &[u8]) -> bool {
 /// an arbitrarily large document. Sized far past any realistic resource-based
 /// policy, which holds at most a few dozen short statements.
 pub const MAX_CLUSTER_POLICY_BYTES: usize = 256 * 1024;
+
+/// How many SASL/SCRAM secrets one cluster may hold in this emulator.
+///
+/// CHOSEN as a process-safety backstop, not an AWS quota: the secret ARNs come
+/// from the request and the modelled list carries no length constraint, so
+/// without a ceiling a caller could grow one cluster's secret set one call at a
+/// time. Sized well above any realistic client script.
+pub const MAX_SCRAM_SECRETS_PER_CLUSTER: usize = 1_000;
+
+/// The message Amazon MSK answers a secret association against a cluster whose
+/// client authentication does not turn SASL/SCRAM on.
+///
+/// A cluster holds SCRAM secrets only to authenticate SASL/SCRAM clients with,
+/// so the condition is about the cluster's configuration and nothing else about
+/// the request; the parameter at fault is reported through
+/// `BadRequestException$InvalidParameter`.
+pub const SASL_SCRAM_NOT_ENABLED_MESSAGE: &str =
+    "The cluster does not have SASL/SCRAM authentication enabled.";
+
+/// Why a batch of SASL/SCRAM secrets was not associated with a cluster. Decided
+/// on the one association path ([`Cluster::associate_scram_secrets`]) rather
+/// than by each caller, and leaving the stored set exactly as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScramSecretsRejected {
+    /// How many secrets the cluster already holds.
+    pub held: usize,
+    /// How many of the request's secrets the cluster does not hold yet.
+    pub added: usize,
+    /// What the two would give it — more than
+    /// [`MAX_SCRAM_SECRETS_PER_CLUSTER`], which is why the batch was refused.
+    pub resulting: usize,
+}
 
 /// Why an append to a configuration's revision history was refused. Decided on
 /// the one append path ([`ConfigurationRecord::append_revision`]) rather than by
@@ -4292,6 +4343,9 @@ impl Cluster {
             // A cluster is created with no resource-based policy; only
             // `PutClusterPolicy` attaches one.
             policy: None,
+            // A cluster is created holding no SASL/SCRAM secrets; only
+            // `BatchAssociateScramSecret` associates one.
+            scram_secret_arns: BTreeSet::new(),
         }
     }
 
@@ -4380,6 +4434,9 @@ impl Cluster {
             // Created with no resource-based policy, exactly as a provisioned
             // cluster is.
             policy: None,
+            // And holding no SASL/SCRAM secrets, exactly as a provisioned
+            // cluster is.
+            scram_secret_arns: BTreeSet::new(),
         }
     }
 
@@ -4409,6 +4466,60 @@ impl Cluster {
             revision,
             current_version,
         })
+    }
+
+    /// Associate `secret_arns` with this cluster, so its SASL/SCRAM clients can
+    /// authenticate with those secrets and `ListScramSecrets` reports them.
+    ///
+    /// The set is what makes this idempotent: a secret the cluster already
+    /// holds is not a second entry, so associating one twice leaves the stored
+    /// set — and therefore every listing of it — unchanged.
+    ///
+    /// ALL OR NOTHING, and the one association path, so the ceiling
+    /// [`MAX_SCRAM_SECRETS_PER_CLUSTER`] states holds for every caller rather
+    /// than only for a handler that remembers to check first: a batch that
+    /// would take the cluster past it is refused with the counts that explain
+    /// the refusal, and stores none of its secrets.
+    pub fn associate_scram_secrets(
+        &mut self,
+        secret_arns: &[String],
+    ) -> Result<(), ScramSecretsRejected> {
+        let held = self.scram_secret_arns.len();
+        // What the batch ADDS is the distinct ARNs the cluster does not hold
+        // yet, since it may repeat one and may name one already stored. Staged
+        // in one pass and then inserted, so the count the bound is read against
+        // is exactly what goes in.
+        let mut staged: BTreeSet<&String> = BTreeSet::new();
+        for arn in secret_arns {
+            if !self.scram_secret_arns.contains(arn) {
+                staged.insert(arn);
+            }
+        }
+        let added = staged.len();
+        let resulting = held.saturating_add(added);
+        if resulting > MAX_SCRAM_SECRETS_PER_CLUSTER {
+            return Err(ScramSecretsRejected {
+                held,
+                added,
+                resulting,
+            });
+        }
+        for arn in staged {
+            self.scram_secret_arns.insert(arn.clone());
+        }
+        Ok(())
+    }
+
+    /// Disassociate `secret_arns` from this cluster, so its SASL/SCRAM clients
+    /// can no longer authenticate with those secrets.
+    ///
+    /// The counterpart of [`Self::associate_scram_secrets`] on the same stored
+    /// set, so a secret the cluster does not hold is removed from nothing and
+    /// the call is idempotent in the same way the association is.
+    pub fn disassociate_scram_secrets(&mut self, secret_arns: &[String]) {
+        for arn in secret_arns {
+            self.scram_secret_arns.remove(arn);
+        }
     }
 
     /// Take this cluster's resource-based policy off the record, handing back
@@ -5346,6 +5457,30 @@ pub fn is_replicator_arn(value: &str) -> bool {
     is_kafka_arn_for(value, "replicator")
 }
 
+/// Whether `value` is an AWS Secrets Manager secret ARN —
+/// `arn:<partition>:secretsmanager:<region>:<account>:secret:<name>`, the form
+/// `SecretArnList` carries ("List of AWS Secrets Manager secret ARNs") and the
+/// same requirement the shared ARN vocabulary states for such a member: the
+/// vendor field is `secretsmanager` and the resource names a `secret`.
+///
+/// Read through [`arn_resource_of`], the one ARN split of this module, so this
+/// predicate and the ones over this service's own ARNs cannot disagree about the
+/// fields in front of the resource. The same distinction between the two client
+/// errors as [`is_cluster_arn`]: a value that is not a secret ARN at all is a
+/// request the service cannot act on (`BadRequestException`), not a resource it
+/// cannot find.
+pub fn is_secrets_manager_secret_arn(value: &str) -> bool {
+    let Some(resource) = arn_resource_of(value, "secretsmanager") else {
+        return false;
+    };
+    // A secret's resource field is `secret:<name>`; a name may itself carry ':'
+    // and '/', so only the first separator ends the type and the rest is the
+    // name, which must not be empty — an ARN naming no secret names none.
+    resource
+        .strip_prefix("secret:")
+        .is_some_and(|name| !name.is_empty())
+}
+
 /// Whether `value`'s resource part is `<kind>/<name>/<id>` — the shape a
 /// cluster, a configuration and a replicator ARN all take, so the predicates
 /// above cannot disagree about what a well-formed ARN of their kind is.
@@ -5478,26 +5613,33 @@ pub fn is_ec2_resource_id(kind: &str, value: &str) -> bool {
 /// nothing. The one ARN parse the `is_*_arn` predicates share, so they cannot
 /// disagree about the five fields in front of the resource.
 fn kafka_arn_resource(value: &str) -> Option<&str> {
+    arn_resource_of(value, "kafka")
+}
+
+/// The resource part of `value` when it is an ARN of `vendor` in some partition,
+/// region and account, and `None` otherwise.
+///
+/// The ONE ARN split of this module, shared by the predicates over this
+/// service's own ARNs and by the one over the Secrets Manager secret ARNs a
+/// member of this API carries, so they cannot disagree about the five fields in
+/// front of the resource. `splitn` with the field count leaves the whole
+/// resource — colons included — as the last field, so an ARN of the
+/// `<type>:<id>` form splits exactly like one of the `<type>/<id>` form, and the
+/// vendor comparison is exact because an ARN namespace is a fixed lowercase
+/// token.
+fn arn_resource_of<'a>(value: &'a str, vendor: &str) -> Option<&'a str> {
     let mut fields = value.splitn(6, ':');
-    let (
-        Some("arn"),
-        Some(partition),
-        Some("kafka"),
-        Some(region),
-        Some(account),
-        Some(resource),
-    ) = (
+    let (Some("arn"), Some(partition), Some(found), Some(region), Some(account), Some(resource)) = (
         fields.next(),
         fields.next(),
         fields.next(),
         fields.next(),
         fields.next(),
         fields.next(),
-    )
-    else {
+    ) else {
         return None;
     };
-    if partition.is_empty() || region.is_empty() || account.is_empty() {
+    if found != vendor || partition.is_empty() || region.is_empty() || account.is_empty() {
         return None;
     }
     Some(resource)

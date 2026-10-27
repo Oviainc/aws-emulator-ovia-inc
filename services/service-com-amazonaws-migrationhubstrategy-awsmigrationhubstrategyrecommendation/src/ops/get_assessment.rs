@@ -172,8 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `@readonly`: this reports the stored assessment. The one write it makes is
-        // materialising the completion the clock already owed that assessment — owed at
-        // this same instant even if nobody had called.
+        // materialising what the clock already owed this portfolio — the completion of this
+        // assessment, the analysis that completion stands for, and the completion of an
+        // import whose records that analysis is recorded over — all owed at this same
+        // instant even if nobody had called.
         //
         // The assessment is looked up in the Region this request was signed for: an id
         // minted through another Region's endpoint names nothing here.
