@@ -2,10 +2,12 @@
 
 //! @op ListTopics
 //!
-//! Pages the stored topics of one cluster in name order: the cluster is resolved
-//! first (a `ClusterArn` that is not an MSK cluster ARN is a bad request, a
-//! well-formed one no live cluster holds is a 404, and a cluster whose
-//! `ClusterType` is serverless is refused with
+//! Pages the topics one cluster reports in name order — the ones it holds itself
+//! and the ones a running MSK Replicator replicates onto it, through the single
+//! derivation [`crate::state::ComAmazonawsKafkaKafkaState::observable_topics_in`]:
+//! the cluster is resolved first (a `ClusterArn` that is not an MSK cluster ARN is
+//! a bad request, a well-formed one no live cluster holds is a 404, and a cluster
+//! whose `ClusterType` is serverless is refused with
 //! [`crate::state::serverless_topic_apis_unsupported`] — the Topic Management
 //! surface is not offered for that cluster kind), then `TopicNameFilter` keeps
 //! the matching prefixes and `MaxResults` / `NextToken` page what is left.
@@ -269,25 +271,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(MAX_RESULTS_LIMIT as usize)
             .clamp(1, MAX_RESULTS_LIMIT as usize);
 
-        // The registry is keyed by (cluster ARN, topic name), so one cluster's
-        // topics are a contiguous range in name order: the page walks that range
-        // from its resume point and stops as soon as it is full. `TopicInfo`
-        // carries no status, so this is a pure read — a topic whose removal the
-        // clock already owes is simply not reported, which is what every other
-        // reader says about it too.
+        // The topics the cluster reports are the ones it holds itself plus the
+        // ones a running replicator replicates onto it, in topic-name order:
+        // `ListTopics` pages the one derivation every topic reader answers from
+        // rather than growing a replication rule of its own. `TopicInfo` carries
+        // no status, so this is a pure read — a topic whose removal the clock
+        // already owes is simply not reported, which is what every other reader
+        // says about it too.
         let now = std::time::SystemTime::now();
+        let observable = state.observable_topics_in(&input.cluster_arn, now);
         let mut page: Vec<TopicInfo> = Vec::with_capacity(page_size);
         let mut last_name: Option<String> = None;
         let mut more_remain = false;
-        for topic in state
-            .topics_in(&input.cluster_arn)
-            .filter(|topic| topic.removal_due.is_none_or(|due| now < due))
-            .filter(|topic| {
-                resume_after
-                    .as_deref()
-                    .is_none_or(|last| topic.name.as_str() > last)
-            })
-        {
+        for topic in observable.values().filter(|topic| {
+            resume_after
+                .as_deref()
+                .is_none_or(|last| topic.name.as_str() > last)
+        }) {
             if input
                 .topic_name_filter
                 .as_deref()

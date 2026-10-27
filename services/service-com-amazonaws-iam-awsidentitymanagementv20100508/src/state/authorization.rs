@@ -170,6 +170,9 @@ pub const GET_ACCOUNT_AUTHORIZATION_DETAILS: &str = "iam:GetAccountAuthorization
 /// `iam:GetDelegationRequest`.
 pub const GET_DELEGATION_REQUEST: &str = "iam:GetDelegationRequest";
 
+/// `iam:ListDelegationRequests`.
+pub const LIST_DELEGATION_REQUESTS: &str = "iam:ListDelegationRequests";
+
 /// The resource an account-WIDE call is decided against.
 ///
 /// An action that reports the account's whole configuration is not taken on one

@@ -83,7 +83,7 @@ fn delegation_request_ids() -> Vec<String> {
 /// still a scaffolded 501 with its own stub issue — so the request is written into the
 /// service's own store rather than into a second copy of it, which is where this read
 /// finds it.
-fn seed(engine: &engine::InMemoryEngine, request: &DelegationRequest) {
+pub(crate) fn seed(engine: &engine::InMemoryEngine, request: &DelegationRequest) {
     let store = state::service_state(engine).expect("the IAM store");
     let id = request
         .delegation_request_id
@@ -94,7 +94,7 @@ fn seed(engine: &engine::InMemoryEngine, request: &DelegationRequest) {
 
 /// The delegation requests the account holds, read straight out of the store: what a
 /// reporting operation must leave exactly as it found it.
-fn held_delegation_requests(engine: &engine::InMemoryEngine) -> Vec<String> {
+pub(crate) fn held_delegation_requests(engine: &engine::InMemoryEngine) -> Vec<String> {
     let store = state::service_state(engine).expect("the IAM store");
     let held = store.lock().delegation_requests.keys().cloned().collect();
     held

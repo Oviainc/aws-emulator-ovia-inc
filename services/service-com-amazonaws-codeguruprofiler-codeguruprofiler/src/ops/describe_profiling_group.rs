@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         Ok(DescribeProfilingGroupOutput {
-            profiling_group: group.description(),
+            profiling_group: group.description(crate::state::now()),
         })
     }
 }

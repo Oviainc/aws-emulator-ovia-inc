@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDelegationRequests
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDelegationRequests`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDelegationRequests::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation answers on the wire
+//!
+//! A page of the delegation requests the account holds, in the store's own key order —
+//! the `DelegationRequestId` order the account's delegation request collection
+//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::delegation_requests`])
+//! holds them in — narrowed to the ones the request's criteria select:
+//!
+//! * a request with no OWNER is reported to nobody: "if a delegation request has no
+//!   owner, even if it is assigned to a specific account, it will not be part of the
+//!   ListDelegationRequests output for that account". The owner is
+//!   `DelegationRequest$OwnerId` ("ARN of the owner of this delegation request"), which a
+//!   request acquires an owner by carrying — `OwnerAccountId` alone is the "assigned to a
+//!   specific account" case that sentence excludes.
+//! * `OwnerId` is "the owner ID to filter delegation requests by", so a request naming
+//!   one narrows the page to the requests held under exactly that owner.
+//!
+//! `MaxItems` and `Marker` page that selection the way every other IAM list operation
+//! pages its own collection: at most `MaxItems` items, 100 by default, `isTruncated` set
+//! when a further selected request remains, and a `Marker` naming the position the next
+//! page resumes strictly after.
+//!
+//! The model names the error SHAPES but not their codes or wording: a `Marker` this
+//! service's encoding cannot have produced is "an invalid or out-of-range value ... for an
+//! input parameter", so it is `400` `<Code>InvalidInput</Code>` rather than a silent
+//! restart from the beginning. A caller whose identity-based policies do not permit the
+//! call is refused before any request is reported, `403` `<Code>AccessDenied</Code>`
+//! ([`crate::state::authorization::authorize`]).
+//!
+//! This operation REPORTS: it leaves the account holding exactly the delegation requests
+//! it held before the call.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +185,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDelegationRequests` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDelegationRequestsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDelegationRequests"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDelegationRequestsErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The page resumes strictly after the POSITION in the key order that the marker
+        // names, so a token this service's encoding cannot have produced is refused as
+        // an "invalid ... value ... supplied for an input parameter" rather than silently
+        // read as "start from the beginning". A token that decodes but names a request
+        // the account no longer holds is NOT an error: pagination resumes from the
+        // position, and that request is simply no longer in the range.
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(
+                crate::state::MARKER_SCOPE_DELEGATION_REQUESTS,
+                marker,
+            ) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListDelegationRequestsErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                "Invalid Marker: the value is not a marker this service issued \
+                                 for this account's delegation requests"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        // `maxItemsType` is range 1..1000 and the boundary validator has already refused
+        // anything outside it, so the only choice left here is the default for an absent
+        // `MaxItems`. `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it reports the delegation requests the account holds and writes
+        // nothing.
+        let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any delegation request is reported. The resource the decision
+        // is made on is the collection this request addresses — the account's
+        // delegation-request resource type, which carries no path, so the collection is
+        // the ARN prefix every request in it is named under.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_DELEGATION_REQUESTS,
+            &crate::state::delegation_request_arn(""),
+        )?;
+
+        let tail = store.delegation_requests.range::<str, _>((
+            match &resume_after {
+                Some(key) => ::std::ops::Bound::Excluded(key.as_str()),
+                None => ::std::ops::Bound::Unbounded,
+            },
+            ::std::ops::Bound::Unbounded,
+        ));
+
+        let mut delegation_requests = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        for (key, held) in tail.filter(|(_, held)| selected(held, input.owner_id.as_deref())) {
+            if delegation_requests.len() == page_size {
+                // There is at least one more selected delegation request, so the caller
+                // needs another page to see it.
+                is_truncated = true;
+                break;
+            }
+            // `delegationRequestsListType`'s member is the SAME `DelegationRequest`
+            // structure `GetDelegationRequest` reports, so a listed request withholds
+            // none of the members the account holds on it.
+            delegation_requests.push(held.clone());
+            last_key = Some(key.clone());
+        }
+
+        Ok(ListDelegationRequestsOutput {
+            delegation_requests: Some(delegation_requests),
+            is_truncated,
+            marker: is_truncated
+                .then(|| {
+                    last_key.as_deref().map(|key| {
+                        crate::state::encode_marker(
+                            crate::state::MARKER_SCOPE_DELEGATION_REQUESTS,
+                            key,
+                        )
+                    })
+                })
+                .flatten(),
+        })
     }
+}
+
+/// Whether `held` is one of the delegation requests this listing reports.
+///
+/// Two criteria, both from the operation's own documentation:
+///
+/// * it has an OWNER. "If a delegation request has no owner, even if it is assigned to a
+///   specific account, it will not be part of the ListDelegationRequests output for that
+///   account" — so an unowned request is reported by no listing, whatever account it is
+///   assigned to, and what owns a request is the `OwnerId` its record carries.
+/// * its owner is the one the request asked about, when it asked about one: `OwnerId` is
+///   "the owner ID to filter delegation requests by". The comparison is verbatim —
+///   `ownerIdType` carries an owner's ARN, a minted handle rather than a friendly name,
+///   which is why it is not case-folded the way an IAM entity name is.
+fn selected(held: &DelegationRequest, owner_id: Option<&str>) -> bool {
+    let Some(owner) = held.owner_id.as_deref() else {
+        return false;
+    };
+    owner_id.is_none_or(|asked| asked == owner)
 }
