@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorkflowRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorkflowRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorkflowRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the runs of ONE workflow: every run this account's workflow of that name holds,
+//! newest started first, one `MaxResults`-sized page at a time, each projected exactly as
+//! the single-run read ([`crate::ops::get_workflow_run`]) projects it — so a client working
+//! from the listing is never less informed than one re-reading each run.
+//!
+//! A `Name` this account holds no workflow under is refused with `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +75,13 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::WorkflowRunEntry;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`GetWorkflowRunsRequest$MaxResults`, `PageSize` range 1..1000) — and so the page size
+/// for a request that names none.
+const MAX_PAGE_SIZE: i32 = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -149,18 +154,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorkflowRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkflowRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorkflowRuns"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on — the same way the
+            // single-run read reports it.
+            return Err(GetWorkflowRunsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue workflow store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The maximum number of workflow runs to be included in the response"
+        // (`MaxResults`, `PageSize` range 1..1000). Absent, the page is the largest the
+        // model accepts for it; the clamp re-states that range here so the page size is
+        // never 0 even if the boundary validator ever stops enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // `Name` is `@required` with `length 1..255`, so an absent or over-long one is
+        // refused at the boundary: reaching here, the only question is whether this account
+        // holds a workflow of that name — and the NAME is that workflow's whole key. Every
+        // operation the model declares over a workflow (`GetWorkflow`, `UpdateWorkflow`,
+        // `DeleteWorkflow`, `StartWorkflowRun`, `GetWorkflowRun`) addresses it by `Name`
+        // alone, with no `CatalogId` and no Region member, so a workflow and its run history
+        // are per-ACCOUNT ([`crate::state::ComAmazonawsGlueAwsglueState::workflows`]) and are
+        // resolved here through the very same accessor those readers use. There is no
+        // narrower key to scope this lookup by.
+        let Some(workflow) = store.workflow_mut(&input.name) else {
+            return Err(GetWorkflowRunsErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::workflow_not_found(&input.name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // The only write a read makes: the status changes the clock had already made due.
+        workflow.settle_due_runs(now);
+
+        // A run history is reported newest first — the order the sibling run listing of
+        // this service documents (`GetJobRuns`, "with the newest jobs returned first") —
+        // taken from the instant each run STARTED rather than from the order the store
+        // happens to hold the runs in, with the run's own id breaking a tie between two
+        // runs started in the same nanosecond so the order is total and the same on every
+        // call. Each run's ordering key is computed ONCE here, so neither the sort nor the
+        // token lookup below re-renders it per comparison.
+        let mut ordered: Vec<(String, &WorkflowRunEntry)> = workflow
+            .runs
+            .iter()
+            .map(|run| (page_cursor(run), run))
+            .collect();
+        ordered.sort_by(|left, right| right.0.cmp(&left.0));
+
+        // The token is the ordering key of the last run of the previous page, so the page
+        // resumes at the first run strictly older than it — which stays correct across runs
+        // started or dropped between two calls. A token this service never issued is
+        // DELIBERATELY a position in that order rather than a refusal, for the same reason:
+        // the cursor is a key in the listing's own order, so every string names one, and
+        // the sibling run listings of this crate resolve a cursor the same way.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => ordered.partition_point(|(key, _)| key.as_str() >= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(ordered.len());
+        // The token names the last entry of the page, taken from the page itself so there
+        // is no index arithmetic to underflow on an empty page, and is absent once the page
+        // reaches the end of the listing.
+        let next_token = if end < ordered.len() {
+            ordered[start..end].last().map(|(key, _)| key.clone())
+        } else {
+            None
+        };
+        // The page's runs, taken out of the store so the record is no longer borrowed while
+        // the graph beside it is read.
+        let page: Vec<WorkflowRunEntry> = ordered[start..end]
+            .iter()
+            .map(|(_, run)| (*run).clone())
+            .collect();
+
+        // "Specifies whether to include the workflow graph in response or not": the reader
+        // that did not ask for one — which is also what a request naming no `IncludeGraph`
+        // asked for — is answered without it, and the reader that asked gets the graph of
+        // the workflow these are runs of, the same graph the single-run read reports. Read
+        // only once the workflow has been resolved, so no graph is built for a name this
+        // account holds no workflow under. The Region is what the GRAPH is read by, not the
+        // workflow: a trigger is served only through the endpoint that created it, so the
+        // graph reports the components attached to this workflow through THIS endpoint,
+        // exactly as `GetWorkflow` and the single-run read report them.
+        let graph = input
+            .include_graph
+            .unwrap_or(false)
+            .then(|| store.workflow_graph(&region, &input.name));
+
+        // Element for element the SAME projection the single-run read serves.
+        let runs: Vec<WorkflowRun> = page
+            .iter()
+            .map(|run| run.to_workflow_run(graph.clone()))
+            .collect();
+
+        Ok(GetWorkflowRunsOutput {
+            // `Runs` is `length 1..1000`, so the model admits no empty list: a workflow no
+            // run has been started of, and a page past the end of its history, report no
+            // `Runs` member at all rather than an empty one.
+            runs: (!runs.is_empty()).then_some(runs),
+            next_token,
+        })
     }
+}
+
+/// One run's place in this listing, as the continuation token renders it: the shared
+/// history cursor ([`crate::state::history_page_cursor`]) over the instant this run started
+/// and its own id.
+///
+/// Ordering runs by this key DESCENDING is the newest-first order this listing serves, and
+/// comparing a token against it is what resumes a page — so any string a request sends
+/// names a well-defined place in that order, exactly as it does for the sibling run
+/// listings of this crate.
+fn page_cursor(run: &WorkflowRunEntry) -> String {
+    crate::state::history_page_cursor(run.started_on, &run.id)
 }
