@@ -49,6 +49,7 @@ use crate::ops::types::{
     DomainStatus, EBSOptions,
     EBSOptionsStatus,
     EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus, ErrorDetails,
+    ExportOptions,
     IAMFederationOptionsOutput, IPAddressTypeStatus, IamIdentityCenterOptions,
     IamIdentityCenterOptionsInput, IdentityCenterOptions,
     IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InboundConnection,
@@ -58,7 +59,8 @@ use crate::ops::types::{
     InvalidPaginationTokenException, InvalidTypeException, JWTOptionsOutput,
     LimitExceededException, Limits,
     LogPublishingOption,
-    LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
+    LogPublishingOptionsStatus, MigrationSource, MigrationWorkspace,
+    NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
     OffPeakWindowOptionsStatus, OptionStatus, OutboundConnection, OutboundConnectionStatus,
     PackageAssociationConfiguration, PackageConfiguration, PackageDetails,
@@ -1566,6 +1568,263 @@ pub fn attachment_quota_exceeded(id: &str) -> ValidationException {
         message: Some(format!(
             "Application {id} already holds the maximum of {ATTACHMENT_QUOTA} data source \
              attachments."
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Saved-object migrations
+//
+// A migration is the job that moves an account's saved objects (dashboards,
+// visualizations, index patterns, searches) out of a data source and into an
+// application's workspace: `StartMigration` mints one and `GetMigration`
+// reports its progress, both from the ONE [`Migration`] record below — so the
+// job a start answered with and the job a later read reports cannot disagree.
+//
+// It is an ACCOUNT resource keyed by its own `migrationId` rather than a record
+// held on the application it migrates into: `GetMigration` addresses a job by
+// that id alone and names no application, so the id has to resolve on its own.
+// ---------------------------------------------------------------------------
+
+/// A migration job's `PENDING` status: the job has been accepted and its export has
+/// not begun — "the status is PENDING when a migration is first created"
+/// (`StartMigrationResponse$status`).
+pub const MIGRATION_STATUS_PENDING: &str = "PENDING";
+
+/// A migration job's `IN_PROGRESS` status: the export has run and the objects it
+/// selected are being imported into the target workspace.
+pub const MIGRATION_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// A migration job's `SUCCEEDED` status: the selected objects are in the workspace.
+pub const MIGRATION_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// A migration job's `FAILED` status: the job stopped without importing its objects.
+pub const MIGRATION_STATUS_FAILED: &str = "FAILED";
+
+/// Every status a migration job reports, in lifecycle order.
+///
+/// The model types `status` as a plain string rather than an enum, so the published
+/// list is its documentation's: "valid values are PENDING, IN_PROGRESS, SUCCEEDED, and
+/// FAILED" (`smithy_query(query="doc",shape="GetMigrationResponse",member="status")`).
+pub const MIGRATION_STATUS_VALUES: [&str; 4] = [
+    MIGRATION_STATUS_PENDING,
+    MIGRATION_STATUS_IN_PROGRESS,
+    MIGRATION_STATUS_SUCCEEDED,
+    MIGRATION_STATUS_FAILED,
+];
+
+/// The conflict-resolution strategies a migration may be started with.
+///
+/// `conflictResolution` is typed as a plain string, so the published set is its
+/// documentation's: "valid values are CREATE_NEW_COPIES, which creates new objects with
+/// unique IDs, and overwrite, which replaces existing objects"
+/// (`smithy_query(query="doc",shape="MigrationOptions",member="conflictResolution")`) —
+/// spelled there exactly as below.
+pub const CONFLICT_RESOLUTION_VALUES: [&str; 2] = ["CREATE_NEW_COPIES", "overwrite"];
+
+/// How many migration jobs ONE application holds before a start is refused rather than
+/// minting another.
+///
+/// Like [`ATTACHMENT_QUOTA`] this is the emulator's OWN bound on the store — the model
+/// publishes none — and it is what stops a caller looping with fresh jobs from growing
+/// the state without end. It bounds the WHOLE set too, because a start resolves its
+/// `applicationId` against the applications this account holds and those are bounded by
+/// [`APPLICATION_QUOTA`]: no request can partition the store past that product.
+pub const MIGRATION_QUOTA: usize = 100;
+
+/// One saved-object migration job of this account, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct Migration {
+    /// "The unique identifier of the migration job", minted by
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_migration_id`] — so
+    /// it IS the key the store holds the record under, and the value `GetMigration`
+    /// addresses it by.
+    pub migration_id: String,
+    /// The application the job migrates saved objects INTO, by its `Id`.
+    pub application_id: String,
+    /// Where the objects come from, stored as the modelled shape every read path
+    /// reports rather than as a second mirror of its one member.
+    pub source: MigrationSource,
+    /// The workspace the objects go into, as the start named it: an existing one by
+    /// `workspaceId`, or one the job was asked to create.
+    pub workspace: MigrationWorkspace,
+    /// Which saved objects the job exports, absent where the start named no filter —
+    /// in which case its scope is every saved object the source holds.
+    pub export_options: Option<ExportOptions>,
+    /// How the import treats an object the workspace already holds, absent where the
+    /// start named no strategy.
+    pub conflict_resolution: Option<String>,
+    /// Where the job stands: one of [`MIGRATION_STATUS_VALUES`].
+    pub status: String,
+    /// The status move the clock owes this job, if any is outstanding.
+    pub owed: Option<OwedStatus>,
+    /// "The number of saved objects exported from the source data source": zero until
+    /// the export step has run.
+    pub exported_count: i32,
+    /// "The number of saved objects successfully imported into the target workspace":
+    /// zero until the import step has run.
+    pub imported_count: i32,
+    /// When the job was created.
+    pub created_at: SystemTime,
+    /// When the job last changed — the creation instant for one still in the status it
+    /// was created in, and the instant a status move FELL DUE for one the clock has
+    /// moved since, rather than whenever a caller happened to read it.
+    pub updated_at: SystemTime,
+    /// The request's `ClientToken`, absent where it carried none: "if this token matches
+    /// a previous request, Amazon OpenSearch Service ignores the request but does not
+    /// return an error", so a repeat is answered with THIS record rather than starting a
+    /// second job.
+    pub client_token: Option<String>,
+}
+
+impl Migration {
+    /// Materialise every status move the clock owes this job whose due instant has
+    /// passed: a `PENDING` job's export runs, and the `IN_PROGRESS` import that follows
+    /// it completes.
+    ///
+    /// The chain is walked from the STORED due instants — the next step falls due a span
+    /// after the previous one did, not a span after somebody read the record — so the
+    /// status a job is in at `now` is the same whoever calls and whenever. This is the
+    /// only write a reporting operation makes, and it writes only what was already owed
+    /// at the same instant had nobody called.
+    pub fn settle(&mut self, now: SystemTime) {
+        while self.owed.as_ref().is_some_and(|owed| now >= owed.due) {
+            let Some(owed) = self.owed.take() else { break };
+            self.status = owed.status;
+            self.updated_at = owed.due;
+            self.owed = self.next_step(owed.due);
+            if self.status == MIGRATION_STATUS_IN_PROGRESS {
+                // The export step has run, so the objects the job selected are out of
+                // the source and waiting on the import that follows.
+                self.exported_count = self.selected_count();
+            }
+            if self.status == MIGRATION_STATUS_SUCCEEDED {
+                // The import step has run: a job that succeeded left every object it
+                // exported in the target workspace.
+                self.imported_count = self.exported_count;
+            }
+        }
+    }
+
+    /// The step the clock owes this job once it has reached `status` at `reached`, or
+    /// `None` for a job in a status nothing follows.
+    ///
+    /// The ONE statement of the lifecycle's order, so the step a start owes and the step
+    /// a settle owes cannot disagree.
+    pub fn next_step(&self, reached: SystemTime) -> Option<OwedStatus> {
+        let next = match self.status.as_str() {
+            MIGRATION_STATUS_PENDING => MIGRATION_STATUS_IN_PROGRESS,
+            MIGRATION_STATUS_IN_PROGRESS => MIGRATION_STATUS_SUCCEEDED,
+            _ => return None,
+        };
+        Some(OwedStatus {
+            status: next.to_string(),
+            message: None,
+            due: reached + PROVISIONING,
+        })
+    }
+
+    /// How many saved objects this job's export selects.
+    ///
+    /// `exportOptions.objects` is "a list of specific saved objects to include in the
+    /// migration, identified by type and ID", so a job filtered to a list of objects
+    /// exports exactly the DISTINCT objects it names. A job that names none has every
+    /// saved object of the source in scope, and this control plane holds no record of
+    /// the saved objects a data source carries, so there is nothing for it to count.
+    pub fn selected_count(&self) -> i32 {
+        let objects = self
+            .export_options
+            .as_ref()
+            .and_then(|options| options.objects.as_ref());
+        let distinct: BTreeSet<(&str, &str)> = objects
+            .into_iter()
+            .flatten()
+            .map(|object| (object.r#type.as_str(), object.id.as_str()))
+            .collect();
+        i32::try_from(distinct.len()).unwrap_or(i32::MAX)
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an id that addresses no migration job of
+/// this account — the migration mirror of [`application_not_found`].
+pub fn migration_not_found(migration_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Migration not found: {migration_id}")),
+    }
+}
+
+/// The `ConflictException` payload for a start whose `clientToken` this account already
+/// holds a migration under, for a DIFFERENT application.
+///
+/// "If this token matches a previous request, Amazon OpenSearch Service ignores the
+/// request": what the token identifies is the start of ONE job, so a token already
+/// identifying a job of another application is one token for two starts, which cannot
+/// both be the one it identifies.
+pub fn migration_client_token_taken(client_token: &str, application_id: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "ClientToken {client_token} already identifies the migration started for \
+             application {application_id}."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for a start made while the application already
+/// holds [`MIGRATION_QUOTA`] migration jobs.
+///
+/// `StartMigration` models no `LimitExceededException`, so the bound on the store is
+/// reported through the client-input error it does model.
+pub fn migration_quota_exceeded(application_id: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Application {application_id} already holds the maximum of {MIGRATION_QUOTA} \
+             migrations."
+        )),
+    }
+}
+
+/// Why `migrationOptions.workspace` names no target the import could write to, or
+/// `None` for one that does — the ONE statement of what a migration's target must be.
+///
+/// "Specify either this parameter or `createWorkspace`"
+/// (`MigrationWorkspace$workspaceId`) and "required when `createWorkspace` is true"
+/// (`MigrationWorkspace$name`): a request naming both an existing workspace and a new
+/// one asks for two targets, one naming neither asks for none, and one asking for a new
+/// workspace without a name leaves it unnamed — none of which is a choice this service
+/// makes for the caller.
+pub fn migration_workspace_refusal(workspace: &MigrationWorkspace) -> Option<ValidationException> {
+    let creating = workspace.create_workspace.unwrap_or_default();
+    let named = workspace
+        .name
+        .as_deref()
+        .is_some_and(|name| !name.is_empty());
+    let message = match (workspace.workspace_id.is_some(), creating) {
+        (true, true) => {
+            "migrationOptions.workspace: workspaceId and createWorkspace are mutually \
+             exclusive: name the workspace to migrate into or ask for a new one, not both."
+        }
+        (false, false) => {
+            "migrationOptions.workspace: name the workspace to migrate into with workspaceId, \
+             or ask for a new one with createWorkspace."
+        }
+        (false, true) if !named => {
+            "migrationOptions.workspace: name is required when createWorkspace is true."
+        }
+        _ => return None,
+    };
+    Some(ValidationException {
+        message: Some(message.to_string()),
+    })
+}
+
+/// The `ValidationException` payload for a `conflictResolution` outside
+/// [`CONFLICT_RESOLUTION_VALUES`].
+pub fn unsupported_conflict_resolution(value: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "migrationOptions.conflictResolution {value} is not supported. Supported values are \
+             {}.",
+            CONFLICT_RESOLUTION_VALUES.join(", ")
         )),
     }
 }
@@ -6532,6 +6791,15 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// what lets two reads of the set report it in the same order. Bounded by
     /// [`DIRECT_QUERY_DATA_SOURCE_QUOTA`].
     pub direct_query_data_sources: BTreeMap<String, DirectQueryDataSourceRecord>,
+    /// Every saved-object migration job of this account, keyed by its `migrationId` —
+    /// unique per job, so the id IS the key. `StartMigration` mints one and
+    /// `GetMigration` reports it, from THIS one record. Iterating a `BTreeMap` is
+    /// order-stable, which is what lets two reads of the set report it in the same
+    /// order. Bounded per application by [`MIGRATION_QUOTA`].
+    pub migrations: BTreeMap<String, Migration>,
+    /// Drives
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_migration_id`].
+    pub migration_seq: u64,
 }
 
 impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
@@ -6558,6 +6826,8 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
             application_seq: 0,
             attachment_seq: 0,
             direct_query_data_sources: BTreeMap::new(),
+            migrations: BTreeMap::new(),
+            migration_seq: 0,
         }
     }
 }
@@ -6601,6 +6871,11 @@ const APPLICATION_ID_OFFSET: u128 = 137_438_953_471;
 /// four above for the same reason: counters that all start at zero must not render the
 /// same token.
 const ATTACHMENT_ID_OFFSET: u128 = 2_199_023_255_551;
+
+/// The bijection's constant term for a saved-object migration job's id. Different from
+/// the five above for the same reason: counters that all start at zero must not render
+/// the same token.
+const MIGRATION_ID_OFFSET: u128 = 35_184_372_088_831;
 
 /// The opaque lowercase-alphanumeric token seed `seq` scrambles to, through the
 /// bijection described on [`SUFFIX_MULTIPLIER`]: distinct seeds under one `offset`
@@ -6712,6 +6987,75 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     pub fn insert_application(&mut self, application: Application) -> &Application {
         let id = application.id.clone();
         self.applications.entry(id).or_insert(application)
+    }
+
+    /// Mint the identifier a saved-object migration job is addressed by, so two jobs
+    /// never share one.
+    ///
+    /// `migrationId` is an opaque string the model constrains not at all, so it is
+    /// minted off its own counter through the same bijection as
+    /// [`Self::mint_endpoint_suffix`], behind the `mig-` prefix that names the resource
+    /// it identifies the way `dsa-` names a data source attachment.
+    pub fn mint_migration_id(&mut self) -> String {
+        self.migration_seq = self.migration_seq.wrapping_add(1);
+        format!(
+            "mig-{}",
+            opaque_token(self.migration_seq, MIGRATION_ID_OFFSET)
+        )
+    }
+
+    /// Materialise every status move the clock owes every stored migration job, for a
+    /// caller about to report on any of them.
+    pub fn settle_migrations(&mut self, now: SystemTime) {
+        for migration in self.migrations.values_mut() {
+            migration.settle(now);
+        }
+    }
+
+    /// The migration job `migration_id` names, with every status move the clock owes it
+    /// already materialised — the one lookup a read of a single job goes through.
+    pub fn settled_migration_mut(
+        &mut self,
+        migration_id: &str,
+        now: SystemTime,
+    ) -> Option<&mut Migration> {
+        let migration = self.migrations.get_mut(migration_id)?;
+        migration.settle(now);
+        Some(migration)
+    }
+
+    /// The migration job a start carrying `client_token` already minted, if this account
+    /// holds one: "if this token matches a previous request, Amazon OpenSearch Service
+    /// ignores the request but does not return an error", so a repeat of the same start
+    /// is answered with the record the first one made rather than starting a second job.
+    ///
+    /// Reads ONLY.
+    pub fn migration_of_client_token(&self, client_token: &str) -> Option<&Migration> {
+        self.migrations
+            .values()
+            .find(|migration| migration.client_token.as_deref() == Some(client_token))
+    }
+
+    /// How many migration jobs this account holds for one application — what
+    /// [`MIGRATION_QUOTA`] bounds.
+    ///
+    /// Reads ONLY.
+    pub fn migrations_of_application(&self, application_id: &str) -> usize {
+        self.migrations
+            .values()
+            .filter(|migration| migration.application_id == application_id)
+            .count()
+    }
+
+    /// Store `migration` and hand back the stored copy, so a start answers with the
+    /// record this service persisted rather than a copy beside it.
+    ///
+    /// The id comes from [`Self::mint_migration_id`], a bijection over its own counter,
+    /// so the key cannot already be taken; the entry API is used so no path can
+    /// overwrite a record this store already holds under one.
+    pub fn insert_migration(&mut self, migration: Migration) -> &Migration {
+        let id = migration.migration_id.clone();
+        self.migrations.entry(id).or_insert(migration)
     }
 
     /// The application `id` names, with any status move the clock owes it already

@@ -892,6 +892,29 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         challenge
     }
 
+    /// The passkey registration `challenge` resolves as of `now`, or `None` when
+    /// this emulator handed out no such challenge or the clock has already taken
+    /// it past [`WebAuthnRegistration::expires_at`].
+    ///
+    /// A PURE read: an expired registration is refused where it stands rather
+    /// than swept, so asking changes nothing a later caller sees.
+    pub fn web_authn_registration(
+        &self,
+        challenge: &str,
+        now: SystemTime,
+    ) -> Option<&WebAuthnRegistration> {
+        self.web_authn_registrations
+            .get(challenge)
+            .filter(|registration| registration.expires_at > now)
+    }
+
+    /// Forget the passkey registration `challenge` names: a challenge is answered
+    /// once, so the call that completes a registration consumes it and a second
+    /// response to the same challenge resolves nothing.
+    pub fn end_web_authn_registration(&mut self, challenge: &str) {
+        self.web_authn_registrations.remove(challenge);
+    }
+
     /// The token record for `token`, or `None` when this emulator never issued it.
     pub fn token(&self, token: &str) -> Option<&TokenRecord> {
         self.issued_tokens.get(token)
@@ -3452,6 +3475,20 @@ impl User {
             self.user_last_modified_date = now;
         }
         Ok(())
+    }
+
+    /// Register `credential` to this user, APPENDING it: the credentials are
+    /// held in registration order ([`User::web_authn_credentials`]), so the
+    /// passkey registered last is read last.
+    pub fn register_web_authn_credential(&mut self, credential: WebAuthnCredential) {
+        self.web_authn_credentials.push(credential);
+    }
+
+    /// Whether this user already holds the passkey credential `credential_id`.
+    pub fn holds_web_authn_credential(&self, credential_id: &str) -> bool {
+        self.web_authn_credentials
+            .iter()
+            .any(|credential| credential.credential_id == credential_id)
     }
 
     /// Store whether passkey MFA is activated for this user, as of `now`.
@@ -6433,6 +6470,23 @@ fn signed_jws(claims: &serde_json::Value, key: &PoolSigningKey) -> Option<String
     );
     let signature = key.sign(signing_input.as_bytes())?;
     Some(format!("{signing_input}.{}", base64_url(&signature)))
+}
+
+/// The bytes `text` carries, read as base64url (RFC 4648 §5) — the encoding the
+/// JSON form of a WebAuthn `BufferSource` member uses — or `None` when `text` is
+/// not a base64 encoding of anything.
+///
+/// The inverse of [`base64_url`]: the URL alphabet's `-` and `_` are mapped back
+/// to the standard alphabet's `+` and `/`, and the padding [`base64_url`] trims
+/// is restored, so a value encoded with padding and one encoded without both
+/// decode. Decoding itself is the codec this workspace already uses for every
+/// Smithy blob (`aws_smithy_types::base64`).
+pub fn base64_url_decode(text: &str) -> Option<Vec<u8>> {
+    let mut standard = text.replace('-', "+").replace('_', "/");
+    while !standard.len().is_multiple_of(4) {
+        standard.push('=');
+    }
+    ::aws_smithy_types::base64::decode(standard).ok()
 }
 
 /// `bytes` in base64url without padding, as a JWS segment is encoded

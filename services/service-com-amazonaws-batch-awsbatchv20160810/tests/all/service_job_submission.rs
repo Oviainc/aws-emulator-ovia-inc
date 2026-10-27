@@ -38,7 +38,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_batch_awsbatchv20160810::state;
 
 use crate::cancel_job::flip_last_hex_digit;
-use crate::job_lifecycle::{arn, compute_environment, error_code, error_message, Batch, REGION};
+use crate::job_lifecycle::{
+    arn, assert_clock_owed_status, assert_reads_agree, bracketed, compute_environment, error_code,
+    error_message, Batch, REGION,
+};
 
 /// The only `ServiceJobType` the model declares
 /// (`smithy_query(query="shape", shape="ServiceJobType")`: SAGEMAKER_TRAINING).
@@ -309,9 +312,12 @@ async fn submitting_a_service_job_persists_it_and_describe_reads_it_back() {
             QueueRef::Name => queue_name.clone(),
             QueueRef::Arn => queue_arn.clone(),
         };
-        let accepted = submitted(&batch, case, row.body(&queue)).await;
+        let accepted = bracketed(submitted(&batch, case, row.body(&queue))).await;
 
-        let job_id = accepted["jobId"].as_str().unwrap_or_default().to_string();
+        let job_id = accepted.value["jobId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         assert_uuid_shaped(case, &job_id);
         assert!(
             !seen_ids.contains(&job_id),
@@ -319,20 +325,23 @@ async fn submitting_a_service_job_persists_it_and_describe_reads_it_back() {
         );
         seen_ids.push(job_id.clone());
         assert_eq!(
-            accepted["jobName"].as_str(),
+            accepted.value["jobName"].as_str(),
             Some(row.job_name.as_str()),
-            "case {case}: the answer echoes the jobName submitted, got {accepted}"
+            "case {case}: the answer echoes the jobName submitted, got {}",
+            accepted.value
         );
         assert_eq!(
-            accepted["jobArn"].as_str(),
+            accepted.value["jobArn"].as_str(),
             Some(arn(&format!("service-job/{job_id}")).as_str()),
-            "case {case}: expected the service-job ARN of the minted id, got {accepted}"
+            "case {case}: expected the service-job ARN of the minted id, got {}",
+            accepted.value
         );
 
-        let detail = described(&batch, case, &job_id).await;
+        let read = bracketed(described(&batch, case, &job_id)).await;
+        let detail = read.value.clone();
         assert_eq!(
             detail["jobArn"].as_str(),
-            accepted["jobArn"].as_str(),
+            accepted.value["jobArn"].as_str(),
             "case {case}: the ARN is minted once, got {detail}"
         );
         assert_eq!(
@@ -356,10 +365,15 @@ async fn submitting_a_service_job_persists_it_and_describe_reads_it_back() {
             Some(row.payload.as_str()),
             "case {case}: the payload is persisted verbatim, got {detail}"
         );
-        assert_eq!(
-            detail["status"].as_str(),
-            Some(state::SERVICE_JOB_SUBMITTED),
-            "case {case}: a service job is accepted in SUBMITTED, got {detail}"
+        // A service job is accepted in the transient status its submit stores, and the
+        // move out of it falls due one span after THAT submit: the bracket of the two
+        // calls is what makes this read's answer certain, not the order they were made in.
+        assert_clock_owed_status(
+            case,
+            &read,
+            accepted.due_window(),
+            state::SERVICE_JOB_SUBMITTED,
+            None,
         );
         assert_eq!(
             detail["isTerminated"].as_bool(),
@@ -830,7 +844,7 @@ async fn a_submitted_service_job_moves_only_with_the_clock_and_never_because_of_
     let (queue_name, _) = environment_and_queue(&batch).await;
     let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
 
-    let accepted = submitted(
+    let accepted = bracketed(submitted(
         &batch,
         "the clock",
         json!({
@@ -839,29 +853,31 @@ async fn a_submitted_service_job_moves_only_with_the_clock_and_never_because_of_
             "serviceJobType": SERVICE_JOB_TYPE,
             "serviceRequestPayload": "{}",
         }),
-    )
+    ))
     .await;
-    let job_id = accepted["jobId"].as_str().unwrap_or_default().to_string();
+    let job_id = accepted.value["jobId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
 
     // Two reads back to back: a read must not advance anything, and the transient status
     // is observable because the span the clock owes is never zero.
-    let before = described(&batch, "read twice", &job_id).await;
-    let after = described(&batch, "read twice", &job_id).await;
-    assert_eq!(
-        before, after,
-        "case read twice: two reads at the same instant must answer identically, got {after}"
-    );
-    assert_eq!(
-        before["status"].as_str(),
-        Some(state::SERVICE_JOB_SUBMITTED),
-        "case straight after submit: expected SUBMITTED, got {before}"
+    let before = bracketed(described(&batch, "read twice", &job_id)).await;
+    let after = bracketed(described(&batch, "read twice", &job_id)).await;
+    assert_reads_agree("read twice", &before, &after, accepted.due_window());
+    assert_clock_owed_status(
+        "straight after submit",
+        &before,
+        accepted.due_window(),
+        state::SERVICE_JOB_SUBMITTED,
+        None,
     );
 
     // Poll to the end, checking the status never goes backwards and only ever takes a
     // value this emulator mints.
     let mut rank = 0_usize;
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-    let mut detail = before;
+    let mut detail = before.value;
     for _ in 0..12 {
         detail = described(&batch, "poll", &job_id).await;
         let status = detail["status"].as_str().unwrap_or_default().to_string();

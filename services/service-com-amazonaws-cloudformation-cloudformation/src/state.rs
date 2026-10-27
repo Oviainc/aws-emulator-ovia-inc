@@ -856,6 +856,10 @@ pub mod execution_status {
     pub const AVAILABLE: &str = "AVAILABLE";
     pub const EXECUTE_IN_PROGRESS: &str = "EXECUTE_IN_PROGRESS";
     pub const EXECUTE_COMPLETE: &str = "EXECUTE_COMPLETE";
+    /// The status of a change set whose execution was attempted and did not go through:
+    /// the stack policy in force refused one of the actions its plan would have taken, so
+    /// the plan was not carried out and the change set is no longer executable.
+    pub const EXECUTE_FAILED: &str = "EXECUTE_FAILED";
 }
 
 /// `ChangeSetType` values (the model's `ChangeSetType` enum).
@@ -1338,10 +1342,10 @@ pub struct StoredStack {
     /// The stack policy body in force, as `SetStackPolicy` or `CreateStack`/`UpdateStack`
     /// last supplied it.
     ///
-    /// A stack policy governs which of a stack's RESOURCES an update may change; this
-    /// service records the resources a template declares but performs no resource
-    /// updates against them, so the policy has nothing to protect yet and is stored (and
-    /// reported by `GetStackPolicy`) rather than enforced.
+    /// A stack policy governs which of a stack's RESOURCES an update may change, and which
+    /// action it may take on each: every update evaluates the document in force against the
+    /// plan it would carry out ([`stack_policy`]), and takes no action the policy refuses.
+    /// `None` for a stack with no policy, which protects nothing.
     pub stack_policy_body: Option<String>,
     /// `ResourceTypes`: the resource types this stack's operations may work with. Stored
     /// as supplied; it constrains which resource types a stack operation may create,
@@ -5164,6 +5168,10 @@ pub fn declared_template(template_body: &str) -> Option<template::Template> {
 /// The resource-level change list a change set carries, computed by comparing the stack's
 /// revision with the submitted one — see [`change_plan`].
 pub use change_plan::computed_changes;
+
+/// [`computed_changes`] against a stack whose template this call has not read yet, which is
+/// how a handler holds one — see [`change_plan::changes_against`].
+pub use change_plan::{changes_against, DeployedStack};
 
 /// Resolve the request's `Parameters` against the values the stack already carries.
 ///

@@ -101,6 +101,8 @@ mod reserved_instance_offerings;
 mod reserved_instances;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/saved_object_migrations.rs"]
+mod saved_object_migrations;
 #[path = "all/scheduled_action_updates.rs"]
 mod scheduled_action_updates;
 #[path = "all/scheduled_actions.rs"]
