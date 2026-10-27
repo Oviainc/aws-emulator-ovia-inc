@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVerifiedAccessTrustProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVerifiedAccessTrustProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVerifiedAccessTrustProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the Verified Access trust provider the request names from this
+//! service's state and answers with the record it removed, so a later
+//! `DescribeVerifiedAccessTrustProviders` no longer reports it — this is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +133,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVerifiedAccessTrustProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVerifiedAccessTrustProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVerifiedAccessTrustProvider"))
+        use crate::state;
+
+        // A trust provider is named by id and its modelled shape carries no Region, so
+        // nothing here reads the request's metadata; the store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+
+        // "A unique, case-sensitive token that you provide to ensure idempotency of your
+        // modification request" (`$ClientToken`): the token is retained for the process's
+        // lifetime, so its length is held to the bound every client token in this crate is.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {} characters",
+                state::MAX_CLIENT_TOKEN_CHARS
+            )));
+        }
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+
+        // Idempotency first: a retry carrying the token of a delete this store still
+        // remembers is answered with the trust provider that delete removed, so the retry
+        // neither refuses an id its own call removed nor removes a second resource.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.verified_access_trust_provider_deletion(token))
+            // A token names the ONE trust provider its call removed, so a retry naming
+            // another id is a different request wearing a spent token, not a replay, and is
+            // answered on its own terms. Telling a MISMATCHED replay apart from a fresh
+            // request needs the original request kept beside the token, which is the same
+            // change every client-token map of this crate shares (see the note on
+            // `flow_log_client_tokens` in `crate::state`) rather than this one's to make.
+            .filter(|deleted| {
+                deleted.verified_access_trust_provider_id.as_deref()
+                    == Some(input.verified_access_trust_provider_id.as_str())
+            })
+            .cloned();
+
+        // "Delete an Amazon Web Services Verified Access trust provider": an id this account
+        // holds no trust provider for is a refusal, not a no-op — a caller that deletes
+        // twice has to be able to tell the deletion it performed from one it did not. A
+        // replay is the one id that is allowed to be gone, because this very token is what
+        // removed it.
+        if replayed.is_none()
+            && !store
+                .verified_access_trust_providers
+                .contains_key(&input.verified_access_trust_provider_id)
+        {
+            return Err(state::invalid_verified_access_trust_provider_id_not_found(
+                &input.verified_access_trust_provider_id,
+            ));
+        }
+
+        // Whichever of the two it is, the request is one that WOULD have succeeded, so a dry
+        // run stops HERE and never with a success status: "If you have the required
+        // permissions, the error response is DryRunOperation" (`$DryRun`). Nothing has been
+        // removed yet, and nothing is.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        if let Some(deleted) = replayed {
+            return Ok(DeleteVerifiedAccessTrustProviderOutput {
+                verified_access_trust_provider: Some(deleted),
+            });
+        }
+
+        // `remove_verified_access_trust_provider` is what takes the create token that minted
+        // the record along with it, gives the record's caller-chosen bytes back to the
+        // store's budget, and keeps the removed record under THIS delete's token so a retry
+        // can be answered with it.
+        let removed = store
+            .remove_verified_access_trust_provider(
+                &input.verified_access_trust_provider_id,
+                input.client_token.as_deref(),
+            )
+            .ok_or_else(|| {
+                state::internal_error(
+                    "the Verified Access trust provider checked a moment ago could not be \
+                     removed",
+                )
+            })?;
+
+        // "Details about the Verified Access trust provider"
+        // (`DeleteVerifiedAccessTrustProviderResult$VerifiedAccessTrustProvider`): the record
+        // as this call leaves it, read out of the store rather than rebuilt here. The
+        // modelled shape carries no status member, so there is no `deleting` state to
+        // report — the trust provider is gone, and the describe no longer reports it.
+        Ok(DeleteVerifiedAccessTrustProviderOutput {
+            verified_access_trust_provider: Some(removed),
+        })
     }
 }
