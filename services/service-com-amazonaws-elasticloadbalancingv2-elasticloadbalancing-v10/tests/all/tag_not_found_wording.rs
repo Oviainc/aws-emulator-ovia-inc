@@ -1,0 +1,301 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The WORDING of the `NotFound` a tag operation answers for a resource the store does
+//! not hold.
+//!
+//! The rule under test is not one call: the tag operations select the resources they act
+//! on through a LIST (`AddTags`, `RemoveTags` and `DescribeTags` all take
+//! `ResourceArns`), so the refusal is about the request's whole selection rather than one
+//! resource the call addresses, and Elastic Load Balancing names no value in it — the
+//! collection-level wording of the resource kind, which is fixed text. So the table below
+//! spans what the rule generalizes over: all three tag operations, every taggable kind,
+//! several ARN forms per kind (including a load balancer that was created and deleted),
+//! and selections of one, several and a live resource beside an absent one — the recorded
+//! call (one deleted load balancer named by `AddTags`) is one row of it.
+//!
+//! The boundary is asserted too: an operation that addresses exactly ONE resource through
+//! its own required identifier still quotes that identifier, so this wording is a property
+//! of the list-shaped selector and not of the service.
+//!
+//! Every request goes through the router exactly as a client's would — awsQuery form body
+//! in, an `<ErrorResponse>` envelope out — and the helpers are the ones the sibling tag
+//! suites already carry (`provisioning_loop`, `resource_tags`, `tag_writes`,
+//! `tag_removal`), so the calls under test are built exactly as those suites build them.
+
+use crate::provisioning_loop::{action, call, create_http_target_group, emulator, p, Reply};
+use crate::resource_tags::{absent_arn, describe_tags};
+use crate::tag_removal::remove_tags;
+use crate::tag_writes::{add_tags, message, owned, stored};
+use crate::target_group_attributes_and_modification::unescaped;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The three operations whose resource selector is the `ResourceArns` LIST
+/// (`smithy_query(query="operation",operation="AddTags,RemoveTags,DescribeTags")`: each
+/// takes `ResourceArns` of type list, and each models the five per-kind `NotFound`
+/// errors).
+const TAG_OPERATIONS: [&str; 3] = ["AddTags", "RemoveTags", "DescribeTags"];
+
+/// One row of the table: the case, the awsQuery error code of the `NotFound` shape the
+/// kind is refused with, and ARNs of that kind that no resource in the store carries.
+type AbsentRow = (&'static str, &'static str, Vec<String>);
+
+/// The collection-level not-found wording Elastic Load Balancing answers with, by the
+/// awsQuery error code of the kind's `NotFound` shape.
+///
+/// The catalog is the service's own: `LoadBalancerNotFound` is the recorded answer to a
+/// selection of load balancers by ARN, and the target group, listener and rule entries are
+/// the wording this service's sibling LIST reads answer ("One or more <plural noun> not
+/// found"), which the trust store entry follows.
+pub(crate) fn collection_message(code: &str) -> String {
+    match code {
+        "LoadBalancerNotFound" => "One or more load balancers not found",
+        "TargetGroupNotFound" => "One or more target groups not found",
+        "ListenerNotFound" => "One or more listeners not found",
+        "RuleNotFound" => "One or more rules not found",
+        "TrustStoreNotFound" => "One or more trust stores not found",
+        other => panic!("case {other:?}: no collection wording is defined for this error code"),
+    }
+    .to_string()
+}
+
+/// One tag operation over `arns`. The tags and keys are the ones the resolution pass never
+/// reaches on a refusal, so every operation refuses on the same selection.
+async fn tag_call(router: &MultiServiceRouter, operation: &str, arns: &[String]) -> Reply {
+    match operation {
+        "AddTags" => add_tags(router, arns, &owned(&[("after", "delete")])).await,
+        "RemoveTags" => remove_tags(router, arns, &["after".to_string()]).await,
+        "DescribeTags" => describe_tags(router, arns).await,
+        other => panic!("case {other:?}: this suite drives only the tag operations"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Every tag operation, every kind, every selection: the collection wording.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_tag_operation_refuses_an_absent_resource_with_the_collection_wording() {
+    let (router, _engine) = emulator();
+
+    // A live resource, so a selection can mix one that resolves with one that does not,
+    // and so the suite can witness that a refused write stored nothing.
+    let live = create_http_target_group(&router, "tagword-live-tg").await;
+    let live_tags = owned(&[("env", "prod")]);
+    assert_eq!(
+        add_tags(&router, std::slice::from_ref(&live), &live_tags)
+            .await
+            .status,
+        200,
+        "case tagging the live target group: expected 200"
+    );
+
+    // A load balancer that was created and then DELETED: the recorded row, and the one no
+    // "it never existed" ARN can stand in for.
+    let mut form = action("CreateLoadBalancer");
+    form.push(p("Name", "tagword-deleted-lb"));
+    form.push(p("Subnets.member.1", "subnet-0123456789abcdef0"));
+    form.push(p("Subnets.member.2", "subnet-0123456789abcdef1"));
+    let created = call(&router, &form).await;
+    assert_eq!(
+        created.status, 200,
+        "case setup: CreateLoadBalancer answered {} body {}",
+        created.status, created.body
+    );
+    let deleted = created
+        .text("LoadBalancerArn")
+        .expect("case setup: CreateLoadBalancer must report a LoadBalancerArn");
+    let mut form = action("DeleteLoadBalancer");
+    form.push(p("LoadBalancerArn", &deleted));
+    let gone = call(&router, &form).await;
+    assert_eq!(
+        gone.status, 200,
+        "case setup: DeleteLoadBalancer answered {} body {}",
+        gone.status, gone.body
+    );
+
+    // The ARN forms AWS publishes for this service's resources, grouped by the kind the
+    // resource segment of the ARN declares.
+    let rows: Vec<AbsentRow> = vec![
+        (
+            "load balancers",
+            "LoadBalancerNotFound",
+            vec![
+                deleted.clone(),
+                absent_arn("loadbalancer/app/absent/0123456789abcdef"),
+                absent_arn("loadbalancer/net/absent/fedcba9876543210"),
+                absent_arn("loadbalancer/gwy/absent/00112233445566aa"),
+            ],
+        ),
+        (
+            "target groups",
+            "TargetGroupNotFound",
+            vec![
+                absent_arn("targetgroup/absent/0123456789abcdef"),
+                absent_arn("targetgroup/nor-this-one/fedcba9876543210"),
+            ],
+        ),
+        (
+            "listeners",
+            "ListenerNotFound",
+            vec![
+                absent_arn("listener/app/absent/0123456789abcdef/fedcba9876543210"),
+                absent_arn("listener/net/nor-this-one/0123456789abcdef/00112233445566aa"),
+            ],
+        ),
+        (
+            "rules",
+            "RuleNotFound",
+            vec![
+                absent_arn(
+                    "listener-rule/app/absent/0123456789abcdef/fedcba9876543210/00112233445566aa",
+                ),
+                absent_arn(
+                    "listener-rule/net/nor-this/fedcba9876543210/0123456789abcdef/aa6655443322110",
+                ),
+            ],
+        ),
+        (
+            "trust stores",
+            "TrustStoreNotFound",
+            vec![
+                absent_arn("truststore/absent/0123456789abcdef"),
+                absent_arn("truststore/nor-this-one/fedcba9876543210"),
+            ],
+        ),
+    ];
+
+    for (kind, code, arns) in &rows {
+        let expected = collection_message(code);
+        // The selections differ along what the rule generalizes over: which ARN of the
+        // kind is named, how many are named at once, and whether one that resolves sits
+        // beside them.
+        let mut selections: Vec<(String, Vec<String>)> = arns
+            .iter()
+            .map(|arn| (format!("one {kind} ARN ({arn})"), vec![arn.clone()]))
+            .collect();
+        selections.push((format!("every absent {kind} ARN at once"), arns.clone()));
+        selections.push((
+            format!("an absent {kind} ARN beside a live target group"),
+            vec![live.clone(), arns[0].clone()],
+        ));
+
+        for operation in TAG_OPERATIONS {
+            for (selection, named) in &selections {
+                let case = format!("{operation} over {selection}");
+                let refused = tag_call(&router, operation, named).await;
+                assert_eq!(
+                    (refused.status, refused.error_code().as_str()),
+                    (400, *code),
+                    "case {case:?}: expected 400 {code}, got {} body {}",
+                    refused.status,
+                    refused.body
+                );
+                // The framework's XML codec escapes the quotes a message carries, so the
+                // VALUE is what is compared — through the crate's one reader for that
+                // encoding.
+                let said = unescaped(&message(&refused));
+                assert_eq!(
+                    said, expected,
+                    "case {case:?}: expected the message {expected:?}, got {said:?}"
+                );
+                for arn in named {
+                    assert!(
+                        !said.contains(arn.as_str()),
+                        "case {case:?}: expected a message naming no identifier, got {said:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Every refusal above left the live resource exactly as it was: the wording changed,
+    // not what a tag call does.
+    let still = stored(&router, &live).await;
+    assert_eq!(
+        still,
+        {
+            let mut sorted = live_tags.clone();
+            sorted.sort();
+            sorted
+        },
+        "case the live target group survives every refusal: got {still:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The boundary: one resource addressed through its own identifier is named.
+// ---------------------------------------------------------------------------
+
+/// One row: the case, the operation, the form fields that carry its single required
+/// identifier, the awsQuery error code and the message the refusal must carry.
+type AddressedRow = (&'static str, &'static str, Vec<(String, String)>, &'static str, String);
+
+#[tokio::test]
+async fn an_operation_addressing_one_resource_still_names_its_identifier() {
+    let (router, _engine) = emulator();
+
+    let absent_lb = absent_arn("loadbalancer/app/addressed/0123456789abcdef");
+    let absent_tg = absent_arn("targetgroup/addressed/fedcba9876543210");
+    let absent_listener = absent_arn("listener/app/addressed/0123456789abcdef/fedcba9876543210");
+
+    let cases: Vec<AddressedRow> = vec![
+        (
+            "the attribute read of one load balancer",
+            "DescribeLoadBalancerAttributes",
+            vec![p("LoadBalancerArn", &absent_lb)],
+            "LoadBalancerNotFound",
+            format!("Load balancer '{absent_lb}' not found"),
+        ),
+        (
+            "the attribute read of one target group",
+            "DescribeTargetGroupAttributes",
+            vec![p("TargetGroupArn", &absent_tg)],
+            "TargetGroupNotFound",
+            format!("Target groups '{absent_tg}' not found"),
+        ),
+        (
+            "the attribute read of one listener",
+            "DescribeListenerAttributes",
+            vec![p("ListenerArn", &absent_listener)],
+            "ListenerNotFound",
+            format!("Listener '{absent_listener}' not found"),
+        ),
+    ];
+
+    for (case, operation, fields, code, expected) in &cases {
+        let mut form = action(operation);
+        form.extend(fields.iter().cloned());
+        let refused = call(&router, &form).await;
+        assert_eq!(
+            (refused.status, refused.error_code().as_str()),
+            (400, *code),
+            "case {case:?}: expected 400 {code}, got {} body {}",
+            refused.status,
+            refused.body
+        );
+        let said = unescaped(&message(&refused));
+        assert_eq!(
+            &said, expected,
+            "case {case:?}: expected the message {expected:?}, got {said:?}"
+        );
+    }
+
+    // The same selection shape as the tag operations, on a read that is NOT a tag call:
+    // a list of load balancer ARNs names no value either, which is the wording the tag
+    // operations now share with it.
+    let mut form = action("DescribeLoadBalancers");
+    form.push(p("LoadBalancerArns.member.1", &absent_lb));
+    let refused = call(&router, &form).await;
+    let said = unescaped(&message(&refused));
+    assert_eq!(
+        (refused.status, refused.error_code().as_str(), said.as_str()),
+        (
+            400,
+            "LoadBalancerNotFound",
+            collection_message("LoadBalancerNotFound").as_str()
+        ),
+        "case a selection of load balancers by ARN: got {} body {}",
+        refused.status,
+        refused.body
+    );
+}

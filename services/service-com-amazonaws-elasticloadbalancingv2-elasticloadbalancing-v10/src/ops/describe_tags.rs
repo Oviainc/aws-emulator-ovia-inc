@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut descriptions = Vec::with_capacity(resolved.len());
         for (arn, kind) in resolved {
             let Some(tags) = guard.tags_of(arn) else {
-                return Err(not_found(kind, arn));
+                return Err(not_found(kind));
             };
             descriptions.push(TagDescription {
                 resource_arn: Some(arn.clone()),
@@ -232,11 +232,12 @@ fn tag_list(tags: &HashMap<String, String>) -> Vec<Tag> {
 }
 
 /// The modelled refusal for an ARN this store holds no resource for: the `NotFound`
-/// error of the resource kind the ARN names.
-fn not_found(kind: TaggableResource, arn: &str) -> DescribeTagsError {
+/// error of the resource kind the ARN names — the collection-level wording of that kind,
+/// because this read selects its resources through a LIST and so names none of them back.
+fn not_found(kind: TaggableResource) -> DescribeTagsError {
     // One wording per kind for every tag operation, so the tag read and the tag writes
     // refuse an absent resource in the same words.
-    let message = Some(crate::state::taggable_not_found_message(kind, arn));
+    let message = Some(crate::state::taggable_not_found_message(kind));
     match kind {
         TaggableResource::LoadBalancer => DescribeTagsErrorModeled::LoadBalancerNotFoundException(
             LoadBalancerNotFoundException { message },

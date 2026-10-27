@@ -56,7 +56,11 @@ fn rule_fields(tg_arn: &str, host: &str) -> Vec<(String, String)> {
 }
 
 /// `RemoveTags` over `arns`, withdrawing `keys`.
-async fn remove_tags(router: &MultiServiceRouter, arns: &[String], keys: &[String]) -> Reply {
+pub(crate) async fn remove_tags(
+    router: &MultiServiceRouter,
+    arns: &[String],
+    keys: &[String],
+) -> Reply {
     let mut form = action("RemoveTags");
     for (index, arn) in arns.iter().enumerate() {
         form.push(p(&format!("ResourceArns.member.{}", index + 1), arn));
@@ -68,7 +72,7 @@ async fn remove_tags(router: &MultiServiceRouter, arns: &[String], keys: &[Strin
 }
 
 /// `RemoveTags` over one ARN, withdrawing `keys`.
-async fn remove_tags_from(
+pub(crate) async fn remove_tags_from(
     router: &MultiServiceRouter,
     arn: &String,
     keys: &[String],
@@ -418,20 +422,17 @@ async fn a_removal_naming_a_resource_the_store_does_not_hold_is_refused_with_the
         // The framework's XML codec escapes the quotes a message carries, so the VALUE
         // is what is compared — through the crate's one reader for that encoding.
         let said = unescaped(&message(&refused));
-        assert!(
-            said.contains(arn.as_str()),
-            "case {case:?}: expected a message naming {arn}, got {said:?}"
+        // A removal selects its resources through a LIST, so the refusal is about the
+        // whole selection: the collection-level wording of the kind, naming no ARN.
+        assert_eq!(
+            said,
+            crate::tag_not_found_wording::collection_message(expected_code),
+            "case {case:?}: expected the service's wording, got {said:?}"
         );
-        if *expected_code == "TargetGroupNotFound" {
-            // Elastic Load Balancing names the target groups it could not resolve under
-            // the plural noun whatever their number — the wording every target-group
-            // refusal in this crate shares.
-            assert_eq!(
-                said,
-                format!("Target groups '{arn}' not found"),
-                "case {case:?}: expected the service's wording, got {said:?}"
-            );
-        }
+        assert!(
+            !said.contains(arn.as_str()),
+            "case {case:?}: expected a message naming no ARN, got {said:?}"
+        );
 
         // A live resource named beside the absent one keeps every key: the removal is
         // all-or-nothing across the resources one call names.

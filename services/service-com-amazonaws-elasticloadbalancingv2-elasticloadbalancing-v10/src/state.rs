@@ -2933,28 +2933,41 @@ pub fn taggable_resource(arn: &str) -> Option<TaggableResource> {
     }
 }
 
-/// The message a tag operation answers the `NotFound` of `kind` with for an ARN this
-/// store holds no resource for.
+/// The message a tag operation answers the `NotFound` of `kind` with when the ARN list it
+/// was given names a resource this store does not hold.
 ///
-/// Built from the request, like every other not-found message here: a tag call addresses
-/// each resource by the ARN the caller supplied, so that ARN is what the caller has to
-/// fix, quoted under the noun of the kind the ARN itself declares. One function for every
-/// tag operation, so a read and a write of the tags of one absent resource cannot be
-/// refused in different words.
+/// A tag operation selects the resources it acts on through a LIST
+/// (`AddTags`/`RemoveTags`/`DescribeTags` all take `ResourceArns`), so its refusal is
+/// about the request's whole selection rather than one resource the call addresses, and
+/// Elastic Load Balancing names no value in it: the collection-level wording of the
+/// kind, which is fixed text — the same wording its list READS answer
+/// ([`load_balancer_selection_not_found_message`],
+/// [`target_group_selection_not_found_message`],
+/// [`listener_selection_not_found_message`], [`rule_selection_not_found_message`]).
+/// Quoting one ARN back would tell a caller that named several which one failed, which
+/// this API deliberately does not report.
 ///
-/// The noun of each kind is the one this service's own refusals use, so a tag call and an
-/// operation addressing the same resource directly word their refusal identically — a
-/// target group is named under the PLURAL noun whatever its number
-/// ([`target_groups_not_found_message`]), a load balancer, listener and rule under the
-/// singular.
-pub fn taggable_not_found_message(kind: TaggableResource, arn: &str) -> String {
+/// One function for every tag operation, so a read and a write of the tags of one absent
+/// resource cannot be refused in different words. The operations that address exactly ONE
+/// resource through their own required identifier keep naming it
+/// ([`load_balancer_not_found_message`], [`listener_not_found_message`],
+/// [`rule_not_found_message`], [`target_groups_not_found_message`]).
+pub fn taggable_not_found_message(kind: TaggableResource) -> String {
     match kind {
-        TaggableResource::LoadBalancer => load_balancer_not_found_message(arn),
-        TaggableResource::TargetGroup => target_groups_not_found_message([arn]),
-        TaggableResource::Listener => listener_not_found_message(arn),
-        TaggableResource::Rule => rule_not_found_message(arn),
-        TaggableResource::TrustStore => format!("Trust store '{arn}' not found"),
+        TaggableResource::LoadBalancer => load_balancer_selection_not_found_message(),
+        TaggableResource::TargetGroup => target_group_selection_not_found_message(),
+        TaggableResource::Listener => listener_selection_not_found_message(),
+        TaggableResource::Rule => rule_selection_not_found_message(),
+        TaggableResource::TrustStore => trust_store_selection_not_found_message(),
     }
+}
+
+/// The message Elastic Load Balancing answers a `TrustStoreNotFound` with for a refusal
+/// about a LIST of trust stores rather than one the call addresses: the collection-level
+/// wording of the kind, built the same way as every other collection-level wording of
+/// this service — "One or more" and the PLURAL noun, naming no value.
+pub fn trust_store_selection_not_found_message() -> String {
+    "One or more trust stores not found".to_string()
 }
 
 /// The ARN segment AWS uses for each load balancer type: `app` for an Application
