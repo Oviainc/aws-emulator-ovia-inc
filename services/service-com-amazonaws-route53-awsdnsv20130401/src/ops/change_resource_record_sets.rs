@@ -108,10 +108,10 @@ use super::types::*;
 
 use crate::state::{
     canonical_dns_name, dns_name_fault, dns_sort_key, name_is_in_zone,
-    name_not_permitted_in_zone_message, no_such_hosted_zone, normalize_zone_id,
-    record_set_already_exists_message, record_set_label, zone_record_set_limit_message,
-    DnsNameFault, DnsNameKey, RecordKey, MAX_CHANGES_PER_BATCH, MAX_RECORD_SETS_PER_ZONE,
-    MAX_REPORTED_CHANGE_PROBLEMS,
+    name_not_permitted_in_zone_message, no_such_health_check, no_such_hosted_zone,
+    normalize_zone_id, record_set_already_exists_message, record_set_label,
+    zone_record_set_limit_message, DnsNameFault, DnsNameKey, RecordKey, MAX_CHANGES_PER_BATCH,
+    MAX_RECORD_SETS_PER_ZONE, MAX_REPORTED_CHANGE_PROBLEMS,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -726,11 +726,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .find(|id| !id.is_empty())
         {
             return Err(ChangeResourceRecordSetsErrorModeled::NoSuchHealthCheck(
-                NoSuchHealthCheck {
-                    message: Some(format!(
-                        "no health check exists with the ID {health_check_id}"
-                    )),
-                },
+                no_such_health_check(health_check_id),
             )
             .into());
         }

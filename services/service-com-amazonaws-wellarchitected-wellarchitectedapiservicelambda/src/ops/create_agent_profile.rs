@@ -13,6 +13,10 @@
 //! answers the profile the original request created, and the same token with different
 //! parameters is a `ConflictException` (409).
 //!
+//! The `tags` this create records are bounded like every other tag write of this service:
+//! a request that would store more tags than one resource may hold is a
+//! `ValidationException` (400) naming the member, and records nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -217,6 +221,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .map(|tag| (tag.key, tag.value))
             .collect();
+
+        // A stored resource holds at most the tag ceiling every tag writer of this crate
+        // holds one at, and a create is a tag write: this member is a `Tags` LIST with no
+        // `@length`, so — unlike the `TagMap` the other tag-carrying creates take —
+        // nothing bounded its count before the handler ran, and without this a profile
+        // would be stored carrying more tags than `TagResource` and `ImportLens` let any
+        // resource reach. Counted and worded by the shared helpers beside
+        // `MAX_TAGS_PER_RESOURCE`, against the empty tag map a profile that does not
+        // exist yet carries — which reduces to the request's DISTINCT key count — so the
+        // three tag writers cannot drift on what they count; checked BEFORE anything is
+        // stored, so a refused create records no profile and spends no idempotency token.
+        if crate::state::merged_tag_count(&std::collections::BTreeMap::new(), &tags)
+            > crate::state::MAX_TAGS_PER_RESOURCE
+        {
+            return Err(CreateAgentProfileErrorModeled::ValidationException(
+                crate::state::member_constraint_exception(
+                    crate::state::AGENT_TAGS_MEMBER,
+                    &crate::state::tag_ceiling_constraint("the agent profile"),
+                ),
+            )
+            .into());
+        }
+
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
             "aggregationConfiguration": input
                 .aggregation_configuration

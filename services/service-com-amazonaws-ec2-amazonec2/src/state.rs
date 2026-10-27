@@ -1372,6 +1372,13 @@ pub use instance_event_windows::*;
 mod classic_link;
 pub use classic_link::*;
 
+/// The Reserved Instances the account holds and the modifications of them — the two stores,
+/// the form of their ids, their ceilings, their refusals and the clock-owed
+/// `processing` -> `fulfilled` move of a modification — in a module of its own, re-exported
+/// so a handler reaches them as `crate::state::<item>` like every other primitive here.
+pub mod reserved_instances;
+pub use reserved_instances::*;
+
 /// The EBS snapshots the account holds — what one snapshot is stored as, the store's
 /// bounds, its byte charge and the clock-owed `pending` -> `completed` move every snapshot
 /// starts out owing — in a module of its own, re-exported so a handler reaches them as
@@ -2524,11 +2531,28 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// of its own, and the delete moves the record to `queued-deleted` instead of dropping
     /// it — `queued-deleted` is a member of the modelled `ReservedInstanceState` enum, so a
     /// describe still reports the cancelled purchase and a repeat delete can say it is no
-    /// longer queued. The record's id, the ceiling that bounds this map (nothing here
-    /// reclaims a record) and the form of a Reserved Instances id all live in
-    /// `crate::ops::delete_queued_reserved_instances`, the one operation that reaches this
-    /// store today; a second one belongs beside it there or, once two share them, here.
+    /// longer queued. A fulfilled `ModifyReservedInstances` moves a record to `retired` the
+    /// same way, and mints the purchases that take its place here. The record's id, the
+    /// ceiling that bounds this map (nothing here reclaims a record) and the form of a
+    /// Reserved Instances id live in [`reserved_instances`], the submodule every operation
+    /// that reaches this store shares.
     pub reserved_instances: BTreeMap<String, crate::ops::types::ReservedInstances>,
+    /// Every Reserved Instances modification the account has asked for, by
+    /// `ReservedInstancesModificationId`, as the modelled
+    /// [`crate::ops::types::ReservedInstancesModification`] shape plus the move the clock
+    /// owes it ([`ReservedInstancesModificationRecord`]). Ordered by id, the order a
+    /// describe reports in.
+    ///
+    /// `ModifyReservedInstances` is its writer, and the fulfilment of a request is what
+    /// mints the Reserved Instances of [`Self::reserved_instances`] that replace the ones it
+    /// named — see [`reserved_instances`].
+    pub reserved_instances_modifications: BTreeMap<String, ReservedInstancesModificationRecord>,
+    /// A `ModifyReservedInstances` `ClientToken` and the `ReservedInstancesModificationId`
+    /// that request minted, so a repeat of the same request answers with that modification
+    /// instead of recording a second one — "A unique, case-sensitive token you provide to
+    /// ensure idempotency of your modification request"
+    /// (`ModifyReservedInstancesRequest$ClientToken`).
+    pub reserved_instances_modification_client_tokens: HashMap<String, String>,
     /// Every Network Access Scope the account holds, by `NetworkInsightsAccessScopeId`, as
     /// the modelled [`NetworkInsightsAccessScope`] shape itself — see the module docs.
     /// Ordered by id, the stable order every reader of it reports in.
@@ -3471,8 +3495,11 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             client_vpn_routes: BTreeMap::new(),
             client_vpn_route_client_tokens: HashMap::new(),
             client_vpn_target_network_client_tokens: HashMap::new(),
-            // A fresh account has bought nothing, so it holds no Reserved Instances.
+            // A fresh account has bought nothing, so it holds no Reserved Instances and has
+            // asked for no modification of one.
             reserved_instances: BTreeMap::new(),
+            reserved_instances_modifications: BTreeMap::new(),
+            reserved_instances_modification_client_tokens: HashMap::new(),
             network_insights_access_scopes: BTreeMap::new(),
             network_insights_access_scope_contents: BTreeMap::new(),
             network_insights_access_scope_client_tokens: HashMap::new(),
@@ -6099,9 +6126,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// route table / VPC association reaching `associated`, an `associating` local gateway
     /// route table / virtual interface group association reaching it too, and a Client VPN
     /// target network association moving `associating` -> `associated`. So is a `pending`
-    /// permission over a network interface reaching `granted`, and a PTR record update owed
+    /// permission over a network interface reaching `granted`, a PTR record update owed
     /// on an Elastic IP address's `domain-name` attribute reaching that record
-    /// ([`Self::apply_due_ptr_record_updates`]).
+    /// ([`Self::apply_due_ptr_record_updates`]), and a `processing` Reserved Instances
+    /// modification reaching `fulfilled` with the purchases it mints
+    /// ([`Self::fulfill_due_reserved_instances_modifications`]).
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         // The one clock-owed REMOVAL: a recycled AMI whose retention period has run out was
@@ -6994,6 +7023,7 @@ impl ComAmazonawsEc2Amazonec2State {
         self.materialize_due_capacity_reservation_fleet_moves(now);
         self.materialize_due_spot_instance_requests(now);
         self.expire_due_store_image_tasks(now);
+        self.fulfill_due_reserved_instances_modifications(now);
     }
 
     /// The kernel and RAM disk an instance launched from `image_id` runs when its launch

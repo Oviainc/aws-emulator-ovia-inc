@@ -216,14 +216,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // that operation is implemented.
             delivery_options: None,
             // `reputationOptions`: `SendingEnabled` is the set's stored sending
-            // state. `ReputationMetricsEnabled` is the member's documented
-            // default ("The default value is false"), which is what holds while
-            // nothing has published metrics for the set, and `LastFreshStart` is
-            // "null" for a set whose sending "has never been disabled and later
-            // re-enabled".
+            // state and `ReputationMetricsEnabled` is the set's stored
+            // publishing state, which
+            // `UpdateConfigurationSetReputationMetricsEnabled` is what writes.
+            // `LastFreshStart` is "null" for a set whose sending "has never been
+            // disabled and later re-enabled".
             reputation_options: asked_for("reputationOptions").then_some(ReputationOptions {
                 sending_enabled: configuration_set.sending_enabled,
-                reputation_metrics_enabled: false,
+                reputation_metrics_enabled: configuration_set.reputation_metrics_enabled,
                 last_fresh_start: None,
             }),
         })

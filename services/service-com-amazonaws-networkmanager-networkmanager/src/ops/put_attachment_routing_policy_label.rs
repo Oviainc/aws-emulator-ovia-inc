@@ -175,38 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Both ids ADDRESS resources that have to be stored already — this call labels an
         // attachment that exists rather than minting one — so an id naming nothing stored is
-        // the service's not-found refusal rather than the field failure a create gives for a
-        // reference it would hang a new resource off. The resource the request reaches the
-        // attachment THROUGH is checked first, the rule every other operation of this service
-        // that addresses a child of a core network follows.
-        if !store.core_networks.contains_key(&input.core_network_id) {
-            return Err(
-                PutAttachmentRoutingPolicyLabelErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
-                        crate::state::CORE_NETWORK_KIND,
-                        &input.core_network_id,
-                    ),
-                )
-                .into(),
-            );
-        }
-
-        // The attachment is resolved WITHIN that core network: one id space holds every
-        // attachment kind and a label applies to any of them, so the kind is never checked —
-        // but an attachment stored under a DIFFERENT core network is not an attachment of
-        // the one addressed, so it is as absent here as an id nothing was ever stored for.
+        // the service's not-found refusal, naming whichever of the two the store does not
+        // hold; the core network the request reaches the attachment through is resolved
+        // first (`State::attachment_of_core_network_mut`, shared with the removal of a
+        // label, which addresses the same pair of resources).
         let record = store
-            .attachments
-            .get_mut(&input.attachment_id)
-            .filter(|record| record.core_network_id == input.core_network_id)
-            .ok_or_else(|| {
-                PutAttachmentRoutingPolicyLabelErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
-                        crate::state::ATTACHMENT_KIND,
-                        &input.attachment_id,
-                    ),
-                )
-            })?;
+            .attachment_of_core_network_mut(&input.core_network_id, &input.attachment_id)
+            .map_err(PutAttachmentRoutingPolicyLabelErrorModeled::ResourceNotFoundException)?;
 
         // An attachment carries ONE routing policy label, so this call overwrites the stored
         // one whatever it was and whatever lifecycle state the attachment is in: a label is

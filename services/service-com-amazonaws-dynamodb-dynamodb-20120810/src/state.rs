@@ -201,6 +201,41 @@ pub const MAX_GLOBAL_SECONDARY_INDEXES: usize = 20;
 /// never be added later, so this is the only place the count is checked.
 pub const MAX_LOCAL_SECONDARY_INDEXES: usize = 5;
 
+/// The most non-key attributes a table's secondary indexes may project BETWEEN THEM:
+/// "the total count of NonKeyAttributes summed across all of the secondary indexes, must
+/// not exceed 100. If you project the same attribute into two different indexes, this
+/// counts as two distinct attributes when determining the total"
+/// (`Projection$NonKeyAttributes`).
+pub const MAX_PROJECTED_NON_KEY_ATTRIBUTES: usize = 100;
+
+/// Hold a table's secondary-index projections to that budget.
+///
+/// Counted the way the doc counts: one entry per NAME PER INDEX, so a name projected
+/// into two indexes spends two of the budget. `ALL` and `KEYS_ONLY` projections name no
+/// attributes and spend none — "This limit only applies when you specify the
+/// ProjectionType of INCLUDE".
+pub fn check_projection_budget<'p>(
+    projections: impl IntoIterator<Item = &'p Projection>,
+) -> Result<(), RequestError> {
+    let projected: usize = projections
+        .into_iter()
+        .map(|projection| {
+            projection
+                .non_key_attributes
+                .as_ref()
+                .map_or(0, |attributes| attributes.len())
+        })
+        .sum();
+    if projected > MAX_PROJECTED_NON_KEY_ATTRIBUTES {
+        return Err(RequestError::Validation(format!(
+            "One or more parameter values were invalid: Number of projected attributes in all \
+             indexes exceeds limit of {MAX_PROJECTED_NON_KEY_ATTRIBUTES}, number of projected \
+             attributes:{projected}"
+        )));
+    }
+    Ok(())
+}
+
 /// The most `HASH` and the most `RANGE` elements a TABLE's primary key may carry: "A
 /// simple primary key would be represented by one `KeySchemaElement` (for the partition
 /// key). A composite primary key would require one `KeySchemaElement` for the partition
@@ -5444,8 +5479,17 @@ pub mod streams_seam;
 
 pub use streams_seam::{
     disable_table_stream, publish_item_changes, register_table_stream, stream_view_type,
-    StreamFault,
+    StreamFault, STREAM_VIEW_TYPE_REQUIRED, STREAM_VIEW_TYPE_REQUIRED_ON_ENABLE,
 };
+
+/// The requirement phrase for a value that is spelled as an ARN and is not a valid one.
+///
+/// A member that takes either a name or an ARN (`TableArn`, which the data-plane
+/// `TableName` members target) states the ARN FORM rather than the name's pattern when
+/// the value it refused was an attempt at an ARN: the pattern a bare table name must
+/// satisfy says nothing about which ARN field was wrong.
+pub const ARN_FORM_REQUIREMENT: &str = "Valid ARN format is \
+     'arn:<awsPartition>:<vendor>:<region>:<awsAccountId>:<resourceType>/<resourceId>'";
 
 /// The form a table name must take: 3..=255 characters of
 /// `[a-zA-Z0-9_.-]` (the `CreateTable$TableName` doc's own length and pattern —
@@ -5479,19 +5523,53 @@ const TABLE_NAME_MEMBER_PATH: &str = "tableName";
 /// constraint violation ([`invalid_member`]), because that is what this check is: the
 /// member, the value and the constraint it broke.
 pub fn resolve_table_name(table_name: &str) -> Result<String, RequestError> {
+    // A value spelled as an ARN is refused in one of TWO ways, and which one depends on
+    // whether it is an ARN at all:
+    //
+    //   * a string that is NOT a well-formed ARN — a required field missing or empty —
+    //     is refused by the ARN FORM, because that is what is wrong with it;
+    //   * a well-formed ARN that simply does not name a table of this service is no way
+    //     of naming a table, so it is refused as the table NAME it would have to be,
+    //     by the pattern a table name must satisfy.
+    let malformed_arn = || {
+        invalid_member(
+            TABLE_NAME_MEMBER_PATH,
+            Some(table_name),
+            ARN_FORM_REQUIREMENT,
+        )
+    };
+    let not_a_table_arn = || {
+        invalid_member(
+            TABLE_NAME_MEMBER_PATH,
+            Some(table_name),
+            &pattern_requirement(TABLE_NAME_PATTERN),
+        )
+    };
     let name = match table_name.strip_prefix("arn:") {
-        Some(rest) => rest
-            .splitn(5, ':')
-            .nth(4)
-            .and_then(|resource| resource.strip_prefix("table/"))
-            .and_then(|path| path.split('/').next())
-            .ok_or_else(|| {
-                invalid_member(
-                    TABLE_NAME_MEMBER_PATH,
-                    Some(table_name),
-                    &pattern_requirement(TABLE_NAME_PATTERN),
-                )
-            })?,
+        Some(rest) => {
+            let fields: Vec<&str> = rest.splitn(5, ':').collect();
+            let [partition, service, region, account, resource] = fields.as_slice() else {
+                return Err(malformed_arn());
+            };
+            if partition.is_empty()
+                || service.is_empty()
+                || region.is_empty()
+                || account.is_empty()
+                || resource.is_empty()
+            {
+                return Err(malformed_arn());
+            }
+            if *service != "dynamodb" {
+                return Err(not_a_table_arn());
+            }
+            let path = resource.strip_prefix("table/").ok_or_else(not_a_table_arn)?;
+            // A sub-resource ARN (`.../index/<i>`, `.../stream/<label>`) names
+            // something other than the table, so it is not a way of naming it.
+            if path.contains('/') {
+                return Err(not_a_table_arn());
+            }
+            path
+        }
         None => table_name,
     };
     let length = name.chars().count();
@@ -6243,6 +6321,21 @@ pub enum CompareOp {
     GreaterOrEqual,
 }
 
+impl CompareOp {
+    /// The operator as an expression writes it, which is what a refusal that quotes
+    /// the offending token has to state.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Equal => "=",
+            Self::NotEqual => "<>",
+            Self::Less => "<",
+            Self::LessOrEqual => "<=",
+            Self::Greater => ">",
+            Self::GreaterOrEqual => ">=",
+        }
+    }
+}
+
 /// One lexical token of a DynamoDB expression.
 ///
 /// The lexer is shared by the condition and update grammars below: both spell a
@@ -6287,10 +6380,213 @@ pub fn expression_size_exceeded(member: &str) -> RequestError {
     ))
 }
 
-/// The refusal for an expression this service cannot parse. The member is named so the
-/// caller knows which one to fix; the expression itself is not echoed back.
-pub fn expression_syntax_error(member: &str) -> RequestError {
-    RequestError::Validation(format!("Invalid {member}: syntax error"))
+/// One clause of the validation envelope for a refusal the EXPRESSION language raises:
+/// AWS states the detail behind the expression member it came from, so a caller reading
+/// the message knows which member of the request carried the mistake.
+///
+/// Whether the clause is wrapped in the `<N> validation error(s) detected: ` envelope
+/// follows the MEMBER: the members a WRITE states its intent through are validated
+/// inside it, and the members a READ narrows its result with are not — the service
+/// states those on their own.
+fn invalid_expression_member(member: &str, detail: &str) -> RequestError {
+    let clause = format!("Invalid {member}: {detail}");
+    if ENVELOPED_EXPRESSION_MEMBERS.contains(&member) {
+        refused(clause)
+    } else {
+        RequestError::Validation(clause)
+    }
+}
+
+/// The expression members whose refusals carry the validation envelope: the two a
+/// write states its intent through.
+const ENVELOPED_EXPRESSION_MEMBERS: [&str; 2] = ["UpdateExpression", "ConditionExpression"];
+
+/// How a refusal names the position past the last token of an expression.
+pub const END_OF_EXPRESSION_TOKEN: &str = "<EOF>";
+
+/// The refusal for an expression this service cannot parse: the token the parse
+/// stopped at and the text around it, both taken from the expression the request sent.
+pub fn expression_syntax_error_at(member: &str, token: &str, near: &str) -> RequestError {
+    invalid_expression_member(
+        member,
+        &format!("Syntax error; token: \"{token}\", near: \"{near}\""),
+    )
+}
+
+/// The same refusal for a CHARACTER the lexer cannot read: the character is the token,
+/// and the whitespace-delimited run it sits in is the text around it.
+pub fn lexical_syntax_error(member: &str, characters: &[char], at: usize) -> RequestError {
+    let token = characters
+        .get(at)
+        .map_or_else(|| END_OF_EXPRESSION_TOKEN.to_string(), |c| c.to_string());
+    let start = characters[..at.min(characters.len())]
+        .iter()
+        .rposition(|c| c.is_whitespace())
+        .map_or(0, |index| index + 1);
+    let end = characters
+        .iter()
+        .enumerate()
+        .skip(at.min(characters.len()))
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(characters.len(), |(index, _)| index);
+    let near: String = characters[start..end.max(start)].iter().collect();
+    expression_syntax_error_at(member, &token, &near)
+}
+
+/// The refusal for a DynamoDB RESERVED WORD written out as an attribute name.
+///
+/// "To access an attribute whose name conflicts with a DynamoDB reserved word" is what
+/// `ExpressionAttributeNames` is for (`UpdateItem$ExpressionAttributeNames`), so a bare
+/// reserved word in an expression is read as the keyword it is and the expression is
+/// refused — the caller has to supply the name through that map instead.
+fn reserved_attribute_name(member: &str, word: &str) -> RequestError {
+    invalid_expression_member(
+        member,
+        &format!("Attribute name is a reserved keyword; reserved keyword: {word}"),
+    )
+}
+
+/// Whether `word`, written out in an expression, is one of DynamoDB's reserved words.
+///
+/// Matched without regard to case, the way the keywords of the expression languages are
+/// ("The operator and section keywords are case-insensitive").
+fn is_reserved_word(word: &str) -> bool {
+    let upper = word.to_ascii_uppercase();
+    RESERVED_WORDS.binary_search(&upper.as_str()).is_ok()
+}
+
+/// The lookup above is a binary search, which silently answers "not reserved" for every
+/// word if the list below ever goes out of order — a missed reserved word is a request
+/// wrongly accepted — so the order is a compile-time requirement rather than a
+/// convention.
+const _: () = {
+    let mut at = 1;
+    while at < RESERVED_WORDS.len() {
+        assert!(
+            str_before(RESERVED_WORDS[at - 1], RESERVED_WORDS[at]),
+            "the reserved-word list must be sorted: the binary search below depends on it"
+        );
+        at += 1;
+    }
+};
+
+/// Whether `left` sorts strictly before `right`, byte by byte — `str::cmp` is not
+/// callable in a const context, so the comparison the assertion above needs is spelled
+/// out here.
+const fn str_before(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    let mut at = 0;
+    while at < left.len() && at < right.len() {
+        if left[at] != right[at] {
+            return left[at] < right[at];
+        }
+        at += 1;
+    }
+    left.len() < right.len()
+}
+
+/// DynamoDB's reserved words, from the "Reserved words in DynamoDB" list in the Amazon
+/// DynamoDB Developer Guide, sorted so a lookup is a binary search rather than a scan
+/// of the whole list per name an expression writes.
+const RESERVED_WORDS: [&str; 573] = [
+    "ABORT", "ABSOLUTE", "ACTION", "ADD", "AFTER", "AGENT", "AGGREGATE", "ALL", "ALLOCATE",
+    "ALTER", "ANALYZE", "AND", "ANY", "ARCHIVE", "ARE", "ARRAY", "AS", "ASC", "ASCII",
+    "ASENSITIVE", "ASSERTION", "ASYMMETRIC", "AT", "ATOMIC", "ATTACH", "ATTRIBUTE", "AUTH",
+    "AUTHORIZATION", "AUTHORIZE", "AUTO", "AVG", "BACK", "BACKUP", "BASE", "BATCH", "BEFORE",
+    "BEGIN", "BETWEEN", "BIGINT", "BINARY", "BIT", "BLOB", "BLOCK", "BOOLEAN", "BOTH",
+    "BREADTH", "BUCKET", "BULK", "BY", "BYTE", "CALL", "CALLED", "CALLING", "CAPACITY",
+    "CASCADE", "CASCADED", "CASE", "CAST", "CATALOG", "CHAR", "CHARACTER", "CHECK", "CLASS",
+    "CLOB", "CLOSE", "CLUSTER", "CLUSTERED", "CLUSTERING", "CLUSTERS", "COALESCE", "COLLATE",
+    "COLLATION", "COLLECTION", "COLUMN", "COLUMNS", "COMBINE", "COMMENT", "COMMIT", "COMPACT",
+    "COMPILE", "COMPRESS", "CONDITION", "CONFLICT", "CONNECT", "CONNECTION", "CONSISTENCY",
+    "CONSISTENT", "CONSTRAINT", "CONSTRAINTS", "CONSTRUCTOR", "CONSUMED", "CONTINUE", "CONVERT",
+    "COPY", "CORRESPONDING", "COUNT", "COUNTER", "CREATE", "CROSS", "CUBE", "CURRENT", "CURSOR",
+    "CYCLE", "DATA", "DATABASE", "DATE", "DATETIME", "DAY", "DEALLOCATE", "DEC", "DECIMAL",
+    "DECLARE", "DEFAULT", "DEFERRABLE", "DEFERRED", "DEFINE", "DEFINED", "DEFINITION", "DELETE",
+    "DELIMITED", "DEPTH", "DEREF", "DESC", "DESCRIBE", "DESCRIPTOR", "DETACH", "DETERMINISTIC",
+    "DIAGNOSTICS", "DIRECTORIES", "DISABLE", "DISCONNECT", "DISTINCT", "DISTRIBUTE", "DO",
+    "DOMAIN", "DOUBLE", "DROP", "DUMP", "DURATION", "DYNAMIC", "EACH", "ELEMENT", "ELSE",
+    "ELSEIF", "EMPTY", "ENABLE", "END", "EQUAL", "EQUALS", "ERROR", "ESCAPE", "ESCAPED", "EVAL",
+    "EVALUATE", "EXCEEDED", "EXCEPT", "EXCEPTION", "EXCEPTIONS", "EXCLUSIVE", "EXEC", "EXECUTE",
+    "EXISTS", "EXIT", "EXPLAIN", "EXPLODE", "EXPORT", "EXPRESSION", "EXTENDED", "EXTERNAL",
+    "EXTRACT", "FAIL", "FALSE", "FAMILY", "FETCH", "FIELDS", "FILE", "FILTER", "FILTERING",
+    "FINAL", "FINISH", "FIRST", "FIXED", "FLATTERN", "FLOAT", "FOR", "FORCE", "FOREIGN",
+    "FORMAT", "FORWARD", "FOUND", "FREE", "FROM", "FULL", "FUNCTION", "FUNCTIONS", "GENERAL",
+    "GENERATE", "GET", "GLOB", "GLOBAL", "GO", "GOTO", "GRANT", "GREATER", "GROUP", "GROUPING",
+    "HANDLER", "HASH", "HAVE", "HAVING", "HEAP", "HIDDEN", "HOLD", "HOUR", "IDENTIFIED",
+    "IDENTITY", "IF", "IGNORE", "IMMEDIATE", "IMPORT", "IN", "INCLUDING", "INCLUSIVE",
+    "INCREMENT", "INCREMENTAL", "INDEX", "INDEXED", "INDEXES", "INDICATOR", "INFINITE",
+    "INITIALLY", "INLINE", "INNER", "INNTER", "INOUT", "INPUT", "INSENSITIVE", "INSERT",
+    "INSTEAD", "INT", "INTEGER", "INTERSECT", "INTERVAL", "INTO", "INVALIDATE", "IS",
+    "ISOLATION", "ITEM", "ITEMS", "ITERATE", "JOIN", "KEY", "KEYS", "LAG", "LANGUAGE", "LARGE",
+    "LAST", "LATERAL", "LEAD", "LEADING", "LEAVE", "LEFT", "LENGTH", "LESS", "LEVEL", "LIKE",
+    "LIMIT", "LIMITED", "LINES", "LIST", "LOAD", "LOCAL", "LOCALTIME", "LOCALTIMESTAMP",
+    "LOCATION", "LOCATOR", "LOCK", "LOCKS", "LOG", "LOGED", "LONG", "LOOP", "LOWER", "MAP",
+    "MATCH", "MATERIALIZED", "MAX", "MAXLEN", "MEMBER", "MERGE", "METHOD", "METRICS", "MIN",
+    "MINUS", "MINUTE", "MISSING", "MOD", "MODE", "MODIFIES", "MODIFY", "MODULE", "MONTH",
+    "MULTI", "MULTISET", "NAME", "NAMES", "NATIONAL", "NATURAL", "NCHAR", "NCLOB", "NEW",
+    "NEXT", "NO", "NONE", "NOT", "NULL", "NULLIF", "NUMBER", "NUMERIC", "OBJECT", "OF",
+    "OFFLINE", "OFFSET", "OLD", "ON", "ONLINE", "ONLY", "OPAQUE", "OPEN", "OPERATOR", "OPTION",
+    "OR", "ORDER", "ORDINALITY", "OTHER", "OTHERS", "OUT", "OUTER", "OUTPUT", "OVER",
+    "OVERLAPS", "OVERRIDE", "OWNER", "PAD", "PARALLEL", "PARAMETER", "PARAMETERS", "PARTIAL",
+    "PARTITION", "PARTITIONED", "PARTITIONS", "PATH", "PERCENT", "PERCENTILE", "PERMISSION",
+    "PERMISSIONS", "PIPE", "PIPELINED", "PLAN", "POOL", "POSITION", "PRECISION", "PREPARE",
+    "PRESERVE", "PRIMARY", "PRIOR", "PRIVATE", "PRIVILEGES", "PROCEDURE", "PROCESSED",
+    "PROJECT", "PROJECTION", "PROPERTY", "PROVISIONING", "PUBLIC", "PUT", "QUERY", "QUIT",
+    "QUORUM", "RAISE", "RANDOM", "RANGE", "RANK", "RAW", "READ", "READS", "REAL", "REBUILD",
+    "RECORD", "RECURSIVE", "REDUCE", "REF", "REFERENCE", "REFERENCES", "REFERENCING", "REGEXP",
+    "REGION", "REINDEX", "RELATIVE", "RELEASE", "REMAINDER", "RENAME", "REPEAT", "REPLACE",
+    "REQUEST", "RESET", "RESIGNAL", "RESOURCE", "RESPONSE", "RESTORE", "RESTRICT", "RESULT",
+    "RETURN", "RETURNING", "RETURNS", "REVERSE", "REVOKE", "RIGHT", "ROLE", "ROLES",
+    "ROLLBACK", "ROLLUP", "ROUTINE", "ROW", "ROWS", "RULE", "RULES", "SAMPLE", "SATISFIES",
+    "SAVE", "SAVEPOINT", "SCAN", "SCHEMA", "SCOPE", "SCROLL", "SEARCH", "SECOND", "SECTION",
+    "SEGMENT", "SEGMENTS", "SELECT", "SELF", "SEMI", "SENSITIVE", "SEPARATE", "SEQUENCE",
+    "SERIALIZABLE", "SESSION", "SET", "SETS", "SHARD", "SHARE", "SHARED", "SHORT", "SHOW",
+    "SIGNAL", "SIMILAR", "SIZE", "SKEWED", "SMALLINT", "SNAPSHOT", "SOME", "SOURCE", "SPACE",
+    "SPACES", "SPARSE", "SPECIFIC", "SPECIFICTYPE", "SPLIT", "SQL", "SQLCODE", "SQLERROR",
+    "SQLEXCEPTION", "SQLSTATE", "SQLWARNING", "START", "STATE", "STATIC", "STATUS", "STORAGE",
+    "STORE", "STORED", "STREAM", "STRING", "STRUCT", "STYLE", "SUB", "SUBMULTISET",
+    "SUBPARTITION", "SUBSTRING", "SUBTYPE", "SUM", "SUPER", "SYMMETRIC", "SYNONYM", "SYSTEM",
+    "TABLE", "TABLESAMPLE", "TEMP", "TEMPORARY", "TERMINATED", "TEXT", "THAN", "THEN",
+    "THROUGHPUT", "TIME", "TIMESTAMP", "TIMEZONE", "TINYINT", "TO", "TOKEN", "TOTAL", "TOUCH",
+    "TRAILING", "TRANSACTION", "TRANSFORM", "TRANSLATE", "TRANSLATION", "TREAT", "TRIGGER",
+    "TRIM", "TRUE", "TRUNCATE", "TTL", "TUPLE", "TYPE", "UNDER", "UNDO", "UNION", "UNIQUE",
+    "UNIT", "UNKNOWN", "UNLOGGED", "UNNEST", "UNPROCESSED", "UNSIGNED", "UNTIL", "UPDATE",
+    "UPPER", "URL", "USAGE", "USE", "USER", "USERS", "USING", "UUID", "VACUUM", "VALUE",
+    "VALUED", "VALUES", "VARCHAR", "VARIABLE", "VARIANCE", "VARINT", "VARYING", "VIEW",
+    "VIEWS", "VIRTUAL", "VOID", "WAIT", "WHEN", "WHENEVER", "WHERE", "WHILE", "WINDOW", "WITH",
+    "WITHIN", "WITHOUT", "WORK", "WRAPPED", "WRITE", "YEAR", "ZONE",
+];
+
+/// The expression text around the token at `at`: the token before it, the token itself
+/// (there is none past the end) and the token after, as the expression wrote them.
+fn token_window(tokens: &[ExprToken], at: usize) -> String {
+    let before = at.checked_sub(1).and_then(|index| tokens.get(index));
+    let here = tokens.get(at);
+    let after = tokens.get(at + 1);
+    [before, here, after]
+        .into_iter()
+        .flatten()
+        .map(token_text)
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// One token as the expression wrote it, which is what the two refusals above quote.
+fn token_text(token: &ExprToken) -> String {
+    match token {
+        ExprToken::Word(word) => word.clone(),
+        ExprToken::Alias(alias) => alias.clone(),
+        ExprToken::Placeholder(placeholder) => placeholder.clone(),
+        ExprToken::Index(index) => format!("[{index}]"),
+        ExprToken::Compare(operator) => operator.as_str().to_string(),
+        ExprToken::Open => "(".to_string(),
+        ExprToken::Close => ")".to_string(),
+        ExprToken::Comma => ",".to_string(),
+        ExprToken::Dot => ".".to_string(),
+        ExprToken::Plus => "+".to_string(),
+        ExprToken::Minus => "-".to_string(),
+    }
 }
 
 /// Split one expression into tokens, refusing a text or a token count past the bounds
@@ -6361,12 +6657,12 @@ pub fn tokenize_expression(
                     end += 1;
                 }
                 if end == start || characters.get(end) != Some(&']') {
-                    return Err(expression_syntax_error(member));
+                    return Err(lexical_syntax_error(member, &characters, at));
                 }
                 let digits: String = characters[start..end].iter().collect();
                 let index = digits
                     .parse::<usize>()
-                    .map_err(|_| expression_syntax_error(member))?;
+                    .map_err(|_| lexical_syntax_error(member, &characters, at))?;
                 tokens.push(ExprToken::Index(index));
                 at = end + 1;
             }
@@ -6377,7 +6673,7 @@ pub fn tokenize_expression(
                     at += 1;
                 }
                 if at - start < 2 {
-                    return Err(expression_syntax_error(member));
+                    return Err(lexical_syntax_error(member, &characters, start));
                 }
                 let text: String = characters[start..at].iter().collect();
                 tokens.push(if character == '#' {
@@ -6393,11 +6689,11 @@ pub fn tokenize_expression(
                 }
                 tokens.push(ExprToken::Word(characters[start..at].iter().collect()));
             }
-            _ => return Err(expression_syntax_error(member)),
+            _ => return Err(lexical_syntax_error(member, &characters, at)),
         }
     }
     if tokens.is_empty() {
-        return Err(expression_syntax_error(member));
+        return Err(lexical_syntax_error(member, &characters, characters.len()));
     }
     Ok(tokens)
 }
@@ -6424,24 +6720,43 @@ pub fn projection_expression_attributes(
     // The list reads as name (`,` name)*, so a name is expected at the start and after
     // every comma, and nowhere else.
     let mut expecting_name = true;
-    for token in &tokens {
+    for (at, token) in tokens.iter().enumerate() {
         match token {
             ExprToken::Word(name) if expecting_name => {
+                // A bare reserved word is read as the keyword it is, wherever an
+                // expression writes an attribute name.
+                if is_reserved_word(name) {
+                    return Err(reserved_attribute_name(member, name));
+                }
                 attributes.insert(name.clone());
                 expecting_name = false;
             }
             ExprToken::Alias(alias) if expecting_name => {
-                attributes.insert(substitutions.name(alias)?);
+                attributes.insert(
+                    substitutions
+                        .name(alias)
+                        .map_err(|error| invalid_expression_member(member, error.message()))?,
+                );
                 expecting_name = false;
             }
             ExprToken::Comma if !expecting_name => expecting_name = true,
             ExprToken::Dot | ExprToken::Index(_) => return Ok(None),
-            _ => return Err(expression_syntax_error(member)),
+            _ => {
+                return Err(expression_syntax_error_at(
+                    member,
+                    &token_text(token),
+                    &token_window(&tokens, at),
+                ))
+            }
         }
     }
     if expecting_name {
         // Nothing, or a trailing comma: the list names an attribute it never gives.
-        return Err(expression_syntax_error(member));
+        return Err(expression_syntax_error_at(
+            member,
+            END_OF_EXPRESSION_TOKEN,
+            &token_window(&tokens, tokens.len()),
+        ));
     }
     Ok(Some(attributes))
 }
@@ -6492,7 +6807,11 @@ impl<'a> Substitutions<'a> {
 }
 
 /// One step of a document path: an attribute name, or an index into a list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Ordered so that two paths of one update can be ordered step by step — an index by
+/// its number and an attribute by its name — which is what lets the removals of one
+/// update be applied greatest-first (see [`ParsedUpdate::apply`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PathStep {
     Attribute(String),
     Index(usize),
@@ -6559,12 +6878,35 @@ impl DocumentPath {
         text
     }
 
+    /// The same path as AWS's refusals print it: the steps as a comma-separated token
+    /// list, an index keeping its brackets — `l[1]` is `[l, [1]]` and `m.a.b` is
+    /// `[m, a, b]`.
+    fn render_tokens(&self) -> String {
+        self.render_tokens_prefix(self.0.len())
+    }
+
+    /// The same for this path's first `steps` steps only, which is what the overlap
+    /// refusal states for the path that contains the other.
+    fn render_tokens_prefix(&self, steps: usize) -> String {
+        let tokens: Vec<String> = self
+            .0
+            .iter()
+            .take(steps)
+            .map(|step| match step {
+                PathStep::Attribute(name) => name.clone(),
+                PathStep::Index(index) => format!("[{index}]"),
+            })
+            .collect();
+        format!("[{}]", tokens.join(", "))
+    }
+
     /// The refusal for a path that does not address a location this item can hold.
+    ///
+    /// AWS's text for this condition is FIXED: it states that the path is invalid and
+    /// nothing of which path it was, so a client matching the sentence exactly — the
+    /// normal pattern for a constant message — recognises the condition.
     fn invalid(&self) -> RequestError {
-        RequestError::Validation(format!(
-            "The document path provided in the update expression is invalid for update: {}",
-            self.render()
-        ))
+        RequestError::Validation(INVALID_DOCUMENT_PATH_MESSAGE.to_string())
     }
 
     /// The value at this path, or `None` when the item holds nothing there.
@@ -6746,13 +7088,38 @@ fn too_many_actions(count: usize) -> RequestError {
     ))
 }
 
+/// AWS's fixed text for an update whose document path addresses no location the item
+/// can hold — a step through a parent that is not there.
+pub const INVALID_DOCUMENT_PATH_MESSAGE: &str =
+    "The document path provided in the update expression is invalid for update";
+
 /// The refusal for two actions of one update that write the same document location, or
 /// one inside the other: DynamoDB cannot apply both.
-fn overlapping_paths(one: &str, two: &str) -> RequestError {
-    RequestError::Validation(format!(
-        "Invalid UpdateExpression: Two document paths overlap with each other; must remove or \
-         rewrite one of these paths; path one: {one}, path two: {two}"
-    ))
+fn overlapping_paths(member: &str, one: &str, two: &str) -> RequestError {
+    invalid_expression_member(
+        member,
+        &format!(
+            "Two document paths overlap with each other; must remove or rewrite one of these \
+             paths; path one: {one}, path two: {two}"
+        ),
+    )
+}
+
+/// The refusal for an operand whose type the operator or function it was given to does
+/// not take: AWS names the operator or function and the type of the offending operand,
+/// both read off the request.
+fn incorrect_operand_type(
+    member: &str,
+    operator_or_function: &str,
+    operand_type: &str,
+) -> RequestError {
+    invalid_expression_member(
+        member,
+        &format!(
+            "Incorrect operand type for operator or function; operator or function: \
+             {operator_or_function}, operand type: {operand_type}"
+        ),
+    )
 }
 
 /// The limits every attribute value this service stores — or compares a stored one
@@ -7155,7 +7522,7 @@ impl ParsedCondition {
         let mut parser = ExprParser::new(member, &tokens, substitutions);
         let node = parser.disjunction()?;
         if !parser.at_end() {
-            return Err(expression_syntax_error(member));
+            return Err(parser.syntax());
         }
         Ok(Self { node })
     }
@@ -7438,6 +7805,9 @@ enum SetOperand {
 /// `AttributeUpdates` map, parsed once and then applied to the stored item.
 #[derive(Debug, Clone)]
 pub struct ParsedUpdate {
+    /// The input member the update travelled in, which is what every refusal this
+    /// update raises names.
+    member: &'static str,
     actions: Vec<UpdateAction>,
 }
 
@@ -7452,7 +7822,7 @@ impl ParsedUpdate {
         let tokens = tokenize_expression(member, expression)?;
         let mut parser = ExprParser::new(member, &tokens, substitutions);
         let actions = parser.update_actions()?;
-        Self::from_actions(actions)
+        Self::from_actions(member, actions)
     }
 
     /// The same update, as the legacy `AttributeUpdates` map states it: one action per
@@ -7493,7 +7863,7 @@ impl ParsedUpdate {
                 }
             }
         }
-        Self::from_actions(actions)
+        Self::from_actions("AttributeUpdates", actions)
     }
 
     /// Hold the actions, refusing two that write overlapping document locations:
@@ -7505,7 +7875,10 @@ impl ParsedUpdate {
     /// store's lock — and the overlap check itself indexes the paths rather than
     /// comparing every pair: a path overlaps another exactly when one is a step-prefix
     /// of the other, so each path only has to look its own prefixes up.
-    fn from_actions(actions: Vec<UpdateAction>) -> Result<Self, RequestError> {
+    fn from_actions(
+        member: &'static str,
+        actions: Vec<UpdateAction>,
+    ) -> Result<Self, RequestError> {
         if actions.len() > MAX_UPDATE_ACTIONS {
             return Err(too_many_actions(actions.len()));
         }
@@ -7513,7 +7886,11 @@ impl ParsedUpdate {
         for action in &actions {
             let path = action.path();
             if !written.insert(path.render()) {
-                return Err(overlapping_paths(&path.render(), &path.render()));
+                return Err(overlapping_paths(
+                    member,
+                    &path.render_tokens(),
+                    &path.render_tokens(),
+                ));
             }
         }
         for action in &actions {
@@ -7521,11 +7898,15 @@ impl ParsedUpdate {
             for steps in 1..path.0.len() {
                 let prefix = path.render_prefix(steps);
                 if written.contains(&prefix) {
-                    return Err(overlapping_paths(&prefix, &path.render()));
+                    return Err(overlapping_paths(
+                        member,
+                        &path.render_tokens_prefix(steps),
+                        &path.render_tokens(),
+                    ));
                 }
             }
         }
-        Ok(Self { actions })
+        Ok(Self { member, actions })
     }
 
     /// The update a request that states none makes: nothing at all. `UpdateItem`
@@ -7533,40 +7914,44 @@ impl ParsedUpdate {
     /// request creates the item from its key alone.
     pub fn nothing() -> Self {
         Self {
+            member: "UpdateExpression",
             actions: Vec::new(),
         }
     }
 
     /// Apply every action to `item`, reporting the top-level attributes that changed.
     ///
-    /// Every operand reads the item as it stood BEFORE the update, so one expression's
-    /// actions are independent of the order they are applied in. A value an action
-    /// COMPUTES goes through [`check_attribute_value`] before it is written, exactly as
-    /// one a request sent does, and the item is clamped AS IT GROWS — the room check and
-    /// the running member count both precede each write — so a many-action update
-    /// cannot multiply a per-value bound into an unbounded item while it is being
-    /// built, however many actions the expression states.
-    pub fn apply(&self, item: &mut Item) -> Result<BTreeSet<String>, RequestError> {
+    /// Every operand reads the item as it stood BEFORE the update, and so does every
+    /// document path: all the clauses of one update resolve against ONE pre-image, so
+    /// a clause that shortens a list cannot move the location a later clause named.
+    /// That is what orders the two phases below — the writes first (writing an
+    /// existing location, and appending past the end of a list, leave every earlier
+    /// index where the pre-image had it), then the removals greatest path first (so
+    /// removing one location never shifts a smaller one that is still to be removed).
+    ///
+    /// A value an action COMPUTES goes through [`check_attribute_value`] before it is
+    /// written, exactly as one a request sent does, and the item is clamped AS IT
+    /// GROWS — the room check and the running member count both precede each write —
+    /// so a many-action update cannot multiply a per-value bound into an unbounded item
+    /// while it is being built, however many actions the expression states.
+    pub fn apply(&self, item: &mut Item) -> Result<UpdateOutcome, RequestError> {
         let before = item.clone();
-        let mut touched = BTreeSet::new();
+        let mut changed: Vec<DocumentPath> = Vec::new();
         let mut members_written = 0usize;
+        let mut removals: Vec<&DocumentPath> = Vec::new();
         for action in &self.actions {
             let path = action.path();
             match action {
                 UpdateAction::Set(path, value) => {
-                    let value = evaluate_set_value(value, &before)?;
+                    let value = evaluate_set_value(self.member, value, &before)?;
                     check_attribute_value(path.attribute(), &value)?;
                     members_written =
                         check_members_written(members_written, path.attribute(), &value)?;
                     check_room_for(item, path, &value)?;
                     path.set(item, value)?;
-                    touched.insert(path.attribute().to_string());
+                    changed.push(path.clone());
                 }
-                UpdateAction::Remove(path) => {
-                    if path.remove(item).is_some() {
-                        touched.insert(path.attribute().to_string());
-                    }
-                }
+                UpdateAction::Remove(path) => removals.push(path),
                 UpdateAction::Add(_, value) => {
                     let added = apply_add(path, value, &before)?;
                     check_attribute_value(path.attribute(), &added)?;
@@ -7574,16 +7959,113 @@ impl ParsedUpdate {
                         check_members_written(members_written, path.attribute(), &added)?;
                     check_room_for(item, path, &added)?;
                     path.set(item, added)?;
-                    touched.insert(path.attribute().to_string());
+                    changed.push(path.clone());
                 }
                 UpdateAction::Delete(_, value) => {
                     if apply_delete(path, value, &before, item)? {
-                        touched.insert(path.attribute().to_string());
+                        changed.push(path.clone());
                     }
                 }
             }
         }
-        Ok(touched)
+        removals.sort_by(|one, two| two.0.cmp(&one.0));
+        for path in removals {
+            if path.remove(item).is_some() {
+                changed.push(path.clone());
+            }
+        }
+        Ok(UpdateOutcome { changed })
+    }
+}
+
+/// What one update changed: every document path it wrote or removed.
+///
+/// Kept as PATHS rather than as the attribute names they reach into, because the two
+/// things a caller asks about them are different questions: which of the item's
+/// attributes the update touched (a key attribute among them refuses the whole update),
+/// and which of the locations the expression NAMED hold a value afterwards (what the
+/// `UPDATED_*` forms report).
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOutcome {
+    changed: Vec<DocumentPath>,
+}
+
+impl UpdateOutcome {
+    /// The top-level attributes the update changed.
+    pub fn attributes(&self) -> BTreeSet<String> {
+        self.changed
+            .iter()
+            .map(|path| path.attribute().to_string())
+            .collect()
+    }
+
+    /// The `Attributes` an `UPDATED_*` projection of `item` reports.
+    ///
+    /// "Returns only the updated attributes" is read PER DOCUMENT PATH, not per
+    /// attribute: what is reported for each path the update changed is the value AT
+    /// that path, wrapped in the containers the path steps through — `REMOVE l[1]`
+    /// reports `l` as a one-element list holding whatever index 1 addresses now, not
+    /// the whole stored list. A path that addresses nothing in `item` contributes
+    /// nothing, which is what a `SET` past the end of a list leaves behind: the element
+    /// is appended, so the index the expression named holds nothing afterwards.
+    fn projected_paths(&self, item: &Item) -> Item {
+        let mut reported = Item::new();
+        // In DOCUMENT-PATH order, so the report does not depend on the order the
+        // clauses happened to be written in: two changed indexes of one list are
+        // reported in index order.
+        let mut paths: Vec<&DocumentPath> = self.changed.iter().collect();
+        paths.sort_by(|one, two| one.0.cmp(&two.0));
+        for path in paths {
+            let Some(value) = path.get(item) else { continue };
+            let Some((PathStep::Attribute(name), rest)) = path.0.split_first() else {
+                continue;
+            };
+            let built = path_skeleton(rest, value.clone());
+            match reported.get_mut(name) {
+                Some(slot) => merge_reported(slot, built),
+                None => {
+                    reported.insert(name.clone(), built);
+                }
+            }
+        }
+        reported
+    }
+}
+
+/// `value`, wrapped in one container per remaining path step: a map entry for an
+/// attribute step and a one-element list for an index step. An empty step list is the
+/// value itself, which is what a path naming one top-level attribute reports.
+fn path_skeleton(steps: &[PathStep], value: AttributeValue) -> AttributeValue {
+    match steps.split_first() {
+        None => value,
+        Some((PathStep::Attribute(name), rest)) => {
+            let mut entries = HashMap::new();
+            entries.insert(name.clone(), path_skeleton(rest, value));
+            AttributeValue::M(entries)
+        }
+        Some((PathStep::Index(_), rest)) => AttributeValue::L(vec![path_skeleton(rest, value)]),
+    }
+}
+
+/// Fold one path's reported skeleton into another's under the same attribute: two
+/// changed paths of one update may step through the same containers.
+fn merge_reported(into: &mut AttributeValue, other: AttributeValue) {
+    match (into, other) {
+        (AttributeValue::M(mine), AttributeValue::M(theirs)) => {
+            for (name, value) in theirs {
+                match mine.get_mut(&name) {
+                    Some(slot) => merge_reported(slot, value),
+                    None => {
+                        mine.insert(name, value);
+                    }
+                }
+            }
+        }
+        (AttributeValue::L(mine), AttributeValue::L(theirs)) => mine.extend(theirs),
+        // Two paths that write the same location are refused before this point
+        // (`ParsedUpdate::from_actions`), so the only way one value replaces another
+        // here is a container that is not one: the later value is what the item holds.
+        (slot, other) => *slot = other,
     }
 }
 
@@ -7677,24 +8159,35 @@ fn apply_delete(
 
 /// The value one `SET` writes, evaluated against the item as it stood before the
 /// update.
-fn evaluate_set_value(value: &SetValue, before: &Item) -> Result<AttributeValue, RequestError> {
+fn evaluate_set_value(
+    member: &str,
+    value: &SetValue,
+    before: &Item,
+) -> Result<AttributeValue, RequestError> {
     match value {
-        SetValue::Single(operand) => evaluate_set_operand(operand, before),
+        SetValue::Single(operand) => evaluate_set_operand(member, operand, before),
         SetValue::Sum(left, right) | SetValue::Difference(left, right) => {
             let subtract = matches!(value, SetValue::Difference(_, _));
-            let left = evaluate_set_operand(left, before)?;
-            let right = evaluate_set_operand(right, before)?;
+            let left = evaluate_set_operand(member, left, before)?;
+            let right = evaluate_set_operand(member, right, before)?;
             match (&left, &right) {
                 (AttributeValue::N(left), AttributeValue::N(right)) => Ok(AttributeValue::N(
                     number_arithmetic(left, right, subtract)?,
                 )),
-                _ => Err(RequestError::Validation(format!(
-                    "Invalid UpdateExpression: Incorrect operand type for operator or function; \
-                     operator: {}, operand types: {} and {}",
-                    if subtract { "-" } else { "+" },
-                    attribute_value_type(&left),
-                    attribute_value_type(&right)
-                ))),
+                // Arithmetic takes two numbers, so the operand that is not one is what
+                // the refusal names — the left one when neither is.
+                _ => {
+                    let offending = if matches!(left, AttributeValue::N(_)) {
+                        &right
+                    } else {
+                        &left
+                    };
+                    Err(incorrect_operand_type(
+                        member,
+                        if subtract { "-" } else { "+" },
+                        attribute_value_type(offending),
+                    ))
+                }
             }
         }
     }
@@ -7703,6 +8196,7 @@ fn evaluate_set_value(value: &SetValue, before: &Item) -> Result<AttributeValue,
 /// One `SET` operand's value. A path that addresses nothing is the caller's mistake —
 /// there is no value to write — rather than a silent no-op.
 fn evaluate_set_operand(
+    member: &str,
     operand: &SetOperand,
     before: &Item,
 ) -> Result<AttributeValue, RequestError> {
@@ -7717,11 +8211,11 @@ fn evaluate_set_operand(
         }),
         SetOperand::IfNotExists(path, fallback) => match path.get(before) {
             Some(value) => Ok(value.clone()),
-            None => evaluate_set_operand(fallback, before),
+            None => evaluate_set_operand(member, fallback, before),
         },
         SetOperand::ListAppend(first, second) => {
-            let first = evaluate_set_operand(first, before)?;
-            let second = evaluate_set_operand(second, before)?;
+            let first = evaluate_set_operand(member, first, before)?;
+            let second = evaluate_set_operand(member, second, before)?;
             match (first, second) {
                 (AttributeValue::L(mut head), AttributeValue::L(tail)) => {
                     // The concatenation is bounded BEFORE it is built, and the result
@@ -7741,12 +8235,20 @@ fn evaluate_set_operand(
                     }
                     Ok(appended)
                 }
-                (first, second) => Err(RequestError::Validation(format!(
-                    "Invalid UpdateExpression: Incorrect operand type for operator or function; \
-                     function: list_append, operand types: {} and {}",
-                    attribute_value_type(&first),
-                    attribute_value_type(&second)
-                ))),
+                // `list_append` concatenates two lists, so the operand that is not a
+                // list is what the refusal names, whichever position it arrived in.
+                (first, second) => {
+                    let offending = if matches!(first, AttributeValue::L(_)) {
+                        &second
+                    } else {
+                        &first
+                    };
+                    Err(incorrect_operand_type(
+                        member,
+                        "list_append",
+                        attribute_value_type(offending),
+                    ))
+                }
             }
         }
     }
@@ -7777,7 +8279,36 @@ impl<'a> ExprParser<'a> {
     }
 
     fn syntax(&self) -> RequestError {
-        expression_syntax_error(self.member)
+        expression_syntax_error_at(self.member, &self.stopped_token(), &self.near_text())
+    }
+
+    /// The token the parse stopped at, as the expression wrote it, or the end-of-input
+    /// marker when it ran out of tokens.
+    fn stopped_token(&self) -> String {
+        self.tokens
+            .get(self.at)
+            .map_or_else(|| END_OF_EXPRESSION_TOKEN.to_string(), token_text)
+    }
+
+    /// The expression text around that token: the token before it, the token itself
+    /// (there is none past the end) and the token after, as the expression wrote them.
+    fn near_text(&self) -> String {
+        token_window(self.tokens, self.at)
+    }
+
+    /// The attribute name an `#alias` stands for, with an undefined alias refused by
+    /// the expression member it travelled in.
+    fn alias_name(&self, alias: &str) -> Result<String, RequestError> {
+        self.substitutions
+            .name(alias)
+            .map_err(|error| invalid_expression_member(self.member, error.message()))
+    }
+
+    /// The value a `:placeholder` stands for, refused the same way.
+    fn placeholder_value(&self, placeholder: &str) -> Result<AttributeValue, RequestError> {
+        self.substitutions
+            .value(placeholder)
+            .map_err(|error| invalid_expression_member(self.member, error.message()))
     }
 
     fn at_end(&self) -> bool {
@@ -7872,8 +8403,13 @@ impl<'a> ExprParser<'a> {
     /// One attribute name of a path, written out or behind an `#alias`.
     fn path_name(&mut self) -> Result<String, RequestError> {
         match self.next_token()? {
-            ExprToken::Word(word) => Ok(word),
-            ExprToken::Alias(alias) => self.substitutions.name(&alias),
+            ExprToken::Word(word) => {
+                if is_reserved_word(&word) {
+                    return Err(reserved_attribute_name(self.member, &word));
+                }
+                Ok(word)
+            }
+            ExprToken::Alias(alias) => self.alias_name(&alias),
             _ => Err(self.syntax()),
         }
     }
@@ -7993,7 +8529,7 @@ impl<'a> ExprParser<'a> {
     fn operand(&mut self) -> Result<Operand, RequestError> {
         if let Some(ExprToken::Placeholder(placeholder)) = self.peek().cloned() {
             self.at += 1;
-            return Ok(Operand::Value(self.substitutions.value(&placeholder)?));
+            return Ok(Operand::Value(self.placeholder_value(&placeholder)?));
         }
         if self.peek_call().as_deref() == Some("size") {
             self.at += 2;
@@ -8051,7 +8587,7 @@ impl<'a> ExprParser<'a> {
     /// actions take a value, not another of the item's attributes.
     fn action_value(&mut self) -> Result<AttributeValue, RequestError> {
         match self.next_token()? {
-            ExprToken::Placeholder(placeholder) => self.substitutions.value(&placeholder),
+            ExprToken::Placeholder(placeholder) => self.placeholder_value(&placeholder),
             _ => Err(self.syntax()),
         }
     }
@@ -8098,7 +8634,7 @@ impl<'a> ExprParser<'a> {
         }
         if let Some(ExprToken::Placeholder(placeholder)) = self.peek().cloned() {
             self.at += 1;
-            return Ok(SetOperand::Value(self.substitutions.value(&placeholder)?));
+            return Ok(SetOperand::Value(self.placeholder_value(&placeholder)?));
         }
         match self.peek() {
             Some(ExprToken::Word(_) | ExprToken::Alias(_)) => Ok(SetOperand::Path(self.path()?)),
@@ -8111,8 +8647,12 @@ impl<'a> ExprParser<'a> {
 /// and through the legacy member that expression member replaces ("This is a legacy
 /// parameter. Use ConditionExpression instead"). The message names both members, the
 /// way the service's own refusal does, so the caller knows which pair to drop.
+///
+/// Stated on its own rather than inside the `<N> validation error(s) detected: `
+/// envelope: it is not a constraint on one member's value but a contradiction between
+/// two of them, and AWS states it as its own sentence.
 pub fn expression_conflict(legacy: &str, expression: &str) -> RequestError {
-    refused(format!(
+    RequestError::Validation(format!(
         "Can not use both expression and non-expression parameters in the same request: \
          Non-expression parameters: {{{legacy}}} Expression parameters: {{{expression}}}"
     ))
@@ -8317,27 +8857,28 @@ pub fn legacy_comparison_matches(
 /// The `Attributes` a write reports, by the `ReturnValues` the request asked for.
 ///
 /// `before` is the item as it stood immediately before the write and `after` as it
-/// stands immediately after it (`None` when the write removed it); `touched` names the
-/// attributes the write changed. An empty projection is reported as no `Attributes`
-/// member at all, the way a write that replaced nothing reports none.
+/// stands immediately after it (`None` when the write removed it); `changed` is what the
+/// write changed. An empty projection is reported as no `Attributes` member at all, the
+/// way a write that replaced nothing reports none — which is also the answer for an
+/// `UPDATED_*` projection whose every changed path addresses nothing in the item being
+/// projected.
 pub fn projected_return_values(
     return_values: Option<&str>,
     before: Option<&Item>,
     after: Option<&Item>,
-    touched: &BTreeSet<String>,
+    changed: &UpdateOutcome,
 ) -> Option<Item> {
     let projected = match return_values {
         Some("ALL_OLD") => before.cloned(),
         Some("ALL_NEW") => after.cloned(),
-        Some("UPDATED_OLD") => before.map(|item| project_attributes(item, touched)),
-        Some("UPDATED_NEW") => after.map(|item| project_attributes(item, touched)),
+        Some("UPDATED_OLD") => before.map(|item| changed.projected_paths(item)),
+        Some("UPDATED_NEW") => after.map(|item| changed.projected_paths(item)),
         _ => None,
     };
     projected.filter(|item| !item.is_empty())
 }
 
-/// Just the named attributes of an item, which is what the `UPDATED_*` forms report:
-/// "Returns only the updated attributes".
+/// Just the named attributes of an item.
 ///
 /// The same rule narrows any read to the attributes a request named — a projection over
 /// an index entry, say — so a name the item does not carry reports nothing for it rather
@@ -8766,6 +9307,31 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
         }
     }
     pattern[at_pattern..].iter().all(|glob| *glob == '*')
+}
+
+/// The actions that let a caller CHANGE a resource's policy again.
+///
+/// A policy that denies the caller any of them removes "your permissions to change the
+/// policy of this resource in the future"
+/// (`PutResourcePolicy$ConfirmRemoveSelfResourceAccess`), which is what that member has
+/// to be set to `true` to accept.
+const POLICY_MANAGEMENT_ACTIONS: [&str; 3] = [
+    "dynamodb:PutResourcePolicy",
+    "dynamodb:DeleteResourcePolicy",
+    "dynamodb:GetResourcePolicy",
+];
+
+/// Whether `policy`, attached to the table at `resource_arn`, would deny THIS CALLER the
+/// ability to change that policy again.
+///
+/// Checked against the policy the request is attaching rather than the one the table
+/// carries: the lock-out is what the NEW document would do, and it is decided before
+/// anything is stored so a refused request leaves the table exactly as it was.
+pub fn locks_the_caller_out(policy: &AttachedPolicy, resource_arn: &str) -> bool {
+    let caller = caller_principal();
+    POLICY_MANAGEMENT_ACTIONS
+        .iter()
+        .any(|action| policy.denies(&caller, action, resource_arn).is_some())
 }
 
 /// The `AccessDeniedException` message a data-plane request earns when the table's

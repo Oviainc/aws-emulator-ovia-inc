@@ -37,7 +37,7 @@ use crate::ops::types::{
     AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions, BaseException,
     ChangeProgressDetails, ChangeProgressStatusDetails, ClusterConfig, ClusterConfigStatus,
     CognitoOptions, CognitoOptionsStatus, ConflictException, ConnectionProperties,
-    DataSource as LinkedDataSource, DataSourceDetails, DataSourceType,
+    DataSource as LinkedDataSource, DataSourceAttachmentSummary, DataSourceDetails, DataSourceType,
     DeploymentStrategyOptions,
     DeploymentStrategyOptionsStatus, DomainConfig, DomainEndpointOptions,
     DomainEndpointOptionsStatus, DomainInfo, DomainInformationContainer, DomainPackageDetails,
@@ -1008,6 +1008,14 @@ pub struct Application {
     /// holds a [`DataSource`] of its own — a domain's direct-query data source, a
     /// different resource that happens to share the model's name.
     pub data_sources: Vec<LinkedDataSource>,
+    /// This application's data source attachments, keyed by the `dataSourceArn`
+    /// they link it to — one attachment per data source, so the ARN IS the key,
+    /// and the value `DetachDataSource` and `DescribeDataSourceAttachment`
+    /// address a record by. Iterating a `BTreeMap` is order-stable, which is what
+    /// lets `ListDataSourceAttachments` report the same order twice and page
+    /// through the set without repeating or skipping a record. Bounded by
+    /// [`ATTACHMENT_QUOTA`].
+    pub attachments: BTreeMap<String, DataSourceAttachment>,
     /// The `AppConfigs` the application was created with, stored as the modelled
     /// shape every read path reports.
     pub app_configs: Vec<AppConfig>,
@@ -1065,6 +1073,54 @@ impl Application {
     pub fn reported_tag_list(&self) -> Option<Vec<Tag>> {
         (!self.tags.is_empty()).then(|| tag_list(&self.tags))
     }
+
+    /// The instant this application becomes usable, or `None` when it already is.
+    ///
+    /// An application that is not up yet is one being provisioned, and such a record
+    /// carries the status move the clock owes it ([`Self::owed`]), whose due instant is
+    /// when it becomes active.
+    pub fn active_at(&self) -> Option<SystemTime> {
+        if self.status == APPLICATION_STATUS_ACTIVE {
+            return None;
+        }
+        self.owed.as_ref().map(|owed| owed.due)
+    }
+
+    /// The attachment of `data_source_arn`, if this application holds one.
+    ///
+    /// Reads ONLY.
+    pub fn attachment(&self, data_source_arn: &str) -> Option<&DataSourceAttachment> {
+        self.attachments.get(data_source_arn)
+    }
+
+    /// The attachment an attach carrying `client_token` already minted on this
+    /// application, if it holds one: "if you retry a request with the same client token
+    /// and the same parameters, the retry succeeds without performing any further
+    /// actions", so a repeat is answered with the record the first call made.
+    ///
+    /// Reads ONLY.
+    pub fn attachment_of_client_token(&self, client_token: &str) -> Option<&DataSourceAttachment> {
+        self.attachments
+            .values()
+            .find(|attachment| attachment.client_token.as_deref() == Some(client_token))
+    }
+
+    /// This application's data source attachments in the order a listing reports them:
+    /// the order they were attached in, oldest first.
+    ///
+    /// Two attachments made at one instant are ordered by the data source they attach,
+    /// which is unique per attachment — so the order is TOTAL, and the same set reports
+    /// the same order twice however the records are held. That is what lets a page token
+    /// name a place in the set.
+    pub fn attachments_in_creation_order(&self) -> Vec<&DataSourceAttachment> {
+        let mut attachments: Vec<&DataSourceAttachment> = self.attachments.values().collect();
+        attachments.sort_by(|one, other| {
+            one.created_at
+                .cmp(&other.created_at)
+                .then_with(|| one.data_source_arn.cmp(&other.data_source_arn))
+        });
+        attachments
+    }
 }
 
 /// An application's ARN: `arn:aws:es:<region>:<account-id>:application/<id>`.
@@ -1114,6 +1170,214 @@ pub fn application_quota_exceeded() -> ValidationException {
     ValidationException {
         message: Some(format!(
             "This account already holds the maximum of {APPLICATION_QUOTA} applications."
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Data source attachments
+//
+// An attachment is a sub-resource of an application: `AttachDataSource` mints
+// one, `DescribeDataSourceAttachment` and `ListDataSourceAttachments` report it
+// and `DetachDataSource` removes it, all from the ONE [`DataSourceAttachment`]
+// record below, held on the application the data source is attached to — so no
+// two of those operations can report one attachment differently.
+//
+// It is a record of its own rather than an entry in the application's
+// `DataSources` list: that list is what a create named and what every
+// application read reports, while an attachment carries an identifier of its
+// own and a status the clock moves.
+// ---------------------------------------------------------------------------
+
+/// `DataSourceAttachmentStatus`'s `PENDING` value: the attachment has been asked
+/// for and is waiting for the application and the data source to become active.
+pub const ATTACHMENT_STATUS_PENDING: &str = "PENDING";
+
+/// `DataSourceAttachmentStatus`'s `ATTACHED` value: the data source is attached.
+pub const ATTACHMENT_STATUS_ATTACHED: &str = "ATTACHED";
+
+/// `DataSourceAttachmentStatus`'s `FAILED` value: the attachment could not be
+/// completed.
+pub const ATTACHMENT_STATUS_FAILED: &str = "FAILED";
+
+/// How many data source attachments one application holds before an attach is
+/// refused rather than adding another record.
+///
+/// Like [`APPLICATION_QUOTA`] this is the emulator's OWN bound on the store — the
+/// model publishes none — and it is what stops a caller looping with fresh data
+/// sources from growing one application's state without end; every record it
+/// counts is released when the data source is detached.
+pub const ATTACHMENT_QUOTA: usize = 25;
+
+/// The page `ListDataSourceAttachments` answers with when a request names no page
+/// size: "the maximum number of results to return per page. The default is 50"
+/// (`ListDataSourceAttachmentsRequest$maxResults`).
+pub const ATTACHMENT_PAGE: usize = 50;
+
+/// One data source attachment of an application, as this emulator persists it.
+#[derive(Debug, Clone)]
+pub struct DataSourceAttachment {
+    /// "The unique identifier assigned to the data source attachment", minted by
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_attachment_id`].
+    pub attachment_id: String,
+    /// The ARN of the data source this attachment links the application to —
+    /// unique per attachment of one application, so it IS the key the
+    /// application holds the record under, and the value `DetachDataSource` and
+    /// `DescribeDataSourceAttachment` address it by.
+    pub data_source_arn: String,
+    /// Where the attachment stands: one of `DataSourceAttachmentStatus`'s values.
+    pub status: String,
+    /// The status move the clock owes this attachment, if any is outstanding.
+    pub owed: Option<OwedStatus>,
+    /// When the attachment was asked for.
+    pub created_at: SystemTime,
+    /// The request's `ClientToken`, absent where it carried none: "if you retry a
+    /// request with the same client token and the same parameters, the retry
+    /// succeeds without performing any further actions", so a repeat is answered
+    /// with THIS record rather than minting a second attachment.
+    pub client_token: Option<String>,
+}
+
+impl DataSourceAttachment {
+    /// Materialise the status move the clock owes this attachment, if `now` is past
+    /// its due instant: a pending attachment "completes automatically once both
+    /// become active", and one whose data source the account no longer holds can
+    /// never complete, which is the non-retryable outcome `FAILED` reports.
+    ///
+    /// `data_sources` are the ARNs the account still holds a data source under.
+    /// This is the only write a reporting operation makes, and it writes only what
+    /// was already owed at the same instant had nobody called.
+    pub fn settle(&mut self, now: SystemTime, data_sources: &BTreeSet<String>) {
+        let Some(owed) = self.owed.take_if(|owed| now >= owed.due) else {
+            return;
+        };
+        self.status = if data_sources.contains(&self.data_source_arn) {
+            owed.status
+        } else {
+            ATTACHMENT_STATUS_FAILED.to_string()
+        };
+    }
+
+    /// This attachment as `DataSourceAttachmentSummary` — what
+    /// `ListDataSourceAttachments` reports it as.
+    pub fn to_summary(&self) -> DataSourceAttachmentSummary {
+        DataSourceAttachmentSummary {
+            attachment_id: Some(self.attachment_id.clone()),
+            data_source_arn: Some(self.data_source_arn.clone()),
+            status: Some(self.status.clone()),
+        }
+    }
+}
+
+/// Where an attachment stands the instant it is asked for, and the status move the
+/// clock then owes it.
+///
+/// "If both the application and the data source are active, the attachment completes
+/// immediately with a status of ATTACHED. Otherwise, the operation returns PENDING and
+/// completes the attachment automatically once both become active" — so `active_at` is
+/// the LATEST instant either of the two becomes active, and `None` when both already
+/// are.
+pub fn attachment_outcome(active_at: Option<SystemTime>) -> (String, Option<OwedStatus>) {
+    match active_at {
+        None => (ATTACHMENT_STATUS_ATTACHED.to_string(), None),
+        Some(due) => (
+            ATTACHMENT_STATUS_PENDING.to_string(),
+            Some(OwedStatus {
+                status: ATTACHMENT_STATUS_ATTACHED.to_string(),
+                message: None,
+                due,
+            }),
+        ),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a `dataSourceArn` this account holds no
+/// data source under.
+///
+/// "The data source must be an Amazon OpenSearch Service domain", so an ARN naming no
+/// domain of this account names nothing that can be attached.
+pub fn data_source_not_found(data_source_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Data source not found: {data_source_arn}")),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an application and data source pair this
+/// account holds no attachment record for.
+pub fn attachment_not_found(id: &str, data_source_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Data source {data_source_arn} is not attached to application {id}."
+        )),
+    }
+}
+
+/// The `ConflictException` payload for a detach of a data source whose attachment has
+/// not landed yet: "throws a ConflictException if the specified data source has a
+/// PENDING attachment".
+pub fn attachment_pending(id: &str, data_source_arn: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Data source {data_source_arn} has a {ATTACHMENT_STATUS_PENDING} attachment to \
+             application {id}. Wait for the attachment to complete before detaching the data \
+             source."
+        )),
+    }
+}
+
+/// The `ConflictException` payload for a detach made while the application is not up:
+/// "the application must be in the ACTIVE state".
+pub fn application_not_active(id: &str, status: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Application {id} is {status}. The application must be \
+             {APPLICATION_STATUS_ACTIVE} to detach a data source."
+        )),
+    }
+}
+
+/// The `ConflictException` payload for an attach whose `clientToken` this application
+/// already holds an attachment under, for a DIFFERENT data source.
+///
+/// "If you retry a request with the same client token and the same parameters, the retry
+/// succeeds without performing any further actions": what the token identifies is the
+/// attach of ONE data source, so a token already identifying another data source's
+/// attach is one token for two attaches, which cannot both be the one it identifies.
+pub fn attachment_client_token_taken(
+    client_token: &str,
+    data_source_arn: &str,
+) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "ClientToken {client_token} already identifies the attachment of data source \
+             {data_source_arn}."
+        )),
+    }
+}
+
+/// The `ValidationException` payload for an attach naming both an existing workspace and
+/// one to create: `workspaceId` is "mutually exclusive with workspaceConfiguration", so
+/// a request carrying both asks for two different workspaces at once.
+pub fn workspace_selection_conflict() -> ValidationException {
+    ValidationException {
+        message: Some(
+            "workspaceId and workspaceConfiguration are mutually exclusive: name the workspace \
+             to update or the workspace to create, not both."
+                .to_string(),
+        ),
+    }
+}
+
+/// The `ValidationException` payload for an attach made while the application already
+/// holds [`ATTACHMENT_QUOTA`] attachments.
+///
+/// `AttachDataSource` models no `LimitExceededException`, so the bound on the store is
+/// reported through the client-input error it does model.
+pub fn attachment_quota_exceeded(id: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "Application {id} already holds the maximum of {ATTACHMENT_QUOTA} data source \
+             attachments."
         )),
     }
 }
@@ -3818,6 +4082,18 @@ impl Domain {
     pub fn cluster_is_up(&self) -> bool {
         self.created && self.processing_status != PROCESSING_STATUS_CREATING
     }
+
+    /// The instant this domain's cluster is up, or `None` when it already is — what a
+    /// caller waiting for the domain to become active waits for.
+    ///
+    /// A domain that is still being provisioned carries the instant its provisioning
+    /// falls due ([`Self::processing_until`]), which is when its cluster comes up.
+    pub fn cluster_up_at(&self) -> Option<SystemTime> {
+        if self.cluster_is_up() {
+            return None;
+        }
+        self.processing_until
+    }
 }
 
 /// `AutoTuneState`'s `DISABLED` value: what Auto-Tune's state is when a domain
@@ -5811,6 +6087,9 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Drives
     /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_application_id`].
     pub application_seq: u64,
+    /// Drives
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_attachment_id`].
+    pub attachment_seq: u64,
 }
 
 impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
@@ -5835,6 +6114,7 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
             vpc_endpoint_seq: 0,
             applications: BTreeMap::new(),
             application_seq: 0,
+            attachment_seq: 0,
         }
     }
 }
@@ -5873,6 +6153,11 @@ const VPC_ENDPOINT_ID_OFFSET: u128 = 8_589_934_591;
 /// from the three above for the same reason: counters that all start at zero must not
 /// render the same token.
 const APPLICATION_ID_OFFSET: u128 = 137_438_953_471;
+
+/// The bijection's constant term for a data source attachment's id. Different from the
+/// four above for the same reason: counters that all start at zero must not render the
+/// same token.
+const ATTACHMENT_ID_OFFSET: u128 = 2_199_023_255_551;
 
 /// The opaque lowercase-alphanumeric token seed `seq` scrambles to, through the
 /// bijection described on [`SUFFIX_MULTIPLIER`]: distinct seeds under one `offset`
@@ -5996,6 +6281,58 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         let application = self.applications.get_mut(id)?;
         application.settle(now);
         Some(application)
+    }
+
+    /// Mint the identifier a data source attachment is addressed by, so two
+    /// attachments never share one.
+    ///
+    /// `attachmentId` is an opaque string the model constrains not at all, so it is
+    /// minted off its own counter through the same bijection as
+    /// [`Self::mint_endpoint_suffix`], behind the `dsa-` prefix that names the resource
+    /// it identifies the way `cc-` names a cross-cluster connection.
+    pub fn mint_attachment_id(&mut self) -> String {
+        self.attachment_seq = self.attachment_seq.wrapping_add(1);
+        format!(
+            "dsa-{}",
+            opaque_token(self.attachment_seq, ATTACHMENT_ID_OFFSET)
+        )
+    }
+
+    /// Materialise the status move the clock owes every data source attachment of every
+    /// stored application, for a caller about to report on any of them.
+    ///
+    /// The data sources the account still holds are resolved FIRST, because that is
+    /// what decides whether a pending attachment that has fallen due completes or
+    /// fails: an attachment whose data source is gone can never complete.
+    pub fn settle_attachments(&mut self, now: SystemTime) {
+        let data_sources: BTreeSet<String> = self
+            .domains
+            .values()
+            .map(|domain| domain.arn.clone())
+            .collect();
+        for application in self.applications.values_mut() {
+            for attachment in application.attachments.values_mut() {
+                attachment.settle(now, &data_sources);
+            }
+        }
+    }
+
+    /// Materialise everything the clock owes the records an attachment operation reads:
+    /// the applications the attachments belong to, and the attachments' own moves.
+    ///
+    /// The ONE place the attachment operations settle, so the four of them cannot drift
+    /// apart over which records they report at `now`.
+    pub fn settle_for_attachments(&mut self, now: SystemTime) {
+        self.settle_applications(now);
+        self.settle_attachments(now);
+    }
+
+    /// The domain `arn` names, if this account holds one — how an operation that takes
+    /// a domain's ARN rather than its name resolves it.
+    ///
+    /// Reads ONLY.
+    pub fn domain_of_arn(&self, arn: &str) -> Option<&Domain> {
+        self.domains.values().find(|domain| domain.arn == arn)
     }
 
     /// Materialise the status move the clock owes every stored VPC endpoint, for a
@@ -7085,6 +7422,19 @@ pub fn max_results_out_of_range(max_results: i32, limit: i32) -> ValidationExcep
         message: Some(format!(
             "MaxResults must be between 0 and {limit}: {max_results}"
         )),
+    }
+}
+
+/// The `ValidationException` payload for a NEGATIVE page size, for a listing whose
+/// `maxResults` publishes no maximum at all.
+///
+/// A negative value is not a page size, so it is refused rather than reinterpreted,
+/// while the default zero stays the request that asks for no particular page size.
+/// There is no upper bound to report because the shape declares none: a page size past
+/// the size of the set is simply the whole set.
+pub fn negative_max_results(max_results: i32) -> ValidationException {
+    ValidationException {
+        message: Some(format!("MaxResults must not be negative: {max_results}")),
     }
 }
 

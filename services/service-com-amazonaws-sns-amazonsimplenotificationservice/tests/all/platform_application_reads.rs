@@ -577,8 +577,9 @@ async fn both_reads_refuse_an_application_the_account_does_not_hold() {
     );
 
     // Well-formed ARNs this account holds no application for: a name nobody registered,
-    // another platform of a held name, another region, another account, another
-    // partition, another service, and SNS ARNs naming another KIND of resource.
+    // another platform of a held name, another account, another service, and SNS ARNs
+    // naming another KIND of resource. An ARN naming another REGION is not one this
+    // endpoint can read at all, and is refused below.
     let missing: &[(&str, &str)] = &[
         (
             "a name nobody registered",
@@ -589,16 +590,8 @@ async fn both_reads_refuse_an_application_the_account_does_not_hold() {
             "arn:aws:sns:us-east-1:000000000000:app/APNS/held-app",
         ),
         (
-            "another region",
-            "arn:aws:sns:eu-west-1:000000000000:app/GCM/held-app",
-        ),
-        (
             "another account",
             "arn:aws:sns:us-east-1:123456789012:app/GCM/held-app",
-        ),
-        (
-            "another partition",
-            "arn:aws-us-gov:sns:us-gov-west-1:000000000000:app/GCM/held-app",
         ),
         (
             "another service",
@@ -638,6 +631,53 @@ async fn both_reads_refuse_an_application_the_account_does_not_hold() {
                 answer.element("Message").as_deref(),
                 Some(PLATFORM_APPLICATION_DOES_NOT_EXIST),
                 "case {case:?} on {operation}: expected the fixed missing-application \
+                 sentence, got {}",
+                answer.body
+            );
+            assert!(
+                endpoints_block(&answer.body).is_none(),
+                "case {case:?} on {operation}: a refused read must serve no listing, got {}",
+                answer.body
+            );
+        }
+    }
+
+    // An ARN of ANOTHER REGION: a regional endpoint serves the applications of its own
+    // region only, so such a value is refused as bad input rather than reported as an
+    // application this account does not hold.
+    let elsewhere: &[(&str, &str)] = &[
+        (
+            "another region",
+            "arn:aws:sns:eu-west-1:000000000000:app/GCM/held-app",
+        ),
+        (
+            "another partition's region",
+            "arn:aws-us-gov:sns:us-gov-west-1:000000000000:app/GCM/held-app",
+        ),
+    ];
+    for (case, arn) in elsewhere {
+        for (operation, answer) in [
+            ("GetPlatformApplicationAttributes", read_application(&sns, arn).await),
+            (
+                "ListEndpointsByPlatformApplication",
+                list_endpoints(&sns, arn, None).await,
+            ),
+        ] {
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?} on {operation}: expected 400, got {} / {}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                answer.code(),
+                "InvalidParameter",
+                "case {case:?} on {operation}: expected the InvalidParameter code, got {}",
+                answer.body
+            );
+            assert_eq!(
+                answer.element("Message").as_deref(),
+                Some("Invalid parameter: PlatformApplicationArn"),
+                "case {case:?} on {operation}: expected the member's bare refusal \
                  sentence, got {}",
                 answer.body
             );

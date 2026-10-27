@@ -50,7 +50,11 @@ use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state
 /// `POST /tags/{WorkloadArn}`, the wire form of `TagResource`. The ARN is a non-greedy
 /// `@httpLabel`, so it travels percent-encoded in ONE path segment, exactly as an SDK
 /// sends it.
-async fn tag(client: &Client, arn: &str, tags: &BTreeMap<String, String>) -> Answer {
+///
+/// `pub(crate)` because `super::create_agent_profile` tags a profile its own create
+/// stored, and a resource is tagged by exactly one operation: the two suites must not
+/// disagree about how that request is spelled.
+pub(crate) async fn tag(client: &Client, arn: &str, tags: &BTreeMap<String, String>) -> Answer {
     client
         .send(
             "POST",

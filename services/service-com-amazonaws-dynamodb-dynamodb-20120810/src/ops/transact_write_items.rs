@@ -449,7 +449,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .cloned()
                         .unwrap_or_else(|| update.key.clone());
                     let touched = applied.apply(&mut item).map_err(lift)?;
-                    for attribute in &touched {
+                    for attribute in touched.attributes() {
                         if attribute.as_str() == partition_key.as_str()
                             || Some(attribute.as_str()) == sort_key.as_deref()
                         {

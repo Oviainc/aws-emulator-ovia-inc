@@ -203,11 +203,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "You tried to update a resource that was already being updated"
                 // (`ResourceInUseException`): a table with an UpdateTable still in
                 // flight cannot be deleted until that update finishes.
+                //
+                // An index of the table in a non-ACTIVE status is the case AWS states
+                // on its own: the delete has to wait for the index lifecycle, and the
+                // sentence says so rather than naming the table.
+                let indexes_moving = table.global_secondary_indexes.iter().any(|index| {
+                    index.status(now) != crate::state::IndexStatus::Active
+                }) || table
+                    .vector_indexes
+                    .iter()
+                    .any(|index| index.status(now) != crate::state::IndexStatus::Active);
+                let detail = if indexes_moving {
+                    "Cannot delete table while indexes are being created, updated, or deleted."
+                        .to_string()
+                } else {
+                    format!("Table is being updated: {name}")
+                };
                 return Err(DeleteTableErrorModeled::ResourceInUseException(
                     ResourceInUseException {
                         message: Some(format!(
-                            "Attempt to change a resource which is still in use: Table is being \
-                             updated: {name}"
+                            "Attempt to change a resource which is still in use: {detail}"
                         )),
                     },
                 )
@@ -231,9 +246,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TableStatus::Active => {}
         }
         if table.deletion_protection_enabled {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Table {name} cannot be deleted because deletion protection is enabled"
-            )));
+            // "The table cannot be deleted" while the flag is set
+            // (`CreateTable$DeletionProtectionEnabled`): the request names the table and
+            // the flag that stands in the way, which is the setting the caller has to
+            // clear before the delete can be accepted.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Resource cannot be deleted as it is currently protected against deletion. \
+                 Disable deletion protection first.",
+            ));
         }
 
         // The clock owes the removal; the response reports the table as it stands at

@@ -179,18 +179,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(now);
 
-        // `quotaShareName` is a plain `String` in the model, so the framework admits
-        // anything: the charset and length the member documents are applied here ("up to
-        // 128 characters long … uppercase and lowercase letters, numbers, hyphens (-),
-        // and underscores (_)").
+        // `quotaShareName` is a plain `String` in the model with no `@pattern`, so the
+        // framework admits anything: the service applies the pattern the member documents
+        // ("up to 128 characters long … uppercase and lowercase letters, numbers, hyphens
+        // (-), and underscores (_)") and refuses a value outside it with the pattern
+        // sentence AWS answers, which publishes neither the length nor the charset
+        // ([`batch::name_pattern_detail`]).
         if !batch::is_valid_resource_name(&input.quota_share_name, batch::MAX_QUOTA_SHARE_NAME_LEN)
         {
             return Err(CreateQuotaShareErrorModeled::ClientException(
-                batch::client_exception_enveloped(format!(
-                    "quotaShareName must be 1 to {} letters, numbers, hyphens (-) or \
-                     underscores (_).",
-                    batch::MAX_QUOTA_SHARE_NAME_LEN
-                )),
+                batch::client_exception_enveloped(batch::name_pattern_detail("quotaShareName")),
             )
             .into());
         }

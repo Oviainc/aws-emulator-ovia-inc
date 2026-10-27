@@ -216,14 +216,18 @@ pub fn quota_message(resource: &str, maximum: usize) -> String {
     format!("Too many {resource}: this emulator stores at most {maximum}")
 }
 
-/// The `ClientException` detail for a `TagResource` whose merge would leave one resource
-/// holding more tags than [`limits::MAX_TAGS_PER_RESOURCE`].
+/// The detail the tagging layer refuses a request whose RESULTANT tag set would leave one
+/// resource holding more than [`limits::MAX_TAGS_PER_RESOURCE`] user tags with.
 ///
-/// Built from the request — the resource it named and how many tags it would end up
-/// holding — the way a Batch refusal states what the caller has to fix.
-pub fn tag_limit_message(arn: &str, requested: usize) -> String {
+/// One fixed sentence for the one rule, carrying the maximum and nothing from the request:
+/// the layer states the ceiling it holds a resource to, not how many entries the call
+/// carried. It answers BOTH ways that ceiling is reached — a request whose own `tags` map
+/// is longer than the declared length of `TagrisTagsMap`, and a merge into tags a resource
+/// already holds that would take it past the ceiling — so the two cannot drift into two
+/// sentences.
+pub fn tag_set_limit_message() -> String {
     format!(
-        "Resource {arn} would hold {requested} tags: a resource carries at most {} tags",
+        "The resultant tag set must not have more than {} user tags.",
         limits::MAX_TAGS_PER_RESOURCE
     )
 }
@@ -364,6 +368,37 @@ pub const SERVICE_ENVIRONMENTS_NOT_ATTACHABLE: &str =
 /// What `DescribeJobDefinitions` answers for a `nextToken` it did not issue — the bare
 /// detail AWS is recorded to state.
 pub const NEXT_TOKEN_NOT_PROCESSABLE: &str = "Error processing next token";
+
+/// What a `Delete*` answers for a resource whose state still accepts work: the fixed
+/// sentence for the rule — the KIND of resource that cannot be deleted while enabled, and
+/// the state to set it to first.
+///
+/// AWS states the RULE here and nothing from the request: no name, no ARN and no state
+/// value read off the record, because a resource that is not [`STATE_DISABLED`] is by the
+/// model's own `CEState`/`JQState` enums exactly an enabled one. Recorded in this form for
+/// `DeleteComputeEnvironment`, and answered by every delete of this service that requires
+/// the same precondition (`DeleteJobQueue`, `DeleteServiceEnvironment`), each naming its
+/// own kind.
+pub fn delete_enabled_message(kind: &str) -> String {
+    format!("Cannot delete an enabled {kind}, set the state to {STATE_DISABLED} first.")
+}
+
+/// What `UpdateComputeEnvironment` answers for a request carrying `computeResources` for
+/// an environment Batch does not manage: the fixed sentence for the rule, naming the
+/// environment by the ARN it is stored under.
+///
+/// `computeResources` is "details of the compute resources MANAGED by the compute
+/// environment", so an environment whose type is not [`CE_TYPE_MANAGED`] has none to
+/// update. The
+/// one value the sentence carries is the resource's ARN — the identity AWS names a
+/// compute environment by in a refusal, whichever of name or ARN the request used to
+/// reach it.
+pub fn unmanaged_compute_resources_message(compute_environment_arn: &str) -> String {
+    format!(
+        "Cannot update, compute resources not supported on unmanaged compute environment \
+         {compute_environment_arn}."
+    )
+}
 
 /// What `UpdateServiceJob` answers for a service job that has already completed — the
 /// bare detail AWS is recorded to state, which names the precondition rather than the
@@ -1903,6 +1938,38 @@ pub fn enum_membership_detail<S: AsRef<str>>(member_path: &str, allowed: &[S]) -
         member_phrase(violation_member(member_path)),
         values.join(", ")
     )
+}
+
+/// How AWS Batch words the refusal of a value outside a closed set the SERVICE holds a
+/// member to: the member as the request spells it, then the set it enforced.
+///
+/// The rejected value is not echoed, for the same reason [`enum_membership_detail`] does
+/// not echo it. The two differ in LAYER, and AWS words them differently: a member the
+/// model declares an enum for is refused by the boundary validator, in the phrasing above,
+/// while a member the model types as a plain `String` reaches a handler that applies the
+/// set itself and is recorded with this phrasing — observed for
+/// `CreateConsumableResource$resourceType`, and raised for every closed set a handler of
+/// this service applies ([`CONSUMABLE_RESOURCE_TYPES`],
+/// [`CONSUMABLE_RESOURCE_UPDATE_OPERATIONS`]).
+pub fn closed_set_detail<S: AsRef<str>>(member: &str, allowed: &[S]) -> String {
+    let values: Vec<&str> = allowed.iter().map(AsRef::as_ref).collect();
+    format!(
+        "{member} needs to be one of the following values: [{}]",
+        values.join(", ")
+    )
+}
+
+/// How AWS Batch words the refusal of a NAME that does not match the pattern it holds that
+/// member to: the member as the request spells it, then that a valid pattern governs it.
+///
+/// Neither the pattern, nor the length or the charset it admits, is stated: the service
+/// names WHICH member was malformed and that a pattern governs it, so the response does
+/// not publish a bound a client could then encode. Recorded in exactly this form for
+/// `CreateQuotaShare$quotaShareName`, and answered for every name member this service
+/// checks itself ([`is_valid_resource_name`]) — the model types each of them as a plain
+/// `String` with no `@pattern` for the boundary validator to enforce.
+pub fn name_pattern_detail(member: &str) -> String {
+    format!("{member} should match a valid pattern.")
 }
 
 /// The sentence AWS Batch's resource resolver answers when an identifier names no stored
@@ -3567,6 +3634,12 @@ pub fn policy_kind_change_message(from: &str, to: &str) -> String {
     )
 }
 
+/// The detail AWS Batch refuses a scheduling policy carrying BOTH kinds with: the fixed
+/// sentence for the rule its two members' docs state ("Only one of fairsharePolicy or
+/// quotaSharePolicy can be set"), naming the two members and nothing from the request.
+pub const POLICY_KINDS_EXCLUSIVE: &str =
+    "A scheduling policy can have either fairsharePolicy or quotaSharePolicy, but not both.";
+
 /// The refusal when a request carries a policy of neither kind or of both, or a policy
 /// outside the bounds its own members document.
 ///
@@ -3575,17 +3648,15 @@ pub fn policy_kind_change_message(from: &str, to: &str) -> String {
 /// operation that accepts the pair (`CreateSchedulingPolicy`, `UpdateSchedulingPolicy`).
 ///
 /// Each refusal carries the envelope AWS is recorded to word IT with, chosen where it is
-/// raised: the exclusivity rule and the fair-share bounds state their detail alone
-/// ([`client_exception`]), while an enum-membership refusal is one of the frontend's
-/// ([`client_exception_enveloped`]).
+/// raised: the exclusivity rule and an enum-membership refusal are the frontend's, so both
+/// carry its envelope ([`client_exception_enveloped`]), while the fair-share bounds state
+/// their detail alone ([`client_exception`]).
 pub fn validate_policy_kinds(
     fairshare: Option<&FairsharePolicy>,
     quota_share: Option<&QuotaSharePolicy>,
 ) -> Result<(), ClientException> {
     if fairshare.is_some() && quota_share.is_some() {
-        return Err(client_exception(
-            "Only one of fairsharePolicy or quotaSharePolicy can be set on a scheduling policy",
-        ));
+        return Err(client_exception_enveloped(POLICY_KINDS_EXCLUSIVE));
     }
     if let Some(quota_share) = quota_share {
         validate_quota_share_policy(quota_share)?;
@@ -3854,6 +3925,44 @@ pub fn not_found_exception(kind: &str, reference: &str) -> ClientException {
     }
 }
 
+/// The detail a tagging call's `resourceArn` is refused with when the ARN is well formed
+/// and names no resource.
+///
+/// One fixed sentence for the one condition, carrying nothing from the request — the twin
+/// of [`BAD_RESOURCE_ARN_MESSAGE`]: the tag layer states WHICH of its two refusals this is
+/// and echoes neither the ARN nor the kind of resource it would have named, where a miss
+/// the SERVICE layer finds names the reference it was given ([`not_found_exception`]).
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The refusal a tagging operation answers a well-formed `resourceArn` that resolves to no
+/// stored resource with.
+///
+/// The tagging endpoint classifies its own refusals, and the two it can raise about a
+/// `resourceArn` are different failures: a value that is not an ARN at all is a malformed
+/// request ([`malformed_resource_arn`]), while a well-formed ARN naming nothing is a
+/// MISSING resource, which that layer answers under
+/// [`crate::scaffolded::TAGGING_NOT_FOUND_CODE`] over
+/// [`RESOURCE_NOT_FOUND_MESSAGE`] — so a caller tearing a resource down can tell "already
+/// gone" from "that is not an ARN" by the code alone.
+///
+/// Shared by `ListTagsForResource`, `TagResource` and `UntagResource` so one endpoint
+/// answers one refusal, and generic over the operation's modeled error enum so each one
+/// returns it through its own error channel.
+pub fn unknown_resource_arn<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::tagging_not_found(RESOURCE_NOT_FOUND_MESSAGE)
+}
+
+/// The refusal a tagging operation answers a request whose resultant tag set would exceed
+/// the ceiling with ([`tag_set_limit_message`]).
+///
+/// Raised under the tagging endpoint's own code, as the boundary validator's refusal of a
+/// `tags` map longer than `TagrisTagsMap` declares is (`crate::service`): one rule, one
+/// code and one sentence, whether the request alone breaks the ceiling or the merge into
+/// what the resource already holds does.
+pub fn tag_set_limit_exceeded<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::tagging_refusal(tag_set_limit_message())
+}
+
 /// The detail a tagging call's `resourceArn` is refused with when the value is not an ARN
 /// at all.
 ///
@@ -3869,8 +3978,8 @@ pub const BAD_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn: bad synt
 /// service's, so a value of the wrong SHAPE is refused there, under that frontend's code
 /// ([`crate::scaffolded::TAGGING_REFUSAL_CODE`], HTTP 400) — the same code it refuses a
 /// tag MAP outside its declared bounds with — and never reaches this service's lookup. An
-/// ARN the lookup then misses is the service's own `ClientException`
-/// ([`not_found_exception`]): a well-formed reference to a resource that is not there.
+/// ARN the lookup then misses is that layer's not-found instead ([`unknown_resource_arn`]):
+/// a well-formed reference to a resource that is not there.
 ///
 /// Shared by `ListTagsForResource`, `TagResource` and `UntagResource` so one endpoint
 /// answers one refusal, and generic over the operation's modeled error enum so each one

@@ -3940,6 +3940,33 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .count()
     }
 
+    /// The attachment `attachment_id` names WITHIN the core network `core_network_id`, for
+    /// the operations that address a stored attachment THROUGH its core network and mint
+    /// nothing — the routing policy label ones.
+    ///
+    /// Both ids address resources that have to be stored already, so an id naming nothing
+    /// stored is the service's not-found refusal rather than the field failure a create
+    /// gives for a reference it would hang a new resource off. The resource the request
+    /// reaches the attachment THROUGH is checked first, the rule every operation of this
+    /// service that addresses a child of a core network follows. The attachment is then
+    /// resolved within that core network: one id space holds every attachment kind and a
+    /// label applies to any of them, so the kind is never checked — but an attachment
+    /// stored under a DIFFERENT core network is not an attachment of the one addressed, so
+    /// it is as absent here as an id nothing was ever stored for.
+    pub fn attachment_of_core_network_mut(
+        &mut self,
+        core_network_id: &str,
+        attachment_id: &str,
+    ) -> Result<&mut AttachmentRecord, ResourceNotFoundException> {
+        if !self.core_networks.contains_key(core_network_id) {
+            return Err(resource_not_found(CORE_NETWORK_KIND, core_network_id));
+        }
+        self.attachments
+            .get_mut(attachment_id)
+            .filter(|record| record.core_network_id == core_network_id)
+            .ok_or_else(|| resource_not_found(ATTACHMENT_KIND, attachment_id))
+    }
+
     /// How many peerings `core_network_id` holds, for the per-core-network quota.
     pub fn peering_count_of_core_network(&self, core_network_id: &str) -> usize {
         self.peerings
