@@ -50,6 +50,18 @@
 //! replacing a task somebody else stopped, re-placing a daemon's task when a container
 //! instance registers later — is not modelled: nothing runs between calls, and a
 //! reporting operation may not place a task nobody asked for.
+//!
+//! ## The rollouts that WAIT
+//!
+//! A rollout whose deployment configuration carries a `PAUSE` lifecycle hook does not run
+//! to its end on its own: `ContinueServiceDeployment` is what takes it on. Travelling to
+//! the stage it pauses at is itself a span the clock settles
+//! ([`ServiceDeploymentRecord::hook_due_at`]), and so is the end the hook action takes it
+//! to ([`ServiceDeploymentRecord::complete_due_at`] for a `CONTINUE`,
+//! [`ServiceDeploymentRecord::rollback_due_at`] for a `ROLLBACK`), and the clock pass
+//! `advance_service_deployments` materialises each of them. A hook whose target type
+//! invokes a Lambda function pauses nothing here: no function is invoked, so no rollout is
+//! reported as waiting on work that is not being done.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -63,6 +75,7 @@ use crate::ops::types::{
     DaemonDeploymentConfiguration, DaemonSummary,
     DaemonTaskDefinition, DaemonTaskDefinitionSummary, DaemonVolume, Deployment,
     DeploymentCircuitBreaker, DeploymentConfiguration, DeploymentController,
+    DeploymentLifecycleHookDetail,
     ECSExpressGatewayService, EphemeralStorage, ExpressGatewayContainer,
     ExpressGatewayScalingTarget, ExpressGatewayServiceConfiguration,
     ExpressGatewayServiceNetworkConfiguration, ExpressGatewayServiceStatus,
@@ -70,7 +83,7 @@ use crate::ops::types::{
     NetworkConfiguration,
     PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProtectedTask,
     ProxyConfiguration,
-    Resource, RuntimePlatform, Scale, Service, ServiceConnectConfiguration,
+    Resource, Rollback, RuntimePlatform, Scale, Service, ServiceConnectConfiguration,
     ServiceCurrentRevisionSummary, ServiceDeployment, ServiceDeploymentAlarms,
     ServiceDeploymentBrief, ServiceDeploymentCircuitBreaker, ServiceEvent, ServiceRegistry,
     ServiceRevisionSummary,
@@ -1127,6 +1140,93 @@ pub const SERVICE_DEPLOYMENT_SUCCESSFUL: &str = "SUCCESSFUL";
 /// service it was rolling out was deleted. Those two are the only ways a rollout ends
 /// early here: nothing else interrupts one, so no deployment is left open forever.
 pub const SERVICE_DEPLOYMENT_STOPPED: &str = "STOPPED";
+/// See [`SERVICE_DEPLOYMENT_IN_PROGRESS`]: the status of a rollout that is being UNDONE,
+/// because the action taken on the lifecycle hook it paused at was
+/// [`LIFECYCLE_HOOK_ACTION_ROLLBACK`] — "ROLLBACK - Rolls back the deployment to the
+/// previous service revision."
+pub const SERVICE_DEPLOYMENT_ROLLBACK_IN_PROGRESS: &str = "ROLLBACK_IN_PROGRESS";
+/// See [`SERVICE_DEPLOYMENT_ROLLBACK_IN_PROGRESS`]: the status of a rollout whose rollback
+/// has run its course, so the previous service revision is the one the service runs again.
+pub const SERVICE_DEPLOYMENT_ROLLBACK_SUCCESSFUL: &str = "ROLLBACK_SUCCESSFUL";
+/// See [`SERVICE_DEPLOYMENT_ROLLBACK_IN_PROGRESS`]: the status of a rollout whose rollback
+/// could not be carried out, because there is no earlier service revision of the service
+/// to put back.
+pub const SERVICE_DEPLOYMENT_ROLLBACK_FAILED: &str = "ROLLBACK_FAILED";
+
+/// The `DeploymentLifecycleHookTargetType` of a hook that PAUSES a rollout rather than
+/// running custom logic: "PAUSE - Pauses the deployment at the specified lifecycle stage
+/// until you call `ContinueServiceDeployment` to continue or roll back." The other target
+/// type "invokes a Lambda function at the specified lifecycle stage", which nothing here
+/// runs, so only a PAUSE hook stops a rollout in this emulator.
+pub const LIFECYCLE_HOOK_TARGET_PAUSE: &str = "PAUSE";
+
+/// `DeploymentLifecycleHookDetail$status` of a PAUSE hook the rollout has REACHED and that
+/// is waiting for the action `ContinueServiceDeployment` takes — one of
+/// `DeploymentLifecycleHookStatus`, and the state the operation's own doc describes: "the
+/// deployment pauses and waits for an explicit action".
+pub const LIFECYCLE_HOOK_AWAITING_ACTION: &str = "AWAITING_ACTION";
+
+/// See [`LIFECYCLE_HOOK_AWAITING_ACTION`]: the status of a hook whose action has been
+/// taken, so the wait is over.
+pub const LIFECYCLE_HOOK_SUCCEEDED: &str = "SUCCEEDED";
+
+/// See [`LIFECYCLE_HOOK_AWAITING_ACTION`]: the status of a hook whose wait never
+/// completed, because the rollout it belonged to ended first — a newer deployment replaced
+/// it, or the service it was rolling out was deleted.
+pub const LIFECYCLE_HOOK_FAILED: &str = "FAILED";
+
+/// See [`LIFECYCLE_HOOK_AWAITING_ACTION`]: the status of a hook nobody acted on in time —
+/// `DeploymentLifecycleHookDetail$expiresAt`: "The time when the lifecycle hook times out.
+/// If the hook has not been completed by this time, Amazon ECS takes the timeout action."
+pub const LIFECYCLE_HOOK_TIMED_OUT: &str = "TIMED_OUT";
+
+/// The `DeploymentLifecycleHookAction` that resumes a paused rollout: "CONTINUE - Proceeds
+/// the deployment to the next lifecycle stage". Also the action a request that names none
+/// takes, from `ContinueServiceDeployment$action`: "If no value is specified, the default
+/// action is CONTINUE."
+pub const LIFECYCLE_HOOK_ACTION_CONTINUE: &str = "CONTINUE";
+
+/// The `DeploymentLifecycleHookAction` that undoes it: "ROLLBACK - Rolls back the
+/// deployment to the previous service revision."
+pub const LIFECYCLE_HOOK_ACTION_ROLLBACK: &str = "ROLLBACK";
+
+/// How long Amazon ECS waits for a lifecycle hook that configured no timeout, from
+/// `DeploymentLifecycleHookTimeoutConfiguration$timeoutInMinutes`: "The number of minutes
+/// Amazon ECS waits for the lifecycle hook to complete before taking the timeout action.
+/// Default: 1440 (24 hours)".
+pub const DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MINUTES: i32 = 1440;
+
+/// What Amazon ECS does with a hook that configured no timeout action, from that
+/// configuration's `action` doc: "Default: ROLLBACK".
+pub const DEFAULT_LIFECYCLE_HOOK_TIMEOUT_ACTION: &str = LIFECYCLE_HOOK_ACTION_ROLLBACK;
+
+/// The stages a deployment lifecycle hook can run at, in the order a rollout passes
+/// through them.
+///
+/// The order is the one the `ServiceDeployment$lifecycleStage` doc lists the stages in
+/// (`smithy_query(query="doc", shape="ServiceDeployment", member="lifecycleStage")`),
+/// narrowed to the eight a hook may name (`DeploymentLifecycleHookStage`, whose generated
+/// `DEPLOYMENT_LIFECYCLE_HOOK_STAGE_VALUES` lists the same eight alphabetically). A rollout
+/// configured to pause at several of them reaches the earliest of those first.
+pub const LIFECYCLE_HOOK_STAGE_ORDER: [&str; 8] = [
+    "RECONCILE_SERVICE",
+    "PRE_SCALE_UP",
+    "POST_SCALE_UP",
+    "TEST_TRAFFIC_SHIFT",
+    "POST_TEST_TRAFFIC_SHIFT",
+    "PRE_PRODUCTION_TRAFFIC_SHIFT",
+    "PRODUCTION_TRAFFIC_SHIFT",
+    "POST_PRODUCTION_TRAFFIC_SHIFT",
+];
+
+/// How far through [`LIFECYCLE_HOOK_STAGE_ORDER`] `stage` is, or `None` for a stage that
+/// order does not name (one a newer model adds, which is then reached after every stage it
+/// does name).
+fn lifecycle_stage_index(stage: &str) -> Option<usize> {
+    LIFECYCLE_HOOK_STAGE_ORDER
+        .iter()
+        .position(|named| *named == stage)
+}
 
 /// `ListServiceDeployments`'s page size when the caller gives no `maxResults`, from that
 /// member's own doc: "This value can be between 1 and 100. If this parameter isn't used,
@@ -3127,6 +3227,126 @@ pub struct ServiceDeploymentRecord {
     /// service afterwards. The failure-detection mechanisms this record reports (the
     /// circuit breaker and the CloudWatch alarms) are the ones it turned on.
     pub deployment_configuration: DeploymentConfiguration,
+    /// The region this rollout was started in, so the redeployment a ROLLBACK performs
+    /// mints its ARNs in the same region as the rollout it undoes.
+    pub region: String,
+    /// The task-definition revision this rollout released, as the `(family, revision)` key
+    /// the store holds it under. `ServiceDeployment$targetServiceRevision` is "the workload
+    /// configuration being deployed", and the revision is the part of it a ROLLBACK has to
+    /// put back when a later rollout is rolled back to this one.
+    pub task_definition: Option<(String, i32)>,
+    /// The PAUSE lifecycle hooks this rollout has REACHED, oldest first — what
+    /// `ServiceDeployment$lifecycleHookDetails` reports ("the details of the lifecycle
+    /// hooks for the current service deployment").
+    pub lifecycle_hooks: Vec<LifecycleHookRecord>,
+    /// The PAUSE stops still AHEAD of this rollout, in the order it reaches them, as the
+    /// deployment configuration it runs under configured them
+    /// ([`lifecycle_hook_stops`]).
+    pub pending_hook_stops: Vec<LifecycleHookStop>,
+    /// When the next of [`Self::pending_hook_stops`] is REACHED, or `None` when no stage is
+    /// being approached. A rollout does not stand at a hooked stage the instant the call
+    /// that started or resumed it answers: the CLOCK takes it there
+    /// ([`TRANSITION_SPAN`]), stored rather than slept on.
+    pub hook_due_at: Option<SystemTime>,
+    /// When this rollout, resumed by a [`LIFECYCLE_HOOK_ACTION_CONTINUE`] with no stop left
+    /// ahead of it, reaches its end, or `None` for a rollout no hook action resumed.
+    pub complete_due_at: Option<SystemTime>,
+    /// When the ROLLBACK this rollout was ended by has run its course, or `None` for a
+    /// rollout that is not rolling back.
+    pub rollback_due_at: Option<SystemTime>,
+    /// `ServiceDeployment$rollback`: "The rollback options the service deployment uses when
+    /// the deployment fails" — carried by exactly the rollouts a rollback ended.
+    pub rollback: Option<Rollback>,
+}
+
+/// One PAUSE lifecycle hook of a rollout, as the rollout reached it.
+///
+/// `DeploymentLifecycleHookDetail` is "the details of a deployment lifecycle hook that is
+/// active during a service deployment", and its `hookId` is what
+/// `ContinueServiceDeployment` acts on: "Use this value when calling
+/// `ContinueServiceDeployment` to continue or roll back a paused deployment."
+#[derive(Debug, Clone)]
+pub struct LifecycleHookRecord {
+    /// `DeploymentLifecycleHookDetail$hookId`, minted when the rollout reached this hook so
+    /// every hook of every rollout is distinct.
+    pub hook_id: String,
+    /// The `ServiceDeploymentLifecycleStage` the rollout stands at while this hook waits.
+    pub stage: String,
+    /// One of `DeploymentLifecycleHookStatus`; see [`LIFECYCLE_HOOK_AWAITING_ACTION`].
+    pub status: String,
+    /// `DeploymentLifecycleHookDetail$expiresAt`: "The time when the lifecycle hook times
+    /// out. If the hook has not been completed by this time, Amazon ECS takes the timeout
+    /// action" — the instant the hook was reached plus the timeout its configuration set.
+    pub expires_at: SystemTime,
+    /// `DeploymentLifecycleHookDetail$timeoutAction`: "The action Amazon ECS takes when the
+    /// lifecycle hook times out."
+    pub timeout_action: String,
+}
+
+/// A PAUSE stop a rollout has ahead of it: the stage it will pause at, with the timeout
+/// the hook configured for that wait.
+#[derive(Debug, Clone)]
+pub struct LifecycleHookStop {
+    pub stage: String,
+    /// `DeploymentLifecycleHookTimeoutConfiguration$timeoutInMinutes`, defaulted to
+    /// [`DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MINUTES`].
+    pub timeout_minutes: i32,
+    /// That configuration's `action`, defaulted to
+    /// [`DEFAULT_LIFECYCLE_HOOK_TIMEOUT_ACTION`].
+    pub timeout_action: String,
+}
+
+/// Why the lifecycle-hook action a request asks for cannot be taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleHookRefusal {
+    /// No stored rollout carries the service-deployment ARN the request named.
+    NoSuchDeployment,
+    /// That rollout holds no hook with the id the request named waiting for an action.
+    NotAwaitingAction,
+    /// A ROLLBACK was asked for on the FIRST rollout of a service, which has no earlier
+    /// service revision to put back.
+    NoPreviousRevision,
+}
+
+/// The PAUSE stops one rollout has, in the order it reaches them.
+///
+/// `DeploymentConfiguration$lifecycleHooks` is "an array of deployment lifecycle hook
+/// objects to run custom logic or pause the deployment at specific stages of the deployment
+/// lifecycle", and each hook names every stage it runs at
+/// (`DeploymentLifecycleHook$lifecycleStages`), so one hook configured for two stages stops
+/// the rollout twice. Only a [`LIFECYCLE_HOOK_TARGET_PAUSE`] hook stops it, and a stage
+/// named by two hooks stops it once: the rollout stands at a stage, not at a configuration
+/// entry.
+fn lifecycle_hook_stops(configuration: &DeploymentConfiguration) -> Vec<LifecycleHookStop> {
+    let mut stops: Vec<LifecycleHookStop> = configuration
+        .lifecycle_hooks
+        .iter()
+        .flatten()
+        .filter(|hook| hook.target_type.as_deref() == Some(LIFECYCLE_HOOK_TARGET_PAUSE))
+        .flat_map(|hook| {
+            let timeout = hook.timeout_configuration.as_ref();
+            let minutes = timeout
+                .and_then(|timeout| timeout.timeout_in_minutes)
+                .unwrap_or(DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MINUTES);
+            let action = timeout
+                .and_then(|timeout| timeout.action.clone())
+                .unwrap_or_else(|| DEFAULT_LIFECYCLE_HOOK_TIMEOUT_ACTION.to_string());
+            hook.lifecycle_stages
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(move |stage| LifecycleHookStop {
+                    stage,
+                    timeout_minutes: minutes,
+                    timeout_action: action.clone(),
+                })
+        })
+        .collect();
+    // The rollout reaches the stages in the documented order
+    // ([`LIFECYCLE_HOOK_STAGE_ORDER`]), whatever order the configuration lists them in.
+    stops.sort_by_key(|stop| lifecycle_stage_index(&stop.stage).unwrap_or(usize::MAX));
+    stops.dedup_by(|left, right| left.stage == right.stage);
+    stops
 }
 
 impl ServiceDeploymentRecord {
@@ -3134,6 +3354,26 @@ impl ServiceDeploymentRecord {
     /// so a reported status and a reported finish time can never disagree.
     pub fn is_finished(&self) -> bool {
         self.finished_at.is_some()
+    }
+
+    /// The PAUSE hook this rollout is waiting on, if it stands at one.
+    pub fn awaiting_hook(&self) -> Option<&LifecycleHookRecord> {
+        self.lifecycle_hooks
+            .iter()
+            .find(|hook| hook.status == LIFECYCLE_HOOK_AWAITING_ACTION)
+    }
+
+    /// Whether this rollout still owes a wait at a PAUSE hook — one it stands at now, or
+    /// one it has not reached yet.
+    ///
+    /// `ContinueServiceDeployment`: "When a service deployment reaches a lifecycle stage
+    /// that has a PAUSE hook configured, the deployment pauses and waits for an explicit
+    /// action" — so such a rollout does not reach its own end until that action is taken,
+    /// however settled the task set it placed is.
+    pub fn awaits_lifecycle_action(&self) -> bool {
+        self.awaiting_hook().is_some()
+            || !self.pending_hook_stops.is_empty()
+            || self.hook_due_at.is_some()
     }
 
     /// The key a listing orders deployments by: the `createdAt` the brief reports, with
@@ -3867,6 +4107,9 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Monotonic source of service-deployment ids, so every service deployment of every
     /// service is distinct.
     next_service_deployment_seq: u64,
+    /// Monotonic source of lifecycle-hook ids, so every PAUSE hook of every rollout is
+    /// distinct.
+    next_lifecycle_hook_seq: u64,
     /// Monotonic source of service-revision ids, so every revision of every service is
     /// distinct.
     next_service_revision_seq: u64,
@@ -3999,6 +4242,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }
             }
         }
+        self.advance_service_deployments(now);
         self.settle_services(now);
     }
 
@@ -4039,6 +4283,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // steady state the service reaches, not a moment before or after.
             let settled_deployment = settled.and_then(|_| {
                 self.current_service_deployment(service)
+                    // A rollout that still owes a wait at a PAUSE lifecycle hook has not
+                    // reached its end, however settled the task set it placed is: it ends
+                    // where the action taken on that hook takes it.
+                    .filter(|deployment| !deployment.awaits_lifecycle_action())
                     .map(|deployment| deployment.arn.clone())
             });
             // A superseded deployment is reported while it is "in the process of being
@@ -4462,6 +4710,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         key: &(String, String),
         region: &str,
         at: DateTime,
+        now: SystemTime,
     ) -> Option<String> {
         let service = self.services.get(key)?;
         if !service.places_tasks() {
@@ -4474,6 +4723,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let cluster_arn = service.cluster_arn.clone();
         let target_service_revision_arn = service.service_revision_arn.clone();
         let deployment_configuration = service.deployment_configuration.clone();
+        let task_definition = service.task_definition.clone();
+        // The stages this rollout pauses at, as the configuration it runs under configured
+        // them. The FIRST of them is not reached in this call: the rollout travels to it,
+        // which is a span the clock settles.
+        let pending_hook_stops = lifecycle_hook_stops(&deployment_configuration);
+        let hook_due_at = (!pending_hook_stops.is_empty()).then(|| now + TRANSITION_SPAN);
         // A rollout this one replaces never reaches the steady state it was rolling out:
         // its tasks are the ones `scale_service` stops as superseded, so it ends here
         // rather than staying open for a steady state that can no longer arrive.
@@ -4499,10 +4754,307 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 target_service_revision_arn,
                 status: SERVICE_DEPLOYMENT_IN_PROGRESS.to_string(),
                 deployment_configuration,
+                region: region.to_string(),
+                task_definition,
+                lifecycle_hooks: Vec::new(),
+                pending_hook_stops,
+                hook_due_at,
+                complete_due_at: None,
+                rollback_due_at: None,
+                rollback: None,
             },
         );
         self.prune_service_deployments(&service_arn);
         Some(arn)
+    }
+
+    /// Mint the id of one PAUSE lifecycle hook of a rollout.
+    ///
+    /// `DeploymentLifecycleHookDetail$hookId` is the id `ContinueServiceDeployment` acts
+    /// on; Amazon ECS spells an id of this kind as a UUID ([`uuid_from_sequence`]), and the
+    /// counter is what makes every hook of every rollout distinct.
+    fn next_lifecycle_hook_id(&mut self) -> String {
+        self.next_lifecycle_hook_seq += 1;
+        uuid_from_sequence(self.next_lifecycle_hook_seq)
+    }
+
+    /// Materialise the SERVICE-DEPLOYMENT transitions the clock owes, as of `now`: the
+    /// PAUSE lifecycle stage a rollout reaches, the timeout action a hook nobody acted on
+    /// in time falls to, and the end of a rollout a hook action resumed or rolled back.
+    ///
+    /// Each was owed at this instant whether or not anybody called, so a reporting
+    /// operation may run them, and each happens at most once because the instant it falls
+    /// due is cleared with it.
+    fn advance_service_deployments(&mut self, now: SystemTime) {
+        let arns: Vec<String> = self.service_deployments.keys().cloned().collect();
+        for arn in arns {
+            // The hooked stage the rollout was travelling to: once that is due it stands at
+            // the stage, and the hook there is waiting for its action.
+            let reached = self
+                .service_deployments
+                .get(&arn)
+                .and_then(|record| record.hook_due_at)
+                .filter(|due| *due <= now);
+            if let Some(due) = reached {
+                if let Some(stop) = self
+                    .service_deployments
+                    .get_mut(&arn)
+                    .and_then(|record| {
+                        record.hook_due_at = None;
+                        (!record.pending_hook_stops.is_empty())
+                            .then(|| record.pending_hook_stops.remove(0))
+                    })
+                {
+                    // Minted only once the stop it belongs to is the rollout's: an id is
+                    // never burned on a hook nothing reached.
+                    let hook_id = self.next_lifecycle_hook_id();
+                    if let Some(record) = self.service_deployments.get_mut(&arn) {
+                        let timeout = u64::try_from(stop.timeout_minutes).unwrap_or(0);
+                        record.lifecycle_hooks.push(LifecycleHookRecord {
+                            hook_id,
+                            stage: stop.stage,
+                            status: LIFECYCLE_HOOK_AWAITING_ACTION.to_string(),
+                            expires_at: due + Duration::from_secs(timeout * 60),
+                            timeout_action: stop.timeout_action,
+                        });
+                    }
+                }
+            }
+            // The hook whose wait ran out: "If the hook has not been completed by this
+            // time, Amazon ECS takes the timeout action."
+            let expired = self.service_deployments.get(&arn).and_then(|record| {
+                record
+                    .awaiting_hook()
+                    .filter(|hook| hook.expires_at <= now)
+                    .map(|hook| (hook.hook_id.clone(), hook.timeout_action.clone(), hook.expires_at))
+            });
+            if let Some((hook_id, action, at)) = expired {
+                let refusal = self.resume_service_deployment(&arn, &action, at).err();
+                if let Some(record) = self.service_deployments.get_mut(&arn) {
+                    if let Some(hook) = record
+                        .lifecycle_hooks
+                        .iter_mut()
+                        .find(|hook| hook.hook_id == hook_id)
+                    {
+                        hook.status = LIFECYCLE_HOOK_TIMED_OUT.to_string();
+                    }
+                    // A rollback the service has no earlier revision for cannot be carried
+                    // out, and nobody is left to refuse it to: the rollout ends there.
+                    if refusal.is_some() {
+                        record.status = SERVICE_DEPLOYMENT_ROLLBACK_FAILED.to_string();
+                        record.status_reason = no_previous_revision_reason(&record.service_arn);
+                        record.finished_at = Some(DateTime::from(at));
+                    }
+                }
+            }
+            // The end of a rollout a CONTINUE resumed with no stop left ahead of it: it
+            // reached the steady state it was rolling out.
+            let completed = self
+                .service_deployments
+                .get(&arn)
+                .and_then(|record| record.complete_due_at)
+                .filter(|due| *due <= now);
+            if let Some(due) = completed {
+                if let Some(record) = self.service_deployments.get_mut(&arn) {
+                    record.complete_due_at = None;
+                    if !record.is_finished() {
+                        record.status = SERVICE_DEPLOYMENT_SUCCESSFUL.to_string();
+                        record.status_reason = rollout_state_reason(&record.deployment_id, true);
+                        record.finished_at = Some(DateTime::from(due));
+                    }
+                }
+            }
+            // The end of a rollout a ROLLBACK undid: the previous service revision is the
+            // one the service runs again.
+            let rolled_back = self
+                .service_deployments
+                .get(&arn)
+                .and_then(|record| record.rollback_due_at)
+                .filter(|due| *due <= now);
+            if let Some(due) = rolled_back {
+                if let Some(record) = self.service_deployments.get_mut(&arn) {
+                    record.rollback_due_at = None;
+                    if !record.is_finished() {
+                        record.status = SERVICE_DEPLOYMENT_ROLLBACK_SUCCESSFUL.to_string();
+                        record.finished_at = Some(DateTime::from(due));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Take `action` on the PAUSE lifecycle hook `hook_id` of the rollout `arn` records, as
+    /// `ContinueServiceDeployment` asks: "Use this API to either continue the deployment to
+    /// the next stage or roll back to the previous service revision."
+    ///
+    /// Only a hook the rollout has REACHED and that is still waiting can be acted on
+    /// (`ContinueServiceDeployment$hookId`: "The ID of the PAUSED lifecycle hook to act
+    /// on"), so a rollout that stands at no hook, a hook that is not the one waiting and a
+    /// hook whose action was already taken are each refused and change nothing.
+    pub fn act_on_lifecycle_hook(
+        &mut self,
+        arn: &str,
+        hook_id: &str,
+        action: &str,
+        now: SystemTime,
+    ) -> Result<(), LifecycleHookRefusal> {
+        let record = self
+            .service_deployments
+            .get(arn)
+            .ok_or(LifecycleHookRefusal::NoSuchDeployment)?;
+        if record
+            .awaiting_hook()
+            .is_none_or(|hook| hook.hook_id != hook_id)
+        {
+            return Err(LifecycleHookRefusal::NotAwaitingAction);
+        }
+        // The action is taken BEFORE the hook is marked, so a rollback that cannot be
+        // carried out leaves the hook waiting for one that can.
+        self.resume_service_deployment(arn, action, now)?;
+        if let Some(record) = self.service_deployments.get_mut(arn) {
+            if let Some(hook) = record
+                .lifecycle_hooks
+                .iter_mut()
+                .find(|hook| hook.hook_id == hook_id)
+            {
+                hook.status = LIFECYCLE_HOOK_SUCCEEDED.to_string();
+            }
+        }
+        Ok(())
+    }
+
+    /// Resume the rollout `arn` records with `action`, the hook action a caller took or a
+    /// hook's own timeout fell to.
+    ///
+    /// [`LIFECYCLE_HOOK_ACTION_CONTINUE`] "proceeds the deployment to the next lifecycle
+    /// stage" — the next stage it pauses at, or, when it has none left, its own end. Both
+    /// are spans the CLOCK settles: the rollout travels on from where it stood.
+    fn resume_service_deployment(
+        &mut self,
+        arn: &str,
+        action: &str,
+        at: SystemTime,
+    ) -> Result<(), LifecycleHookRefusal> {
+        if action == LIFECYCLE_HOOK_ACTION_ROLLBACK {
+            return self.roll_back_service_deployment(arn, at);
+        }
+        let record = self
+            .service_deployments
+            .get_mut(arn)
+            .ok_or(LifecycleHookRefusal::NoSuchDeployment)?;
+        if record.pending_hook_stops.is_empty() {
+            record.complete_due_at = Some(at + TRANSITION_SPAN);
+        } else {
+            record.hook_due_at = Some(at + TRANSITION_SPAN);
+        }
+        Ok(())
+    }
+
+    /// Roll the rollout `arn` records back: "ROLLBACK - Rolls back the deployment to the
+    /// previous service revision."
+    ///
+    /// The previous revision is the one the rollout just before this one released
+    /// (`ServiceDeployment$sourceServiceRevisions`: "the currently deployed workload
+    /// configuration"), so a service's FIRST rollout has none and the rollback is refused.
+    ///
+    /// Putting that revision back means running it again: the scheduler replaces the task
+    /// set this rollout placed with one from the previous revision, which is a rollout of
+    /// its own and is recorded like any other ([`Self::start_service_deployment`]). The
+    /// rollout being undone keeps its own identity and ends in
+    /// [`SERVICE_DEPLOYMENT_ROLLBACK_SUCCESSFUL`], carrying the `rollback` that names the
+    /// revision which was deployed in its place.
+    fn roll_back_service_deployment(
+        &mut self,
+        arn: &str,
+        at: SystemTime,
+    ) -> Result<(), LifecycleHookRefusal> {
+        let record = self
+            .service_deployments
+            .get(arn)
+            .ok_or(LifecycleHookRefusal::NoSuchDeployment)?
+            .clone();
+        let source = self
+            .service_deployments
+            .values()
+            .filter(|other| {
+                other.service_arn == record.service_arn && other.order_key() < record.order_key()
+            })
+            .max_by(|left, right| left.order_key().cmp(&right.order_key()))
+            .cloned()
+            .ok_or(LifecycleHookRefusal::NoPreviousRevision)?;
+        let definition = source
+            .task_definition
+            .as_ref()
+            .and_then(|key| self.task_definitions.get(key))
+            .cloned()
+            .ok_or(LifecycleHookRefusal::NoPreviousRevision)?;
+        let key = (record.cluster_name.clone(), record.service_name.clone());
+        let timestamp = DateTime::from(at);
+        let deployment_id = self.next_deployment_id();
+        // The service a rollout belongs to outlives it, but a rollout of a service that is
+        // gone has nothing to put a revision back onto.
+        let Some(service) = self.services.get_mut(&key) else {
+            return Err(LifecycleHookRefusal::NoPreviousRevision);
+        };
+        // The rollout being undone is the one whose task set is now being replaced, exactly
+        // as a forced redeployment replaces the one it supersedes.
+        service.supersede_deployment(at);
+        service.deployment_id = deployment_id;
+        service.deployment_created_at = timestamp;
+        service.deployment_updated_at = timestamp;
+        service.deployment_rollout_completed = false;
+        service.deployment_steady_due_at = Some(at + TRANSITION_SPAN);
+        service.deployment_stable_due_at = Some(at + TRANSITION_SPAN);
+        service.version += 1;
+        service.task_definition = source.task_definition.clone();
+        service.task_definition_arn = Some(definition.arn.clone());
+        // A service revision IS a workload configuration, so running the previous one again
+        // runs that same revision rather than minting a new one — which is the revision
+        // `Rollback$serviceRevisionArn` names: "The ARN of the service revision deployed as
+        // part of the rollback."
+        service.service_revision_arn = source.target_service_revision_arn.clone();
+        // The scheduler brings the task set back in line with the revision the service runs
+        // again. A placement this emulator cannot hold leaves the task set alone; the
+        // rollback itself is recorded either way, as the deployment it undoes is over.
+        let _ = self.scale_service(&key, &definition, &record.region, at);
+        let redeployed = self.start_service_deployment(&key, &record.region, timestamp, at);
+        // That redeployment is how this rollback puts the previous revision back, not a
+        // release somebody asked for, so it waits at no lifecycle hook: a rollback that
+        // paused again would leave the service short of the revision the caller asked to go
+        // back to.
+        if let Some(record) = redeployed
+            .as_deref()
+            .and_then(|arn| self.service_deployments.get_mut(arn))
+        {
+            record.pending_hook_stops.clear();
+            record.hook_due_at = None;
+        }
+        // Written AFTER that redeployment, which ends every open rollout of the service:
+        // this one did not merely stop, it was rolled back, and its rollback is still under
+        // way until the clock settles it.
+        if let Some(record) = self.service_deployments.get_mut(arn) {
+            record.status = SERVICE_DEPLOYMENT_ROLLBACK_IN_PROGRESS.to_string();
+            record.status_reason = format!(
+                "ECS deployment {} was rolled back to service revision {}.",
+                record.deployment_id, source.target_service_revision_arn
+            );
+            record.finished_at = None;
+            record.complete_due_at = None;
+            record.hook_due_at = None;
+            record.pending_hook_stops.clear();
+            record.rollback_due_at = Some(at + TRANSITION_SPAN);
+            record.rollback = Some(Rollback {
+                // "The reason the rollback happened. For example, the circuit breaker
+                // initiated the rollback operation" — this one was asked for.
+                reason: Some(format!(
+                    "The {LIFECYCLE_HOOK_ACTION_ROLLBACK} action was taken on the paused \
+                     lifecycle hook of this service deployment."
+                )),
+                started_at: Some(timestamp),
+                service_revision_arn: Some(source.target_service_revision_arn.clone()),
+            });
+        }
+        Ok(())
     }
 
     /// End every rollout of `service_arn` that has not finished yet, at `at`.
@@ -4522,6 +5074,22 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 deployment.status = status.to_string();
                 deployment.status_reason = reason.to_string();
                 deployment.finished_at = Some(at);
+                // A rollout that has ended waits for nothing: the hook it stood at never
+                // got its action, and the stages ahead of it are never reached — so there
+                // is no hook left for `ContinueServiceDeployment` to act on.
+                for hook in deployment
+                    .lifecycle_hooks
+                    .iter_mut()
+                    .filter(|hook| hook.status == LIFECYCLE_HOOK_AWAITING_ACTION)
+                {
+                    hook.status = LIFECYCLE_HOOK_FAILED.to_string();
+                }
+                deployment.pending_hook_stops.clear();
+                deployment.hook_due_at = None;
+                deployment.complete_due_at = None;
+                // A rollback that had not run its course when the rollout ended does not
+                // run it afterwards: this end is the one the rollout keeps.
+                deployment.rollback_due_at = None;
             }
         }
     }
@@ -4615,16 +5183,27 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             target_service_revision: Some(target_service_revision),
             status: Some(record.status.clone()),
             status_reason: Some(record.status_reason.clone()),
-            // Every stage `ServiceDeploymentLifecycleStage` names is a step of a traffic
-            // shift between two running service revisions, and a lifecycle hook is the
-            // custom logic a stage runs. A rollout here shifts no traffic and runs no
-            // hook, so it stands in no stage and holds no hook detail to report.
-            lifecycle_stage: None,
-            lifecycle_hook_details: None,
+            // "The current lifecycle stage of the deployment": the stage a rollout stands
+            // at is the one its waiting PAUSE hook pauses it at. The stages between two
+            // hooked ones are passed through within the span the rollout takes to reach the
+            // next hook, so a rollout that waits at none stands at none.
+            lifecycle_stage: record
+                .awaiting_hook()
+                .map(|hook| hook.stage.clone()),
+            // "The details of the lifecycle hooks for the current service deployment" —
+            // every PAUSE hook this rollout has reached, and nothing at all for a rollout
+            // whose configuration set none.
+            lifecycle_hook_details: (!record.lifecycle_hooks.is_empty()).then(|| {
+                record
+                    .lifecycle_hooks
+                    .iter()
+                    .map(lifecycle_hook_detail)
+                    .collect()
+            }),
             deployment_configuration: Some(record.deployment_configuration.clone()),
             // "The rollback options the service deployment uses when the deployment
-            // fails": no rollout here fails, so none has been rolled back.
-            rollback: None,
+            // fails": carried by exactly the rollouts a rollback ended.
+            rollback: record.rollback.clone(),
             deployment_circuit_breaker: Some(deployment_circuit_breaker_view(
                 &record.deployment_configuration,
                 // "the latest service desired count" — the count the threshold is
@@ -7388,6 +7967,65 @@ fn rollback_monitors_status(enabled: bool, finished: bool) -> &'static str {
         (true, false) => ROLLBACK_MONITORS_MONITORING,
         (true, true) => ROLLBACK_MONITORS_MONITORING_COMPLETE,
     }
+}
+
+/// The `DeploymentLifecycleHookDetail` one reached PAUSE hook is reported as.
+///
+/// `targetArn` is left out for every hook here: "For `AWS_LAMBDA` hooks, this is the Lambda
+/// function ARN. For `PAUSE` hooks, this field is not set."
+fn lifecycle_hook_detail(hook: &LifecycleHookRecord) -> DeploymentLifecycleHookDetail {
+    DeploymentLifecycleHookDetail {
+        hook_id: Some(hook.hook_id.clone()),
+        target_type: Some(LIFECYCLE_HOOK_TARGET_PAUSE.to_string()),
+        target_arn: None,
+        status: Some(hook.status.clone()),
+        expires_at: Some(DateTime::from(hook.expires_at)),
+        timeout_action: Some(hook.timeout_action.clone()),
+    }
+}
+
+/// `ServiceDeploymentRecord::status_reason` of a rollout whose rollback could not be
+/// carried out: there is no earlier revision of its service to put back.
+fn no_previous_revision_reason(service_arn: &str) -> String {
+    format!(
+        "This service deployment couldn't be rolled back because service {service_arn} has \
+         no previous service revision."
+    )
+}
+
+/// The `ServiceDeploymentNotFoundException` message for an ARN that names no stored
+/// rollout, from that error's own doc: "The service deploy ARN that you specified in the
+/// `ContinueServiceDeployment` doesn't exist. You can use `ListServiceDeployments` to
+/// retrieve the service deployment ARNs."
+pub fn service_deployment_not_found_message(arn: &str) -> String {
+    format!(
+        "The service deployment ARN {arn} that you specified doesn't exist. You can use \
+         ListServiceDeployments to retrieve the service deployment ARNs."
+    )
+}
+
+/// The `InvalidParameterException` message for a hook action asked for where no such hook
+/// is waiting for one — the one state `ContinueServiceDeployment` acts in: "When a service
+/// deployment reaches a lifecycle stage that has a PAUSE hook configured, the deployment
+/// pauses and waits for an explicit action."
+///
+/// The fixed text follows the error shape's own doc — "The specified parameter isn't valid.
+/// Review the available parameters for the API request" — naming the member that isn't
+/// (`hookId`); the hook id and the service deployment are the ones the request named.
+pub fn lifecycle_hook_not_awaiting_message(hook_id: &str, arn: &str) -> String {
+    format!(
+        "The specified hookId {hook_id} isn't valid for service deployment {arn}. Review \
+         the available parameters for the API request."
+    )
+}
+
+/// The `InvalidParameterException` message for a ROLLBACK asked for on a rollout that has
+/// no earlier service revision to roll back to.
+pub fn no_previous_service_revision_message(arn: &str) -> String {
+    format!(
+        "The service deployment {arn} can't be rolled back because its service has no \
+         previous service revision."
+    )
 }
 
 /// `ServiceDeployment$alarms`: "The CloudWatch alarms that determine when a service
