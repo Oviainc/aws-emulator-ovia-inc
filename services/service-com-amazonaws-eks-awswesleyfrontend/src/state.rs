@@ -70,6 +70,16 @@
 //! `DescribeInsightsRefresh` reports that same record, so there is one place a
 //! cluster's latest refresh is held and deleting the cluster takes it with it.
 //!
+//! A cluster's INSIGHTS are not stored beside it: an insight is the result of a
+//! check Amazon EKS runs against a cluster, so [`InsightCheck`] declares the checks
+//! this service can evaluate and
+//! [`ComAmazonawsEksAwswesleyfrontendState::cluster_insights`] evaluates every one of
+//! them from the cluster record, the node groups and add-ons inside it and the add-on
+//! catalog. `ListInsights` and `DescribeInsight` both report that one walk. The only
+//! part of an insight the store keeps is the instant of the latest completed analysis
+//! ([`ClusterRecord::insights_analyzed_at`]), which the clock writes when it completes
+//! a refresh.
+//!
 //! The identity-provider slice lives on the same record:
 //! `AssociateIdentityProviderConfig` writes an [`IdentityProviderConfigRecord`]
 //! into the owning cluster's [`ClusterRecord::identity_provider_configs`], and
@@ -95,6 +105,7 @@ use crate::ops::types::{
     ControlPlaneScalingConfig, EncryptionConfig, FargateProfile, FargateProfileHealth,
     FargateProfileSelector, Identity, KubeApiServerConfigResponse,
     KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
+    InsightStatus, InsightSummary, Insight, InsightResourceDetail,
     KubernetesNetworkConfigResponse, LaunchTemplateSpecification, Logging, MarketplaceInformation,
     NodeRepairConfig,
     Nodegroup, NodegroupHealth, NodegroupScalingConfig, NodegroupUpdateConfig,
@@ -358,6 +369,29 @@ pub const INSIGHTS_REFRESH_FAILED: &str = "FAILED";
 /// it.
 pub const INSIGHTS_REFRESH_DURATION: Duration = Duration::from_millis(500);
 
+/// The `Category` members a cluster insight reports. The model's enum
+/// (`smithy_query query="shape" shape="Category"`) is `UPGRADE_READINESS |
+/// MISCONFIGURATION | ROLLBACK_READINESS`, and the category is reported as the wire
+/// token, as every other enum member in this service is.
+pub const INSIGHT_CATEGORY_UPGRADE_READINESS: &str = "UPGRADE_READINESS";
+/// See [`INSIGHT_CATEGORY_UPGRADE_READINESS`].
+pub const INSIGHT_CATEGORY_MISCONFIGURATION: &str = "MISCONFIGURATION";
+/// See [`INSIGHT_CATEGORY_UPGRADE_READINESS`].
+pub const INSIGHT_CATEGORY_ROLLBACK_READINESS: &str = "ROLLBACK_READINESS";
+
+/// The `InsightStatusValue` members a check's result reports. The model's enum
+/// (`smithy_query query="shape" shape="InsightStatusValue"`) is `PASSING | WARNING |
+/// ERROR | UNKNOWN`: `PASSING` is a check that found nothing, `WARNING` and `ERROR`
+/// a check that found something, and `UNKNOWN` a check that could not be evaluated
+/// because the state it examines is not there.
+pub const INSIGHT_STATUS_PASSING: &str = "PASSING";
+/// See [`INSIGHT_STATUS_PASSING`].
+pub const INSIGHT_STATUS_WARNING: &str = "WARNING";
+/// See [`INSIGHT_STATUS_PASSING`].
+pub const INSIGHT_STATUS_ERROR: &str = "ERROR";
+/// See [`INSIGHT_STATUS_PASSING`].
+pub const INSIGHT_STATUS_UNKNOWN: &str = "UNKNOWN";
+
 /// The `CapabilityType` members whose `configuration` this service maps from the
 /// request shape to the response shape. The model's enum
 /// (`smithy_query query="shape" shape="CapabilityType"`) is `ACK | ARGOCD | KRO`,
@@ -422,6 +456,22 @@ pub const PLATFORM_VERSION: &str = "eks.4";
 pub fn kubernetes_minor_version(version: &str) -> Option<(u32, u32)> {
     let (major, minor) = version.split_once('.')?;
     Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// The Kubernetes minor version right AFTER `version` — the one a cluster running
+/// `version` would move to, because "a cluster moves one minor version per update"
+/// (`UpdateClusterVersion`). `None` for a string that names no minor version.
+pub fn next_kubernetes_minor_version(version: &str) -> Option<String> {
+    let (major, minor) = kubernetes_minor_version(version)?;
+    Some(format!("{major}.{}", minor.saturating_add(1)))
+}
+
+/// The Kubernetes minor version right BEFORE `version` — the one a cluster running
+/// `version` would roll back to. `None` for a string that names no minor version,
+/// and for the first minor version of a major release, which has no earlier one.
+pub fn previous_kubernetes_minor_version(version: &str) -> Option<String> {
+    let (major, minor) = kubernetes_minor_version(version)?;
+    minor.checked_sub(1).map(|earlier| format!("{major}.{earlier}"))
 }
 
 /// The `ipFamily` a cluster gets when `kubernetesNetworkConfig.ipFamily` is
@@ -1556,6 +1606,18 @@ pub struct ClusterRecord {
     /// reports. Deleting the cluster takes it with it, and nothing else keeps a
     /// second copy.
     pub insights_refresh: Option<InsightsRefreshRecord>,
+    /// When set, the instant of the latest COMPLETED analysis of this cluster's
+    /// insights — `InsightSummary$lastRefreshTime`, read through
+    /// [`ClusterRecord::insights_refreshed_at`].
+    ///
+    /// It is separate from [`Self::insights_refresh`] because that slot holds the
+    /// LATEST refresh operation, whichever status it is in: starting a new one
+    /// replaces the completed record it reported before, and an analysis that
+    /// completed is not undone by the next refresh being started. Only the clock
+    /// writes it, when it completes a refresh
+    /// ([`ClusterRecord::materialize_due_transitions`]), so it never moves backwards
+    /// and a read never changes it.
+    pub insights_analyzed_at: Option<SystemTime>,
 }
 
 /// One on-demand cluster insights refresh, as this service stores it.
@@ -1626,6 +1688,249 @@ impl InsightsRefreshRecord {
             _ => "The cluster insights refresh is in progress.".to_string(),
         }
     }
+}
+
+/// One check Amazon EKS runs against a cluster, which is what ONE insight of that
+/// cluster is.
+///
+/// `ListInsights` "Returns a list of all insights CHECKED FOR against the specified
+/// cluster", so an insight is not a record a caller writes: it is the result of a
+/// check, evaluated against the cluster and the resources inside it. This enum is the
+/// set of checks this service holds the state to evaluate, and
+/// [`ComAmazonawsEksAwswesleyfrontendState::cluster_insights`] evaluates every one of
+/// them for one cluster. A check is a fixed part of the API surface, like the version
+/// calendar and the add-on catalog, so it is declared here rather than stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsightCheck {
+    /// Whether the cluster's managed node groups all run the cluster's own
+    /// Kubernetes version, which is what an upgrade of the control plane needs.
+    NodegroupVersions,
+    /// Whether every add-on installed on the cluster is published for the Kubernetes
+    /// version the cluster would upgrade to.
+    AddonVersions,
+    /// Whether the remote networks the cluster's hybrid nodes need are both
+    /// configured.
+    HybridNodeNetworks,
+    /// Whether the cluster has a completed Kubernetes version update its version can
+    /// be rolled back to.
+    VersionRollback,
+}
+
+impl InsightCheck {
+    /// Every check this service evaluates, in the order a listing reports them.
+    pub fn all() -> [Self; 4] {
+        [
+            Self::NodegroupVersions,
+            Self::AddonVersions,
+            Self::HybridNodeNetworks,
+            Self::VersionRollback,
+        ]
+    }
+
+    /// The stable key this check is identified by inside a cluster, which is what
+    /// its insight id is derived from (see [`derive_insight_id`]). It never travels
+    /// on the wire: an insight is addressed by its id.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::NodegroupVersions => "node-group-kubernetes-versions",
+            Self::AddonVersions => "addon-version-compatibility",
+            Self::HybridNodeNetworks => "hybrid-node-remote-networks",
+            Self::VersionRollback => "cluster-version-rollback",
+        }
+    }
+
+    /// The `Category` this check's insight is reported under.
+    ///
+    /// The first two are `UPGRADE_READINESS` — "Amazon EKS identifies issues that
+    /// could impact your ability to upgrade to new versions of Kubernetes"
+    /// (`ListInsights`) — the hybrid-nodes check is `MISCONFIGURATION`, "a
+    /// misconfiguration in your EKS Hybrid Nodes setup that could impair
+    /// functionality of your cluster or workloads", and the rollback check is the
+    /// third member of the enum, which is what a rollback-blocking readiness issue
+    /// is reported under (`UpdateClusterVersion$force` "override[s] upgrade-blocking
+    /// or rollback-blocking readiness checks").
+    pub fn category(self) -> &'static str {
+        match self {
+            Self::NodegroupVersions | Self::AddonVersions => {
+                INSIGHT_CATEGORY_UPGRADE_READINESS
+            }
+            Self::HybridNodeNetworks => INSIGHT_CATEGORY_MISCONFIGURATION,
+            Self::VersionRollback => INSIGHT_CATEGORY_ROLLBACK_READINESS,
+        }
+    }
+
+    /// `InsightSummary$name`, "The name of the insight": what the check is called.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NodegroupVersions => "Managed node group Kubernetes version skew",
+            Self::AddonVersions => "Amazon EKS add-on version compatibility",
+            Self::HybridNodeNetworks => "Hybrid nodes remote network configuration",
+            Self::VersionRollback => "Cluster version rollback readiness",
+        }
+    }
+
+    /// `InsightSummary$description`, "The description of the insight which includes
+    /// alert criteria, remediation recommendation, and additional resources": what
+    /// the check looks at and what to do about a finding.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::NodegroupVersions => {
+                "Checks whether every managed node group of the cluster runs the cluster's \
+                 Kubernetes version. A node group left on an older version blocks an update of \
+                 the cluster's version; update the node group before updating the cluster."
+            }
+            Self::AddonVersions => {
+                "Checks whether the installed version of each Amazon EKS add-on is published \
+                 for the Kubernetes version the cluster would be updated to. Update an add-on \
+                 to a version compatible with that Kubernetes version before updating the \
+                 cluster."
+            }
+            Self::HybridNodeNetworks => {
+                "Checks the remote networks configured for the cluster's hybrid nodes. Pods \
+                 running on hybrid nodes are only reachable from the rest of the cluster when \
+                 the remote pod networks they run in are configured alongside the remote node \
+                 networks."
+            }
+            Self::VersionRollback => {
+                "Checks whether the cluster has a completed Kubernetes version update whose \
+                 version it can be rolled back from. A cluster that has never completed a \
+                 version update has no earlier version to roll back to."
+            }
+        }
+    }
+
+    /// `Insight$recommendation`, "A recommendation to remediate the issue": what to
+    /// do about a finding of this check.
+    pub fn recommendation(self) -> &'static str {
+        match self {
+            Self::NodegroupVersions => {
+                "Update every managed node group to the cluster's Kubernetes version, or pass \
+                 force on the cluster version update to override the readiness check."
+            }
+            Self::AddonVersions => {
+                "Update each add-on to a version published for the Kubernetes version the \
+                 cluster is being updated to before updating the cluster."
+            }
+            Self::HybridNodeNetworks => {
+                "Add the remote pod networks the cluster's hybrid nodes run pods in to the \
+                 cluster's remote network configuration."
+            }
+            Self::VersionRollback => {
+                "Complete a Kubernetes version update of the cluster before attempting to roll \
+                 its version back."
+            }
+        }
+    }
+}
+
+/// One insight of one cluster, as this service computes it.
+///
+/// Everything the modelled `InsightSummary` reports is here: the parts that are a
+/// property of the CHECK come from [`InsightView::check`], and the parts that are a
+/// property of this cluster's state are computed from that state. It carries no
+/// behaviour of its own beyond rendering, so `ListInsights` and `DescribeInsight`
+/// report the same values for the same insight.
+#[derive(Debug, Clone)]
+pub struct InsightView {
+    /// `InsightSummary$id`, derived from the cluster and the check (see
+    /// [`derive_insight_id`]) rather than minted, because no call creates an insight.
+    pub id: String,
+    /// Which check this insight is the result of.
+    pub check: InsightCheck,
+    /// `InsightSummary$kubernetesVersion`, "The Kubernetes version associated with
+    /// the insight": the version the check is about, which is unset for a check that
+    /// is about no particular version.
+    pub kubernetes_version: Option<String>,
+    /// The `InsightStatusValue` the check produced.
+    pub status: String,
+    /// `InsightStatus$reason`, "The explanation of the insight which includes
+    /// additional details": what the check found, named from this cluster's state.
+    pub reason: String,
+    /// `InsightSummary$lastRefreshTime`, "The time Amazon EKS last successfully
+    /// completed a refresh of this insight check on the cluster".
+    pub last_refresh_time: SystemTime,
+    /// `InsightSummary$lastTransitionTime`, "The time the status of the insight last
+    /// changed".
+    pub last_transition_time: SystemTime,
+}
+
+impl InsightView {
+    /// This insight as the modelled `InsightSummary` shape.
+    pub fn to_summary(&self) -> InsightSummary {
+        InsightSummary {
+            id: Some(self.id.clone()),
+            name: Some(self.check.name().to_string()),
+            category: Some(self.check.category().to_string()),
+            kubernetes_version: self.kubernetes_version.clone(),
+            last_refresh_time: Some(::aws_smithy_types::DateTime::from(self.last_refresh_time)),
+            last_transition_time: Some(::aws_smithy_types::DateTime::from(
+                self.last_transition_time,
+            )),
+            description: Some(self.check.description().to_string()),
+            insight_status: Some(InsightStatus {
+                status: Some(self.status.clone()),
+                reason: Some(self.reason.clone()),
+            }),
+        }
+    }
+
+    /// This insight as the modelled `Insight` shape — the whole insight
+    /// `DescribeInsight` reports, which is the summary plus the check's
+    /// recommendation and the resources it examined.
+    ///
+    /// `additionalInfo` ("summary information about deprecated resource usage") and
+    /// `categorySpecificSummary` are left unset: both report the Kubernetes API usage
+    /// and deprecation data an API server collects, and this emulator runs no
+    /// Kubernetes control plane to collect any — so there is nothing to report rather
+    /// than a number to invent.
+    pub fn to_insight(&self, resources: Vec<InsightResourceDetail>) -> Insight {
+        let summary = self.to_summary();
+        Insight {
+            id: summary.id,
+            name: summary.name,
+            category: summary.category,
+            kubernetes_version: summary.kubernetes_version,
+            last_refresh_time: summary.last_refresh_time,
+            last_transition_time: summary.last_transition_time,
+            description: summary.description,
+            insight_status: summary.insight_status,
+            recommendation: Some(self.check.recommendation().to_string()),
+            additional_info: None,
+            resources: Some(resources),
+            category_specific_summary: None,
+        }
+    }
+}
+
+/// What evaluating one [`InsightCheck`] against one cluster produced: the parts of an
+/// [`InsightView`] that depend on the cluster's state rather than on the check.
+struct InsightEvaluation {
+    status: &'static str,
+    reason: String,
+    kubernetes_version: Option<String>,
+    last_transition_time: SystemTime,
+}
+
+/// The id of one insight of one cluster.
+///
+/// An insight is the result of a check rather than a resource a call creates, so
+/// there is no create to mint an id at: it is DERIVED from the cluster's own ARN —
+/// which already carries the account, the Region and the cluster name — and the
+/// check's [`InsightCheck::key`]. So the id is stable for as long as the cluster
+/// lives, two checks of one cluster never share one, and the same check of two
+/// clusters does not either. Rendered in the 8-4-4-4-12 hex form AWS insight ids
+/// take, the same way [`derive_association_external_id`] renders its own.
+pub fn derive_insight_id(cluster_arn: &str, check_key: &str) -> String {
+    let digest = Sha256::digest(format!("insight/{cluster_arn}/{check_key}").as_bytes());
+    let hex = hex::encode(&digest[..16]);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// Which resource of a cluster an [`UpdateRecord`] is an update OF.
@@ -1894,9 +2199,19 @@ impl ClusterRecord {
         }
 
         // The on-demand insights refresh this cluster is running: its analysis was
-        // owed its completion at the stored instant whether or not anybody called.
+        // owed its completion at the stored instant whether or not anybody called,
+        // and completing it is what makes its end the instant the cluster's insights
+        // were last analysed at.
         if let Some(refresh) = self.insights_refresh.as_mut() {
             refresh.materialize_due_transitions(now);
+            if refresh.status == INSIGHTS_REFRESH_COMPLETED {
+                let completed_at = refresh.ended_at;
+                self.insights_analyzed_at = self
+                    .insights_analyzed_at
+                    .into_iter()
+                    .chain(completed_at)
+                    .max();
+            }
         }
 
         let due: Vec<String> = self
@@ -1925,6 +2240,68 @@ impl ClusterRecord {
     /// rather than an Amazon EKS cluster `CreateCluster` provisioned.
     pub fn is_connected(&self) -> bool {
         self.connector_config.is_some()
+    }
+
+    /// The instant of the latest COMPLETED analysis of this cluster's insights —
+    /// `InsightSummary$lastRefreshTime` for every insight of the cluster.
+    ///
+    /// Amazon EKS analyses a cluster's insights when it creates the cluster and again
+    /// whenever a refresh of them completes, so the latest analysis is the on-demand
+    /// refresh the cluster has completed, or the cluster's own creation when it has
+    /// completed none. A refresh that is still `IN_PROGRESS` has not produced an
+    /// analysis yet, which is why it does not move this instant until the clock ends
+    /// it ([`InsightsRefreshRecord::materialize_due_transitions`]), and starting
+    /// another refresh does not take a completed analysis back: the latest of the
+    /// instant the clock recorded on the cluster and the one the refresh it still
+    /// holds completed at is the latest analysis.
+    pub fn insights_refreshed_at(&self) -> SystemTime {
+        let from_latest_refresh = self
+            .insights_refresh
+            .as_ref()
+            .filter(|refresh| refresh.status == INSIGHTS_REFRESH_COMPLETED)
+            .and_then(|refresh| refresh.ended_at);
+        self.insights_analyzed_at
+            .into_iter()
+            .chain(from_latest_refresh)
+            .max()
+            .unwrap_or(self.created_at)
+    }
+
+    /// The instant at which the configuration of this cluster's own control plane
+    /// last changed: its creation, or the latest configuration update it has taken.
+    ///
+    /// An insight whose subject is a member of the cluster's configuration reports
+    /// this as its `lastTransitionTime`, because the status of such a check can only
+    /// have changed when that configuration did. `UpdateClusterConfig` is the one
+    /// writer of those members after the create, and it records the change it made as
+    /// an update of the narrow type for the category it changed or
+    /// [`UPDATE_TYPE_CONFIG`] for a request that changed more than one.
+    pub fn configuration_changed_at(&self, update_type: &str) -> SystemTime {
+        self.updates
+            .values()
+            .filter(|update| update.r#type == update_type || update.r#type == UPDATE_TYPE_CONFIG)
+            .map(|update| update.created_at)
+            .chain(std::iter::once(self.created_at))
+            .max()
+            .unwrap_or(self.created_at)
+    }
+
+    /// The latest successful Kubernetes version change of this cluster, as
+    /// `(UpdateType, when)` — what the cluster's rollback readiness is computed from.
+    ///
+    /// A version change is only a change the cluster has actually made once its
+    /// update is [`UPDATE_SUCCESSFUL`]: an update still running has not moved the
+    /// version yet, and a cancelled or failed one never did.
+    pub fn latest_version_change(&self) -> Option<(&str, SystemTime)> {
+        self.updates
+            .values()
+            .filter(|update| {
+                update.status == UPDATE_SUCCESSFUL
+                    && (update.r#type == UPDATE_TYPE_VERSION
+                        || update.r#type == UPDATE_TYPE_VERSION_ROLLBACK)
+            })
+            .max_by_key(|update| update.created_at)
+            .map(|update| (update.r#type.as_str(), update.created_at))
     }
 
     /// The update this cluster is still running, if any.
@@ -4198,6 +4575,421 @@ impl ComAmazonawsEksAwswesleyfrontendState {
             .map(|(_, record)| record)
     }
 
+    /// The add-ons installed on one cluster, in add-on-name order.
+    ///
+    /// The map is keyed `(region, cluster, addon)`, so one cluster's add-ons are a
+    /// contiguous, name-sorted RANGE of it, the same walk [`Self::nodegroups_of`]
+    /// makes over its own child resource. This is the records;
+    /// [`Self::addon_names_in`] is the names.
+    pub fn addons_of<'a>(
+        &'a self,
+        region: &'a str,
+        cluster_name: &'a str,
+    ) -> impl Iterator<Item = &'a AddonRecord> + 'a {
+        self.addons
+            .range((
+                std::ops::Bound::Included((
+                    region.to_string(),
+                    cluster_name.to_string(),
+                    String::new(),
+                )),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(move |((key_region, key_cluster, _), _)| {
+                key_region == region && key_cluster == cluster_name
+            })
+            .map(|(_, record)| record)
+    }
+
+    /// The managed node groups of one cluster whose Kubernetes version is not
+    /// `cluster_version`, each as `name (version)`.
+    ///
+    /// "If your cluster has managed node groups attached to it, all of your node
+    /// groups' Kubernetes versions must match the cluster's Kubernetes version in
+    /// order to update the cluster to a new Kubernetes version"
+    /// (`UpdateClusterVersion`), so this is the one walk both the operation that
+    /// REFUSES such an update and the cluster's own upgrade-readiness insight read
+    /// the mismatch from — rather than two copies of one rule that can drift.
+    pub fn mismatched_nodegroup_versions(
+        &self,
+        region: &str,
+        cluster_name: &str,
+        cluster_version: &str,
+    ) -> Vec<String> {
+        self.nodegroups_of(region, cluster_name)
+            .filter(|nodegroup| nodegroup.version != cluster_version)
+            .map(|nodegroup| format!("{} ({})", nodegroup.nodegroup_name, nodegroup.version))
+            .collect()
+    }
+
+    /// Every insight Amazon EKS checks for against one cluster, in
+    /// [`InsightCheck::all`] order.
+    ///
+    /// COMPUTED from what this store holds — the cluster record, the node groups and
+    /// add-ons inside it and the add-on catalog — and writing nothing: an insight is
+    /// the result of a check, so `ListInsights` and `DescribeInsight` both report
+    /// this and cannot disagree. A cluster this store does not hold has no insights
+    /// at all, which is what the empty vector says.
+    pub fn cluster_insights(&self, region: &str, cluster_name: &str) -> Vec<InsightView> {
+        let Some(cluster) = self
+            .clusters
+            .get(&(region.to_string(), cluster_name.to_string()))
+        else {
+            return Vec::new();
+        };
+        let last_refresh_time = cluster.insights_refreshed_at();
+        InsightCheck::all()
+            .into_iter()
+            .map(|check| {
+                let evaluated = self.evaluate_insight(check, region, cluster);
+                InsightView {
+                    id: derive_insight_id(&cluster.arn, check.key()),
+                    check,
+                    kubernetes_version: evaluated.kubernetes_version,
+                    status: evaluated.status.to_string(),
+                    reason: evaluated.reason,
+                    last_refresh_time,
+                    last_transition_time: evaluated.last_transition_time,
+                }
+            })
+            .collect()
+    }
+
+    /// The resources one check of one cluster examined, each with the status it has
+    /// against that check — `Insight$resources`, "The details about each resource
+    /// listed in the insight check result".
+    ///
+    /// Only a check whose subject is a SET of resources inside the cluster lists any:
+    /// the node group check lists the cluster's managed node groups and the add-on
+    /// check its installed add-ons, each with its own ARN and its own status, so a
+    /// caller reading one insight sees which resource the finding is about. A check
+    /// whose subject is the cluster itself lists none — the cluster is not a resource
+    /// listed INSIDE its own insight.
+    pub fn insight_resources(
+        &self,
+        check: InsightCheck,
+        region: &str,
+        cluster_name: &str,
+    ) -> Vec<InsightResourceDetail> {
+        let Some(cluster) = self
+            .clusters
+            .get(&(region.to_string(), cluster_name.to_string()))
+        else {
+            return Vec::new();
+        };
+        // `kubernetesResourceUri` is "The Kubernetes resource URI if applicable": a
+        // node group and an add-on are Amazon EKS resources addressed by ARN, not
+        // objects of the Kubernetes API, so neither carries one.
+        match check {
+            InsightCheck::NodegroupVersions => {
+                let Some(cluster_version) = cluster.version.as_deref() else {
+                    return Vec::new();
+                };
+                self.nodegroups_of(region, &cluster.name)
+                    .map(|nodegroup| {
+                        let matches = nodegroup.version == cluster_version;
+                        InsightResourceDetail {
+                            insight_status: Some(InsightStatus {
+                                status: Some(
+                                    if matches {
+                                        INSIGHT_STATUS_PASSING
+                                    } else {
+                                        INSIGHT_STATUS_ERROR
+                                    }
+                                    .to_string(),
+                                ),
+                                reason: Some(if matches {
+                                    format!(
+                                        "The node group runs the cluster's Kubernetes version \
+                                         {cluster_version}."
+                                    )
+                                } else {
+                                    format!(
+                                        "The node group runs Kubernetes version {} instead of the \
+                                         cluster's {cluster_version}.",
+                                        nodegroup.version
+                                    )
+                                }),
+                            }),
+                            kubernetes_resource_uri: None,
+                            arn: Some(nodegroup.arn.clone()),
+                        }
+                    })
+                    .collect()
+            }
+            InsightCheck::AddonVersions => {
+                let Some(target) = cluster
+                    .version
+                    .as_deref()
+                    .and_then(next_kubernetes_minor_version)
+                else {
+                    return Vec::new();
+                };
+                self.addons_of(region, &cluster.name)
+                    .map(|addon| {
+                        let published = self
+                            .addon_catalog
+                            .iter()
+                            .find(|entry| entry.addon_name == addon.addon_name)
+                            .and_then(|entry| {
+                                entry
+                                    .versions
+                                    .iter()
+                                    .find(|build| build.addon_version == addon.addon_version)
+                            });
+                        let (status, reason) = match published {
+                            Some(build) if !build.supports(&target) => (
+                                INSIGHT_STATUS_ERROR,
+                                format!(
+                                    "Version {} of the add-on is not published for Kubernetes \
+                                     version {target}.",
+                                    addon.addon_version
+                                ),
+                            ),
+                            Some(_) => (
+                                INSIGHT_STATUS_PASSING,
+                                format!(
+                                    "Version {} of the add-on is published for Kubernetes version \
+                                     {target}.",
+                                    addon.addon_version
+                                ),
+                            ),
+                            // A build the catalog does not publish is one whose
+                            // compatibilities this service does not know, which is
+                            // what `UNKNOWN` says.
+                            None => (
+                                INSIGHT_STATUS_UNKNOWN,
+                                format!(
+                                    "Version {} of the add-on is not one Amazon EKS publishes, so \
+                                     the versions it supports are not known.",
+                                    addon.addon_version
+                                ),
+                            ),
+                        };
+                        InsightResourceDetail {
+                            insight_status: Some(InsightStatus {
+                                status: Some(status.to_string()),
+                                reason: Some(reason),
+                            }),
+                            kubernetes_resource_uri: None,
+                            arn: Some(addon.arn.clone()),
+                        }
+                    })
+                    .collect()
+            }
+            InsightCheck::HybridNodeNetworks | InsightCheck::VersionRollback => Vec::new(),
+        }
+    }
+
+    /// Evaluate ONE check against one cluster.
+    ///
+    /// Each check reports the status its own subject justifies, the reason naming
+    /// what it found in this store, the Kubernetes version the check is ABOUT (the
+    /// version the cluster would move to for an upgrade check, the version it would
+    /// return to for the rollback check, and none for a check that is about no
+    /// version), and the instant that subject last changed — which is when the
+    /// check's status can last have changed.
+    fn evaluate_insight(
+        &self,
+        check: InsightCheck,
+        region: &str,
+        cluster: &ClusterRecord,
+    ) -> InsightEvaluation {
+        // "A cluster moves one minor version per update", so the version an upgrade
+        // check is about is the minor version right after the cluster's own.
+        let upgrade_target = cluster
+            .version
+            .as_deref()
+            .and_then(next_kubernetes_minor_version);
+        match check {
+            InsightCheck::NodegroupVersions => {
+                // The node groups are the subject, so the check's status can only
+                // have changed when one of them was created or last changed.
+                let last_transition_time = self
+                    .nodegroups_of(region, &cluster.name)
+                    .map(|nodegroup| nodegroup.modified_at)
+                    .chain(std::iter::once(cluster.created_at))
+                    .max()
+                    .unwrap_or(cluster.created_at);
+                let Some(cluster_version) = cluster.version.as_deref() else {
+                    return InsightEvaluation {
+                        status: INSIGHT_STATUS_UNKNOWN,
+                        reason: "The cluster reports no Kubernetes version, so its node groups \
+                                 could not be compared against one."
+                            .to_string(),
+                        kubernetes_version: None,
+                        last_transition_time,
+                    };
+                };
+                let mismatched =
+                    self.mismatched_nodegroup_versions(region, &cluster.name, cluster_version);
+                if mismatched.is_empty() {
+                    InsightEvaluation {
+                        status: INSIGHT_STATUS_PASSING,
+                        reason: format!(
+                            "Every managed node group of the cluster runs Kubernetes version \
+                             {cluster_version}."
+                        ),
+                        kubernetes_version: upgrade_target,
+                        last_transition_time,
+                    }
+                } else {
+                    InsightEvaluation {
+                        status: INSIGHT_STATUS_ERROR,
+                        reason: format!(
+                            "Managed node groups whose Kubernetes version does not match the \
+                             cluster's {cluster_version}: {}.",
+                            mismatched.join(", ")
+                        ),
+                        kubernetes_version: upgrade_target,
+                        last_transition_time,
+                    }
+                }
+            }
+            InsightCheck::AddonVersions => {
+                let last_transition_time = self
+                    .addons_of(region, &cluster.name)
+                    .map(|addon| addon.modified_at)
+                    .chain(std::iter::once(cluster.created_at))
+                    .max()
+                    .unwrap_or(cluster.created_at);
+                let Some(target) = upgrade_target else {
+                    return InsightEvaluation {
+                        status: INSIGHT_STATUS_UNKNOWN,
+                        reason: "The cluster reports no Kubernetes version, so no add-on could be \
+                                 checked against the version it would be updated to."
+                            .to_string(),
+                        kubernetes_version: None,
+                        last_transition_time,
+                    };
+                };
+                // An installed build the catalog does not publish is not one this
+                // service knows the compatibilities of, so it is not reported as
+                // incompatible: only a build the catalog carries can fail the check.
+                let incompatible: Vec<String> = self
+                    .addons_of(region, &cluster.name)
+                    .filter(|addon| {
+                        self.addon_catalog
+                            .iter()
+                            .find(|entry| entry.addon_name == addon.addon_name)
+                            .and_then(|entry| {
+                                entry
+                                    .versions
+                                    .iter()
+                                    .find(|build| build.addon_version == addon.addon_version)
+                            })
+                            .is_some_and(|build| !build.supports(&target))
+                    })
+                    .map(|addon| format!("{} ({})", addon.addon_name, addon.addon_version))
+                    .collect();
+                if incompatible.is_empty() {
+                    InsightEvaluation {
+                        status: INSIGHT_STATUS_PASSING,
+                        reason: format!(
+                            "Every Amazon EKS add-on installed on the cluster is published for \
+                             Kubernetes version {target}."
+                        ),
+                        kubernetes_version: Some(target),
+                        last_transition_time,
+                    }
+                } else {
+                    InsightEvaluation {
+                        status: INSIGHT_STATUS_ERROR,
+                        reason: format!(
+                            "Amazon EKS add-ons installed at a version that is not published for \
+                             Kubernetes version {target}: {}.",
+                            incompatible.join(", ")
+                        ),
+                        kubernetes_version: Some(target),
+                        last_transition_time,
+                    }
+                }
+            }
+            InsightCheck::HybridNodeNetworks => {
+                let last_transition_time =
+                    cluster.configuration_changed_at(UPDATE_TYPE_REMOTE_NETWORK_CONFIG);
+                let remote = cluster.remote_network_config.as_ref();
+                let has_node_networks = remote
+                    .and_then(|config| config.remote_node_networks.as_ref())
+                    .is_some_and(|networks| !networks.is_empty());
+                let has_pod_networks = remote
+                    .and_then(|config| config.remote_pod_networks.as_ref())
+                    .is_some_and(|networks| !networks.is_empty());
+                // No remote node networks means the cluster runs no hybrid nodes, so
+                // there is no setup to find a misconfiguration in: the check has no
+                // subject rather than a passing one.
+                let (status, reason) = if !has_node_networks {
+                    (
+                        INSIGHT_STATUS_UNKNOWN,
+                        "The cluster has no remote node networks, so no hybrid nodes setup was \
+                         evaluated."
+                            .to_string(),
+                    )
+                } else if !has_pod_networks {
+                    (
+                        INSIGHT_STATUS_WARNING,
+                        "The cluster has remote node networks for hybrid nodes but no remote pod \
+                         networks, so pods running on those nodes are not reachable from the rest \
+                         of the cluster."
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        INSIGHT_STATUS_PASSING,
+                        "The cluster has both remote node networks and remote pod networks \
+                         configured for its hybrid nodes."
+                            .to_string(),
+                    )
+                };
+                InsightEvaluation {
+                    status,
+                    reason,
+                    // A hybrid nodes misconfiguration is about the cluster's network
+                    // configuration, not about a Kubernetes version.
+                    kubernetes_version: None,
+                    last_transition_time,
+                }
+            }
+            InsightCheck::VersionRollback => {
+                let latest_change = cluster.latest_version_change();
+                let last_transition_time = latest_change
+                    .map(|(_, changed_at)| changed_at.max(cluster.created_at))
+                    .unwrap_or(cluster.created_at);
+                let rollback_target = cluster
+                    .version
+                    .as_deref()
+                    .and_then(previous_kubernetes_minor_version);
+                match (latest_change, rollback_target) {
+                    (Some((UPDATE_TYPE_VERSION, _)), Some(target)) => InsightEvaluation {
+                        status: INSIGHT_STATUS_PASSING,
+                        reason: format!(
+                            "The cluster completed a Kubernetes version update, so its version \
+                             can be rolled back to {target}."
+                        ),
+                        kubernetes_version: Some(target),
+                        last_transition_time,
+                    },
+                    (Some((UPDATE_TYPE_VERSION_ROLLBACK, _)), _) => InsightEvaluation {
+                        status: INSIGHT_STATUS_UNKNOWN,
+                        reason: "The cluster's last completed Kubernetes version change was a \
+                                 rollback, so it has no version update to roll back."
+                            .to_string(),
+                        kubernetes_version: None,
+                        last_transition_time,
+                    },
+                    _ => InsightEvaluation {
+                        status: INSIGHT_STATUS_UNKNOWN,
+                        reason: "The cluster has not completed a Kubernetes version update, so it \
+                                 has no earlier version to roll back to."
+                            .to_string(),
+                        kubernetes_version: None,
+                        last_transition_time,
+                    },
+                }
+            }
+        }
+    }
+
     /// The capabilities one cluster holds, in capability-name order.
     ///
     /// The map is keyed `(region, cluster, capability)`, so one cluster's
@@ -4788,6 +5580,9 @@ pub const CERTIFICATE_AUTHORITIES_LISTING: &str = "certificate-authorities";
 /// The scope `ListUpdates`'s tokens carry, over the update ids of one resource
 /// of one cluster. See [`CLUSTERS_LISTING`].
 pub const UPDATES_LISTING: &str = "updates";
+/// The scope `ListInsights`'s tokens carry, over the ids of the insights of one
+/// cluster. See [`CLUSTERS_LISTING`].
+pub const INSIGHTS_LISTING: &str = "insights";
 
 /// Encode a page token for `listing` that resumes AFTER `last_returned`.
 ///
