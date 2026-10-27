@@ -125,7 +125,10 @@ async fn wait_for_database(emulator: &Emulator, name: &str, want: &str) -> Value
 
 /// The stored database snapshot `name`, as `GetRelationalDatabaseSnapshots`
 /// reports it — the implemented reader over the snapshot store.
-async fn read_snapshot(emulator: &Emulator, name: &str) -> Value {
+///
+/// `pub(crate)` so a sibling suite reads a snapshot back the same way rather than
+/// keeping a second copy of this walk.
+pub(crate) async fn read_snapshot(emulator: &Emulator, name: &str) -> Value {
     let mut token: Option<String> = None;
     loop {
         let body = match &token {
@@ -163,7 +166,10 @@ async fn read_snapshot(emulator: &Emulator, name: &str) -> Value {
 }
 
 /// Poll the snapshot listing until `name` reports `want`, answering it.
-async fn wait_for_snapshot(emulator: &Emulator, name: &str, want: &str) -> Value {
+///
+/// `pub(crate)` for the same reason as [`read_snapshot`]: the transition is owed
+/// by the clock, and one suite's wait for it serves every suite.
+pub(crate) async fn wait_for_snapshot(emulator: &Emulator, name: &str, want: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let snapshot = read_snapshot(emulator, name).await;
