@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDeleteClusterSnapshots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDeleteClusterSnapshots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDeleteClusterSnapshots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes each manual snapshot one entry of the request names, reporting the
+//! identifiers it deleted and, per entry it could not, that entry's own failure —
+//! so what ONE entry gets wrong never fails the entries beside it.
 //!
 //! ## Shape of an operation
 //!
@@ -81,10 +76,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `BatchDeleteClusterSnapshotsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#BatchDeleteClusterSnapshots")]
+// `DependentServiceUnavailableFault` is widened in, exactly as the sibling batch
+// operation widens it: the model does not list it here, but the service declares
+// the shape, and it is the only modelled way to say "the control-plane store
+// could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#BatchDeleteClusterSnapshots",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum BatchDeleteClusterSnapshotsErrorModeled {
     BatchDeleteRequestSizeExceededFault(BatchDeleteRequestSizeExceededFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -138,18 +141,199 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDeleteClusterSnapshots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDeleteClusterSnapshotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDeleteClusterSnapshots"))
+        // The delete holds the store's lock; the events it raises are published
+        // once that lock is released, because a publish is an in-process call
+        // into another service and must not run under it.
+        let output = self.delete(&input)?;
+
+        // Each snapshot this call removed no longer exists, which is the event
+        // that removal raises: every subscription scoped to it is told, on its
+        // own topic.
+        for deleted in output.resources.iter().flatten() {
+            crate::state::notifications::raise(
+                ctx,
+                &*self.engine,
+                crate::state::EVENT_ID_SNAPSHOT_DELETED,
+                deleted,
+                &[(crate::state::notifications::SNAPSHOT_NAME, deleted.as_str())],
+            )
+            .await;
+        }
+
+        Ok(output)
+    }
+}
+
+/// The per-entry failure code of an entry naming a snapshot this account holds
+/// none of, and the text that failure reports.
+///
+/// A batch reports what one entry got wrong as that entry's own failure
+/// (`SnapshotErrorMessage$FailureCode` is "the failure code for the error" and
+/// `FailureReason` "the text message describing the error"), so the code names the
+/// modelled fault the one-snapshot path would have refused with and the reason is
+/// fixed text for this failure class, with no part taken from the request.
+const FAILURE_CODE_NOT_FOUND: &str = "ClusterSnapshotNotFoundFault";
+/// The text [`FAILURE_CODE_NOT_FOUND`] reports. See that constant.
+const FAILURE_REASON_NOT_FOUND: &str = "Snapshot does not exist for the customer.";
+/// The per-entry failure code of an entry naming a snapshot that cannot be
+/// deleted as it stands — see [`FAILURE_CODE_NOT_FOUND`] for why the code is the
+/// modelled fault's name.
+const FAILURE_CODE_INVALID_STATE: &str = "InvalidClusterSnapshotStateFault";
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> BatchDeleteClusterSnapshots<Eng> {
+    /// The delete itself: the identifiers it removed and the per-entry failures.
+    ///
+    /// Everything that touches the store lives here, so the lock is held for the
+    /// write ALONE and nothing is awaited while it is.
+    fn delete(
+        &self,
+        input: &BatchDeleteClusterSnapshotsInput,
+    ) -> Result<BatchDeleteClusterSnapshotsOutput, BatchDeleteClusterSnapshotsError> {
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                BatchDeleteClusterSnapshotsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let started = ::std::time::Instant::now();
+
+        // A list longer than the published limit is a property of the REQUEST, so
+        // it refuses the whole call rather than reporting a per-entry failure:
+        // "the maximum number for a batch delete of snapshots has been reached."
+        let requested_count = input.identifiers.len();
+        if requested_count > st::BATCH_SNAPSHOT_IDENTIFIER_LIMIT {
+            return Err(
+                BatchDeleteClusterSnapshotsErrorModeled::BatchDeleteRequestSizeExceededFault(
+                    BatchDeleteRequestSizeExceededFault {
+                        message: Some(format!(
+                            "The maximum number for a batch delete of snapshots is {}; {requested_count} were supplied.",
+                            st::BATCH_SNAPSHOT_IDENTIFIER_LIMIT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        let mut resources: Vec<String> = Vec::new();
+        let mut errors: Vec<SnapshotErrorMessage> = Vec::new();
+
+        // Each entry is decided against the store as it stands when that entry is
+        // reached, in the order the request lists them, so a list naming one
+        // snapshot twice sees its own first delete.
+        for requested in &input.identifiers {
+            // An empty entry names no snapshot, so it locates none. It is
+            // reported as this entry's own not-found failure rather than refusing
+            // the request the way the one-snapshot path does: in a batch, what
+            // ONE entry gets wrong must not fail the entries beside it.
+            let locator = (!requested.snapshot_identifier.is_empty())
+                .then_some(requested.snapshot_identifier.as_str());
+            // `SnapshotClusterIdentifier` is "the unique identifier of the cluster
+            // the snapshot was created from", so the pair is the locator and an
+            // entry naming a cluster the snapshot was not taken of names no
+            // snapshot — the same rule `AuthorizeSnapshotAccess` applies.
+            let wanted_cluster = requested
+                .snapshot_cluster_identifier
+                .as_deref()
+                .filter(|value| !value.is_empty());
+            let found = locator
+                .and_then(|id| store.snapshot_located_position(Some(id), None))
+                .filter(|index| {
+                    wanted_cluster.is_none_or(|wanted| {
+                        store.snapshots[*index].snapshot.cluster_identifier.as_deref()
+                            == Some(wanted)
+                    })
+                });
+            let Some(index) = found else {
+                errors.push(SnapshotErrorMessage {
+                    snapshot_identifier: Some(requested.snapshot_identifier.clone()),
+                    snapshot_cluster_identifier: None,
+                    failure_code: Some(FAILURE_CODE_NOT_FOUND.to_string()),
+                    failure_reason: Some(FAILURE_REASON_NOT_FOUND.to_string()),
+                });
+                continue;
+            };
+
+            // Read what the decision needs, then let the borrow go: the entry
+            // removes the very record it was read from.
+            let (identifier, cluster_identifier, status, snapshot_type, shared_with) = {
+                let snapshot = &store.snapshots[index].snapshot;
+                (
+                    snapshot
+                        .snapshot_identifier
+                        .clone()
+                        .unwrap_or_else(|| requested.snapshot_identifier.clone()),
+                    snapshot.cluster_identifier.clone(),
+                    snapshot.status.clone().unwrap_or_default(),
+                    snapshot.snapshot_type.clone().unwrap_or_default(),
+                    snapshot
+                        .accounts_with_restore_access
+                        .iter()
+                        .flatten()
+                        .count(),
+                )
+            };
+
+            // The three rules the one-snapshot path deletes by, reported here as
+            // that entry's failure. "Deletes the specified MANUAL snapshot":
+            // Amazon Redshift deletes a snapshot it took on its own schedule
+            // itself, when that snapshot's retention period ends.
+            if snapshot_type != st::SNAPSHOT_TYPE_MANUAL {
+                errors.push(SnapshotErrorMessage {
+                    snapshot_identifier: Some(identifier.clone()),
+                    snapshot_cluster_identifier: cluster_identifier,
+                    failure_code: Some(FAILURE_CODE_INVALID_STATE.to_string()),
+                    failure_reason: Some(format!(
+                        "Cluster snapshot {identifier} is of type {snapshot_type}, and only a {} snapshot can be deleted.",
+                        st::SNAPSHOT_TYPE_MANUAL
+                    )),
+                });
+                continue;
+            }
+            // "The snapshot must be in the available state".
+            if status != st::STATUS_AVAILABLE {
+                errors.push(SnapshotErrorMessage {
+                    snapshot_identifier: Some(identifier.clone()),
+                    snapshot_cluster_identifier: cluster_identifier,
+                    failure_code: Some(FAILURE_CODE_INVALID_STATE.to_string()),
+                    failure_reason: Some(format!(
+                        "Cluster snapshot {identifier} is in the {status} state, not {}.",
+                        st::STATUS_AVAILABLE
+                    )),
+                });
+                continue;
+            }
+            // "with no other users authorized to access the snapshot […] If other
+            // accounts are authorized to access the snapshot, you must revoke all
+            // of the authorizations before you can delete the snapshot."
+            if shared_with > 0 {
+                errors.push(SnapshotErrorMessage {
+                    snapshot_identifier: Some(identifier.clone()),
+                    snapshot_cluster_identifier: cluster_identifier,
+                    failure_code: Some(FAILURE_CODE_INVALID_STATE.to_string()),
+                    failure_reason: Some(format!(
+                        "Cluster snapshot {identifier} is authorized for restore by {shared_with} other account(s); revoke every authorization before deleting it."
+                    )),
+                });
+                continue;
+            }
+
+            store.snapshots.remove(index);
+            resources.push(identifier);
+        }
+
+        Ok(BatchDeleteClusterSnapshotsOutput {
+            resources: Some(resources),
+            errors: Some(errors),
+        })
     }
 }

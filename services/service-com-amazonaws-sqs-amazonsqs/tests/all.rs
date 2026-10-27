@@ -35,6 +35,8 @@ mod message_move_task;
 mod message_plane;
 #[path = "all/message_visibility_changes.rs"]
 mod message_visibility_changes;
+#[path = "all/pagination_token_refusal.rs"]
+mod pagination_token_refusal;
 #[path = "all/purge_queue.rs"]
 mod purge_queue;
 #[path = "all/queue_configuration.rs"]

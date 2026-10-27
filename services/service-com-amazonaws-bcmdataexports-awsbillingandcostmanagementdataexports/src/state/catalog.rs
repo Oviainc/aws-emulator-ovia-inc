@@ -365,10 +365,16 @@ impl TableSpec {
     ///
     /// `Err` is the modelled 400 for a property this table does not publish, or a value
     /// outside the property's valid values: neither names a configuration of this table,
-    /// so there is no schema to report for it.
+    /// so there is no schema to report for it. `field` is the member path of the CALLER's
+    /// own input that carried `requested` — the member the refusal names, since
+    /// `ValidationExceptionField$Name` is "[t]he field name where the invalid entry was
+    /// detected" (smithy_query shape `ValidationExceptionField`) and the operations that
+    /// reach this one carry a requested property map at different members of their
+    /// different inputs.
     pub fn effective_properties(
         &self,
         requested: Option<&HashMap<String, String>>,
+        field: &str,
     ) -> Result<BTreeMap<String, String>, ValidationException> {
         let mut effective: BTreeMap<String, String> = self
             .properties
@@ -382,9 +388,9 @@ impl TableSpec {
         for (name, value) in requested.into_iter().flatten() {
             let property = self
                 .property(name)
-                .ok_or_else(|| unknown_table_property(self, name))?;
+                .ok_or_else(|| unknown_table_property(field, self, name))?;
             if !property.accepts(value) {
-                return Err(invalid_table_property_value(property, value));
+                return Err(invalid_table_property_value(field, property, value));
             }
             effective.insert(name.clone(), value.clone());
         }
@@ -444,8 +450,19 @@ pub fn unknown_table(name: &str) -> ValidationException {
     )
 }
 
-/// The modelled 400 for a `TableProperties` key `table` does not publish.
-fn unknown_table_property(table: &TableSpec, property: &str) -> ValidationException {
+/// The modelled input member a table-property refusal names when the request carried the
+/// property map at `GetTableRequest$TableProperties` — the member `GetTable` declares it
+/// at. An operation that carries one somewhere else states ITS member path instead; see
+/// [`TableSpec::effective_properties`].
+pub const TABLE_PROPERTIES_FIELD: &str = "TableProperties";
+
+/// The modelled 400 for a table-property key `table` does not publish, naming the
+/// caller's own member path `field` as the place the invalid entry was detected.
+fn unknown_table_property(
+    field: &str,
+    table: &TableSpec,
+    property: &str,
+) -> ValidationException {
     let supported = table
         .properties
         .iter()
@@ -453,7 +470,7 @@ fn unknown_table_property(table: &TableSpec, property: &str) -> ValidationExcept
         .collect::<Vec<_>>()
         .join(", ");
     field_validation_failed(
-        "TableProperties",
+        field,
         format!(
             "Table property {} is not supported for table {}. Supported table properties: [{supported}].",
             clip_for_message(property),
@@ -463,15 +480,17 @@ fn unknown_table_property(table: &TableSpec, property: &str) -> ValidationExcept
     )
 }
 
-/// The modelled 400 for a `TableProperties` value outside the property's valid values.
-/// Only an enumerated property refuses a value: a free-form one accepts any.
+/// The modelled 400 for a table-property value outside the property's valid values,
+/// naming the caller's own member path `field` as the place the invalid entry was
+/// detected. Only an enumerated property refuses a value: a free-form one accepts any.
 fn invalid_table_property_value(
+    field: &str,
     property: &TablePropertySpec,
     value: &str,
 ) -> ValidationException {
     let valid = property.valid_values.join(", ");
     field_validation_failed(
-        "TableProperties",
+        field,
         format!(
             "Value {} is not supported for table property {}. Valid values: [{valid}].",
             clip_for_message(value),

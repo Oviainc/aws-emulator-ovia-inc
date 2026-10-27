@@ -479,6 +479,52 @@ pub const EVENT_ACTIVITY_SCHEDULED: &str = "ActivityScheduled";
 /// The history event a worker's successful reply to an activity task writes.
 pub const EVENT_ACTIVITY_SUCCEEDED: &str = "ActivitySucceeded";
 
+/// The history event a `Task` state writes when the work its `Resource` names is
+/// handed over, which a `Retry` writes again for each attempt it makes.
+pub const EVENT_TASK_SCHEDULED: &str = "TaskScheduled";
+
+/// The history event a `Task` state writes when that work starts.
+pub const EVENT_TASK_STARTED: &str = "TaskStarted";
+
+/// The history event a `Task` state writes when that work answered.
+pub const EVENT_TASK_SUCCEEDED: &str = "TaskSucceeded";
+
+/// The history event a `Task` state writes when that work failed.
+pub const EVENT_TASK_FAILED: &str = "TaskFailed";
+
+/// The history event a `Task` state writes when that work ran out of the time the
+/// state allowed it, which the language reports under [`TASK_TIMEOUT_ERROR`].
+pub const EVENT_TASK_TIMED_OUT: &str = "TaskTimedOut";
+
+/// The history event a `Map` state writes when it starts iterating, carrying how many
+/// items it is iterating; written again for each attempt a `Retry` makes.
+pub const EVENT_MAP_STATE_STARTED: &str = "MapStateStarted";
+
+/// The history event a `Map` state writes when every one of its iterations the state
+/// needed finished.
+pub const EVENT_MAP_STATE_SUCCEEDED: &str = "MapStateSucceeded";
+
+/// The history event a `Map` state writes when more of its iterations failed than it
+/// tolerates.
+pub const EVENT_MAP_STATE_FAILED: &str = "MapStateFailed";
+
+/// The history events ONE iteration of a `Map` state writes, each carrying the state's
+/// name and the index of the item the iteration was handed.
+pub const EVENT_MAP_ITERATION_STARTED: &str = "MapIterationStarted";
+pub const EVENT_MAP_ITERATION_SUCCEEDED: &str = "MapIterationSucceeded";
+pub const EVENT_MAP_ITERATION_FAILED: &str = "MapIterationFailed";
+pub const EVENT_MAP_ITERATION_ABORTED: &str = "MapIterationAborted";
+
+/// The history event a `Parallel` state writes when its branches start, written again
+/// for each attempt a `Retry` makes.
+pub const EVENT_PARALLEL_STATE_STARTED: &str = "ParallelStateStarted";
+
+/// The history event a `Parallel` state writes when every branch completed.
+pub const EVENT_PARALLEL_STATE_SUCCEEDED: &str = "ParallelStateSucceeded";
+
+/// The history event a `Parallel` state writes when one of its branches failed.
+pub const EVENT_PARALLEL_STATE_FAILED: &str = "ParallelStateFailed";
+
 /// The history event an execution that one of its states failed ends on.
 pub const EVENT_EXECUTION_FAILED: &str = "ExecutionFailed";
 
@@ -597,11 +643,21 @@ pub const TOO_MANY_TAGS_MESSAGE: &str = "Too many tags provided.";
 /// The most history events one execution keeps.
 ///
 /// This is the interpreter's own ceiling, not a separate guess: a transition emits
-/// at most two events, [`asl::MAX_STATE_TRANSITIONS`] bounds the transitions, and
-/// `ExecutionStarted` plus one terminal event bracket them. Each event carries a
-/// state name, which [`asl::MAX_STATE_NAME_CHARS`] bounds, so the history's BYTES
-/// are bounded too.
-pub const MAX_HISTORY_EVENTS: usize = 2 * asl::MAX_STATE_TRANSITIONS + 2;
+/// the pair its state was entered and left with plus the lifecycle events of the work
+/// between them — the handover, start and outcome of a `Task`'s work, the start and
+/// outcome of a `Map`'s or a `Parallel`'s, the start and outcome of one `Map`
+/// iteration — which is at most [`EVENTS_PER_TRANSITION`] per transition;
+/// [`asl::MAX_STATE_TRANSITIONS`] bounds the transitions, and `ExecutionStarted` plus
+/// one terminal event bracket them. Each event carries a state name, which
+/// [`asl::MAX_STATE_NAME_CHARS`] bounds, so the history's BYTES are bounded too.
+pub const MAX_HISTORY_EVENTS: usize = EVENTS_PER_TRANSITION * asl::MAX_STATE_TRANSITIONS + 2;
+
+/// The most history events one state transition writes: the `<Type>StateEntered` and
+/// `<Type>StateExited` pair, and the at most six lifecycle events the work between
+/// them can write — a `Map` iteration's start and outcome, and, for the attempt that
+/// iteration belongs to, the enclosing state's own start and outcome plus the
+/// handover and start of a `Task`'s work.
+const EVENTS_PER_TRANSITION: usize = 8;
 
 /// What [`Execution::measure`] reserves for a stop that has not happened yet.
 ///
@@ -1215,8 +1271,12 @@ pub struct HistoryEvent {
 /// emulator does not record is not reported at all.
 #[derive(Debug, Clone, Default)]
 pub struct EventDetails {
-    /// The resource the event's work names: the activity ARN of a scheduled task.
+    /// The resource the event's work names: the activity ARN of a scheduled task, or
+    /// the action a `Task` state's integration called.
     pub resource: Option<String>,
+    /// The kind of resource that action belongs to, which a `Task` state's own events
+    /// report beside it.
+    pub resource_type: Option<String>,
     /// The input that work was handed.
     pub input: Option<String>,
     /// The output it answered.
@@ -1234,6 +1294,10 @@ pub struct EventDetails {
     /// moves again at the NEXT redrive, so the count belongs to the event rather
     /// than being read back off the execution.
     pub redrive_count: Option<i32>,
+    /// The index of the item one `Map` iteration was handed.
+    pub index: Option<i32>,
+    /// How many items a `Map` state is iterating.
+    pub length: Option<i32>,
 }
 
 impl EventDetails {
@@ -1241,6 +1305,7 @@ impl EventDetails {
     fn measure(&self) -> usize {
         let text = |value: &Option<String>| value.as_ref().map_or(0, String::len);
         text(&self.resource)
+            + text(&self.resource_type)
             + text(&self.input)
             + text(&self.output)
             + text(&self.worker_name)
@@ -6267,7 +6332,7 @@ fn plan_from_run(
             details: if step.terminal {
                 outcome.clone()
             } else {
-                EventDetails::default()
+                step.details
             },
         })
         .collect();

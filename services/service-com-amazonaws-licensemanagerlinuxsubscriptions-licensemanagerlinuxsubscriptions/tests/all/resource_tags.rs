@@ -3,9 +3,10 @@
 //! End-to-end coverage for this service's tagging slice: `TagResource`
 //! (`PUT /tags/{resourceArn}`) and `ListTagsForResource` (`GET /tags/{resourceArn}`).
 //!
-//! Every case drives a real request through the router's `dispatch`, so what is asserted
-//! is the wire behaviour an SDK client sees: deserialize → constraint check → handle →
-//! serialize.
+//! Every case drives a real request through the shared harness's `dispatch`, so what is
+//! asserted is the wire behaviour an SDK client sees: deserialize → constraint check →
+//! handle → serialize, with this suite stating no second copy of what that request looks
+//! like on the wire.
 //!
 //! The rules under test, each asserted over a SET of inputs rather than one request:
 //!
@@ -34,28 +35,14 @@
 //! below it and one past it.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
-use serde_json::{json, Map, Value};
-use smithy_server_runtime::MultiServiceRouter;
+use serde_json::{Map, Value};
 
-use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::state::{
-    SubscriptionProviderRecord, PROVIDER_STATUS_ACTIVE,
+use crate::harness::{
+    deregister, get_provider, harness, list_tags, provider_arn_for, seed_provider,
+    stored_provider_count, tag, Harness, Reply, ACCOUNT, RED_HAT, REGION, SIGNING_NAME,
 };
-use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::{
-    ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState as ServiceState,
-    EmulatedService,
-};
-
-/// This service's sigv4 signing name (`OPERATIONS.md`, "Wire protocol") — how the router
-/// picks the service out of the request's credential scope.
-const SIGNING_NAME: &str = "license-manager-linux-subscriptions";
-/// The region the test requests are signed for; every minted ARN carries it.
-const REGION: &str = "us-west-2";
-/// The one account id a generated emulator presents.
-const ACCOUNT: &str = "000000000000";
-/// The only `SubscriptionProviderSource` the model declares (`one of: RedHat`).
-const RED_HAT: &str = "RedHat";
+use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState as ServiceState;
 
 /// The largest tag set a resource may carry: the modelled `Tags` map is `len 0..50`,
 /// both as `TagResource`'s input and as `ListTagsForResource`'s output
@@ -74,118 +61,16 @@ const TAG_LIMIT: (u16, &str, &str) = (
     "The resultant tag set must not have more than 50 user tags.",
 );
 
-/// One emulator: the router that dispatches, plus the shared engine its service was
-/// built from (so a test can read the store the handlers write).
-struct Harness {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
-}
-
-fn harness() -> Harness {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // The tests sign nothing; authentication is the framework's concern, not this
-    // service's.
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(Arc::clone(&engine)));
-    Harness { router, engine }
-}
-
-/// What a call answered: the HTTP status, the wire error code (if any) and the body.
-#[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: Option<String>,
-    body: Value,
-}
-
-impl Reply {
-    fn ok(&self, case: &str) -> &Value {
-        assert_eq!(
-            self.status, 200,
-            "case {case:?}: expected HTTP 200, got {} with body {:?}",
-            self.status, self.body
-        );
-        &self.body
-    }
-
-    /// Assert this reply is the HTTP status, wire error code and message of `refusal`.
-    fn refused(&self, case: &str, refusal: (u16, &str, &str)) {
-        let (status, code, message) = refusal;
-        assert_eq!(
-            self.status, status,
-            "case {case:?}: expected HTTP {status}, got {} with body {:?}",
-            self.status, self.body
-        );
-        let actual = self.error_type.as_deref().unwrap_or("<none>");
-        assert!(
-            actual.ends_with(code),
-            "case {case:?}: expected error code {code}, got {actual:?} with body {:?}",
-            self.body
-        );
-        assert_eq!(
-            self.body.get("message").and_then(Value::as_str),
-            Some(message),
-            "case {case:?}: expected message {message:?}, got body {:?}",
-            self.body
-        );
-    }
-}
-
-async fn call(h: &Harness, method: &str, path: &str, body: Option<&Value>) -> Reply {
-    let mut builder = http::Request::builder()
-        .method(method)
-        .uri(format!("https://{SIGNING_NAME}.{REGION}.amazonaws.com{path}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTEXAMPLE/20260101/{REGION}/{SIGNING_NAME}\
-                 /aws4_request, SignedHeaders=host, Signature=0"
-            ),
-        );
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let payload = body.map_or_else(bytes::Bytes::new, |value| {
-        bytes::Bytes::from(serde_json::to_vec(value).expect("the request body serializes"))
-    });
-    let request = builder.body(payload).expect("a well-formed request");
-    let response = h.router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let header_error = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let body: Value = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    let error_type = header_error.or_else(|| {
-        body.get("__type")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    });
-    Reply {
-        status,
-        error_type,
-        body,
-    }
-}
-
-/// `resourceArn` is bound to a NON-greedy `@httpLabel` (`/tags/{resourceArn}`), so an
-/// ARN travels as ONE path segment with its `/` and `:` percent-encoded — exactly what
-/// an SDK client sends.
-fn encode_label(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| match c {
-            '/' => "%2F".to_string(),
-            ':' => "%3A".to_string(),
-            other => other.to_string(),
-        })
-        .collect()
+/// Assert `reply` is the HTTP status, wire error code and message of `refusal`.
+fn assert_refused(reply: &Reply, case: &str, refusal: (u16, &str, &str)) {
+    let (status, code, message) = refusal;
+    reply.error(case, status, code);
+    assert_eq!(
+        reply.message(),
+        message,
+        "case {case:?}: expected message {message:?}, got body {:?}",
+        reply.body
+    );
 }
 
 /// A JSON tag map from `(key, value)` pairs.
@@ -213,39 +98,34 @@ fn generated_pairs(count: usize) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Put a subscription provider carrying `tags` in the store and return its ARN.
+/// Put a subscription provider carrying `tags` in the store, under the id `index` names,
+/// and return its ARN.
 ///
-/// The provider is seeded DIRECTLY, through the same `engine.state::<…>()` seam the
-/// handlers use, because these rules are about the TAG slice of a provider that is already
-/// usable: `RegisterSubscriptionProvider` creates one over the wire and it becomes usable
+/// The provider is seeded DIRECTLY, through the shared harness's one seeding routine (the
+/// same `engine.state::<…>()` seam the handlers use), because these rules are about the
+/// TAG slice of a provider that is already usable:
+/// `RegisterSubscriptionProvider` creates one over the wire and it becomes usable
 /// on the clock (the create path is covered by
 /// `tests/all/subscription_provider_registration.rs`), so a suite about tags would
-/// otherwise wait out that span once per row. The `secret` keeps each seeded record
-/// distinct.
-async fn register(h: &Harness, case: &str, secret: &str, tags: &[(String, String)]) -> String {
-    let store = h.engine.state::<ServiceState>();
-    let mut guard = store.lock();
-    let arn = format!(
-        "arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT}:subscription-provider/\
-         00000000-0000-4000-8000-{:012x}",
-        guard.providers.len() + 1
+/// otherwise wait out that span once per row. The id and the secret keep each seeded
+/// record distinct.
+fn register(h: &Harness, case: &str, index: usize, tags: &[(String, String)]) -> String {
+    let borrowed: Vec<(&str, &str)> = tags
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let before = stored_provider_count(h);
+    let arn = seed_provider(
+        h,
+        &format!("00000000-0000-4000-8000-{:012x}", index + 1),
+        &secret_arn(index),
+        &borrowed,
     );
-    assert!(
-        !guard.providers.contains_key(&arn),
-        "case {case:?}: the seeded ARN {arn} is already in the store"
+    assert_eq!(
+        stored_provider_count(h),
+        before + 1,
+        "case {case:?}: the seeded ARN {arn} was already in the store"
     );
-    guard.providers.insert(
-        arn.clone(),
-        SubscriptionProviderRecord::settled(
-            arn.clone(),
-            RED_HAT.to_string(),
-            secret.to_string(),
-            PROVIDER_STATUS_ACTIVE.to_string(),
-            tags.iter().cloned().collect(),
-            std::time::SystemTime::now(),
-        ),
-    );
-    guard.provider_order.push(arn.clone());
     arn
 }
 
@@ -255,17 +135,7 @@ fn secret_arn(index: usize) -> String {
 }
 
 async fn tag_resource(h: &Harness, arn: &str, tags: &[(String, String)]) -> Reply {
-    call(
-        h,
-        "PUT",
-        &format!("/tags/{}", encode_label(arn)),
-        Some(&json!({ "tags": tag_map(tags) })),
-    )
-    .await
-}
-
-async fn list_tags(h: &Harness, arn: &str) -> Reply {
-    call(h, "GET", &format!("/tags/{}", encode_label(arn)), None).await
+    tag(h, arn, &tag_map(tags)).await
 }
 
 /// The tag set a `ListTagsForResource` body reports, as a sorted map so two sets compare
@@ -391,7 +261,7 @@ async fn a_tag_write_merges_into_the_stored_set_the_read_reports() {
 
     for (index, row) in merge_cases().into_iter().enumerate() {
         let case = row.case.clone();
-        let arn = register(&h, &case, &secret_arn(index), &row.stored).await;
+        let arn = register(&h, &case, index, &row.stored);
 
         tag_resource(&h, &arn, &row.written).await.ok(&case);
         let got = reported_tags(&list_tags(&h, &arn).await, &case);
@@ -429,7 +299,7 @@ async fn reading_tags_changes_nothing_a_later_caller_sees() {
     let h = harness();
     let case = "read a provider's tags twice";
     let stored = pairs(&[("env", "prod"), ("owner", "platform")]);
-    let arn = register(&h, case, &secret_arn(0), &stored).await;
+    let arn = register(&h, case, 0, &stored);
 
     let first = reported_tags(&list_tags(&h, &arn).await, case);
     let second = reported_tags(&list_tags(&h, &arn).await, case);
@@ -445,13 +315,7 @@ async fn reading_tags_changes_nothing_a_later_caller_sees() {
     );
 
     // The rest of the record is untouched too: the reader is `@readonly`.
-    let provider = call(
-        &h,
-        "POST",
-        "/subscription/GetRegisteredSubscriptionProvider",
-        Some(&json!({ "SubscriptionProviderArn": arn })),
-    )
-    .await;
+    let provider = get_provider(&h, &arn).await;
     let body = provider.ok(case);
     for (member, want) in [
         ("SubscriptionProviderArn", arn.as_str()),
@@ -472,26 +336,18 @@ async fn an_arn_addressing_no_resource_is_refused_by_both_tag_operations() {
     // One registered provider, so a refusal cannot be confused with an empty store, and
     // so the test can show a refused write stored nothing.
     let stored = pairs(&[("env", "prod")]);
-    let live = register(&h, "the registered provider", &secret_arn(0), &stored).await;
+    let live = register(&h, "the registered provider", 0, &stored);
     // A provider that WAS registered and is not any more: its ARN is well-formed and
     // addresses nothing.
-    let deregistered = register(&h, "a provider to deregister", &secret_arn(1), &[]).await;
-    call(
-        &h,
-        "POST",
-        "/subscription/DeregisterSubscriptionProvider",
-        Some(&json!({ "SubscriptionProviderArn": deregistered })),
-    )
-    .await
-    .ok("deregister the second provider");
+    let deregistered = register(&h, "a provider to deregister", 1, &[]);
+    deregister(&h, &deregistered)
+        .await
+        .ok("deregister the second provider");
 
     let unknown: Vec<(String, String)> = vec![
         (
             "an id nothing was ever registered under".to_string(),
-            format!(
-                "arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT}:subscription-provider/\
-                 55555555-5555-4555-8555-555555555555"
-            ),
+            provider_arn_for("55555555-5555-4555-8555-555555555555"),
         ),
         ("a deregistered provider".to_string(), deregistered),
         (
@@ -514,12 +370,14 @@ async fn an_arn_addressing_no_resource_is_refused_by_both_tag_operations() {
 
     for (label, arn) in &unknown {
         let case = format!("TagResource on {label}");
-        tag_resource(&h, arn, &pairs(&[("env", "prod")]))
-            .await
-            .refused(&case, NOT_FOUND);
+        assert_refused(
+            &tag_resource(&h, arn, &pairs(&[("env", "prod")])).await,
+            &case,
+            NOT_FOUND,
+        );
 
         let case = format!("ListTagsForResource on {label}");
-        list_tags(&h, arn).await.refused(&case, NOT_FOUND);
+        assert_refused(&list_tags(&h, arn).await, &case, NOT_FOUND);
     }
 
     // Nothing the refused writes carried was stored: the store still holds exactly the
@@ -562,7 +420,7 @@ async fn a_write_past_the_tag_maximum_is_refused_and_stores_nothing() {
     for (index, (stored_count, added, accepted)) in rows.into_iter().enumerate() {
         let case = format!("{stored_count} stored tags plus {added} new keys");
         let stored = generated_pairs(stored_count);
-        let arn = register(&h, &case, &secret_arn(index), &stored).await;
+        let arn = register(&h, &case, index, &stored);
         let added_pairs: Vec<(String, String)> = (0..added)
             .map(|offset| {
                 (
@@ -578,7 +436,7 @@ async fn a_write_past_the_tag_maximum_is_refused_and_stores_nothing() {
             reply.ok(&case);
             want.extend(added_pairs.iter().cloned());
         } else {
-            reply.refused(&case, TAG_LIMIT);
+            assert_refused(&reply, &case, TAG_LIMIT);
         }
 
         let got = reported_tags(&list_tags(&h, &arn).await, &case);
