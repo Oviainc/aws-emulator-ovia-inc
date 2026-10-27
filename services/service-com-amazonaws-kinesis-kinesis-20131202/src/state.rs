@@ -4,10 +4,10 @@
 //!
 //! This module owns the stream records the implemented operations read and write: the
 //! shard map `CreateStream` lays down, the ARN a stream is addressed by, the tags assigned
-//! to it, the record log a producer appends to and a consumer drains, and the single place
-//! where the `CREATING` -> `ACTIVE`, `UPDATING` -> `ACTIVE` and `DELETING` -> gone
-//! transitions the clock owes a stream are decided ([`Stream::status`],
-//! [`Stream::is_held`]).
+//! to it, the record log a producer appends to and a consumer drains, the enhanced fan-out
+//! consumers registered with it ([`ConsumerRecord`]), and the single place where the
+//! `CREATING` -> `ACTIVE`, `UPDATING` -> `ACTIVE` and `DELETING` -> gone transitions the
+//! clock owes a stream are decided ([`Stream::status`], [`Stream::is_held`]).
 //!
 //! It owns the channel records the same way ([`Channel`]): the destination, logging and
 //! encryption configuration `CreateChannel` resolves every documented default into, the ARN
@@ -19,10 +19,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     ChannelDescription, ChannelEncryptionConfiguration, ChannelLoggingConfiguration,
-    ChannelStreamDescription, ChildShard, EnhancedMetrics, HashKeyRange, Record,
-    S3DestinationDescription, S3TablesDestinationDescription, SequenceNumberRange, Shard,
-    StreamDescription, StreamDescriptionSummary, StreamModeDetails, StreamSummary, Tag,
-    WarmThroughputObject,
+    ChannelStreamDescription, ChildShard, Consumer, ConsumerDescription, EnhancedMetrics,
+    HashKeyRange, Record, S3DestinationDescription, S3TablesDestinationDescription,
+    SequenceNumberRange, Shard, StreamDescription, StreamDescriptionSummary, StreamModeDetails,
+    StreamSummary, Tag, WarmThroughputObject,
 };
 
 /// The region a stream is created in when the request carries no SigV4 credential scope
@@ -88,6 +88,43 @@ pub const RESHARD_DELAY: Duration = Duration::from_millis(500);
 /// and a second change that overlaps the first is refused rather than served. The instant
 /// it falls due is stored on the record and never slept on.
 pub const MODE_UPDATE_DELAY: Duration = Duration::from_millis(500);
+
+/// A consumer that is still being registered, spelled as `ConsumerStatus` models it
+/// (`smithy_query(query="shape",shape="ConsumerStatus")`). "A consumer can't read data
+/// while in the CREATING or DELETING states" (`Consumer$ConsumerStatus`).
+pub const CONSUMER_CREATING: &str = "CREATING";
+
+/// A consumer that is ready to read the stream it is registered with through enhanced
+/// fan-out.
+pub const CONSUMER_ACTIVE: &str = "ACTIVE";
+
+/// How long after the `RegisterStreamConsumer` call the consumer's `CREATING` -> `ACTIVE`
+/// transition falls due. A CHOSEN span, not an AWS-documented duration: it only has to be
+/// non-zero, so a caller that reads the consumer straight after registering it still
+/// observes `CREATING`, and it is the same span this emulator gives a stream's own
+/// activation ([`ACTIVATION_DELAY`]). The instant it falls due is stored on the record and
+/// never slept on.
+pub const CONSUMER_ACTIVATION_DELAY: Duration = ACTIVATION_DELAY;
+
+/// The most consumers one stream carries: "With On-demand Standard and Provisioned
+/// streams, you can register up to 20 consumers per stream to use Enhanced Fan-out"
+/// (`RegisterStreamConsumer`) — the mode every stream of this emulator is in, since
+/// On-demand Advantage (50 consumers) is a billing option no operation of this service
+/// exposes.
+pub const MAX_CONSUMERS_PER_STREAM: usize = 20;
+
+/// The most consumers of one stream that may be in `CREATING` at the same time: "only 5
+/// consumers can be created simultaneously. In other words, you cannot have more than 5
+/// consumers in a CREATING status at the same time. Registering a 6th consumer while there
+/// are 5 in a CREATING status results in a LimitExceededException"
+/// (`RegisterStreamConsumer`).
+pub const MAX_CONSUMERS_CREATING: usize = 5;
+
+/// The most tags one consumer carries: "A set of up to 50 key-value pairs"
+/// (`RegisterStreamConsumerInput$Tags`), the same count a stream carries
+/// ([`MAX_STREAM_TAGS`]) and narrower than the `TagMap` `@length` of 1..200 the boundary
+/// validator enforces.
+pub const MAX_CONSUMER_TAGS: usize = MAX_STREAM_TAGS;
 
 /// How many shard-count changes one stream may be scaled by inside [`RESHARD_WINDOW`]: by
 /// default you cannot "scale more than ten times per rolling 24-hour period per stream"
@@ -714,6 +751,84 @@ impl ShardRecord {
     }
 }
 
+/// One consumer registered with a stream for enhanced fan-out: the authoritative record
+/// `RegisterStreamConsumer` writes and `DescribeStreamConsumer` projects onto its output
+/// shape.
+#[derive(Debug, Clone)]
+pub struct ConsumerRecord {
+    /// The `ConsumerName` the registration carried, which is what names this consumer
+    /// inside its stream: "For a given Kinesis data stream, each consumer must have a
+    /// unique name. However, consumer names don't have to be unique across data streams"
+    /// (`RegisterStreamConsumerInput$ConsumerName`).
+    pub name: String,
+    /// The `ConsumerARN`, as [`consumer_arn`] builds it.
+    pub arn: String,
+    /// When `RegisterStreamConsumer` minted the consumer.
+    pub created_at: SystemTime,
+    /// When the consumer's `CREATING` -> `ACTIVE` transition falls due: a registered
+    /// consumer "can't read data while in the CREATING or DELETING states"
+    /// (`Consumer$ConsumerStatus`), so the status it starts in is not terminal.
+    pub active_at: SystemTime,
+    /// The tags the registration carried: "Tags will take effect from the CREATING status
+    /// of the consumer" (`RegisterStreamConsumer`).
+    pub tags: HashMap<String, String>,
+}
+
+impl ConsumerRecord {
+    /// The consumer a registration at `at` writes for `name` under the stream `stream_arn`
+    /// addresses.
+    pub fn registered_at(
+        stream_arn: &str,
+        name: &str,
+        at: SystemTime,
+        tags: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            arn: consumer_arn(stream_arn, name, at),
+            created_at: at,
+            // CREATING is not terminal: the consumer is owed ACTIVE, and the instant that
+            // is due is stored rather than slept on.
+            active_at: at + CONSUMER_ACTIVATION_DELAY,
+            tags,
+        }
+    }
+
+    /// The consumer's status at `now`: `CREATING` until the transition its registration
+    /// armed falls due, `ACTIVE` from then on. Derived from the stored instant, so two
+    /// reads at the same instant agree and no read has to write.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.active_at {
+            CONSUMER_CREATING
+        } else {
+            CONSUMER_ACTIVE
+        }
+    }
+
+    /// This record as the modelled `Consumer`, which is what a registration answers with.
+    pub fn to_shape(&self, now: SystemTime) -> Consumer {
+        Consumer {
+            consumer_name: self.name.clone(),
+            consumer_arn: self.arn.clone(),
+            consumer_status: self.status(now).to_string(),
+            consumer_creation_timestamp: timestamp(self.created_at),
+        }
+    }
+
+    /// This record as the modelled `ConsumerDescription`, which carries the ARN of "the
+    /// stream with which you registered the consumer"
+    /// (`ConsumerDescription$StreamARN`) beside everything the `Consumer` shape holds.
+    pub fn to_description(&self, now: SystemTime, stream_arn: &str) -> ConsumerDescription {
+        ConsumerDescription {
+            consumer_name: self.name.clone(),
+            consumer_arn: self.arn.clone(),
+            consumer_status: self.status(now).to_string(),
+            consumer_creation_timestamp: timestamp(self.created_at),
+            stream_arn: stream_arn.to_string(),
+        }
+    }
+}
+
 /// One stored Kinesis data stream: the authoritative record every stream operation reads.
 /// `CreateStream` inserts it and `DescribeStream` / `DescribeStreamSummary` project it
 /// onto their output shapes.
@@ -779,6 +894,11 @@ pub struct Stream {
     pub encryption_stops: Vec<SystemTime>,
     /// The tags the create carried.
     pub tags: HashMap<String, String>,
+    /// The consumers registered with the stream for enhanced fan-out, in registration
+    /// order. Empty until `RegisterStreamConsumer` registers one, and gone with the stream
+    /// once its removal falls due: "When you delete a stream, any shards in that stream are
+    /// also deleted" (`DeleteStream`), and a consumer is registered with the stream.
+    pub consumers: Vec<ConsumerRecord>,
 }
 
 impl Stream {
@@ -1210,6 +1330,47 @@ impl Stream {
             .unwrap_or(i32::MAX)
     }
 
+    /// The consumer the stream carries under `name`, if any: a consumer name is unique
+    /// inside ONE stream ("For a given Kinesis data stream, each consumer must have a
+    /// unique name", `RegisterStreamConsumerInput$ConsumerName`).
+    pub fn consumer(&self, name: &str) -> Option<&ConsumerRecord> {
+        self.consumers.iter().find(|consumer| consumer.name == name)
+    }
+
+    /// The consumer the stream carries under `arn`, if any.
+    pub fn consumer_by_arn(&self, arn: &str) -> Option<&ConsumerRecord> {
+        self.consumers.iter().find(|consumer| consumer.arn == arn)
+    }
+
+    /// How many of the stream's consumers are still in `CREATING` at `now`, which is what
+    /// [`MAX_CONSUMERS_CREATING`] bounds.
+    pub fn consumers_creating(&self, now: SystemTime) -> usize {
+        self.consumers
+            .iter()
+            .filter(|consumer| consumer.status(now) == CONSUMER_CREATING)
+            .count()
+    }
+
+    /// How many consumers are registered with the stream, which is what
+    /// `StreamDescriptionSummary$ConsumerCount` reports.
+    pub fn consumer_count(&self) -> i32 {
+        i32::try_from(self.consumers.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Register a consumer named `name` with the stream at `at` and answer the record that
+    /// was stored. The caller has already refused a name the stream carries and a
+    /// registration past the documented ceilings, so this only writes.
+    pub fn register_consumer(
+        &mut self,
+        name: &str,
+        at: SystemTime,
+        tags: HashMap<String, String>,
+    ) -> ConsumerRecord {
+        let consumer = ConsumerRecord::registered_at(&self.arn, name, at, tags);
+        self.consumers.push(consumer.clone());
+        consumer
+    }
+
     /// This record as the modelled `StreamSummary`, which is what a listing reports beside
     /// the stream's name.
     pub fn to_stream_summary(&self, now: SystemTime) -> StreamSummary {
@@ -1335,9 +1496,9 @@ impl Stream {
             encryption_type: Some(self.encryption_type.clone()),
             key_id: self.key_id.clone(),
             open_shard_count: self.open_shard_count(),
-            // No consumer is registered until `RegisterStreamConsumer` registers one, and
-            // no channel is associated until `CreateChannel` creates one.
-            consumer_count: Some(0),
+            // Every consumer `RegisterStreamConsumer` registered with the stream is counted
+            // here; no channel is associated until `CreateChannel` creates one.
+            consumer_count: Some(self.consumer_count()),
             warm_throughput: Some(self.warm_throughput()),
             max_record_size_in_ki_b: self.max_record_size_in_ki_b,
             channel_count: Some(0),
@@ -1527,6 +1688,59 @@ impl ComAmazonawsKinesisKinesis20131202State {
             .ok_or(StreamLookupFailure::NotFound)
     }
 
+    /// The stream and the consumer a `DescribeStreamConsumer`-shaped request names at
+    /// `now`.
+    ///
+    /// "To get the description of a registered consumer, provide the ARN of the consumer.
+    /// Alternatively, you can provide the ARN of the data stream and the name you gave the
+    /// consumer when you registered it. You may also provide all three parameters, as long
+    /// as they don't conflict with each other" (`DescribeStreamConsumer`): a request naming
+    /// neither the consumer's ARN nor the stream-and-name pair is refused rather than
+    /// answered, and a request naming both has to name ONE consumer with them.
+    pub fn resolve_consumer(
+        &self,
+        now: SystemTime,
+        region: &str,
+        stream_arn: Option<&str>,
+        consumer_name: Option<&str>,
+        consumer_arn: Option<&str>,
+    ) -> Result<(&Stream, &ConsumerRecord), ConsumerLookupFailure> {
+        match (consumer_arn, stream_arn) {
+            (Some(consumer_arn), _) => {
+                let (stream, consumer) = self
+                    .streams
+                    .values()
+                    .filter(|stream| stream.region == region && stream.is_held(now))
+                    .find_map(|stream| {
+                        stream
+                            .consumer_by_arn(consumer_arn)
+                            .map(|consumer| (stream, consumer))
+                    })
+                    .ok_or(ConsumerLookupFailure::ConsumerNotFound)?;
+                // The members a request names beside the consumer's ARN must not conflict
+                // with the consumer that ARN resolves to.
+                if stream_arn.is_some_and(|arn| arn != stream.arn)
+                    || consumer_name.is_some_and(|name| name != consumer.name)
+                {
+                    return Err(ConsumerLookupFailure::Mismatch);
+                }
+                Ok((stream, consumer))
+            }
+            (None, Some(stream_arn)) => {
+                let consumer_name =
+                    consumer_name.ok_or(ConsumerLookupFailure::ConsumerUnspecified)?;
+                let stream = self
+                    .stream_by_arn(now, region, stream_arn)
+                    .ok_or(ConsumerLookupFailure::StreamNotFound)?;
+                let consumer = stream
+                    .consumer(consumer_name)
+                    .ok_or(ConsumerLookupFailure::ConsumerNotFound)?;
+                Ok((stream, consumer))
+            }
+            (None, None) => Err(ConsumerLookupFailure::ConsumerUnspecified),
+        }
+    }
+
     /// Drop every stream whose removal has fallen due at `now`, freeing its shard logs.
     ///
     /// The removal a `DeleteStream` armed is what makes the stream stop naming a resource
@@ -1662,6 +1876,21 @@ pub enum StreamLookupFailure {
     Mismatch,
     /// The members are well formed, but this account and region hold no such stream.
     NotFound,
+}
+
+/// Why a request's `ConsumerARN` / `StreamARN` / `ConsumerName` members name no consumer a
+/// store holds. Each operation maps it onto the error ITS model declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumerLookupFailure {
+    /// The request named neither the consumer's ARN nor a stream-and-name pair, so it
+    /// names no consumer at all.
+    ConsumerUnspecified,
+    /// The request named members that name different consumers.
+    Mismatch,
+    /// The members are well formed, but this account and region hold no such stream.
+    StreamNotFound,
+    /// The stream is held, but no consumer of it answers to the request's members.
+    ConsumerNotFound,
 }
 
 /// How a request that names no stream is refused: the rule `DescribeStream` publishes
@@ -1933,6 +2162,107 @@ pub fn tag_ceiling_exceeded_message(resulting: usize) -> String {
         "assigning these tags would leave the resource carrying {resulting} tags, past the \
          {MAX_STREAM_TAGS} tags one resource may carry"
     )
+}
+
+/// How a request that names no consumer is refused: the rule `DescribeStreamConsumer`
+/// publishes ("provide the ARN of the consumer. Alternatively, you can provide the ARN of
+/// the data stream and the name you gave the consumer when you registered it").
+pub const CONSUMER_IDENTIFIER_REQUIRED_MESSAGE: &str =
+    "you must provide the ConsumerARN, or the StreamARN and the ConsumerName";
+
+/// How a request whose consumer identifiers name different consumers is refused: "You may
+/// also provide all three parameters, as long as they don't conflict with each other"
+/// (`DescribeStreamConsumer`).
+pub const CONSUMER_IDENTIFIER_CONFLICT_MESSAGE: &str =
+    "ConsumerARN, StreamARN and ConsumerName name different consumers; they must not \
+     conflict with each other";
+
+/// How a read states that no consumer the request's members name is registered with this
+/// account. Built FROM the request, so the consumer at fault is what names it — and the
+/// stream clause is there only when the request named a stream to look under, since a
+/// request that resolves by `ConsumerARN` alone names none.
+pub fn consumer_not_found_message(consumer_identifier: &str, stream_identifier: &str) -> String {
+    let under_stream = if stream_identifier.is_empty() {
+        String::new()
+    } else {
+        format!(" and stream {stream_identifier}")
+    };
+    format!(
+        "Consumer {consumer_identifier} not found under account {}{under_stream}.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How a registration refuses a name the stream already carries a consumer under: "For a
+/// given Kinesis data stream, each consumer must have a unique name"
+/// (`RegisterStreamConsumerInput$ConsumerName`), which is the modelled "resource is not
+/// available for this operation" refusal. Built FROM the request and the stored record, so
+/// the consumer, the stream and the account at fault are what name it.
+pub fn consumer_already_exists_message(consumer_name: &str, stream_name: &str) -> String {
+    format!(
+        "Consumer {consumer_name} under stream {stream_name} already exists for account {}.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How a registration refuses a stream that already carries every consumer it may carry:
+/// "you can register up to 20 consumers per stream to use Enhanced Fan-out"
+/// (`RegisterStreamConsumer`). Built FROM the stored record, so the stream and the count at
+/// fault name it.
+pub fn consumer_ceiling_exceeded_message(stream_identifier: &str, registered: usize) -> String {
+    format!(
+        "stream {stream_identifier} already has {registered} registered consumers; you can \
+         register up to {MAX_CONSUMERS_PER_STREAM} consumers per stream to use Enhanced \
+         Fan-out"
+    )
+}
+
+/// How a registration refuses a stream that already has as many consumers being created as
+/// may be created at once: "you cannot have more than 5 consumers in a CREATING status at
+/// the same time. Registering a 6th consumer while there are 5 in a CREATING status results
+/// in a LimitExceededException" (`RegisterStreamConsumer`).
+pub fn consumers_creating_message(stream_identifier: &str) -> String {
+    format!(
+        "stream {stream_identifier} already has {MAX_CONSUMERS_CREATING} consumers in \
+         {CONSUMER_CREATING} status; you cannot have more than \
+         {MAX_CONSUMERS_CREATING} consumers in a {CONSUMER_CREATING} status at the same time"
+    )
+}
+
+/// How a delete refuses a stream that still carries consumers: "If this parameter is unset
+/// (null) or if you set it to false, and the stream has registered consumers, the call to
+/// DeleteStream fails with a ResourceInUseException"
+/// (`DeleteStreamInput$EnforceConsumerDeletion`), so the refusal names the member that
+/// serves the call anyway. Built FROM the stored record and this account, so the stream
+/// standing in the way is what names it.
+pub fn stream_has_consumers_message(stream_name: &str) -> String {
+    format!(
+        "DeleteStream can\u{2019}t delete {}:{stream_name} because there are consumers \
+         associated with this data stream. To delete {stream_name} anyway, set the \
+         EnforceConsumerDeletion parameter to true to force the deletion of all the \
+         consumers associated with this data stream.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The ARN a consumer named `name`, registered at `created_at` with the stream `stream_arn`
+/// addresses, is addressed by.
+///
+/// "If you delete a consumer and then create a new one with the same name, it won't have
+/// the same ARN. That's because consumer ARNs contain the creation timestamp"
+/// (`Consumer$ConsumerARN`), so the registration instant is the ARN's last segment — in
+/// whole seconds since the epoch, as the modelled `ConsumerARN` pattern
+/// (`…stream/<name>/consumer/<name>:[0-9]+`) ends.
+pub fn consumer_arn(stream_arn: &str, name: &str, created_at: SystemTime) -> String {
+    format!("{stream_arn}/consumer/{name}:{}", epoch_seconds(created_at))
+}
+
+/// Whole seconds since the epoch at `at`, which is the segment a [`consumer_arn`] ends
+/// with.
+pub fn epoch_seconds(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 /// How a create refuses a request that names no destination, or names both: "You must

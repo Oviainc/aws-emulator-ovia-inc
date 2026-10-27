@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStreamConsumer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStreamConsumer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStreamConsumer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects the consumer record `RegisterStreamConsumer` stored on its stream
+//! ([`crate::state::ConsumerRecord`]) onto the modelled `ConsumerDescription`, resolving it
+//! by `ConsumerARN`, by `StreamARN` and `ConsumerName`, or by all three as long as they
+//! name ONE consumer. The status it reports is `CREATING` until the transition the
+//! registration armed falls due and `ACTIVE` from then on, so what a registration wrote is
+//! what this read reports.
+//!
+//! A request naming no consumer at all, or whose members name different consumers, is
+//! refused with the modelled `InvalidArgumentException`; one naming a stream or a consumer
+//! this account and region do not hold is `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -101,12 +103,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `DescribeStreamConsumerError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#DescribeStreamConsumer")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#DescribeStreamConsumer",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models it
+    // ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer for
+    // a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum DescribeStreamConsumerErrorModeled {
     InvalidArgumentException(InvalidArgumentException),
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -132,6 +142,58 @@ impl From<DescribeStreamConsumerErrorModeled> for DescribeStreamConsumerError {
 /// concrete engine where it mounts the service, not here.
 pub struct DescribeStreamConsumer<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// The modelled refusal for a request whose consumer identifiers name no consumer of this
+/// account and region. Built FROM the request, so the identifier at fault is what names it.
+fn lookup_refusal(
+    failure: crate::state::ConsumerLookupFailure,
+    input: &DescribeStreamConsumerInput,
+) -> DescribeStreamConsumerError {
+    match failure {
+        crate::state::ConsumerLookupFailure::ConsumerUnspecified => {
+            DescribeStreamConsumerErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(
+                        crate::state::CONSUMER_IDENTIFIER_REQUIRED_MESSAGE.to_string(),
+                    ),
+                },
+            )
+        }
+        crate::state::ConsumerLookupFailure::Mismatch => {
+            DescribeStreamConsumerErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(
+                        crate::state::CONSUMER_IDENTIFIER_CONFLICT_MESSAGE.to_string(),
+                    ),
+                },
+            )
+        }
+        crate::state::ConsumerLookupFailure::StreamNotFound => {
+            DescribeStreamConsumerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::stream_not_found_message(
+                        input.stream_arn.as_deref().unwrap_or_default(),
+                    )),
+                },
+            )
+        }
+        crate::state::ConsumerLookupFailure::ConsumerNotFound => {
+            DescribeStreamConsumerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::consumer_not_found_message(
+                        input
+                            .consumer_name
+                            .as_deref()
+                            .or(input.consumer_arn.as_deref())
+                            .unwrap_or_default(),
+                        input.stream_arn.as_deref().unwrap_or_default(),
+                    )),
+                },
+            )
+        }
+    }
+    .into()
 }
 
 impl<Eng> DescribeStreamConsumer<Eng> {
@@ -160,18 +222,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStreamConsumer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStreamConsumerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStreamConsumer"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeStreamConsumerError::from(
+                DescribeStreamConsumerErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the stream store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        // `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
+        // carries one and a request naming only that member names no consumer.
+        let (stream, consumer) = store
+            .resolve_consumer(
+                now,
+                &region,
+                input.stream_arn.as_deref(),
+                input.consumer_name.as_deref(),
+                input.consumer_arn.as_deref(),
+            )
+            .map_err(|failure| lookup_refusal(failure, &input))?;
+
+        Ok(DescribeStreamConsumerOutput {
+            consumer_description: consumer.to_description(now, &stream.arn),
+        })
     }
 }

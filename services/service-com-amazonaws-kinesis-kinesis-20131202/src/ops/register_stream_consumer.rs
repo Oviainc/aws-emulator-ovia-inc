@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterStreamConsumer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterStreamConsumer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterStreamConsumer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a consumer with the stream the request's `StreamARN` addresses, storing it on
+//! that stream's record in `crate::state` ([`crate::state::ConsumerRecord`]) and answering
+//! with the `Consumer` shape that record projects onto: the generated `ConsumerARN`, the
+//! `CREATING` status a consumer starts in, and the instant the registration happened.
+//! `DescribeStreamConsumer` reads that stored record back, and `DescribeStreamSummary`'s
+//! `ConsumerCount` counts it.
+//!
+//! A consumer name is unique inside ONE stream, so a name the stream already carries a
+//! consumer under is refused with the modelled `ResourceInUseException` and the stored
+//! consumer is left untouched; the same name on another stream is another consumer. A
+//! registration past the documented per-stream ceiling, or past the consumers that may be
+//! in `CREATING` at once, is refused with `LimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +106,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::HashMap;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -113,13 +119,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `RegisterStreamConsumerError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#RegisterStreamConsumer")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#RegisterStreamConsumer",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models it
+    // ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer for
+    // a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum RegisterStreamConsumerErrorModeled {
     InvalidArgumentException(InvalidArgumentException),
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -145,6 +159,142 @@ impl From<RegisterStreamConsumerErrorModeled> for RegisterStreamConsumerError {
 /// concrete engine where it mounts the service, not here.
 pub struct RegisterStreamConsumer<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the consumer was registered in, and
+/// how the call ended. No stream name, no consumer name and no ARN: a log sink needs none
+/// of them to attribute the change.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "RegisterStreamConsumer",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// Refuse the request with the error this operation models for a parameter that "exceeds
+/// its restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> RegisterStreamConsumerError {
+    RegisterStreamConsumerErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request because serving it would take the stream past a documented ceiling on
+/// the consumers it may carry: the error `RegisterStreamConsumer` names for both of them.
+fn limit_exceeded(message: String) -> RegisterStreamConsumerError {
+    RegisterStreamConsumerErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled refusal for a request whose `StreamARN` names no stream of this account and
+/// region, worded exactly as every other operation of this service words it.
+fn lookup_refusal(
+    failure: crate::state::StreamLookupFailure,
+    identifier: &str,
+) -> RegisterStreamConsumerError {
+    match failure {
+        crate::state::StreamLookupFailure::Unspecified
+        | crate::state::StreamLookupFailure::Mismatch => {
+            invalid_argument(crate::state::STREAM_ARN_REQUIRED_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::NotFound => {
+            RegisterStreamConsumerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::stream_not_found_message(identifier)),
+                },
+            )
+            .into()
+        }
+    }
+}
+
+/// Register the consumer the request names with the stream it addresses, or answer the
+/// modelled refusal that stands in the way. The whole write lives here so the caller holds
+/// the store's lock for exactly this long, which is also what admits exactly ONE of two
+/// overlapping registrations of the same name: the one that gets the lock first stores the
+/// consumer, and the next one reads it and is refused.
+fn register_consumer(
+    store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &RegisterStreamConsumerInput,
+) -> Result<Consumer, RegisterStreamConsumerError> {
+    // "A set of up to 50 key-value pairs" (`RegisterStreamConsumerInput$Tags`) — narrower
+    // than the `TagMap` `@length` of 1..200 the boundary validator enforces, so the
+    // documented ceiling is applied here, BEFORE anything is stored.
+    let tags: HashMap<String, String> = input.tags.clone().unwrap_or_default();
+    if tags.len() > crate::state::MAX_CONSUMER_TAGS {
+        return Err(invalid_argument(crate::state::tag_ceiling_exceeded_message(
+            tags.len(),
+        )));
+    }
+
+    // `StreamARN` is the only identifier this operation takes (`@required`), and `StreamId`
+    // is documented "Not Implemented. Reserved for future use".
+    let identifier = input.stream_arn.clone();
+    let stream = store
+        .resolve_stream_mut(now, region, None, Some(&identifier))
+        .map_err(|failure| lookup_refusal(failure, &identifier))?;
+
+    // "The resource is not available for this operation. For successful operation, the
+    // resource must be in the ACTIVE state" (`ResourceInUseException`): a stream whose
+    // create, whose removal or whose re-tiling is still due is not in that state, so a
+    // registration against it is refused rather than stored.
+    let status = stream.status(now);
+    if status != crate::state::STREAM_ACTIVE {
+        return Err(RegisterStreamConsumerErrorModeled::ResourceInUseException(
+            ResourceInUseException {
+                message: Some(crate::state::stream_not_active_message(&identifier, status)),
+            },
+        )
+        .into());
+    }
+
+    // "For a given Kinesis data stream, each consumer must have a unique name"
+    // (`RegisterStreamConsumerInput$ConsumerName`), so a name this stream already carries a
+    // consumer under is a conflict rather than a second record, and the stored consumer is
+    // left exactly as it was. The same name on ANOTHER stream is another consumer:
+    // "consumer names don't have to be unique across data streams".
+    if stream.consumer(&input.consumer_name).is_some() {
+        return Err(RegisterStreamConsumerErrorModeled::ResourceInUseException(
+            ResourceInUseException {
+                message: Some(crate::state::consumer_already_exists_message(
+                    &input.consumer_name,
+                    &stream.name,
+                )),
+            },
+        )
+        .into());
+    }
+
+    // The two documented ceilings on registering: how many consumers one stream carries at
+    // all, and how many of them may be in `CREATING` at the same time.
+    let registered = stream.consumers.len();
+    if registered >= crate::state::MAX_CONSUMERS_PER_STREAM {
+        return Err(limit_exceeded(
+            crate::state::consumer_ceiling_exceeded_message(&identifier, registered),
+        ));
+    }
+    if stream.consumers_creating(now) >= crate::state::MAX_CONSUMERS_CREATING {
+        return Err(limit_exceeded(crate::state::consumers_creating_message(
+            &identifier,
+        )));
+    }
+
+    // "Tags will take effect from the CREATING status of the consumer"
+    // (`RegisterStreamConsumer`), so the tags the request carried are stored with the
+    // consumer the call mints rather than applied once it turns `ACTIVE`.
+    Ok(stream
+        .register_consumer(&input.consumer_name, now, tags)
+        .to_shape(now))
 }
 
 impl<Eng> RegisterStreamConsumer<Eng> {
@@ -173,18 +323,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterStreamConsumer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterStreamConsumerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterStreamConsumer"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region whose streams this request
+        // addresses, since a stream name "is also scoped by Amazon Web Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            RegisterStreamConsumerError::from(
+                RegisterStreamConsumerErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the stream store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let registered = {
+            let mut store = state.lock();
+            register_consumer(&mut store, &region, now, &input)
+        };
+        audit(
+            &akid,
+            &region,
+            if registered.is_ok() {
+                "registered"
+            } else {
+                "refused"
+            },
+        );
+
+        Ok(RegisterStreamConsumerOutput {
+            consumer: registered?,
+        })
     }
 }
