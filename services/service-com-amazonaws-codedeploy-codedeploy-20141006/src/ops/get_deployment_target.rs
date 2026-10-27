@@ -9,10 +9,11 @@
 //! ([`crate::state::deployment_targets`]) — and projected by the crate's single
 //! target builder ([`crate::state::deployment_target_view`]), the same one the
 //! batch reader `BatchGetDeploymentTargets` answers from, so a target reads the
-//! same whichever of the two a client asks. A deployment the clock has not
-//! started yet has no target state to report, which is its
-//! `DeploymentNotStartedException`; an id the deployment holds no target under
-//! is `DeploymentTargetDoesNotExistException`, and one outside the FORM a target
+//! same whichever of the two a client asks. This read is keyed on the per-target
+//! RECORD: an id no record of this deployment is readable under — because the
+//! deployment reports no target under it, or because it has not resolved its
+//! targets yet ([`crate::state::readable_deployment_target`]) — is
+//! `DeploymentTargetDoesNotExistException`, and one outside the FORM a target
 //! of its compute platform is reported under is
 //! `InvalidDeploymentTargetIdException` (see
 //! [`crate::state::check_deployment_target_id`]) — the refusal BOTH readers
@@ -229,15 +230,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 );
             }
-            // MEMBERSHIP is resolved before the deployment's own progress: the
-            // targets a deployment has are the snapshot its group resolved when
-            // it was created, so whether an id names one of them is already
-            // decided, and an id that names none of them belongs to no target of
-            // this deployment however far the deployment has got. Only for a
-            // target the deployment DOES have is there a state to report, which
-            // is what `DeploymentNotStartedException` refuses until the clock has
-            // started the deployment.
-            let Some(target) = crate::state::find_deployment_target(deployment, &target_id) else {
+            // The per-target RECORD is what this read is keyed on, and the
+            // deployment's own progress is not: there is a record to answer
+            // under this id, or there is not
+            // ([`crate::state::readable_deployment_target`]). An id the
+            // deployment holds no target under is refused, and so is one it
+            // does hold a target under before that target's record exists,
+            // which keeps ONE code for the whole not-yet-readable window — a
+            // client polling a target retries on that code and stops on the
+            // answer, instead of having to tell "not ready yet" from "not
+            // mine" by the code it got.
+            let Some(target) = crate::state::readable_deployment_target(deployment, &target_id)
+            else {
                 return Err(
                     GetDeploymentTargetErrorModeled::DeploymentTargetDoesNotExistException(
                         DeploymentTargetDoesNotExistException {
@@ -251,15 +255,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 );
             };
-            // A deployment that has not started has deployed to nothing, so it
-            // has no target state to report.
-            if !deployment.is_started() {
-                return Err(GetDeploymentTargetErrorModeled::DeploymentNotStartedException(
-                    DeploymentNotStartedException {
-                        message: Some(crate::state::deployment_not_started(&deployment_id)),
-                    },
-                ));
-            }
             Ok(crate::state::deployment_target_view(state, deployment, target))
         })
         .ok_or_else(|| {

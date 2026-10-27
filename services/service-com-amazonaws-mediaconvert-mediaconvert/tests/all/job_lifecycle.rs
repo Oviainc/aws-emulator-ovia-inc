@@ -204,6 +204,24 @@ impl Emulator {
             .await
     }
 
+    pub(crate) async fn create_preset(&self, body: Value) -> Reply {
+        self.send("POST", "/2017-08-29/presets", Some(body)).await
+    }
+
+    pub(crate) async fn delete_preset(&self, name: &str) -> Reply {
+        self.send("DELETE", &format!("/2017-08-29/presets/{name}"), None)
+            .await
+    }
+
+    pub(crate) async fn list_presets(&self, query: &str) -> Reply {
+        let uri = if query.is_empty() {
+            "/2017-08-29/presets".to_string()
+        } else {
+            format!("/2017-08-29/presets?{query}")
+        };
+        self.send("GET", &uri, None).await
+    }
+
     pub(crate) async fn list_job_templates(&self, query: &str) -> Reply {
         let uri = if query.is_empty() {
             "/2017-08-29/jobTemplates".to_string()

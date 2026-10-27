@@ -292,8 +292,8 @@ type ParameterCase = (&'static str, Value, Expected);
 /// The table: parameter maps spanning what the rule generalises over — whether each
 /// target key is present at all, how many entries it names, how the comma-separated
 /// value is written (padding, empty entries, repeats), a parameter map that names no
-/// deployment target at all, a target set outside what may be deployed, and the
-/// deployment bound itself (at it and one past it).
+/// deployment target at all, a target set outside what may be deployed, the deployment
+/// bound itself (at it and one past it), and a target list far longer than that bound.
 fn cases(local: &str) -> Vec<ParameterCase> {
     let other = "111122223333".to_string();
     let third = "444455556666".to_string();
@@ -377,6 +377,21 @@ fn cases(local: &str) -> Vec<ParameterCase> {
             json!({
                 "TargetAccounts": accounts(5),
                 "TargetRegions": regions(MAX_DEPLOYMENT_TARGETS / 4),
+            }),
+            Expected::Refused,
+        ),
+        (
+            // Far more accounts than may be deployed to, with one entry that is not an
+            // account id among them: a list this long names more deployments than this
+            // service serves whatever its further entries say, so both operations refuse
+            // it on the fan-out and state the same rule.
+            "far more accounts than the deployment bound, one of them malformed",
+            json!({
+                "TargetAccounts": format!(
+                    "{},my-account,{}",
+                    accounts(MAX_DEPLOYMENT_TARGETS * 2),
+                    accounts(1)
+                ),
             }),
             Expected::Refused,
         ),

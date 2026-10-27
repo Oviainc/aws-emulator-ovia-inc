@@ -28,6 +28,29 @@ const USERS: &[(&str, &str)] = &[
     ("heidi-4", "/eng/tools/"),
 ];
 
+/// The user the account holds BEFORE any request has been served: the IAM user this
+/// emulator's own long-term credential belongs to
+/// (`service_common::caller_principal`), which `iam:CreateUser` did not create and no
+/// fixture below creates. Every read of the account's users reports it beside the
+/// fixture's own, so the suites that enumerate or count users name it here.
+const ACCOUNT_CALLER: &str = ::service_common::caller_principal::AMBIENT_USER_NAME;
+
+/// The path that user sits under: the account root.
+const ACCOUNT_CALLER_PATH: &str = ::service_common::caller_principal::AMBIENT_USER_PATH;
+
+/// `names` plus [`ACCOUNT_CALLER`], in the order the service enumerates users:
+/// ascending by the case-folded name, which is the key its store is ordered on.
+fn stored_names(names: &[&str]) -> Vec<String> {
+    let mut all: Vec<String> = names
+        .iter()
+        .copied()
+        .chain(::std::iter::once(ACCOUNT_CALLER))
+        .map(ToString::to_string)
+        .collect();
+    all.sort_by_key(|name| name.to_ascii_lowercase());
+    all
+}
+
 /// The account id every emulated ARN carries (`engine::emulator_account_id`).
 ///
 /// This module's awsQuery harness is shared with the other suites in this crate
@@ -345,11 +368,11 @@ async fn with_fixture_users() -> MultiServiceRouter {
 }
 
 /// The fixture user names in the order the service enumerates them: ascending by
-/// the case-folded name, which is the key the store is ordered on.
-fn users_in_store_order() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = USERS.iter().map(|(name, _)| *name).collect();
-    names.sort_by_key(|name| name.to_ascii_lowercase());
-    names
+/// the case-folded name, which is the key the store is ordered on — beside
+/// [`ACCOUNT_CALLER`], the user the account already held.
+fn users_in_store_order() -> Vec<String> {
+    let names: Vec<&str> = USERS.iter().map(|(name, _)| *name).collect();
+    stored_names(&names)
 }
 
 /// RULE: `CreateUser` mints and persists a user carrying every required member of
@@ -601,11 +624,12 @@ async fn a_repeated_name_is_refused_case_insensitively() {
         );
     }
 
-    // No second user, and the first is untouched.
+    // No second user, and the first is untouched: the account holds the one create that
+    // succeeded, beside the user it already held.
     let (_, listed) = call(&router, "ListUsers", &[]).await;
     assert_eq!(
         elements(&listed, "UserName"),
-        vec!["MixedCase".to_string()],
+        stored_names(&["MixedCase"]),
         "expected the account to hold exactly the first user, got {:?}",
         elements(&listed, "UserName")
     );
@@ -1007,7 +1031,13 @@ async fn list_users_filters_by_path_prefix() {
         let (status, body) = call(&router, "ListUsers", &[("PathPrefix", prefix)]).await;
         assert_eq!(status, 200, "case {prefix:?}: expected 200, got {status}: {body}");
         let listed = elements(&body, "UserName");
-        let expected: Vec<String> = expected.iter().map(|n| (*n).to_string()).collect();
+        // [`ACCOUNT_CALLER`] sits at the account root, so the root prefix selects it
+        // beside the fixture's users and no deeper prefix does.
+        let expected: Vec<String> = if *prefix == ACCOUNT_CALLER_PATH {
+            stored_names(expected)
+        } else {
+            expected.iter().map(|n| (*n).to_string()).collect()
+        };
         assert_eq!(
             listed, expected,
             "case {prefix:?}: expected {expected:?}, got {listed:?}"
@@ -1227,7 +1257,9 @@ async fn creating_past_the_user_quota_is_refused() {
     );
 
     let router = router();
-    for n in 0..QUOTA {
+    // The account already holds [`ACCOUNT_CALLER`], and the quota is the number of users
+    // the account may hold in total — so the creates that fit inside it are one fewer.
+    for n in 0..QUOTA - 1 {
         let name = format!("quota_user_{n}");
         let (status, body) = call(&router, "CreateUser", &[("UserName", name.as_str())]).await;
         assert_eq!(
@@ -1533,9 +1565,10 @@ async fn a_name_outside_the_published_constraints_is_refused() {
 
     let (_, listed) = call(&router, "ListUsers", &[]).await;
     assert_eq!(
-        elements(&listed, "UserName").len(),
-        accepted.len(),
-        "expected only the accepted names to be stored, got {:?}",
+        elements(&listed, "UserName"),
+        stored_names(accepted),
+        "expected only the accepted names to be stored beside the user the account \
+         already held, got {:?}",
         elements(&listed, "UserName")
     );
 }

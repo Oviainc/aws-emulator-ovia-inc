@@ -6,6 +6,12 @@
 //! documented ENTITY, `merge` landing an entry on the part that already documents that
 //! entity and `overwrite` replacing the API's documentation set.
 //!
+//! The import is ALL-OR-NOTHING: an entry this service cannot store refuses the whole
+//! body with the modelled 400 and leaves the API's documentation set exactly as it was.
+//! This emulator therefore recognises no warning-level condition on an import it DOES
+//! carry out: every entry of an accepted body is applied, so `warnings` is always absent
+//! and `failOnWarnings` has nothing to roll back.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -136,14 +142,13 @@ struct ImportedPart {
     properties: String,
 }
 
-/// What an import reads out of a body: the entries it can store, in document order, and
-/// what it could not carry over.
+/// What an import reads out of a body: the entries it can store, in document order.
+///
+/// There is no "partially readable" body: an entry this service cannot store refuses the
+/// whole import (see [`parse_import`]), so every entry here is one the import applies.
 #[derive(Debug, Clone, Default)]
 struct ImportedParts {
     parts: Vec<ImportedPart>,
-    /// Reported in the response's `warnings`, and what `failOnWarnings` rolls the import
-    /// back for.
-    warnings: Vec<String>,
 }
 
 /// One entry of the documentation set, as it will be stored.
@@ -153,8 +158,7 @@ struct ImportedParts {
 /// documents ("The map must be encoded as a JSON string"); an entry that already writes
 /// the map as a JSON string is taken as given.
 ///
-/// `Err` carries what is wrong with this one entry, which the import reports as a
-/// warning.
+/// `Err` carries what is wrong with this one entry, which refuses the whole import.
 fn imported_part(entry: &Value) -> Result<ImportedPart, String> {
     let entry = entry
         .as_object()
@@ -212,7 +216,13 @@ const UNREADABLE_IMPORT: &str = "Unable to build importer with provided input.";
 /// so it cannot amplify what the body carries. The per-API part quota is NOT a bound here:
 /// it counts the parts the API would hold, which `handle` is where it knows.
 ///
-/// `Err` carries [`UNREADABLE_IMPORT`] for a body that is not such a document, and this
+/// An import is ALL-OR-NOTHING: an entry this service cannot store refuses the whole
+/// body, so a caller is never told a documentation set was imported when part of it was
+/// dropped. The refusal is found while READING the body, before the store lock is taken,
+/// which is what makes "nothing is applied" true of every one of them.
+///
+/// `Err` carries [`UNREADABLE_IMPORT`] for a body that is not such a document, the
+/// offending entry's own problem for a body whose entries are not all storable, and this
 /// emulator's own bound for one that is too large to read.
 fn parse_import(body: &[u8]) -> Result<ImportedParts, String> {
     if body.len() > MAX_IMPORT_BYTES {
@@ -242,34 +252,23 @@ fn parse_import(body: &[u8]) -> Result<ImportedParts, String> {
         MAX_IMPORT_ENTRIES,
     )?;
     let mut read = ImportedParts::default();
-    let mut unstorable = 0usize;
     for (index, entry) in declared.iter().enumerate() {
-        match imported_part(entry) {
-            Ok(part) => read.parts.push(part),
-            // One warning per entry the import could not carry over, up to the number of
-            // entries this service reports for a caller-sized list: what the response
-            // carries stays bounded however many entries the body declares.
-            Err(message) => {
-                unstorable += 1;
-                if read.warnings.len() < crate::state::MAX_COLLECTION_ENTRIES {
-                    read.warnings
-                        .push(format!("{DOCUMENTATION_PARTS_MEMBER}[{index}]: {message}"));
-                }
-            }
-        }
-    }
-    // A body with more unstorable entries than that says how many more there were, so the
-    // bounded list never reports fewer failures than happened. The summary takes the LAST
-    // slot rather than an extra one, so the list is at most
-    // `MAX_COLLECTION_ENTRIES` entries whatever the body declared.
-    if unstorable > read.warnings.len() {
-        read.warnings.pop();
-        let further = unstorable - read.warnings.len();
-        read.warnings.push(format!(
-            "{DOCUMENTATION_PARTS_MEMBER}: {further} further entries were not imported"
-        ));
+        // The FIRST entry the import cannot store ends the read: it names the entry and
+        // its problem, which is what the caller has to fix, and the entries after it are
+        // not reported because none of them is applied either.
+        let part = imported_part(entry).map_err(|message| {
+            import_errors(&format!("{DOCUMENTATION_PARTS_MEMBER}[{index}]: {message}"))
+        })?;
+        read.parts.push(part);
     }
     Ok(read)
+}
+
+/// The `BadRequestException` message for an import this service refuses for what one of
+/// its entries declares: the sentence API Gateway states for a documentation import it
+/// could not carry out, followed by the problem found.
+fn import_errors(problem: &str) -> String {
+    format!("Errors found during import: {problem}")
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -358,21 +357,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The body is read and bounded BEFORE the store lock is taken, so a malformed or
-        // over-sized import never reaches the records at all.
+        // over-sized import never reaches the records at all — and so does the rule that
+        // every entry be storable, which is what makes the import all-or-nothing.
         let mode = put_mode(input.mode.as_deref()).map_err(bad_request)?;
-        let ImportedParts { parts, warnings } =
-            parse_import(&input.body).map_err(bad_request)?;
+        let ImportedParts { parts } = parse_import(&input.body).map_err(bad_request)?;
 
         // `failOnWarnings` is "a query parameter to specify whether to rollback the
         // documentation importation (true) or not (false) when a warning is encountered":
-        // the body is read before anything is written, so the rollback is that no record
-        // changes at all.
-        if input.fail_on_warnings && !warnings.is_empty() {
-            return Err(bad_request(format!(
-                "Errors found during import: {}",
-                warnings.join("; ")
-            )));
-        }
+        // an import this service carries out applies every entry its body declares, so
+        // there is no entry left over to warn about and nothing for the rollback to undo.
+        // An entry that cannot be stored has already refused the whole request above,
+        // whichever way this parameter is set.
 
         let mut store = state.lock();
 
@@ -510,9 +505,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         Ok(ImportDocumentationPartsOutput {
             ids: Some(imported),
-            // What THIS import could not carry over; an import that warned about nothing
-            // reports no warnings, never a value some other call left behind.
-            warnings: (!warnings.is_empty()).then_some(warnings),
+            // An import that is carried out carried over every entry its body declared,
+            // so there is nothing to warn about; a body with an entry this service cannot
+            // store is refused instead of reported.
+            warnings: None,
         })
     }
 }

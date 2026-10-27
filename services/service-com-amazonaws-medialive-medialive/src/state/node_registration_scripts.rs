@@ -170,7 +170,10 @@ impl ComAmazonawsMedialiveMedialiveState {
         cluster_id: &str,
         requested: NewNodeRegistrationScript,
     ) -> Result<String, NodeRegistrationScriptRefusal> {
-        if !self.clusters.contains_key(cluster_id) {
+        // Resolved through the LIVE cluster, like every other write addressed to
+        // one: a cluster whose delete has been accepted is leaving the account,
+        // so there is no endpoint for a new node of it to register against.
+        if self.live_cluster(cluster_id).is_none() {
             return Err(NodeRegistrationScriptRefusal::ClusterNotFound);
         }
         if let Some(node_id) = requested.node_id.as_deref() {

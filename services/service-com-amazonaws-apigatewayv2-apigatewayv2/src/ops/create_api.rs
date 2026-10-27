@@ -441,22 +441,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ([`crate::state::target_names_a_function`]), so the form this builds from is
             // the form that was accepted.
             let is_function_arn = crate::state::target_names_a_function(target);
+            // The type both the record and the members resolved FROM the type read, so
+            // the two cannot drift apart.
+            let integration_type = if is_function_arn {
+                crate::state::AWS_PROXY_INTEGRATION_TYPE
+            } else {
+                crate::state::HTTP_PROXY_INTEGRATION_TYPE
+            };
             let integration_id = stored.mint_integration_id();
             stored.integrations.insert(
                 integration_id.clone(),
                 crate::state::Integration {
                     integration_id: integration_id.clone(),
-                    integration_type: if is_function_arn {
-                        crate::state::AWS_PROXY_INTEGRATION_TYPE
-                    } else {
-                        crate::state::HTTP_PROXY_INTEGRATION_TYPE
-                    }
-                    .to_string(),
+                    integration_type: integration_type.to_string(),
                     // The target IS the integration's endpoint: "For a Lambda
                     // integration, specify the URI of a Lambda function. For an HTTP
                     // integration, specify a fully-qualified URL"
                     // (`Integration$IntegrationUri`).
                     integration_uri: Some(target.clone()),
+                    // A quick create whose target is a function mints the Lambda proxy
+                    // integration, which is invoked through Lambda's own Invoke action, so
+                    // the method is the service's to supply here too
+                    // (`crate::state::default_integration_method`); an HTTP target passes
+                    // the request's own method to its endpoint.
+                    integration_method: crate::state::default_integration_method(
+                        integration_type,
+                        ::std::option::Option::None,
+                    )
+                    .map(str::to_string),
                     // "This property is part of quick create. It specifies the
                     // credentials required for the integration"
                     // (`CreateApi$CredentialsArn`) — the integration quick create mints
@@ -536,7 +548,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     deployment_id,
                     access_log_settings: ::std::option::Option::None,
                     client_certificate_id: ::std::option::Option::None,
-                    default_route_settings: ::std::option::Option::None,
+                    // Every stage is served under route settings, so the ones a stage
+                    // nobody configured carries are the service's own
+                    // (`crate::state::resolve_route_settings`); quick create is supported
+                    // only for HTTP APIs, so these are an HTTP api's.
+                    default_route_settings: Some(crate::state::resolve_route_settings(
+                        crate::state::HTTP_PROTOCOL_TYPE,
+                        ::std::option::Option::None,
+                    )),
                     route_settings: ::std::collections::BTreeMap::new(),
                     stage_variables: ::std::collections::BTreeMap::new(),
                     last_deployment_status_message,

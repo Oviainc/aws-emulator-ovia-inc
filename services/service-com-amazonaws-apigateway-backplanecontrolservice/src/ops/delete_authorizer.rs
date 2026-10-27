@@ -2,7 +2,8 @@
 
 //! @op DeleteAuthorizer
 //! IMPLEMENTED: removes the `Authorizer` stored under `authorizerId` on the API named by
-//! `restApiId`, so a later `GetAuthorizer` for that id no longer finds one.
+//! `restApiId`, so a later `GetAuthorizer` for that id no longer finds one — unless a
+//! `Method` of the API still names that authorizer, which is the modelled conflict.
 //!
 //! ## Shape of an operation
 //!
@@ -178,19 +179,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // later read answer `NotFoundException` — including a second delete of the same
         // id, which names no authorizer once the first one has taken it away.
         //
-        // A `Method` naming this authorizer in its `authorizerId` is left as the caller
-        // wrote it: nothing documents this call as rewriting the methods of the API, and
-        // a method whose `authorizerId` names no authorizer is already a case the invoke
-        // path answers (see `crate::service::invoke`), so the records stay as they are.
-        // The modelled `ConflictException` is left unreachable for the same reason: no
-        // documented rule for this operation makes a referenced authorizer a conflict,
-        // and `PutMethod` does not require the `authorizerId` it stores to resolve.
-        if api.authorizers.remove(&input.authorizer_id).is_none() {
+        // A `Method` of the API that still names this authorizer in its `authorizerId`
+        // DEPENDS on it: deleting the authorizer would leave that method pointing at a
+        // record that no longer exists, so the delete is refused with the modelled
+        // `ConflictException` while the reference stands, the way this service refuses
+        // every delete a stored record still depends on. The methods are left exactly as
+        // the caller wrote them — nothing documents this call as rewriting them — so
+        // clearing the reference is the caller's own `UpdateMethod` or `DeleteMethod`.
+        // The authorizer is resolved FIRST, so an id that names no authorizer is the
+        // not-found it always was whether or not a method carries that identifier.
+        if !api.authorizers.contains_key(&input.authorizer_id) {
             return Err(DeleteAuthorizerErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::NO_SUCH_AUTHORIZER.to_string()),
             })
             .into());
         }
+        if api.authorizer_is_referenced(&input.authorizer_id) {
+            return Err(DeleteAuthorizerErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::AUTHORIZER_IN_USE.to_string()),
+            })
+            .into());
+        }
+        api.authorizers.remove(&input.authorizer_id);
         // The store lock is released before the record is formatted: the critical
         // section covers the state change only.
         drop(store);

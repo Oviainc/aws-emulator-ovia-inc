@@ -249,7 +249,16 @@ impl ChannelPlacementGroupRecord {
     /// does for a channel.
     pub fn is_delete_accepted(&self) -> bool {
         self.state == channel_placement_group_state::DELETING
-            || self.state == channel_placement_group_state::DELETED
+            || self.is_deleted()
+    }
+
+    /// Whether this group's delete has come due, which is what puts it in the
+    /// terminal `DELETED` state it then keeps — and what takes it out of the
+    /// cluster it was created in
+    /// ([`ComAmazonawsMedialiveMedialiveState::resources_in_cluster`]), since a
+    /// group in that state is no longer a resource the cluster holds.
+    pub fn is_deleted(&self) -> bool {
+        self.state == channel_placement_group_state::DELETED
     }
 
     /// Materialise the transition the clock has already made due as of `now`.
@@ -431,7 +440,10 @@ impl ComAmazonawsMedialiveMedialiveState {
         tags: HashMap<String, String>,
         now: SystemTime,
     ) -> Result<String, ChannelPlacementGroupRefusal> {
-        if !self.clusters.contains_key(cluster_id) {
+        // Resolved through the LIVE cluster: a cluster whose delete has been
+        // accepted is on its way out of the account, so no new group is created
+        // in it even though its record stays readable.
+        if self.live_cluster(cluster_id).is_none() {
             return Err(ChannelPlacementGroupRefusal::NoSuchCluster);
         }
         // The store's own ceiling is checked before anything about the

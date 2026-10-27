@@ -505,7 +505,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled 400 — and nothing is stored, because this returns before `accept_job`.
         // The template reference itself was resolved against this same guarded store above,
         // so a template that vanished is already the 404 naming the member it came from.
-        if let Some(problem) = crate::state::job_settings_problem(&settings) {
+        // The graph's OWN references are resolved here, against the same guarded store: an
+        // output names its encoder settings either by naming a preset the account holds or
+        // by carrying container settings of its own, so a preset that was never created, or
+        // was deleted after the template naming it was written, refuses the submission
+        // instead of being stored on a job no reader can resolve.
+        if let Some(problem) = state.job_settings_problem(&settings) {
             return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
                 message: Some(problem.message()),
             })

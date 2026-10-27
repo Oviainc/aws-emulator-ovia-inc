@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServerCertificateTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServerCertificateTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServerCertificateTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags attached to the IAM server certificate the request's name addresses,
+//! sorted by tag key and paged by `Marker`/`MaxItems`. A pure READ — nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +163,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServerCertificateTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServerCertificateTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServerCertificateTags"))
+        // `ctx` carries request metadata only; nothing here depends on it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListServerCertificateTagsErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // IAM names "are not distinguished by case", so the request's spelling is folded
+        // to the key the certificate is held under — the same keying
+        // `GetServerCertificate` resolves a name through.
+        let certificate_key = crate::state::name_key(&input.server_certificate_name);
+        // `maxItemsType` is range 1..1000 and the boundary validator has already refused
+        // anything outside it, so the only choice left here is the default for an absent
+        // `MaxItems`: "if you do not include this parameter, the number of items defaults
+        // to 100". `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        // A read: it reports the tags the certificate persists and writes nothing, so a
+        // later caller sees exactly what this one did.
+        let store = state.lock();
+        // The entity is resolved FIRST, so a name the account holds no certificate for is
+        // the entity-absent error whatever else the request carries — the precedence the
+        // other tag-listing operations in this crate report.
+        let Some(held) = store.server_certificates.get(&certificate_key) else {
+            return Err(
+                ListServerCertificateTagsErrorModeled::NoSuchEntityException(
+                    NoSuchEntityException {
+                        message: Some(format!(
+                            "The Server Certificate with name {} cannot be found.",
+                            input.server_certificate_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The page resumes strictly after the POSITION the marker names in THIS
+        // certificate's tag order, so a token this service did not issue while paging
+        // this certificate's tags is refused rather than read as "start from the
+        // beginning". The scope is taken from the held certificate's own ARN, the handle
+        // every tag-listing operation in this crate scopes a marker by.
+        let scope = crate::state::entity_tags_marker_scope(&held.metadata.arn);
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(&scope, marker) {
+                Some(key) => Some(key),
+                None => {
+                    // Neither modelled error fits a token that is not one this service
+                    // issued, so the refusal goes through the crate's generic
+                    // client-input channel (HTTP 400, `ValidationException`).
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Invalid Marker: the value is not a marker this service issued \
+                         for this server certificate's tags",
+                    ));
+                }
+            },
+            None => None,
+        };
+        let page = crate::state::tag_page(
+            held.tags.as_ref(),
+            &scope,
+            resume_after.as_deref(),
+            page_size,
+        );
+        Ok(ListServerCertificateTagsOutput {
+            // "If no tags are attached to the specified resource, the response contains
+            // an empty list" — the member is required, and empty is that answer.
+            tags: page.tags,
+            is_truncated: page.is_truncated,
+            marker: page.marker,
+        })
     }
 }

@@ -57,7 +57,11 @@ pub const SESSION_TOKEN_SIZE_LIMIT: usize = 4096;
 /// The name of the ambient IAM user: the identity a request speaks for when its
 /// access key id names no session this registry minted (the long-term key the
 /// emulator publishes at start, or an unsigned request).
-pub const AMBIENT_USER_NAME: &str = "emulator";
+///
+/// Stated once by [`::service_common::caller_principal`], because IAM holds that user
+/// among the account's own users: the service that HOLDS the principal and this one,
+/// which REPORTS it as the caller, must not name it differently.
+pub const AMBIENT_USER_NAME: &str = ::service_common::caller_principal::AMBIENT_USER_NAME;
 
 /// The most managed session policies one mint may name: "You can provide up to 10
 /// managed policy ARNs" (`AssumeRoleRequest$PolicyArns`, this service's model). The
@@ -98,14 +102,6 @@ pub const EXTERNAL_ID_CONDITION_KEY: &str = "sts:ExternalId";
 fn account_root_arn(account: &str) -> String {
     format!("arn:aws:iam::{account}:root")
 }
-
-/// The alphabet AWS unique ids (`AIDA…`, `AROA…`) are drawn from: uppercase
-/// letters and digits. Matches the alphabet the emulator's own key ids use.
-const UNIQUE_ID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-
-/// An AWS unique id is a four-character type prefix plus 17 more characters, 21 in
-/// total (`AROAJ4XQZ7X5YQ2R3TZ4A`).
-const UNIQUE_ID_SUFFIX_LEN: usize = 17;
 
 /// Who a credential speaks for, as `GetCallerIdentity` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1247,29 +1243,27 @@ pub fn role_id(role_arn: &str) -> String {
 /// emulator publishes. Every account and ARN comes from the emulator's own account
 /// contract, and the user id is derived from the ARN, so it is the same on every
 /// call and across restarts.
+///
+/// The ARN and the id are the ones
+/// [`::service_common::caller_principal`] states for that user, which is also the record
+/// IAM holds for it — so `GetCallerIdentity` and `iam:GetUser` report one principal.
 pub fn ambient_identity() -> Identity {
-    let arn = ::engine::emulator_arn("iam", "", &format!("user/{AMBIENT_USER_NAME}"));
     Identity {
-        user_id: unique_id("AIDA", &arn),
+        user_id: ::service_common::caller_principal::ambient_user_id(),
         account: ::engine::emulator_account_id().to_string(),
-        arn,
+        arn: ::service_common::caller_principal::ambient_user_arn(),
     }
 }
 
 /// An AWS unique id: `prefix` plus 17 characters derived from `seed`.
 ///
-/// The characters are a SHA-256 digest of `seed` mapped onto the id alphabet, so the
-/// id is a function of the thing it names — the same role ARN always yields the same
-/// role id, two different ones practically never collide, and nothing about the id
-/// depends on when it was asked for. This is NOT base32: the mapping only needs to
-/// be stable and well distributed, never decodable.
+/// The derivation is [`::service_common::caller_principal::aws_unique_id`], the tree's one
+/// mapping of a seed onto an AWS unique id's alphabet, so the id a role gets here and the
+/// id the ambient user carries in IAM are built by one rule: the same seed always yields
+/// the same id, two different ones practically never collide, and nothing about the id
+/// depends on when it was asked for.
 pub fn unique_id(prefix: &str, seed: &str) -> String {
-    let digest = Sha256::digest(seed.as_bytes());
-    let suffix = digest
-        .iter()
-        .take(UNIQUE_ID_SUFFIX_LEN)
-        .map(|byte| char::from(UNIQUE_ID_ALPHABET[usize::from(*byte) % UNIQUE_ID_ALPHABET.len()]));
-    prefix.chars().chain(suffix).collect()
+    ::service_common::caller_principal::aws_unique_id(prefix, seed)
 }
 
 /// An ARN in STS's own namespace. STS ARNs are global, so the region segment is

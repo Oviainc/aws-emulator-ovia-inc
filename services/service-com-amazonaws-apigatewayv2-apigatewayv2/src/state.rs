@@ -694,6 +694,54 @@ pub const LAMBDA_PROXY_PAYLOAD_FORMAT_VERSION: &str = "2.0";
 pub const LAMBDA_PROXY_PAYLOAD_FORMAT_VERSIONS: &[&str] =
     &[ONLY_PAYLOAD_FORMAT_VERSION, LAMBDA_PROXY_PAYLOAD_FORMAT_VERSION];
 
+/// The `PassthroughBehavior` an integration gets when the request names none: "There are
+/// three valid values: WHEN_NO_MATCH, WHEN_NO_TEMPLATES, and NEVER … WHEN_NO_MATCH
+/// passes the request body for unmapped content types through to the integration backend
+/// without transformation" (`Integration$PassthroughBehavior`) — the behaviour of an
+/// integration that maps no content type at all, so it is the one the service applies by
+/// itself.
+pub const DEFAULT_PASSTHROUGH_BEHAVIOR: &str = "WHEN_NO_MATCH";
+
+/// The `PassthroughBehavior` an integration of an api of this `ProtocolType` carries
+/// when its create named none, or `None` for an api whose protocol does not support the
+/// member at all.
+///
+/// `Integration$PassthroughBehavior` is "Supported only for WebSocket APIs" — the same
+/// clause [`validate_protocol_restricted_members`] refuses the member under for an api of
+/// the other protocol — so only a WebSocket api's integration carries one, and it carries
+/// [`DEFAULT_PASSTHROUGH_BEHAVIOR`] until a request names another.
+pub fn default_passthrough_behavior(protocol_type: &str) -> Option<&'static str> {
+    (protocol_type == WEBSOCKET_PROTOCOL_TYPE).then_some(DEFAULT_PASSTHROUGH_BEHAVIOR)
+}
+
+/// The HTTP method Lambda's own function-invoking action is reached with, and so the
+/// `IntegrationMethod` of an integration that invokes a function: the Invoke action is
+/// served at `POST /2015-03-31/functions/{FunctionArn}/invocations`, the resource
+/// `Integration$IntegrationUri` names for a Lambda integration ("For a Lambda
+/// integration, specify the URI of a Lambda function").
+pub const LAMBDA_INVOKE_INTEGRATION_METHOD: &str = "POST";
+
+/// The `IntegrationMethod` an integration of this type and subtype carries when its
+/// create named none, or `None` when the method is the request's to name.
+///
+/// An integration whose endpoint is a Lambda FUNCTION invokes it through Lambda's Invoke
+/// action, which is served for one method only ([`LAMBDA_INVOKE_INTEGRATION_METHOD`]), so
+/// the method is not a choice the caller has to make and the service supplies it. That is
+/// the Lambda proxy integration — `AWS_PROXY` naming no `IntegrationSubtype`, the same
+/// pair [`validate_payload_format_version`] reads as one. Every other integration's
+/// method belongs to its own endpoint: `HTTP`/`HTTP_PROXY` pass the backend's method, an
+/// `AWS_PROXY` integration naming a subtype invokes that service action rather than a
+/// function, an `AWS` integration names whichever action its URI addresses, and `MOCK`
+/// invokes nothing — so none of those is defaulted here.
+pub fn default_integration_method(
+    integration_type: &str,
+    integration_subtype: Option<&str>,
+) -> Option<&'static str> {
+    let is_lambda_proxy =
+        integration_type == AWS_PROXY_INTEGRATION_TYPE && integration_subtype.is_none();
+    is_lambda_proxy.then_some(LAMBDA_INVOKE_INTEGRATION_METHOD)
+}
+
 /// The `TimeoutInMillis` an integration of an HTTP API gets when the request names
 /// none: "The default timeout is … 30 seconds for HTTP APIs"
 /// (`CreateIntegration$TimeoutInMillis`).
@@ -2263,6 +2311,44 @@ impl Stage {
 /// The most stages one api may hold, after which CreateStage is refused. AWS's
 /// published API Gateway quota is 10 stages per API.
 pub const MAX_STAGES_PER_API: usize = 10;
+
+/// The `LoggingLevel` of a route that pushes no entries to CloudWatch Logs, from
+/// `LOGGING_LEVEL_VALUES` (`ERROR | INFO | OFF`): "Specifies the logging level for this
+/// route: INFO, ERROR, or OFF" (`RouteSettings$LoggingLevel`).
+pub const LOGGING_LEVEL_OFF: &str = "OFF";
+
+/// The `DefaultRouteSettings` a stage of an api of this `ProtocolType` carries, resolving
+/// MEMBER BY MEMBER whatever the request configured (`None` for a request that configured
+/// nothing at all).
+///
+/// Every stage has route settings — they are what its routes are served under — so each
+/// member of them whose value the request did not name is the service's to supply, not a
+/// member the stage simply lacks: every facility `RouteSettings` switches is OFF, which is
+/// `DataTraceEnabled` and `DetailedMetricsEnabled` false and the logging level that pushes
+/// no log entries ([`LOGGING_LEVEL_OFF`]). The two members documented "Supported only for
+/// WebSocket APIs" (`RouteSettings$DataTraceEnabled` and `RouteSettings$LoggingLevel` —
+/// the same clause [`validate_protocol_restricted_members`] refuses them under for an api
+/// of the other protocol) are carried only by a stage of the protocol that supports them.
+/// The throttling members name a LIMIT rather than a facility, and a stage that named none
+/// is not throttled at a figure the service could report, so they are left as they came.
+pub fn resolve_route_settings(
+    protocol_type: &str,
+    configured: Option<wire::RouteSettings>,
+) -> wire::RouteSettings {
+    let is_websocket = protocol_type == WEBSOCKET_PROTOCOL_TYPE;
+    let configured = configured.unwrap_or_default();
+    wire::RouteSettings {
+        data_trace_enabled: configured
+            .data_trace_enabled
+            .or_else(|| is_websocket.then_some(false)),
+        detailed_metrics_enabled: configured.detailed_metrics_enabled.or(Some(false)),
+        logging_level: configured
+            .logging_level
+            .or_else(|| is_websocket.then(|| LOGGING_LEVEL_OFF.to_string())),
+        throttling_burst_limit: configured.throttling_burst_limit,
+        throttling_rate_limit: configured.throttling_rate_limit,
+    }
+}
 
 /// The sentence API Gateway refuses a `CreateStage` naming a stage its api already
 /// holds with.

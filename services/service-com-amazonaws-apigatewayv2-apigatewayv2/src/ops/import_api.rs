@@ -733,11 +733,21 @@ impl ImportedIntegration {
     /// members the extension left out to the values the model documents for them —
     /// exactly as `CreateIntegration` resolves them for a request that omits them.
     fn into_record(self, integration_id: String) -> crate::state::Integration {
+        // The method a Lambda proxy integration is invoked with is the service's to
+        // supply, whatever wrote the integration: the one `CreateIntegration` resolves
+        // for a request that names none (`crate::state::default_integration_method`).
+        let integration_method = self.integration_method.or_else(|| {
+            crate::state::default_integration_method(
+                &self.integration_type,
+                self.integration_subtype.as_deref(),
+            )
+            .map(str::to_string)
+        });
         crate::state::Integration {
             integration_id,
             integration_type: self.integration_type,
             integration_uri: self.integration_uri,
-            integration_method: self.integration_method,
+            integration_method,
             integration_subtype: self.integration_subtype,
             // "The default value is INTERNET" (`Integration$ConnectionType`).
             connection_type: self

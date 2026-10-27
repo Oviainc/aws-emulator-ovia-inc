@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Delete a Cluster, which the model documents must be IDLE: the cluster the
+//! `ClusterId` names is resolved against the store, refused while it still holds
+//! any of the resources that live inside a Cluster, and otherwise moved into the
+//! `DELETING` state the clock owes the terminal `DELETED`. The body is the
+//! cluster read back out of the store, so `State` is the one the acceptance just
+//! wrote and every other member is the stored record's.
+//!
+//! The cluster slice owns the rules — what makes a cluster not idle, the
+//! acceptance and the projection — so this handler only turns a
+//! [`crate::state::ClusterDeleteRefusal`] into this operation's own modelled
+//! error: [`crate::state::ComAmazonawsMedialiveMedialiveState::delete_cluster`].
 //!
 //! ## Shape of an operation
 //!
@@ -157,6 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteCluster";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_CLUSTER_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_CLUSTER_OUTPUT_SCHEMA;
+    // The model's own `@http` code, kept: deleting a cluster is genuinely
+    // asynchronous (the body reports the cluster in `DELETING`), so `202
+    // Accepted` is exactly what this answer is — the caller polls
+    // `DescribeCluster` for the terminal `DELETED`.
     const SUCCESS_STATUS: u16 = 202u16;
 
     async fn handle(
@@ -164,18 +171,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCluster"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Clock-owed work first, as every operation of this service does: it
+        // materialises only the transitions that were owed at this instant
+        // whether or not anybody called — a cluster's `CREATING` -> `ACTIVE`
+        // step, an earlier delete's `DELETING` -> `DELETED` one, and the steps
+        // that take a channel, a group or a node out of this cluster — so the
+        // idle check below sees the store a reader would.
+        state.settle(now);
+
+        // The precondition, the acceptance and the projection all live in the
+        // slice, so the body reports what was STORED rather than something
+        // assembled here, and a refused delete leaves the cluster exactly as it
+        // was.
+        let cluster = state
+            .delete_cluster(&input.cluster_id, now)
+            .map_err(|refusal| refused(refusal, &input.cluster_id))?;
+
+        Ok(crate::state::cluster_description_output!(
+            DeleteClusterOutput,
+            cluster
+        ))
     }
+}
+
+/// The modelled error a [`crate::state::ClusterDeleteRefusal`] is answered with.
+///
+/// A `ClusterId` the store holds no cluster for is this operation's modelled
+/// `NotFoundException` (404), worded by the shared helper every reader of this
+/// service uses, exactly as `DescribeCluster` refuses the same id. A cluster that
+/// still holds resources is the modelled `ConflictException` (409) — the refusal
+/// a delete of a resource something is still inside gets throughout this service
+/// (`DeleteNetwork`, `DeleteChannelPlacementGroup`) — carrying the slice's own
+/// wording for that rejection class.
+fn refused(
+    refusal: crate::state::ClusterDeleteRefusal,
+    cluster_id: &str,
+) -> DeleteClusterError {
+    use crate::state::ClusterDeleteRefusal as Refusal;
+    match refusal {
+        Refusal::NoSuchCluster => {
+            DeleteClusterErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("Cluster", cluster_id)),
+            })
+        }
+        Refusal::NotIdle { resources } => {
+            DeleteClusterErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::cluster_not_idle_message(
+                    cluster_id,
+                    &resources,
+                )),
+            })
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to delete the cluster from. A modelled server error,
+/// never a fresh engine (which would drop the deletion on return).
+fn unavailable() -> DeleteClusterError {
+    DeleteClusterErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

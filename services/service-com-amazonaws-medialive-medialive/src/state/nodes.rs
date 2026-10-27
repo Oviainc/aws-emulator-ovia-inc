@@ -320,6 +320,15 @@ impl NodeRecord {
         self.state == node_state::DEREGISTERING || self.state == node_state::DEREGISTERED
     }
 
+    /// Whether this node's deregistration has come due, which is what puts it in
+    /// the terminal `DEREGISTERED` state it then keeps — and what takes it out
+    /// of the cluster it was registered with
+    /// ([`ComAmazonawsMedialiveMedialiveState::resources_in_cluster`]), since a
+    /// node in that state is no longer a resource the cluster holds.
+    pub fn is_deregistered(&self) -> bool {
+        self.state == node_state::DEREGISTERED
+    }
+
     /// Accept a delete for this node: move it into `DEREGISTERING` and owe the
     /// terminal `DEREGISTERED` once [`TRANSIENT_STATE_SPAN`] has passed.
     ///
@@ -424,7 +433,10 @@ impl ComAmazonawsMedialiveMedialiveState {
         interface_mappings: Vec<NodeInterfaceMappingCreateRequest>,
         tags: HashMap<String, String>,
     ) -> Result<String, NodeRefusal> {
-        if !self.clusters.contains_key(cluster_id) {
+        // Resolved through the LIVE cluster: a cluster whose delete has been
+        // accepted is on its way out of the account, so it takes no new node
+        // even though its record stays readable.
+        if self.live_cluster(cluster_id).is_none() {
             return Err(NodeRefusal::ClusterNotFound);
         }
         if interface_mappings.len() > MAX_NODE_INTERFACE_MAPPINGS {

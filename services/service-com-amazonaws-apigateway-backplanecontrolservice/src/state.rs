@@ -193,6 +193,13 @@ pub struct RestApiEntry {
     /// identifier a `Method`'s `requestValidatorId` names and `GetRequestValidator`
     /// takes in its path label.
     pub request_validators: BTreeMap<String, RequestValidatorEntry>,
+    /// Every `Model` of this API, keyed by the model NAME — the identifier `GetModel`
+    /// takes in its `modelName` path label and a `Method`'s `requestModels` /
+    /// `MethodResponse`'s `responseModels` entry names. The NAME is the record's key,
+    /// which is what makes a second model under one name a conflict; the minted
+    /// `id` is carried on the record rather than keying it, because no operation of this
+    /// service addresses a model by id.
+    pub models: BTreeMap<String, ModelEntry>,
     /// This API's creation rank, from [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`].
     pub sequence: u64,
 }
@@ -308,6 +315,20 @@ impl RestApiEntry {
             })
             .map(|stage| stage.stage_name.clone())
             .collect()
+    }
+
+    /// Whether any method of this API names `authorizer_id` in its `authorizerId`.
+    ///
+    /// A method names its authorizer in `Method$authorizerId`, so a method carrying that
+    /// identifier is a reference to the authorizer; one walk, so every operation that has
+    /// to know whether an authorizer is referenced reads the same records.
+    pub fn authorizer_is_referenced(&self, authorizer_id: &str) -> bool {
+        self.resources.values().any(|resource| {
+            resource
+                .methods
+                .values()
+                .any(|method| method.authorizer_id.as_deref() == Some(authorizer_id))
+        })
     }
 }
 
@@ -537,6 +558,27 @@ pub struct DocumentationVersionEntry {
     /// This version's creation rank, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
     /// listing reports creation order rather than version-identifier order.
+    pub sequence: u64,
+}
+
+/// One stored `Model` of an API: "the data structure of a method request or response
+/// payload", with the schema that describes it.
+///
+/// `schema` is optional because `CreateModel$schema` is: a model created without one
+/// carries none, and a read of it reports none rather than a schema invented per read.
+/// `content_type` is not optional, because `CreateModel$contentType` is `@required`, so a
+/// stored model always has one.
+#[derive(Debug, Clone, Default)]
+pub struct ModelEntry {
+    pub id: String,
+    /// The model's name, which is also this record's key in [`RestApiEntry::models`].
+    pub name: String,
+    pub description: Option<String>,
+    pub content_type: String,
+    pub schema: Option<String>,
+    /// This model's creation rank, from
+    /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
+    /// listing can report creation order rather than name order.
     pub sequence: u64,
 }
 
@@ -1459,6 +1501,11 @@ pub const MAX_DEPLOYMENTS_PER_API: usize = 300;
 /// keeps for one API. API Gateway publishes no request-validator quota, so this bound is
 /// the emulator's own, the same order as the deployment guard above.
 pub const MAX_REQUEST_VALIDATORS_PER_API: usize = 300;
+
+/// Emulator resource guard, NOT an AWS quota: the most models this emulator keeps for one
+/// API. API Gateway publishes no model quota, so this bound is the emulator's own, the
+/// same order as the request-validator guard above.
+pub const MAX_MODELS_PER_API: usize = 300;
 
 /// From `CreateStage$stageName`'s own documentation: "Maximum length is 128
 /// characters."
@@ -3165,6 +3212,58 @@ pub const NO_SUCH_DOCUMENTATION_VERSION: &str = "Invalid Documentation version s
 /// The `NotFoundException` message for an `authorizerId` that names no stored authorizer
 /// of the API.
 pub const NO_SUCH_AUTHORIZER: &str = "Invalid Authorizer identifier specified";
+
+/// The `ConflictException` message for an authorizer a `Method` of the same API still
+/// names in its `authorizerId`, which is what `DeleteAuthorizer` refuses while the
+/// reference stands (see [`RestApiEntry::authorizer_is_referenced`]).
+///
+/// AWS publishes no fixed sentence for this condition, so the message takes the shape of
+/// the sibling refusal for the same class — a dependent record blocking a delete
+/// ([`crate::ops::delete_deployment::DEPLOYMENT_IN_USE`]) — and names the two ways a
+/// caller clears the reference: re-point the method at another authorizer, or delete the
+/// method.
+pub const AUTHORIZER_IN_USE: &str =
+    "Active methods pointing to this authorizer must be updated or deleted";
+
+/// The `NotFoundException` message for a `modelName` that names no stored model of the
+/// API, in the shape of the sibling identifier messages above.
+pub const NO_SUCH_MODEL: &str = "Invalid model identifier specified";
+
+/// The `ConflictException` message for a model name this API already holds a model under:
+/// a model is keyed by its name, so the second create under one name is refused rather
+/// than replacing the model the first one stored (replacing it is `UpdateModel`'s own
+/// call).
+///
+/// AWS publishes no fixed sentence for this condition, so the message is BUILT FROM THE
+/// REQUEST the way
+/// [`crate::ops::create_documentation_version::version_clash_message`] is: it names the
+/// model name that already exists, which is the one thing the caller has to change.
+pub fn model_already_exists(name: &str) -> String {
+    format!("Model name already exists: {name}")
+}
+
+/// The `BadRequestException` message for a `name` that is not a model name: "The name of
+/// the model. Must be alphanumeric." (`CreateModel$name`), so a name carrying anything
+/// else names no model. BUILT FROM THE REQUEST — it names the value that was rejected, in
+/// the shape of the sibling invalid-value messages above.
+pub fn invalid_model_name(name: &str) -> String {
+    format!("Invalid model name specified {name}; a model name must be alphanumeric")
+}
+
+/// The `BadRequestException` message for a `contentType` that is not a media type: "The
+/// content-type for the model" (`CreateModel$contentType`) is the media type of the
+/// payload the model describes, so a value that is not one types nothing. BUILT FROM THE
+/// REQUEST, in the shape of the sibling invalid-value messages above.
+pub fn invalid_model_content_type(content_type: &str) -> String {
+    format!("Invalid content type specified {content_type}")
+}
+
+/// The `BadRequestException` message for a `schema` that is not a schema document,
+/// carrying WHY it could not be read so the caller can fix the request from this text
+/// alone.
+pub fn invalid_model_schema(reason: &str) -> String {
+    format!("Invalid model schema specified: {reason}")
+}
 
 /// The `NotFoundException` message for a `vpcLinkId` that names no stored VPC link, in
 /// the shape of the sibling identifier messages above.

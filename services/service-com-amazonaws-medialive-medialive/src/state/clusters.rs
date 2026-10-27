@@ -23,9 +23,20 @@
 //! A cluster's LIFECYCLE is one stored pending transition per record (a
 //! [`ClusterTransition`]: the instant it comes due and the `ClusterState` it
 //! settles into), the same shape as the multiplex slice's own: `CREATING`
-//! settles into `ACTIVE`. The instant is stored and never slept on —
-//! [`ComAmazonawsMedialiveMedialiveState::settle`], which every operation runs
-//! first, is what materialises the ones the clock has already made due.
+//! settles into `ACTIVE`, and the `DELETING` an accepted delete starts settles
+//! into the terminal `DELETED` the record then keeps. The instant is stored and
+//! never slept on — [`ComAmazonawsMedialiveMedialiveState::settle`], which every
+//! operation runs first, is what materialises the ones the clock has already
+//! made due.
+//!
+//! A DELETE never drops the record: a deleted cluster stays readable in that
+//! terminal state, so `DescribeCluster` and `ListClusters` go on reporting it
+//! there instead of losing it, while a caller may no longer CHANGE it — every
+//! mutation addressed to a cluster resolves its id through
+//! [`ComAmazonawsMedialiveMedialiveState::live_cluster`]. A cluster is deleted
+//! only once it is idle, which is what
+//! [`ComAmazonawsMedialiveMedialiveState::delete_cluster`] resolves against the
+//! rest of the store.
 //!
 //! The ALERTS a cluster carries live on the [`ClusterRecord`] that owns them:
 //! one [`ClusterAlertRecord`] per alert raised against the cluster, in the order
@@ -56,17 +67,21 @@ use super::{ComAmazonawsMedialiveMedialiveState, TRANSIENT_STATE_SPAN};
 
 /// The `ClusterState` values this slice uses, spelled exactly as the model
 /// declares them (`smithy_query(query="shape", shape="ClusterState")`: CREATING
-/// | CREATE_FAILED | ACTIVE | DELETING | DELETE_FAILED | DELETED). The four the
+/// | CREATE_FAILED | ACTIVE | DELETING | DELETE_FAILED | DELETED). The two the
 /// model declares but this slice does not name are the ones nothing here can
 /// reach: `CREATE_FAILED` and `DELETE_FAILED` report a failure of the
 /// provisioning the real service performs for a Cluster, which this emulator
-/// does not perform and therefore never claims, and `DELETING`/`DELETED` belong
-/// to `DeleteCluster`, which is still a scaffold (its own issue,
-/// `20261024T010738Z-medialive-deletecluster-stub.md`) and so is where that half
-/// of the lifecycle lands.
+/// does not perform and therefore never claims.
 pub mod cluster_state {
+    /// The cluster is coming up; the clock owes it [`ACTIVE`].
     pub const CREATING: &str = "CREATING";
+    /// The cluster is up.
     pub const ACTIVE: &str = "ACTIVE";
+    /// A delete has been accepted; the clock owes the terminal [`DELETED`].
+    pub const DELETING: &str = "DELETING";
+    /// The accepted delete has come due. TERMINAL: the record keeps this state,
+    /// and stays readable in it.
+    pub const DELETED: &str = "DELETED";
 }
 
 /// The `ClusterAlertState` values, spelled exactly as the model declares them
@@ -144,6 +159,10 @@ pub enum ClusterUpdateRefusal {
     /// The `ClusterId` names no cluster this store holds — the same resolution a
     /// read of the cluster performs.
     NoSuchCluster,
+    /// The store still holds the cluster — a delete keeps the record readable —
+    /// but that delete has been accepted, so the id names nothing a caller may
+    /// still change.
+    AlreadyDeleted,
     /// Another cluster of the account already carries the new `Name`.
     NameTaken,
     /// The request named more `InterfaceMapping` entries than
@@ -163,6 +182,37 @@ pub enum ClusterUpdateRefusal {
 pub struct ClusterChanges {
     pub name: Option<String>,
     pub network_settings: Option<ClusterNetworkSettingsUpdateRequest>,
+}
+
+/// Why [`ComAmazonawsMedialiveMedialiveState::delete_cluster`] deleted nothing.
+/// Each variant is one refusal `DeleteCluster` answers with, and each leaves the
+/// stored cluster exactly as it was.
+#[derive(Debug)]
+pub enum ClusterDeleteRefusal {
+    /// The `ClusterId` names no cluster this store holds.
+    NoSuchCluster,
+    /// The cluster still holds resources, so it is not idle. Carries them as the
+    /// refusal names them, in the order
+    /// [`ComAmazonawsMedialiveMedialiveState::resources_in_cluster`] derives
+    /// them.
+    NotIdle { resources: Vec<String> },
+}
+
+/// The message a delete refused on a cluster that still holds resources
+/// carries: the cluster the REQUEST named, how many resources are still in it
+/// and which they are, then the rule the delete is held to ("Delete a Cluster.
+/// The Cluster must be idle").
+///
+/// The same shape as the network side's own refusal for the same rejection
+/// class, so the two cannot word "this resource still holds something" two
+/// ways. Every value is read off the request and the store.
+pub fn cluster_not_idle_message(cluster_id: &str, resources: &[String]) -> String {
+    format!(
+        "Cluster {cluster_id} still has {} resource(s) in it ({}); a cluster must be idle \
+         before it can be deleted",
+        resources.len(),
+        resources.join(", ")
+    )
 }
 
 /// Why [`ComAmazonawsMedialiveMedialiveState::insert_cluster`] stored nothing.
@@ -290,16 +340,61 @@ impl ClusterRecord {
         &self.alerts
     }
 
-    /// Materialise the transition the clock has already made due: a cluster AWS
-    /// answers `CREATING` becomes `ACTIVE` once the span has passed.
-    fn settle(&mut self, now: SystemTime) {
-        let Some(transition) = self.transition else {
+    /// Whether this cluster's deletion has come due, which is what puts it in
+    /// the terminal `DELETED` state it then keeps.
+    pub fn is_deleted(&self) -> bool {
+        self.state == cluster_state::DELETED
+    }
+
+    /// Whether a delete has been accepted for this cluster, in either half of
+    /// the deletion lifecycle — so a repeated `DeleteCluster` is idempotent
+    /// rather than restarting the clock, a cluster on its way out no longer
+    /// holds the name it was created under
+    /// ([`ComAmazonawsMedialiveMedialiveState::cluster_named`]), and no mutation
+    /// addressed to it still resolves
+    /// ([`ComAmazonawsMedialiveMedialiveState::live_cluster`]).
+    pub fn is_delete_accepted(&self) -> bool {
+        self.state == cluster_state::DELETING || self.is_deleted()
+    }
+
+    /// Accept a delete for this cluster: it moves into `DELETING` and owes the
+    /// terminal `DELETED` once [`TRANSIENT_STATE_SPAN`] has passed.
+    ///
+    /// Deleting a cluster is asynchronous — the model answers `DeleteCluster`
+    /// with `202 Accepted` and the response reports the cluster in `DELETING` —
+    /// so the caller polls `DescribeCluster` for the terminal state, which the
+    /// record then keeps.
+    ///
+    /// IDEMPOTENT: a delete already accepted keeps the instant the first call
+    /// set, so a repeat can neither restart the clock nor revive a deleted
+    /// cluster. A creation still in flight is REPLACED rather than carried: the
+    /// cluster is leaving the account, so the one transition the clock still
+    /// owes it is the deletion.
+    fn begin_delete(&mut self, now: SystemTime) {
+        if self.is_delete_accepted() {
             return;
+        }
+        self.state = cluster_state::DELETING.to_string();
+        self.transition = Some(ClusterTransition {
+            due: now + TRANSIENT_STATE_SPAN,
+            to: cluster_state::DELETED,
+        });
+    }
+
+    /// Materialise the transition the clock has already made due — a cluster AWS
+    /// answers `CREATING` becomes `ACTIVE` once the span has passed, and one
+    /// whose delete was accepted becomes the terminal `DELETED` — answering
+    /// whether THIS call is the one that settled the deletion.
+    fn settle(&mut self, now: SystemTime) -> bool {
+        let Some(transition) = self.transition else {
+            return false;
         };
         if now >= transition.due {
             self.state = transition.to.to_string();
             self.transition = None;
+            return self.is_deleted();
         }
+        false
     }
 }
 
@@ -331,8 +426,21 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// `now`. Called from [`ComAmazonawsMedialiveMedialiveState::settle`], which
     /// every operation runs first.
     pub(super) fn settle_clusters(&mut self, now: SystemTime) {
-        for cluster in self.clusters.values_mut() {
-            cluster.settle(now);
+        // Only a cluster that settles into the terminal `DELETED` on THIS call
+        // is collected, so the work here does not grow with the number of
+        // clusters that have already reached that state.
+        let mut just_deleted: Vec<String> = Vec::new();
+        for (id, cluster) in &mut self.clusters {
+            if cluster.settle(now) {
+                just_deleted.push(id.clone());
+            }
+        }
+        // A token never outlives the cluster it minted: once that cluster has
+        // reached the terminal `DELETED` state its idempotency window is over,
+        // so a retried create mints a new cluster rather than answering with a
+        // deleted one — the rule the channel and network tokens follow too.
+        for id in just_deleted {
+            self.cluster_tokens.forget(&id);
         }
     }
 
@@ -349,6 +457,12 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// Case-SENSITIVE, because `Name` documents "Names are case-sensitive", so
     /// two clusters whose names differ only in case are two different names.
     ///
+    /// A cluster whose delete this service has accepted is skipped: it is on its
+    /// way out of the account, so the name it was created under is free for the
+    /// next create even though its record stays readable under that name — the
+    /// rule the network side applies to a network that is leaving
+    /// ([`ComAmazonawsMedialiveMedialiveState::network_named`]).
+    ///
     /// The uniqueness both the create and the UPDATE resolve against: a rename
     /// is what `UpdateCluster$Name` is for, and this lookup is what tells it
     /// apart from a clash with another cluster of the account (see
@@ -356,8 +470,24 @@ impl ComAmazonawsMedialiveMedialiveState {
     pub fn cluster_named(&self, name: &str) -> Option<&str> {
         self.clusters
             .values()
-            .find(|cluster| cluster.name.as_deref() == Some(name))
+            .find(|cluster| {
+                cluster.name.as_deref() == Some(name) && !cluster.is_delete_accepted()
+            })
             .map(|cluster| cluster.id.as_str())
+    }
+
+    /// The cluster `id` names, if a caller may still CHANGE it.
+    ///
+    /// A delete keeps the record READABLE, but an id whose delete has been
+    /// accepted names no cluster a write may still reach, so every mutation
+    /// addressed to a cluster — the cluster's own update, and the creates of the
+    /// resources that live inside one — resolves its id through here and answers
+    /// a dead id as not found rather than with the conflict a cluster that still
+    /// exists gets.
+    pub fn live_cluster(&self, id: &str) -> Option<&ClusterRecord> {
+        self.clusters
+            .get(id)
+            .filter(|cluster| !cluster.is_delete_accepted())
     }
 
     /// Store a cluster created in `region` and answer its minted id, or refuse.
@@ -431,8 +561,16 @@ impl ComAmazonawsMedialiveMedialiveState {
         id: &str,
         changes: ClusterChanges,
     ) -> Result<(), ClusterUpdateRefusal> {
-        if !self.clusters.contains_key(id) {
-            return Err(ClusterUpdateRefusal::NoSuchCluster);
+        // Resolved through the LIVE record, like every other mutation of this
+        // service: a delete keeps the record readable, but an id whose delete
+        // has been accepted names nothing a caller may still change, and that
+        // resolution comes before anything about the request is looked at.
+        match self.clusters.get(id) {
+            None => return Err(ClusterUpdateRefusal::NoSuchCluster),
+            Some(cluster) if cluster.is_delete_accepted() => {
+                return Err(ClusterUpdateRefusal::AlreadyDeleted)
+            }
+            Some(_) => {}
         }
         // Bounded before anything is written, for the reason on
         // [`MAX_CLUSTER_INTERFACE_MAPPINGS`]: it is the bound that keeps the
@@ -510,6 +648,80 @@ impl ComAmazonawsMedialiveMedialiveState {
             })
             .map(|channel| channel.id.clone())
             .collect()
+    }
+
+    /// Everything the cluster `cluster_id` still holds, each labelled by its
+    /// resource type and named by its id \u2014 what makes a cluster NOT idle, and
+    /// what the refusal of its delete reports.
+    ///
+    /// A cluster is the container of MediaLive Anywhere's three per-cluster
+    /// resources: the channels that run on it (the association
+    /// [`Self::channels_in_cluster`] derives), the channel placement groups
+    /// created in it and the nodes registered with it. A member stops being held
+    /// when it has reached its OWN terminal state \u2014 the deleted channel's and
+    /// group's `DELETED`, the node's `DEREGISTERED` \u2014 because a resource in that
+    /// state is no longer in the cluster, which is the same reading
+    /// [`Self::channels_in_cluster`] already applies to a deleted channel.
+    ///
+    /// BOUNDED work: each store it scans is bounded by its own ceiling
+    /// ([`super::MAX_CHANNELS`], [`super::MAX_CHANNEL_PLACEMENT_GROUPS`],
+    /// [`super::MAX_NODES`]).
+    pub fn resources_in_cluster(&self, cluster_id: &str) -> Vec<String> {
+        let channels = self
+            .channels_in_cluster(cluster_id)
+            .into_iter()
+            .map(|id| format!("Channel {id}"));
+        let groups = self
+            .channel_placement_groups
+            .values()
+            .filter(|group| group.cluster_id == cluster_id && !group.is_deleted())
+            .map(|group| format!("ChannelPlacementGroup {}", group.id));
+        let nodes = self
+            .nodes
+            .values()
+            .filter(|node| node.cluster_id == cluster_id && !node.is_deregistered())
+            .map(|node| format!("Node {}", node.id));
+        channels.chain(groups).chain(nodes).collect()
+    }
+
+    /// Accept a delete for the cluster `id` names and answer the cluster as it
+    /// then stands, or refuse.
+    ///
+    /// "Delete a Cluster. The Cluster must be idle": a cluster that still holds
+    /// any of the resources that live inside one ([`Self::resources_in_cluster`])
+    /// is refused, and the refusal is taken BEFORE the first write, so a refused
+    /// delete leaves the stored cluster exactly as it was. An accepted delete
+    /// moves the cluster into `DELETING` and owes it the terminal `DELETED`,
+    /// which the record keeps while staying readable.
+    ///
+    /// IDEMPOTENT: a delete already accepted writes nothing and is accepted
+    /// again \u2014 the state the caller is asking for is the one the cluster is
+    /// already heading for or in, so nothing about the request conflicts with
+    /// the stored cluster, and a repeat neither restarts the clock nor revives a
+    /// deleted cluster. It is also not held to the idle rule a second time: the
+    /// resources it held are free to leave in any order after the acceptance.
+    pub fn delete_cluster(
+        &mut self,
+        id: &str,
+        now: SystemTime,
+    ) -> Result<DescribeClusterSummary, ClusterDeleteRefusal> {
+        let Some(cluster) = self.clusters.get(id) else {
+            return Err(ClusterDeleteRefusal::NoSuchCluster);
+        };
+        if !cluster.is_delete_accepted() {
+            let resources = self.resources_in_cluster(id);
+            if !resources.is_empty() {
+                return Err(ClusterDeleteRefusal::NotIdle { resources });
+            }
+            self.clusters
+                .get_mut(id)
+                .ok_or(ClusterDeleteRefusal::NoSuchCluster)?
+                .begin_delete(now);
+        }
+        // Read back out of the store, so the answer reports the cluster as it
+        // now stands rather than one assembled here.
+        self.cluster_description(id)
+            .ok_or(ClusterDeleteRefusal::NoSuchCluster)
     }
 
     /// The full description of one stored cluster, or `None` when no cluster has
@@ -637,8 +849,7 @@ pub fn cluster_alert_output(alert: &ClusterAlertRecord) -> ClusterAlert {
 
 /// Project a `DescribeClusterSummary` onto one of the structurally identical
 /// per-operation FLAT cluster output shapes (`CreateClusterOutput`,
-/// `DescribeClusterOutput` and `UpdateClusterOutput` today; `DeleteClusterOutput`
-/// when its own issue lands).
+/// `DescribeClusterOutput`, `DeleteClusterOutput` and `UpdateClusterOutput`).
 ///
 /// One macro rather than a hand-written copy of the same eight-member move per
 /// operation, so the operations that report a cluster cannot drift from each
