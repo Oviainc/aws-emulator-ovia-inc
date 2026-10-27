@@ -171,13 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = batch::now_millis();
 
         // `name` is a plain `String` in the model, so the framework admits anything: the
-        // charset and length the member documents are applied here.
+        // service applies the pattern the member documents and refuses a value outside it
+        // with the pattern sentence every name refusal of this service carries
+        // ([`batch::name_pattern_detail`]).
         if !batch::is_valid_scheduling_policy_name(&input.name) {
             return Err(CreateSchedulingPolicyErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "name must be 1 to {} letters, numbers, hyphens (-) or underscores (_)",
-                    batch::MAX_SCHEDULING_POLICY_NAME_LEN
-                )),
+                batch::client_exception_enveloped(batch::name_pattern_detail("name")),
             )
             .into());
         }
