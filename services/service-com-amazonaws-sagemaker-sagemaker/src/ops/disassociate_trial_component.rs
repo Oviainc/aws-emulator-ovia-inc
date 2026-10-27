@@ -179,13 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(component) = store.trial_components.get(&component_key) else {
             return Err(DisassociateTrialComponentErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(format!(
-                        "Could not find trial component \"{}\".",
-                        crate::state::resource_arn(
+                    message: Some(crate::state::could_not_find(
+                        crate::state::TRIAL_COMPONENT_KIND_LABEL,
+                        &crate::state::resource_arn(
                             &region,
                             crate::state::TRIAL_COMPONENT_KIND,
                             &input.trial_component_name,
-                        )
+                        ),
                     )),
                 },
             )
