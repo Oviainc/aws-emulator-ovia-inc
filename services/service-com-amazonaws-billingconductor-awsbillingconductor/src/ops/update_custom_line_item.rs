@@ -318,14 +318,10 @@ fn merge(
     // [`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::put_custom_line_item`]),
     // so a read of an earlier period still reports the item as it stood there.
     if let Some(range) = input.billing_period_range.as_ref() {
-        if !crate::state::billing_period_range_is_ordered(range) {
-            return Err(validation(
-                "ILLEGAL_BILLING_PERIOD_RANGE",
-                "BillingPeriodRange.ExclusiveEndBillingPeriod",
-                "the exclusive end billing period must be later than the inclusive start \
-                 billing period"
-                    .to_string(),
-            ));
+        if let Err((reason, field, message)) =
+            crate::state::check_billing_period_range_is_ordered(range)
+        {
+            return Err(validation(reason, field, message));
         }
         updated.spans = vec![crate::state::BillingPeriodSpan::new(
             Some(range.inclusive_start_billing_period.clone()),
