@@ -92,6 +92,16 @@
 //! this same store, and the asset type is itself ADDRESSED by the opaque `AssetTypeId` the
 //! first put under a name mints.
 //!
+//! ASSETS — the catalog entities `PutAsset` registers, each one an instance of an asset
+//! type carrying its metadata forms — sit in their own per-account namespace beside the
+//! asset types they are instances of ([`ComAmazonawsGlueAwsglueState::assets`]). They are
+//! keyed by the `AssetId` the PUT's caller chose rather than by a minted id, because that
+//! identifier is what every operation addressing an asset carries (`PutAsset$Identifier`,
+//! `GetAsset$Identifier`, `AssociateGlossaryTerms$AssetIdentifier`) and it is what decides
+//! whether a put creates an asset or updates the one already stored. The asset type an
+//! asset is an instance of is recorded ON the asset ([`AssetEntry::asset_type_id`]), as the
+//! put addressed it.
+//!
 //! BUSINESS GLOSSARIES — the containers for business-concept terms `CreateGlossary`
 //! registers — sit beside that tree in another per-account namespace
 //! ([`ComAmazonawsGlueAwsglueState::glossaries`]). They are keyed by the opaque
@@ -200,7 +210,8 @@ use std::time::{Duration, SystemTime};
 use self::catalog_encryption::ObjectEncryption;
 
 use crate::ops::types::{
-    Action, AssetTypeFormReference, CatalogInput, CatalogProperties, CatalogPropertiesOutput,
+    Action, AssetFormEntry, AssetTypeFormReference, CatalogInput, CatalogProperties,
+    CatalogPropertiesOutput,
     Classifier,
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, ColumnStatisticsTaskSettings,
     ConfigurationObject,
@@ -388,6 +399,14 @@ pub const MAX_FORM_TYPES: usize = 1_000;
 /// than stored; `PutAssetType` models no limit error, so the refusal is the closest client
 /// error it does model (`InvalidInputException`).
 pub const MAX_ASSET_TYPES: usize = 1_000;
+
+/// Ceiling on the assets this emulator will hold, for the same reason as
+/// [`MAX_ASSET_TYPES`]: `PutAsset` writes a record any caller can reach, each one carrying
+/// its forms and their JSON content, so the number of records one process will hold is
+/// bounded here. A put that would add one past the ceiling is refused rather than stored;
+/// `PutAsset` models no limit error, so the refusal is the closest client error it does
+/// model (`InvalidInputException`).
+pub const MAX_ASSETS: usize = 1_000;
 
 /// Ceiling on the business glossaries this emulator will hold, for the same reason as
 /// [`MAX_CRAWLERS`]: `CreateGlossary` writes a record any caller can reach, so the number
@@ -840,6 +859,18 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// the name it registered the asset type under. [`Self::asset_type_by_reference`] is
     /// that resolution.
     pub asset_types: BTreeMap<String, AssetTypeEntry>,
+    /// Every asset this emulator holds, keyed by its `AssetId`.
+    ///
+    /// Per account and beside the asset types they are instances of: `PutAsset` names an
+    /// asset by `Identifier` alone, with no `CatalogId` member, and every operation that
+    /// reads, updates, deletes or annotates an asset carries that same identifier. Keyed by
+    /// it because the identifier is the whole address and is the CLIENT's, not minted here:
+    /// "The unique identifier of the asset. If an asset with this identifier already
+    /// exists, it is updated" (`PutAssetRequest$Identifier`). Ordered, so a listing of
+    /// assets has one deterministic order to page over, and bounded by [`MAX_ASSETS`]. The
+    /// key is the identifier exactly as sent — the model documents no case fold for
+    /// `AssetId`.
+    pub assets: BTreeMap<String, AssetEntry>,
     /// Every business glossary this emulator holds, keyed by its `GlossaryId`.
     ///
     /// Per account, like crawlers and job definitions: `GetGlossary`, `UpdateGlossary`,
@@ -1945,6 +1976,26 @@ impl ComAmazonawsGlueAwsglueState {
     pub fn asset_type_by_reference(&self, identifier: &str) -> Option<&AssetTypeEntry> {
         self.asset_type_by_id(identifier)
             .or_else(|| self.asset_types.get(identifier))
+    }
+
+    /// Whether the store can hold another asset, i.e. is below [`MAX_ASSETS`].
+    pub fn can_store_asset(&self) -> bool {
+        self.assets.len() < MAX_ASSETS
+    }
+
+    /// The stored asset an `AssetId` names, or `None` when this account holds no asset
+    /// under that identifier.
+    ///
+    /// Every operation that addresses an asset does so by that identifier, which is this
+    /// namespace's own key, so the resolution is this map's lookup, exact as sent. One copy,
+    /// shared, so no two operations can disagree about which record an identifier names.
+    pub fn asset(&self, identifier: &str) -> Option<&AssetEntry> {
+        self.assets.get(identifier)
+    }
+
+    /// The stored asset an `AssetId` names, mutably.
+    pub fn asset_mut(&mut self, identifier: &str) -> Option<&mut AssetEntry> {
+        self.assets.get_mut(identifier)
     }
 
     /// Whether the store can hold another business glossary, i.e. is below
@@ -5267,6 +5318,109 @@ impl AssetTypeEntry {
                     },
                 )
             })
+            .collect()
+    }
+}
+
+/// The message the catalog's asset type surface refuses an identifier it holds no asset
+/// type under with: the value of that refusal's `EntityNotFoundException$Message`.
+///
+/// Wording for this slice is pinned by no recording or doc, so the refusal is derived from
+/// the request: it names the resource kind and the identifier that resolved to nothing.
+/// What is pinned is the behaviour — 400 with `EntityNotFoundException`.
+///
+/// One copy, shared by every operation that resolves an asset type identifier
+/// ([`ComAmazonawsGlueAwsglueState::asset_type_by_reference`]), so two of them cannot
+/// disagree about how the one miss is worded.
+pub fn asset_type_not_found_message(identifier: &str) -> String {
+    format!("Asset type {identifier} not found")
+}
+
+/// The message the catalog's asset surface refuses an identifier it holds no asset under
+/// with, for the reason [`asset_type_not_found_message`] is worded the way it is, and
+/// shared by every operation that resolves an `AssetId`
+/// ([`ComAmazonawsGlueAwsglueState::asset`]).
+pub fn asset_not_found_message(identifier: &str) -> String {
+    format!("Asset {identifier} not found")
+}
+
+/// A stored asset: one catalog entity `PutAsset` registers as an instance of an asset
+/// type, carrying that entity's metadata in forms keyed by form name.
+///
+/// Every member of the modelled asset is held here — its identifier, the asset type it is
+/// an instance of, its name, its description, its forms and the two instants the SERVER
+/// stamps on it — so a read reports the asset the last write stored and nothing invented on
+/// the way out. The identifier, the asset type, the name, the description and the forms
+/// come from the request; the two instants are the clock's.
+#[derive(Debug, Clone)]
+pub struct AssetEntry {
+    /// `AssetId`: the identifier the PUT's caller chose, which is also this record's key in
+    /// [`ComAmazonawsGlueAwsglueState::assets`] and the address every later operation
+    /// carries. Stored exactly as sent.
+    pub id: String,
+    /// "The identifier of the asset type for the asset" (`PutAssetRequest$AssetTypeId`),
+    /// stored exactly as the put addressed it — either the `AssetTypeId` the catalog minted
+    /// for that asset type or the `AssetTypeName` it was registered under, the two forms
+    /// [`ComAmazonawsGlueAwsglueState::asset_type_by_reference`] resolves — because it
+    /// resolved against this store when it was stored, so a read reports the identifier the
+    /// client wrote.
+    pub asset_type_id: String,
+    /// "The name of the asset" (`PutAssetRequest$Name`), as the latest put sent it.
+    pub name: String,
+    /// "The description of the asset", or `None` when the latest put carried none: the
+    /// member is optional and the model gives it no default.
+    pub description: Option<String>,
+    /// "The forms to set on the asset, keyed by form name", each entry the form type that
+    /// defines the form's schema and the form's JSON content, stored exactly as the put
+    /// sent them. A put SETS the whole map, so a form the latest put did not send is not
+    /// held. Ordered by form name, so two reads of one asset report its forms in one order.
+    pub forms: BTreeMap<String, AssetFormEntry>,
+    /// "The timestamp at which the asset was created": the instant the put that first
+    /// stored this identifier was served, kept by every later put under it so every read
+    /// reports the same creation instant.
+    pub created_at: SystemTime,
+    /// "The timestamp at which the asset was last updated" (`GetAssetOutput$UpdatedAt`):
+    /// the instant the latest put that changed this record was served, which for a record
+    /// no put has updated yet is [`Self::created_at`].
+    pub updated_at: SystemTime,
+    /// The `ClientToken` of the put that last wrote this record, when it carried one.
+    ///
+    /// `PutAssetRequest$ClientToken` is "a unique, case-sensitive identifier that you
+    /// provide to ensure the idempotency of the request", so a retry carrying the token of
+    /// the put already stored is answered with that record rather than writing it again.
+    pub client_token: Option<String>,
+}
+
+impl AssetEntry {
+    /// The record a put stores for an identifier this store does not hold yet: the
+    /// request's members, stamped with the instant `now` the put was served at.
+    pub fn new(
+        id: String,
+        asset_type_id: String,
+        name: String,
+        description: Option<String>,
+        forms: BTreeMap<String, AssetFormEntry>,
+        client_token: Option<String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            id,
+            asset_type_id,
+            name,
+            description,
+            forms,
+            created_at: now,
+            updated_at: now,
+            client_token,
+        }
+    }
+
+    /// This record's forms as the modelled `AssetFormMap`, which is what every operation
+    /// that reports an asset's forms answers with.
+    pub fn forms_map(&self) -> HashMap<String, AssetFormEntry> {
+        self.forms
+            .iter()
+            .map(|(form_name, form)| (form_name.clone(), form.clone()))
             .collect()
     }
 }

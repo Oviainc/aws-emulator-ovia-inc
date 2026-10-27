@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAsset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAsset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAsset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the asset the request's `Identifier` names, read out of this account's asset
+//! namespace ([`crate::state::ComAmazonawsGlueAwsglueState::assets`]) by the `AssetId` the
+//! put that stored it was addressed with — the identifier is the asset's whole address, so
+//! the resolution is that namespace's own lookup
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::asset`]). Every member comes from the
+//! stored record, so a read after a put reports what that put stored, and an identifier
+//! this account holds no asset under is refused with the modelled
+//! `EntityNotFoundException`. The `Attachments` and `IterableForms` of an asset, and the
+//! glossary terms associated with it, are written by the operations that own those
+//! surfaces, so an asset reports none of them until one of those writes has landed.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +161,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAsset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAssetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAsset"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(GetAssetErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue asset store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // Read-only: the stored asset is projected out and nothing is written.
+        let store = state.lock();
+        let Some(entry) = store.asset(&input.identifier) else {
+            return Err(GetAssetErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    // The one wording this surface refuses an identifier it holds no asset
+                    // under with (`crate::state::asset_not_found_message`), with the
+                    // identifier that resolved to nothing as its variable part.
+                    message: Some(crate::state::asset_not_found_message(&input.identifier)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // Every member comes from the store, so two reads of one asset agree and a read
+        // after a put reports what that put stored. The three surfaces another operation
+        // owns are reported as the record holds them: an asset no attachment, iterable form
+        // or glossary term association has been written to carries none.
+        Ok(GetAssetOutput {
+            id: entry.id.clone(),
+            name: Some(entry.name.clone()),
+            description: entry.description.clone(),
+            created_at: Some(crate::state::to_date_time(entry.created_at)),
+            updated_at: Some(crate::state::to_date_time(entry.updated_at)),
+            asset_type_id: entry.asset_type_id.clone(),
+            glossary_terms: None,
+            forms: Some(entry.forms_map()),
+            attachments: None,
+            iterable_forms: None,
+        })
     }
 }
