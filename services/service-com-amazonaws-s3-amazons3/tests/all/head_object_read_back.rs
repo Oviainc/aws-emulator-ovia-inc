@@ -206,19 +206,14 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
     put_object(&router, bucket, "held.txt", b"abc").await;
 
     // Each bound header below decides something about the answer that a 200 full-metadata
-    // read could not report.
+    // read could not report: a condition that does not hold is answered with HTTP 304 and no
+    // body, which an operation rendering one success status cannot express, and the rest name
+    // a feature no object here has.
     for (case, header, value) in [
-        ("a byte range", "range", "bytes=0-1"),
-        ("a conditional match", "if-match", "\"abc\""),
         ("a conditional non-match", "if-none-match", "\"abc\""),
         (
             "a modified-since condition",
             "if-modified-since",
-            "2026-10-21T07:28:00Z",
-        ),
-        (
-            "an unmodified-since condition",
-            "if-unmodified-since",
             "2026-10-21T07:28:00Z",
         ),
         (
@@ -241,6 +236,51 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
             "NotImplemented",
             "case {case:?}: expected NotImplemented, got {:?}",
             answer.error_code()
+        );
+    }
+
+    // The members this read DOES answer: a byte range is served as the partial read it asks
+    // for ("a HEAD request has the same options as a GET operation on an object"), and a
+    // precondition is judged against the object — served when it holds, refused with the
+    // documented 412 when it does not.
+    let ranged = head_object(&router, bucket, "held.txt", &[("range", "bytes=0-1")]).await;
+    assert_eq!(
+        ranged.status, 206,
+        "case \"a byte range\": expected HTTP 206, got {} with body {:?}",
+        ranged.status,
+        String::from_utf8_lossy(&ranged.body)
+    );
+    assert_eq!(
+        ranged.header("content-range"),
+        Some(String::from("bytes 0-1/3")),
+        "case \"a byte range\": expected the span of the object, got {:?}",
+        ranged.header("content-range")
+    );
+    let held_etag = head_object(&router, bucket, "held.txt", &[])
+        .await
+        .header("etag")
+        .expect("the stored object must report an ETag");
+    let matched = head_object(&router, bucket, "held.txt", &[("if-match", &held_etag)]).await;
+    assert_eq!(
+        matched.status, 200,
+        "case \"a conditional match that holds\": expected HTTP 200, got {} with body {:?}",
+        matched.status,
+        String::from_utf8_lossy(&matched.body)
+    );
+    for (case, header, value) in [
+        ("a conditional match that does not hold", "if-match", "\"not-this-object\""),
+        (
+            "an unmodified-since condition that does not hold",
+            "if-unmodified-since",
+            "2020-10-21T07:28:00Z",
+        ),
+    ] {
+        let refused = head_object(&router, bucket, "held.txt", &[(header, value)]).await;
+        assert_eq!(
+            refused.status, 412,
+            "case {case:?}: expected HTTP 412, got {} with body {:?}",
+            refused.status,
+            String::from_utf8_lossy(&refused.body)
         );
     }
 
@@ -281,8 +321,13 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
         );
     }
 
-    // `partNumber` is a query parameter rather than a header, and is refused the same way.
-    for (case, query) in [("a part number", "partNumber=1")] {
+    // `partNumber` is a query parameter rather than a header, and is served the same way a
+    // `Range` is: this object was stored by one write, so part 1 IS the whole object and a
+    // part past it is not satisfiable.
+    for (case, query, expected_status) in [
+        ("the only part of a one-shot write", "partNumber=1", 206),
+        ("a part number past the object's parts", "partNumber=2", 416),
+    ] {
         let answer = send(
             &router,
             "HEAD",
@@ -292,8 +337,8 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
         )
         .await;
         assert_eq!(
-            answer.status, 501,
-            "case {case:?}: expected HTTP 501, got {} with body {:?}",
+            answer.status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {} with body {:?}",
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );

@@ -66,6 +66,7 @@
 //! this service answers a union.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use aws_smithy_runtime_api::http::{Request, Response, StatusCode};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeDeserializer, ShapeSerializer};
@@ -101,14 +102,37 @@ const NO_ERROR_WRAPPING: bool = true;
 /// quietly keep the envelope.
 pub const UNWRAPPED_XML_OUTPUT_OPERATIONS: &[&str] = &["GetBucketLocation"];
 
+/// Whether a name is a bucket this emulator holds — the one question an ADDRESS cannot
+/// answer from its own shape (see [`super::addressed_in_host`]).
+///
+/// A closure rather than an engine, so this file names no engine type and holds no store of
+/// its own: `super`'s constructor captures the one shared engine it was handed.
+pub type BucketLookup = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// This service's wire protocol: `restXml` exactly as the model declares it, with an
 /// unwrapped output document for the operations the model marks as carrying one.
 ///
 /// Everything but those outputs is the framework's own restXml protocol, delegated to
 /// unchanged — request deserialization and the bare `<Error>` envelope included.
-#[derive(Debug)]
 pub struct UnwrappedXmlRestXml {
     inner: RestXmlServerProtocol,
+    /// Whether a name is a bucket this emulator holds, for the one question an ADDRESS
+    /// cannot answer from its own shape: whether a request's first HOST label is the bucket
+    /// (virtual-hosted style) or part of the endpoint's name (path style). See
+    /// [`super::addressed_in_host`] for the rule and [`Self::with_buckets`] for where the
+    /// answer comes from.
+    holds_bucket: Option<BucketLookup>,
+}
+
+/// Hand-written because the bucket lookup is a closure, which carries no `Debug` of its own;
+/// the protocol is otherwise its inner one plus that one function.
+impl ::std::fmt::Debug for UnwrappedXmlRestXml {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("UnwrappedXmlRestXml")
+            .field("inner", &self.inner)
+            .field("holds_bucket", &self.holds_bucket.is_some())
+            .finish()
+    }
 }
 
 impl UnwrappedXmlRestXml {
@@ -126,7 +150,28 @@ impl UnwrappedXmlRestXml {
             inner: RestXmlServerProtocol::new(&[])
                 .with_namespace(S3_XML_NAMESPACE)
                 .with_no_error_wrapping(NO_ERROR_WRAPPING),
+            holds_bucket: None,
         }
+    }
+
+    /// The same protocol, able to ask whether a name is a bucket this emulator holds.
+    ///
+    /// Taken as a [`BucketLookup`] rather than as an engine, so this file names no engine
+    /// type and holds no store of its own. A protocol built WITHOUT it reads every request
+    /// as path-style, which is what a protocol constructed outside a service (a unit test of
+    /// the codec) has.
+    pub fn with_buckets(mut self, holds_bucket: BucketLookup) -> Self {
+        self.holds_bucket = Some(holds_bucket);
+        self
+    }
+
+    /// The bucket a virtual-hosted-style `request` addresses in its host, when it is one —
+    /// see [`super::addressed_in_host`].
+    fn addressed_in_host(&self, request: &Request) -> Option<String> {
+        let holds_bucket = self.holds_bucket.as_ref()?;
+        let host = super::request_host_of(request)?;
+        super::addressed_in_host(host, request_path(request.uri()), &**holds_bucket)
+            .map(str::to_string)
     }
 }
 
@@ -810,6 +855,49 @@ impl ShapeDeserializer for OwnedXmlBody {
     }
 }
 
+/// `response` with the status HTTP gives a PARTIAL answer, when it is one.
+///
+/// "The 206 (Partial Content) status code indicates that the server is successfully
+/// fulfilling a range request for the target resource by transferring one or more parts of
+/// the selected representation" and such a response "generates a `Content-Range` header
+/// field describing what range of the selected representation is enclosed" (RFC 9110, HTTP
+/// Semantics, §15.3.7). So the `Content-Range` a handler bound IS the signal: a successful
+/// response that reports one carries part of the object rather than the whole of it, and
+/// 200 would tell a client it had received everything.
+///
+/// The rule lives here, once, because an operation's success status is a single modelled
+/// constant (`Operation::SUCCESS_STATUS`) and this service's model binds the member rather
+/// than the status: two operations answer a `Content-Range` (`GetObject` and `HeadObject`),
+/// and neither handler can state a second status of its own. Only a 200 is promoted — an
+/// operation whose modelled success status is anything else is answering something this rule
+/// is not about.
+fn with_partial_content_status(response: Response) -> Response {
+    if response.status().as_u16() != 200 || response.headers().get("content-range").is_none() {
+        return response;
+    }
+    let Ok(partial) = StatusCode::try_from(PARTIAL_CONTENT_STATUS) else {
+        return response;
+    };
+    let headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    let mut promoted = Response::new(partial, response.into_body());
+    for (name, value) in headers {
+        // `append`, not `insert`: a header name the serializer wrote twice keeps both of its
+        // values. The headers came off a response the serializer built, so every one of them
+        // is already representable; a value the HTTP layer refuses is dropped rather than
+        // turning a served range into a transport failure.
+        let _ = promoted.headers_mut().try_append(name, value);
+    }
+    promoted
+}
+
+/// The status a response carrying part of the selected representation is sent with — see
+/// [`with_partial_content_status`].
+const PARTIAL_CONTENT_STATUS: u16 = 206;
+
 /// `response` with every `@xmlAttribute` member written where the API publishes it, or
 /// `response` unchanged when its body carries none.
 ///
@@ -866,6 +954,15 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         if let Some(violation) = xml_charset_violation(request, input_schema) {
             return Err(ProtocolError::Invalid(vec![violation]));
         }
+        // The PATH the `@httpLabel` members are bound from. A VIRTUAL-HOSTED-STYLE request
+        // names its bucket in the host and leaves its path as the key alone, so the bucket
+        // is put back in front of it — the same normalization the routing seam resolved the
+        // operation from (`super::Service::override_operation`), so the operation that was
+        // matched binds the bucket that was addressed. `None` for a path-style request,
+        // whose path already IS the path the labels bind from.
+        let host_style_path = self
+            .addressed_in_host(request)
+            .map(|bucket| super::path_with_bucket(&bucket, request_path(request.uri())));
         // Only a request whose BODY IS AN XML DOCUMENT can carry a member the framework's
         // codec cannot bind as the document spells it, and only a body that actually
         // spells one needs normalizing; everything else — every request whose body is not
@@ -898,7 +995,7 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                 let uri = request.uri();
                 let binding = HttpBindingDeserializer::new(
                     input_schema.http().map(|http| http.uri()),
-                    request_path(uri),
+                    host_style_path.as_deref().unwrap_or(request_path(uri)),
                     request_query(uri),
                     request_headers(request),
                     OwnedXmlBody {
@@ -908,6 +1005,38 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                 .with_payload_bytes(document);
                 return Ok(Box::new(binding));
             }
+        }
+        if let Some(path) = host_style_path {
+            // The framework's own deserializer reads the path off the request, which for a
+            // virtual-hosted-style request carries no bucket, so this one is built over the
+            // normalized path instead. Everything else is the framework's: the same binding
+            // deserializer, over the same query, headers and body.
+            let body = request
+                .body()
+                .bytes()
+                .ok_or_else(|| ProtocolError::BodyRead("body is not available as bytes".into()))?;
+            let uri = request.uri();
+            let binding = HttpBindingDeserializer::new(
+                input_schema.http().map(|http| http.uri()),
+                &path,
+                request_query(uri),
+                request_headers(request),
+                OwnedXmlBody {
+                    document: body.to_vec(),
+                },
+            );
+            // An `@httpPayload` member IS the body, so the raw bytes are wired for it (the
+            // binding deserializer picks them for a scalar payload and the codec above for
+            // a structured one). An input with no payload member never reads them.
+            let binding = match input_schema
+                .members()
+                .iter()
+                .any(|member| member.http_payload().is_some())
+            {
+                true => binding.with_payload_bytes(body.to_vec()),
+                false => binding,
+            };
+            return Ok(Box::new(binding));
         }
         self.inner.deserialize_input(request, input_schema)
     }
@@ -940,8 +1069,9 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                 .serialize_output(output, output_schema, operation_name, success_status)?;
         // A member the model marks `@xmlAttribute` has been written as an element; it
         // belongs on its parent's start tag, where the API publishes it and where a
-        // namespace-aware parser can read it.
-        Ok(with_attribute_members(response))
+        // namespace-aware parser can read it. And a response that reports a
+        // `Content-Range` carries PART of the object, which HTTP answers with 206.
+        Ok(with_partial_content_status(with_attribute_members(response)))
     }
 
     fn serialize_error(

@@ -291,8 +291,12 @@ async fn restoring_an_archived_object_reports_an_ongoing_retrieval_then_an_avail
             initiated.header("x-amz-restore-output-path")
         );
 
-        // The copy is NOT there when the call returns: both readers of the object report
-        // the retrieval as ongoing, and they report the same thing.
+        // The copy is NOT there when the call returns: a HEAD of the object reports the
+        // retrieval as ongoing, and a GET of it is still barred by the storage class the
+        // bytes are in — "before you can retrieve the object you must first restore a copy
+        // using RestoreObject. Otherwise, this operation returns an InvalidObjectState
+        // error" (`GetObject`'s documentation of that error), and a retrieval that has not
+        // fallen due has made no copy to retrieve.
         let ongoing = head_object(&router, "object-restore", key, "").await;
         assert_eq!(
             ongoing.header("x-amz-restore").as_deref(),
@@ -302,12 +306,17 @@ async fn restoring_an_archived_object_reports_an_ongoing_retrieval_then_an_avail
         );
         let read = get_object(&router, "object-restore", key, "", &[]).await;
         assert_eq!(
-            read.header("x-amz-restore"),
-            ongoing.header("x-amz-restore"),
-            "case {case:?}: GetObject and HeadObject must report one restore state, got {:?} \
-             and {:?}",
-            read.header("x-amz-restore"),
-            ongoing.header("x-amz-restore")
+            read.status, 403,
+            "case {case:?}: a read of the object while the retrieval is ongoing must be \
+             refused, got {} with body {:?}",
+            read.status,
+            text(&read)
+        );
+        assert_eq!(
+            read.error_code(),
+            "InvalidObjectState",
+            "case {case:?}: expected the InvalidObjectState code, got {:?}",
+            read.error_code()
         );
 
         // Once the retrieval falls due the copy is there, and the header says when S3 is

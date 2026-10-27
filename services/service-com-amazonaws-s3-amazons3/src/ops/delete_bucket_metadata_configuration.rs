@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBucketMetadataConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBucketMetadataConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBucketMetadataConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the S3 Metadata configuration a general purpose bucket carries.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +159,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBucketMetadataConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBucketMetadataConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Everything this delete needs is in its deserialized input: the bucket travels as
+        // an @httpLabel and the expected owner as a bound header.
+        let _ = ctx;
+
+        // "The expected bucket owner of the general purpose bucket that you want to remove
+        // the metadata table configuration from"
+        // (`DeleteBucketMetadataConfigurationRequest$ExpectedBucketOwner`), judged the way
+        // every other bucket-scoped operation in this crate judges it: this emulator serves
+        // one account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine that
+            // is not the shared `InMemoryEngine`; no configuration can then be removed, and
+            // this operation models no error to say so, so the scaffold's 501 carries what
+            // is true rather than a success that deleted nothing.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteBucketMetadataConfiguration",
+            ));
+        };
+
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            // The model declares no error for this operation, so the bucket this emulator
+            // does not hold is reported through the unmodelled channel with the code and
+            // status every other bucket-subresource call in this crate answers it with.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_BUCKET_CODE,
+                NO_SUCH_BUCKET_STATUS,
+                crate::state::NO_SUCH_BUCKET_MESSAGE,
+            ));
+        };
+        // "Deletes an S3 Metadata configuration from a general purpose bucket" (this
+        // operation's own documentation): the whole subresource goes, so
+        // `GetBucketMetadataConfiguration` reports none again. Idempotent, like every other
+        // subresource delete in this crate: a bucket carrying no configuration is already in
+        // the asked-for state, so the call still succeeds.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBucketMetadataConfiguration"))
+        // The TABLES the configuration created are not deleted with it — they are S3 Tables
+        // resources in the managed table bucket's namespace, and "Delete the journal table,
+        // and then try again" (`ErrorDetails$ErrorCode`, `JournalTableAlreadyExists`) is
+        // what AWS tells a caller that creates the configuration again. So the namespace
+        // keeps them, and the next create provisions into `FAILED`.
+        bucket.clear_metadata_configuration();
+
+        // `Unit` output: success is the modelled 204 and an empty body.
+        Ok(DeleteBucketMetadataConfigurationOutput)
     }
 }
+
+/// The code S3 answers a request whose `x-amz-expected-bucket-owner` is not the owner of the
+/// bucket it names, the way every other bucket-scoped operation in this crate answers it.
+/// Not a shape in this model, so it goes out through the unmodelled channel.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`] — the status an owner mismatch is answered with: "403
+/// Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;
+/// See [`ACCESS_DENIED_CODE`] — the text Amazon S3 "Error responses" publishes for it.
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The HTTP status `NoSuchBucket` is rendered with: 404, from that code's own entry in
+/// Amazon S3's "Error responses" list (and from the shape's own `@httpError`).
+const NO_SUCH_BUCKET_STATUS: u16 = 404;

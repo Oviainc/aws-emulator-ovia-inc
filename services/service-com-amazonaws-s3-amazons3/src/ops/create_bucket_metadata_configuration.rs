@@ -325,7 +325,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bucket that does not exist (the order every other bucket-subresource write in
         // this crate keeps).
         let mut store = state.lock();
-        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+        let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(
                 CreateBucketMetadataConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {})
                     .into(),
@@ -349,12 +349,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller that reads the configuration straight afterwards still sees `CREATING`;
         // nothing waits for the instant here.
         //
+        // A table whose NAME the managed table bucket's namespace already holds is one S3
+        // cannot create: "A journal table already exists in the Amazon Web Services managed
+        // table bucket's namespace" (`ErrorDetails$ErrorCode`, the V2 list), which is a
+        // provisioning failure rather than a refusal of the create — the configuration is
+        // recorded and the table reports `FAILED` with those `ErrorDetails`. That is the
+        // state a bucket is in after its configuration was deleted and created again: the
+        // delete takes the configuration away and leaves the tables it created behind.
+        //
         // `ContentMD5` is NOT verified, and `ChecksumAlgorithm` not acted on: by the time
         // this handler runs the payload is the deserialized container rather than the bytes
         // a digest was computed over, so nothing this handler holds can confirm or deny
         // either. That is where every other bucket-subresource write in this crate leaves
         // them.
         let now = ::std::time::SystemTime::now();
+        let journal_name =
+            crate::state::metadata_table_name(&input.bucket, crate::state::METADATA_JOURNAL_TABLE_SUFFIX);
+        let inventory_name = crate::state::metadata_table_name(
+            &input.bucket,
+            crate::state::METADATA_INVENTORY_TABLE_SUFFIX,
+        );
+        let annotation_name = crate::state::metadata_table_name(
+            &input.bucket,
+            crate::state::METADATA_ANNOTATION_TABLE_SUFFIX,
+        );
+        let journal_taken = store.metadata_namespace_holds(&journal_name);
+        let inventory_taken = store.metadata_namespace_holds(&inventory_name);
+        let journal = match journal_taken {
+            false => crate::state::MetadataTable::creating(journal_name.clone(), now),
+            true => crate::state::MetadataTable::failed(
+                journal_name.clone(),
+                now,
+                crate::state::MetadataTableFailure {
+                    code: crate::state::METADATA_JOURNAL_TABLE_EXISTS_CODE,
+                    message: crate::state::METADATA_JOURNAL_TABLE_EXISTS_MESSAGE,
+                },
+            ),
+        };
+        // The INVENTORY table has two documented ways to fail: its own name already taken
+        // ("An inventory table already exists in the Amazon Web Services managed table
+        // bucket's namespace"), and the journal table it reads from having failed — "The
+        // journal table that the inventory table relies on has a `FAILED` status. An
+        // inventory table requires a journal table with an `ACTIVE` status"
+        // (`JournalTableNotAvailable`, same list). Its own name is judged first: that is
+        // what stops a second table being created under it.
+        //
+        // The ANNOTATION table is left to be created: the published list of V2 provisioning
+        // error codes names no failure for it, so there is no code or sentence to report one
+        // with.
+        let inventory_failure = if inventory_taken {
+            Some(crate::state::MetadataTableFailure {
+                code: crate::state::METADATA_INVENTORY_TABLE_EXISTS_CODE,
+                message: crate::state::METADATA_INVENTORY_TABLE_EXISTS_MESSAGE,
+            })
+        } else if journal_taken {
+            Some(crate::state::MetadataTableFailure {
+                code: crate::state::METADATA_JOURNAL_TABLE_UNAVAILABLE_CODE,
+                message: crate::state::METADATA_JOURNAL_TABLE_UNAVAILABLE_MESSAGE,
+            })
+        } else {
+            None
+        };
         let table = |suffix: &str| {
             crate::state::MetadataTable::creating(
                 crate::state::metadata_table_name(&input.bucket, suffix),
@@ -370,7 +425,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let recorded = crate::state::BucketMetadataConfiguration {
             // `MetadataConfiguration$JournalTableConfiguration` is REQUIRED, so every
             // configuration has a journal table.
-            journal: table(crate::state::METADATA_JOURNAL_TABLE_SUFFIX),
+            journal,
             journal_record_expiration: configuration
                 .journal_table_configuration
                 .record_expiration
@@ -381,7 +436,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     table: optional_table(
                         &inventory.configuration_state,
                         crate::state::METADATA_INVENTORY_TABLE_SUFFIX,
-                    ),
+                    )
+                    .map(|table| match inventory_failure.clone() {
+                        Some(failure) => {
+                            crate::state::MetadataTable::failed(table.name, now, failure)
+                        }
+                        None => table,
+                    }),
                     // `InventoryTableConfiguration` carries no `Role` member; only the
                     // annotation table is managed by an IAM role.
                     role: None,
@@ -399,6 +460,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
+        // Every table this create really provisions joins the managed table bucket's
+        // namespace, and stays in it once the configuration is deleted — which is what makes
+        // a later create of the same configuration report the failure above. A table that
+        // FAILED to be created adds nothing: the name was already taken by the table that is
+        // there.
+        let created: Vec<String> = [
+            (!journal_taken).then(|| journal_name.clone()),
+            recorded
+                .inventory
+                .as_ref()
+                .and_then(|inventory| inventory.table.as_ref())
+                .filter(|table| table.failure.is_none())
+                .map(|_| inventory_name.clone()),
+            recorded
+                .annotation
+                .as_ref()
+                .and_then(|annotation| annotation.table.as_ref())
+                .map(|_| annotation_name.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        // The namespace is bounded ([`crate::state::MAX_METADATA_NAMESPACE_TABLES`]): a
+        // table outlives the configuration that created it, so nothing releases a name and
+        // the ceiling is what keeps the record bounded whatever a caller does. A create that
+        // would carry it past the maximum is refused with NOTHING recorded — the emulator's
+        // own ceiling, so it goes out through the framework's 400 refusal channel rather
+        // than as an AWS error code, the way this handler's other resource guard does.
+        if created.len() > store.metadata_namespace_room() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "the managed table bucket's namespace holds as many metadata tables as this \
+                 emulator records ({})",
+                crate::state::MAX_METADATA_NAMESPACE_TABLES
+            )));
+        }
+        for name in &created {
+            store.record_metadata_namespace_table(name);
+        }
+
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            // Unreachable: the lookup above ran under this same guard.
+            return Err(
+                CreateBucketMetadataConfigurationErrorModeled::NoSuchBucket(NoSuchBucket {})
+                    .into(),
+            );
+        };
         bucket.set_metadata_configuration(recorded);
 
         // `Unit` output: success is the modelled 200 and an empty body.
