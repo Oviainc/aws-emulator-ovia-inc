@@ -437,7 +437,10 @@ async fn idle_channel(router: &MultiServiceRouter, case: &str) -> String {
         router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": format!("post-delete-{case}") })),
+        Some(json!({
+            "name": format!("post-delete-{case}"),
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(

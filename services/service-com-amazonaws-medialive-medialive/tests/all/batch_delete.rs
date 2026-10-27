@@ -76,6 +76,7 @@ async fn idle_channel(router: &MultiServiceRouter, case: &str, name: &str) -> St
 
 /// A channel created from `body`, still in `CREATING`.
 async fn creating_channel(router: &MultiServiceRouter, case: &str, body: Value) -> String {
+    let body = crate::support::resolved_channel_body(router, body).await;
     let (status, response) = call(router, "POST", "/prod/channels", Some(body)).await;
     assert_eq!(
         status, 201,

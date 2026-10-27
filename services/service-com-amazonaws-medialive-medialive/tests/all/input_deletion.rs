@@ -179,6 +179,7 @@ async fn deleting_an_input_is_refused_while_a_channel_attaches_it() {
                 Some(json!({
                     "name": format!("attaching-{index}"),
                     "inputAttachments": attachments,
+                    "encoderSettings": crate::support::channel_encoder_settings(),
                 })),
             )
             .await;
@@ -692,6 +693,7 @@ async fn a_refused_delete_carries_no_input() {
         Some(json!({
             "name": "attaching",
             "inputAttachments": [{ "inputId": id, "inputAttachmentName": "slot-0" }],
+            "encoderSettings": crate::support::channel_encoder_settings(),
         })),
     )
     .await;

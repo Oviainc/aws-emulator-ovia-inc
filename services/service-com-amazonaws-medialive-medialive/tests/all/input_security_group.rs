@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_medialive_medialive::state::TRANSIENT_STATE_SPAN;
+use service_com_amazonaws_medialive_medialive::state::{MAX_WHITELIST_RULES, TRANSIENT_STATE_SPAN};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{call, error_code, medialive, ACCOUNT};
@@ -325,6 +325,112 @@ async fn whitelist_rules_outside_the_ipv4_cidr_rule_are_refused() {
     }
 }
 
+/// Rule: `WhitelistRules` is a caller-chosen list this emulator KEEPS on the
+/// stored group, so its length is bounded exactly as a network's CIDR lists are:
+/// a request at or below the ceiling is accepted and stores every rule it
+/// carried, and one entry past it is refused with the modelled
+/// `BadRequestException` (400) with nothing written — for the create and for the
+/// update alike, since the two share one validator.
+///
+/// The rows span the published bound from both sides (one rule, the ceiling, one
+/// past it), because that is what a bound generalises over.
+#[tokio::test]
+async fn the_whitelist_of_one_group_is_bounded() {
+    // (case, how many rules the request carries, whether it is accepted)
+    let table: [(&str, usize, bool); 3] = [
+        ("one rule", 1, true),
+        ("at the ceiling", MAX_WHITELIST_RULES, true),
+        ("one past the ceiling", MAX_WHITELIST_RULES + 1, false),
+    ];
+
+    for (case, count, accepted) in table {
+        let cidrs: Vec<String> = (0..count)
+            .map(|index| format!("10.{}.{}.0/24", index / 256, index % 256))
+            .collect();
+        let rules: Vec<Value> = cidrs.iter().map(|cidr| json!({ "cidr": cidr })).collect();
+        let expected = whitelist(
+            &cidrs.iter().map(String::as_str).collect::<Vec<&str>>(),
+        );
+
+        // The create, the first writer of a group's whitelist.
+        let router = medialive();
+        let (status, body) = call(
+            &router,
+            "POST",
+            "/prod/inputSecurityGroups",
+            Some(json!({ "whitelistRules": rules.clone() })),
+        )
+        .await;
+        if accepted {
+            assert_eq!(
+                status, 201,
+                "case {case:?}: expected {count} rules to be accepted, got {status}: {body}"
+            );
+            assert_eq!(
+                body["securityGroup"]["whitelistRules"], expected,
+                "case {case:?}: expected the accepted rules to be stored, got {:?}",
+                body["securityGroup"]["whitelistRules"]
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected {count} rules to be refused, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(status, &body),
+                "BadRequestException",
+                "case {case:?}: expected the operation's own BadRequestException, got {body}"
+            );
+            let (status, listed) = call(&router, "GET", "/prod/inputSecurityGroups", None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: ListInputSecurityGroups: got {status}: {listed}"
+            );
+            assert_eq!(
+                listed["inputSecurityGroups"],
+                json!([]),
+                "case {case:?}: expected the refused create to store no group, got {:?}",
+                listed["inputSecurityGroups"]
+            );
+        }
+
+        // The update, which rewrites the same list under the same ceiling: a
+        // refused one leaves the group with the whitelist it already had.
+        let router = medialive();
+        let created = create_group(
+            &router,
+            case,
+            json!({ "whitelistRules": [{ "cidr": "192.0.2.0/24" }] }),
+        )
+        .await;
+        let id = created["id"].as_str().unwrap_or_default().to_string();
+        let (status, body) = update_group(&router, &id, json!({ "whitelistRules": rules })).await;
+        let (_, described) = describe_group(&router, &id).await;
+        if accepted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the update of {count} rules to be accepted, got {status}: {body}"
+            );
+            assert_eq!(
+                described["whitelistRules"], expected,
+                "case {case:?}: expected the updated rules to be stored, got {:?}",
+                described["whitelistRules"]
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected the update of {count} rules to be refused, got {status}: {body}"
+            );
+            assert_eq!(
+                described["whitelistRules"],
+                whitelist(&["192.0.2.0/24"]),
+                "case {case:?}: expected the refused update to leave the whitelist alone, got {:?}",
+                described["whitelistRules"]
+            );
+        }
+    }
+}
+
 /// Rule: a group's `State`, `Inputs` and `Channels` report what currently uses
 /// it, so a group is `IN_USE` exactly while some resource in state references it
 /// and `IDLE` otherwise — and the reader tracks every later create and delete
@@ -349,6 +455,7 @@ async fn a_group_is_in_use_exactly_while_a_resource_references_it() {
         Some(json!({
             "name": "uses-the-group",
             "channelSecurityGroups": [attached_id.clone()],
+            "encoderSettings": crate::support::channel_encoder_settings(),
         })),
     )
     .await;
@@ -468,7 +575,10 @@ async fn describe_refuses_an_id_no_group_has() {
         &router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "not-a-security-group" })),
+        Some(json!({
+            "name": "not-a-security-group",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(status, 201, "CreateChannel: expected 201, got {status}: {channel}");
@@ -863,7 +973,10 @@ async fn an_update_refuses_an_id_no_group_has() {
         &router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "not-a-security-group" })),
+        Some(json!({
+            "name": "not-a-security-group",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(status, 201, "CreateChannel: expected 201, got {status}: {channel}");
@@ -1010,6 +1123,7 @@ async fn an_update_keeps_reporting_what_uses_the_group() {
         Some(json!({
             "name": "also-uses-the-group",
             "channelSecurityGroups": [group_id.clone()],
+            "encoderSettings": crate::support::channel_encoder_settings(),
         })),
     )
     .await;
@@ -1081,7 +1195,10 @@ async fn a_resource_create_answers_the_status_the_wire_carries() {
         (
             "channel",
             "/prod/channels",
-            json!({ "name": "created" }),
+            json!({
+                "name": "created",
+                "encoderSettings": crate::support::channel_encoder_settings(),
+            }),
             201,
             "the model's declared code",
         ),
@@ -1220,6 +1337,7 @@ async fn a_deleted_group_reaches_the_terminal_deleted_state() {
                     Some(json!({
                         "name": "uses-the-group",
                         "channelSecurityGroups": [id.clone()],
+                        "encoderSettings": crate::support::channel_encoder_settings(),
                     })),
                 )
                 .await;
@@ -1342,7 +1460,10 @@ async fn deleting_an_id_no_group_has_is_not_found() {
         &router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "not-a-security-group" })),
+        Some(json!({
+            "name": "not-a-security-group",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(status, 201, "CreateChannel: expected 201, got {status}: {channel}");

@@ -43,7 +43,8 @@ use crate::ops::types::{
     EventSubscription, HsmConfiguration, MaintenanceTrack,
     NamespaceIdentifierUnion,
     NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, RecurringCharge,
-    RedshiftIdcApplication, ReservedNode, ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet,
+    RedshiftIdcApplication, ReservedNode, ReservedNodeConfigurationOption,
+    ReservedNodeExchangeStatus, ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet,
     SupportedOperation,
     SupportedPlatform, UpdateTarget,
     VpcEndpoint, VpcSecurityGroupMembership,
@@ -1188,10 +1189,189 @@ pub fn reserved_node_of_offering(
 
 /// What an operation naming a `ReservedNodeId` answers when the account holds no
 /// reservation under it: ONE sentence naming the resource that was not found and
-/// the identifier the request asked for, worded like the sibling refusal for an
-/// offering id the catalog does not publish.
+/// the identifier the request asked for, shared by every operation that looks a
+/// reservation up so a client sees one message for one condition.
 pub fn reserved_node_not_found_message(reserved_node_id: &str) -> String {
-    format!("Reserved node not found: '{reserved_node_id}'.")
+    format!("Reserved Node {reserved_node_id} not found.")
+}
+
+/// Whether `value` has the FORM of an identifier this service MINTS: five
+/// lowercase-hex groups of 8-4-4-4-12 characters.
+///
+/// Every identifier this service issues for a reservation, for an offering and
+/// for an exchange request has that form (see [`new_reserved_node_id`],
+/// [`reserved_node_offering_id`] and [`new_reserved_node_exchange_request_id`]),
+/// so a value of any other form names nothing this account could ever hold —
+/// which is what lets the exchange operations rule it out as a bad parameter
+/// value before any lookup runs.
+///
+/// A shape test over the form this crate already MINTS with its existing digest,
+/// not a parser: it decodes nothing, keeps nothing and allocates nothing, which
+/// is also why it needs no crate of its own (the generator that mints these ids
+/// records why this crate takes no `uuid` dependency).
+pub fn is_minted_identifier(value: &str) -> bool {
+    /// The character count of each group, in order.
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+
+    let mut groups = value.split('-');
+    for width in GROUPS {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        let hex = group
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if group.len() != width || !hex {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
+/// What an exchange operation answers an identifier whose FORM it ruled out
+/// before any lookup: the member it was given on and the value that member
+/// cannot take.
+pub fn malformed_identifier_message(member: &str, value: &str) -> String {
+    format!("Invalid value for {member}: '{value}'. {member} must be a universally unique identifier.")
+}
+
+/// The `State` a reservation reports while it is being exchanged for another.
+///
+/// Source: `smithy_query(query="doc", shape="ReservedNode", member="State")` —
+/// "exchanging-The owner is exchanging the reserved node for another reserved
+/// node", from the same documented value list as
+/// [`RESERVED_NODE_STATE_PENDING_PAYMENT`].
+pub const RESERVED_NODE_STATE_EXCHANGING: &str = "exchanging";
+
+/// The `State` the reservation an exchange moved OFF reports once that exchange
+/// is complete, from the same documented value list: "retired-The reserved node
+/// is no longer available."
+pub const RESERVED_NODE_STATE_RETIRED: &str = "retired";
+
+/// The `Status` an exchange request reports from the call that asked for it.
+///
+/// Source: `smithy_query(query="doc", shape="ReservedNodeExchangeStatus",
+/// member="Status")` — "The status of the reserved-node exchange request.
+/// Statuses include in-progress and requested", a value of
+/// `ReservedNodeExchangeStatusType`.
+pub const RESERVED_NODE_EXCHANGE_STATUS_REQUESTED: &str = "REQUESTED";
+
+/// The `Status` an exchange request reports once the exchange is complete, from
+/// the same modelled value list as
+/// [`RESERVED_NODE_EXCHANGE_STATUS_REQUESTED`].
+pub const RESERVED_NODE_EXCHANGE_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// How long after the `AcceptReservedNodeExchange` call that asks for it an
+/// exchange falls due: the request leaves
+/// [`RESERVED_NODE_EXCHANGE_STATUS_REQUESTED`], the reservation it moved off
+/// leaves [`RESERVED_NODE_STATE_EXCHANGING`] for
+/// [`RESERVED_NODE_STATE_RETIRED`], and the reservation it minted leaves
+/// [`RESERVED_NODE_STATE_PENDING_PAYMENT`] — one instant for all three, so no
+/// caller can see the exchange half applied.
+///
+/// The span is the emulator's own choice — Amazon Redshift documents no exchange
+/// duration — and is deliberately non-zero, for the same reason as
+/// [`RESERVED_NODE_PAYMENT_SPAN`]: a caller that polls the exchange straight
+/// after asking for it still observes the transient status the accept reported.
+/// The due instant is stored and nothing ever sleeps for it.
+pub const RESERVED_NODE_EXCHANGE_SPAN: Duration = Duration::from_millis(500);
+
+/// The node-type prefix of a cluster or snapshot whose reserved nodes
+/// reserved-node exchange covers: Amazon Redshift exchanges DS2 reservations
+/// only, which is what [`ONLY_DS2_EXCHANGEABLE`] says to every other node type.
+pub const EXCHANGEABLE_CLUSTER_NODE_TYPE_PREFIX: &str = "ds2.";
+
+/// What a cluster-scoped exchange request about a resolved resource of any other
+/// node type is refused with: the whole sentence is fixed, naming the one node
+/// family the operation covers rather than the resource it was asked about.
+pub const ONLY_DS2_EXCHANGEABLE: &str = "You can only exchange DS2 reserved nodes.";
+
+/// The `ActionType` of a reserved-node exchange initiated from a cluster RESIZE,
+/// so the cluster being resized is what the configuration options are reported
+/// for.
+///
+/// Source: `smithy_query(query="shape",
+/// shape="ReservedNodeExchangeActionType")` — one of the two values the enum
+/// declares.
+pub const EXCHANGE_ACTION_RESIZE_CLUSTER: &str = "resize-cluster";
+
+/// The `ActionType` of a reserved-node exchange initiated from a snapshot
+/// RESTORE, the other value of the same enum, so the snapshot being restored
+/// from is what the configuration options are reported for.
+pub const EXCHANGE_ACTION_RESTORE_CLUSTER: &str = "restore-cluster";
+
+/// A fresh `ReservedNodeExchangeRequestId`.
+///
+/// "The identifier of the reserved-node exchange request"
+/// (`smithy_query(query="shape", shape="ReservedNodeExchangeStatus")`) is minted
+/// by the service and carries nothing from the request, exactly like
+/// [`new_reserved_node_id`], and the minted id is STORED so every later read of
+/// that exchange reports the same one.
+pub fn new_reserved_node_exchange_request_id() -> String {
+    crate::service::query_error_envelope::new_request_id()
+}
+
+/// What an operation naming a `ReservedNodeExchangeRequestId` answers when this
+/// account asked for no such exchange, worded like the sibling refusal for a
+/// reservation id nobody holds ([`reserved_node_not_found_message`]).
+pub fn reserved_node_exchange_not_found_message(request_id: &str) -> String {
+    format!("Reserved Node Exchange Request {request_id} not found.")
+}
+
+/// What a reserved-node exchange operation answers a `ClusterIdentifier` that
+/// names no cluster this account holds.
+pub fn exchange_cluster_not_found_message(cluster_identifier: &str) -> String {
+    format!("The cluster {cluster_identifier} was not found.")
+}
+
+/// What a reserved-node exchange operation answers a `SnapshotIdentifier` that
+/// names no snapshot this account holds, worded like its sibling
+/// [`exchange_cluster_not_found_message`].
+pub fn exchange_snapshot_not_found_message(snapshot_identifier: &str) -> String {
+    format!("The snapshot {snapshot_identifier} was not found.")
+}
+
+/// Why a reservation cannot take part in an exchange, classified so each
+/// operation answers it with the fault its OWN model declares for that class.
+///
+/// One classification for every exchange operation that dereferences a
+/// `ReservedNodeId`, so no two of them can refuse the same reservation
+/// differently.
+#[derive(Debug)]
+pub enum ExchangeRefusal {
+    /// An identifier of a form this service never mints, ruled out before any
+    /// lookup. The model declares no client-input fault for it, so it is
+    /// answered with the `InvalidParameterValue` code Amazon Redshift itself
+    /// uses.
+    InvalidParameterValue(String),
+    /// A well-formed identifier naming no reservation this account holds —
+    /// `ReservedNodeNotFoundFault`.
+    ReservedNodeNotFound(String),
+    /// A reservation whose payment is not confirmed yet, so it is not available
+    /// for use — `InvalidReservedNodeStateFault`.
+    InvalidReservedNodeState(String),
+    /// A reservation an exchange already moved off —
+    /// `ReservedNodeAlreadyMigratedFault`.
+    ReservedNodeAlreadyMigrated(String),
+    /// The exchange would take the account past the compute-node bound this
+    /// store holds ([`RESERVED_NODE_QUOTA`]) — `ReservedNodeQuotaExceededFault`.
+    /// Only the path that MINTS a reservation can raise it.
+    QuotaExceeded(String),
+}
+
+/// How close two published prices must be to be the same amount: a tenth of the
+/// smallest digit a price carries ([`reserved_node_offering`] rounds every price
+/// to three decimal places), so two prices computed from the same rate match and
+/// two rounded to different amounts do not.
+const PRICE_MATCH_TOLERANCE: f64 = 0.000_1;
+
+/// Whether two published prices are the same amount.
+fn prices_match(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => (left - right).abs() < PRICE_MATCH_TOLERANCE,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// The default number of days automated snapshots are retained.
@@ -2921,6 +3101,20 @@ pub struct StoredReservedNode {
     pub active_at: Instant,
 }
 
+/// A reserved-node exchange as this service stores it: the modelled projection
+/// `DescribeReservedNodeExchangeStatus` reports, plus when the exchange the
+/// accept started falls due.
+#[derive(Debug, Clone)]
+pub struct StoredReservedNodeExchange {
+    /// Exactly what `DescribeReservedNodeExchangeStatus` reports, so a read
+    /// never recomputes it.
+    pub status: ReservedNodeExchangeStatus,
+    /// When the clock-owed [`RESERVED_NODE_EXCHANGE_STATUS_REQUESTED`] ->
+    /// [`RESERVED_NODE_EXCHANGE_STATUS_SUCCEEDED`] transition falls due. See
+    /// [`RESERVED_NODE_EXCHANGE_SPAN`].
+    pub completed_at: Instant,
+}
+
 /// Per-service state for com-amazonaws-redshift-redshiftserviceversion20121201. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
@@ -3010,6 +3204,11 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// which is seeded and never grows, this collection starts empty and a
     /// purchase is the only thing that adds to it.
     pub reserved_nodes: Vec<StoredReservedNode>,
+    /// Every reserved-node exchange `AcceptReservedNodeExchange` asked for,
+    /// keyed by `ReservedNodeExchangeRequestId`, in request order — like the
+    /// reservations above, this collection starts empty and an accept is the
+    /// only thing that adds to it.
+    pub reserved_node_exchanges: Vec<StoredReservedNodeExchange>,
     /// Every namespace registration `RegisterNamespace` recorded, keyed by the
     /// (namespace, consumer account) pair it is a registration of, in
     /// registration order.
@@ -3083,6 +3282,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             account_attributes: published_account_attributes(),
             reserved_node_offerings: published_reserved_node_offerings(),
             reserved_nodes: Vec::new(),
+            reserved_node_exchanges: Vec::new(),
             namespace_registrations: Vec::new(),
             event_subscriptions: Vec::new(),
             event_catalog: published_event_catalog(),
@@ -3176,6 +3376,21 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             // it falls with the clock whether or not anybody called.
             refresh_manual_retention(&mut stored.snapshot, wall);
         }
+        // An exchange the accept recorded is complete once its span has passed:
+        // the request reports it succeeded and the reservation it moved off is
+        // retired, both due at this instant whether or not anybody called.
+        let mut retired: Vec<String> = Vec::new();
+        for exchange in &mut self.reserved_node_exchanges {
+            if exchange.status.status.as_deref() == Some(RESERVED_NODE_EXCHANGE_STATUS_REQUESTED)
+                && now >= exchange.completed_at
+            {
+                exchange.status.status =
+                    Some(RESERVED_NODE_EXCHANGE_STATUS_SUCCEEDED.to_string());
+                if let Some(source) = exchange.status.source_reserved_node_id.clone() {
+                    retired.push(source);
+                }
+            }
+        }
         // A reservation whose payment its purchase left unconfirmed is active
         // once that purchase's span has passed: the confirmation was due at this
         // instant whether or not anybody called.
@@ -3184,6 +3399,16 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                 && now >= stored.active_at
             {
                 stored.node.state = Some(RESERVED_NODE_STATE_ACTIVE.to_string());
+            }
+            // The reservation an exchange moved off is no longer available once
+            // that exchange completed, which the loop above just settled.
+            let exchanged = stored
+                .node
+                .reserved_node_id
+                .as_deref()
+                .is_some_and(|held| retired.iter().any(|source| source == held));
+            if stored.node.state.as_deref() == Some(RESERVED_NODE_STATE_EXCHANGING) && exchanged {
+                stored.node.state = Some(RESERVED_NODE_STATE_RETIRED.to_string());
             }
         }
         // A registration a deregister reported as leaving is GONE once that
@@ -3349,6 +3574,241 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.reserved_nodes
             .iter()
             .find(|stored| stored.node.reserved_node_id.as_deref() == Some(reserved_node_id))
+    }
+
+    /// The reservation an exchange operation's `ReservedNodeId` names.
+    ///
+    /// The ONE dereference rule the exchange operations share: the identifier's
+    /// FORM is ruled out before any lookup — a value this service could never
+    /// have minted is a bad parameter value, not a missing resource — and only
+    /// then is it resolved against the reservations this account holds.
+    pub fn held_reserved_node(
+        &self,
+        reserved_node_id: &str,
+    ) -> Result<&StoredReservedNode, ExchangeRefusal> {
+        if !is_minted_identifier(reserved_node_id) {
+            return Err(ExchangeRefusal::InvalidParameterValue(
+                malformed_identifier_message("ReservedNodeId", reserved_node_id),
+            ));
+        }
+        self.reserved_node(reserved_node_id).ok_or_else(|| {
+            ExchangeRefusal::ReservedNodeNotFound(reserved_node_not_found_message(
+                reserved_node_id,
+            ))
+        })
+    }
+
+    /// The reservation an exchange operation's `ReservedNodeId` names, checked
+    /// against the state an exchange needs it in.
+    ///
+    /// [`Self::held_reserved_node`] plus the two preconditions the modelled
+    /// faults name: a reservation an exchange already moved off has "already
+    /// been exchanged", and one whose payment is not confirmed yet "is not in an
+    /// active state".
+    pub fn exchangeable_reserved_node(
+        &self,
+        reserved_node_id: &str,
+    ) -> Result<&StoredReservedNode, ExchangeRefusal> {
+        let stored = self.held_reserved_node(reserved_node_id)?;
+        match stored.node.state.as_deref() {
+            Some(RESERVED_NODE_STATE_EXCHANGING | RESERVED_NODE_STATE_RETIRED) => {
+                Err(ExchangeRefusal::ReservedNodeAlreadyMigrated(format!(
+                    "Reserved Node {reserved_node_id} has already been exchanged."
+                )))
+            }
+            Some(RESERVED_NODE_STATE_ACTIVE) => Ok(stored),
+            other => Err(ExchangeRefusal::InvalidReservedNodeState(format!(
+                "Reserved Node {reserved_node_id} is in state {} and is not available for exchange.",
+                other.unwrap_or_default()
+            ))),
+        }
+    }
+
+    /// Whether `offering` is one `source` may be exchanged ONTO: the ONE
+    /// candidate predicate, so the read, the options report and the exchange
+    /// itself cannot disagree about what is eligible.
+    fn is_exchange_target(offering: &ReservedNodeOffering, source: &ReservedNode) -> bool {
+        offering.reserved_node_offering_type.as_deref()
+            == Some(RESERVED_NODE_OFFERING_TYPE_UPGRADABLE)
+            && offering.offering_type == source.offering_type
+            && offering.duration == source.duration
+            && prices_match(offering.usage_price, source.usage_price)
+    }
+
+    /// The published offerings one reservation may be exchanged ONTO, in catalog
+    /// order.
+    ///
+    /// Source: `smithy_query(query="doc",
+    /// operation="GetReservedNodeExchangeOfferings")` — "Returns an array of DC2
+    /// ReservedNodeOfferings that matches the payment type, term, and usage
+    /// price of the given DC1 reserved node": the candidates are the
+    /// exchange-target offerings the catalog publishes (the ones carrying
+    /// [`RESERVED_NODE_OFFERING_TYPE_UPGRADABLE`]) whose payment type
+    /// (`OfferingType`), term (`Duration`) and `UsagePrice` are the
+    /// reservation's own — which is also what "no changes to the configuration
+    /// (term, payment type, or number of nodes) and no additional costs"
+    /// (`smithy_query(query="doc", operation="AcceptReservedNodeExchange")`)
+    /// requires of the exchange itself.
+    ///
+    /// References into the published catalog, never clones: the list is bounded
+    /// by that catalog ([`published_reserved_node_offerings`]) and a caller
+    /// clones only the page it serves.
+    pub fn exchange_target_offerings(&self, source: &ReservedNode) -> Vec<&ReservedNodeOffering> {
+        self.reserved_node_offerings
+            .iter()
+            .filter(|offering| Self::is_exchange_target(offering, source))
+            .collect()
+    }
+
+    /// Every (reservation, offering) pair the exchange configuration options of
+    /// one node type are, in reservation order then catalog order.
+    ///
+    /// Index pairs rather than built options, so the whole list costs no clone
+    /// and only the PAGE a request asks for is materialised (see
+    /// [`Self::reserved_node_configuration_option`]): the pair count is the
+    /// product of the account's ACTIVE reservations of that node type — bounded
+    /// by [`RESERVED_NODE_QUOTA`], which every path that records a reservation
+    /// enforces — and the published catalog, while the memory one request drives
+    /// stays proportional to the documented `MaxRecords` window.
+    pub fn reserved_node_configuration_pairs(&self, node_type: &str) -> Vec<(usize, usize)> {
+        let mut pairs = Vec::new();
+        for (held, stored) in self.reserved_nodes.iter().enumerate() {
+            if stored.node.node_type.as_deref() != Some(node_type)
+                || stored.node.state.as_deref() != Some(RESERVED_NODE_STATE_ACTIVE)
+            {
+                continue;
+            }
+            for (published, offering) in self.reserved_node_offerings.iter().enumerate() {
+                if Self::is_exchange_target(offering, &stored.node) {
+                    pairs.push((held, published));
+                }
+            }
+        }
+        pairs
+    }
+
+    /// The option one pair of [`Self::reserved_node_configuration_pairs`]
+    /// describes: "Details for a reserved-node exchange" — the reservation it
+    /// would move off, the offering it would move onto, and the node count the
+    /// exchange keeps ("no changes to the configuration (term, payment type, or
+    /// number of nodes)").
+    pub fn reserved_node_configuration_option(
+        &self,
+        pair: (usize, usize),
+    ) -> Option<ReservedNodeConfigurationOption> {
+        let stored = self.reserved_nodes.get(pair.0)?;
+        let offering = self.reserved_node_offerings.get(pair.1)?;
+        Some(ReservedNodeConfigurationOption {
+            source_reserved_node: Some(stored.node.clone()),
+            target_reserved_node_count: stored.node.node_count,
+            target_reserved_node_offering: Some(offering.clone()),
+        })
+    }
+
+    /// The stored exchange with this `ReservedNodeExchangeRequestId`, if this
+    /// account asked for one.
+    pub fn reserved_node_exchange(
+        &self,
+        request_id: &str,
+    ) -> Option<&StoredReservedNodeExchange> {
+        self.reserved_node_exchanges.iter().find(|stored| {
+            stored.status.reserved_node_exchange_request_id.as_deref() == Some(request_id)
+        })
+    }
+
+    /// Record the exchange of the reservation `source_reserved_node_id` names
+    /// onto `target`, and answer the reservation it minted together with the
+    /// request that tracks it.
+    ///
+    /// What an exchange IS, in one place: the reservation being exchanged
+    /// reports [`RESERVED_NODE_STATE_EXCHANGING`] from this call, a new
+    /// reservation on the target offering is recorded for the same number of
+    /// nodes ("no changes to the configuration (term, payment type, or number of
+    /// nodes)"), and a request is recorded so the caller can follow the
+    /// exchange. All three transitions fall due together, one
+    /// [`RESERVED_NODE_EXCHANGE_SPAN`] after this call, so
+    /// [`settle`](Self::settle) can never show the exchange half applied.
+    ///
+    /// BOUNDED by the compute-node quota, before anything is recorded: the
+    /// reservation this mints holds as many nodes as the one it moves off, so
+    /// the quota [`RESERVED_NODE_QUOTA`] that bounds a purchase bounds this path
+    /// too — and because every exchange adds at least one node to that count,
+    /// the same bound caps
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::reserved_node_exchanges`],
+    /// which grows one record per exchange.
+    ///
+    /// The caller has already resolved both identifiers (see
+    /// [`Self::exchangeable_reserved_node`] and
+    /// [`Self::exchange_target_offerings`]); a `source_reserved_node_id` this
+    /// store holds no reservation under changes nothing and is refused as a
+    /// reservation that is not there.
+    pub fn begin_reserved_node_exchange(
+        &mut self,
+        source_reserved_node_id: &str,
+        target: &ReservedNodeOffering,
+        started: Instant,
+        requested_at: ::aws_smithy_types::DateTime,
+    ) -> Result<(ReservedNode, ReservedNodeExchangeStatus), ExchangeRefusal> {
+        let position = self
+            .reserved_nodes
+            .iter()
+            .position(|stored| {
+                stored.node.reserved_node_id.as_deref() == Some(source_reserved_node_id)
+            })
+            .ok_or_else(|| {
+                ExchangeRefusal::ReservedNodeNotFound(reserved_node_not_found_message(
+                    source_reserved_node_id,
+                ))
+            })?;
+
+        let node_count = self.reserved_nodes[position]
+            .node
+            .node_count
+            .unwrap_or(DEFAULT_RESERVED_NODE_COUNT);
+        if self.reserved_node_count().saturating_add(node_count) > RESERVED_NODE_QUOTA {
+            return Err(ExchangeRefusal::QuotaExceeded(format!(
+                "The request would exceed the allowed number of reserved compute nodes ({RESERVED_NODE_QUOTA})."
+            )));
+        }
+
+        let source = {
+            let stored = &mut self.reserved_nodes[position];
+            stored.node.state = Some(RESERVED_NODE_STATE_EXCHANGING.to_string());
+            stored.node.clone()
+        };
+
+        let exchanged = reserved_node_of_offering(
+            new_reserved_node_id(),
+            target,
+            node_count,
+            requested_at,
+        );
+        // Bounded by the quota tested above: this is the push that grows the
+        // reserved-node collection on the exchange path.
+        self.reserved_nodes.push(StoredReservedNode {
+            node: exchanged.clone(),
+            active_at: started + RESERVED_NODE_EXCHANGE_SPAN,
+        });
+
+        let status = ReservedNodeExchangeStatus {
+            reserved_node_exchange_request_id: Some(new_reserved_node_exchange_request_id()),
+            status: Some(RESERVED_NODE_EXCHANGE_STATUS_REQUESTED.to_string()),
+            request_time: Some(requested_at),
+            source_reserved_node_id: source.reserved_node_id.clone(),
+            source_reserved_node_type: source.node_type.clone(),
+            source_reserved_node_count: Some(node_count),
+            target_reserved_node_offering_id: target.reserved_node_offering_id.clone(),
+            target_reserved_node_type: target.node_type.clone(),
+            target_reserved_node_count: Some(node_count),
+        };
+        // Bounded by the SAME quota: one record per exchange, and every exchange
+        // took at least one node of the headroom the test above requires.
+        self.reserved_node_exchanges.push(StoredReservedNodeExchange {
+            status: status.clone(),
+            completed_at: started + RESERVED_NODE_EXCHANGE_SPAN,
+        });
+
+        Ok((exchanged, status))
     }
 
     /// How many reserved compute NODES the account holds in all, across every

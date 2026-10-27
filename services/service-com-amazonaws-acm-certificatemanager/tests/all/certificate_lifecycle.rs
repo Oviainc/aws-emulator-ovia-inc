@@ -1033,7 +1033,7 @@ async fn list_certificates_filters_sorts_and_pages_the_store() {
     for (member, expected) in [
         ("Status", json!("PENDING_VALIDATION")),
         ("Type", json!("AMAZON_ISSUED")),
-        ("KeyAlgorithm", json!("RSA_2048")),
+        ("KeyAlgorithm", json!("RSA-2048")),
         ("RenewalEligibility", json!("INELIGIBLE")),
         ("InUse", json!(false)),
         ("Exported", json!(false)),

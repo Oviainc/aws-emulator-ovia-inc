@@ -17,7 +17,10 @@
 //! label encoder every `@httpLabel` suite shares ([`percent_encoded`]), the
 //! readers the group assertions need, the two clock readings a timestamp
 //! assertion compares ([`epoch_seconds`], [`unix_seconds`]), the one channel
-//! a signal map's discovery is entered from ([`entry_point`]), the input
+//! a signal map's discovery is entered from ([`entry_point`]), the channel
+//! configuration every suite that creates a channel declares
+//! ([`channel_encoder_settings`], [`attachable_input`],
+//! [`resolved_channel_body`]), the input
 //! setup every suite that creates an input shares ([`input_security_group`],
 //! [`sdi_source`], [`claimed_device`], [`resolved_input_body`]) and the network
 //! setup every suite that maps a cluster onto one shares
@@ -387,7 +390,7 @@ pub async fn entry_point(router: &MultiServiceRouter, name: &str) -> String {
         router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": name })),
+        Some(json!({ "name": name, "encoderSettings": channel_encoder_settings() })),
     )
     .await;
     assert_eq!(
@@ -398,4 +401,125 @@ pub async fn entry_point(router: &MultiServiceRouter, name: &str) -> String {
         .as_str()
         .unwrap_or_default()
         .to_string()
+}
+
+/// The `EncoderSettings` a channel configuration has to declare, carrying the
+/// four members the shape requires (`smithy_query(query="shape",
+/// shape="EncoderSettings")`: AudioDescriptions, OutputGroups, TimecodeConfig,
+/// VideoDescriptions).
+///
+/// The setup every suite that creates a channel shares: a channel encodes
+/// through the encoder settings its configuration declares, so a create that
+/// declares none is refused — see
+/// `crate::channel_configuration_validation`, which is the suite ABOUT that
+/// rule.
+pub fn channel_encoder_settings() -> Value {
+    json!({
+        "audioDescriptions": [],
+        "outputGroups": [],
+        "timecodeConfig": { "source": "EMBEDDED" },
+        "videoDescriptions": [],
+    })
+}
+
+/// One input a channel can attach, answering its minted `Id`.
+///
+/// The setup every suite whose channel configuration carries an
+/// `InputAttachments` entry shares: an attachment's `InputId` has to name an
+/// input this account holds, so no suite has to invent an input id that nothing
+/// minted. `URL_PULL` is the type that needs no other resource in the account,
+/// just the redundant pair of source URLs every PULL-type input needs.
+pub async fn attachable_input(router: &MultiServiceRouter, name: &str) -> String {
+    let (status, created) = call(
+        router,
+        "POST",
+        "/prod/inputs",
+        Some(json!({
+            "name": name,
+            "type": "URL_PULL",
+            "sources": [
+                { "url": "https://example.com/a.m3u8" },
+                { "url": "https://example.com/b.m3u8" },
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "setup: expected CreateInput to answer 201, got {status}: {created}"
+    );
+    created["input"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The same `CreateChannel` body, as a channel configuration this service can
+/// run.
+///
+/// A channel configuration has to declare the encoder settings the channel
+/// encodes through, and every id it names has to resolve to a resource this
+/// account holds, so a suite's row says only what ITS rule is about and this
+/// helper supplies the rest — exactly as [`resolved_input_body`] does for an
+/// input's configuration: the encoder settings for a body that declares none,
+/// and one input behind every `inputId` spelling that names no input this
+/// account holds. Keyed by the spelling, so one spelling resolves to the SAME
+/// input however often a body repeats it, and a body that already names an
+/// input this account holds (or already declares its own encoder settings) is
+/// left exactly as it is.
+pub async fn resolved_channel_body(router: &MultiServiceRouter, body: Value) -> Value {
+    let mut body = body;
+    if body.get("encoderSettings").is_none() {
+        body["encoderSettings"] = channel_encoder_settings();
+    }
+    resolved_channel_attachments(router, body).await
+}
+
+/// The same body with every `inputAttachments` entry pointed at an input this
+/// account holds, and nothing else changed.
+///
+/// What [`resolved_channel_body`] does for a CREATE's references, for a PATCH
+/// that must name only the members its own rule is about: an `UpdateChannel`
+/// body goes through here, so adding the encoder settings a create has to
+/// declare does not turn a patch that names one member into one that names two.
+pub async fn resolved_channel_attachments(router: &MultiServiceRouter, body: Value) -> Value {
+    let mut body = body;
+    let Some(entries) = body
+        .get("inputAttachments")
+        .and_then(Value::as_array)
+        .cloned()
+    else {
+        return body;
+    };
+    let mut minted: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut resolved = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let mut entry = entry;
+        let spelled = entry
+            .get("inputId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !spelled.is_empty() && already_held(router, &format!("/prod/inputs/{spelled}")).await {
+            resolved.push(entry);
+            continue;
+        }
+        let id = match minted.get(&spelled) {
+            Some(id) => id.clone(),
+            None => {
+                let name = if spelled.is_empty() {
+                    "attachable"
+                } else {
+                    spelled.as_str()
+                };
+                let id = attachable_input(router, name).await;
+                minted.insert(spelled, id.clone());
+                id
+            }
+        };
+        entry["inputId"] = json!(id);
+        resolved.push(entry);
+    }
+    body["inputAttachments"] = Value::Array(resolved);
+    body
 }

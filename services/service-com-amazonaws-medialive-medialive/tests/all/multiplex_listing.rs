@@ -618,7 +618,10 @@ async fn a_multiplex_listing_reports_only_multiplexes() {
         &router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "not-a-multiplex" })),
+        Some(json!({
+            "name": "not-a-multiplex",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(

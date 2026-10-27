@@ -508,7 +508,10 @@ async fn a_group_delete_is_refused_while_a_signal_map_names_it() {
             REGION,
             "POST",
             "/prod/channels",
-            Some(json!({ "name": "entry" })),
+            Some(json!({
+                "name": "entry",
+                "encoderSettings": crate::support::channel_encoder_settings(),
+            })),
         )
         .await;
         assert_eq!(
