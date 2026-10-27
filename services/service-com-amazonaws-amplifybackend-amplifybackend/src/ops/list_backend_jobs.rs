@@ -338,12 +338,12 @@ fn decode_next_token(token: &str, app_id: &str, environment_name: &str) -> Optio
 ///
 /// `BadRequestException` ("An error returned if a request is not formed properly") is
 /// this operation's modelled client-input error; the message is built from the request so
-/// the caller can see what it addressed.
+/// the caller can see what it addressed, behind the service's fixed prefix like every
+/// other message it renders (`crate::state::bad_request`).
 fn unresolvable_next_token(environment_name: &str) -> ListBackendJobsError {
-    ListBackendJobsErrorModeled::BadRequestException(BadRequestException {
-        message: Some(format!(
-            "NextToken is not a pagination token this service issued for backend environment {environment_name}"
-        )),
-    })
+    ListBackendJobsErrorModeled::BadRequestException(crate::state::bad_request(format!(
+        "NextToken is not a pagination token this service issued for backend environment \
+         {environment_name}."
+    )))
     .into()
 }

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLoadBalancerMetricData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLoadBalancerMetricData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the load balancer metric series the store holds for the load balancer
+//! the request names, over the window and at the granularity the request asks
+//! for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLoadBalancerMetricData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting read: it looks up the load balancer in the Region the request is
+//! made in, refuses a request whose values cannot hold together, and reports the
+//! datapoints the store has for that metric — it writes nothing, so a later
+//! caller sees exactly what it would have seen had this call never happened.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +199,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLoadBalancerMetricData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLoadBalancerMetricDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Reporting only: the answer is read from the stored load balancer record
+        // and the observations the store holds for the metric, and the one write
+        // behind this call is the clock materialising transitions it already owed
+        // (see `crate::state::with_state`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLoadBalancerMetricData"))
+        // A load balancer belongs to the Region it was created in, so the one a
+        // name addresses is the one in the Region THIS request is signed for —
+        // exactly as it is for `GetLoadBalancer` and `GetLoadBalancers`. Nothing
+        // else this operation reports comes from the request metadata.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `loadBalancerName`, `metricName`, `period`, `startTime`, `endTime`,
+        // `unit` and `statistics` are modelled `@required` members; the name's
+        // pattern, the `MetricPeriod` range (60..=86400) and every enum this
+        // input reaches (`LoadBalancerMetricName`, `MetricUnit` and the
+        // `MetricStatistic` entries of `statistics`) are modelled constraints, so
+        // the centralized walk refused anything outside them before this body
+        // ran. What is left is what the model cannot express: the window has to
+        // be a window, the unit has to be the one the metric is published in, and
+        // the request has to ask for at least one statistic.
+
+        // "The start time of the period" / "The end time of the period": a period
+        // whose end does not follow its start is no period at all, so no window
+        // of it could be reported. The refusal is
+        // [`crate::state::inverted_window_refusal`], which names both bounds as
+        // the instants they are — this service answers that pair the same way
+        // wherever it takes one.
+        if let Some(message) =
+            crate::state::inverted_window_refusal(input.start_time, input.end_time)
+        {
+            return Err(invalid(message));
+        }
+
+        // `unit` is "The unit for the metric data request. Valid units depend on
+        // the metric data being requested. For the valid units with each
+        // available metric, see the metricName parameter" — and each load
+        // balancer metric's own entry states the ONE unit it is published in
+        // (`crate::state::load_balancer_metric_unit`). A request asking for a
+        // metric in a unit it is not published in names no series, so it is
+        // refused as the invalid input it is rather than answered as if the
+        // series existed.
+        let Some(published_unit) = crate::state::load_balancer_metric_unit(&input.metric_name)
+        else {
+            // Unreachable while the catalog covers the modelled
+            // `LoadBalancerMetricName` enum, which the boundary walk restricts
+            // `metricName` to. A metric the model gains and the catalog does not
+            // know yet has no published unit here, so it is honestly "not written
+            // yet" rather than refused or answered.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "GetLoadBalancerMetricData for the load balancer metric {}",
+                input.metric_name
+            )));
+        };
+        if input.unit != published_unit {
+            return Err(invalid(format!(
+                "unit '{}' is not a valid unit for the load balancer metric {}: its published \
+                 unit is {published_unit}",
+                input.unit, input.metric_name
+            )));
+        }
+
+        // `statistics` is "The statistic for the metric": a request that names
+        // none asks for no statistic of the metric, so there is nothing it could
+        // be answered with.
+        if input.statistics.is_empty() {
+            return Err(invalid(
+                "statistics must name at least one statistic of the metric to return".to_string(),
+            ));
+        }
+
+        let metric_name = input.metric_name;
+        let load_balancer_name = input.load_balancer_name;
+        crate::state::with_state(&*self.engine, |store| {
+            // Metrics are reported for a load balancer this account HOLDS in the
+            // Region the request is made in: a name no load balancer record of
+            // that Region answers to earns the service's `DoesNotExist` envelope,
+            // not an authoritative-looking empty series.
+            if store.load_balancer(&region, &load_balancer_name).is_none() {
+                return Err(not_found(&load_balancer_name));
+            }
+            Ok(GetLoadBalancerMetricDataOutput {
+                // "The name of the metric returned" — the metric whose series
+                // this answer is, which is the one the request named.
+                metric_name: Some(metric_name.clone()),
+                // The datapoints the store holds for that metric over the
+                // requested window: NONE, for every window and every load
+                // balancer.
+                //
+                // Every load balancer metric is a measurement of the TRAFFIC a
+                // load balancer carried — the requests it processed, the response
+                // codes it and its target instances generated, the TLS
+                // negotiations that failed, the connections it rejected, how long
+                // a target took to answer — or of the HEALTH CHECKS it ran against
+                // its targets, which is what the healthy and unhealthy host
+                // counts count
+                // (`GetLoadBalancerMetricDataRequest$metricName`). This emulator
+                // serves no request through a load balancer and runs no health
+                // check against a registered instance — which is why every
+                // registration stays in the modelled `initial` state, neither
+                // healthy nor unhealthy
+                // (`crate::state::INSTANCE_HEALTH_INITIAL`) — so no observation of
+                // either kind was ever made in any of the period windows the
+                // request spans, whatever its `period`.
+                //
+                // An empty `metricData` says exactly that, and is what the
+                // service itself answers for a window it holds no data for — a
+                // window before the load balancer existed, say. A
+                // plausible-looking number per window would be invented telemetry
+                // a client could not tell from a measured one, and would
+                // contradict the rest of this store, where every alarm stays
+                // `INSUFFICIENT_DATA` because no metric of it has data
+                // (`crate::state::ALARM_STATE_INSUFFICIENT_DATA`) and
+                // `GetInstanceMetricData`, `GetContainerServiceMetricData` and
+                // `GetDistributionMetricData` report the same empty series. The
+                // `statistics` the request asked for select members OF a
+                // datapoint, so with no datapoints they have nothing to fill.
+                metric_data: Some(Vec::new()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the rule it broke.
+fn invalid(message: String) -> GetLoadBalancerMetricDataError {
+    GetLoadBalancerMetricDataErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No load balancer of that name is stored in that Region: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the requested
+/// name. The Region scopes the LOOKUP, but it is not part of the message: the
+/// identifier the message names is the one the request carried.
+fn not_found(name: &str) -> GetLoadBalancerMetricDataError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetLoadBalancerMetricDataError {
+    GetLoadBalancerMetricDataErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail load balancer store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

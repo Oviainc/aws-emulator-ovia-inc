@@ -312,6 +312,9 @@ fn token_rejected(rejection: crate::state::TokenRejection) -> DeleteUserAttribut
     match rejection {
         crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
         crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::MissingRequiredScopes => {
+            not_authorized(crate::state::MISSING_REQUIRED_SCOPES_MESSAGE)
+        }
         crate::state::TokenRejection::PoolGone => {
             DeleteUserAttributesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 // The caller named no pool — the token did — so this message
