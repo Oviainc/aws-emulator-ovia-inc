@@ -21,13 +21,14 @@
 //!
 //! The second is this account's own registry WRITERS — `RegisterType` and `ActivateType`
 //! (which add an extension version), `SetTypeConfiguration` (`ConfigurationSchema`),
-//! `SetTypeDefaultVersion` (`DefaultVersionId`), `DeprecateType`/`DeregisterType`
-//! (`DeprecatedStatus`), `DeactivateType` (which deactivates an activation, see
+//! `SetTypeDefaultVersion` (`DefaultVersionId`), `DeregisterType` (`DeprecatedStatus`, see
+//! [`StoredTypeVersion::deprecate`] and [`StoredExtension::deprecate_every_version`]),
+//! `DeactivateType` (which deactivates an activation, see
 //! [`StoredExtension::deactivate`]), `TestType` (`TypeTestsStatus`) and `PublishType` (which
 //! publishes one version of a private record as the PUBLIC extension record
 //! [`published_record`] is).
-//! `TestType`, `PublishType` and `DeactivateType` are implemented; the others are still
-//! scaffold stubs with
+//! `TestType`, `PublishType`, `DeactivateType` and `DeregisterType` are implemented; the
+//! others are still scaffold stubs with
 //! their own issues, so the only record `src/` adds to this registry is a publication's
 //! public one. A publication adds at most one RECORD per private record it publishes, and
 //! the versions it then adds to that record are bounded at [`MAX_PUBLISHED_VERSIONS`],
@@ -346,6 +347,18 @@ impl StoredTypeVersion {
         });
     }
 
+    /// Whether this version is still in ACTIVE USE: `LIVE`, "the extension is activated or
+    /// registered and can be used in CloudFormation operations" — as opposed to `DEPRECATED`,
+    /// which "can no longer be used".
+    pub fn is_live(&self) -> bool {
+        self.deprecated_status == deprecated_status::LIVE
+    }
+
+    /// Mark this version `DEPRECATED`, "removing it from active use".
+    pub fn deprecate(&mut self) {
+        self.deprecated_status = deprecated_status::DEPRECATED.to_string();
+    }
+
     /// Materialise the contract-test conclusion the clock has already made due, if any.
     pub fn settle(&mut self, now: SystemTime) {
         if self
@@ -527,9 +540,36 @@ impl StoredExtension {
         self.is_activated = Some(false);
         self.auto_update = Some(false);
         self.configuration_schema = None;
+        self.deprecate_every_version();
+    }
+
+    /// Mark every version of this extension `DEPRECATED`: what the extension ITSELF being
+    /// "marked as deprecated in the registry" is, since a deprecation status is carried per
+    /// version and a record with no version left in active use is one nothing can be used
+    /// from.
+    ///
+    /// The record itself stays in the registry, deprecated rather than dropped, so a later
+    /// read still reports what this account and Region hold for the extension — "to view the
+    /// deprecation status of an extension or extension version, use DescribeType".
+    pub fn deprecate_every_version(&mut self) {
         for version in &mut self.versions {
-            version.deprecated_status = deprecated_status::DEPRECATED.to_string();
+            version.deprecate();
         }
+    }
+
+    /// The versions of this extension that are still in ACTIVE USE, in the order the record
+    /// carries them.
+    pub fn live_versions(&self) -> impl Iterator<Item = &StoredTypeVersion> {
+        self.versions.iter().filter(|version| version.is_live())
+    }
+
+    /// Whether this extension is still in ACTIVE USE: it holds at least one `LIVE` version.
+    ///
+    /// A record every version of which is `DEPRECATED` is a deregistered or deactivated
+    /// extension: "deprecated extensions or extension versions cannot be used in
+    /// CloudFormation operations".
+    pub fn is_live(&self) -> bool {
+        self.live_versions().next().is_some()
     }
 
     /// The version with this `TypeVersionId`, if the registry holds it.

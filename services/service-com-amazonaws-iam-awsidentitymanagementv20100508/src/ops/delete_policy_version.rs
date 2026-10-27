@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePolicyVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePolicyVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePolicyVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE version from a managed policy the ACCOUNT holds, leaving every other
+//! version of that policy, and the policy itself, exactly as they were. The operative
+//! (default) version is not removable this way — it goes with the policy — so a request
+//! naming it is refused as a delete of a resource that still has a subordinate entity.
+//! Every other refusal is the modelled one for what the request got wrong: the shape of
+//! the `PolicyArn`, the ownership of the policy it names, the absence of that policy, or
+//! the absence of the version asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +175,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePolicyVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePolicyVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePolicyVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeletePolicyVersionErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `arnType` constrains only the length, so a value that is not a
+        // managed-policy ARN at all is an "invalid … value … supplied for an input
+        // parameter" — a different refusal from an ARN naming a policy that is not
+        // held. The form is checked through the one definition of the ARN grammar this
+        // crate holds, the same one every operation taking a `PolicyArn` reads one with.
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            return Err(DeletePolicyVersionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!("ARN {} is not valid.", input.policy_arn)),
+                },
+            )
+            .into());
+        }
+
+        // This operation changes a managed policy the ACCOUNT holds: an ARN in AWS's own
+        // managed-policy namespace names a policy AWS owns and an account cannot change,
+        // so such an ARN is an out-of-range value for this parameter rather than a
+        // missing entity — the same rule, and the same refusal, `CreatePolicyVersion`
+        // and `TagPolicy` apply to a change of an AWS-owned policy. The refusal does not
+        // depend on whether this emulator's catalog carries that entry, because no entry
+        // of it could lose a version either.
+        if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
+            return Err(DeletePolicyVersionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Policy {} is an AWS managed policy, which cannot be modified.",
+                        input.policy_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any version is removed, and before the STORE is consulted for
+        // the policy — so a caller that may not delete a version of a policy learns that
+        // it may not, never whether the account holds that policy. (The refusals above
+        // are about the ARN the request itself supplied, which the caller already knows.)
+        // The decision is made on the ARN the request addresses, while the refusal NAMES
+        // the entity that ARN identifies.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_POLICY_VERSION,
+            &input.policy_arn,
+            &format!("policy {}", input.policy_arn),
+        )?;
+
+        // The delete is addressed exactly as a read of the same ARN is, so it reaches the
+        // one record `GetPolicy` reports; an ARN the account holds no policy under
+        // "referenced a resource entity that does not exist", through the one wording
+        // `crate::state` holds for a missing managed policy, which every operation taking
+        // a `PolicyArn` answers with.
+        let Some(held) = store.policy_by_arn_mut(&input.policy_arn) else {
+            return Err(DeletePolicyVersionErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
+                },
+            )
+            .into());
+        };
+
+        // "Policy version identifiers always begin with v (always lowercase)"
+        // (`PolicyVersion$VersionId`), and the version map is keyed by exactly that
+        // identifier: a version the policy does not carry "referenced a resource entity
+        // that does not exist", worded through the one spelling this crate holds for a
+        // policy version a request cannot be served from — the same one
+        // `GetPolicyVersion` answers a read of a missing version with.
+        if !held.versions.contains_key(&input.version_id) {
+            return Err(DeletePolicyVersionErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(crate::state::policy_version_not_found(
+                        &input.policy_arn,
+                        &input.version_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "You cannot delete the default version from a policy using this operation. To
+        // delete the default version from a policy, use DeletePolicy": the operative
+        // version is the policy's own, so a request naming it is refused rather than
+        // leaving the policy with no version in effect. The default is read from the
+        // policy record every reader publishes it from (`Policy$DefaultVersionId`), so
+        // this refusal and that report can never disagree.
+        if held.policy.default_version_id.as_deref() == Some(input.version_id.as_str()) {
+            return Err(DeletePolicyVersionErrorModeled::DeleteConflictException(
+                DeleteConflictException {
+                    message: Some("Cannot delete the default version of a policy.".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The version is one entry of the policy's version map, so removing it leaves the
+        // policy, its tags and its other versions untouched, and every read of that
+        // version afterwards reports no such entity. What the policy's NEXT version is
+        // numbered stays the one rule `ManagedPolicy::next_version_id` holds — one past
+        // the greatest number still held. `Policy$UpdateDate` is "the date and time when
+        // the most recent policy version was created", so a delete, which creates no
+        // version, leaves it where it stands.
+        held.versions.remove(&input.version_id);
+
+        // Audit record for the change: the acting principal, the operation and what it
+        // removed from which policy, so a state-changing call leaves a local record — the
+        // same shape `CreatePolicyVersion` and `UntagPolicy` emit in this crate. The
+        // document itself is not recorded, only the version it belonged to.
+        ::tracing::info!(
+            audit = true,
+            operation = "DeletePolicyVersion",
+            outcome = "deleted",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            policy_arn = %input.policy_arn,
+            version_id = %input.version_id,
+            "a version was removed from a managed policy"
+        );
+
+        // The modelled output carries no members: a successful delete reports only that
+        // the version is gone, which the readers of the policy then show.
+        Ok(DeletePolicyVersionOutput)
     }
 }

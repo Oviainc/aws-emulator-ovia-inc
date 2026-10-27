@@ -457,6 +457,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match store.resolve_mut(&request_region, &stack_id) {
                 None => None,
                 Some(stack) => {
+                    // A resource whose owning service has not reported it ready yet holds
+                    // this operation open ([`crate::state::stabilising`]), which is what
+                    // withholds the transition that would report the resource created.
+                    stack.record_stabilisations(
+                        &materialised.stabilising,
+                        ::std::time::SystemTime::now(),
+                    );
                     // The resources' own transitions come BEFORE the stack's terminal
                     // event: the event stream is what the execution did, in order.
                     stack.schedule_resource_events(&materialised.transitions);

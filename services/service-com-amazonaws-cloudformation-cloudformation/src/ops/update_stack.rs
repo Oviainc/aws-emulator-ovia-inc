@@ -804,6 +804,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(stack) = store.resolve_mut(&request_region, &stack_id) else {
                 return Ok(output);
             };
+            // A resource whose owning service has not reported it ready yet holds this
+            // operation open ([`crate::state::stabilising`]), which is what withholds the
+            // transition that would report the resource created.
+            stack.record_stabilisations(&materialised.stabilising, ::std::time::SystemTime::now());
             // The resources' own transitions come BEFORE the stack's terminal event: the
             // event stream is what the update did, in the order it did it.
             stack.schedule_resource_events(&materialised.transitions);

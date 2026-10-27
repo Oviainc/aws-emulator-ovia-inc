@@ -1045,6 +1045,48 @@ pub fn find_notification_mut<'a>(
         .find(|held| same_notification(&held.notification, wanted))
 }
 
+/// The sentence refusing a notification a budget already holds, naming the budget it
+/// would have belonged to.
+///
+/// One rule is being refused — a budget holds at most one notification per identity
+/// ([`same_notification`]) — so every write that ATTACHES a notification words the
+/// refusal from here, whether the notification arrives on its own
+/// (`CreateNotification`) or in the set a `CreateBudget` attaches with the budget. The
+/// notification itself is not named: its identity is four members a caller supplied in
+/// the very request being refused.
+pub fn duplicate_notification_refusal(budget_name: &str) -> String {
+    format!("Unable to create notification: {budget_name} - the notification already exists.")
+}
+
+/// Whether the set of notifications ONE call would attach leaves a budget that already
+/// holds `already_held` of them holding two notifications of one identity.
+///
+/// A notification's identity is what it alerts on ([`same_notification`]) and every
+/// operation that acts on one names it by value, resolving the FIRST match
+/// ([`find_notification`]) — so a budget holding a second notification of one identity
+/// holds it where no later read, update or delete could reach it, and a delete of "the"
+/// notification would leave a copy behind. A write that attaches a whole SET is
+/// therefore held to the rule the single-notification path enforces, over what the
+/// budget would END UP holding: the attached set is checked against the notifications
+/// the budget already holds AND against its own earlier entries, so one call cannot
+/// establish the state a second call is refused for.
+pub fn attaches_duplicate_notification(
+    already_held: &[StoredNotification],
+    attaching: &[NotificationWithSubscribers],
+) -> bool {
+    let mut set: Vec<&Notification> = already_held.iter().map(|held| &held.notification).collect();
+    for supplied in attaching {
+        if set
+            .iter()
+            .any(|held| same_notification(held, &supplied.notification))
+        {
+            return true;
+        }
+        set.push(&supplied.notification);
+    }
+    false
+}
+
 /// Whether `left` and `right` name the SAME subscriber of a notification.
 ///
 /// A subscriber carries no id either: every operation that acts on one

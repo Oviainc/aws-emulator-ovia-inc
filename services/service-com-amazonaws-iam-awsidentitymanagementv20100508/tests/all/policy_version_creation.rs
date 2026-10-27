@@ -23,7 +23,7 @@
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::user_lifecycle::{account_id, call, element, elements, error_code, router, router_with_engine};
+use crate::user_lifecycle::{account_id, call, element, elements, error_code, router};
 
 /// A trust policy every fixture `CreateRole` sends.
 const TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
@@ -298,13 +298,12 @@ async fn each_create_adds_the_next_version_carrying_the_document_it_was_given() 
 /// a policy whose version numbers are not contiguous still numbers its next version
 /// after all of them rather than after however many it happens to carry.
 ///
-/// The gap is made the way AWS's own is: versions a policy carried are removed, which is
-/// what `DeletePolicyVersion` will do once it is implemented (it is still a scaffolded
-/// 501 with its own stub issue), so the fixture takes them out of the service's OWN
-/// store rather than keeping a second copy.
+/// The gap is made the way AWS's own is: versions the policy carried are removed through
+/// `DeletePolicyVersion`, so the fixture arranges the sparse numbering exactly as a
+/// client would.
 #[tokio::test]
 async fn the_next_version_is_numbered_past_the_greatest_the_policy_holds() {
-    let (router, engine) = router_with_engine();
+    let router = router();
     let policy_name = "SparselyVersioned";
     let arn = create_policy(&router, policy_name, "/").await;
     for document in DOCUMENTS {
@@ -322,19 +321,19 @@ async fn the_next_version_is_numbered_past_the_greatest_the_policy_holds() {
     );
 
     // Everything between the first and the last version goes away, leaving `v1` and
-    // `v5` held and three numbers unused.
-    {
-        let store = state::service_state(&*engine).expect("the IAM store");
-        let mut store = store.lock();
-        let held = store
-            .policies
-            .get_mut(&state::name_key(policy_name))
-            .expect("the created policy");
-        for version_id in ["v2", "v3", "v4"] {
-            held.versions
-                .remove(version_id)
-                .unwrap_or_else(|| panic!("the fixture version {version_id:?} must be held"));
-        }
+    // `v5` held and three numbers unused. Each of them is non-default (every fixture
+    // create asked not to become the operative version), so each delete must succeed.
+    for version_id in ["v2", "v3", "v4"] {
+        let (status, body) = call(
+            &router,
+            "DeletePolicyVersion",
+            &[("PolicyArn", &arn), ("VersionId", version_id)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "the fixture delete of {version_id:?} must succeed, got {status}: {body}"
+        );
     }
 
     // Rows: the first create after the gap, and the one after that, so the numbering is
