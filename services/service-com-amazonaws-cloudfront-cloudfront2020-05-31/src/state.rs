@@ -4374,6 +4374,20 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         self.connection_groups.contains_key(id)
     }
 
+    /// Whether any distribution tenant this store holds is routed through the connection
+    /// group `id`.
+    ///
+    /// A connection group is "what a distribution tenant's viewers are routed through", and
+    /// the attachment lives on the tenant as its `ConnectionGroupId`, so the question is
+    /// answered against the STORED tenants rather than against any request — the way
+    /// [`Self::key_value_store_is_associated`] answers the same question for the other
+    /// attachment this store holds. It is what decides whether a group may be deleted.
+    pub fn connection_group_is_associated(&self, id: &str) -> bool {
+        self.distribution_tenants
+            .values()
+            .any(|tenant| tenant.connection_group_id == id)
+    }
+
     /// The first of `domains` this service has no proof the account controls, or `None`
     /// when every one of them is proven.
     ///
@@ -9021,6 +9035,25 @@ pub const CONNECTION_GROUP_NOT_FOUND_MESSAGE: &str =
 pub fn connection_group_not_found() -> EntityNotFound {
     EntityNotFound {
         message: Some(CONNECTION_GROUP_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// `ResourceNotDisabled`'s message, as the model documents the shape: "The specified
+/// CloudFront resource hasn't been disabled yet."
+pub const RESOURCE_NOT_DISABLED_MESSAGE: &str =
+    "The specified CloudFront resource hasn't been disabled yet.";
+
+/// The modelled `ResourceNotDisabled` (HTTP 409) for a delete of a resource that is still
+/// enabled.
+///
+/// FIXED service text ([`RESOURCE_NOT_DISABLED_MESSAGE`]), for the reason
+/// [`entity_in_use`]'s is fixed: what the refusal states is a property of the CONDITION —
+/// the resource has not been disabled — rather than of the request, so nothing from the
+/// request or from the store belongs in the sentence and every delete this condition
+/// refuses reads the same.
+pub fn resource_not_disabled() -> crate::ops::types::ResourceNotDisabled {
+    crate::ops::types::ResourceNotDisabled {
+        message: Some(RESOURCE_NOT_DISABLED_MESSAGE.to_string()),
     }
 }
 

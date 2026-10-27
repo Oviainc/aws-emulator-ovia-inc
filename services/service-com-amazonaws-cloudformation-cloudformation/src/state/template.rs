@@ -5405,8 +5405,12 @@ fn intrinsic(
 ) -> Option<Resolved> {
     match name {
         // "The intrinsic function Ref returns the value of the specified parameter or
-        // resource."
-        "Ref" => reference(argument.as_str()?, scope),
+        // resource." The argument NAMES that parameter or resource, and the name may be
+        // spelled by an expression rather than written out — the same reading
+        // [`attribute`] gives `Fn::GetAtt`'s first argument — so it is evaluated to the
+        // name first and then dereferenced. A plain string evaluates to itself, so the
+        // written-out form is unchanged.
+        "Ref" => reference(&text(argument, scope, depth + 1, budget)?, scope),
         // "The Fn::GetAtt intrinsic function returns the value of an attribute from a
         // resource in the template": [logicalNameOfResource, attributeName], or the
         // short form's dotted string.
