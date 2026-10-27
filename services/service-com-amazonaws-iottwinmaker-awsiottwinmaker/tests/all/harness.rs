@@ -591,6 +591,39 @@ impl Emulator {
         .await
     }
 
+    /// `ListSyncResources`: POST
+    /// /workspaces/{workspaceId}/sync-jobs/{syncSource}/resources-list, with the
+    /// workspace and the sync source as `@httpLabel`s and `filters` and the page
+    /// members (`maxResults`, `nextToken`) carried in the body.
+    pub(crate) async fn list_sync_resources(
+        &self,
+        workspace_id: &str,
+        sync_source: &str,
+        body: Value,
+    ) -> Resp {
+        self.list_sync_resources_signed_for(Some(REGION), workspace_id, sync_source, body)
+            .await
+    }
+
+    /// `ListSyncResources` signed for `region`, the seam a case about Region
+    /// scoping drives; [`Emulator::list_sync_resources`] is this with the
+    /// suite-wide [`REGION`].
+    pub(crate) async fn list_sync_resources_signed_for(
+        &self,
+        region: Option<&str>,
+        workspace_id: &str,
+        sync_source: &str,
+        body: Value,
+    ) -> Resp {
+        self.call_signed_for(
+            region,
+            "POST",
+            &format!("/workspaces/{workspace_id}/sync-jobs/{sync_source}/resources-list"),
+            Some(body),
+        )
+        .await
+    }
+
     /// `TagResource`: POST /tags with the ARN and the tag map in the body.
     pub(crate) async fn tag_resource(&self, resource_arn: &str, tags: Value) -> Resp {
         self.call(

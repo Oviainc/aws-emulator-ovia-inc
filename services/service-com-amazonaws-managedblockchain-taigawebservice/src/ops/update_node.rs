@@ -183,16 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `UpdateNodeInput$MemberId` is "The unique identifier of the member that owns
         // the node. Applies only to Hyperledger Fabric" — and, unlike
         // `GetNodeInput$MemberId`, `ListNodesInput$MemberId` and `DeleteNodeInput$MemberId`,
-        // it does NOT carry "and is required for Hyperledger Fabric". So a member named
-        // here only SCOPES the lookup: a node the named member does not own is not found
-        // under it, exactly as an unknown node id is not, while a request that names no
-        // member addresses the node by network and node id alone.
-        let found = network.node_mut(&region, &input.node_id).filter(|node| {
-            input
-                .member_id
-                .as_deref()
-                .is_none_or(|member_id| node.member_id.as_deref() == Some(member_id))
-        });
+        // it does NOT carry "and is required for Hyperledger Fabric". So this operation
+        // makes no member-required refusal at all; a member named here only SCOPES the
+        // lookup, through `crate::state`'s one scoped node lookup (to write, here): a node
+        // the named member does not own is not found under it, exactly as an unknown node
+        // id is not, while a request that names no member addresses the node by network and
+        // node id alone.
+        let found = network.scoped_node_mut(&region, &input.node_id, input.member_id.as_deref());
         let Some(node) = found else {
             return Err(UpdateNodeErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_NODE, &input.node_id),

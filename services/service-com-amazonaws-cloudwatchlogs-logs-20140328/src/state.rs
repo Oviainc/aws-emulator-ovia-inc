@@ -501,11 +501,21 @@ pub const RETENTION_IN_DAYS_VALUES: [i32; 22] = [
     3288, 3653,
 ];
 
-/// AWS's documented subscription-filter quota, from `PutSubscriptionFilter`: "Each log
-/// group can have up to two subscription filters associated with it." A put naming a
-/// filter the group already holds is an update of that filter, so it does not count
-/// against this.
-pub const MAX_SUBSCRIPTION_FILTERS_PER_GROUP: usize = 2;
+/// The subscription filters one log group can have ATTACHED at any one time. The
+/// operation's own documentation still says "Each log group can have up to two
+/// subscription filters associated with it", but the service accepts five attached
+/// filters on one log group and refuses the one after that, so the quota is five.
+///
+/// It counts the filters a group HOLDS, not the puts made against it: a put naming a
+/// filter the group already holds is an update of that filter, and deleting one frees its
+/// slot for the next put.
+pub const MAX_SUBSCRIPTION_FILTERS_PER_GROUP: usize = 5;
+
+/// The refusal CloudWatch Logs answers a `PutSubscriptionFilter` that would take a log
+/// group past the subscription filters it can hold
+/// ([`MAX_SUBSCRIPTION_FILTERS_PER_GROUP`]). The text is FIXED — it names neither the
+/// quota nor anything from the request — so every such refusal reads identically.
+pub const SUBSCRIPTION_FILTER_LIMIT_EXCEEDED: &str = "Resource limit exceeded.";
 
 /// The destinations `PutSubscriptionFilter` documents as supported, as the service
 /// segment of the `destinationArn` naming each: "An Amazon Kinesis stream", "A logical
@@ -3111,6 +3121,71 @@ pub fn access_policy_grants_organization(document: &str) -> bool {
         }
     }
     false
+}
+
+/// The refusal CloudWatch Logs answers an `accessPolicy` its IAM policy parser will not
+/// take: a document that is not an IAM policy document at all, and one whose statements do
+/// not identify the principals they grant to. The text is FIXED — it carries nothing from
+/// the request — so every such refusal reads identically.
+pub const ACCESS_POLICY_PARSE_FAILED: &str =
+    "Error occurred while parsing accessPolicy. Please check if the accessPolicy has been \
+     constructed correctly using IAM grammar.";
+
+/// The principal value that names EVERY principal rather than one: the IAM wildcard.
+const WILDCARD_PRINCIPAL: &str = "*";
+
+/// Whether an access policy ALLOWS every principal — a statement that allows the wildcard
+/// principal and narrows it with no condition.
+///
+/// An access policy "authorizes cross-account users to deliver their log events to the
+/// associated destination", so its statements have to identify who is authorized: either a
+/// concrete principal, or the wildcard narrowed by a condition, which is how a grant to an
+/// organization names its members (`PutDestinationPolicy$forceUpdate`, the
+/// [`ORGANIZATION_PRINCIPAL_CONDITION_KEY`] form). A statement allowing the wildcard with
+/// no condition at all identifies nobody, and the document is refused.
+///
+/// `Principal` is read in both of its IAM forms — the bare string and the map from
+/// principal type to one value or a list of them — and only an `Allow` statement is
+/// examined, since a `Deny` over the wildcard restricts rather than grants. A document
+/// that is not JSON allows nothing: the handler refuses it before asking.
+pub fn access_policy_allows_every_principal(document: &str) -> bool {
+    let Ok(serde_json::Value::Object(members)) =
+        serde_json::from_str::<serde_json::Value>(document)
+    else {
+        return false;
+    };
+    // "Statement" carries either one statement or a list of them.
+    let statements: Vec<&serde_json::Value> = match members.get("Statement") {
+        Some(serde_json::Value::Array(items)) => items.iter().collect(),
+        Some(statement) => vec![statement],
+        None => Vec::new(),
+    };
+    statements.into_iter().any(|statement| {
+        let allows = statement
+            .get("Effect")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|effect| effect.eq_ignore_ascii_case("Allow"));
+        let narrowed = statement
+            .get("Condition")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|condition| !condition.is_empty());
+        allows && !narrowed && names_wildcard_principal(statement.get("Principal"))
+    })
+}
+
+/// Whether a statement's `Principal` is the wildcard, in either of the forms IAM writes it:
+/// the bare string, or a map from principal type to the wildcard (alone or among a list).
+fn names_wildcard_principal(principal: Option<&serde_json::Value>) -> bool {
+    let is_wildcard =
+        |value: &serde_json::Value| value.as_str() == Some(WILDCARD_PRINCIPAL);
+    match principal {
+        Some(serde_json::Value::Object(by_type)) => by_type.values().any(|named| match named {
+            serde_json::Value::Array(items) => items.iter().any(is_wildcard),
+            value => is_wildcard(value),
+        }),
+        Some(value) => is_wildcard(value),
+        None => false,
+    }
 }
 
 /// The refusal CloudWatch Logs answers a `PutDestinationPolicy` that would replace a
@@ -6339,40 +6414,31 @@ fn arn_parts(arn: &str) -> Option<(&str, &str, &str, &str)> {
     ))
 }
 
-/// The destination vendor CloudWatch Logs delivers to without assuming a role: a Lambda
-/// function is invoked directly, which is why `PutSubscriptionFilter` documents the
-/// `iam:PassRole` requirement for "any destination except a Lambda function".
-pub const SELF_DELIVERED_DESTINATION_VENDOR: &str = "lambda";
+/// The vendors of a `destinationArn` CloudWatch Logs delivers to by ASSUMING the role
+/// `roleArn` names, so a subscription against one of them cannot be configured without
+/// that role: a stream of one of the two streaming services named as direct destinations
+/// ("An Amazon Kinesis stream belonging to the same account as the subscription filter",
+/// "A Kinesis Data Firehose delivery stream belonging to the same account").
+///
+/// The other two destination kinds carry their own authorisation, so neither needs
+/// `roleArn`: a Lambda function is invoked directly, which is why the operation documents
+/// the `iam:PassRole` requirement for "any destination except a Lambda function", and a
+/// logical destination created with `PutDestination` was given the role it delivers
+/// through when it was created (`roleArn`: "You don't need to provide the ARN when you are
+/// working with a logical destination for cross-account delivery").
+pub const ROLE_ASSUMED_DESTINATION_VENDORS: [&str; 2] = ["kinesis", "firehose"];
 
 /// The vendor of a `destinationArn` whose delivery needs the role `roleArn` names, or
 /// `None` when the filter can be configured without one.
 ///
-/// "To perform a PutSubscriptionFilter operation for any destination except a Lambda
-/// function, you must also have the iam:PassRole permission": every vendor but Lambda is
-/// delivered to through a role CloudWatch Logs assumes. The exception is a logical
-/// destination owned by ANOTHER account, where the destination's own policy authorises
-/// the delivery (`roleArn`: "You don't need to provide the ARN when you are working with
-/// a logical destination for cross-account delivery").
-///
-/// A vendor this operation delivers to nothing in ([`SUBSCRIPTION_DESTINATIONS`]) needs
-/// no role either: there is no delivery to authorise, and such a `destinationArn` is
-/// refused for the resource it names instead.
+/// Only the vendors in [`ROLE_ASSUMED_DESTINATION_VENDORS`] need one. A vendor this
+/// operation delivers to nothing in needs no role either: there is no delivery to
+/// authorise, and such a `destinationArn` is refused for the resource it names instead.
 pub fn subscription_role_required_vendor(arn: &str) -> Option<&str> {
-    let (_partition, vendor, account, resource) = arn_parts(arn)?;
-    if vendor == SELF_DELIVERED_DESTINATION_VENDOR
-        || !SUBSCRIPTION_DESTINATIONS
-            .iter()
-            .any(|(name, _)| vendor == *name)
-    {
-        return None;
-    }
-    let cross_account_logical_destination = vendor == "logs"
-        && resource.starts_with("destination:")
-        && account != ::engine::emulator_account_id();
-    if cross_account_logical_destination {
-        return None;
-    }
-    Some(vendor)
+    let (_partition, vendor, _account, _resource) = arn_parts(arn)?;
+    ROLE_ASSUMED_DESTINATION_VENDORS
+        .contains(&vendor)
+        .then_some(vendor)
 }
 
 /// Whether an ARN names a CloudWatch Logs log group — the only resource type a resource

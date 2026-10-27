@@ -75,6 +75,8 @@ mod resource_tagging;
 mod resource_untagging;
 #[path = "all/response_members.rs"]
 mod response_members;
+#[path = "all/shared_pagination_rules.rs"]
+mod shared_pagination_rules;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/supplied_tag_validation.rs"]

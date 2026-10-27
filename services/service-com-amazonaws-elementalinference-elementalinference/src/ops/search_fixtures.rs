@@ -357,13 +357,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Err(rejection) => return Err(validation(rejection.message().to_string())),
             },
         };
-        // `maxResults` is modelled with range 1..100, so the boundary has already
-        // refused anything outside it; the clamp is the server-side bound that does
-        // not depend on that.
-        let page_size = input
-            .max_results
-            .map_or(DEFAULT_MAX_RESULTS, |max| max.max(1) as usize)
-            .clamp(1, MAX_PAGE_SIZE);
+        // The page-size rule itself lives in `crate::state`, shared by every paginated
+        // operation of this service; this operation contributes only its own default
+        // and ceiling.
+        let page_size = crate::state::resolve_page_size(
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            MAX_PAGE_SIZE,
+        );
 
         let state = state.lock();
         // The held fixtures of this sport scheduled on a day of the window, in

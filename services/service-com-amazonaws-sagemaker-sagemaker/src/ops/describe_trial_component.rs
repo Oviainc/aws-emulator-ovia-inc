@@ -173,7 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Never a 200 with empty members: a caller cannot tell that from a component
             // that exists and carries nothing.
             DescribeTrialComponentErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Could not find trial component \"{identifier}\".")),
+                message: Some(crate::state::could_not_find(
+                    crate::state::TRIAL_COMPONENT_KIND_LABEL,
+                    identifier,
+                )),
             })
             .into()
         };

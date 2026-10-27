@@ -11,7 +11,8 @@
 //! * `CapacityForecast` is the whole capacity that holds every target tracking
 //!   configuration of the instruction at its target under that load;
 //! * `ScheduledActionMinCapacity` is "the larger of two values: the capacity forecast or
-//!   the minimum capacity in the scaling instruction";
+//!   the minimum capacity in the scaling instruction", held inside the band that scheduled
+//!   scaling action provisions in;
 //! * `ScheduledActionMaxCapacity` follows the instruction's
 //!   `PredictiveScalingMaxCapacityBehavior` and `PredictiveScalingMaxCapacityBuffer`;
 //!
@@ -260,6 +261,16 @@ impl Case {
             value["PredictiveScalingMode"] = json!(mode);
         }
         value
+    }
+
+    /// The minimum capacity of a scheduled scaling action of this instruction, given the
+    /// capacity forecast of one interval: "the larger of two values: the capacity forecast
+    /// or the minimum capacity in the scaling instruction", inside the band that action
+    /// provisions in — so never above the maximum capacity the same action may reach.
+    fn scheduled_action_min_capacity(&self, capacity_forecast: f64) -> f64 {
+        capacity_forecast
+            .max(self.min_capacity as f64)
+            .min(self.scheduled_action_max_capacity(capacity_forecast))
     }
 
     /// The maximum capacity a scheduled scaling action of this instruction may reach,
@@ -531,7 +542,7 @@ async fn the_four_forecast_data_types_are_computed_from_the_stored_instruction()
                 continue;
             }
             // "the larger of two values: the capacity forecast or the minimum capacity in
-            // the scaling instruction"
+            // the scaling instruction", inside the band the scheduled action provisions in
             let (min_at, min_value) = scheduled_min[index];
             assert_eq!(
                 min_at, *at,
@@ -539,7 +550,7 @@ async fn the_four_forecast_data_types_are_computed_from_the_stored_instruction()
             );
             assert_close(
                 min_value,
-                capacity_value.max(case.min_capacity as f64),
+                case.scheduled_action_min_capacity(capacity_value),
                 &format!("{at_case} / ScheduledActionMinCapacity"),
             );
 
@@ -604,7 +615,7 @@ async fn the_minimum_capacity_of_the_instruction_floors_the_scheduled_action_min
             let (_, min_value) = scheduled_min[index];
             assert_close(
                 min_value,
-                capacity_value.max(min_capacity as f64),
+                case.scheduled_action_min_capacity(*capacity_value),
                 &format!("{label:?} at {at}"),
             );
             if min_value > *capacity_value {

@@ -1998,6 +1998,39 @@ pub fn page_criteria(fields: &[&str]) -> String {
     canonical
 }
 
+/// The criteria a `nextToken` of a listing that enumerates ONE Region's records
+/// binds: the operation that issued the token and the Region the request was signed
+/// for.
+///
+/// Stated here once, beside the codec that encodes and decodes the token, so every
+/// region-scoped listing of this service binds the same two fields: the service is
+/// regional, so another Region's endpoint reports another set of records and a token
+/// issued by one does not continue a listing of the other. `operation` is the listing's
+/// own name, which is what keeps one listing's token from continuing another's.
+pub fn region_page_criteria(operation: &str, region: &str) -> String {
+    page_criteria(&[operation, region])
+}
+
+/// How many records one page of a paginated operation carries, resolved from what the
+/// request asked for.
+///
+/// The rule every paginated operation of this service follows, stated once: a request
+/// that names `maxResults` is answered with that many records, one that names none with
+/// the operation's own `default`, and neither fewer than one record nor more than
+/// `ceiling`. `default` and `ceiling` are the per-operation constants — the page size
+/// the operation's model documents for a request that omits `maxResults`, and the
+/// `@range` maximum the model gives that member — so each listing keeps its own values
+/// while the resolution is written here.
+///
+/// The floor and the ceiling do not depend on the boundary having refused an out-of-range
+/// `maxResults`: they are the server-side bound, so no page can exceed `ceiling` records
+/// however the request was built.
+pub fn resolve_page_size(max_results: Option<i32>, default: usize, ceiling: usize) -> usize {
+    max_results
+        .map_or(default, |max| max.max(1) as usize)
+        .clamp(1, ceiling)
+}
+
 /// The digest of a canonical criteria string ([`page_criteria`]) that a token binds.
 ///
 /// SHA-256 from the `sha2` crate, truncated to [`PAGE_TOKEN_DIGEST_BYTES`]: nothing

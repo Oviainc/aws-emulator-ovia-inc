@@ -40,7 +40,11 @@
 //! `VALIDATING` state and carries the instant its outcome falls due
 //! (`MetadataTransferJob::settles_at`), the same way a component type carries
 //! its own — and so does a *sync job* (`SyncJob::settles_at`), which
-//! `CreateSyncJob` accepts in the non-terminal `CREATING` state.
+//! `CreateSyncJob` accepts in the non-terminal `CREATING` state. A sync job
+//! also OWNS the resources its synchronisation has acted on
+//! (`SyncJob::sync_resources`), keyed by their identity in the sync source, so
+//! they cannot outlive the job any more than the job can outlive its
+//! workspace — see [`SyncResource`] for what writes one.
 //!
 //! The account's *pricing plan* is the same shape of thing: a plan change the
 //! service bills from the start of the next cycle is held beside the plan in
@@ -1725,6 +1729,15 @@ pub struct SyncJob {
     /// slept for, so a reader can materialise a transition the clock already
     /// owed without any caller having had to poll.
     pub settles_at: SystemTime,
+    /// The resources this job's synchronisation has acted on, keyed by the
+    /// `externalId` that identifies each in the sync SOURCE — see
+    /// [`SyncResource`], which is also where what writes one is set out.
+    ///
+    /// Keyed by the external id, so iterating the map is external-id order:
+    /// two listings of one job report its resources in the same order and a
+    /// page of them can be resumed at a row rather than at an offset
+    /// (`crate::ops::list_sync_resources`).
+    pub sync_resources: BTreeMap<String, SyncResource>,
 }
 
 impl SyncJob {
@@ -1751,6 +1764,9 @@ impl SyncJob {
             state: SYNC_JOB_STATE_CREATING.to_string(),
             error: None,
             settles_at: now + SYNC_JOB_SETTLE_SPAN,
+            // Nothing has been synchronised yet, so the job has acted on no
+            // resource of its source: an accepted job holds none.
+            sync_resources: BTreeMap::new(),
         }
     }
 
@@ -1792,6 +1808,67 @@ impl SyncJob {
     /// `status.error` needs no null guard.
     pub fn status(&self) -> crate::ops::types::SyncJobStatus {
         crate::ops::types::SyncJobStatus {
+            state: Some(self.state.clone()),
+            error: Some(self.error.clone().unwrap_or_default()),
+        }
+    }
+}
+
+/// One resource a sync job's synchronisation has acted on.
+///
+/// A sync job synchronises the resources of its source into the workspace that
+/// holds the job, so each resource it has acted on is named at BOTH ends: in
+/// the source by the `externalId` that identifies it there — which is why it is
+/// the key of [`SyncJob::sync_resources`] — and, once the synchronisation has
+/// created the matching resource in the workspace, in the workspace by its
+/// `resourceId`, of the `resourceType` that says which kind of resource it is.
+/// A resource no workspace resource has been created for yet carries no
+/// `resourceId`, which is why that member is optional on the modelled summary;
+/// its own `state` is the state of ITS synchronisation, independent of the
+/// job's (one resource can be in sync while another is still being processed or
+/// has failed).
+///
+/// NOTHING in this emulator writes one: synchronising means reading the source
+/// service and creating, updating or deleting the corresponding resources in
+/// the workspace, which this emulator does not perform
+/// ([`SYNC_JOB_ERROR_CODE`]), so a job accepted here acts on no resource and
+/// holds none. The listing that reports them
+/// (`crate::ops::list_sync_resources`) therefore reports what the job HOLDS —
+/// an empty page for every job this emulator's create accepted — rather than
+/// rows it invents for a synchronisation that did not run.
+#[derive(Debug, Clone)]
+pub struct SyncResource {
+    /// Which kind of workspace resource this is, from the modelled
+    /// `SyncResourceType` value list (`ops::types::SYNC_RESOURCE_TYPE_VALUES`).
+    pub resource_type: String,
+    /// The resource's identity in the sync SOURCE, which is the key it is held
+    /// under and is therefore not repeated in the map's values by accident: it
+    /// is stored here so a row reports it without the caller having to read the
+    /// key.
+    pub external_id: String,
+    /// The id of the resource in the WORKSPACE, and `None` until the
+    /// synchronisation has created one for it.
+    pub resource_id: Option<String>,
+    /// The resource's `SyncResourceState`
+    /// (`ops::types::SYNC_RESOURCE_STATE_VALUES`), as stored.
+    pub state: String,
+    /// Why this resource's synchronisation failed, and `None` while nothing has
+    /// failed.
+    pub error: Option<crate::ops::types::ErrorDetails>,
+    /// When this resource's synchronisation last changed.
+    pub update_date_time: SystemTime,
+}
+
+impl SyncResource {
+    /// The resource's modelled `SyncResourceStatus`: its stored state and, when
+    /// its synchronisation has failed, why.
+    ///
+    /// The `error` structure is reported WHOLE, the way every other status of
+    /// this service is (see [`SyncJob::status`]): a resource that has not failed
+    /// carries an `ErrorDetails` with neither a code nor a message, so a client
+    /// that reads `status.error` needs no null guard.
+    pub fn status(&self) -> crate::ops::types::SyncResourceStatus {
+        crate::ops::types::SyncResourceStatus {
             state: Some(self.state.clone()),
             error: Some(self.error.clone().unwrap_or_default()),
         }

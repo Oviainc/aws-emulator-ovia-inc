@@ -9,6 +9,12 @@
 //! rendering) cannot drift on any of them. The request harness and the JSON readers
 //! live with the lexicon suite (`crate::lexicons_and_speech`), which every suite drives
 //! the service through.
+//!
+//! The one PLS document whose replacement is measured against the lexeme quota lives
+//! here for the same reason: `error_semantics` (the refusals and their messages),
+//! `error_document_message` (the rendering) and `shared_pls_fixture` (the shared path
+//! itself) all build it here, so a change to the document — its alphabet, its language,
+//! how many lexemes it carries, how the replacement nests — reaches every suite at once.
 
 use std::time::SystemTime;
 
@@ -35,6 +41,17 @@ pub(crate) fn message_slot(response: &http::Response<Bytes>) -> Option<serde_jso
         }
     }
     None
+}
+
+/// A PLS lexicon with one lexeme whose `element` replacement is `length` characters.
+pub(crate) fn pls_with_replacement(element: &str, length: usize) -> String {
+    format!(
+        "<lexicon version=\"1.0\" \
+         xmlns=\"http://www.w3.org/2005/01/pronunciation-lexicon\" \
+         alphabet=\"ipa\" xml:lang=\"en-US\">\
+         <lexeme><grapheme>G</grapheme><{element}>{}</{element}></lexeme></lexicon>",
+        "x".repeat(length)
+    )
 }
 
 /// A `TaskId` in the form Amazon Polly mints one — a UUID in the canonical hyphenated

@@ -521,8 +521,8 @@ async fn a_domain_string_names_at_most_one_pool() {
     )
     .await;
     assert_eq!(
-        (status, error_code(&payload)),
-        (404, "ResourceNotFoundException"),
+        (status, payload["DomainDescription"].clone()),
+        (200, json!({})),
         "a refused create stores no domain, got {payload}"
     );
 
@@ -621,8 +621,8 @@ async fn a_request_the_documented_rules_forbid_is_refused() {
         )
         .await;
         assert_eq!(
-            (status, error_code(&payload)),
-            (404, "ResourceNotFoundException"),
+            (status, payload["DomainDescription"].clone()),
+            (200, json!({})),
             "case {label:?}: a refused create stores no domain, got {payload}"
         );
     }

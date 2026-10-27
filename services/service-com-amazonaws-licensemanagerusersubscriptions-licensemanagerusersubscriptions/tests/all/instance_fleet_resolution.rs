@@ -84,13 +84,13 @@ const GATED_PATHS: &[(&str, &str)] = &[
 /// This service and EC2 — the owner of the instances — over ONE shared engine, plus an EC2
 /// client over the router's own in-process callback: the very seam this service's instance
 /// resolution reaches EC2 through.
-struct Fleet {
-    h: Harness,
-    ec2: ::aws_sdk_ec2::Client,
+pub(crate) struct Fleet {
+    pub(crate) h: Harness,
+    pub(crate) ec2: ::aws_sdk_ec2::Client,
 }
 
 impl Fleet {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The tests sign nothing; authentication is the framework's concern, not this
@@ -125,7 +125,7 @@ impl Fleet {
 
     /// Launch `count` instances through EC2 itself and answer the ids it minted, in launch
     /// order.
-    async fn launch(&self, count: i32) -> Vec<String> {
+    pub(crate) async fn launch(&self, count: i32) -> Vec<String> {
         let launched = self
             .ec2
             .run_instances()
@@ -161,7 +161,7 @@ impl Fleet {
     }
 
     /// The `InstanceState$Name` EC2 reports for `instance_id`.
-    async fn instance_state(&self, instance_id: &str) -> String {
+    pub(crate) async fn instance_state(&self, instance_id: &str) -> String {
         let described = self
             .ec2
             .describe_instances()
@@ -179,7 +179,7 @@ impl Fleet {
     }
 
     /// Wait until EC2 reports `instance_id` in `state`, and answer it.
-    async fn settled_in(&self, instance_id: &str, state: &str) -> String {
+    pub(crate) async fn settled_in(&self, instance_id: &str, state: &str) -> String {
         let deadline = Instant::now() + EC2_BUDGET;
         loop {
             let reported = self.instance_state(instance_id).await;
@@ -203,7 +203,7 @@ struct Row {
     instance_id: String,
 }
 
-async fn associate(h: &Harness, username: &str, instance_id: &str) -> Reply {
+pub(crate) async fn associate(h: &Harness, username: &str, instance_id: &str) -> Reply {
     call(
         h,
         "/user/AssociateUser",
@@ -216,7 +216,7 @@ async fn associate(h: &Harness, username: &str, instance_id: &str) -> Reply {
     .await
 }
 
-async fn list_associations(h: &Harness, instance_id: &str) -> Reply {
+pub(crate) async fn list_associations(h: &Harness, instance_id: &str) -> Reply {
     call(
         h,
         "/user/ListUserAssociations",
@@ -247,7 +247,7 @@ async fn list_instances(h: &Harness) -> Reply {
 
 /// The registration the user-association plane resolves a request through, so a call that
 /// is authorized is answered rather than refused for an unregistered provider.
-async fn register_provider(h: &Harness) {
+pub(crate) async fn register_provider(h: &Harness) {
     register(
         h,
         &json!({
