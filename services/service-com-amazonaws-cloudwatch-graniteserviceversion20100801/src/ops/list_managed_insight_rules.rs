@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListManagedInsightRules
-//! Reports the managed Contributor Insights rules this account holds for one Amazon Web
-//! Services resource, page by page. Implemented here, and the ONLY file to touch for this
-//! operation.
+//! Reports the managed Contributor Insights rules available for one Amazon Web Services
+//! resource — the templates this account's catalog publishes for it, each carrying the rule
+//! enabled from it when one is enabled — page by page. Implemented here, and the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -204,46 +205,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        let rules = store.managed_insight_rules_for(&input.resource_arn);
-        // The cursor names the (template, rule) pair the next page starts at, so a page
-        // follows the previous one under the total order the store reports the rules in.
-        let cursors: Vec<String> = rules
+        let available = store.managed_rules_available_for(&input.resource_arn);
+        // The cursor is the template name the next page starts at. A listing reports at most
+        // ONE entry per template available for the resource, so the template name identifies
+        // the entry and orders the listing on its own — which is what keeps a token this
+        // service issued pointing at the same entry when a rule is later enabled from that
+        // template, rather than at a position that moved under the caller.
+        let cursors: Vec<&str> = available
             .iter()
-            .map(|(name, stored)| page_cursor(crate::state::template_name_of(stored), name))
+            .map(|reported| reported.template_name)
             .collect();
         let from = match start_at.as_deref() {
             None => 0,
-            Some(cursor) => cursors.partition_point(|at| at.as_str() < cursor),
+            Some(cursor) => cursors.partition_point(|at| *at < cursor),
         };
         let next_token = cursors
             .get(from.saturating_add(page_size))
             .map(|cursor| crate::state::encode_page_token(cursor));
 
-        let managed_rules: Vec<ManagedRuleDescription> = rules
+        let managed_rules: Vec<ManagedRuleDescription> = available
             .get(from..)
             .unwrap_or_default()
             .iter()
             .take(page_size)
-            .map(|(name, stored)| {
-                let origin = stored.managed.as_ref();
-                ManagedRuleDescription {
-                    // "The template name for the managed rule. Used to enable managed rules
-                    // using PutManagedInsightRules." (`ManagedRuleDescription$TemplateName`)
-                    template_name: origin.map(|origin| origin.template_name.clone()),
-                    // "If a managed rule is enabled, this is the ARN for the related Amazon
-                    // Web Services resource." (`ManagedRuleDescription$ResourceARN`)
-                    resource_arn: origin.map(|origin| origin.resource_arn.clone()),
-                    // "Describes the state of a managed rule. If present, it contains
-                    // information about the Contributor Insights rule that contains
-                    // information about the related Amazon Web Services resource."
-                    // (`ManagedRuleDescription$RuleState`) — the rule exists, so what is
-                    // reported is the rule's own name and the state the store holds it in,
-                    // whichever operation last moved that state.
-                    rule_state: Some(ManagedRuleState {
-                        rule_name: (*name).clone(),
-                        state: stored.rule.state.clone(),
-                    }),
-                }
+            .map(|reported| ManagedRuleDescription {
+                // "The template name for the managed rule. Used to enable managed rules
+                // using PutManagedInsightRules." (`ManagedRuleDescription$TemplateName`)
+                template_name: Some(reported.template_name.to_string()),
+                // "If a managed rule is enabled, this is the ARN for the related Amazon Web
+                // Services resource." (`ManagedRuleDescription$ResourceARN`) — so the resource
+                // is reported for a template a rule HAS been enabled from, and a template that
+                // is merely available for the resource carries none.
+                resource_arn: reported.rule.map(|_| input.resource_arn.clone()),
+                // "Describes the state of a managed rule. If present, it contains
+                // information about the Contributor Insights rule that contains
+                // information about the related Amazon Web Services resource."
+                // (`ManagedRuleDescription$RuleState`) — present only when a rule has been
+                // enabled from the template, and then it is that rule's own name and the state
+                // the store holds it in, whichever operation last moved that state.
+                rule_state: reported.rule.map(|(name, stored)| ManagedRuleState {
+                    rule_name: name.clone(),
+                    state: stored.rule.state.clone(),
+                }),
             })
             .collect();
 
@@ -263,15 +266,3 @@ const MIN_MAX_RESULTS: usize = 1;
 
 /// `MaxResults`'s modelled maximum (range 1..500).
 const MAX_MAX_RESULTS: usize = 500;
-
-/// The pagination cursor of one reported rule: its template name and its rule name, joined by
-/// a space.
-///
-/// A space cannot appear in a `TemplateName`
-/// (`^[0-9A-Za-z][\-\.\_0-9A-Za-z]{0,126}[0-9A-Za-z]$`) and sorts below every character that
-/// can, so ordering the joined cursors is exactly ordering the (template name, rule name)
-/// pairs — which is what lets the next page start at the first cursor at or above the one the
-/// token carries.
-fn page_cursor(template_name: &str, rule_name: &str) -> String {
-    format!("{template_name} {rule_name}")
-}
