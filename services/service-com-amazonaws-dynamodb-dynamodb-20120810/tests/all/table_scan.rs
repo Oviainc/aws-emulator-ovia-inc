@@ -27,7 +27,8 @@
 //!   values and the read-consistency factor.
 //! * `a_scan_request_the_service_refuses` — the refusals: the all-or-nothing
 //!   `Segment`/`TotalSegments` pair, a key that is not this table's, a table that is
-//!   not there, and the members this slice does not serve.
+//!   not there, an index name it does not declare, and the member combinations that
+//!   cannot hold together.
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_dynamodb_dynamodb_20120810::state::STATUS_TRANSITION;
@@ -125,7 +126,7 @@ const SET_MEMBERS: [&str; 3] = ["SS", "NS", "BS"];
 /// the order its members are serialised in is the store's business — so the rendering
 /// sorts every object's members, and the members of a set attribute with them. A
 /// list (`L`) keeps its order, because a list IS ordered.
-fn canonical(value: &Value) -> String {
+pub(crate) fn canonical(value: &Value) -> String {
     match value {
         Value::Object(members) => {
             let mut rendered: Vec<String> = members
@@ -157,7 +158,7 @@ fn canonical(value: &Value) -> String {
 /// The items a response reports, rendered canonically and sorted — a `Scan` returns a
 /// SET of items, and DynamoDB promises no order over it, so every comparison here is
 /// between sets.
-fn reported_items(response: &Value) -> Vec<String> {
+pub(crate) fn reported_items(response: &Value) -> Vec<String> {
     let mut rendered: Vec<String> = response["Items"]
         .as_array()
         .cloned()
@@ -170,7 +171,7 @@ fn reported_items(response: &Value) -> Vec<String> {
 }
 
 /// The same rendering for the items a test wrote.
-fn rendered(items: &[Value]) -> Vec<String> {
+pub(crate) fn rendered(items: &[Value]) -> Vec<String> {
     let mut rendered: Vec<String> = items.iter().map(canonical).collect();
     rendered.sort();
     rendered
@@ -208,7 +209,7 @@ async fn seed(router: &MultiServiceRouter, table: &TableCase) -> Value {
 
 /// The `LastEvaluatedKey` a response carries, or `None` when it reports none — an
 /// absent key is the last page.
-fn last_evaluated_key(response: &Value) -> Option<Value> {
+pub(crate) fn last_evaluated_key(response: &Value) -> Option<Value> {
     response
         .get("LastEvaluatedKey")
         .filter(|key| !key.is_null())
@@ -585,7 +586,8 @@ async fn a_scan_request_the_service_refuses() {
     // answered with, and a phrase the message must carry (empty where the wording is
     // not this test's business). The rows span the refusal classes: the
     // all-or-nothing parallel-scan pair and its range, a key that is not this
-    // table's, a table that is not there, and each member the slice does not serve.
+    // table's, a table that is not there, an index name the table does not declare,
+    // and each pair of members that cannot hold together.
     let cases: Vec<(&str, Value, u16, &str, &str)> = vec![
         (
             "Segment without TotalSegments",
@@ -652,11 +654,11 @@ async fn a_scan_request_the_service_refuses() {
             "ExpressionAttributeNames",
         ),
         (
-            "a secondary index, which this slice does not serve",
+            "an IndexName this table declares no index for",
             json!({"TableName": &table.name, "IndexName": "ByAlbums"}),
-            501,
-            "NotImplemented",
-            "",
+            400,
+            "ValidationException",
+            "The table does not have the specified index: ByAlbums",
         ),
         (
             "a FilterExpression beside the legacy ScanFilter it replaces",
@@ -669,41 +671,59 @@ async fn a_scan_request_the_service_refuses() {
             "Can not use both expression and non-expression parameters",
         ),
         (
-            "the legacy ScanFilter",
+            "a ScanFilter entry naming an operator outside the modeled set",
             json!({"TableName": &table.name,
-                   "ScanFilter": {"Albums": {"ComparisonOperator": "EQ",
+                   "ScanFilter": {"Albums": {"ComparisonOperator": "SOUNDS_LIKE",
                                              "AttributeValueList": [{"N": "3"}]}}}),
-            501,
-            "NotImplemented",
-            "",
+            400,
+            "ValidationException",
+            "Member must satisfy enum value set",
         ),
         (
-            "the legacy ConditionalOperator",
+            "a ScanFilter entry given the wrong number of operands",
+            json!({"TableName": &table.name,
+                   "ScanFilter": {"Albums": {"ComparisonOperator": "BETWEEN",
+                                             "AttributeValueList": [{"N": "3"}]}}}),
+            400,
+            "ValidationException",
+            "BETWEEN takes 2 value(s)",
+        ),
+        (
+            "the legacy ConditionalOperator with no ScanFilter to combine",
             json!({"TableName": &table.name, "ConditionalOperator": "AND"}),
-            501,
-            "NotImplemented",
-            "",
+            400,
+            "ValidationException",
+            "ConditionalOperator can only be used together with ScanFilter",
         ),
         (
-            "a ProjectionExpression",
-            json!({"TableName": &table.name, "ProjectionExpression": "Albums"}),
-            501,
-            "NotImplemented",
-            "",
+            "a ProjectionExpression beside the legacy AttributesToGet it replaces",
+            json!({"TableName": &table.name, "ProjectionExpression": "Albums",
+                   "AttributesToGet": ["Albums"]}),
+            400,
+            "ValidationException",
+            "Can not use both expression and non-expression parameters",
         ),
         (
-            "the legacy AttributesToGet",
-            json!({"TableName": &table.name, "AttributesToGet": ["Albums"]}),
-            501,
-            "NotImplemented",
-            "",
+            "a ProjectionExpression beside a Select other than SPECIFIC_ATTRIBUTES",
+            json!({"TableName": &table.name, "ProjectionExpression": "Albums",
+                   "Select": "ALL_ATTRIBUTES"}),
+            400,
+            "ValidationException",
+            "SPECIFIC_ATTRIBUTES",
+        ),
+        (
+            "Select SPECIFIC_ATTRIBUTES with nothing listed to return",
+            json!({"TableName": &table.name, "Select": "SPECIFIC_ATTRIBUTES"}),
+            400,
+            "ValidationException",
+            "SPECIFIC_ATTRIBUTES",
         ),
         (
             "a Select only an index scan accepts",
             json!({"TableName": &table.name, "Select": "ALL_PROJECTED_ATTRIBUTES"}),
-            501,
-            "NotImplemented",
-            "",
+            400,
+            "ValidationException",
+            "allowed only when an index is scanned",
         ),
     ];
 

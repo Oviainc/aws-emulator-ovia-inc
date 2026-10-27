@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token resumes THIS agreement's entitlements: the scope names the
         // operation as well as the agreement, so a token minted for the same
         // agreement's terms cannot resume this list.
-        let scope = crate::state::query_scope(&[Self::NAME, &input.agreement_id]);
+        let scope = crate::state::listing_scope(Self::NAME, &[&input.agreement_id]);
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => match crate::state::page_offset(&scope, token) {

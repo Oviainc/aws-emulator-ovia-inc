@@ -196,13 +196,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token resumes THIS listing: one minted for a different agreement
         // or a different set of filters would index into a different sequence.
         let scope = crate::state::invoice_line_item_scope(
+            Self::NAME,
             &input.agreement_id,
             &input.group_by,
             input.invoice_id.as_deref(),
             input.invoice_type.as_deref(),
             input.invoice_billing_period.as_ref(),
-            issued_after,
-            issued_before,
+            (issued_after, issued_before),
         );
         let offset = match input.next_token.as_deref() {
             None => 0,
