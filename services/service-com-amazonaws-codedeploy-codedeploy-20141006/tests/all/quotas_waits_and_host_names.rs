@@ -281,9 +281,11 @@ fn alarms(count: usize) -> Value {
 }
 
 /// RULE: a deployment's `overrideAlarmConfiguration` is held to the DEPLOYMENT
-/// alarm quota (50), and a deployment group's own `alarmConfiguration` to the
-/// deployment-group quota (10) the model states for it; past either, the request
-/// is refused with `AlarmsLimitExceededException` stating the quota it exceeded.
+/// alarm quota (50) and a NEW deployment group's own `alarmConfiguration` to the
+/// deployment-group quota (10) the model states for it — past either, the
+/// request is refused with `AlarmsLimitExceededException` stating the quota it
+/// exceeded — while an UPDATE of an existing group's configuration is admitted
+/// whatever its length.
 #[tokio::test]
 async fn a_deployment_overrides_alarms_under_its_own_quota() {
     let emulator = Emulator::new();
@@ -351,8 +353,8 @@ async fn a_deployment_overrides_alarms_under_its_own_quota() {
         );
     }
 
-    // The DEPLOYMENT GROUP's own configuration keeps the model's quota, on both
-    // operations that set one.
+    // The DEPLOYMENT GROUP's own configuration AT the model's figure is accepted
+    // by both operations that set one.
     for (case, operation, request) in [
         (
             "CreateDeploymentGroup at the group quota",
@@ -380,9 +382,10 @@ async fn a_deployment_overrides_alarms_under_its_own_quota() {
             "case {case:?}: expected the group quota to accept it, got {status} {body:?}"
         );
     }
-    for (case, operation, request) in [
-        (
-            "CreateDeploymentGroup past the group quota",
+    // Past it, a NEW group is refused with the sentence naming the quota.
+    let case = "CreateDeploymentGroup past the group quota";
+    let (status, body) = emulator
+        .call(
             "CreateDeploymentGroup",
             json!({
                 "applicationName": application,
@@ -390,26 +393,50 @@ async fn a_deployment_overrides_alarms_under_its_own_quota() {
                 "serviceRoleArn": SERVICE_ROLE,
                 "alarmConfiguration": alarms(DEPLOYMENT_GROUP_ALARM_QUOTA + 1),
             }),
-        ),
-        (
-            "UpdateDeploymentGroup past the group quota",
-            "UpdateDeploymentGroup",
-            json!({
-                "applicationName": application,
-                "currentDeploymentGroupName": group,
-                "alarmConfiguration": alarms(DEPLOYMENT_ALARM_QUOTA),
-            }),
-        ),
-    ] {
-        let (status, body) = emulator.call(operation, request).await;
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "AlarmsLimitExceededException"),
+        "case {case:?}: expected the group alarm quota to refuse it, got {status} {body:?}"
+    );
+    assert!(
+        error_message(&body).contains(&format!("({DEPLOYMENT_GROUP_ALARM_QUOTA})")),
+        "case {case:?}: expected the sentence naming the deployment-group quota, got {body:?}"
+    );
+    // An UPDATE of an existing group is admitted whatever its length, and stores
+    // every entry it names; the count-past-the-figure cases are tabulated in
+    // `super::deployment_group_alarm_counts`.
+    for count in [DEPLOYMENT_GROUP_ALARM_QUOTA + 1, DEPLOYMENT_ALARM_QUOTA] {
+        let (status, body) = emulator
+            .call(
+                "UpdateDeploymentGroup",
+                json!({
+                    "applicationName": application,
+                    "currentDeploymentGroupName": group,
+                    "alarmConfiguration": alarms(count),
+                }),
+            )
+            .await;
         assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "AlarmsLimitExceededException"),
-            "case {case:?}: expected the group alarm quota to refuse it, got {status} {body:?}"
+            status, 200,
+            "case {count} alarms on a group update: expected it to be accepted, got {status} \
+             {body:?}"
         );
-        assert!(
-            error_message(&body).contains(&format!("({DEPLOYMENT_GROUP_ALARM_QUOTA})")),
-            "case {case:?}: expected the sentence naming the deployment-group quota, got {body:?}"
+        let stored = emulator
+            .ok(
+                "GetDeploymentGroup",
+                json!({"applicationName": application, "deploymentGroupName": group}),
+            )
+            .await;
+        let reported = stored["deploymentGroupInfo"]["alarmConfiguration"]["alarms"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default();
+        assert_eq!(
+            reported, count,
+            "case {count} alarms on a group update: expected every alarm to be stored, got \
+             {stored:?}"
         );
     }
 }
@@ -699,9 +726,9 @@ async fn a_target_id_outside_the_deployment_is_refused_whatever_its_progress() {
         }
         assert_eq!(
             error_code(&body),
-            "DeploymentNotStartedException",
-            "case member-host: expected the target to be reported or the deployment not to have \
-             started, got {status} {body:?}"
+            "DeploymentTargetDoesNotExistException",
+            "case member-host: expected the target to be reported or its record not to exist \
+             yet, got {status} {body:?}"
         );
         assert!(
             Instant::now() < deadline,
