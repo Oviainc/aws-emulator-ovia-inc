@@ -101,6 +101,8 @@ mod state_roundtrip;
 mod tagging_arn_qualifiers;
 #[path = "all/tagging_resource_families.rs"]
 mod tagging_resource_families;
+#[path = "all/transcription_job_absent_media_state.rs"]
+mod transcription_job_absent_media_state;
 #[path = "all/transcription_job_language_identification.rs"]
 mod transcription_job_language_identification;
 #[path = "all/transcription_job_queueing.rs"]
