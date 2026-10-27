@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestMetricFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestMetricFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestMetricFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +133,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestMetricFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestMetricFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // This operation "tests the filter pattern of a metric filter against a sample of
+        // log event messages": both the pattern and the sample are in the request, so the
+        // answer is a function of the request alone — it names no stored resource, reads
+        // none, and leaves the store exactly as it found it. The engine and `ctx` are bound
+        // so that stays visible.
+        let _ = (ctx, &self.engine);
+
+        let invalid = |message: String| {
+            TestMetricFilterError::from(TestMetricFilterErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        };
+
+        // A pattern that does not parse describes no log events at all, so there is no
+        // verdict to report for it: it is a bad PARAMETER, refused by the same reading of
+        // the filter-pattern syntax that refuses a configuration write — and checked FIRST,
+        // because what a pattern IS precedes what it may carry.
+        let pattern = crate::state::filter_pattern::FilterPattern::parse(&input.filter_pattern)
+            .map_err(invalid)?;
+
+        // "Using regular expressions in filter patterns is supported. For these filters,
+        // there is a quota of two regular expression patterns within a single filter
+        // pattern." A pattern no metric filter could be configured with is not one this
+        // operation can report a verdict on, so it is held to the same quota, by the same
+        // counter and the same sentence, that `PutMetricFilter` holds a put's pattern to.
+        let pattern_regexes = crate::state::filter_pattern_regex_count(&input.filter_pattern);
+        if pattern_regexes > crate::state::MAX_REGEX_PATTERNS_PER_FILTER_PATTERN {
+            return Err(invalid(
+                crate::state::filter_pattern_regex_quota_message(),
+            ));
+        }
+
+        // "The log event messages to test." A message larger than the largest log event
+        // CloudWatch Logs holds is no log event message, so the sample is held to the same
+        // per-event ceiling an ingested batch is — which is also what caps, server-side, the
+        // message length every scan below is linear in. The refusal is the service's own
+        // documented sentence for the condition
+        // ([`crate::state::LOG_EVENT_TOO_LARGE`]).
+        if input.log_event_messages.iter().any(|message| {
+            i64::try_from(message.len()).unwrap_or(i64::MAX) > crate::state::MAX_LOG_EVENT_BYTES
+        }) {
+            return Err(invalid(crate::state::LOG_EVENT_TOO_LARGE.to_string()));
+        }
+
+        // "The matched events": one record per sample message the pattern matches, carrying
+        // the message's 1-based position in the sample the REQUEST sent — so a caller can
+        // tell which of its messages matched — the message itself, and the values the
+        // pattern extracted from it. A pattern that selects no field of the event extracts
+        // nothing, and then the record carries no `extractedValues` rather than an empty map.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TestMetricFilter"))
+        // The sample is up to 50 messages (`TestEventMessages` is `length 1..50`) and each
+        // is matched in bounded work, but the loop yields between messages all the same, so
+        // a timeout or a cancellation has somewhere to land rather than waiting for the
+        // whole sample.
+        let mut matches = Vec::with_capacity(input.log_event_messages.len());
+        for (index, message) in input.log_event_messages.iter().enumerate() {
+            ::tokio::task::yield_now().await;
+            let Some(extracted) = pattern.match_message(message) else {
+                continue;
+            };
+            matches.push(MetricFilterMatchRecord {
+                event_number: i64::try_from(index + 1).unwrap_or(i64::MAX),
+                event_message: Some(message.clone()),
+                extracted_values: (!extracted.is_empty())
+                    .then(|| extracted.into_iter().collect()),
+            });
+        }
+
+        Ok(TestMetricFilterOutput {
+            matches: Some(matches),
+        })
     }
 }

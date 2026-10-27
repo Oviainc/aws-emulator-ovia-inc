@@ -140,6 +140,10 @@ use std::collections::BTreeMap;
 /// `StartQuery` accepts one.
 pub mod query_compile;
 
+/// Running a `filterPattern` over a log event message, which is what `TestMetricFilter`
+/// reports.
+pub mod filter_pattern;
+
 /// Metric extraction from an ingested Embedded Metric Format log event.
 pub mod emf;
 
@@ -174,6 +178,21 @@ pub const TRANSFORMER_LOG_GROUP_CLASS: &str = "STANDARD";
 /// From the PutLogEvents quota: a batch's size "is calculated as the sum of all event
 /// messages in UTF-8, plus 26 bytes for each log event".
 pub const EVENT_OVERHEAD_BYTES: i64 = 26;
+
+/// The largest single log event CloudWatch Logs holds, from `PutLogEvents`: "Each log event
+/// can be no larger than 1 MB."
+///
+/// A bound on a log event MESSAGE wherever one arrives, not only on an ingested batch: a
+/// `TestMetricFilter` sample message larger than the largest log event the service holds is
+/// no log event message at all. It lives here so the two operations are held to the one
+/// number.
+pub const MAX_LOG_EVENT_BYTES: i64 = 1_048_576;
+
+/// The refusal for a log event message larger than one CloudWatch Logs holds: the
+/// service's own documented sentence for the condition, which states the ceiling and
+/// interpolates nothing from the request. Kept beside
+/// [`MAX_LOG_EVENT_BYTES`] so the sentence and the number it states cannot disagree.
+pub const LOG_EVENT_TOO_LARGE: &str = "Each log event can be no larger than 1 MB.";
 
 /// The number of items `DescribeLogGroups` / `DescribeLogStreams` return when the
 /// request omits `limit` ("If you don't specify a value, the default is up to 50 items").
@@ -515,6 +534,17 @@ pub const METRIC_FILTER_SYSTEM_FIELDS: [&str; 2] = ["@aws.account", "@aws.region
 /// `PutMetricFilter`: "there is a quota of two regular expression patterns within a single
 /// filter pattern".
 pub const MAX_REGEX_PATTERNS_PER_FILTER_PATTERN: usize = 2;
+
+/// The refusal CloudWatch Logs answers a `filterPattern` carrying more regular expression
+/// patterns than one may hold. The quota is stated once
+/// ([`MAX_REGEX_PATTERNS_PER_FILTER_PATTERN`]) and so is the sentence, so no two operations
+/// that take a filter pattern can word the same refusal differently.
+pub fn filter_pattern_regex_quota_message() -> String {
+    format!(
+        "a single filter pattern can contain at most \
+         {MAX_REGEX_PATTERNS_PER_FILTER_PATTERN} regular expression patterns"
+    )
+}
 
 /// The regular expression patterns one log group's metric filters may carry between them,
 /// from `PutMetricFilter`: "There is also a quota of five regular expression patterns per
@@ -6229,6 +6259,38 @@ pub fn unparsable_arn_message(member: &str, value: &str) -> Option<String> {
     arn_service_and_resource(value)
         .is_none()
         .then(|| format!("1 validation error detected: Unable to parse {member} {value}"))
+}
+
+/// Whether `value` matches a term carrying `*` wildcards, each standing for any run of
+/// characters (`prod*`, `*prod`, `a*b*c`); a term with no `*` matches only itself.
+///
+/// THE one reading of the `*` wildcard this service uses, shared by every member that
+/// carries one: a `ListLogGroups` name term, and a filter pattern's `"*…*"` literal
+/// ([`filter_pattern`]). Case folding is the CALLER's, because the two differ there — log
+/// group name matching is documented case-INsensitive, and the filter-pattern syntax is case
+/// sensitive — so this answers only the wildcard question.
+pub fn wildcard_matches(value: &str, term: &str) -> bool {
+    let mut literals = term.split('*');
+    // The run before the first `*` is anchored at the start, the run after the last `*`
+    // at the end, and every run between them is matched in order.
+    let Some(first) = literals.next() else {
+        return true;
+    };
+    let Some(mut rest) = value.strip_prefix(first) else {
+        return false;
+    };
+    let remaining: Vec<&str> = literals.collect();
+    let Some((last, middle)) = remaining.split_last() else {
+        // No `*` at all: the term is literal.
+        return rest.is_empty();
+    };
+    for literal in middle {
+        match rest.find(literal) {
+            Some(at) => rest = &rest[at + literal.len()..],
+            None => return false,
+        }
+    }
+    rest.ends_with(last)
 }
 
 /// Hold a `filterPattern` to the filter-pattern syntax's bracket rule: a pattern that
