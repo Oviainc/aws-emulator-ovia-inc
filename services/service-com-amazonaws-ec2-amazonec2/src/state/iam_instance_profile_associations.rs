@@ -1,0 +1,427 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! # IAM instance profile associations
+//!
+//! [`ComAmazonawsEc2Amazonec2State::iam_instance_profile_associations`] holds the
+//! associations between the account's instances and the IAM instance profiles they run
+//! as, keyed by `IamInstanceProfileAssociationId`, as the modelled
+//! [`IamInstanceProfileAssociation`] shape itself — the one every operation that reports
+//! an association answers with — so a member a writer sets round-trips through a report
+//! without a field-by-field copy that can silently drop one.
+//!
+//! "You cannot associate more than one IAM instance profile with an instance"
+//! (`AssociateIamInstanceProfile`), so at most one association of this store names any
+//! one instance.
+//! [`ComAmazonawsEc2Amazonec2State::iam_instance_profile_association_by_instance`] is the
+//! index of that rule: it answers which association an instance holds without a scan, and
+//! it is what [`ComAmazonawsEc2Amazonec2State::instance_view`] reads to report the profile
+//! on the instance itself, so the instance report and the association report cannot
+//! disagree about one instance's profile. Both maps are written ONLY by the two seams
+//! below, which is what keeps them in step.
+//!
+//! An association moves through the states `IamInstanceProfileAssociationState` publishes
+//! (`smithy_query(query="shape",shape="IamInstanceProfileAssociationState")`), and both
+//! moves are owed by the CLOCK rather than by a later call, on the same
+//! [`TRANSITION_DELAY`] as every other transient state of this store:
+//!
+//! * a new association is recorded [`IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATING`]
+//!   and reaches [`IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATED`] one span later, so a
+//!   caller that reads straight after the write still sees the transient state;
+//! * a disassociation records
+//!   [`IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_DISASSOCIATING`] and the association itself
+//!   is GONE one span later — the state EC2's own association filters stop at
+//!   (`DescribeIamInstanceProfileAssociationsRequest$Filters` documents `state` as
+//!   "associating | associated | disassociating"), so a fully disassociated profile is
+//!   reported as no association rather than as a terminal row.
+//!
+//! [`ComAmazonawsEc2Amazonec2State::iam_instance_profile_association_due_at`] is when that
+//! move falls due, on the same monotonic clock as
+//! [`ComAmazonawsEc2Amazonec2State::vpc_available_at`], and
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it.
+//!
+//! A child module of [`crate::state`] rather than more lines in it: everything here belongs
+//! to one resource and reaches the rest of the store through `use super::*`.
+
+use std::time::{Instant, SystemTime};
+
+use crate::ops::types::{
+    IamInstanceProfile, IamInstanceProfileAssociation, IamInstanceProfileSpecification,
+};
+
+use super::*;
+
+/// The id prefix an IAM instance profile association is minted with.
+///
+/// The model publishes no pattern for `IamInstanceProfileAssociationId` (it is a plain
+/// `String` — `smithy_query(query="shape",shape="IamInstanceProfileAssociationId")`), so the
+/// id takes EC2's own `<prefix>-<hex>` form through
+/// [`ComAmazonawsEc2Amazonec2State::next_id`], with the `iip-assoc` prefix EC2 gives one. It
+/// is minted by the store and never taken from a request.
+pub const IAM_INSTANCE_PROFILE_ASSOCIATION_ID_PREFIX: &str = "iip-assoc";
+
+/// The state an association is recorded in: the `IamInstanceProfileAssociationState` member
+/// `associating` (`crate::ops::types::IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_VALUES`), the
+/// non-terminal state it sits in until [`TRANSITION_DELAY`] has passed.
+pub const IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATING: &str = "associating";
+
+/// The state the clock owes a recorded association: that enum's `associated` member.
+pub const IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
+
+/// The state a disassociation records: that enum's `disassociating` member, the
+/// non-terminal state the association sits in until the clock removes it.
+pub const IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_DISASSOCIATING: &str = "disassociating";
+
+/// The largest number of IAM instance profile associations this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_NETWORK_INTERFACE_PERMISSIONS`], not an AWS
+/// quota: each association is a record in this process's memory, so the number a caller can
+/// create has to be finite. At most one association names any one instance, so this bounds
+/// the instances that may hold a profile as well.
+/// [`ComAmazonawsEc2Amazonec2State::has_iam_instance_profile_association_capacity`] is the
+/// predicate a writer asks before inserting.
+pub const MAX_IAM_INSTANCE_PROFILE_ASSOCIATIONS: usize = 1_000;
+
+/// EC2's code for a request whose state does not admit the action, which an instance that
+/// already runs as a profile answers an attempt to give it a second one with.
+pub const INCORRECT_STATE: &str = "IncorrectState";
+
+/// The caller-chosen bytes one stored association retains: the instance profile reference
+/// the request named, which is the only part of the record a caller sizes (the id, the
+/// instance id, the state word and the timestamp are all this service's own and
+/// fixed-size).
+///
+/// The ONE definition of that charge, the way [`network_interface_permission_payload_bytes`]
+/// is for a permission: a writer charges exactly it, and the removal path gives exactly it
+/// back.
+pub fn iam_instance_profile_association_payload_bytes(profile: &IamInstanceProfile) -> usize {
+    profile
+        .arn
+        .as_ref()
+        .map_or(0, String::len)
+        .saturating_add(profile.id.as_ref().map_or(0, String::len))
+}
+
+/// What the store needs to record one association, so the id, the state and the byte charge
+/// are decided in exactly one place.
+#[derive(Debug, Clone)]
+pub struct IamInstanceProfileAssociationSpec {
+    /// "The ID of the instance" (`AssociateIamInstanceProfileRequest$InstanceId`), already
+    /// resolved against the instance store by the caller.
+    pub instance_id: String,
+    /// The IAM instance profile the instance is to run as, as the association reports it
+    /// (`IamInstanceProfileAssociation$IamInstanceProfile`).
+    pub iam_instance_profile: IamInstanceProfile,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another association fits inside the store's ceiling
+    /// ([`MAX_IAM_INSTANCE_PROFILE_ASSOCIATIONS`]).
+    ///
+    /// The same contract as [`Self::has_network_interface_permission_capacity`]: a writer
+    /// asks this first and refuses when it answers `false`.
+    pub fn has_iam_instance_profile_association_capacity(&self) -> bool {
+        self.iam_instance_profile_associations.len() < MAX_IAM_INSTANCE_PROFILE_ASSOCIATIONS
+    }
+
+    /// The association the instance `instance_id` holds, whatever state it is in, or `None`
+    /// for an instance that runs as no instance profile.
+    ///
+    /// A READ ONLY, answered through the by-instance index rather than by scanning the
+    /// store: what a writer asks to find the association an instance already has, and what
+    /// [`Self::iam_instance_profile_of_instance`] reads.
+    pub fn iam_instance_profile_association_over(
+        &self,
+        instance_id: &str,
+    ) -> Option<&IamInstanceProfileAssociation> {
+        let association_id = self
+            .iam_instance_profile_association_by_instance
+            .get(instance_id)?;
+        self.iam_instance_profile_associations.get(association_id)
+    }
+
+    /// The instance profile `instance_id` RUNS AS, as `Instance$IamInstanceProfile` reports
+    /// it, or `None` for an instance that runs as none.
+    ///
+    /// An association the clock has not finished taking away
+    /// ([`IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_DISASSOCIATING`]) no longer gives the
+    /// instance a profile — the disassociation has been performed, and what the clock still
+    /// owes is only the removal of the association record — so the instance reports none.
+    pub fn iam_instance_profile_of_instance(&self, instance_id: &str) -> Option<IamInstanceProfile> {
+        self.iam_instance_profile_association_over(instance_id)
+            .filter(|association| {
+                association.state.as_deref()
+                    != Some(IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_DISASSOCIATING)
+            })
+            .and_then(|association| association.iam_instance_profile.clone())
+    }
+
+    /// Record an association between an instance and an IAM instance profile and answer it
+    /// as every report of it will read, or `None` when the store has no room for it.
+    ///
+    /// The ONE writer seam: everything the service owns is derived here rather than taken
+    /// from a caller — the id, the `associating` state the clock then moves to `associated`,
+    /// the timestamp and the by-instance index — so two writers cannot report one
+    /// association differently. The caller-chosen bytes the record retains
+    /// ([`iam_instance_profile_association_payload_bytes`]) are charged against the store's
+    /// byte budget here, and both ceilings are enforced here rather than trusted to the
+    /// caller.
+    pub fn insert_iam_instance_profile_association(
+        &mut self,
+        spec: IamInstanceProfileAssociationSpec,
+    ) -> Option<IamInstanceProfileAssociation> {
+        if !self.has_iam_instance_profile_association_capacity()
+            || self.iam_instance_profile_associations.len() >= MAX_STORED_RECORDS_PER_STORE
+        {
+            return None;
+        }
+        let payload_bytes =
+            iam_instance_profile_association_payload_bytes(&spec.iam_instance_profile);
+        if self.would_exceed_stored_bytes(payload_bytes) {
+            return None;
+        }
+        let association_id = self.next_id(IAM_INSTANCE_PROFILE_ASSOCIATION_ID_PREFIX);
+        let association = IamInstanceProfileAssociation {
+            association_id: Some(association_id.clone()),
+            instance_id: Some(spec.instance_id.clone()),
+            iam_instance_profile: Some(spec.iam_instance_profile),
+            state: Some(IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATING.to_string()),
+            // "The time the IAM instance profile was associated with the instance"
+            // (`IamInstanceProfileAssociation$Timestamp`): the instant this record was
+            // made, which no later move of the association changes.
+            timestamp: Some(system_time_to_date_time(SystemTime::now())),
+        };
+        self.add_stored_bytes(payload_bytes.saturating_add(STORED_RECORD_OVERHEAD_BYTES));
+        self.iam_instance_profile_association_due_at
+            .insert(association_id.clone(), due_instant(TRANSITION_DELAY));
+        self.iam_instance_profile_association_by_instance
+            .insert(spec.instance_id, association_id.clone());
+        self.iam_instance_profile_associations
+            .insert(association_id, association.clone());
+        Some(association)
+    }
+
+    /// Start taking the association `association_id` away and answer it as the caller will
+    /// read it, or `None` when the store holds no such association.
+    ///
+    /// The association is recorded [`IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_DISASSOCIATING`]
+    /// and the clock owes its REMOVAL one [`TRANSITION_DELAY`] later
+    /// ([`Self::settle_due_iam_instance_profile_associations`]), so a caller that reads
+    /// straight after the call still sees the transient state and the instance has already
+    /// stopped running as the profile. An association that is ALREADY being taken away is
+    /// answered as it stands, with the move the clock already owes it left where it is: the
+    /// disassociation has been started once, and starting it again would move its due
+    /// instant out.
+    pub fn start_iam_instance_profile_disassociation(
+        &mut self,
+        association_id: &str,
+    ) -> Option<IamInstanceProfileAssociation> {
+        let association = self
+            .iam_instance_profile_associations
+            .get_mut(association_id)?;
+        if association.state.as_deref()
+            == Some(IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_DISASSOCIATING)
+        {
+            return Some(association.clone());
+        }
+        association.state =
+            Some(IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_DISASSOCIATING.to_string());
+        let association = association.clone();
+        self.iam_instance_profile_association_due_at
+            .insert(association_id.to_string(), due_instant(TRANSITION_DELAY));
+        Some(association)
+    }
+
+    /// Remove the association `association_id` and answer it as it was last reported, or
+    /// `None` when the store holds no such association.
+    ///
+    /// The exact reverse of [`Self::insert_iam_instance_profile_association`]: the record's
+    /// bytes go back to the store's budget, and the index entry and the move the clock still
+    /// owed it go with it, so an association followed by its removal leaves the store
+    /// exactly where it started.
+    pub fn remove_iam_instance_profile_association(
+        &mut self,
+        association_id: &str,
+    ) -> Option<IamInstanceProfileAssociation> {
+        let association = self
+            .iam_instance_profile_associations
+            .remove(association_id)?;
+        if let Some(profile) = association.iam_instance_profile.as_ref() {
+            self.release_stored_bytes(
+                iam_instance_profile_association_payload_bytes(profile)
+                    .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
+            );
+        }
+        if let Some(instance_id) = association.instance_id.as_deref() {
+            // Only the entry that still points AT this association: an instance given a new
+            // profile after this one was taken away points at the newer association.
+            if self
+                .iam_instance_profile_association_by_instance
+                .get(instance_id)
+                .is_some_and(|held| held == association_id)
+            {
+                self.iam_instance_profile_association_by_instance
+                    .remove(instance_id);
+            }
+        }
+        self.iam_instance_profile_association_due_at
+            .remove(association_id);
+        Some(association)
+    }
+
+    /// Apply the moves the clock owes this store's associations as of `now`: an
+    /// `associating` association becomes `associated`, and a `disassociating` one is
+    /// removed.
+    ///
+    /// Called from [`Self::materialize_due_transitions`], which every operation that reads
+    /// or writes the store calls first: both moves were owed at their due instant whether or
+    /// not anybody called, so applying them here changes nothing a later caller would not
+    /// have seen anyway.
+    pub(super) fn settle_due_iam_instance_profile_associations(&mut self, now: Instant) {
+        let due: Vec<String> = self
+            .iam_instance_profile_association_due_at
+            .iter()
+            .filter(|(_, due_at)| now >= **due_at)
+            .map(|(association_id, _)| association_id.clone())
+            .collect();
+        for association_id in due {
+            let disassociating = self
+                .iam_instance_profile_associations
+                .get(&association_id)
+                .and_then(|association| association.state.as_deref())
+                == Some(IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_DISASSOCIATING);
+            if disassociating {
+                self.remove_iam_instance_profile_association(&association_id);
+                continue;
+            }
+            if let Some(association) = self
+                .iam_instance_profile_associations
+                .get_mut(&association_id)
+            {
+                if association.state.as_deref()
+                    == Some(IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATING)
+                {
+                    association.state =
+                        Some(IAM_INSTANCE_PROFILE_ASSOCIATION_STATE_ASSOCIATED.to_string());
+                }
+            }
+            // The move is applied once; nothing is owed on this association any more.
+            self.iam_instance_profile_association_due_at
+                .remove(&association_id);
+        }
+    }
+}
+
+/// Refuse a request that named an IAM instance profile association id this account holds no
+/// association for: HTTP 400 `InvalidParameterValue`, with the message EC2 builds from the
+/// id the request named.
+///
+/// EC2 answers this ONE refusal for every association id it cannot resolve, whether the
+/// value is not an association id at all or merely names none — unlike the resource kinds
+/// that answer an `Invalid<Kind>ID.Malformed` / `.NotFound` pair
+/// ([`invalid_network_interface_permission_id_malformed`]) — so there is no second wording
+/// here to choose between.
+pub fn invalid_iam_instance_profile_association_id<E>(association_id: &str) -> Scaffolded<E> {
+    invalid_parameter_value(format!("Invalid Id: {association_id}"))
+}
+
+/// Refuse giving an instance a second IAM instance profile: HTTP 400
+/// [`INCORRECT_STATE`], naming the instance that already holds one.
+///
+/// "You cannot associate more than one IAM instance profile with an instance"
+/// (`AssociateIamInstanceProfile`), and an instance that already runs as one is in a state
+/// that does not admit another, which is what this code says.
+pub fn existing_iam_instance_profile_association<E>(instance_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INCORRECT_STATE,
+        400,
+        format!("There is an existing association for instance {instance_id}"),
+    )
+}
+
+/// The most characters an IAM instance profile name may carry: IAM's own
+/// `instanceProfileNameType` (len 1..128, pattern `^[\w+=,.@-]+$`), the type every
+/// `InstanceProfileName` member of the IAM model carries, so a name EC2 accepts here is one
+/// IAM could hold a profile under.
+pub const MAX_IAM_INSTANCE_PROFILE_NAME_CHARACTERS: usize = 128;
+
+/// Whether `name` is a name IAM could hold an instance profile under: between one and
+/// [`MAX_IAM_INSTANCE_PROFILE_NAME_CHARACTERS`] of the characters
+/// `instanceProfileNameType`'s pattern admits.
+///
+/// A path is NOT one of them: a name is the last segment of the profile's ARN, and `/` is
+/// what separates it from the path.
+pub fn iam_instance_profile_name_is_well_formed(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= MAX_IAM_INSTANCE_PROFILE_NAME_CHARACTERS
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"+=,.@_-".contains(&byte))
+}
+
+/// The instance profile an `IamInstanceProfileSpecification` names, as an association
+/// reports it (`IamInstanceProfileAssociation$IamInstanceProfile`).
+///
+/// The specification carries "the Amazon Resource Name (ARN) of the instance profile"
+/// (`IamInstanceProfileSpecification$Arn`) or "the name of the instance profile"
+/// (`IamInstanceProfileSpecification$Name`) — two spellings of ONE profile, so exactly one
+/// of them identifies it: both together are an `InvalidParameterCombination` and neither is
+/// a `MissingParameter`. A name is reported as the ARN the profile of THIS account holds
+/// under that name, so an association records one spelling of the profile however the
+/// request named it.
+///
+/// The ONE reading of that member, shared by every operation that takes one, so two of them
+/// cannot accept different values for one profile. The reference is stored as the request
+/// named it rather than resolved against IAM's own records, which is how this service treats
+/// every IAM reference a request carries (`CreateLaunchTemplate` stores a launch template's
+/// `IamInstanceProfile` verbatim); `IamInstanceProfile$Id` is IAM's own id for the profile,
+/// which this service holds no record of, so an association reports the ARN and no id.
+pub fn resolve_iam_instance_profile<E>(
+    specification: &IamInstanceProfileSpecification,
+) -> Result<IamInstanceProfile, Scaffolded<E>> {
+    // ec2Query carries an omitted member and an empty one identically, and an empty value
+    // names no profile either way, so both read as "not given".
+    let arn = specification
+        .arn
+        .as_deref()
+        .filter(|arn| !arn.is_empty());
+    let name = specification
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty());
+    match (arn, name) {
+        (Some(_), Some(_)) => Err(invalid_parameter_combination(
+            "Specify either iamInstanceProfile.name or iamInstanceProfile.arn, but not both",
+        )),
+        (None, None) => Err(missing_parameter(
+            "Either iamInstanceProfile.name or iamInstanceProfile.arn must be specified",
+        )),
+        (Some(arn), None) => {
+            if !iam_instance_profile_arn_is_well_formed(arn) {
+                return Err(invalid_parameter_value(format!(
+                    "Value ({arn}) for parameter iamInstanceProfile.arn is invalid. \
+                     Invalid IAM Instance Profile ARN"
+                )));
+            }
+            Ok(IamInstanceProfile {
+                arn: Some(arn.to_string()),
+                id: None,
+            })
+        }
+        (None, Some(name)) => {
+            if !iam_instance_profile_name_is_well_formed(name) {
+                return Err(invalid_parameter_value(format!(
+                    "Value ({name}) for parameter iamInstanceProfile.name is invalid. \
+                     Invalid IAM Instance Profile name"
+                )));
+            }
+            Ok(IamInstanceProfile {
+                arn: Some(::engine::emulator_arn(
+                    "iam",
+                    "",
+                    &format!("{IAM_INSTANCE_PROFILE_RESOURCE_PREFIX}{name}"),
+                )),
+                id: None,
+            })
+        }
+    }
+}
