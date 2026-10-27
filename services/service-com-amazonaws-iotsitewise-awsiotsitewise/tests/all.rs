@@ -273,6 +273,8 @@ mod describe_pipeline_reads;
 // In its alphabetical place inside the sorted list, rather than appended after
 // it: the end of this file is where every concurrent iotsitewise change appends a
 // declaration of its own, and each append there collided with this one.
+#[path = "all/describe_portal_reads.rs"]
+mod describe_portal_reads;
 #[path = "all/describe_search_reads.rs"]
 mod describe_search_reads;
 #[path = "all/describe_storage_configuration_reads.rs"]
