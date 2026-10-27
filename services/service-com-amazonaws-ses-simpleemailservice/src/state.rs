@@ -18,7 +18,8 @@
 //! entries, each identity's sending-authorization policies at
 //! [`MAX_IDENTITY_POLICIES`] documents of [`MAX_POLICY_BYTES`], the configuration
 //! sets at [`MAX_CONFIGURATION_SETS`], the receipt rule sets at
-//! [`MAX_RECEIPT_RULE_SETS`], the receipt IP address filters at
+//! [`MAX_RECEIPT_RULE_SETS`] with each set's rules at
+//! [`MAX_RECEIPT_RULES_PER_RULE_SET`], the receipt IP address filters at
 //! [`MAX_RECEIPT_FILTERS`], and the send log
 //! at the activity its longest report covers, with that retention's expiry
 //! applied on append ([`ComAmazonawsSesSimpleemailserviceState::log_sent_message`])
@@ -116,6 +117,19 @@ pub const MAX_RECEIPT_RULE_SETS: usize = 20;
 /// `CreateReceiptRuleSetRequest$RuleSetName`): the name must "Contain 64
 /// characters or fewer".
 pub const MAX_RECEIPT_RULE_SET_NAME: usize = 64;
+
+/// The receipt rules ONE rule set may hold, and so the ceiling on a set's rule
+/// list: SES documents a limit of 200 receipt rules per receipt rule set, and an
+/// addition past it is refused with the modelled `LimitExceeded` rather than
+/// letting caller input grow one set without end.
+pub const MAX_RECEIPT_RULES_PER_RULE_SET: usize = 200;
+
+/// The longest name a receipt rule may carry.
+///
+/// `ReceiptRule$Name` documents the same ceiling the rule set names carry
+/// ("Contain 64 characters or fewer"), so this is that constant rather than a
+/// second copy of the number.
+pub const MAX_RECEIPT_RULE_NAME: usize = MAX_RECEIPT_RULE_SET_NAME;
 
 /// The receipt IP address filters one account may hold, and so the ceiling on
 /// the filter store: SES documents a limit of 100 receipt filters per AWS
@@ -711,8 +725,42 @@ pub struct ReceiptRuleSet {
     /// When the set was created, reported as
     /// `ReceiptRuleSetMetadata$CreatedTimestamp`.
     pub created_at: SystemTime,
-    /// The set's rules, in the order SES applies them.
+    /// The set's rules, in the order SES applies them. Grown ONLY through
+    /// [`Self::insert_rule`], which is where its ceiling
+    /// ([`MAX_RECEIPT_RULES_PER_RULE_SET`]) is applied; a handler that pushed
+    /// here directly would let caller input grow one set without end.
     pub rules: Vec<crate::ops::types::ReceiptRule>,
+}
+
+impl ReceiptRuleSet {
+    /// Where the rule named `name` sits in this set's ordered rule list, and
+    /// `None` when the set holds no rule of that name.
+    ///
+    /// A rule's position is what the order incoming mail is evaluated in is made
+    /// of, so every operation that places a rule relative to another one reads
+    /// it from here.
+    pub fn rule_position(&self, name: &str) -> Option<usize> {
+        self.rules.iter().position(|held| held.name == name)
+    }
+
+    /// Add `rule` to this set at `at`, the position it is to occupy in the
+    /// evaluation order, pushing the rules from that position on one place
+    /// later.
+    ///
+    /// The caller has already decided that the rule's name is free — a name the
+    /// set already holds is a naming conflict, which the creating operation
+    /// answers with its own modelled `AlreadyExists` — so this only applies the
+    /// set's own ceiling: `false`, having stored nothing, when the set already
+    /// holds [`MAX_RECEIPT_RULES_PER_RULE_SET`] rules, which the caller refuses
+    /// with the modelled `LimitExceeded` rather than growing the list past the
+    /// limit. A position past the end appends, so the list keeps no gaps.
+    pub fn insert_rule(&mut self, rule: crate::ops::types::ReceiptRule, at: usize) -> bool {
+        if self.rules.len() >= MAX_RECEIPT_RULES_PER_RULE_SET {
+            return false;
+        }
+        self.rules.insert(at.min(self.rules.len()), rule);
+        true
+    }
 }
 
 /// Per-service state for com-amazonaws-ses-simpleemailservice. A handler reaches it through [`service_state`].
@@ -1258,23 +1306,47 @@ fn statistics_period_start(at: SystemTime) -> Option<u64> {
     Some(since_epoch - since_epoch % period)
 }
 
-/// Whether `value` is a receipt rule or rule set name in the form SES documents.
+/// Whether `value` is a receipt rule set name in the form SES documents.
 ///
-/// The model states the rule on every `ReceiptRuleSetName` and `ReceiptRuleName`
-/// member (e.g. `CloneReceiptRuleSetRequest$RuleSetName`): the name must
-/// "Contain only ASCII letters (a-z, A-Z), numbers (0-9), underscores (_), or
-/// dashes (-)", "Start and end with a letter or number", and "Contain 64
-/// characters or fewer" ([`MAX_RECEIPT_RULE_SET_NAME`]).
+/// The model states the rule on every `ReceiptRuleSetName` member (e.g.
+/// `CreateReceiptRuleSetRequest$RuleSetName`): the name must "Contain only ASCII
+/// letters (a-z, A-Z), numbers (0-9), underscores (_), or dashes (-)", "Start
+/// and end with a letter or number", and "Contain 64 characters or fewer"
+/// ([`MAX_RECEIPT_RULE_SET_NAME`]).
 pub fn is_receipt_rule_set_name(value: &str) -> bool {
+    is_receipt_name(value, false)
+}
+
+/// Whether `value` is a receipt RULE name in the form SES documents.
+///
+/// `ReceiptRule$Name` states the same three clauses a rule set name carries with
+/// one more character admitted: the name must "Contain only ASCII letters (a-z,
+/// A-Z), numbers (0-9), underscores (_), dashes (-), or periods (.)", "Start and
+/// end with a letter or number", and "Contain 64 characters or fewer"
+/// ([`MAX_RECEIPT_RULE_NAME`]). So the two names are read through ONE reading
+/// ([`is_receipt_name`]) that differs only in whether the period is admitted,
+/// rather than two copies of the same three clauses.
+pub fn is_receipt_rule_name(value: &str) -> bool {
+    is_receipt_name(value, true)
+}
+
+/// The reading both receipt names share: 7-bit ASCII letters, numbers,
+/// underscores and dashes — and periods when `periods_admitted`, as a rule's own
+/// name admits them — a letter or number at each end, and at most
+/// [`MAX_RECEIPT_RULE_SET_NAME`] characters. The empty string ends with no letter
+/// or number, so it is neither name.
+fn is_receipt_name(value: &str, periods_admitted: bool) -> bool {
     let mut characters = value.chars();
     let Some(first) = characters.next() else {
         return false;
     };
     let last = characters.next_back().unwrap_or(first);
     value.len() <= MAX_RECEIPT_RULE_SET_NAME
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '-')
+                || (periods_admitted && character == '.')
+        })
         && first.is_ascii_alphanumeric()
         && last.is_ascii_alphanumeric()
 }
@@ -1282,11 +1354,11 @@ pub fn is_receipt_rule_set_name(value: &str) -> bool {
 /// Whether `value` is a receipt IP address filter name in the form SES
 /// documents.
 ///
-/// `ReceiptFilter$Name` states the same three clauses the receipt rule and rule
-/// set names carry — ASCII letters, numbers, underscores or dashes only, a
-/// letter or number at each end, and [`MAX_RECEIPT_FILTER_NAME`] characters or
-/// fewer — so the value is read through [`is_receipt_rule_set_name`] instead of
-/// repeating them.
+/// `ReceiptFilter$Name` states the same three clauses the receipt rule set name
+/// carries — ASCII letters, numbers, underscores or dashes only, a letter or
+/// number at each end, and [`MAX_RECEIPT_FILTER_NAME`] characters or fewer — so
+/// the value is read through [`is_receipt_rule_set_name`] instead of repeating
+/// them.
 pub fn is_receipt_filter_name(value: &str) -> bool {
     is_receipt_rule_set_name(value)
 }
@@ -1459,6 +1531,239 @@ const SNS_ARN_VENDOR: &str = "sns";
 /// (`engine::emulator_arn` writes `arn:aws:…`), so an ARN of another partition
 /// names a resource in a partition this emulator does not serve.
 const ARN_PARTITION: &str = "aws";
+
+/// The vendor field of an Amazon Web Services Lambda ARN
+/// (`aws.api#service$arnNamespace`): the third field of a function ARN.
+const LAMBDA_ARN_VENDOR: &str = "lambda";
+
+/// The vendor field of an Amazon Web Services KMS ARN: the third field of a key
+/// or alias ARN.
+const KMS_ARN_VENDOR: &str = "kms";
+
+/// The resource type a KMS customer managed key's ARN addresses
+/// (`arn:aws:kms:<region>:<account>:key/<id>`).
+const KMS_KEY_RESOURCE_TYPE: &str = "key";
+
+/// The resource type a KMS alias ARN addresses, which is the form
+/// `S3Action$KmsKeyArn` documents for the managed key
+/// (`arn:aws:kms:<region>:<account>:alias/aws/ses`).
+const KMS_ALIAS_RESOURCE_TYPE: &str = "alias";
+
+/// Whether `value` is the ARN of an Amazon SNS topic, as a receipt action's
+/// `TopicArn` member documents one ("the Amazon Resource Name (ARN) of the Amazon
+/// SNS topic").
+///
+/// The published form of a topic ARN, read exactly as
+/// [`resolve_sns_topic`] reads it: the vendor is Amazon SNS's, and the resource
+/// field is the topic NAME alone ([`is_sns_topic_name`]), since a topic ARN names
+/// no subresource while a subscription ARN carries a further `:<subscription-id>`
+/// segment. What is deliberately NOT read here is the clause that reading adds —
+/// that the topic belongs to this account and Region — because a receipt action's
+/// topic is one SES publishes to on the account's behalf, and whether SES may
+/// publish to it is Amazon SNS's own state and permissions, which this service
+/// does not hold.
+fn is_sns_topic_arn(value: &str) -> bool {
+    ::service_common::arn::parse_of(value, SNS_ARN_VENDOR)
+        .is_some_and(|arn| is_sns_topic_name(arn.resource))
+}
+
+/// What `LambdaAction$FunctionArn` has to name: the member documents the form,
+/// "An example of an Amazon Web Services Lambda function ARN is
+/// arn:aws:lambda:us-west-2:account-id:function:MyFunction", so the resource type
+/// is `function` and an ARN of another Lambda resource names no function to call.
+const LAMBDA_FUNCTION_ARN: ::service_common::arn::Requirement = ::service_common::arn::Requirement {
+    vendor: LAMBDA_ARN_VENDOR,
+    resource_type: Some("function"),
+    label: "an Amazon Web Services Lambda function",
+};
+
+/// Whether `value` is the ARN of an Amazon Web Services KMS key SES could encrypt
+/// with.
+///
+/// `S3Action$KmsKeyArn` documents both forms a caller may give: "To use the Amazon
+/// Web Services managed key, provide an ARN in the form of
+/// arn:aws:kms:REGION:ACCOUNT-ID-WITHOUT-HYPHENS:alias/aws/ses", and "To use a
+/// customer managed key that you created in Amazon Web Services KMS, provide the
+/// ARN of the customer managed key" — an ARN of the `key` resource. So both
+/// resource types name a key, and an ARN of another vendor or another KMS
+/// resource names none. Read on the ARN alone: whether the key EXISTS is Amazon
+/// Web Services KMS's own state, which this service does not hold.
+fn is_kms_key_arn(value: &str) -> bool {
+    ::service_common::arn::parse_of(value, KMS_ARN_VENDOR).is_some_and(|arn| {
+        arn.resource_type() == KMS_KEY_RESOURCE_TYPE
+            || arn.resource_type() == KMS_ALIAS_RESOURCE_TYPE
+    })
+}
+
+/// Why one action of a receipt rule is an action SES could never take, keyed by
+/// the refusal it is reported as.
+///
+/// The three modelled refusals a receipt action's members carry — one per
+/// downstream service a rule's action reaches — plus the one the `ReceiptAction`
+/// shape itself states and the model declares no error for. Each carries the
+/// message, naming the member and its value, that the operation refusing the rule
+/// renders.
+#[derive(Debug, Clone)]
+pub enum ReceiptActionDefect {
+    /// The entry does not carry exactly one action: `ReceiptAction` documents
+    /// that "An instance of this data type can represent only one action", so an
+    /// entry setting none represents nothing and one setting several represents
+    /// no single action either. The model expresses neither, so the operation
+    /// refuses it through its own 400 channel.
+    NotOneAction { message: String },
+    /// A `TopicArn` member names no Amazon SNS topic to publish to
+    /// (`InvalidSnsTopic`), carrying the value it named as the topic.
+    SnsTopic { topic: String, message: String },
+    /// An `S3Action` names no bucket to write to, or no KMS key to encrypt with
+    /// (`InvalidS3Configuration`), carrying the action's own bucket.
+    S3Configuration { bucket: String, message: String },
+    /// A `LambdaAction` names no Lambda function to call
+    /// (`InvalidLambdaFunction`), carrying the value it named as the function.
+    LambdaFunction { function_arn: String, message: String },
+}
+
+/// The defect of the FIRST action of `actions` SES could never take, and `None`
+/// when every one of them is an action it could.
+///
+/// The ONE reading of a receipt rule's actions, so every operation that stores a
+/// rule holds its actions to the same requirements instead of each keeping its
+/// own copy of them. What is decided is the form of the values the action's
+/// members name: a member the model documents as the ARN of a resource of another
+/// service must name a resource of THAT service ([`is_sns_topic_arn`],
+/// [`LAMBDA_FUNCTION_ARN`], [`is_kms_key_arn`]), and an `S3Action` must name a
+/// bucket. Whether those resources exist, and whether SES may write to them, is
+/// the other service's own state and permissions, which this service does not
+/// hold — so a well-formed ARN is accepted here and the rule is stored.
+pub fn receipt_actions_defect(
+    actions: &[crate::ops::types::ReceiptAction],
+) -> Option<ReceiptActionDefect> {
+    actions
+        .iter()
+        .enumerate()
+        // The awsQuery member path a caller wrote the action at, which is
+        // 1-based, so a refusal names the member the request itself carried.
+        .find_map(|(index, action)| receipt_action_defect(index + 1, action))
+}
+
+/// The defect of ONE action, written at `position` of the rule's action list.
+fn receipt_action_defect(
+    position: usize,
+    action: &crate::ops::types::ReceiptAction,
+) -> Option<ReceiptActionDefect> {
+    let member = |name: &str| format!("Actions.member.{position}.{name}");
+    let set = [
+        action.s3_action.is_some(),
+        action.bounce_action.is_some(),
+        action.workmail_action.is_some(),
+        action.lambda_action.is_some(),
+        action.stop_action.is_some(),
+        action.add_header_action.is_some(),
+        action.sns_action.is_some(),
+        action.connect_action.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if set != 1 {
+        return Some(ReceiptActionDefect::NotOneAction {
+            message: format!("Actions.member.{position} must set exactly one action, got {set}"),
+        });
+    }
+
+    if let Some(s3_action) = &action.s3_action {
+        if s3_action.bucket_name.trim().is_empty() {
+            return Some(ReceiptActionDefect::S3Configuration {
+                bucket: s3_action.bucket_name.clone(),
+                message: format!(
+                    "{} must name an Amazon S3 bucket",
+                    member("S3Action.BucketName")
+                ),
+            });
+        }
+        if let Some(key) = &s3_action.kms_key_arn {
+            if !is_kms_key_arn(key) {
+                return Some(ReceiptActionDefect::S3Configuration {
+                    bucket: s3_action.bucket_name.clone(),
+                    message: format!(
+                        "{} {key:?} must be the ARN of an Amazon Web Services KMS key",
+                        member("S3Action.KmsKeyArn")
+                    ),
+                });
+            }
+        }
+    }
+    if let Some(lambda_action) = &action.lambda_action {
+        if !LAMBDA_FUNCTION_ARN.admits(&lambda_action.function_arn) {
+            return Some(ReceiptActionDefect::LambdaFunction {
+                function_arn: lambda_action.function_arn.clone(),
+                message: format!(
+                    "{} {:?} {}",
+                    member("LambdaAction.FunctionArn"),
+                    lambda_action.function_arn,
+                    LAMBDA_FUNCTION_ARN.phrase()
+                ),
+            });
+        }
+    }
+    // Every action may publish a notification to an Amazon SNS topic, and the
+    // `SNSAction` is nothing but that topic, so the one topic reading covers
+    // them all.
+    let topic_arns = [
+        (
+            "S3Action",
+            action
+                .s3_action
+                .as_ref()
+                .and_then(|set| set.topic_arn.as_deref()),
+        ),
+        (
+            "BounceAction",
+            action
+                .bounce_action
+                .as_ref()
+                .and_then(|set| set.topic_arn.as_deref()),
+        ),
+        (
+            "WorkmailAction",
+            action
+                .workmail_action
+                .as_ref()
+                .and_then(|set| set.topic_arn.as_deref()),
+        ),
+        (
+            "LambdaAction",
+            action
+                .lambda_action
+                .as_ref()
+                .and_then(|set| set.topic_arn.as_deref()),
+        ),
+        (
+            "StopAction",
+            action
+                .stop_action
+                .as_ref()
+                .and_then(|set| set.topic_arn.as_deref()),
+        ),
+        (
+            "SNSAction",
+            action
+                .sns_action
+                .as_ref()
+                .map(|set| set.topic_arn.as_str()),
+        ),
+    ];
+    topic_arns
+        .into_iter()
+        .filter_map(|(action_name, topic_arn)| topic_arn.map(|arn| (action_name, arn)))
+        .find(|(_, topic_arn)| !is_sns_topic_arn(topic_arn))
+        .map(|(action_name, topic_arn)| ReceiptActionDefect::SnsTopic {
+            topic: topic_arn.to_string(),
+            message: format!(
+                "{} {topic_arn:?} must be the ARN of an Amazon SNS topic",
+                member(&format!("{action_name}.TopicArn"))
+            ),
+        })
+}
 
 /// The Region an operation serves a request that carries no SigV4 credential
 /// scope in, which is the Region AWS's own `email` endpoint resolves to without

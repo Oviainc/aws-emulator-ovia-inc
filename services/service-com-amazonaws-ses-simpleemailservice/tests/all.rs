@@ -35,6 +35,8 @@ mod ses_configuration_set_listing;
 mod ses_configuration_set_reputation_metrics;
 #[path = "all/ses_configuration_set_sending_state.rs"]
 mod ses_configuration_set_sending_state;
+#[path = "all/ses_create_receipt_rule.rs"]
+mod ses_create_receipt_rule;
 #[path = "all/ses_custom_verification_email_send.rs"]
 mod ses_custom_verification_email_send;
 #[path = "all/ses_identity_policies.rs"]
