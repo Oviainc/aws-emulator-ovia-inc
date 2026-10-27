@@ -382,6 +382,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Nothing is queued against a control being enabled; `UpdateEnabledControl`
                 // is what parks a configuration here.
                 pending_update: None,
+                // Nothing is tearing this control down either; `DisableControl` is what
+                // parks a removal here.
+                pending_deletion: None,
             },
         );
 
