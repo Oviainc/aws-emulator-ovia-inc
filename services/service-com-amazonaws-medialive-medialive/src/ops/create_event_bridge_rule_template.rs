@@ -220,7 +220,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let event_targets = event_targets(input.event_targets.as_deref())?;
+        // The `EventTargets` rule has ONE owner in `state`, shared with
+        // `UpdateEventBridgeRuleTemplate`, because it is the same member of the
+        // same resource; what is left here is carrying its message in this
+        // operation's own modelled client error.
+        let event_targets = crate::state::event_targets_from_request(
+            input.event_targets.as_deref().unwrap_or_default(),
+        )
+        .map_err(bad_request)?;
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
@@ -280,41 +287,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The target ARNs of the request's `EventTargets`, in the order it listed them.
-///
-/// A template carries at most
-/// [`crate::state::MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS`] targets (the count
-/// the model can report is `__integerMax5`), each one an ARN of the two kinds the
-/// member documents ("Target ARNs must be either an SNS topic or CloudWatch log
-/// group") and within the length its target shape names.
-fn event_targets(
-    targets: Option<&[EventBridgeRuleTemplateTarget]>,
-) -> Result<Vec<String>, CreateEventBridgeRuleTemplateError> {
-    let targets = targets.unwrap_or_default();
-    if targets.len() > crate::state::MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS {
-        return Err(bad_request(format!(
-            "eventTargets must carry at most {} targets, but carried {}",
-            crate::state::MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS,
-            targets.len()
-        )));
-    }
-    for target in targets {
-        bounded(
-            "eventTargets.arn",
-            Some(target.arn.as_str()),
-            1,
-            crate::state::MAX_EVENT_TARGET_ARN_LEN,
-        )?;
-        if !crate::state::is_event_target_arn(&target.arn) {
-            return Err(bad_request(format!(
-                "eventTargets.arn must be the ARN of an SNS topic or a CloudWatch log group, but was {}",
-                target.arn
-            )));
-        }
-    }
-    Ok(targets.iter().map(|target| target.arn.clone()).collect())
-}
-
 /// Turn a store refusal into this operation's own modelled error: a group the
 /// region does not hold is its 404, a name the region already uses its 409, and a
 /// full store its 429.
@@ -354,24 +326,15 @@ fn refused(
 }
 
 /// Refuse a member whose length is outside the bounds its target shape names,
-/// with the operation's own modelled client error and a message built from the
-/// request: the member, the bound and the length that broke it.
+/// with the operation's own modelled client error carrying the message the
+/// shared length rule ([`crate::state::bounded_length`]) states.
 fn bounded(
     member: &str,
     value: Option<&str>,
     min: usize,
     max: usize,
 ) -> Result<(), CreateEventBridgeRuleTemplateError> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let len = value.chars().count();
-    if len >= min && len <= max {
-        return Ok(());
-    }
-    Err(bad_request(format!(
-        "{member} must be between {min} and {max} characters long, but was {len}"
-    )))
+    crate::state::bounded_length(member, value, min, max).map_err(bad_request)
 }
 
 /// This operation's modelled 400, for a request the model's own constraints do
