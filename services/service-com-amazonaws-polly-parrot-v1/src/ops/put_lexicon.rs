@@ -343,7 +343,12 @@ fn read_document_element(
 /// refused — the shape of the examples this emulator has seen does not enter into it.
 /// The document element is checked by [`read_document_element`] before anything in
 /// the document is read. Each `<lexeme>`'s replacement elements are measured as they
-/// close, so an oversized one is refused without the document being stored.
+/// close, so an oversized one is refused without the document being stored; what is
+/// measured is the WHOLE character content of the element — every text node under it,
+/// whatever elements that text is nested in and whatever follows them, with a
+/// character written as an entity or character reference counting as the one character
+/// it stands for — so no nesting and no form of escaping can leave part of a
+/// replacement unmeasured.
 pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
     use quick_xml::events::Event;
     use quick_xml::name::ResolveResult;
@@ -353,10 +358,15 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
 
     let mut document_element: Option<DocumentElement> = None;
     let mut lexemes_count: i32 = 0;
-    let mut in_lexeme = false;
-    // The text of the `<alias>`/`<phoneme>` element currently open inside a
-    // `<lexeme>`, accumulated until that element closes.
-    let mut replacement: Option<String> = None;
+    // How many `<lexeme>` elements are open. A count rather than a flag, because a
+    // `<lexeme>` closing inside another must not take its ancestor's contents out of a
+    // lexeme.
+    let mut lexeme_depth: usize = 0;
+    // How many characters of content each `<alias>`/`<phoneme>` currently open inside a
+    // `<lexeme>` has seen, innermost last. A stack, so an element opening inside
+    // another adds a counter rather than displacing one; a count rather than the text
+    // itself, because the quota is the only thing the content is read for.
+    let mut replacements: Vec<usize> = Vec::new();
 
     loop {
         let (resolved, event) = reader
@@ -386,15 +396,19 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
                     "lexeme" if in_pls_namespace => {
                         // An empty `<lexeme/>` opens nothing, so it leaves no element
                         // for a later replacement to be measured inside.
-                        in_lexeme = matches!(event, Event::Start(_));
+                        if matches!(event, Event::Start(_)) {
+                            lexeme_depth = lexeme_depth.saturating_add(1);
+                        }
                         lexemes_count = lexemes_count.saturating_add(1);
                     }
                     // A replacement is the text between the tags, so an EMPTY element
                     // carries none and needs no measuring.
                     "alias" | "phoneme"
-                        if in_pls_namespace && in_lexeme && matches!(event, Event::Start(_)) =>
+                        if in_pls_namespace
+                            && lexeme_depth > 0
+                            && matches!(event, Event::Start(_)) =>
                     {
-                        replacement = Some(String::new());
+                        replacements.push(0usize);
                     }
                     _ => {}
                 }
@@ -403,12 +417,19 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
                 let local_name =
                     String::from_utf8_lossy(element.local_name().as_ref()).to_string();
                 match local_name.as_str() {
-                    "lexeme" if in_pls_namespace => in_lexeme = false,
+                    "lexeme" if in_pls_namespace => {
+                        lexeme_depth = lexeme_depth.saturating_sub(1);
+                    }
                     "alias" | "phoneme" if in_pls_namespace => {
-                        if let Some(text) = replacement.take() {
-                            let length = text.chars().count();
+                        if let Some(length) = replacements.pop() {
                             if length > MAX_LEXEME_CHARACTERS {
                                 return Err(PlsRejection::LexemeTooLong(length));
+                            }
+                            // The content of an element nested in a replacement is
+                            // content of that replacement too, so what closes here
+                            // counts towards the element enclosing it as well.
+                            if let Some(enclosing) = replacements.last_mut() {
+                                *enclosing = enclosing.saturating_add(length);
                             }
                         }
                     }
@@ -416,18 +437,40 @@ pub fn parse_pls(content: &str) -> Result<ParsedLexicon, PlsRejection> {
                 }
             }
             Event::Text(ref text) => {
-                if let Some(open) = replacement.as_mut() {
+                // The innermost open replacement counts the text; the elements around
+                // it count it when that one closes.
+                if let Some(open) = replacements.last_mut() {
                     // Entities stand for the character they name, so the raw bytes
                     // are unescaped before the replacement is measured.
                     let raw = String::from_utf8_lossy(text.as_ref()).to_string();
                     let unescaped = quick_xml::escape::unescape(&raw)
                         .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
-                    open.push_str(unescaped.as_ref());
+                    *open = open.saturating_add(unescaped.chars().count());
                 }
             }
             Event::CData(ref text) => {
-                if let Some(open) = replacement.as_mut() {
-                    open.push_str(&String::from_utf8_lossy(text.as_ref()));
+                // CDATA carries the characters it holds verbatim: that is what it is
+                // for, so nothing in it is resolved before it is measured.
+                if let Some(open) = replacements.last_mut() {
+                    let characters = String::from_utf8_lossy(text.as_ref()).chars().count();
+                    *open = open.saturating_add(characters);
+                }
+            }
+            // The reader BREAKS text at a reference and emits the reference on its own,
+            // so a loop reading only text events would measure none of the characters a
+            // replacement spells with `&amp;` or `&#NN;`.
+            Event::GeneralRef(ref reference) => {
+                if let Some(open) = replacements.last_mut() {
+                    let name = reference
+                        .decode()
+                        .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
+                    // Reconstructed and unescaped so a predefined entity and a numeric
+                    // character reference resolve the same way, and an undefined entity
+                    // stays an error rather than silently measuring as nothing.
+                    let reconstructed = format!("&{name};");
+                    let resolved = quick_xml::escape::unescape(&reconstructed)
+                        .map_err(|e| PlsRejection::NotALexicon(e.to_string()))?;
+                    *open = open.saturating_add(resolved.chars().count());
                 }
             }
             _ => {}

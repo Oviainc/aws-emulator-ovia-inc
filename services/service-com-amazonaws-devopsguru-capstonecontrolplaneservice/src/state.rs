@@ -2709,10 +2709,11 @@ pub const INSIGHT_RESOURCE_TYPE: &str = "INSIGHT";
 /// [`INSIGHT_RESOURCE_TYPE`] gives.
 pub const ANOMALY_RESOURCE_TYPE: &str = "ANOMALY";
 
-/// The `ResourceType` a channel-shaped `ResourceNotFoundException` reports — the kind
-/// of resource the refused `ResourceId` would have named, for the reason
-/// [`INSIGHT_RESOURCE_TYPE`] gives. This is what `RemoveNotificationChannel` reports
-/// for a `NotificationChannelId` that names no stored channel.
+/// The `ResourceType` a channel-shaped `ResourceNotFoundException` would report — the
+/// kind of resource the refused `ResourceId` would have named, for the reason
+/// [`INSIGHT_RESOURCE_TYPE`] gives. No notification-channel operation refuses an id
+/// today: `RemoveNotificationChannel` is a terminal, idempotent deletion, so an id
+/// naming no stored channel is a no-op success rather than a refusal.
 pub const NOTIFICATION_CHANNEL_RESOURCE_TYPE: &str = "NOTIFICATION_CHANNEL";
 
 /// Before any `UpdateServiceIntegration`, every integration is opted out: a

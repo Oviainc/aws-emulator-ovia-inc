@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for `RemoveNotificationChannel`'s target resolution.
+//! End-to-end tests for `RemoveNotificationChannel`'s deletion contract.
 //!
-//! The RULE these tests pin: a deletion addressed by the identifier of a stored
-//! resource acts on the resource that identifier names, so an identifier naming no
-//! stored resource is refused with the modelled `ResourceNotFoundException` (HTTP 404)
-//! carrying that identifier and its resource type, and changes nothing — only a call
-//! that really deleted the resource answers HTTP 200 with the empty output. For a
-//! notification channel the identifier is the `NotificationChannelId`
-//! `AddNotificationChannel` minted, so the FIRST removal of a channel succeeds and
-//! every later removal of that id, like a removal of an id this account never minted,
-//! is refused.
+//! The RULE these tests pin: removing a notification channel is a TERMINAL, idempotent
+//! deletion — the request carries nothing but the channel id and the response models no
+//! member, so the call's whole contract is that no channel with that id is registered
+//! afterwards. A removal therefore answers HTTP 200 with the empty output for EVERY
+//! well-formed id, deleting the channel when one is registered under it and changing
+//! nothing when none is (an id never minted, or one an earlier removal already freed),
+//! and it never touches another channel.
 //!
 //! The rows differ along what the rule generalises over: where the requested id comes
 //! from (minted and live, minted and already removed, never minted, one hex digit away
@@ -23,8 +21,6 @@
 //! ([`crate::configuration_lifecycle::Emulator`]).
 
 use serde_json::{json, Value};
-
-use service_com_amazonaws_devopsguru_capstonecontrolplaneservice::state::NOTIFICATION_CHANNEL_RESOURCE_TYPE;
 
 use crate::configuration_lifecycle::{Emulator, Reply};
 use crate::mutation_idempotency_and_tenancy::{channel_config, listed_channel_ids, minted_id};
@@ -43,7 +39,7 @@ enum Target {
 
 struct Case {
     name: &'static str,
-    /// Channels minted beside the row's target, which every refusal must leave alone.
+    /// Channels minted beside the row's target, which every removal must leave alone.
     bystanders: usize,
     /// Whether the row mints the channel its target is derived from.
     mint: bool,
@@ -68,48 +64,33 @@ fn one_digit_off(id: &str) -> String {
     altered
 }
 
-/// The `ResourceNotFoundException` a refused removal must carry, about `id`.
-fn assert_refused(case: &str, attempt: usize, id: &str, reply: &Reply) {
+/// What every removal of a well-formed id must look like: HTTP 200, the empty
+/// `RemoveNotificationChannelResponse` body, and no error of any kind.
+fn assert_empty_success(case: &str, attempt: usize, id: &str, reply: &Reply) {
     assert_eq!(
-        reply.status, 404,
-        "case {case:?}: removal {attempt} of {id:?} must be refused with 404, got status {} body {}",
+        reply.status, 200,
+        "case {case:?}: removal {attempt} of {id:?} must succeed, got status {} body {}",
         reply.status, reply.raw
     );
-    assert!(
-        reply.names_error("ResourceNotFoundException"),
-        "case {case:?}: removal {attempt} of {id:?} must name a ResourceNotFoundException, got {}",
+    assert_eq!(
+        reply.body,
+        json!({}),
+        "case {case:?}: removal {attempt} of {id:?} must report the empty output, got {}",
         reply.raw
     );
-    let resource_id = reply.at("/ResourceId").and_then(Value::as_str);
-    assert_eq!(
-        resource_id,
-        Some(id),
-        "case {case:?}: removal {attempt} must report ResourceId {id:?}, got {resource_id:?}"
-    );
-    let resource_type = reply.at("/ResourceType").and_then(Value::as_str);
-    assert_eq!(
-        resource_type,
-        Some(NOTIFICATION_CHANNEL_RESOURCE_TYPE),
-        "case {case:?}: removal {attempt} must report ResourceType \
-         {NOTIFICATION_CHANNEL_RESOURCE_TYPE:?}, got {resource_type:?}"
-    );
-    let message = reply
-        .at("/Message")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     assert!(
-        message.contains(id),
-        "case {case:?}: removal {attempt} must name {id:?} in its message, got {message:?}"
+        reply.error_name.is_empty(),
+        "case {case:?}: removal {attempt} of {id:?} must name no error, got {:?}",
+        reply.error_name
     );
 }
 
-/// RULE: a removal addressed by a resource identifier acts on the resource that
-/// identifier names — the first removal of a channel succeeds with the empty output, and
-/// an id that names no stored channel (never minted, or already removed) is refused with
-/// `ResourceNotFoundException` (404) naming the id and the channel resource type,
-/// leaving every other channel exactly as it was.
+/// RULE: removing a notification channel is terminal and idempotent — every well-formed
+/// id answers HTTP 200 with the empty output, the channel registered under that id (if
+/// any) is gone afterwards, and an id naming no channel (never minted, already removed)
+/// changes nothing and leaves every other channel exactly as it was.
 #[tokio::test]
-async fn removing_an_id_that_names_no_channel_is_refused_as_not_found() {
+async fn removing_a_channel_is_an_idempotent_empty_success() {
     let cases = [
         Case {
             name: "an id that was never minted, over an empty store",
@@ -198,35 +179,28 @@ async fn removing_an_id_that_names_no_channel_is_refused_as_not_found() {
                 one_digit_off(minted.as_deref().expect("a OneDigitOff target mints a channel"))
             }
         };
-        // Only a live channel's own id names something to delete; that is the single
-        // removal that succeeds.
+        // Only a live channel's own id names something to delete; every other removal
+        // succeeds without changing the store.
         let deletes_a_channel = matches!(case.target, Target::Minted);
 
         for attempt in 0..case.removals {
             let before = listed_channel_ids(&emulator).await;
             let reply = emulator.remove_notification_channel(&id).await;
-            if attempt == 0 && deletes_a_channel {
-                assert_eq!(
-                    reply.status, 200,
-                    "case {:?}: the first removal of a live channel must succeed, got status {} body {}",
-                    case.name, reply.status, reply.raw
-                );
-                assert_eq!(
-                    reply.body,
-                    json!({}),
-                    "case {:?}: a successful removal must report the empty output, got {}",
-                    case.name,
-                    reply.raw
-                );
+            assert_empty_success(case.name, attempt, &id, &reply);
+
+            let after = listed_channel_ids(&emulator).await;
+            let expected_after: Vec<String> = if attempt == 0 && deletes_a_channel {
+                before.iter().filter(|held| *held != &id).cloned().collect()
             } else {
-                assert_refused(case.name, attempt, &id, &reply);
-                let after = listed_channel_ids(&emulator).await;
-                assert_eq!(
-                    after, before,
-                    "case {:?}: removal {attempt} was refused, so the store must be unchanged: expected {before:?}, got {after:?}",
-                    case.name
-                );
-            }
+                // Nothing was registered under this id any more, so the no-op removal
+                // must leave the collection byte-for-byte as it was.
+                before.clone()
+            };
+            assert_eq!(
+                after, expected_after,
+                "case {:?}: after removal {attempt} of {id:?} expected {expected_after:?} to be held, got {after:?}",
+                case.name
+            );
         }
 
         let remaining = listed_channel_ids(&emulator).await;
@@ -248,13 +222,13 @@ async fn removing_an_id_that_names_no_channel_is_refused_as_not_found() {
 }
 
 /// RULE (the same rule, from the other side): a removal that DID delete a channel frees
-/// the id's resource, so the id then names nothing and the topic may be registered
-/// again — the re-added topic gets a fresh id, and the removed id stays refused.
+/// the id's resource, so the id then names nothing — removing it again is still an empty
+/// success — while the topic may be registered again and gets a fresh id of its own.
 ///
 /// The rows differ in the form of `Config.Filters` the registration carries, which the
 /// rule generalises over.
 #[tokio::test]
-async fn a_removed_id_stays_refused_while_its_topic_can_be_registered_again() {
+async fn a_removed_id_stays_removable_while_its_topic_can_be_registered_again() {
     let cases: [(&str, Value); 4] = [
         ("no filters", json!(null)),
         ("severities only", json!({ "Severities": ["HIGH"] })),
@@ -282,11 +256,7 @@ async fn a_removed_id_stays_refused_while_its_topic_can_be_registered_again() {
         let id = minted_id(&added);
 
         let removed = emulator.remove_notification_channel(&id).await;
-        assert_eq!(
-            removed.status, 200,
-            "case {name:?}: the removal must succeed, got {}",
-            removed.raw
-        );
+        assert_empty_success(name, 0, &id, &removed);
 
         let reused = emulator.add_notification_channel(config.clone()).await;
         assert_eq!(
@@ -300,9 +270,10 @@ async fn a_removed_id_stays_refused_while_its_topic_can_be_registered_again() {
             "case {name:?}: a re-added topic must get a fresh id, got the removed {id:?}"
         );
 
-        // The removed id names nothing even though its topic backs a channel again.
+        // The removed id names nothing even though its topic backs a channel again, so
+        // removing it again is a no-op success that leaves the new channel alone.
         let again = emulator.remove_notification_channel(&id).await;
-        assert_refused(name, 1, &id, &again);
+        assert_empty_success(name, 1, &id, &again);
 
         let remaining = listed_channel_ids(&emulator).await;
         assert_eq!(
@@ -311,14 +282,17 @@ async fn a_removed_id_stays_refused_while_its_topic_can_be_registered_again() {
             "case {name:?}: expected only {reused_id:?} to remain, got {remaining:?}"
         );
 
-        // And the fresh id does name a channel, so removing it succeeds exactly once.
+        // And the fresh id does name a channel, so removing it deletes that channel and
+        // every later removal of it is the same empty success.
         let fresh = emulator.remove_notification_channel(&reused_id).await;
-        assert_eq!(
-            fresh.status, 200,
-            "case {name:?}: removing the re-added channel must succeed, got {}",
-            fresh.raw
-        );
+        assert_empty_success(name, 0, &reused_id, &fresh);
         let fresh_again = emulator.remove_notification_channel(&reused_id).await;
-        assert_refused(name, 1, &reused_id, &fresh_again);
+        assert_empty_success(name, 1, &reused_id, &fresh_again);
+
+        let empty = listed_channel_ids(&emulator).await;
+        assert!(
+            empty.is_empty(),
+            "case {name:?}: expected no channels after both removals, got {empty:?}"
+        );
     }
 }
