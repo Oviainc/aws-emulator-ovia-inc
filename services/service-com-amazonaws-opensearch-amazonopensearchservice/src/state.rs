@@ -43,7 +43,7 @@ use crate::ops::types::{
     CognitoOptions, CognitoOptionsStatus, ConflictException, ConnectionProperties,
     DataSource as LinkedDataSource, DataSourceAttachmentSummary, DataSourceDetails, DataSourceType,
     DeploymentStrategyOptions,
-    DeploymentStrategyOptionsStatus, DomainConfig, DomainEndpointOptions,
+    DeploymentStrategyOptionsStatus, DisabledOperationException, DomainConfig, DomainEndpointOptions,
     DomainEndpointOptionsStatus, DomainInfo, DomainInformationContainer, DomainPackageDetails,
     DomainStatus, EBSOptions,
     EBSOptionsStatus,
@@ -1969,6 +1969,49 @@ pub const CONNECTION_STATUS_PENDING_ACCEPTANCE: &str = "PENDING_ACCEPTANCE";
 /// ends up, instead of waiting for a decision no owner can make.
 pub const CONNECTION_STATUS_VALIDATION_FAILED: &str = "VALIDATION_FAILED";
 
+/// `InboundConnectionStatusCode`'s (and `OutboundConnectionStatusCode`'s) `APPROVED`:
+/// where the destination domain owner's acceptance puts a connection that was waiting
+/// for their decision, before the connection itself is in place.
+pub const CONNECTION_STATUS_APPROVED: &str = "APPROVED";
+
+/// `InboundConnectionStatusCode`'s `PROVISIONING`: "Inbound connection is being
+/// provisioned" — the step between an approved request and a usable connection.
+pub const CONNECTION_STATUS_PROVISIONING: &str = "PROVISIONING";
+
+/// `InboundConnectionStatusCode`'s `ACTIVE`: "Inbound connection is active and ready
+/// to use" — where an approved connection ends up once it is in place.
+pub const CONNECTION_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `InboundConnectionStatusCode`'s `REJECTING`: "Inbound connection rejection is in
+/// process" — where the destination domain owner's refusal of a request puts it.
+pub const CONNECTION_STATUS_REJECTING: &str = "REJECTING";
+
+/// `InboundConnectionStatusCode`'s `REJECTED`: "Inbound connection is rejected" —
+/// where a refused request comes to rest.
+pub const CONNECTION_STATUS_REJECTED: &str = "REJECTED";
+
+/// `InboundConnectionStatusCode`'s (and `OutboundConnectionStatusCode`'s) `DELETING`:
+/// "Inbound connection deletion is in progress" — where a delete leaves the record
+/// while the connection is being taken down.
+pub const CONNECTION_STATUS_DELETING: &str = "DELETING";
+
+/// `InboundConnectionStatusCode`'s `DELETED`: "Inbound connection is deleted and can
+/// no longer be used" — where a deleted connection comes to rest, and is still
+/// reported from, until the store releases the record ([`CONNECTION_RETENTION`]).
+pub const CONNECTION_STATUS_DELETED: &str = "DELETED";
+
+/// How long a deleted cross-cluster connection is still reported before the store
+/// takes the record out.
+///
+/// A deletion does not make the connection unreportable the instant it is asked for:
+/// the record rests in [`CONNECTION_STATUS_DELETED`], which is what tells a caller
+/// polling the connection it asked to delete that the deletion finished, rather than
+/// leaving it to tell a finished deletion from an id it got wrong. Longer than
+/// [`PROVISIONING`], so the deleted status is observable, and bounded, so the slot the
+/// record holds against [`CONNECTION_QUOTA`] is released: the span is the emulator's
+/// own choice, as AWS documents no window for it.
+pub const CONNECTION_RETENTION: Duration = Duration::from_secs(5);
+
 /// How many cross-cluster connections ONE source domain holds before
 /// `CreateOutboundConnection` refuses with the modelled `LimitExceededException`.
 ///
@@ -2054,6 +2097,15 @@ pub struct Connection {
     pub status_message: Option<String>,
     /// The status move the clock owes this connection, if any is outstanding.
     pub owed: Option<OwedStatus>,
+    /// When the clock takes this connection out of the store, for one a delete has
+    /// asked to remove; `None` for one no call has asked to remove.
+    ///
+    /// A removal needs its own due instant rather than an [`OwedStatus`], for the same
+    /// reason a package association's does ([`PackageAssociation::removal_due`]): the
+    /// record comes to rest in [`CONNECTION_STATUS_DELETED`] and is then GONE rather
+    /// than resting in a further status, and it is the removal that releases the slot
+    /// it held against [`CONNECTION_QUOTA`].
+    pub removal_due: Option<SystemTime>,
 }
 
 impl Connection {
@@ -2063,15 +2115,34 @@ impl Connection {
     ///
     /// This is the only write a reporting operation makes, and it writes only what
     /// was already owed at the same instant had nobody called.
+    ///
+    /// A status the clock owes may itself owe the next one ([`connection_successor`]),
+    /// so the moves are applied in a loop from the instant each FELL DUE rather than
+    /// from `now`: a caller that reads a connection long after it was accepted sees
+    /// the status it would have reached without them, not one step of its lifecycle
+    /// per call.
     pub fn settle(&mut self, now: SystemTime) {
-        if self.owed.as_ref().is_none_or(|owed| now < owed.due) {
-            return;
+        while let Some(due) = self.owed.as_ref().map(|owed| owed.due) {
+            if now < due {
+                return;
+            }
+            let Some(owed) = self.owed.take() else {
+                return;
+            };
+            self.status = owed.status;
+            self.status_message = owed.message;
+            self.owed = connection_successor(&self.status).map(|status| OwedStatus {
+                status: status.to_string(),
+                message: None,
+                due: due + PROVISIONING,
+            });
         }
-        let Some(owed) = self.owed.take() else {
-            return;
-        };
-        self.status = owed.status;
-        self.status_message = owed.message;
+    }
+
+    /// Whether the clock has taken this connection out of the store by `now`: a
+    /// delete asked for its removal and the span that removal takes has passed.
+    pub fn removed_by(&self, now: SystemTime) -> bool {
+        self.removal_due.is_some_and(|due| now >= due)
     }
 
     /// This record as `OutboundConnection` — the element shape
@@ -2131,6 +2202,24 @@ impl Connection {
             }),
             connection_mode: Some(self.connection_mode.clone()),
         }
+    }
+}
+
+/// The status a connection moves to ON ITS OWN once it has reached `status`, and
+/// `None` where it is somewhere only another call takes it further from.
+///
+/// A connection's lifecycle has steps the service drives and steps a caller drives:
+/// once a domain owner has decided about a request, carrying that decision out is
+/// work the service does, so each of those steps falls due [`PROVISIONING`] after the
+/// previous one rather than waiting for another call. Where a connection waits for a
+/// decision — a validated request waiting to be accepted or rejected — or where it
+/// has come to rest, nothing is owed.
+pub fn connection_successor(status: &str) -> Option<&'static str> {
+    match status {
+        CONNECTION_STATUS_PROVISIONING => Some(CONNECTION_STATUS_ACTIVE),
+        CONNECTION_STATUS_REJECTING => Some(CONNECTION_STATUS_REJECTED),
+        CONNECTION_STATUS_DELETING => Some(CONNECTION_STATUS_DELETED),
+        _ => None,
     }
 }
 
@@ -6518,11 +6607,37 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     }
 
     /// Materialise the status move the clock owes every stored cross-cluster
-    /// connection, for a caller about to report on all of them.
+    /// connection, and take out the ones whose removal has fallen due, for a caller
+    /// about to report on all of them.
     pub fn settle_connections(&mut self, now: SystemTime) {
-        for connection in self.connections.values_mut() {
+        self.connections.retain(|_, connection| {
             connection.settle(now);
+            !connection.removed_by(now)
+        });
+    }
+
+    /// The cross-cluster connection `connection_id` names, with every status move the
+    /// clock owes it already materialised — so an operation on one connection decides
+    /// from the status the record is in at `now`, exactly as a report of the whole set
+    /// would have shown it.
+    ///
+    /// `None` once a delete's removal span has passed: the record is out of the store
+    /// by then, so the id addresses nothing, exactly as in the report.
+    pub fn settled_connection_mut(
+        &mut self,
+        connection_id: &str,
+        now: SystemTime,
+    ) -> Option<&mut Connection> {
+        let removed = {
+            let connection = self.connections.get_mut(connection_id)?;
+            connection.settle(now);
+            connection.removed_by(now)
+        };
+        if removed {
+            self.connections.remove(connection_id);
+            return None;
         }
+        self.connections.get_mut(connection_id)
     }
 
     /// Materialise the status move the clock owes every stored package, for a caller
@@ -7200,6 +7315,38 @@ pub fn datetime(at: SystemTime) -> ::aws_smithy_types::DateTime {
 pub fn domain_not_found(domain_name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Domain not found: {domain_name}")),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an id that addresses no cross-cluster
+/// connection the caller has a view of — one this service never minted, one since
+/// released, or one the caller's side of the connection has nothing to see yet.
+///
+/// The id the request carried is what fills the message, so a caller is told which of
+/// several connections it named could not be resolved.
+pub fn connection_not_found(connection_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Connection ID {connection_id} does not exist")),
+    }
+}
+
+/// The `DisabledOperationException` payload for a decision on a connection that is
+/// not waiting for one.
+///
+/// Accepting or rejecting an inbound connection request is available only while the
+/// request waits for the destination domain owner's decision; past that the
+/// connection is somewhere its lifecycle does not come back from, so the call is not
+/// an operation that connection offers. The refusal names the status the connection
+/// is actually in, so a caller can tell a decision already taken from one the
+/// connection never waited for.
+pub fn connection_decision_unavailable(
+    connection_id: &str,
+    status: &str,
+) -> DisabledOperationException {
+    DisabledOperationException {
+        message: Some(format!(
+            "Connection {connection_id} is in {status} state, not {CONNECTION_STATUS_PENDING_ACCEPTANCE}"
+        )),
     }
 }
 

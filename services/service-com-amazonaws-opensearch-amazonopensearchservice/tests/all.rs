@@ -19,6 +19,8 @@ mod change_progress;
 mod collection_element_refusals;
 #[path = "all/compatible_versions.rs"]
 mod compatible_versions;
+#[path = "all/connection_decisions.rs"]
+mod connection_decisions;
 #[path = "all/cross_cluster_connections.rs"]
 mod cross_cluster_connections;
 #[path = "all/data_source_attachments.rs"]
@@ -47,6 +49,8 @@ mod domain_nodes;
 mod domain_package_listing_cursor;
 #[path = "all/engine_version_resolution.rs"]
 mod engine_version_resolution;
+#[path = "all/inbound_connection_acceptance.rs"]
+mod inbound_connection_acceptance;
 #[path = "all/inbound_connections.rs"]
 mod inbound_connections;
 #[path = "all/index_authorization.rs"]
