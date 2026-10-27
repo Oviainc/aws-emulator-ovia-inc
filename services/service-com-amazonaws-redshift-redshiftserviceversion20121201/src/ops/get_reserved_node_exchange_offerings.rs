@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReservedNodeExchangeOfferings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReservedNodeExchangeOfferings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReservedNodeExchangeOfferings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the offerings one reservation may be exchanged ONTO: the
+//! exchange-target offerings whose payment type, term and usage price are the
+//! reservation's own, under the shared `MaxRecords` window and `Marker` cursor.
+//! `ReservedNodeId` is dereferenced first — a value of a form this service never
+//! mints is a bad parameter value, an unheld one is the modelled
+//! `ReservedNodeNotFoundFault`, and a reservation already exchanged or not yet
+//! active is refused with the fault that names its state.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +158,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReservedNodeExchangeOfferings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReservedNodeExchangeOfferingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReservedNodeExchangeOfferings"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                GetReservedNodeExchangeOfferingsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let read_at = ::std::time::Instant::now();
+
+        let mut store = state.lock();
+        // A reporting operation: the ONE write it makes is materialising the
+        // transitions the clock already owed — a purchase's payment confirmation
+        // and an exchange's completion were due at this instant whether or not
+        // anybody called.
+        store.settle(read_at);
+
+        // "A string representing the node identifier for the DC1 Reserved Node to
+        // be exchanged": the request names the reservation being exchanged, so it
+        // is dereferenced through the rule every exchange operation shares before
+        // any offering is considered.
+        let source = match store.exchangeable_reserved_node(&input.reserved_node_id) {
+            Ok(stored) => stored.node.clone(),
+            Err(refusal) => return Err(refuse(refusal)),
+        };
+
+        // "Returns an array of DC2 ReservedNodeOfferings that matches the payment
+        // type, term, and usage price of the given DC1 reserved node" — the same
+        // rule `AcceptReservedNodeExchange` accepts a target offering by, so a
+        // caller can exchange onto anything this page lists. References into the
+        // published catalog, so only the page served is cloned.
+        let candidates = store.exchange_target_offerings(&source);
+
+        // The same `MaxRecords` window and opaque cursor every paginated Redshift
+        // read shares, so a marker one page hands out resumes the next.
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, candidates.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+        let offerings: Vec<ReservedNodeOffering> = candidates[start..end]
+            .iter()
+            .map(|offering| (*offering).clone())
+            .collect();
+
+        Ok(GetReservedNodeExchangeOfferingsOutput {
+            reserved_node_offerings: Some(offerings),
+            marker: next_marker,
+        })
+    }
+}
+
+/// The modelled fault this operation answers one class of exchange refusal with.
+///
+/// This operation records nothing, so the quota class cannot arrive here; it is
+/// answered as a bad parameter value rather than as a fault its model does not
+/// declare.
+fn refuse(refusal: crate::state::ExchangeRefusal) -> GetReservedNodeExchangeOfferingsError {
+    use crate::state::ExchangeRefusal as R;
+    match refusal {
+        R::InvalidParameterValue(message) | R::QuotaExceeded(message) => {
+            crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+        }
+        R::ReservedNodeNotFound(message) => {
+            GetReservedNodeExchangeOfferingsErrorModeled::ReservedNodeNotFoundFault(
+                ReservedNodeNotFoundFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        R::InvalidReservedNodeState(message) => {
+            GetReservedNodeExchangeOfferingsErrorModeled::InvalidReservedNodeStateFault(
+                InvalidReservedNodeStateFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        R::ReservedNodeAlreadyMigrated(message) => {
+            GetReservedNodeExchangeOfferingsErrorModeled::ReservedNodeAlreadyMigratedFault(
+                ReservedNodeAlreadyMigratedFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }

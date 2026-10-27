@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptReservedNodeExchange
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptReservedNodeExchange`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptReservedNodeExchange::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Exchanges the reservation `ReservedNodeId` names onto the offering
+//! `TargetReservedNodeOfferingId` names: both identifiers are dereferenced
+//! first — a value of a form this service never mints is a bad parameter value,
+//! an unheld reservation and an unpublished offering are the modelled not-found
+//! faults, a reservation already exchanged or not yet active is refused with the
+//! fault that names its state, and an offering the reservation may not be
+//! exchanged onto is the modelled "isn't supported" refusal — and only then is
+//! the exchange recorded: the reservation being exchanged reports `exchanging`,
+//! a new reservation on the target offering is minted for the same number of
+//! nodes, and the request that tracks the exchange becomes readable through
+//! `DescribeReservedNodeExchangeStatus`.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +81,8 @@
 //!   already been exchanged.
 //! * `ReservedNodeNotFoundFault` (HTTP 404) — The specified reserved compute node not found.
 //! * `ReservedNodeOfferingNotFoundFault` (HTTP 404) — Specified offering does not exist.
+//! * `ReservedNodeQuotaExceededFault` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): Request would exceed the user's compute node quota.
 //! * `UnsupportedOperationFault` (HTTP 400) — The requested operation isn't supported.
 
 #[allow(unused_imports)]
@@ -89,12 +94,20 @@ use super::types::*;
 // `AcceptReservedNodeExchangeError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftserviceversion20121201.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `AcceptReservedNodeExchangeError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#AcceptReservedNodeExchange")]
+// The operation's MODELED errors, plus `ReservedNodeQuotaExceededFault` widened in
+// through `extra_errors`: this SERVICE models it ("Request would exceed the user's
+// compute node quota", and `PurchaseReservedNodeOffering` lists it) but this operation
+// does not, and it is the only honest answer for an exchange that would carry the
+// account past the compute-node bound this store holds — the exchange RECORDS a
+// reservation, so it is bounded exactly as a purchase is.
+//
+// `#[operation_error]` accepts only variants the model declares for this operation
+// plus the ones widened in, so the scaffold's `NotImplemented` cannot live here —
+// hence the `AcceptReservedNodeExchangeError` alias below.
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#AcceptReservedNodeExchange",
+    extra_errors = ["ReservedNodeQuotaExceededFault"]
+)]
 #[derive(Debug)]
 pub enum AcceptReservedNodeExchangeErrorModeled {
     DependentServiceUnavailableFault(DependentServiceUnavailableFault),
@@ -103,6 +116,7 @@ pub enum AcceptReservedNodeExchangeErrorModeled {
     ReservedNodeAlreadyMigratedFault(ReservedNodeAlreadyMigratedFault),
     ReservedNodeNotFoundFault(ReservedNodeNotFoundFault),
     ReservedNodeOfferingNotFoundFault(ReservedNodeOfferingNotFoundFault),
+    ReservedNodeQuotaExceededFault(ReservedNodeQuotaExceededFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
 }
 
@@ -155,20 +169,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptReservedNodeExchange` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptReservedNodeExchangeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptReservedNodeExchange"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                AcceptReservedNodeExchangeErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let started = ::std::time::Instant::now();
+
+        // Both identifiers are ones this service MINTED — the reservation's own,
+        // and an offering's ("You can obtain the value for the parameter by
+        // calling GetReservedNodeExchangeOfferings") — so each is ruled out by
+        // its FORM, in the order the request carries them, before any lookup
+        // runs.
+        for (member, value) in [
+            ("ReservedNodeId", &input.reserved_node_id),
+            (
+                "TargetReservedNodeOfferingId",
+                &input.target_reserved_node_offering_id,
+            ),
+        ] {
+            if !st::is_minted_identifier(value) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::malformed_identifier_message(member, value),
+                ));
+            }
+        }
+
+        let mut store = state.lock();
+        // The transitions the clock already owed are materialised before anything
+        // is read off a reservation, so this call decides on the same state a
+        // read would have reported.
+        store.settle(started);
+
+        // "A string representing the node identifier of the DC1 Reserved Node to
+        // be exchanged": the reservation being exchanged, dereferenced through the
+        // rule every exchange operation shares.
+        let source = match store.exchangeable_reserved_node(&input.reserved_node_id) {
+            Ok(stored) => stored.node.clone(),
+            Err(refusal) => return Err(refuse(refusal)),
+        };
+
+        // "The unique identifier of the DC2 Reserved Node offering to be used for
+        // the exchange": an id the catalog does not publish is the modelled
+        // "Specified offering does not exist", worded as every other operation
+        // reading this one catalog words it.
+        let Some(target) = store
+            .reserved_node_offering(&input.target_reserved_node_offering_id)
+            .cloned()
+        else {
+            return Err(
+                AcceptReservedNodeExchangeErrorModeled::ReservedNodeOfferingNotFoundFault(
+                    ReservedNodeOfferingNotFoundFault {
+                        message: Some(format!(
+                            "Reserved node offering not found: '{}'.",
+                            input.target_reserved_node_offering_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The exchange keeps the configuration "(term, payment type, or number of
+        // nodes)" and costs nothing more, so the only offerings it may target are
+        // the ones `GetReservedNodeExchangeOfferings` reports for this
+        // reservation. Any other published offering would change the
+        // configuration, which this operation does not do.
+        let eligible = store
+            .exchange_target_offerings(&source)
+            .iter()
+            .any(|offering| {
+                offering.reserved_node_offering_id == target.reserved_node_offering_id
+            });
+        if !eligible {
+            return Err(
+                AcceptReservedNodeExchangeErrorModeled::UnsupportedOperationFault(
+                    UnsupportedOperationFault {
+                        message: Some(format!(
+                            "Reserved node offering {} does not match the payment type, term and usage price of Reserved Node {}.",
+                            input.target_reserved_node_offering_id, input.reserved_node_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // One rule for what an exchange DOES, held in the store beside the state
+        // it changes, so the reservation it retires, the reservation it mints and
+        // the request that tracks it cannot disagree — and so the compute-node
+        // bound that governs recording a reservation is tested at the record
+        // itself, before anything is stored.
+        let (exchanged, _) = match store.begin_reserved_node_exchange(
+            &input.reserved_node_id,
+            &target,
+            started,
+            ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+        ) {
+            Ok(recorded) => recorded,
+            Err(refusal) => return Err(refuse(refusal)),
+        };
+
+        Ok(AcceptReservedNodeExchangeOutput {
+            exchanged_reserved_node: Some(exchanged),
+        })
+    }
+}
+
+/// The modelled fault this operation answers one class of exchange refusal with.
+///
+/// This operation also models `ReservedNodeAlreadyExistsFault` ("User already
+/// has a reservation with the given identifier"), which no request can reach: the
+/// reservation an exchange mints carries an id the service draws per call, so no
+/// reservation this account holds can already carry it.
+fn refuse(refusal: crate::state::ExchangeRefusal) -> AcceptReservedNodeExchangeError {
+    use crate::state::ExchangeRefusal as R;
+    match refusal {
+        R::InvalidParameterValue(message) => {
+            crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+        }
+        R::QuotaExceeded(message) => {
+            AcceptReservedNodeExchangeErrorModeled::ReservedNodeQuotaExceededFault(
+                ReservedNodeQuotaExceededFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        R::ReservedNodeNotFound(message) => {
+            AcceptReservedNodeExchangeErrorModeled::ReservedNodeNotFoundFault(
+                ReservedNodeNotFoundFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        R::InvalidReservedNodeState(message) => {
+            AcceptReservedNodeExchangeErrorModeled::InvalidReservedNodeStateFault(
+                InvalidReservedNodeStateFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        R::ReservedNodeAlreadyMigrated(message) => {
+            AcceptReservedNodeExchangeErrorModeled::ReservedNodeAlreadyMigratedFault(
+                ReservedNodeAlreadyMigratedFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }

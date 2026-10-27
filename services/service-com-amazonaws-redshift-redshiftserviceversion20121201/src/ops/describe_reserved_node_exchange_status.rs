@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReservedNodeExchangeStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReservedNodeExchangeStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReservedNodeExchangeStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the reserved-node exchange requests this account asked for, under the
+//! shared `MaxRecords` window and `Marker` cursor. The request must say WHICH
+//! exchanges it wants reported — one that names neither a reservation nor an
+//! exchange request is refused on the parameter combination before any lookup —
+//! and each filter is dereferenced: a reservation nobody holds and an exchange
+//! request nobody asked for are the modelled not-found faults, while a
+//! reservation that simply has no exchange yet reports an empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +153,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReservedNodeExchangeStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReservedNodeExchangeStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReservedNodeExchangeStatus"))
+        use crate::state as st;
+
+        // Both filters are optional in the model, but one of them is what says
+        // which exchanges are being reported, so a request that names neither
+        // cannot be served and is refused on the PARAMETER COMBINATION — decided
+        // on the request alone, before the store is reached.
+        if input.reserved_node_id.is_none() && input.reserved_node_exchange_request_id.is_none() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                "You must specify either the ReservedNodeId parameter or the ReservedNodeExchangeRequestId parameter.",
+            ));
+        }
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeReservedNodeExchangeStatusErrorModeled::UnsupportedOperationFault(
+                    UnsupportedOperationFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let read_at = ::std::time::Instant::now();
+
+        let mut store = state.lock();
+        // A reporting operation: the ONE write it makes is materialising the
+        // transitions the clock already owed — an exchange asked for a span ago
+        // was complete at this instant whether or not anybody polled it.
+        store.settle(read_at);
+
+        // "The identifier of the reserved-node exchange request": an id names ONE
+        // request, so an id this account asked for no exchange under is refused
+        // rather than served as an empty page.
+        if let Some(request_id) = input.reserved_node_exchange_request_id.as_deref() {
+            if !st::is_minted_identifier(request_id) {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::malformed_identifier_message("ReservedNodeExchangeRequestId", request_id),
+                ));
+            }
+            if store.reserved_node_exchange(request_id).is_none() {
+                return Err(
+                    DescribeReservedNodeExchangeStatusErrorModeled::ReservedNodeExchangeNotFoundFault(
+                        ReservedNodeExchangeNotFoundFault {
+                            message: Some(st::reserved_node_exchange_not_found_message(request_id)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `ReservedNodeId` names the reservation an exchange was asked FOR, so it
+        // is dereferenced through the rule every exchange operation shares —
+        // except that a reservation's state is no bar to READING its exchanges:
+        // being exchanged is exactly what a caller polls this operation about.
+        if let Some(reserved_node_id) = input.reserved_node_id.as_deref() {
+            if let Err(refusal) = store.held_reserved_node(reserved_node_id) {
+                return Err(refuse(refusal));
+            }
+        }
+
+        // Each filter NARROWS the report: naming both reports the one exchange
+        // that is both of that reservation and under that request id.
+        let selected: Vec<ReservedNodeExchangeStatus> = store
+            .reserved_node_exchanges
+            .iter()
+            .map(|stored| &stored.status)
+            .filter(|status| {
+                input.reserved_node_id.as_deref().is_none_or(|wanted| {
+                    status.source_reserved_node_id.as_deref() == Some(wanted)
+                }) && input
+                    .reserved_node_exchange_request_id
+                    .as_deref()
+                    .is_none_or(|wanted| {
+                        status.reserved_node_exchange_request_id.as_deref() == Some(wanted)
+                    })
+            })
+            .cloned()
+            .collect();
+
+        // The same `MaxRecords` window and opaque cursor every paginated Redshift
+        // read shares, so a marker one page hands out resumes the next.
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, selected.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeReservedNodeExchangeStatusOutput {
+            reserved_node_exchange_status_details: Some(selected[start..end].to_vec()),
+            marker: next_marker,
+        })
+    }
+}
+
+/// The fault this operation answers one class of exchange refusal with.
+///
+/// Only the two classes a READ can reach: this operation never refuses an
+/// exchange for the state its reservation is in and records nothing, so
+/// [`crate::state::ExchangeRefusal::InvalidReservedNodeState`],
+/// [`crate::state::ExchangeRefusal::ReservedNodeAlreadyMigrated`] and
+/// [`crate::state::ExchangeRefusal::QuotaExceeded`] cannot arrive here — and
+/// none is a fault this operation's model declares.
+fn refuse(refusal: crate::state::ExchangeRefusal) -> DescribeReservedNodeExchangeStatusError {
+    use crate::state::ExchangeRefusal as R;
+    match refusal {
+        R::ReservedNodeNotFound(message) => {
+            DescribeReservedNodeExchangeStatusErrorModeled::ReservedNodeNotFoundFault(
+                ReservedNodeNotFoundFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        R::InvalidParameterValue(message)
+        | R::InvalidReservedNodeState(message)
+        | R::ReservedNodeAlreadyMigrated(message)
+        | R::QuotaExceeded(message) => {
+            crate::scaffolded::Scaffolded::invalid_parameter_value(message)
+        }
     }
 }
