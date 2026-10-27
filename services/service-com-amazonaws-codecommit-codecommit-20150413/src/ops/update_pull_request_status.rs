@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The identity whose call moves the status, which is the actor the pull
         // request's event log attributes the change to.
-        let actor = crate::state::caller_identity_arn(ctx.parts());
+        let actor = crate::state::caller_identity_arn(&*self.engine, ctx);
         // Which ids address a pull request is `crate::state`'s rule, so every
         // operation taking a `pullRequestId` agrees about it; this only maps each
         // outcome onto the error THIS operation models for it.

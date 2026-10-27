@@ -8,6 +8,10 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The STS session registry, so the identity this service records for a request is the
+# principal the credential it was signed with was minted for (see
+# `crate::state::caller_identity_arn`).
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -40,6 +44,12 @@ diffy = "0.4"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The IAM store, so a test can seed the account's record of which user holds a
+# long-term access key — the record `crate::state::caller_identity_arn` resolves such
+# a key's identity through.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

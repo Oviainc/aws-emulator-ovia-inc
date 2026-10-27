@@ -153,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // "Only comment authors can modify or delete their comments", so who is
         // asking decides whether this edit is allowed.
-        let caller_arn = crate::state::caller_identity_arn(ctx.parts());
+        let caller_arn = crate::state::caller_identity_arn(&*self.engine, ctx);
 
         let comment_id = match crate::state::normalize_comment_id(&input.comment_id) {
             Ok(comment_id) => comment_id.to_string(),

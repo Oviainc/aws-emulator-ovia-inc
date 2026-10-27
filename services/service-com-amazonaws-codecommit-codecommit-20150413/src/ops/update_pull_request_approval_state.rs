@@ -263,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The user is derived from the signed-in account when the request is made":
         // the approval this call records belongs to the identity that MADE it, never
         // to anything the request names.
-        let reviewer = crate::state::caller_identity_arn(ctx.parts());
+        let reviewer = crate::state::caller_identity_arn(&*self.engine, ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // An unreachable store is an internal mounting fault, not a modelled

@@ -289,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to this caller at this instant.
         template.replace_content(
             input.new_rule_content.clone(),
-            crate::state::caller_identity_arn(ctx.parts()),
+            crate::state::caller_identity_arn(&*self.engine, ctx),
             std::time::SystemTime::now(),
         );
 
