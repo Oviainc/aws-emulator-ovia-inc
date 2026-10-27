@@ -169,6 +169,22 @@ pub(crate) async fn create_resource(
     answer.body
 }
 
+/// `CreateResource` for `path_part` under `parent`, answering the created resource's ID —
+/// [`create_resource`] followed by the [`string_member`] read of its `id`.
+///
+/// This crate's one copy of that pair, shared by every suite that stands a resource up to
+/// address it afterwards (`test_invoke_method`, `test_invoke_method_no_integration`,
+/// `stage_invoke`), so none of them writes the read again.
+pub(crate) async fn resource_under(
+    gateway: &Gateway,
+    api: &str,
+    parent: &str,
+    path_part: &str,
+) -> String {
+    let created = create_resource(gateway, api, parent, path_part).await;
+    string_member(&created, "id", &format!("CreateResource({path_part})"))
+}
+
 /// A required string member of a response body, with the case named on failure.
 pub(crate) fn string_member(body: &Value, member: &str, case: &str) -> String {
     body[member]

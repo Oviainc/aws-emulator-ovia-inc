@@ -5,7 +5,8 @@
 //! that method's own records produce for it — the status, the body and the headers its
 //! integration answers with, the execution log of the simulation, and the latency the
 //! simulation took — or `NotFoundException` when the API, the resource or the verb has no
-//! record. Reads only: a simulated invocation changes nothing a later caller sees.
+//! record, or `BadRequestException` when the method it resolves carries no integration to
+//! invoke. Reads only: a simulated invocation changes nothing a later caller sees.
 //!
 //! ## What a simulated invocation resolves
 //!
@@ -26,10 +27,17 @@
 //! likewise unused — the certificate is what API Gateway presents on the HTTPS request to a
 //! backend, and no backend is called — and is reported in the execution log as such.
 //!
-//! An integration this emulator cannot perform (one naming a backend it cannot call, or a
-//! mapping template written in Velocity) is reported exactly as the data plane answers it:
-//! through this API's gateway response for the matching response type, with the reason in
-//! the execution log. Nothing is invented for a backend that never ran.
+//! What this operation invokes is the method's INTEGRATION, so a method carrying none
+//! leaves the call nothing to invoke: that is a precondition of the operation, refused on
+//! its own error channel as `BadRequestException` ([`crate::state::NO_INTEGRATION_DEFINED`])
+//! rather than simulated as a response. A client then tells a half-wired method from a
+//! backend that answered badly, which one simulated 5xx for both cannot.
+//!
+//! An integration that EXISTS and this emulator cannot perform (one naming a backend it
+//! cannot call, or a mapping template written in Velocity) is a different thing, and is
+//! reported exactly as the data plane answers it: through this API's gateway response for
+//! the matching response type, with the reason in the execution log. Nothing is invented
+//! for a backend that never ran.
 //!
 //! ## Shape of an operation
 //!
@@ -321,18 +329,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let api = store
             .rest_apis
             .get(&input.rest_api_id)
-            .ok_or_else(|| not_found(crate::state::no_such_rest_api(&input.rest_api_id)))?;
+            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
         let resource = api
             .resources
             .get(&input.resource_id)
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE.to_string()))?;
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
         // The verb is addressed exactly as `GetMethod` addresses it, so a method is
         // reachable by the spelling it was put under.
         let verb = super::put_method::method_key(&input.http_method);
         let method = resource
             .methods
             .get(&verb)
-            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD.to_string()))?;
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+        // The integration is WHAT a simulated invocation invokes. A method that carries
+        // none cannot be invoked at all, so this is a precondition of the operation —
+        // refused on its error channel before anything is simulated — and not a response
+        // to render. An integration that exists and cannot be PERFORMED is reported
+        // through the API's gateway response further down, which is the data plane's own
+        // answer for it.
+        if method.integration.is_none() {
+            return Err(bad_request(crate::state::NO_INTEGRATION_DEFINED));
+        }
 
         let mut log = ExecutionLog::started_at(
             crate::state::now()
@@ -463,11 +480,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The modelled 400 this operation answers for a request a precondition of the operation
+/// refuses, carrying the fixed sentence the service words that condition as.
+fn bad_request(message: &str) -> TestInvokeMethodError {
+    TestInvokeMethodErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
 /// The modelled 404 this operation answers for an identifier no record of this account
 /// carries, worded as every other reader of the same records words it.
-fn not_found(message: String) -> TestInvokeMethodError {
+fn not_found(message: &str) -> TestInvokeMethodError {
     TestInvokeMethodErrorModeled::NotFoundException(NotFoundException {
-        message: Some(message),
+        message: Some(message.to_string()),
     })
     .into()
 }
