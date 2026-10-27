@@ -29,6 +29,8 @@ mod delete_resource_policy_existence;
 mod entity_reads;
 #[path = "all/entity_type_projections.rs"]
 mod entity_type_projections;
+#[path = "all/filter_validation.rs"]
+mod filter_validation;
 #[path = "all/request_validation.rs"]
 mod request_validation;
 #[path = "all/reserved_tag_keys.rs"]

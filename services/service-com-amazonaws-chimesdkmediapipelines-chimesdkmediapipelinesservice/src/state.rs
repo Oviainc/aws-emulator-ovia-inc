@@ -3,11 +3,11 @@
 //! Engine state for the com-amazonaws-chimesdkmediapipelines-chimesdkmediapipelinesservice service.
 //!
 //! The media-pipeline resources this service mints live here, in ONE store behind
-//! the engine's per-service lock. `MediaCapturePipeline` and the media insights
-//! pipeline CONFIGURATIONS are the kinds wired so far; the sibling kinds
-//! (concatenation, live-connector, stream and insights pipelines, and Kinesis
-//! video stream pools) get their own collections beside [`CapturePipeline`] and
-//! [`InsightsConfiguration`] as their operations are implemented, and
+//! the engine's per-service lock. `MediaCapturePipeline`, `MediaInsightsPipeline`, the
+//! media insights pipeline CONFIGURATIONS and the Kinesis Video Stream POOLS are the kinds
+//! wired so far; the sibling kinds (concatenation, live-connector and stream pipelines)
+//! get their own collections beside [`CapturePipeline`], [`InsightsPipeline`],
+//! [`InsightsConfiguration`] and [`StreamPool`] as their operations are implemented, and
 //! `GetMediaPipeline`/`ListMediaPipelines` read over all of them.
 //!
 //! Besides the store this module holds the few derivations every pipeline handler
@@ -26,11 +26,14 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    BadRequestException, ChimeSdkMeetingConfiguration, MediaCapturePipeline,
-    MediaCapturePipelineSummary, MediaInsightsPipelineConfiguration,
+    BadRequestException, ChimeSdkMeetingConfiguration, ConflictException,
+    KinesisVideoStreamConfiguration, KinesisVideoStreamPoolConfiguration,
+    KinesisVideoStreamPoolSummary, KinesisVideoStreamRecordingSourceRuntimeConfiguration,
+    KinesisVideoStreamSourceRuntimeConfiguration, MediaCapturePipeline,
+    MediaCapturePipelineSummary, MediaInsightsPipeline, MediaInsightsPipelineConfiguration,
     MediaInsightsPipelineConfigurationElement, MediaPipelineSummary, NotFoundException,
-    RealTimeAlertConfiguration, ResourceLimitExceededException, ServiceFailureException,
-    SseAwsKeyManagementParams,
+    RealTimeAlertConfiguration, ResourceLimitExceededException, S3RecordingSinkRuntimeConfiguration,
+    ServiceFailureException, SseAwsKeyManagementParams,
 };
 
 /// The `MediaPipelineStatus` value a freshly created pipeline carries.
@@ -40,6 +43,21 @@ pub const STATUS_INITIALIZING: &str = "Initializing";
 
 /// The `MediaPipelineStatus` value a pipeline reaches once it is running.
 pub const STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// The `MediaPipelineStatus` value a pipeline carries while a caller has paused it
+/// (`UpdateMediaInsightsPipelineStatus` with `Pause`).
+pub const STATUS_PAUSED: &str = "Paused";
+
+/// The `KinesisVideoStreamPoolStatus` a freshly created stream pool carries.
+/// From `smithy_query(query="shape", shape="KinesisVideoStreamPoolStatus")`:
+/// `CREATING | ACTIVE | UPDATING | DELETING | FAILED`.
+pub const POOL_STATUS_CREATING: &str = "CREATING";
+
+/// The `KinesisVideoStreamPoolStatus` a pool reaches once it is usable.
+pub const POOL_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `KinesisVideoStreamPoolStatus` a pool carries while an update is being applied.
+pub const POOL_STATUS_UPDATING: &str = "UPDATING";
 
 /// The `ErrorCode` enum value a `BadRequestException` carries.
 /// From `smithy_query(query="shape", shape="ErrorCode")`.
@@ -166,6 +184,50 @@ pub const MEDIA_PIPELINE_RESOURCE_TYPE: &str = "media-pipeline";
 pub const MEDIA_INSIGHTS_CONFIGURATION_RESOURCE_TYPE: &str =
     "media-insights-pipeline-configuration";
 
+/// The resource TYPE a Kinesis Video Stream pool's ARN carries, as
+/// [`kinesis_video_stream_pool_arn`] derives it.
+pub const KINESIS_VIDEO_STREAM_POOL_RESOURCE_TYPE: &str =
+    "media-pipeline-kinesis-video-stream-pool";
+
+/// A Kinesis Video Stream pool's ARN, in this service's ARN namespace (`chime`):
+/// `arn:aws:chime:<region>:<account>:media-pipeline-kinesis-video-stream-pool/<pool id>`.
+///
+/// The resource part carries the minted `PoolId` rather than the caller's `PoolName`, so
+/// renaming nothing and reusing a freed name cannot make one ARN name two pools; the name
+/// is reported beside it as its own member and resolves the pool too
+/// ([`StreamPool::is_named_by`]).
+pub fn kinesis_video_stream_pool_arn(region: &str, pool_id: &str) -> String {
+    ::engine::emulator_arn(
+        "chime",
+        region,
+        &format!("{KINESIS_VIDEO_STREAM_POOL_RESOURCE_TYPE}/{pool_id}"),
+    )
+}
+
+/// The most Kinesis Video Stream pools this store holds at once.
+///
+/// The same RESOURCE BOUND as [`MAX_CAPTURE_PIPELINES`], for the collection
+/// `CreateMediaPipelineKinesisVideoStreamPool` grows: the real service enforces a
+/// per-account quota and declares `ResourceLimitExceededException` (HTTP 400) on that
+/// operation for it. The number itself is CHOSEN — AWS's quota is not in the model and is
+/// adjustable per account.
+pub const MAX_STREAM_POOLS: usize = 1_000;
+
+/// The most media insights pipelines this store holds at once: the bound for the
+/// collection `CreateMediaInsightsPipeline` grows, for the reason [`MAX_STREAM_POOLS`]
+/// gives, and the modelled `ResourceLimitExceededException` (HTTP 400) when it is reached.
+pub const MAX_INSIGHTS_PIPELINES: usize = 1_000;
+
+/// How long after `CreateMediaPipelineKinesisVideoStreamPool` — and after an update that
+/// changes one — a pool's `CREATING`/`UPDATING -> ACTIVE` transition falls due.
+///
+/// `CREATING` and `UPDATING` are NON-TERMINAL `KinesisVideoStreamPoolStatus` values, so the
+/// real service leaves that transition to its own clock rather than to a caller's call. AWS
+/// publishes no duration for it, so this span is CHOSEN: long enough that a caller reading
+/// straight back still observes the transient status (it is never zero), short enough not
+/// to stall a client workflow.
+pub const POOL_TRANSIENT_TO_ACTIVE: Duration = Duration::from_secs(3);
+
 /// How many tags one resource of THIS service carries at once.
 ///
 /// Its own model bounds `TagList` at 200 members, not the 50 the other Chime models
@@ -271,6 +333,22 @@ pub fn resource_limit_exceeded(message: impl Into<String>) -> ResourceLimitExcee
     }
 }
 
+/// The modelled 409 `ConflictException`, carrying `message`.
+///
+/// Its `Code` member targets the model's `ErrorCode` enum
+/// (`smithy_query(query="shape", shape="ErrorCode")`), which declares no value for a
+/// conflict — `BadRequest | Forbidden | NotFound | ResourceLimitExceeded | ServiceFailure
+/// | ServiceUnavailable | Throttling` — so it is left ABSENT rather than filled with a
+/// value the enum does not carry. The error code a client branches on is the shape name
+/// (`ConflictException`), which the wire envelope carries either way.
+pub fn conflict(message: impl Into<String>) -> ConflictException {
+    ConflictException {
+        code: None,
+        message: Some(message.into()),
+        request_id: Some(next_request_id()),
+    }
+}
+
 /// The `message` a refused pagination token is reported with.
 pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The next-token value is not a valid pagination token.";
 
@@ -321,6 +399,41 @@ pub enum InsightsConfigurationRefused {
     /// cannot refuse, and the store is where it is admitted or not — reported as the
     /// modelled `BadRequestException` (HTTP 400), the input-restriction failure it is.
     TooManyElements(usize),
+}
+
+/// Why the store refused to persist a Kinesis Video Stream pool. A create reports each as
+/// the modelled error named here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamPoolRefused {
+    /// The store already holds [`MAX_STREAM_POOLS`] pools — the modelled
+    /// `ResourceLimitExceededException` (HTTP 400).
+    LimitReached,
+    /// A pool with that name already exists. The name is one of the two forms of the
+    /// `Identifier` every later read, update and delete resolves, so a second pool under
+    /// one name would leave that lookup ambiguous — and the create models
+    /// `ConflictException` (HTTP 409) for exactly a clash with the current state of the
+    /// resource.
+    NameInUse,
+}
+
+/// Why the store refused to persist a media insights pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsightsPipelineRefused {
+    /// The store already holds [`MAX_INSIGHTS_PIPELINES`] pipelines — the modelled
+    /// `ResourceLimitExceededException` (HTTP 400).
+    LimitReached,
+}
+
+/// Why a requested media insights pipeline status change was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusUpdateRefused {
+    /// No pipeline this store holds is named by the identifier — the modelled
+    /// `NotFoundException` (HTTP 404).
+    NoSuchPipeline,
+    /// The pipeline is not in a status the requested change can be made from; the payload
+    /// is the status it is actually in, which is what the refusal reports. The modelled
+    /// `ConflictException` (HTTP 409).
+    WrongStatus(String),
 }
 
 /// How a refusal of too many elements is worded: built from the request (the count it
@@ -461,6 +574,138 @@ impl InsightsConfiguration {
     }
 }
 
+/// One persisted Kinesis Video Stream pool: everything
+/// `CreateMediaPipelineKinesisVideoStreamPool` minted or stored, which is what every later
+/// read renders from.
+#[derive(Debug, Clone)]
+pub struct StreamPool {
+    /// Creation sequence, assigned by
+    /// [`ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState::insert_stream_pool`].
+    /// Monotonic and never reused, so it is a stable pagination cursor.
+    pub seq: u64,
+    pub pool_id: String,
+    pub pool_name: String,
+    pub pool_arn: String,
+    pub pool_status: String,
+    /// The caller's stream configuration, stored as submitted and reported back: it is the
+    /// caller's configuration, not something the service derives.
+    pub stream_configuration: KinesisVideoStreamConfiguration,
+    pub created_timestamp: DateTime,
+    pub updated_timestamp: DateTime,
+    /// When the `CREATING`/`UPDATING -> ACTIVE` transition the clock owes falls due, or
+    /// `None` once it has been materialised. Stored as an instant rather than slept for,
+    /// so the transition is owed whether or not anybody calls.
+    pub active_due_at: Option<SystemTime>,
+}
+
+impl StreamPool {
+    /// Whether `identifier` names this pool. The model documents the `Identifier` label as
+    /// the pool's NAME or its ARN, so both forms resolve here and nothing else does.
+    pub fn is_named_by(&self, identifier: &str) -> bool {
+        self.pool_name == identifier || self.pool_arn == identifier
+    }
+
+    /// This pool as the modelled `KinesisVideoStreamPoolConfiguration` every read returns.
+    ///
+    /// `PoolSize` is left ABSENT: the model documents it as "the size of the video stream
+    /// pool in the configuration" — how many Kinesis Video Streams the pool holds — and
+    /// this emulator provisions no Kinesis Video Stream, so there is no count to report
+    /// and none is invented.
+    pub fn as_modeled(&self) -> KinesisVideoStreamPoolConfiguration {
+        KinesisVideoStreamPoolConfiguration {
+            pool_arn: Some(self.pool_arn.clone()),
+            pool_name: Some(self.pool_name.clone()),
+            pool_id: Some(self.pool_id.clone()),
+            pool_status: Some(self.pool_status.clone()),
+            pool_size: None,
+            stream_configuration: Some(self.stream_configuration.clone()),
+            created_timestamp: Some(self.created_timestamp),
+            updated_timestamp: Some(self.updated_timestamp),
+        }
+    }
+
+    /// This pool as `ListMediaPipelineKinesisVideoStreamPools` summarises it.
+    pub fn as_summary(&self) -> KinesisVideoStreamPoolSummary {
+        KinesisVideoStreamPoolSummary {
+            pool_name: Some(self.pool_name.clone()),
+            pool_id: Some(self.pool_id.clone()),
+            pool_arn: Some(self.pool_arn.clone()),
+        }
+    }
+}
+
+/// One persisted media insights pipeline: everything `CreateMediaInsightsPipeline` minted
+/// or stored, which is what every later read renders from.
+///
+/// The runtime configurations are kept exactly as the caller submitted them. The modelled
+/// `MediaInsightsPipeline` carries no `UpdatedTimestamp`, so a status change moves only the
+/// status.
+#[derive(Debug, Clone)]
+pub struct InsightsPipeline {
+    /// Creation sequence, assigned by
+    /// [`ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState::insert_insights_pipeline`].
+    pub seq: u64,
+    pub media_pipeline_id: String,
+    pub media_pipeline_arn: String,
+    /// The ARN of the configuration the create resolved, as the stored configuration
+    /// carries it.
+    pub configuration_arn: String,
+    pub status: String,
+    pub kinesis_video_stream_source_runtime_configuration:
+        Option<KinesisVideoStreamSourceRuntimeConfiguration>,
+    pub media_insights_runtime_metadata: Option<HashMap<String, String>>,
+    pub kinesis_video_stream_recording_source_runtime_configuration:
+        Option<KinesisVideoStreamRecordingSourceRuntimeConfiguration>,
+    pub s3_recording_sink_runtime_configuration: Option<S3RecordingSinkRuntimeConfiguration>,
+    pub created_timestamp: DateTime,
+    /// When the `Initializing -> InProgress` transition the clock owes falls due, or `None`
+    /// once it has been materialised or the pipeline has been paused.
+    pub in_progress_due_at: Option<SystemTime>,
+}
+
+impl InsightsPipeline {
+    /// Whether `identifier` names this pipeline. The model documents the `Identifier`
+    /// label as the pipeline's ID or its ARN, so both forms resolve here and nothing else
+    /// does.
+    pub fn is_named_by(&self, identifier: &str) -> bool {
+        self.media_pipeline_id == identifier || self.media_pipeline_arn == identifier
+    }
+
+    /// This pipeline as the modelled `MediaInsightsPipeline` every read returns.
+    ///
+    /// `ElementStatuses` is left ABSENT: the model documents it as "the statuses that the
+    /// elements in a media insights pipeline can have during data processing", and this
+    /// emulator runs no processor or sink, so there is no per-element progress to report.
+    pub fn as_modeled(&self) -> MediaInsightsPipeline {
+        MediaInsightsPipeline {
+            media_pipeline_id: Some(self.media_pipeline_id.clone()),
+            media_pipeline_arn: Some(self.media_pipeline_arn.clone()),
+            media_insights_pipeline_configuration_arn: Some(self.configuration_arn.clone()),
+            status: Some(self.status.clone()),
+            kinesis_video_stream_source_runtime_configuration: self
+                .kinesis_video_stream_source_runtime_configuration
+                .clone(),
+            media_insights_runtime_metadata: self.media_insights_runtime_metadata.clone(),
+            kinesis_video_stream_recording_source_runtime_configuration: self
+                .kinesis_video_stream_recording_source_runtime_configuration
+                .clone(),
+            s3_recording_sink_runtime_configuration: self
+                .s3_recording_sink_runtime_configuration
+                .clone(),
+            created_timestamp: Some(self.created_timestamp),
+            element_statuses: None,
+        }
+    }
+
+    /// This pipeline as `ListMediaPipelines` summarises it.
+    pub fn as_pipeline_summary(&self) -> MediaPipelineSummary {
+        MediaPipelineSummary {
+            media_pipeline_id: Some(self.media_pipeline_id.clone()),
+            media_pipeline_arn: Some(self.media_pipeline_arn.clone()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-chimesdkmediapipelines-chimesdkmediapipelinesservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
@@ -486,6 +731,18 @@ pub struct ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState 
     /// [`Self::insert_insights_configuration`], beside the configuration it minted,
     /// and dropped by [`Self::remove_insights_configuration`].
     insights_configuration_tokens: HashMap<String, String>,
+    /// Every created-and-not-deleted Kinesis Video Stream pool, in creation order, so
+    /// paging over it is stable.
+    stream_pools: Vec<StreamPool>,
+    /// `ClientRequestToken -> the pool NAME`, so a replayed create answers with the pool
+    /// the first one minted instead of refusing its name. Bounded exactly as
+    /// [`Self::request_tokens`] is.
+    stream_pool_tokens: HashMap<String, String>,
+    /// Every created-and-not-deleted media insights pipeline, in creation order.
+    insights_pipelines: Vec<InsightsPipeline>,
+    /// `ClientRequestToken -> the pipeline ID`, so a replayed create answers with the
+    /// pipeline the first one minted instead of minting a second.
+    insights_pipeline_tokens: HashMap<String, String>,
     /// The next creation sequence to hand out.
     next_seq: u64,
     /// The id counter, seeded from the clock on first use and advanced through
@@ -497,6 +754,18 @@ impl ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
     /// Mint a fresh `MediaPipelineId`: a lowercase v4 GUID matching the model's
     /// `GuidString` pattern, drawn from this store's own counter.
     pub fn mint_media_pipeline_id(&mut self) -> String {
+        self.mint_guid()
+    }
+
+    /// Mint a fresh `KinesisVideoStreamPoolId`, drawn from the same counter: the model
+    /// bounds that id at 1..256 characters matching `^[0-9a-zA-Z._-]+$`, which a v4 GUID
+    /// satisfies, so the two ids are minted by ONE derivation rather than two.
+    pub fn mint_stream_pool_id(&mut self) -> String {
+        self.mint_guid()
+    }
+
+    /// The next id from this store's counter, as a well-formed lowercase v4 GUID.
+    fn mint_guid(&mut self) -> String {
         if self.id_seed == 0 {
             self.id_seed = seed_from_clock();
         }
@@ -522,6 +791,27 @@ impl ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
             pipeline.status = STATUS_IN_PROGRESS.to_string();
             pipeline.updated_timestamp = timestamp(due);
             pipeline.in_progress_due_at = None;
+        }
+        for pipeline in &mut self.insights_pipelines {
+            let Some(due) = pipeline.in_progress_due_at else {
+                continue;
+            };
+            if now < due {
+                continue;
+            }
+            pipeline.status = STATUS_IN_PROGRESS.to_string();
+            pipeline.in_progress_due_at = None;
+        }
+        for pool in &mut self.stream_pools {
+            let Some(due) = pool.active_due_at else {
+                continue;
+            };
+            if now < due {
+                continue;
+            }
+            pool.pool_status = POOL_STATUS_ACTIVE.to_string();
+            pool.updated_timestamp = timestamp(due);
+            pool.active_due_at = None;
         }
     }
 
@@ -581,41 +871,220 @@ impl ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
         self.capture_pipeline(id)
     }
 
-    /// One page of the capture pipelines, in creation order: the items, and the
-    /// token to resume after them — present ONLY when at least one pipeline
-    /// remains beyond the page.
-    ///
-    /// `next_token` resumes after the cursor it carries; `max_results` truncates.
-    /// An absent `max_results` returns everything remaining — as does a
-    /// non-positive one, which the modelled 1..100 range already refuses at the
-    /// boundary; treating it as "no limit" rather than as a page size of zero keeps
-    /// the function total, so no caller can ever be handed an empty page with no
-    /// resume token while records remain.
+    /// One page of the capture pipelines, in creation order, as
+    /// [`page_by_sequence`] pages every listing of this service.
     pub fn page_capture_pipelines(
         &self,
         next_token: Option<&str>,
         max_results: Option<i32>,
     ) -> Result<(Vec<&CapturePipeline>, Option<String>), InvalidPageToken> {
-        let after = match next_token.filter(|token| !token.is_empty()) {
-            Some(token) => Some(decode_page_token(token)?),
-            None => None,
-        };
-        let remaining: Vec<&CapturePipeline> = self
+        page_by_sequence(
+            self.capture_pipelines
+                .iter()
+                .map(|pipeline| (pipeline.seq, pipeline)),
+            next_token,
+            max_results,
+        )
+    }
+
+    /// One page of EVERY media pipeline this store holds, whatever its kind, summarised as
+    /// `ListMediaPipelines` reports them.
+    ///
+    /// The creation sequence is handed out by one counter across all the kinds, so sorting
+    /// the kinds together by it is the order they were created in — and a page token keeps
+    /// its meaning when a later create adds a pipeline of another kind.
+    pub fn page_media_pipelines(
+        &self,
+        next_token: Option<&str>,
+        max_results: Option<i32>,
+    ) -> Result<(Vec<MediaPipelineSummary>, Option<String>), InvalidPageToken> {
+        let mut every_kind: Vec<(u64, MediaPipelineSummary)> = self
             .capture_pipelines
             .iter()
-            .filter(|pipeline| after.is_none_or(|cursor| pipeline.seq > cursor))
+            .map(|pipeline| (pipeline.seq, pipeline.as_pipeline_summary()))
+            .chain(
+                self.insights_pipelines
+                    .iter()
+                    .map(|pipeline| (pipeline.seq, pipeline.as_pipeline_summary())),
+            )
             .collect();
-        let limit = max_results
-            .filter(|max| *max > 0)
-            .map_or(remaining.len(), |max| max as usize);
-        let more = remaining.len() > limit;
-        let page: Vec<&CapturePipeline> = remaining.into_iter().take(limit).collect();
-        let token = if more {
-            page.last().map(|pipeline| encode_page_token(pipeline.seq))
+        every_kind.sort_by_key(|(seq, _)| *seq);
+        page_by_sequence(every_kind.into_iter(), next_token, max_results)
+    }
+
+    /// One page of the Kinesis Video Stream pools, in creation order.
+    pub fn page_stream_pools(
+        &self,
+        next_token: Option<&str>,
+        max_results: Option<i32>,
+    ) -> Result<(Vec<&StreamPool>, Option<String>), InvalidPageToken> {
+        page_by_sequence(
+            self.stream_pools.iter().map(|pool| (pool.seq, pool)),
+            next_token,
+            max_results,
+        )
+    }
+
+    /// Persist `pool` (and, when the create carried one, the `ClientRequestToken` that
+    /// minted it), assign its creation sequence, and hand back the STORED record so a
+    /// create renders its response from the store.
+    ///
+    /// THE STORE'S BOUND: refuses before growing either collection once the store already
+    /// holds [`MAX_STREAM_POOLS`] pools, and refuses a name another live pool already
+    /// carries — the name is one of the two forms of the `Identifier` every later read,
+    /// update and delete resolves. Both checks are HERE, at the one growth site, so two
+    /// concurrent creates of one name cannot both be admitted: the store lock serialises
+    /// them and the second sees the first's record.
+    pub fn insert_stream_pool(
+        &mut self,
+        mut pool: StreamPool,
+        request_token: Option<String>,
+    ) -> Result<&StreamPool, StreamPoolRefused> {
+        if self.stream_pools.len() >= MAX_STREAM_POOLS {
+            return Err(StreamPoolRefused::LimitReached);
+        }
+        if self
+            .stream_pools
+            .iter()
+            .any(|stored| stored.pool_name == pool.pool_name)
+        {
+            return Err(StreamPoolRefused::NameInUse);
+        }
+        pool.seq = self.next_seq;
+        self.next_seq += 1;
+        if let Some(token) = request_token {
+            self.stream_pool_tokens.insert(token, pool.pool_name.clone());
+        }
+        self.stream_pools.push(pool);
+        Ok(self.stream_pools.last().expect("a pool was just pushed"))
+    }
+
+    /// The pool `identifier` names — its own name or its ARN — or `None` when none was
+    /// created under it or it has been deleted.
+    pub fn stream_pool(&self, identifier: &str) -> Option<&StreamPool> {
+        self.stream_pools
+            .iter()
+            .find(|pool| pool.is_named_by(identifier))
+    }
+
+    /// The pool a previous create minted under `token`, for the idempotent replay.
+    pub fn stream_pool_for_request_token(&self, token: &str) -> Option<&StreamPool> {
+        let name = self.stream_pool_tokens.get(token)?;
+        self.stream_pool(name)
+    }
+
+    /// Apply `data_retention_in_hours` to the pool `identifier` names and start the
+    /// `UPDATING -> ACTIVE` transition the change owes, answering the STORED record.
+    ///
+    /// An update that names no retention change leaves the stored configuration alone and
+    /// still reports the pool, which is what an update carrying no change is.
+    pub fn update_stream_pool(
+        &mut self,
+        identifier: &str,
+        data_retention_in_hours: Option<i32>,
+        now: SystemTime,
+    ) -> Option<&StreamPool> {
+        let pool = self
+            .stream_pools
+            .iter_mut()
+            .find(|pool| pool.is_named_by(identifier))?;
+        if let Some(hours) = data_retention_in_hours {
+            pool.stream_configuration.data_retention_in_hours = Some(hours);
+            pool.pool_status = POOL_STATUS_UPDATING.to_string();
+            pool.updated_timestamp = timestamp(now);
+            pool.active_due_at = Some(now + POOL_TRANSIENT_TO_ACTIVE);
+        }
+        Some(pool)
+    }
+
+    /// Remove the pool `identifier` names, with its idempotency records, and answer its
+    /// ARN so the caller can drop its tags. `None` when there was nothing to remove.
+    pub fn remove_stream_pool(&mut self, identifier: &str) -> Option<String> {
+        let (name, arn) = self
+            .stream_pool(identifier)
+            .map(|pool| (pool.pool_name.clone(), pool.pool_arn.clone()))?;
+        self.stream_pools.retain(|pool| pool.pool_name != name);
+        self.stream_pool_tokens.retain(|_, minted| *minted != name);
+        Some(arn)
+    }
+
+    /// Persist `pipeline` (and, when the create carried one, the `ClientRequestToken` that
+    /// minted it), assign its creation sequence, and hand back the STORED record.
+    ///
+    /// THE STORE'S BOUND: refuses before growing either collection once the store already
+    /// holds [`MAX_INSIGHTS_PIPELINES`] pipelines.
+    pub fn insert_insights_pipeline(
+        &mut self,
+        mut pipeline: InsightsPipeline,
+        request_token: Option<String>,
+    ) -> Result<&InsightsPipeline, InsightsPipelineRefused> {
+        if self.insights_pipelines.len() >= MAX_INSIGHTS_PIPELINES {
+            return Err(InsightsPipelineRefused::LimitReached);
+        }
+        pipeline.seq = self.next_seq;
+        self.next_seq += 1;
+        if let Some(token) = request_token {
+            self.insights_pipeline_tokens
+                .insert(token, pipeline.media_pipeline_id.clone());
+        }
+        self.insights_pipelines.push(pipeline);
+        Ok(self
+            .insights_pipelines
+            .last()
+            .expect("a pipeline was just pushed"))
+    }
+
+    /// The media insights pipeline `identifier` names — its own id or its ARN — or `None`
+    /// when none was created under it.
+    pub fn insights_pipeline(&self, identifier: &str) -> Option<&InsightsPipeline> {
+        self.insights_pipelines
+            .iter()
+            .find(|pipeline| pipeline.is_named_by(identifier))
+    }
+
+    /// The pipeline a previous create minted under `token`, for the idempotent replay.
+    pub fn insights_pipeline_for_request_token(&self, token: &str) -> Option<&InsightsPipeline> {
+        let id = self.insights_pipeline_tokens.get(token)?;
+        self.insights_pipeline(id)
+    }
+
+    /// Pause or resume the media insights pipeline `identifier` names.
+    ///
+    /// `pause` is the requested change (`UpdateStatus` `Pause` / `Resume`). A pause is
+    /// made only from the RUNNING status and a resume only from the paused one: every
+    /// other current status is a clash with the state of the resource, which the operation
+    /// models `ConflictException` for, and the status it clashed with is carried back so
+    /// the refusal can name it. A pause also drops the transition the clock owed, since a
+    /// paused pipeline is not on its way to running.
+    pub fn set_insights_pipeline_paused(
+        &mut self,
+        identifier: &str,
+        pause: bool,
+        now: SystemTime,
+    ) -> Result<&InsightsPipeline, StatusUpdateRefused> {
+        // The status a pause or resume may be made from is decided against the status the
+        // clock already owes, not the one the record happens to still carry.
+        self.settle_clock(now);
+        let pipeline = self
+            .insights_pipelines
+            .iter_mut()
+            .find(|pipeline| pipeline.is_named_by(identifier))
+            .ok_or(StatusUpdateRefused::NoSuchPipeline)?;
+        let from = if pause {
+            STATUS_IN_PROGRESS
         } else {
-            None
+            STATUS_PAUSED
         };
-        Ok((page, token))
+        if pipeline.status != from {
+            return Err(StatusUpdateRefused::WrongStatus(pipeline.status.clone()));
+        }
+        pipeline.status = if pause {
+            STATUS_PAUSED.to_string()
+        } else {
+            STATUS_IN_PROGRESS.to_string()
+        };
+        pipeline.in_progress_due_at = None;
+        Ok(pipeline)
     }
 
     /// Persist `configuration` (and, when the create carried one, the
@@ -709,10 +1178,19 @@ impl ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
     /// check.
     pub fn taggable(&self, arn: &str) -> bool {
         let own_resource_exists = match ::service_common::arn::resource_type(arn) {
+            // Every kind of media pipeline carries this resource type, so the id is
+            // looked for among all the kinds the store holds.
             Some(MEDIA_PIPELINE_RESOURCE_TYPE) => Some(
                 ::service_common::arn::resource_id_of_type(arn, MEDIA_PIPELINE_RESOURCE_TYPE)
-                    .is_some_and(|id| self.capture_pipeline(id).is_some()),
+                    .is_some_and(|id| {
+                        self.capture_pipeline(id).is_some() || self.insights_pipeline(id).is_some()
+                    }),
             ),
+            Some(KINESIS_VIDEO_STREAM_POOL_RESOURCE_TYPE) => {
+                // A pool is named by its ARN as well as by its name, which is what
+                // `StreamPool::is_named_by` reads.
+                Some(self.stream_pool(arn).is_some())
+            }
             // A configuration is named by its ARN as well as by its name, which is what
             // `InsightsConfiguration::is_named_by` reads.
             Some(MEDIA_INSIGHTS_CONFIGURATION_RESOURCE_TYPE) => {
@@ -722,6 +1200,46 @@ impl ComAmazonawsChimesdkmediapipelinesChimesdkmediapipelinesserviceState {
         };
         ::service_common::chime_tags::addresses_taggable_resource(arn, own_resource_exists)
     }
+}
+
+/// One page of records ordered by their creation SEQUENCE: the items, and the token to
+/// resume after them — present ONLY when at least one record remains beyond the page.
+///
+/// `next_token` resumes after the cursor it carries; `max_results` truncates. An absent
+/// `max_results` returns everything remaining — as does a non-positive one, which the
+/// modelled 1..100 range already refuses at the boundary; treating it as "no limit" rather
+/// than as a page size of zero keeps the function total, so no caller can ever be handed an
+/// empty page with no resume token while records remain.
+///
+/// Every listing this service serves pages through here, so the cursor rule is stated once
+/// and the collections cannot drift apart on it. `items` must be in ascending sequence
+/// order, which is the order each collection is held in.
+fn page_by_sequence<T, I>(
+    items: I,
+    next_token: Option<&str>,
+    max_results: Option<i32>,
+) -> Result<(Vec<T>, Option<String>), InvalidPageToken>
+where
+    I: Iterator<Item = (u64, T)>,
+{
+    let after = match next_token.filter(|token| !token.is_empty()) {
+        Some(token) => Some(decode_page_token(token)?),
+        None => None,
+    };
+    let remaining: Vec<(u64, T)> = items
+        .filter(|(seq, _)| after.is_none_or(|cursor| *seq > cursor))
+        .collect();
+    let limit = max_results
+        .filter(|max| *max > 0)
+        .map_or(remaining.len(), |max| max as usize);
+    let more = remaining.len() > limit;
+    let page: Vec<(u64, T)> = remaining.into_iter().take(limit).collect();
+    let token = if more {
+        page.last().map(|(seq, _)| encode_page_token(*seq))
+    } else {
+        None
+    };
+    Ok((page.into_iter().map(|(_, item)| item).collect(), token))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -22,7 +22,7 @@ use crate::ops::types::{
     AssessmentTargetFilter, AssessmentTargetSummary, ChangeSetSummaryListItem, ChangeSummary,
     ContainerProductSummary, ContainerSecuritySummary, ControlAssessment, ControlError,
     DataProductSummary, Entity, EntitySummary, ErrorDetail, ErrorScope,
-    ExpressPrivateOfferConfigurationSummary, FrameworkFilters, FrameworkSummary,
+    ExpressPrivateOfferConfigurationSummary, Filter, FrameworkFilters, FrameworkSummary,
     MachineLearningProductSummary, OfferSetSummary, OfferSummary, ResaleAuthorizationSummary,
     ResourceInUseException, ResourceNotFoundException, SaaSProductSummary, Tag,
     ValidationException,
@@ -134,6 +134,45 @@ pub const DEFAULT_SORT_ORDER: &str = SORT_ORDER_DESCENDING;
 /// same way, whatever order the default happens to be.
 pub fn sorts_descending(sort_order: &str) -> bool {
     sort_order == SORT_ORDER_DESCENDING
+}
+
+/// The attribute one `Filter` selects on and the values it matches, or the
+/// modelled `ValidationException` that refuses the filter.
+///
+/// `Filter$Name` is "the name of the filter, which is unique for each filter
+/// that you want to apply" and names an attribute the list being called filters
+/// on, while `Filter$ValueList` is "the list of values" that filter matches — so
+/// a filter naming no attribute, one naming an attribute this list does not
+/// filter on, and one carrying no value to match are the three ways a filter is
+/// refused, each under the member it is about. This is the one place that
+/// decision is made, so every list operation judges the same `Filter` shape the
+/// same way: `operation` is the list being called and `filtered_on` the
+/// attributes it publishes.
+pub fn filter_predicate(
+    operation: &str,
+    filtered_on: &[&str],
+    filter: Filter,
+) -> Result<(String, Vec<String>), ValidationException> {
+    let Some(name) = filter.name else {
+        return Err(validation(
+            "FilterList.Name",
+            "every filter names an attribute",
+        ));
+    };
+    if !filtered_on.contains(&name.as_str()) {
+        return Err(validation(
+            "FilterList.Name",
+            format!("{operation} filters on {filtered_on:?}, not on {name:?}"),
+        ));
+    }
+    let values = filter.value_list.unwrap_or_default();
+    if values.is_empty() {
+        return Err(validation(
+            "FilterList.ValueList",
+            format!("filter {name} carries no value to match"),
+        ));
+    }
+    Ok((name, values))
 }
 
 /// The details members an entity's `Name` is read from.

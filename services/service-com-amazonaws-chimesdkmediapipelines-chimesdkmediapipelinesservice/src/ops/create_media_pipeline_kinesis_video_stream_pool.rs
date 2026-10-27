@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMediaPipelineKinesisVideoStreamPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMediaPipelineKinesisVideoStreamPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMediaPipelineKinesisVideoStreamPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a Kinesis Video Stream pool and persists it: the pool is minted with its own
+//! id and ARN, starts in the non-terminal `CREATING` status the clock moves to `ACTIVE`,
+//! and a `PoolName` another live pool already carries is the modelled 409
+//! `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMediaPipelineKinesisVideoStreamPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMediaPipelineKinesisVideoStreamPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMediaPipelineKinesisVideoStreamPool"))
+        // Modelled constraints — `PoolName`'s 1..128 length and `^[0-9a-zA-Z._-]+$`
+        // pattern, the stream configuration's `Region` pattern and non-negative
+        // retention, `Tags`' 1..200 and the `ClientRequestToken` pattern — are refused
+        // BEFORE this handler runs, and `service.rs` words that refusal as this service's
+        // 400 `BadRequestException`.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateMediaPipelineKinesisVideoStreamPoolErrorModeled::ServiceFailureException(
+                    crate::state::service_failure("The media pipeline store is unavailable."),
+                )
+                .into(),
+            );
+        };
+        // The tags given at create time go in the family's shared, ARN-keyed tag
+        // directory, which is where the tagging operations read them from; resolved before
+        // anything is written so a create cannot half-succeed.
+        let Some(tag_directory) = crate::state::chime_tags(&*self.engine) else {
+            return Err(
+                CreateMediaPipelineKinesisVideoStreamPoolErrorModeled::ServiceFailureException(
+                    crate::state::service_failure("The Chime tag directory is unavailable."),
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Idempotent replay: the same `ClientRequestToken` answers with the pool the first
+        // create minted rather than refusing its name.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(existing) = store.stream_pool_for_request_token(token) {
+                return Ok(CreateMediaPipelineKinesisVideoStreamPoolOutput {
+                    kinesis_video_stream_pool_configuration: Some(existing.as_modeled()),
+                });
+            }
+        }
+
+        let pool_id = store.mint_stream_pool_id();
+        let created = crate::state::timestamp(now);
+        // Bound once and used both for the record and for the tag directory's key, so a
+        // create-time tag can never be written under a different ARN than the one the
+        // pool carries — nor be dropped for want of one.
+        let pool_arn = crate::state::kinesis_video_stream_pool_arn(
+            &crate::state::request_region(ctx.parts()),
+            &pool_id,
+        );
+        let pool = crate::state::StreamPool {
+            // Replaced by the store, which owns the creation sequence.
+            seq: 0,
+            pool_id,
+            pool_name: input.pool_name,
+            pool_arn: pool_arn.clone(),
+            // `CREATING` is a non-terminal `KinesisVideoStreamPoolStatus`: the move to
+            // `ACTIVE` is the clock's, not a caller's.
+            pool_status: crate::state::POOL_STATUS_CREATING.to_string(),
+            stream_configuration: input.stream_configuration,
+            created_timestamp: created,
+            updated_timestamp: created,
+            active_due_at: Some(now + crate::state::POOL_TRANSIENT_TO_ACTIVE),
+        };
+
+        let stored = match store.insert_stream_pool(pool, input.client_request_token) {
+            Ok(stored) => stored.as_modeled(),
+            // The store is full: the quota the real service enforces, and the modelled
+            // error it declares for it.
+            Err(crate::state::StreamPoolRefused::LimitReached) => {
+                return Err(
+                    CreateMediaPipelineKinesisVideoStreamPoolErrorModeled::ResourceLimitExceededException(
+                        crate::state::resource_limit_exceeded(format!(
+                            "The maximum number of Kinesis Video Stream pools ({}) already \
+                             exists. Delete a pool before creating another.",
+                            crate::state::MAX_STREAM_POOLS
+                        )),
+                    )
+                    .into(),
+                );
+            }
+            // Admission is serialised by the store lock, so of several concurrent creates
+            // of ONE name exactly one is admitted and every other is refused here.
+            Err(crate::state::StreamPoolRefused::NameInUse) => {
+                return Err(
+                    CreateMediaPipelineKinesisVideoStreamPoolErrorModeled::ConflictException(
+                        crate::state::conflict(
+                            "A Kinesis Video Stream pool with that name already exists.",
+                        ),
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // `TagList` is `@length(min: 1)`, so the member is either absent or non-empty.
+        let tags: Vec<(String, String)> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        if !tags.is_empty() {
+            tag_directory
+                .lock()
+                .tag_within(&pool_arn, tags, crate::state::MAX_TAGS_PER_RESOURCE);
+        }
+
+        Ok(CreateMediaPipelineKinesisVideoStreamPoolOutput {
+            kinesis_video_stream_pool_configuration: Some(stored),
+        })
     }
 }
