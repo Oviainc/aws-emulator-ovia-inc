@@ -29,7 +29,10 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_batch_awsbatchv20160810::state;
 
-use crate::job_lifecycle::{arn, compute_environment, error_code, error_message, job_queue, Batch};
+use crate::job_lifecycle::{
+    arn, assert_clock_owed_status, assert_reads_agree, bracketed, compute_environment, error_code,
+    error_message, job_queue, Batch,
+};
 
 /// `UpdateQuotaShare`'s route (`smithy_query(query="operation",
 /// operation="UpdateQuotaShare")`: POST /v1/updatequotashare).
@@ -286,22 +289,20 @@ async fn an_accepted_update_leaves_the_share_in_the_transient_status() {
             "case {case}: a share whose create the clock has settled is VALID, got {settled}"
         );
 
-        batch
-            .ok(UPDATE, update_body(&reference, &update.patch))
-            .await;
-        // The span is never zero, so the transient status is observable.
-        let fresh = described(&batch, &case, &reference).await;
-        assert_eq!(
-            fresh["status"].as_str(),
-            Some(state::STATUS_UPDATING),
-            "case {case}: an updated share is in the transient status, got {fresh}"
+        let accepted = bracketed(batch.ok(UPDATE, update_body(&reference, &update.patch))).await;
+        // The span is never zero, so the transient status is observable — and the bracket
+        // of the update that started it is what makes this read's answer certain.
+        let fresh = bracketed(described(&batch, &case, &reference)).await;
+        assert_clock_owed_status(
+            &case,
+            &fresh,
+            accepted.due_window(),
+            state::STATUS_UPDATING,
+            Some(state::STATUS_VALID),
         );
-        // A read does not advance it: two reads at one instant answer alike.
-        let again = described(&batch, &case, &reference).await;
-        assert_eq!(
-            again, fresh,
-            "case {case}: a read must not change what a later read sees, got {again} then {fresh}"
-        );
+        // A read does not advance it: two reads before the clock owes anything answer alike.
+        let again = bracketed(described(&batch, &case, &reference)).await;
+        assert_reads_agree(&case, &fresh, &again, accepted.due_window());
         references.push((case, reference));
     }
 
