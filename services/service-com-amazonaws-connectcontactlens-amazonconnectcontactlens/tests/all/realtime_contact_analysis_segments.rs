@@ -62,6 +62,15 @@ impl Reply {
             .and_then(Value::as_str)
             .map(str::to_string)
     }
+
+    /// The modeled `Message` member of an error body (the only member the error shapes
+    /// in this service carry).
+    fn message(&self) -> Option<String> {
+        self.body
+            .get("Message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
 }
 
 fn build_engine() -> Arc<engine::InMemoryEngine> {
@@ -746,6 +755,131 @@ async fn an_unknown_session_is_not_found() {
         "case \"seeded pair\": expected HTTP 200, got {} {:?}",
         hit.status, hit.body
     );
+}
+
+/// The message Contact Lens returns with `ResourceNotFoundException`. Fixed text: it is
+/// pinned here as a literal, not read from the crate, so a handler that starts
+/// interpolating the request into it fails this test.
+const NOT_FOUND_MESSAGE: &str = "Real-time contact analysis not found.";
+
+/// The not-found refusal carries the service's FIXED message: the same sentence for every
+/// missing session, with nothing from the request (or from stored state) interpolated into
+/// it, and no member besides `Message` in the body.
+///
+/// The rows vary what the rule generalises over — which half of the key misses, the form
+/// and length of the identifiers (`ContactId`/`InstanceId` are len 1..256, pattern `\S`,
+/// per `smithy_query(query="operation",operation="ListRealtimeContactAnalysisSegments")`),
+/// and whether the session never existed at all or has aged out of the retention window.
+#[tokio::test]
+async fn the_not_found_message_is_the_services_fixed_text() {
+    let longest = "l".repeat(256);
+    let rows: [(&str, &str, &str, bool); 9] = [
+        ("unknown contact", INSTANCE, "contact-does-not-exist", false),
+        ("unknown instance", "inst-does-not-exist", CONTACT, false),
+        ("both unknown", "inst-9", "contact-9", false),
+        ("swapped pair", CONTACT, INSTANCE, false),
+        (
+            "uuid-shaped identifiers",
+            "4cd1aa0d-0000-4000-8000-000000000001",
+            "b5f87632-0000-4000-8000-000000000002",
+            false,
+        ),
+        ("single-character identifiers", "i", "c", false),
+        ("maximum-length identifiers", &longest, &longest, false),
+        ("punctuated identifiers", "inst/9:a|b", "contact%9#d", false),
+        ("session aged out of retention", INSTANCE, CONTACT, true),
+    ];
+
+    for (case, instance, contact, aged_out) in rows {
+        let engine = build_engine();
+        let router = build_router(&engine);
+        // The control session always exists; for the aged-out row it is the requested
+        // pair itself, placed past the retention window.
+        let started_at = if aged_out {
+            SystemTime::now()
+                .checked_sub(VOICE_DATA_RETENTION + Duration::from_secs(60))
+                .expect("a representable start time")
+        } else {
+            SystemTime::now()
+        };
+        seed(
+            &engine,
+            AnalysisSession::new(INSTANCE, CONTACT)
+                .with_segments((0..2).map(transcript_segment))
+                .completed(true)
+                .started_at(started_at),
+        );
+
+        let reply = list(&router, &request(instance, contact, None, None)).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {case:?}: expected HTTP 404, got {} {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            reply.error_type
+        );
+        assert_eq!(
+            reply.message().as_deref(),
+            Some(NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the fixed message {NOT_FOUND_MESSAGE:?}, got {:?}",
+            reply.message()
+        );
+        assert!(
+            reply.body.get("Segments").is_none() && reply.body.get("NextToken").is_none(),
+            "case {case:?}: the error body must carry no output member, got {:?}",
+            reply.body
+        );
+    }
+
+    // The control row: a session inside the window is served, so the refusal above is
+    // the missing session and not a blanket 404.
+    let engine = build_engine();
+    let router = build_router(&engine);
+    seed(
+        &engine,
+        AnalysisSession::new(INSTANCE, CONTACT)
+            .with_segments((0..2).map(transcript_segment))
+            .completed(true),
+    );
+    let hit = list(&router, &request(INSTANCE, CONTACT, None, None)).await;
+    assert_eq!(
+        hit.status, 200,
+        "case \"seeded pair\": expected HTTP 200, got {} {:?}",
+        hit.status, hit.body
+    );
+    assert_eq!(
+        hit.message(),
+        None,
+        "case \"seeded pair\": a served page carries no Message, got {:?}",
+        hit.body
+    );
+}
+
+/// Polling an unknown session repeatedly answers the SAME refusal every time: the message
+/// is state-independent, so it cannot drift between calls.
+#[tokio::test]
+async fn repeated_polls_of_an_unknown_session_answer_identically() {
+    let engine = build_engine();
+    let router = build_router(&engine);
+    seed(
+        &engine,
+        AnalysisSession::new(INSTANCE, CONTACT).with_segments((0..2).map(transcript_segment)),
+    );
+
+    for poll in 0..4 {
+        let reply = list(&router, &request(INSTANCE, "never-a-contact", None, None)).await;
+        assert_eq!(
+            (reply.status, reply.message().as_deref()),
+            (404, Some(NOT_FOUND_MESSAGE)),
+            "case \"poll {poll}\": expected 404 with the fixed message, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+    }
 }
 
 /// A `NextToken` the service did not mint for THIS contact is `InvalidRequestException`
