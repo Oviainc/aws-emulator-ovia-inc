@@ -88,10 +88,11 @@
 //! `COMPLETED`, or to `CANCELLED` once a cancel has asked for it.
 //!
 //! And it holds the Automated Reasoning policy tests
-//! `ops/create_automated_reasoning_policy_test_case.rs` mints and
-//! `ops/get_automated_reasoning_policy_test_case.rs` reads back, each keyed by the policy it
+//! `ops/create_automated_reasoning_policy_test_case.rs` mints,
+//! `ops/get_automated_reasoning_policy_test_case.rs` reads back and
+//! `ops/delete_automated_reasoning_policy_test_case.rs` removes, each keyed by the policy it
 //! was created under, so a test created by one request is the test every later request
-//! sees.
+//! sees — and a test one request deleted is a test no later request finds.
 //!
 //! And it holds the runs of those tests —
 //! `ops/start_automated_reasoning_policy_test_workflow.rs` schedules them against a built
@@ -2350,6 +2351,24 @@ pub struct AutomatedReasoningPolicyVersionRecord {
 /// this part of the store from growing without end, since a test carries no name a second
 /// create of it could collide with.
 pub const MAX_AUTOMATED_REASONING_POLICY_TEST_CASES_PER_POLICY: usize = 1000;
+
+/// What a request addressing a test this store does not hold answers as its
+/// `ResourceNotFoundException` message, wherever that request came from: a read of the test
+/// itself, or a read of a run of it.
+///
+/// RECORDED behaviour: Amazon Bedrock names the test and then the policy the request
+/// addressed, so the wording is fixed and both ids are variable parts taken from the
+/// request. Stated once here because the message belongs to the RESOURCE rather than to one
+/// operation, so every operation that addresses a test refuses it the same way.
+#[must_use]
+pub fn automated_reasoning_policy_test_case_not_found_message(
+    test_case_id: &str,
+    policy_arn: &str,
+) -> String {
+    format!(
+        "The TestCase with testCaseId: {test_case_id} and policyArn: {policy_arn} does not exist"
+    )
+}
 
 /// One stored Automated Reasoning policy test: the identity
 /// `CreateAutomatedReasoningPolicyTestCase` minted, and the sample input and expected

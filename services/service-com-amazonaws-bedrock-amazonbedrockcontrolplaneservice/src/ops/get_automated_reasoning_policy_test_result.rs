@@ -177,10 +177,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .automated_reasoning_policy_test_case(&input.policy_arn, &input.test_case_id)
             .is_none()
         {
-            return Err(not_found(format!(
-                "no test {} exists for automated reasoning policy {}",
-                input.test_case_id, input.policy_arn
-            )));
+            return Err(not_found(
+                crate::state::automated_reasoning_policy_test_case_not_found_message(
+                    &input.test_case_id,
+                    &input.policy_arn,
+                ),
+            ));
         }
 
         // The run is read as of `now`, so the completion the workflow that scheduled it
@@ -207,10 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(test_case) =
             store.automated_reasoning_policy_test_case(&input.policy_arn, &input.test_case_id)
         else {
-            return Err(not_found(format!(
-                "no test {} exists for automated reasoning policy {}",
-                input.test_case_id, input.policy_arn
-            )));
+            return Err(not_found(
+                crate::state::automated_reasoning_policy_test_case_not_found_message(
+                    &input.test_case_id,
+                    &input.policy_arn,
+                ),
+            ));
         };
 
         Ok(GetAutomatedReasoningPolicyTestResultOutput {
@@ -224,8 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// one of the four is "the resource was not found".
 ///
 /// The wording for a missing build workflow is the service's own for that resource
-/// ([`crate::state::build_workflow_not_found_message`]), so a request addressing one gets
-/// the same message wherever it came from.
+/// ([`crate::state::build_workflow_not_found_message`]), and the wording for a missing test
+/// is the service's own for THAT resource
+/// ([`crate::state::automated_reasoning_policy_test_case_not_found_message`]), so a request
+/// addressing either gets the same message wherever it came from.
 fn not_found(message: String) -> GetAutomatedReasoningPolicyTestResultError {
     GetAutomatedReasoningPolicyTestResultErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {

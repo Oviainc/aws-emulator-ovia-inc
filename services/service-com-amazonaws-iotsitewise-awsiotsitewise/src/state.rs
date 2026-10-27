@@ -40,7 +40,8 @@
 //! workspace's enrichment jobs live in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::enrichment_jobs`], keyed by the
 //! workspace and the minted job id, each record carrying the configuration it
-//! was created from and the instant it was created, from which a read DERIVES
+//! was created from, the instant it was created and the instant a cancel was
+//! recorded on it, from which a read DERIVES
 //! the job's type, the data it analyses and the status the clock has made due. An
 //! execution of an action lives in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::executions`], keyed by its own
@@ -7983,6 +7984,13 @@ impl BulkImportJobRecord {
 // a read reports what the clock has made due without writing anything, and two
 // readers of one job cannot disagree about where it has got to.
 //
+// A cancellation IS something a call does to a job, so it is RECORDED on the
+// record ([`EnrichmentJobRecord::cancelled_at`]) rather than derived, and from
+// then on it is the terminal status every reader reports for that job: the
+// cancel takes effect at the instant it is recorded, because
+// `CancelEnrichmentJob` "responds immediately after recording the
+// cancellation" with the status the job then stands in.
+//
 // What a record does NOT hold is an embedding of any video: nothing in this
 // emulator analyses a time series, and no operation of this API answers an
 // embedding. The job's identity, the configuration it was created from and
@@ -8003,6 +8011,10 @@ pub const ENRICHMENT_JOB_RUNNING: &str = "RUNNING";
 
 /// The value a job reports once the clock has finished processing it. Terminal.
 pub const ENRICHMENT_JOB_COMPLETED: &str = "COMPLETED";
+
+/// The value a job a cancel was recorded on reports from that instant on:
+/// "Jobs in PENDING or RUNNING status transition to CANCELLED". Terminal.
+pub const ENRICHMENT_JOB_CANCELLED: &str = "CANCELLED";
 
 /// The `JobType` an `eventDetection` configuration makes a job: the type is
 /// "derived from the job configuration union member", so it is derived here
@@ -8054,6 +8066,11 @@ pub struct EnrichmentJobRecord {
     /// When the job was created, which is the `createdAt` a read reports and
     /// the instant its whole lifecycle is owed from.
     pub created_at: SystemTime,
+    /// When a cancel was recorded on this job, if one was: the `cancelledAt` a
+    /// read reports, and from that instant the terminal status every reader
+    /// reports for the job. Held rather than derived, because a cancellation is
+    /// something a CALL did to the job and not something the clock owed it.
+    pub cancelled_at: Option<SystemTime>,
 }
 
 impl EnrichmentJobRecord {
@@ -8082,14 +8099,18 @@ impl EnrichmentJobRecord {
         enrichment_job_target(&self.configuration).3
     }
 
-    /// The job's `status` at `now`: `PENDING` until the first
-    /// [`ENRICHMENT_JOB_STEP`] has elapsed, `RUNNING` until the second has,
-    /// `COMPLETED` after that. A terminal status never moves again.
+    /// The job's `status` at `now`: `CANCELLED` once a cancel was recorded on
+    /// it, otherwise `PENDING` until the first [`ENRICHMENT_JOB_STEP`] has
+    /// elapsed, `RUNNING` until the second has, `COMPLETED` after that. A
+    /// terminal status never moves again.
     ///
     /// No job of this emulator fails or times out, so `FAILED` and `TIMED_OUT`
     /// — and the `failureMessage` the model documents beside them — are
     /// statuses nothing here reports.
     pub fn status(&self, now: SystemTime) -> &'static str {
+        if self.cancelled_at.is_some() {
+            return ENRICHMENT_JOB_CANCELLED;
+        }
         match self.completed_at(now) {
             Some(_) => ENRICHMENT_JOB_COMPLETED,
             None if now >= self.created_at + ENRICHMENT_JOB_STEP => ENRICHMENT_JOB_RUNNING,
@@ -8097,25 +8118,43 @@ impl EnrichmentJobRecord {
         }
     }
 
-    /// The instant the job's terminal status fell due, and `None` until it has.
+    /// The instant the job COMPLETED, and `None` until it has — or at all for a
+    /// job a cancel was recorded on, which stopped where that cancel found it
+    /// and so never reaches the status this instant records (`completedAt` is
+    /// "only present if status is COMPLETED").
     pub fn completed_at(&self, now: SystemTime) -> Option<SystemTime> {
+        if self.cancelled_at.is_some() {
+            return None;
+        }
         let completes_at = self.created_at + 2 * ENRICHMENT_JOB_STEP;
         (now >= completes_at).then_some(completes_at)
     }
 
-    /// "Timestamp of the last job status change": the instant of the latest
-    /// transition the clock has made due, and `None` for a job still in the
-    /// status its create answered with, which no transition has moved yet.
+    /// "Timestamp of the last job status change": the instant a recorded
+    /// cancellation took the job to its terminal status, else the instant of the
+    /// latest transition the clock has made due, and `None` for a job still in
+    /// the status its create answered with, which nothing has moved yet.
     pub fn updated_at(&self, now: SystemTime) -> Option<SystemTime> {
+        if let Some(cancelled_at) = self.cancelled_at {
+            return Some(cancelled_at);
+        }
         let runs_at = self.created_at + ENRICHMENT_JOB_STEP;
         self.completed_at(now)
             .or_else(|| (now >= runs_at).then_some(runs_at))
     }
 
     /// Whether the status this job reports at `now` is one it can still move
-    /// out of — what the duplicate-job rule reads.
+    /// out of — what the duplicate-job rule reads, and what decides whether a
+    /// cancel may still be recorded on the job.
     pub fn is_active(&self, now: SystemTime) -> bool {
-        self.completed_at(now).is_none()
+        self.cancelled_at.is_none() && self.completed_at(now).is_none()
+    }
+
+    /// Record a cancellation on this job at `now`. The cancel takes effect from
+    /// that instant: "the API responds immediately after recording the
+    /// cancellation", with `CANCELLED` as the status it answers.
+    pub fn record_cancel(&mut self, now: SystemTime) {
+        self.cancelled_at = Some(now);
     }
 
     /// This job as the summary a listing reports for it, at `now`.
@@ -8198,13 +8237,14 @@ pub fn check_enrichment_job_configuration(
 /// under the one form [`not_found_message`] states every absence in.
 ///
 /// Declared here, in this section, rather than beside the other resource kinds:
-/// an enrichment job is addressed by `DescribeEnrichmentJob` alone, so the label
-/// belongs with the record that operation reads.
+/// an enrichment job is addressed by `DescribeEnrichmentJob` and
+/// `CancelEnrichmentJob` alone, so the label belongs with the record those
+/// operations read.
 pub const RESOURCE_ENRICHMENT_JOB: &str = "Enrichment Job";
 
-/// The ARN segment an enrichment job is named by in the one place this API
-/// reports a job's ARN: the required `resourceArn` of the conflict a duplicate
-/// create is refused with.
+/// The ARN segment an enrichment job is named by in the places this API reports
+/// a job's ARN: the required `resourceArn` of the conflict a duplicate create,
+/// or a cancel of a job that already reached a terminal status, is refused with.
 ///
 /// No modelled member of an enrichment job carries an ARN, so the form is this
 /// service's own — the `<type>/<id>` resource form every IoT SiteWise ARN

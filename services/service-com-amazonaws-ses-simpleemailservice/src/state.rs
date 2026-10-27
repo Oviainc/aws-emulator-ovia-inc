@@ -516,6 +516,17 @@ pub struct ConfigurationSet {
     /// `TrackingOptionsDoesNotExistException` reports the absence of), and what
     /// `DescribeConfigurationSet` reports as `TrackingOptions`.
     pub custom_redirect_domain: Option<String>,
+    /// The `TlsPolicy` of this set's `DeliveryOptions` sub-resource: whether a
+    /// message that uses the set is only delivered over a TLS connection
+    /// (`Require`) or may fall back to plain text (`Optional`).
+    ///
+    /// The sub-resource EXISTS exactly while this is `Some`: that is what
+    /// `PutConfigurationSetDeliveryOptions` writes and what
+    /// `DescribeConfigurationSet` reports as `DeliveryOptions`. The model
+    /// documents no default for `DeliveryOptions$TlsPolicy`, so a set nobody has
+    /// written delivery options for carries none rather than a policy the
+    /// service never stored.
+    pub tls_policy: Option<String>,
     /// When this set's reputation metrics were last reset — a *fresh start* —
     /// and `None` while sending for the set "has never been disabled and later
     /// re-enabled", which is what `ReputationOptions$LastFreshStart` documents
@@ -1002,6 +1013,9 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     // And it carries no `TrackingOptions` sub-resource:
                     // `CreateConfigurationSetTrackingOptions` is what adds one.
                     custom_redirect_domain: None,
+                    // And no `DeliveryOptions` sub-resource either:
+                    // `PutConfigurationSetDeliveryOptions` is what writes one.
+                    tls_policy: None,
                     // A set whose sending has never been disabled and later
                     // re-enabled has had no fresh start.
                     last_fresh_start: None,

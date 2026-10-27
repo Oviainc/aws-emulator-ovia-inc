@@ -39,8 +39,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    build_router, call, element, emulator, error_code, grant_sns_delivery, now_secs, ok, rpc, sns,
-    wait_for_evaluation,
+    build_router, call, element, emulator, error_code, grant_sns_delivery, merged, now_secs, ok,
+    rpc, sns, wait_for_evaluation,
 };
 
 /// The customer namespace the alarm rows below watch.
@@ -159,18 +159,7 @@ pub(crate) async fn publish(router: &MultiServiceRouter, domain: &str, data: &[D
 /// and a member the row names `null` is REMOVED — an alarm carries `Statistic` or
 /// `ExtendedStatistic`, never both, so a row that names one has to drop the other.
 pub(crate) fn patched(name: &str, patch: &Value) -> Value {
-    let mut alarm = base_alarm(name);
-    for (member, value) in patch.as_object().cloned().unwrap_or_default() {
-        if value.is_null() {
-            alarm
-                .as_object_mut()
-                .expect("the alarm is a JSON object")
-                .remove(&member);
-        } else {
-            alarm[member] = value;
-        }
-    }
-    alarm
+    merged(base_alarm(name), patch)
 }
 
 #[tokio::test]
