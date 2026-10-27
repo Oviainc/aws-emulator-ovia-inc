@@ -794,12 +794,14 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// Record the exemption `exemption_type` and `authority` identify for every
     /// account of `account_ids`, as submitted at `recorded_at`.
     ///
-    /// The one place an exemption becomes a stored record. The exemption's
-    /// identity is its type and the jurisdiction it applies in — the request
-    /// carries no exemption id — so submitting the same pair for an account again
-    /// REPLACES that account's record in place, which is what makes this a `Put`
-    /// rather than an append; case and padding in the jurisdiction do not make a
-    /// second exemption ([`is_same_exemption`]).
+    /// The one place an exemption becomes a stored record. `exemption_type` is
+    /// the token the submission named its type by, recorded as
+    /// [`submitted_exemption_type`] describes. The exemption's identity is that
+    /// type and the jurisdiction it applies in — the request carries no exemption
+    /// id — so submitting the same pair for an account again REPLACES that
+    /// account's record in place, which is what makes this a `Put` rather than an
+    /// append; case and padding in either do not make a second exemption
+    /// ([`is_same_exemption`]).
     ///
     /// The record is stored in [`EXEMPTION_STATUS_PENDING`], the status the model
     /// gives an exemption whose certificate has not been reviewed: a submission
@@ -826,11 +828,16 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     pub fn store_exemptions(
         &mut self,
         account_ids: &[String],
-        exemption_type: &TaxExemptionTypeRow,
+        exemption_type: &str,
         authority: &Authority,
         recorded_at: SystemTime,
     ) -> Result<(), CaseCreationLimitExceededException> {
-        let description = exemption_type.1;
+        // The type the record is held under — the published entry the token
+        // names, or the token as submitted ([`submitted_exemption_type`]) — and
+        // its `description`, which with the jurisdiction is the exemption's
+        // identity.
+        let recorded_type = submitted_exemption_type(exemption_type, authority);
+        let description = recorded_type.description.clone().unwrap_or_default();
         let distinct = distinct_account_ids(account_ids);
         let additional = distinct
             .iter()
@@ -838,7 +845,7 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
                 self.exemptions.get(**account_id).is_none_or(|held| {
                     !held
                         .iter()
-                        .any(|stored| is_same_exemption(stored, description, authority))
+                        .any(|stored| is_same_exemption(stored, &description, authority))
                 })
             })
             .count();
@@ -848,7 +855,7 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
 
         let submitted = StoredTaxExemption {
             authority: normalized_authority(authority),
-            exemption_type: exemption_type_of(exemption_type),
+            exemption_type: recorded_type,
             effective_date: None,
             expiration_date: None,
             system_effective_date: Some(recorded_at),
@@ -858,7 +865,7 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
             let held = self.exemptions.entry(account_id.to_string()).or_default();
             match held
                 .iter()
-                .position(|stored| is_same_exemption(stored, description, authority))
+                .position(|stored| is_same_exemption(stored, &description, authority))
             {
                 Some(index) => held[index] = submitted.clone(),
                 None => held.push(submitted.clone()),
@@ -1164,8 +1171,8 @@ pub struct StoredTaxExemption {
     /// `TaxExemption$authority`: the address domain (country, and state where
     /// the exemption is a state one) the exemption applies in.
     pub authority: Authority,
-    /// `TaxExemption$taxExemptionType`: the entry of
-    /// [`TAX_EXEMPTION_TYPE_CATALOG`] the exemption was granted under.
+    /// `TaxExemption$taxExemptionType`: the type the exemption was submitted
+    /// under, as [`submitted_exemption_type`] records it.
     pub exemption_type: TaxExemptionType,
     /// When the exemption takes effect. `None` while that is not decided (an
     /// exemption still under review has no effective date yet).
@@ -3020,6 +3027,12 @@ pub type TaxExemptionTypeRow = (&'static str, &'static str, &'static [Jurisdicti
 /// phrasing of a documented category, sorted by `displayName` so the collection is
 /// enumerated one stable way; a client that keys off the prose rather than off a type it
 /// already read from this catalog is reading wording the real service words differently.
+///
+/// Because that wording is not AWS's, this table only REPORTS: it is what the read
+/// publishes, and it decides nothing about a write. A submission names its type with a
+/// free-form string the model constrains only in length and pattern, so it is admitted on
+/// those constraints whether or not this table happens to spell it the same way — see
+/// [`submitted_exemption_type`].
 pub const TAX_EXEMPTION_TYPE_CATALOG: &[TaxExemptionTypeRow] = &[
     (
         "501(c)(3)",
@@ -3097,16 +3110,18 @@ pub fn exemption_type_of(
     }
 }
 
-/// The published row a caller names by `exemption_type`.
+/// The published row a caller names by `exemption_type`, or `None` for a token
+/// that names no entry of the collection this service publishes.
 ///
 /// `PutTaxExemptionRequest$exemptionType` documents "Use the supported tax
 /// exemption type description", so the `description` of a
 /// [`TAX_EXEMPTION_TYPE_CATALOG`] entry is the token a type is named by; the
 /// `displayName` is accepted for the same entry, because it is the catalog's
-/// other identifying member and that wording is this emulator's own (see
-/// [`TAX_EXEMPTION_TYPE_CATALOG`]) rather than something a client could have read
-/// off AWS. Matching ignores case and surrounding whitespace, neither of which
-/// distinguishes one published type from another.
+/// other identifying member. Matching ignores case and surrounding whitespace,
+/// neither of which distinguishes one published type from another.
+///
+/// This PLACES a token in the published collection; it never decides whether a
+/// submission is admitted — see [`submitted_exemption_type`].
 pub fn find_exemption_type(exemption_type: &str) -> Option<&'static TaxExemptionTypeRow> {
     let wanted = exemption_type.trim();
     TAX_EXEMPTION_TYPE_CATALOG
@@ -3116,62 +3131,41 @@ pub fn find_exemption_type(exemption_type: &str) -> Option<&'static TaxExemption
         })
 }
 
-/// Refuse an `exemptionType` the published catalog does not name, answering the
-/// row it does name.
+/// The `TaxExemptionType` a submission of `exemption_type` in `authority`
+/// records, and that every reader of the record then reports.
 ///
-/// The exemption types are a collection the SERVICE publishes
-/// (`GetTaxExemptionTypes`), and the write documents that a request names one of
-/// them, so a request naming anything else asks for an exemption this service
-/// does not offer: a field violation naming that parameter, never a stored record
-/// under a type no reader could describe.
-pub fn check_exemption_type(
-    exemption_type: &str,
-) -> Result<&'static TaxExemptionTypeRow, ValidationException> {
-    find_exemption_type(exemption_type).ok_or_else(|| {
-        // The message names the member and what it must satisfy, never the value
-        // that was refused — the shape every refusal of this service takes.
-        validation(
-            ERROR_CODE_FIELD_VALIDATION_FAILED,
-            "exemptionType",
-            "exemptionType must be the description of a tax exemption type \
-             GetTaxExemptionTypes publishes.",
-        )
-    })
+/// `exemptionType` is a free-form string the model constrains only in length
+/// (1..=200) and by a pattern that admits every character
+/// (`smithy_query(query="operation", operation="PutTaxExemption")`), and
+/// `TaxExemptionType` is a structure of free text rather than an enumeration
+/// (`smithy_query(query="shape", shape="TaxExemptionType")`): the model
+/// publishes no set of legal values, so a submitted token is admitted on the
+/// constraints the model states and recorded as the caller spelled it.
+///
+/// A token that names an entry of the published collection is recorded AS that
+/// entry, so the type an exemption is held under reads back the same whichever
+/// of the entry's two identifying members the caller named it by, and with the
+/// jurisdictions the collection publishes for it. Any other token is recorded as
+/// submitted, applicable in the jurisdiction this submission names — the only
+/// jurisdiction this service is told the type applies in. The token is its
+/// `displayName` too where the member's 0..50 bound admits it; a longer token
+/// has none, because a truncation would report a name no caller sent.
+pub fn submitted_exemption_type(exemption_type: &str, authority: &Authority) -> TaxExemptionType {
+    if let Some(published) = find_exemption_type(exemption_type) {
+        return exemption_type_of(published);
+    }
+    TaxExemptionType {
+        display_name: (exemption_type.chars().count() <= MAX_TYPE_DISPLAY_NAME)
+            .then(|| exemption_type.to_string()),
+        description: Some(exemption_type.to_string()),
+        applicable_jurisdictions: Some(vec![normalized_authority(authority)]),
+    }
 }
 
-/// Refuse an `authority` outside the jurisdictions the exemption type applies
-/// in.
-///
-/// A published type carries the `applicableJurisdictions` it applies in, so an
-/// exemption asked for in any other jurisdiction is one this service does not
-/// offer. A jurisdiction naming a country only applies throughout that country,
-/// so the request may name a state of it (a certificate is held in one) or none;
-/// a jurisdiction naming a state applies in that state alone.
-pub fn check_exemption_authority(
-    (_, description, jurisdictions): &TaxExemptionTypeRow,
-    authority: &Authority,
-) -> Result<(), ValidationException> {
-    let applies = jurisdictions.iter().any(|(country, state)| {
-        country.eq_ignore_ascii_case(authority.country.trim())
-            && (*state).is_none_or(|state| {
-                authority
-                    .state
-                    .as_deref()
-                    .is_some_and(|submitted| submitted.trim().eq_ignore_ascii_case(state))
-            })
-    });
-    if applies {
-        return Ok(());
-    }
-    Err(validation(
-        ERROR_CODE_FIELD_VALIDATION_FAILED,
-        "authority",
-        format!(
-            "The {description} tax exemption does not apply in the jurisdiction this request \
-             names. Use a jurisdiction GetTaxExemptionTypes publishes for that type."
-        ),
-    ))
-}
+/// The longest `TaxExemptionType$displayName` the model admits: `@length` 0..50
+/// (`smithy_query(query="shape", shape="TaxExemptionType")`), against the
+/// 1..=200 of the `exemptionType` a submission names a type by.
+const MAX_TYPE_DISPLAY_NAME: usize = 50;
 
 // ---------------------------------------------------------------------------
 // Writing a tax exemption
@@ -3214,10 +3208,12 @@ pub fn normalized_authority(authority: &Authority) -> Authority {
 ///
 /// The type and the jurisdiction are the identity a submission addresses — the
 /// request carries no exemption id — so a second submission of the same pair
-/// replaces the account's record rather than adding one beside it. Case and
-/// padding make no second exemption: they are compared the way
-/// [`check_exemption_authority`] admits a jurisdiction, so what the admission
-/// check treats as one jurisdiction the store treats as one record.
+/// replaces the account's record rather than adding one beside it. `description`
+/// is the recorded type's own ([`submitted_exemption_type`]), so naming a
+/// published entry by either of its identifying members addresses one record.
+/// Case and padding make no second exemption either: they are compared the way
+/// [`normalized_authority`] stores a jurisdiction, so what the store treats as
+/// one jurisdiction it treats as one record.
 pub fn is_same_exemption(
     stored: &StoredTaxExemption,
     description: &str,
