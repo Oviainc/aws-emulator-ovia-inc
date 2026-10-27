@@ -463,8 +463,9 @@ async fn max_records_is_bounded_and_the_marker_resumes_the_report() {
 
     // "The maximum number of records to include in the response … Minimum 20, maximum
     // 100" — each published bound, and one step past each. The bound is a MODELLED range
-    // on this operation's `MaxRecords`, so a value past it is refused at the boundary with
-    // the constraint validator's own `ValidationError`, before this handler runs.
+    // on this operation's `MaxRecords`, so a value past it is refused at the boundary,
+    // before this handler runs — under the same `InvalidParameterValue` the reports that
+    // carry the bound in prose answer it with.
     for (case, value, status) in [
         ("one below the published minimum", "19", 400),
         ("the published minimum", "20", 200),
@@ -475,7 +476,7 @@ async fn max_records_is_bounded_and_the_marker_resumes_the_report() {
         if status == 200 {
             expect_ok(case, response);
         } else {
-            let body = expect_error(case, response, status, "ValidationError");
+            let body = expect_error(case, response, status, "InvalidParameterValue");
             assert!(
                 text(&body, "Message").contains("maxRecords"),
                 "case {case:?}: the refusal must name the member it refused, got {body}"

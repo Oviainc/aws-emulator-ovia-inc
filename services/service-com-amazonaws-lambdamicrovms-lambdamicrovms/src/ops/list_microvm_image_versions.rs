@@ -185,6 +185,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(::std::time::Instant::now());
 
+        // The AUTHORIZATION verdict, decided BEFORE the own-account lookup: an
+        // identifier in the AWS-OWNED namespace names a resource of AWS's own
+        // catalogue, whose versions are read through the managed listing rather than
+        // through this one, so it is DENIED rather than reported missing — the same
+        // verdict the image's own read path answers, and taken first for the same
+        // reason: a 404 would tell a caller with no permission on the identifier
+        // whether it exists.
+        if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
+            return Err(ListMicrovmImageVersionsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage", so the
         // identifier is resolved as an id this account holds and, failing that, read as
         // an ARN — the same resolution the image's own read path takes, because this

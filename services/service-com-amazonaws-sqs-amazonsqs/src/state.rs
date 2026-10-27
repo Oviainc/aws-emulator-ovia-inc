@@ -22,7 +22,12 @@
 //! maps the receipt handle a receive minted to the message it names, which is what
 //! `DeleteMessage` resolves — and [`Queue::deleted_handles`] remembers the handles a
 //! delete has already consumed, so repeating a delete that succeeded is idempotent
-//! rather than refused. Visibility and retention are evaluated against the clock
+//! rather than refused. A handle is not an opaque value with no provenance: it carries
+//! the queue incarnation that minted it ([`Queue::mint_receipt_handle`]), so
+//! [`ComAmazonawsSqsAmazonsqsState::receipt_handle_origin`] can tell this queue's own
+//! handle from one another queue issued and from one a deleted incarnation issued, which
+//! are three refusals a caller recovers from differently. Visibility and retention are
+//! evaluated against the clock
 //! by [`Queue::materialise_due`], so the three `ApproximateNumberOfMessages*`
 //! attributes are counts over real state rather than made-up values. A message carries
 //! the visibility timeout it was RECEIVED under, so a later change to the queue's
@@ -187,15 +192,24 @@ pub const DEDUPLICATION_INTERVAL: Duration = Duration::from_secs(300);
 /// (`ReceiveMessageRequest$ReceiveRequestAttemptId`).
 pub const RECEIVE_REQUEST_ATTEMPT_INTERVAL: Duration = Duration::from_secs(300);
 
-/// How long a deleted queue's NAME stays unavailable: "If you delete a queue, you must
-/// wait at least 60 seconds before creating a queue with the same name" (`CreateQueue`'s
-/// own documentation).
-///
-/// The sentence `CreateQueue` answers with is Amazon SQS's own for the
-/// `QueueDeletedRecently` class — "You must wait 60 seconds after deleting a queue before
-/// you can create another with the same name." — which is the model's documentation of
-/// that error shape with its second "queue" dropped, as the recorded refusal words it.
-pub const QUEUE_DELETED_RECENTLY_INTERVAL: Duration = Duration::from_secs(60);
+/// The wait the `QueueDeletedRecently` refusal STATES, which is Amazon SQS's own figure:
+/// "If you delete a queue, you must wait at least 60 seconds before creating a queue with
+/// the same name" (`CreateQueue`'s own documentation), worded in the refusal as "You must
+/// wait 60 seconds after deleting a queue before you can create another with the same
+/// name." — the model's documentation of that error shape with its second "queue"
+/// dropped, as the recorded refusal words it. It is part of the fixed text of the class
+/// through [`queue_deleted_recently_message`], so the sentence says what AWS says however
+/// long this emulator actually defers the name.
+pub const QUEUE_DELETED_RECENTLY_DOCUMENTED_WAIT: Duration = Duration::from_secs(60);
+
+/// How long a deleted queue's NAME actually stays unavailable here: the delete makes the
+/// name available again only once the deletion has propagated, so a re-create straight
+/// after a delete is refused and one a moment later is served. The span is this
+/// emulator's own — long enough that a caller re-creating a name it has just deleted sees
+/// the refusal, short enough that a caller backing off and retrying gets its queue — and
+/// is not the figure AWS's sentence quotes
+/// ([`QUEUE_DELETED_RECENTLY_DOCUMENTED_WAIT`]).
+pub const QUEUE_DELETED_RECENTLY_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long an accepted `PurgeQueue` keeps the next one on the same queue refused:
 /// "the specified queue previously received a PurgeQueue request within the last 60
@@ -873,6 +887,12 @@ pub struct ComAmazonawsSqsAmazonsqsState {
 #[derive(Debug, Clone)]
 pub struct Queue {
     pub name: String,
+    /// What identifies THIS incarnation of the queue: minted when the queue was created,
+    /// so a queue created again under a name a delete removed is a different incarnation
+    /// of that name. Every receipt handle this queue mints carries it
+    /// ([`mint_receipt_handle`](Self::mint_receipt_handle)), which is what lets a handle
+    /// be traced back to the queue that issued it after the queue is gone.
+    pub incarnation: String,
     /// The url minted when the queue was created, and the one every later reference
     /// to this queue reports.
     pub url: String,
@@ -1220,6 +1240,22 @@ impl Queue {
             }
             message.available_at = after(message.sent_at, delay);
         }
+    }
+
+    /// Mint a receipt handle for a receive of one of this queue's messages: this queue's
+    /// incarnation and a fresh token identifying the receive, joined so the handle names
+    /// the queue that issued it.
+    ///
+    /// The handle a consumer holds therefore carries its own provenance: a later call that
+    /// presents it to another queue, or to a queue created again under the same name, is
+    /// answered for what the handle IS rather than for what some live table happens to
+    /// hold ([`receipt_handle_incarnation`]).
+    pub fn mint_receipt_handle(&self) -> String {
+        format!(
+            "{}{RECEIPT_HANDLE_SEPARATOR}{}",
+            self.incarnation,
+            new_identifier()
+        )
     }
 
     /// Record the receipt handle a receive just minted for `message_id`, dropping the
@@ -1646,24 +1682,38 @@ impl ComAmazonawsSqsAmazonsqsState {
         self.queues.get_mut(&name)
     }
 
-    /// Where `receipt_handle` came from, for the queue at `queue_url` that cannot resolve
-    /// it: another queue of this store minted it, or no queue did and it is not a receipt
-    /// handle at all. A handle a delete has already consumed still counts as minted by
-    /// the queue that issued it.
+    /// Which queue minted `receipt_handle`, as the queue at `queue_url` that cannot
+    /// resolve it sees it: a handle names the queue INCARNATION that minted it
+    /// ([`receipt_handle_incarnation`]), so the three cases a caller recovers from
+    /// differently are told apart by that name rather than by searching the live handle
+    /// maps.
+    ///
+    /// A handle a delete has already consumed, or a later receive superseded, still names
+    /// the incarnation that issued it, and a value this service never minted names none.
     pub fn receipt_handle_origin<'a>(
         &self,
         queue_url: &str,
         receipt_handle: &'a str,
     ) -> ReceiptHandleOrigin<'a> {
-        let elsewhere = self.queues.values().any(|queue| {
-            queue.url != queue_url
-                && (queue.handles.contains_key(receipt_handle)
-                    || queue.deleted_handle(receipt_handle))
-        });
-        if elsewhere {
+        let Some(minted_by) = receipt_handle_incarnation(receipt_handle) else {
+            return ReceiptHandleOrigin::Unrecognised;
+        };
+        if self
+            .queue_by_url(queue_url)
+            .is_some_and(|queue| queue.incarnation == minted_by)
+        {
+            // The queue addressed is the one that minted it, so what the refusal is about
+            // is the handle's MESSAGE rather than which queue it belongs to.
+            return ReceiptHandleOrigin::Unrecognised;
+        }
+        if self
+            .queues
+            .values()
+            .any(|queue| queue.incarnation == minted_by)
+        {
             ReceiptHandleOrigin::AnotherQueue(receipt_handle)
         } else {
-            ReceiptHandleOrigin::Unrecognised
+            ReceiptHandleOrigin::PreviousIncarnation
         }
     }
 
@@ -2649,6 +2699,16 @@ pub fn queue_does_not_exist() -> QueueDoesNotExist {
     }
 }
 
+/// What Amazon SQS answers a `CreateQueue` for a name whose queue was just deleted: one
+/// fixed sentence quoting the wait its own documentation states
+/// ([`QUEUE_DELETED_RECENTLY_DOCUMENTED_WAIT`]), with nothing of the request in it.
+pub fn queue_deleted_recently_message() -> String {
+    format!(
+        "You must wait {} seconds after deleting a queue before you can create another with the same name.",
+        QUEUE_DELETED_RECENTLY_DOCUMENTED_WAIT.as_secs(),
+    )
+}
+
 /// What Amazon SQS answers a `PurgeQueue` on the queue called `name` with while the one
 /// before it is still deleting: the interval is part of the sentence, so the caller is
 /// told how long the deletion can take, and the queue the request named is the only
@@ -2673,14 +2733,72 @@ pub fn receipt_handle_of_another_queue_message(receipt_handle: &str) -> String {
 }
 
 /// Where a receipt handle a queue cannot resolve came from, which is what decides how the
-/// refusal is worded.
+/// refusal is worded — and, for a handle of a queue that is gone, WHICH refusal answers
+/// it ([`unresolvable_receipt_handle`]).
 #[derive(Debug, Clone, Copy)]
 pub enum ReceiptHandleOrigin<'a> {
-    /// No queue minted it, so it is not a receipt handle at all.
+    /// The queue addressed minted it, or no queue of this store did and it is not a
+    /// receipt handle at all: either way the refusal is about the handle itself, so it
+    /// names the class of fault and no queue.
     Unrecognised,
-    /// Another queue minted it: it is a receipt handle, just not one of this queue's.
+    /// Another queue that EXISTS minted it: it is a receipt handle, just not one of this
+    /// queue's.
     AnotherQueue(&'a str),
+    /// An incarnation that no longer exists minted it: the queue the handle names was
+    /// deleted, whether or not a queue carries its name again.
+    PreviousIncarnation,
 }
+
+/// The refusal a receipt handle the queue addressed cannot resolve earns, as the two
+/// modelled errors every operation taking a `ReceiptHandle` declares.
+///
+/// A handle names the queue incarnation that minted it, so a handle of an incarnation that
+/// is gone addresses a queue that does not exist — which is a different fault from a
+/// handle that is merely not this queue's, and recovered from differently: the caller has
+/// to receive again from the queue it has now, not retry or re-address.
+#[derive(Debug)]
+pub enum UnresolvableReceiptHandle {
+    /// The queue the handle names is gone.
+    QueueIsGone(QueueDoesNotExist),
+    /// The handle is not a valid one for the queue addressed.
+    HandleIsInvalid(ReceiptHandleIsInvalid),
+}
+
+/// Which refusal answers a receipt handle the queue addressed cannot resolve, so every
+/// operation that takes one classifies it the same way.
+pub fn unresolvable_receipt_handle(origin: ReceiptHandleOrigin<'_>) -> UnresolvableReceiptHandle {
+    match origin {
+        ReceiptHandleOrigin::PreviousIncarnation => {
+            UnresolvableReceiptHandle::QueueIsGone(queue_does_not_exist())
+        }
+        ReceiptHandleOrigin::Unrecognised | ReceiptHandleOrigin::AnotherQueue(_) => {
+            UnresolvableReceiptHandle::HandleIsInvalid(receipt_handle_is_invalid(origin))
+        }
+    }
+}
+
+/// The `Code` and `Message` a BATCH entry carrying a handle the queue addressed cannot
+/// resolve fails with: a batch judges each entry on its own, so the entry carries the code
+/// of the error the single-message operation answers for the same handle — the model's
+/// `awsQueryError` code for that error shape.
+pub fn unresolvable_receipt_handle_batch_failure(
+    origin: ReceiptHandleOrigin<'_>,
+) -> (&'static str, Option<String>) {
+    match unresolvable_receipt_handle(origin) {
+        UnresolvableReceiptHandle::QueueIsGone(error) => (QUEUE_DOES_NOT_EXIST_CODE, error.message),
+        UnresolvableReceiptHandle::HandleIsInvalid(error) => {
+            (RECEIPT_HANDLE_IS_INVALID_CODE, error.message)
+        }
+    }
+}
+
+/// The error code `QueueDoesNotExist` is reported under, from the model's `awsQueryError`
+/// for that shape — which is what a batch result entry's `Code` carries.
+pub const QUEUE_DOES_NOT_EXIST_CODE: &str = "AWS.SimpleQueueService.NonExistentQueue";
+
+/// The error code `ReceiptHandleIsInvalid` is reported under, from the model's
+/// `awsQueryError` for that shape.
+pub const RECEIPT_HANDLE_IS_INVALID_CODE: &str = "ReceiptHandleIsInvalid";
 
 /// The modelled refusal for a receipt handle this queue cannot resolve.
 ///
@@ -2690,9 +2808,11 @@ pub enum ReceiptHandleOrigin<'a> {
 pub fn receipt_handle_is_invalid(origin: ReceiptHandleOrigin<'_>) -> ReceiptHandleIsInvalid {
     ReceiptHandleIsInvalid {
         message: Some(match origin {
-            ReceiptHandleOrigin::Unrecognised => RECEIPT_HANDLE_IS_INVALID_MESSAGE.to_string(),
             ReceiptHandleOrigin::AnotherQueue(receipt_handle) => {
                 receipt_handle_of_another_queue_message(receipt_handle)
+            }
+            ReceiptHandleOrigin::Unrecognised | ReceiptHandleOrigin::PreviousIncarnation => {
+                RECEIPT_HANDLE_IS_INVALID_MESSAGE.to_string()
             }
         }),
     }
@@ -2719,22 +2839,46 @@ pub enum ReceiptHandleRefusal {
 /// Whether `receipt_handle` is formed as a receipt handle at all — a handle is an opaque
 /// token a receive handed a consumer, so what can be judged of a value is its FORM.
 ///
-/// A handle this emulator minted is one [`new_identifier`] produced, and another queue
-/// service's is a longer opaque token of the same alphabet, so both are handles here: a
-/// consumer replaying one is told its MESSAGE is gone rather than that what it holds is
-/// not a handle. A value shorter than a minted one, one holding a character no opaque
-/// token does, or one longer than any handle a consumer can have been handed is not one.
+/// A handle this emulator minted is one [`Queue::mint_receipt_handle`] produced, and
+/// another queue service's is a longer opaque token of the same alphabet, so both are
+/// handles here: a consumer replaying one is told its MESSAGE is gone rather than that
+/// what it holds is not a handle. A value shorter than one minted identifier, one holding
+/// a character no opaque token does, or one longer than any handle a consumer can have
+/// been handed is not one.
 pub fn is_receipt_handle(receipt_handle: &str) -> bool {
     let length = receipt_handle.chars().count();
-    (MINTED_RECEIPT_HANDLE_LENGTH..=MAX_RECEIPT_HANDLE_LENGTH).contains(&length)
+    (MINTED_IDENTIFIER_LENGTH..=MAX_RECEIPT_HANDLE_LENGTH).contains(&length)
         && receipt_handle
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '='))
 }
 
-/// The length of a receipt handle this service mints: [`new_identifier`] produces the
-/// hyphenated 36-character form, and nothing shorter is a handle.
-const MINTED_RECEIPT_HANDLE_LENGTH: usize = 36;
+/// The queue INCARNATION a receipt handle this service minted names, or `None` for a value
+/// this service did not mint.
+///
+/// A minted handle is the incarnation that issued it and the token identifying the receive
+/// joined by [`RECEIPT_HANDLE_SEPARATOR`] — both [`new_identifier`] values — so the queue
+/// a consumer's handle belongs to is read out of the handle itself, and a value of any
+/// other form names no queue.
+pub fn receipt_handle_incarnation(receipt_handle: &str) -> Option<&str> {
+    let (incarnation, receive) = receipt_handle.split_once(RECEIPT_HANDLE_SEPARATOR)?;
+    (is_minted_identifier(incarnation) && is_minted_identifier(receive)).then_some(incarnation)
+}
+
+/// Whether `value` is one of the opaque identifiers this service mints — the form
+/// [`new_identifier`] produces, and nothing else.
+fn is_minted_identifier(value: &str) -> bool {
+    value.chars().count() == MINTED_IDENTIFIER_LENGTH && uuid::Uuid::parse_str(value).is_ok()
+}
+
+/// What joins the two parts of a receipt handle this service mints. It is inside the
+/// alphabet [`is_receipt_handle`] accepts, so a minted handle is a well-formed one, and it
+/// appears in neither part, so the split is unambiguous.
+const RECEIPT_HANDLE_SEPARATOR: char = '/';
+
+/// The length of one opaque identifier this service mints: [`new_identifier`] produces the
+/// hyphenated 36-character form, and nothing shorter is a receipt handle.
+const MINTED_IDENTIFIER_LENGTH: usize = 36;
 
 /// The longest value this service treats as a receipt handle. A handle is held by a
 /// consumer and handed back, so this bounds what one refusal can be made to echo; it is

@@ -221,7 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         )
                         .into());
                     };
-                    objective_filter = Some(arn.clone());
+                    // A filter ARN names an objective by the identifier it carries, not
+                    // by the partition it is written in, so it is read as the ARN the
+                    // catalog stores for that objective before anything is compared
+                    // with it — the identity rule GetControl applies to a control ARN.
+                    objective_filter =
+                        Some(crate::state::canonical_catalog_arn("objective", arn));
                 }
             }
         }

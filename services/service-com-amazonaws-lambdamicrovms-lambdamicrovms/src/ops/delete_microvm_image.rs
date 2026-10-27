@@ -4,8 +4,9 @@
 //!
 //! Deletes the [`crate::state::MicrovmImage`] the `imageIdentifier` names: the call
 //! records it `DELETING` and the removal the clock then owes takes the record and
-//! every version it holds, so a later read misses. Idempotent: an image this account
-//! no longer holds is reported deleted rather than refused.
+//! every version it holds, so a later read misses. Idempotent while the record still
+//! exists with a deletion in flight; once the record is gone the identifier resolves to
+//! nothing and the delete is refused with the modelled 404.
 //!
 //! ## Shape of an operation
 //!
@@ -166,17 +167,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         store.materialize_due(now);
 
+        // An image of the AWS-OWNED namespace is not this account's to delete, and the
+        // verdict is taken BEFORE the lookup: a 404 here would tell a caller with no
+        // permission on the identifier whether it exists.
+        if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
+            return Err(DeleteMicrovmImageErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // The delete is DURABLE and ASYNCHRONOUS: the call records the image
         // `DELETING` and the removal the clock then owes takes the record, both of its
         // index entries and every version it held — so `GetMicrovmImage` and every
         // other lookup miss once it is due, and the name is free for a later create.
         //
         // "This operation is idempotent; deleting an image that has already been
-        // deleted succeeds without error" — so a repeat leaves the deletion already in
-        // flight exactly as it is, and an identifier this account no longer holds is
-        // answered with the state it has: DELETED.
-        let state_after_deletion = match store.image_mut(&input.image_identifier) {
-            Some(image) => {
+        // deleted succeeds without error" — which is the window in which the record
+        // still EXISTS with a deletion in flight: a repeat leaves that deletion exactly
+        // as it is and reports the same state. Once the record is really gone the
+        // identifier resolves to nothing, and the delete is refused like every other
+        // call addressed at a resource that is not there — that 404 is the terminal
+        // signal a cleanup loop reconciles on, and it is what keeps a delete of a
+        // mistyped identifier from being reported as a deletion.
+        let state_after_deletion = match store.resolve_image_reference(&input.image_identifier) {
+            crate::state::ImageReference::Resolved(name) => {
+                let Some(image) = store.images.get_mut(&name) else {
+                    return Err(not_found(&input.image_identifier));
+                };
                 if image.delete_due_at.is_none() {
                     image.state = crate::state::IMAGE_STATE_DELETING.to_string();
                     image.updated_at = Some(crate::state::now_datetime());
@@ -184,7 +204,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 image.state.clone()
             }
-            None => crate::state::IMAGE_STATE_DELETED.to_string(),
+            crate::state::ImageReference::Absent => {
+                return Err(not_found(&input.image_identifier));
+            }
+            // A value that is neither an id this account holds nor a well-formed ARN
+            // addresses nothing this API can ever name: a bad REQUEST, not a resource
+            // that happens to be missing — the same separation the read path makes.
+            crate::state::ImageReference::Malformed => {
+                return Err(DeleteMicrovmImageErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::invalid_arn_format_message(
+                            &input.image_identifier,
+                        )),
+                    },
+                )
+                .into());
+            }
         };
 
         Ok(DeleteMicrovmImageOutput {
@@ -194,4 +229,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: state_after_deletion,
         })
     }
+}
+
+/// The modelled 404 for an `imageIdentifier` that resolves to no record this account
+/// holds, built from the identifier the request carried.
+///
+/// `ResourceNotFoundException` models `message` as its only required member;
+/// `resourceType` and `resourceId` are optional and this service leaves them unset, so
+/// the message is the whole envelope.
+fn not_found(identifier: &str) -> DeleteMicrovmImageError {
+    DeleteMicrovmImageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::delete_image_not_found_message(identifier),
+        resource_type: None,
+        resource_id: None,
+    })
+    .into()
 }

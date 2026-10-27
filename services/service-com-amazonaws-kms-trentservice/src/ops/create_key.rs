@@ -507,15 +507,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let multi_region = input.multi_region.unwrap_or(false);
-        let mut state = state.lock();
-        // The store is bounded: past `MAX_KEYS` nothing is minted and nothing is
-        // persisted, so a loop of valid creates cannot grow the process without end.
-        if !state.has_room_for_another_key() {
-            return Err(quota_exceeded(format!(
+
+        // The store is bounded, and the bound is read BEFORE any material is generated
+        // so a request that will be refused for quota costs no key pair. It is read
+        // under a lock scope of its own, which is released before the generation below;
+        // the authoritative check is the one under the lock that persists.
+        let quota_exceeded_refusal = || {
+            quota_exceeded(format!(
                 "The request was rejected because a quota was exceeded: this emulator holds \
                  at most {} KMS keys.",
                 crate::state::MAX_KEYS
-            )));
+            ))
+        };
+        if !state.lock().has_room_for_another_key() {
+            return Err(quota_exceeded_refusal());
         }
 
         // A key whose origin is EXTERNAL is created with NO key material and waits in
@@ -526,21 +531,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`smithy_query(query="doc",shape="GetParametersForImport")`), which the
         // older "valid only for symmetric KMS keys" sentence on the `Origin` member
         // predates.
+        //
+        // Minting the material of an ASYMMETRIC spec generates a key pair, which is
+        // CPU work — hundreds of milliseconds for the largest modulus — so minting
+        // runs on the blocking pool BEFORE the store is locked:
+        // `spawn_blocking(..).await` is a real await point, so one key pair cannot
+        // starve the worker that serves health checks and every other request, and no
+        // other request waits on the store while it runs.
         let material = if origin == crate::state::ORIGIN_EXTERNAL {
             crate::state::KeyMaterial::AwaitingImport
         } else {
-            let Some(material) = crate::state::mint_material(profile.material) else {
+            match ::tokio::task::spawn_blocking(move || crate::state::mint_material(profile)).await
+            {
+                Ok(Some(material)) => material,
                 // No entropy, no key: nothing is persisted and the caller sees a
                 // retryable server error rather than a key with predictable material.
-                return Err(CreateKeyErrorModeled::KMSInternalException(
-                    KMSInternalException {
-                        message: Some("the key material could not be generated".to_string()),
-                    },
-                )
-                .into());
-            };
-            material
+                Ok(None) => {
+                    return Err(CreateKeyErrorModeled::KMSInternalException(
+                        KMSInternalException {
+                            message: Some("the key material could not be generated".to_string()),
+                        },
+                    )
+                    .into());
+                }
+                // A panic or a cancellation on the pool says nothing about the
+                // request, so it is reported as the server fault it is rather than as
+                // a key whose material nothing generated.
+                Err(error) => {
+                    ::tracing::error!(
+                        operation = Self::NAME,
+                        error = %error,
+                        "the key material did not complete"
+                    );
+                    return Err(CreateKeyErrorModeled::KMSInternalException(
+                        KMSInternalException {
+                            message: Some("the key material could not be generated".to_string()),
+                        },
+                    )
+                    .into());
+                }
+            }
         };
+
+        let mut state = state.lock();
+        // Past `MAX_KEYS` nothing is persisted, so a loop of valid creates cannot grow
+        // the process without end. This is the authoritative read: another request may
+        // have taken the last room while the material was being generated.
+        if !state.has_room_for_another_key() {
+            return Err(quota_exceeded_refusal());
+        }
 
         let key = crate::state::Cmk::new(
             // "For a single-Region KMS key, omit this parameter or set it to False.

@@ -7,9 +7,9 @@
 //! the `imageIdentifier` names — resolved by either form `MicrovmImageIdentifier`
 //! accepts — each carrying that image's AWS-owned ARN in the region the request was
 //! signed for, its version, its lifecycle status and the instants the entry was
-//! published, paged by the operation's `@paginated` contract; a well-formed reference
-//! the catalogue does not publish is HTTP 404, and a value that is no identifier of this
-//! API is HTTP 400.
+//! published, paged by the operation's `@paginated` contract; a well-formed reference the
+//! catalogue does not publish has an empty published version set and so pages through to
+//! an empty page, and a value that is no identifier of this API is HTTP 400.
 //!
 //! Each test states that rule and exercises it over a SET of inputs; the values any one
 //! row happens to carry are examples, not the specification. The wire harness
@@ -17,8 +17,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    base_image_not_found_message, invalid_arn_format_message, managed_base_image_arn,
-    published_managed_base_image_versions, MANAGED_BASE_IMAGE_IDS, MAX_LIST_PAGE,
+    invalid_arn_format_message, managed_base_image_arn, published_managed_base_image_versions,
+    MANAGED_BASE_IMAGE_IDS, MAX_LIST_PAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -234,12 +234,13 @@ async fn the_versions_carry_the_region_the_request_was_signed_for() {
     }
 }
 
-/// RULE: the identifier is resolved against the PUBLISHED catalogue — a well-formed
-/// reference it does not publish (an account's own image included) is HTTP 404
-/// `ResourceNotFoundException`, and a value that is neither a published id nor an ARN is
-/// HTTP 400 `ValidationException`.
+/// RULE: the identifier is resolved against the PUBLISHED catalogue — the version set of
+/// a well-formed reference it does not publish (an account's own image included) is
+/// EMPTY, so the listing is a terminal empty page rather than a refusal (`items` is
+/// `@required` on this `@paginated` listing), and only a value that is neither a
+/// published id nor an ARN is HTTP 400 `ValidationException`.
 #[tokio::test]
-async fn an_identifier_the_catalogue_does_not_publish_is_refused() {
+async fn an_identifier_the_catalogue_does_not_publish_pages_empty() {
     let router = emulator();
 
     // An image this ACCOUNT holds: it is addressable through the customer API, and is
@@ -257,39 +258,36 @@ async fn an_identifier_the_catalogue_does_not_publish_is_refused() {
     // Rows differ in HOW the reference fails to name a published managed version set:
     // the right ARN form with an unpublished id, another service's ARN, an account's own
     // image ARN, and values that are no identifier of this API at all.
-    let rows: Vec<(&str, String, u16, String)> = vec![
+    let rows: Vec<(&str, String, u16, Option<String>)> = vec![
         (
             "a managed ARN the catalogue does not publish",
             managed_base_image_arn(REGION, "not-a-published-base-image"),
-            404,
-            base_image_not_found_message(&managed_base_image_arn(
-                REGION,
-                "not-a-published-base-image",
-            )),
+            200,
+            None,
         ),
         (
             "another service's ARN",
             format!("arn:aws:ec2:{REGION}:aws:image:al2023-1"),
-            404,
-            base_image_not_found_message(&format!("arn:aws:ec2:{REGION}:aws:image:al2023-1")),
+            200,
+            None,
         ),
         (
             "the account's own image ARN",
             expected_image_arn(own),
-            404,
-            base_image_not_found_message(&expected_image_arn(own)),
+            200,
+            None,
         ),
         (
             "the account's own image name",
             own.to_string(),
             400,
-            invalid_arn_format_message(own),
+            Some(invalid_arn_format_message(own)),
         ),
         (
             "no identifier of this API at all",
             "not-an-identifier".to_string(),
             400,
-            invalid_arn_format_message("not-an-identifier"),
+            Some(invalid_arn_format_message("not-an-identifier")),
         ),
     ];
 
@@ -299,22 +297,35 @@ async fn an_identifier_the_catalogue_does_not_publish_is_refused() {
             status, expected_status,
             "case {case:?}: {identifier:?} expected {expected_status}, got {status} {body}"
         );
-        let expected_type = match expected_status {
-            404 => "ResourceNotFoundException",
-            _ => "ValidationException",
-        };
-        assert_eq!(
-            body["__type"].as_str(),
-            Some(expected_type),
-            "case {case:?}: expected {expected_type}, got {body}"
-        );
-        assert_eq!(
-            body["message"].as_str(),
-            Some(expected_message.as_str()),
-            "case {case:?}: expected the refusal built from the identifier the request \
-             carried, got {:?}",
-            body["message"]
-        );
+        match expected_message {
+            None => {
+                assert_eq!(
+                    page_items(&body, case),
+                    Vec::<Value>::new(),
+                    "case {case:?}: the catalogue publishes no version of it, so the page is \
+                     empty, got {body}"
+                );
+                assert!(
+                    body["nextToken"].is_null(),
+                    "case {case:?}: an empty page is terminal, got {:?}",
+                    body["nextToken"]
+                );
+            }
+            Some(expected_message) => {
+                assert_eq!(
+                    body["__type"].as_str(),
+                    Some("ValidationException"),
+                    "case {case:?}: expected ValidationException, got {body}"
+                );
+                assert_eq!(
+                    body["message"].as_str(),
+                    Some(expected_message.as_str()),
+                    "case {case:?}: expected the refusal built from the identifier the request \
+                     carried, got {:?}",
+                    body["message"]
+                );
+            }
+        }
     }
 }
 

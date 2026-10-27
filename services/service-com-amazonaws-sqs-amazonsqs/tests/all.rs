@@ -51,6 +51,8 @@ mod queue_permissions;
 mod queue_policy_authorization;
 #[path = "all/queue_tags.rs"]
 mod queue_tags;
+#[path = "all/receipt_handle_provenance.rs"]
+mod receipt_handle_provenance;
 #[path = "all/receive_message_attribute_names.rs"]
 mod receive_message_attribute_names;
 #[path = "all/refusal_message_reasons.rs"]

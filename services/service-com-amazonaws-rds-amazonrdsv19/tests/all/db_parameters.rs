@@ -516,7 +516,8 @@ async fn a_parameter_value_outside_the_published_set_is_refused() {
         );
 
         // The model types `ApplyMethod` as an enum, so a method outside it is refused at the
-        // boundary — before the handler — with the framework's own `ValidationError`.
+        // boundary — before the handler — under the code this service answers a parameter
+        // value its member does not accept with.
         let modifiable = catalog
             .iter()
             .find(|spec| spec.is_modifiable)
@@ -531,7 +532,7 @@ async fn a_parameter_value_outside_the_published_set_is_refused() {
             )
             .await,
             400,
-            "ValidationError",
+            "InvalidParameterValue",
         );
     }
 }

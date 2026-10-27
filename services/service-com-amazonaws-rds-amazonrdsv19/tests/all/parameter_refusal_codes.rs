@@ -19,8 +19,14 @@
 //!    member's constraints the value broke.
 //! 3. A `Marker` no prior page issued is refused in the fixed text RDS answers it with,
 //!    the same on every paginated report, because one shared paginator serves them all.
+//! 4. A value that broke a constraint the MODEL declares — refused by the boundary
+//!    validator, before any handler runs — carries that SAME `InvalidParameterValue` code,
+//!    so one class of refusal has one code whichever layer found it. The table spans the
+//!    constraint KINDS a member can declare (a numeric range below and above its bound, a
+//!    string length, an enumerated value set) across four operations, with the published
+//!    bound itself served to show the refusal is not blanket.
 //!
-//! A fourth test pins the two not-found wordings of the snapshot paths —
+//! A fifth test pins the two not-found wordings of the snapshot paths —
 //! `CreateDBSnapshot` naming an absent DB instance and `DescribeDBSnapshots` naming an
 //! absent snapshot — each with the modelled code and status beside it, so a row cannot
 //! pass by failing for another reason, and reads a stored snapshot back so the absent
@@ -363,6 +369,254 @@ async fn an_unissued_marker_is_refused_in_one_fixed_text_on_every_report() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The constraints the MODEL declares
+// ---------------------------------------------------------------------------
+
+/// One row of the modelled-constraint table: a request whose value breaks a constraint the
+/// model declares, and the clause its refusal must state.
+struct ConstraintRow {
+    case: String,
+    action: &'static str,
+    params: Vec<(&'static str, String)>,
+    /// The member the clause names, spelled the way a validation path spells it.
+    path: &'static str,
+    /// The value the clause echoes back.
+    value: String,
+    /// The requirement the clause states.
+    requirement: String,
+}
+
+/// The requirement clause of a numeric member below its `@range` minimum.
+fn at_least(bound: i32) -> String {
+    format!("Member must have value greater than or equal to {bound}")
+}
+
+/// The requirement clause of a numeric member above its `@range` maximum.
+fn at_most(bound: i32) -> String {
+    format!("Member must have value less than or equal to {bound}")
+}
+
+/// The requirement clause of a string shorter than its `@length` minimum.
+fn at_least_long(bound: usize) -> String {
+    format!("Member must have length greater than or equal to {bound}")
+}
+
+/// The requirement clause of a string longer than its `@length` maximum.
+fn at_most_long(bound: usize) -> String {
+    format!("Member must have length less than or equal to {bound}")
+}
+
+/// The longest `Engine` and `MajorEngineVersion`
+/// `DescribeDBMajorEngineVersions` admits: both members are `len 1..50`
+/// (`smithy_query(query="shape",shape="DescribeDBMajorEngineVersionsRequest")`).
+const MAX_ENGINE_LEN: usize = 50;
+
+/// The longest `Marker` that operation admits: `len 1..340`, from the same shape.
+const MAX_MARKER_LEN: usize = 340;
+
+/// The values `ExportSourceType` publishes
+/// (`smithy_query(query="shape",shape="ExportSourceType")`), in the order the enum lists
+/// them — which is the order the requirement clause states them in.
+const EXPORT_SOURCE_TYPES: [&str; 2] = ["SNAPSHOT", "CLUSTER"];
+
+/// The rows of the modelled-constraint table.
+///
+/// The axes are the constraint KIND (a numeric `@range` crossed in each direction, a
+/// `@length` crossed in each direction, an enumerated value set) and the operation it is
+/// declared on: the three reports below each take their page size against the one
+/// `MaxRecords` shape the model bounds at 20..100, so the same bound is asserted through
+/// three different front doors rather than one.
+fn constraint_rows() -> Vec<ConstraintRow> {
+    let mut rows = Vec::new();
+
+    let (low, high) = (*MAX_RECORDS_RANGE.start(), *MAX_RECORDS_RANGE.end());
+    for action in [
+        "DescribeDBMajorEngineVersions",
+        "DescribeExportTasks",
+        "DescribeDBShardGroups",
+    ] {
+        for (case, value, requirement) in [
+            ("one below the modelled minimum", low - 1, at_least(low)),
+            ("zero", 0, at_least(low)),
+            ("a negative page size", -1, at_least(low)),
+            ("one above the modelled maximum", high + 1, at_most(high)),
+            ("far above the modelled maximum", 1000, at_most(high)),
+        ] {
+            rows.push(ConstraintRow {
+                case: format!("{action} with MaxRecords {case}"),
+                action,
+                params: vec![("MaxRecords", value.to_string())],
+                path: "maxRecords",
+                value: value.to_string(),
+                requirement,
+            });
+        }
+    }
+
+    // A `@length` on a string member, crossed in each direction, on two members of one
+    // operation.
+    for member in ["Engine", "MajorEngineVersion"] {
+        let path = if member == "Engine" {
+            "engine"
+        } else {
+            "majorEngineVersion"
+        };
+        let too_long = "a".repeat(MAX_ENGINE_LEN + 1);
+        rows.push(ConstraintRow {
+            case: format!("DescribeDBMajorEngineVersions with a {member} one past its bound"),
+            action: "DescribeDBMajorEngineVersions",
+            params: vec![(if member == "Engine" { "Engine" } else { "MajorEngineVersion" }, too_long.clone())],
+            path,
+            value: too_long,
+            requirement: at_most_long(MAX_ENGINE_LEN),
+        });
+        rows.push(ConstraintRow {
+            case: format!("DescribeDBMajorEngineVersions with an empty {member}"),
+            action: "DescribeDBMajorEngineVersions",
+            params: vec![(if member == "Engine" { "Engine" } else { "MajorEngineVersion" }, String::new())],
+            path,
+            value: String::new(),
+            requirement: at_least_long(1),
+        });
+    }
+    rows.push(ConstraintRow {
+        case: "DescribeDBMajorEngineVersions with an empty Marker".to_string(),
+        action: "DescribeDBMajorEngineVersions",
+        params: vec![("Marker", String::new())],
+        path: "marker",
+        value: String::new(),
+        requirement: at_least_long(1),
+    });
+
+    // An enumerated value set: a value outside the one the model publishes.
+    for value in ["not-a-source-type", "snapshot"] {
+        rows.push(ConstraintRow {
+            case: format!("DescribeExportTasks with the SourceType {value:?}"),
+            action: "DescribeExportTasks",
+            params: vec![("SourceType", value.to_string())],
+            path: "sourceType",
+            value: value.to_string(),
+            requirement: format!(
+                "Member must satisfy enum value set: [{}]",
+                EXPORT_SOURCE_TYPES.join(", ")
+            ),
+        });
+    }
+
+    rows
+}
+
+/// A value that broke a constraint the MODEL declares is refused under the same Query API
+/// code as one a handler refuses: HTTP 400 `InvalidParameterValue`, in the awsQuery error
+/// envelope this front door answers with, stating the member and the requirement it broke.
+#[tokio::test]
+async fn a_value_outside_a_modelled_constraint_carries_the_same_invalid_parameter_value() {
+    let router = emulator();
+
+    for row in constraint_rows() {
+        let body = expect_error(
+            &row.case,
+            call(&router, row.action, &row.params).await,
+            400,
+            "InvalidParameterValue",
+        );
+        assert_eq!(
+            text(&body, "Message"),
+            format!(
+                "1 validation error detected: Value '{}' at '{}' failed to satisfy constraint: {}",
+                row.value, row.path, row.requirement
+            ),
+            "case {:?}: expected the clause naming the member and the requirement, got {body}",
+            row.case
+        );
+        // The envelope stays the one every other refusal of this front door carries.
+        assert_eq!(
+            text(&body, "Type"),
+            "Sender",
+            "case {:?}: expected a Sender fault, got {body}",
+            row.case
+        );
+        assert!(
+            body.contains("<RequestId>"),
+            "case {:?}: expected the envelope's RequestId, got {body}",
+            row.case
+        );
+    }
+
+    // The published bound itself is SERVED, so no row above passed on a report that
+    // refuses everything.
+    for (case, params) in [
+        (
+            "the modelled minimum page size",
+            vec![("MaxRecords", MAX_RECORDS_RANGE.start().to_string())],
+        ),
+        (
+            "the modelled maximum page size",
+            vec![("MaxRecords", MAX_RECORDS_RANGE.end().to_string())],
+        ),
+        (
+            "the longest Engine the member admits",
+            vec![("Engine", "a".repeat(MAX_ENGINE_LEN))],
+        ),
+        (
+            "the longest MajorEngineVersion the member admits",
+            vec![("MajorEngineVersion", "a".repeat(MAX_ENGINE_LEN))],
+        ),
+    ] {
+        expect_ok(
+            case,
+            call(&router, "DescribeDBMajorEngineVersions", &params).await,
+        );
+    }
+
+    // A `Marker` at its length bound passes the boundary and is then refused by the
+    // paginator instead — same code, the service's own text — which is what shows the
+    // rows above were refused for the constraint they broke rather than for being long.
+    let body = expect_error(
+        "the longest Marker the member admits",
+        call(
+            &router,
+            "DescribeDBMajorEngineVersions",
+            &[("Marker", "m".repeat(MAX_MARKER_LEN))],
+        )
+        .await,
+        400,
+        "InvalidParameterValue",
+    );
+    assert_eq!(
+        text(&body, "Message"),
+        INVALID_MARKER,
+        "case \"the longest Marker the member admits\": expected the paginator's own refusal, \
+         got {body}"
+    );
+
+    // One past that bound is the boundary's refusal again, and the clause still names the
+    // member — the value is elided where it is longer than the envelope echoes, so this
+    // row reads the clause's ends rather than the whole of it.
+    let body = expect_error(
+        "one character past the Marker bound",
+        call(
+            &router,
+            "DescribeDBMajorEngineVersions",
+            &[("Marker", "m".repeat(MAX_MARKER_LEN + 1))],
+        )
+        .await,
+        400,
+        "InvalidParameterValue",
+    );
+    let message = text(&body, "Message");
+    assert!(
+        message.starts_with("1 validation error detected: Value 'mmm")
+            && message.ends_with(&format!(
+                "at 'marker' failed to satisfy constraint: {}",
+                at_most_long(MAX_MARKER_LEN)
+            )),
+        "case \"one character past the Marker bound\": expected the clause naming marker and \
+         its length bound, got {message:?}"
+    );
 }
 
 /// The snapshot paths' not-found wordings, each with its modelled code and status: the

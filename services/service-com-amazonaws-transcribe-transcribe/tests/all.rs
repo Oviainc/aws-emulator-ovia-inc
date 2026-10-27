@@ -47,6 +47,8 @@ mod get_call_analytics_category_reads;
 mod get_medical_vocabulary_reads;
 #[path = "all/job_concurrency_quota.rs"]
 mod job_concurrency_quota;
+#[path = "all/job_start_vocabulary_state.rs"]
+mod job_start_vocabulary_state;
 #[path = "all/language_model_delete_requires_the_model.rs"]
 mod language_model_delete_requires_the_model;
 #[path = "all/language_model_listing.rs"]

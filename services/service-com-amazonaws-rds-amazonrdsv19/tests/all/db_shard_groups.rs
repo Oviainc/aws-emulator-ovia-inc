@@ -555,13 +555,14 @@ async fn parameters_outside_what_the_members_document_are_refused() {
     }
 
     // Both published bounds of `MaxRecords`, and one value past each. The range is
-    // modelled, so a value outside it is refused by the boundary validator, which answers
-    // the `ValidationError` code rather than reaching the handler at all.
+    // modelled, so a value outside it is refused by the boundary validator rather than
+    // reaching the handler at all — under the `InvalidParameterValue` code this service
+    // answers a parameter value its member does not accept with.
     for (case, value, code) in [
         ("the lowest MaxRecords", "20", ""),
         ("the highest MaxRecords", "100", ""),
-        ("one below the lowest", "19", "ValidationError"),
-        ("one above the highest", "101", "ValidationError"),
+        ("one below the lowest", "19", "InvalidParameterValue"),
+        ("one above the highest", "101", "InvalidParameterValue"),
     ] {
         let response = call(&router, "DescribeDBShardGroups", &[("MaxRecords", value)]).await;
         if code.is_empty() {
