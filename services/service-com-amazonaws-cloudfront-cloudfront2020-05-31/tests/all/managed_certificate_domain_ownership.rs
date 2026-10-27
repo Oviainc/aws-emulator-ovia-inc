@@ -40,10 +40,13 @@
 //! [`crate::distribution_lifecycle`] already builds; the tenant helpers are
 //! [`crate::distribution_tenant_lifecycle`]'s.
 
+use std::time::Duration;
+
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::ops::types::VALIDATION_TOKEN_HOST_VALUES;
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    CERTIFICATE_STATUS_PENDING_VALIDATION, DOMAIN_OWNERSHIP_UNVERIFIED_MESSAGE,
-    INVALID_DOMAIN_NAME_MESSAGE, MAX_DOMAINS_PER_TENANT, VALIDATION_TOKEN_HOST_CLOUDFRONT,
+    CERTIFICATE_STATUS_PENDING_VALIDATION, CERTIFICATE_VALIDATION_DELAY,
+    DOMAIN_OWNERSHIP_UNVERIFIED_MESSAGE, INVALID_DOMAIN_NAME_MESSAGE, MAX_DOMAINS_PER_TENANT,
+    VALIDATION_TOKEN_HOST_CLOUDFRONT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -75,6 +78,19 @@ async fn get_distribution_tenant_by_domain(router: &MultiServiceRouter, domain: 
         None,
     )
     .await
+}
+
+/// Wait out the span the clock owes a CloudFront managed certificate its issuance in.
+///
+/// A domain the certificate covers is not in the host-to-tenant map until the certificate
+/// is issued, so a by-domain read of it answers only once the clock has made the issuance
+/// due ([`CERTIFICATE_VALIDATION_DELAY`]). Nothing in the service sleeps for it; only this
+/// test does, to observe the state the clock owes.
+///
+/// `pub(crate)` so every sibling suite whose create asks CloudFront to validate a domain
+/// waits for that issuance the same way rather than growing a copy of this.
+pub(crate) async fn await_certificate_issuance() {
+    tokio::time::sleep(CERTIFICATE_VALIDATION_DELAY + Duration::from_millis(100)).await;
 }
 
 /// `GET /2020-05-31/distribution-tenant/{Identifier}` — the read that says whether the
@@ -393,29 +409,6 @@ async fn cloudfront_hosted_validation_demands_a_domain_that_resolves_to_cloudfro
             let id = text(tenant, "Id", case, "the created tenant", &created.raw);
             let etag = created.header("etag").to_string();
 
-            // Every domain the create claimed reaches the one stored tenant.
-            for domain in &row.domains {
-                let answer = get_distribution_tenant_by_domain(&router, domain).await;
-                assert_eq!(
-                    answer.status, 200,
-                    "case {case} ({domain}): expected the tenant to be readable by its domain, \
-                     got {} with {}",
-                    answer.status, answer.raw
-                );
-                let read_id = text(answer.root(), "Id", case, "read by domain", &answer.raw);
-                assert_eq!(
-                    read_id, id,
-                    "case {case} ({domain}): expected the created tenant {id}, got {read_id:?}"
-                );
-                assert_eq!(
-                    answer.header("etag"),
-                    etag,
-                    "case {case} ({domain}): expected the version token the create minted \
-                     ({etag}), got {:?}",
-                    answer.header("etag")
-                );
-            }
-
             // The certificate the create asked for — if it asked for one — reports the
             // token host it chose, and is still awaiting validation.
             let certificate = get_managed_certificate_details(&router, &row.name).await;
@@ -451,6 +444,27 @@ async fn cloudfront_hosted_validation_demands_a_domain_that_resolves_to_cloudfro
                         "case {case}: expected a just-requested certificate to be \
                          {CERTIFICATE_STATUS_PENDING_VALIDATION}, got {status:?}"
                     );
+
+                    // While that certificate is pending, CloudFront cannot serve the
+                    // domains it covers, so they are not in the host-to-tenant map yet.
+                    for domain in &row.domains {
+                        let pending = get_distribution_tenant_by_domain(&router, domain).await;
+                        assert_eq!(
+                            pending.status, 404,
+                            "case {case} ({domain}): expected HTTP 404 while the certificate is \
+                             {CERTIFICATE_STATUS_PENDING_VALIDATION}, got {} with {}",
+                            pending.status, pending.raw
+                        );
+                        assert_eq!(
+                            pending.error_code(),
+                            "EntityNotFound",
+                            "case {case} ({domain}): expected EntityNotFound while the \
+                             certificate is pending, got {}",
+                            pending.raw
+                        );
+                    }
+                    // The issuance the clock owes makes the domains servable.
+                    await_certificate_issuance().await;
                 }
                 None => assert_eq!(
                     certificate.status, 404,
@@ -458,6 +472,29 @@ async fn cloudfront_hosted_validation_demands_a_domain_that_resolves_to_cloudfro
                      {} with {}",
                     certificate.status, certificate.raw
                 ),
+            }
+
+            // Every domain the create claimed reaches the one stored tenant.
+            for domain in &row.domains {
+                let answer = get_distribution_tenant_by_domain(&router, domain).await;
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case} ({domain}): expected the tenant to be readable by its domain, \
+                     got {} with {}",
+                    answer.status, answer.raw
+                );
+                let read_id = text(answer.root(), "Id", case, "read by domain", &answer.raw);
+                assert_eq!(
+                    read_id, id,
+                    "case {case} ({domain}): expected the created tenant {id}, got {read_id:?}"
+                );
+                assert_eq!(
+                    answer.header("etag"),
+                    etag,
+                    "case {case} ({domain}): expected the version token the create minted \
+                     ({etag}), got {:?}",
+                    answer.header("etag")
+                );
             }
             continue;
         }
@@ -524,6 +561,10 @@ async fn cloudfront_hosted_validation_demands_a_domain_that_resolves_to_cloudfro
              accepted, got {} with {}",
             accepted.status, accepted.raw
         );
+        // The accepted re-submit asked CloudFront for a managed certificate, so the domains
+        // it covers reach the tenant once the clock has made its issuance due — one wait for
+        // the one transition, whatever the number of domains.
+        await_certificate_issuance().await;
         for domain in &row.domains {
             let answer = get_distribution_tenant_by_domain(&router, domain).await;
             assert_eq!(
@@ -562,7 +603,9 @@ async fn a_domain_no_tenant_claims_is_not_found() {
     );
     let id = text(created.root(), "Id", row.case, "the created tenant", &created.raw);
 
-    // The claimed name reaches the tenant in any case it is written in.
+    // The claimed name reaches the tenant in any case it is written in, once the managed
+    // certificate the create asked for has been issued.
+    await_certificate_issuance().await;
     for (case, domain) in [
         ("the claimed domain as submitted", "Claimed.Example.com"),
         ("the claimed domain in lower case", "claimed.example.com"),

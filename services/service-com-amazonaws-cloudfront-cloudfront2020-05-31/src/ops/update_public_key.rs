@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the configuration of the public key an id names and reports the record as it
+//! then stands, read from [`crate::state`] rather than from the request.
+//!
+//! "Note that the only value you can change is the comment": `CallerReference`, `Name` and
+//! `EncodedKey` are fixed once the key is uploaded, so an update that submits a different
+//! value for any one of them is refused 400 `CannotChangeImmutablePublicKeyFields` and
+//! leaves the stored record and its version token exactly as they were
+//! ([`crate::state::immutable_public_key_change`]); one that resubmits them unchanged beside
+//! a new comment lands, moves `Comment` to the submitted value and mints a fresh version
+//! token, which is the one a later `If-Match` against this key is checked against.
+//!
+//! The refusals, in the order they are checked — each one BEFORE anything is written:
+//!
+//! * an `If-Match` that is absent or is not a version token at all —
+//!   `InvalidIfMatchVersion` (HTTP 400), "The If-Match version is missing or not valid":
+//!   the FORM of the header is a property of the request, so no version of any resource
+//!   could make it valid and it is decided before the id is resolved
+//!   ([`crate::state::if_match_version`]);
+//! * an id no stored key holds — `NoSuchPublicKey` (HTTP 404);
+//! * a well-formed token that is not this key's current one — `PreconditionFailed`
+//!   (HTTP 412), so an update only lands on the configuration its caller actually read;
+//! * a `Comment` past the documented 128 characters — `InvalidArgument` (HTTP 400), the
+//!   SAME check the create path applies ([`crate::state::MAX_PUBLIC_KEY_COMMENT`]);
+//! * a change to an immutable member — `CannotChangeImmutablePublicKeyFields` (HTTP 400).
+//!
+//! `IllegalUpdate` ("The update contains modifications that are not allowed") is not
+//! reachable here: the modifications a public key does not allow are exactly the immutable
+//! members, which the model gives this operation its own error for. `AccessDenied` is
+//! unreachable here, as it is from every other operation in this service: the emulator
+//! authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +174,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePublicKey"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.public_key_config;
+        let now = ::std::time::SystemTime::now();
+
+        // The FORM of the `If-Match` header: "missing or not valid" is a property of the
+        // request alone, so it is decided before the id is resolved — no version of any key
+        // could make an absent or malformed header valid.
+        let Some(submitted_version) = crate::state::if_match_version(input.if_match.as_deref())
+        else {
+            return Err(UpdatePublicKeyErrorModeled::InvalidIfMatchVersion(
+                crate::state::invalid_if_match_version(),
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Materialise whatever the clock owes the rest of the store before this call reads
+        // it, as every handler here does. A public key itself has no transition owed: the
+        // model gives it no status.
+        store.settle(now);
+
+        // The key being updated is looked up first: every refusal below is about the record
+        // this id names, and nothing is minted for an id the store does not hold.
+        let Some(stored) = store.public_key(&input.id) else {
+            return Err(UpdatePublicKeyErrorModeled::NoSuchPublicKey(
+                crate::state::no_such_public_key(),
+            )
+            .into());
+        };
+        let current_etag = stored.etag.clone();
+        let held = stored.config.clone();
+
+        // The precondition is checked against the STORED version, so an update only lands
+        // on the configuration its caller actually read.
+        if submitted_version != current_etag {
+            return Err(UpdatePublicKeyErrorModeled::PreconditionFailed(
+                crate::state::precondition_failed(),
+            )
+            .into());
+        }
+
+        // "A comment to describe the public key. The comment cannot be longer than 128
+        // characters." The documented bound holds on every payload that states a
+        // configuration, so an update cannot store one the create would have refused.
+        let comment_length = config.comment.as_deref().unwrap_or_default().chars().count();
+        if comment_length > crate::state::MAX_PUBLIC_KEY_COMMENT {
+            return Err(UpdatePublicKeyErrorModeled::InvalidArgument(
+                crate::state::comment_too_long(comment_length),
+            )
+            .into());
+        }
+
+        // "Note that the only value you can change is the comment": a request that moves
+        // any other member asks for a change the key does not take, and the stored record
+        // and its version token are left exactly as they are.
+        if crate::state::immutable_public_key_change(&held, &config).is_some() {
+            return Err(
+                UpdatePublicKeyErrorModeled::CannotChangeImmutablePublicKeyFields(
+                    crate::state::cannot_change_immutable_public_key_fields(),
+                )
+                .into(),
+            );
+        }
+
+        // Defensive: the id was confirmed present above under this same lock, so the write
+        // cannot miss. The `None` arm is the modelled 404 rather than a panic.
+        let Some(stored) = store.apply_public_key_config(&input.id, config) else {
+            return Err(UpdatePublicKeyErrorModeled::NoSuchPublicKey(
+                crate::state::no_such_public_key(),
+            )
+            .into());
+        };
+
+        Ok(UpdatePublicKeyOutput {
+            // "The public key." — read from the record just written, never from the
+            // request, so the instant it was uploaded is still the create's.
+            public_key: Some(stored.to_public_key()),
+            // "The identifier of the current version of the public key" — a fresh token, so
+            // the version this caller just replaced no longer satisfies an `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

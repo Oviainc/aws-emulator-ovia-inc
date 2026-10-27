@@ -19,7 +19,9 @@
 //! * the version token a mutation hands back is the only one an `If-Match` against that
 //!   policy satisfies afterwards: an absent or malformed header is `InvalidIfMatchVersion`
 //!   (HTTP 400), a well-formed token that is not the current one is `PreconditionFailed`
-//!   (HTTP 412), and the current one — bare, quoted or weak — is accepted;
+//!   (HTTP 412), and the current one — bare, quoted or weak — is accepted; so of two updates
+//!   that start from ONE token exactly one lands and the other is refused on the
+//!   precondition, whether the two are sent concurrently or one after the other;
 //! * every constraint the create path refuses a configuration with holds on an update too (a
 //!   list wrapper whose `Quantity` disagrees with its `Items`, a `Name` another policy
 //!   holds), and a refused update writes NOTHING: the stored configuration and its version
@@ -395,6 +397,89 @@ async fn an_update_replaces_the_whole_configuration_and_the_read_reports_it() {
             stale.raw
         );
         assert_stored(&router, &id, &target, &etag, "after the stale update").await;
+    }
+}
+
+/// Two updates that start from ONE version token resolve to exactly one winner: the first
+/// to land mints a new token, so the other no longer matches the stored version and is
+/// refused on the precondition. Asserted both concurrently (the two requests dispatched
+/// together) and sequentially, over the whole table, and the stored record afterwards is
+/// the winner's configuration — never a blend of the two.
+#[tokio::test]
+async fn two_updates_from_one_token_resolve_to_one_winner() {
+    let router = emulator();
+    let table = policy_table();
+
+    for (index, policy) in table.iter().enumerate() {
+        let case = policy.case;
+        let created = Policy {
+            name: format!("orp-race-{index}"),
+            ..policy.clone()
+        };
+        let (id, etag) = seed(&router, &created).await;
+
+        // Two candidate configurations, each differing from the stored one and from each
+        // other, under the name the policy already holds.
+        let first = Policy {
+            case,
+            name: created.name.clone(),
+            comment: Some(format!("racer a for {index}")),
+            ..table[(index + 1) % table.len()].clone()
+        };
+        let second = Policy {
+            case,
+            name: created.name.clone(),
+            comment: Some(format!("racer b for {index}")),
+            ..table[(index + 2) % table.len()].clone()
+        };
+
+        let first_body = first.xml();
+        let second_body = second.xml();
+        let (a, b) = tokio::join!(
+            update_policy(&router, &id, &first_body, Some(&etag)),
+            update_policy(&router, &id, &second_body, Some(&etag)),
+        );
+
+        let winners: Vec<&Answer> = [&a, &b]
+            .into_iter()
+            .filter(|answer| answer.status == 200)
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "case {case}: expected exactly one winner, got statuses {} and {} with {} / {}",
+            a.status,
+            b.status,
+            a.raw,
+            b.raw
+        );
+        let loser = if a.status == 200 { &b } else { &a };
+        assert_eq!(
+            loser.status, 412,
+            "case {case}: expected the loser to be refused on the precondition, got {} with {}",
+            loser.status, loser.raw
+        );
+        assert_eq!(
+            loser.error_code(),
+            "PreconditionFailed",
+            "case {case}: expected PreconditionFailed from the loser, got {}",
+            loser.raw
+        );
+
+        // The stored record is the winner's configuration, at the token the winner minted.
+        let winner_etag = winners[0].header("etag").to_string();
+        let landed = if a.status == 200 { &first } else { &second };
+        assert_stored(&router, &id, landed, &winner_etag, "after the race").await;
+
+        // Sequentially, from the token that is now stale: the same refusal, and nothing
+        // changes.
+        let late = update_policy(&router, &id, &second_body, Some(&etag)).await;
+        assert_eq!(
+            late.status, 412,
+            "case {case}: expected HTTP 412 from the superseded token, got {} with {}",
+            late.status, late.raw
+        );
+        assert_stored(&router, &id, landed, &winner_etag, "after the late update").await;
     }
 }
 

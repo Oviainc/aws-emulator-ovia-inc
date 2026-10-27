@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDistributionTenant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDistributionTenant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDistributionTenant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the distribution tenant an id names from [`crate::state`]'s tenant slice, so the
+//! id afterwards names no tenant, the domains it claimed are free for another resource to
+//! claim, and the managed certificate and invalidations held on its record go with it.
+//! Answers 204 with no body: the record is gone, so there is nothing to report.
+//!
+//! The refusals, in the order they are checked — each one BEFORE anything is removed, so a
+//! refused delete leaves the tenant readable at the version it already had:
+//!
+//! * an id no stored tenant holds — `EntityNotFound` (HTTP 404); `Id` is "the ID of the
+//!   distribution tenant to delete", so the id is what resolves it, as the update's is;
+//! * an `If-Match` that is not a version token at all — `InvalidIfMatchVersion` (HTTP 400);
+//!   the member is `@required`, so a request stating none is refused at the request boundary
+//!   and never reaches here;
+//! * a well-formed token that is not this tenant's current one — `PreconditionFailed`
+//!   (HTTP 412), so a delete only lands on the version its caller actually read;
+//! * a tenant that is still ENABLED — `ResourceNotDisabled` (HTTP 409): "If you use this API
+//!   operation to delete a distribution tenant that is currently enabled, the request will
+//!   fail. To delete a distribution tenant, you must first disable the distribution tenant
+//!   by using the UpdateDistributionTenant API operation."
+//!
+//! `AccessDenied` is unreachable here, as it is from every other operation in this service:
+//! the emulator authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +184,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDistributionTenant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDistributionTenantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDistributionTenant"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes this service's state before the call
+        // reads it, so the version this precondition is evaluated against is the one a read
+        // at this instant reports.
+        store.settle(::std::time::SystemTime::now());
+
+        // The delete removes ONE stored tenant, so the record has to be there:
+        // `EntityNotFound` is the error this operation models for an entity it cannot find.
+        // `Id` is "the ID of the distribution tenant to delete", so the id is what resolves
+        // it, exactly as the update's does.
+        let Some(tenant) = store.distribution_tenants.get(&input.id) else {
+            return Err(DeleteDistributionTenantErrorModeled::EntityNotFound(
+                crate::state::distribution_tenant_not_found(),
+            )
+            .into());
+        };
+        let current_etag = tenant.etag.clone();
+        let enabled = tenant.enabled;
+
+        // "The value of the ETag header that you received when retrieving the distribution
+        // tenant": the version the delete runs under. A value that is no version token at
+        // all is "the `If-Match` version is missing or not valid", while a well-formed token
+        // that is not the stored one is a failed precondition. The member is `@required`, so
+        // a request stating no `If-Match` is refused at the request boundary.
+        match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
+            crate::state::IfMatch::Current => {}
+            crate::state::IfMatch::Invalid => {
+                return Err(DeleteDistributionTenantErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            crate::state::IfMatch::Stale => {
+                return Err(DeleteDistributionTenantErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // "If you use this API operation to delete a distribution tenant that is currently
+        // enabled, the request will fail. To delete a distribution tenant, you must first
+        // disable the distribution tenant by using the UpdateDistributionTenant API
+        // operation." So a tenant still serving traffic is refused here and stays readable.
+        if enabled {
+            return Err(DeleteDistributionTenantErrorModeled::ResourceNotDisabled(
+                crate::state::distribution_tenant_not_disabled(),
+            )
+            .into());
+        }
+
+        // Gone means gone: the record every read of this tenant answered from is removed,
+        // so the id names no tenant, the domains it claimed are unclaimed, and its name is
+        // free for a later create.
+        store.distribution_tenants.remove(&input.id);
+
+        Ok(DeleteDistributionTenantOutput)
     }
 }
