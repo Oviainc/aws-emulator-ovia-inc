@@ -14,6 +14,11 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// The schema and serializer for each response shape with a `@timestampFormat("date-time")`
+// member, because the vendored codegen drops that trait. Hand-added, not generated; see
+// the module's own note.
+pub mod date_time_wire;
+
 pub mod batch_create_memory_records_types;
 pub mod batch_delete_memory_records_types;
 pub mod batch_update_memory_records_types;
@@ -80,6 +85,8 @@ pub mod stop_runtime_session_types;
 pub mod update_ab_test_types;
 pub mod update_browser_stream_types;
 
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use date_time_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use batch_create_memory_records_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
