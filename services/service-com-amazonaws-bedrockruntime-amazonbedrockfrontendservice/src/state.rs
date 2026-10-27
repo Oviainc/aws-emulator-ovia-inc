@@ -30,7 +30,10 @@
 //! model family's own response envelope, text that says plainly that no model
 //! ran, together with the token accounting computed from the real request; an
 //! asynchronous invocation ends in the service's own `Failed` state with a
-//! failure message that says the same (see [`ASYNC_INVOKE_FAILURE_MESSAGE`]).
+//! failure message that says the same (see [`ASYNC_INVOKE_FAILURE_MESSAGE`]);
+//! and the arguments a forced tool call carries are the instantiation of the
+//! schema that tool was DECLARED with ([`tool_input_arguments`]), not values a
+//! model inferred from the conversation.
 //! Everything around that — resolution, validation, status, timestamps, ARNs,
 //! paging and the invocation log — is real and computed from persisted state.
 
@@ -251,6 +254,10 @@ impl ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
     /// `None` when the request leaves the choice to the model (`auto`, or no
     /// `toolChoice` at all).
     ///
+    /// The request carries the arguments the chosen tool's own `inputSchema`
+    /// describes ([`tool_input_arguments`]), so a client reading `toolUse.input`
+    /// finds the argument object it declared the tool with.
+    ///
     /// `Err` carries the refusal sentence for a choice the request's own tools
     /// cannot satisfy; the caller answers it with the operation's modelled
     /// `ValidationException` (400).
@@ -294,16 +301,14 @@ impl ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
             }
         };
         let tool_use_id = self.mint_tool_use_id(&name, at_millis);
+        // The arguments the tool is requested with are the instantiation of the
+        // schema that tool was DECLARED with ([`tool_input_arguments`]): a tool
+        // is called with the argument object its own `inputSchema` describes.
+        let input = tool_input_arguments(config, &name);
         Ok(Some(ToolUseBlock {
             tool_use_id,
             name,
-            // No language model runs in this emulator, so nothing composes the
-            // arguments a model would have inferred from the conversation: the
-            // tool is requested with an empty input object rather than with
-            // invented values. The envelope — the minted id, the tool requested
-            // and the input member — is computed from the request that was
-            // served.
-            input: ::aws_smithy_types::Document::Object(::std::collections::HashMap::new()),
+            input,
             r#type: None,
         }))
     }
@@ -2768,6 +2773,541 @@ pub fn document_to_json(document: &::aws_smithy_types::Document) -> serde_json::
         }
     }
     walk(document, 0)
+}
+/// A JSON value as a Smithy document — the inverse of [`document_to_json`], so a
+/// document this service composes as JSON reaches the wire as the modelled
+/// `Document` member it belongs to. The walk stops at [`MAX_DOCUMENT_DEPTH`] for
+/// the same reason, past which a branch becomes `Document::Null`.
+pub fn json_to_document(value: &serde_json::Value) -> ::aws_smithy_types::Document {
+    fn walk(value: &serde_json::Value, depth: usize) -> ::aws_smithy_types::Document {
+        use ::aws_smithy_types::{Document, Number};
+        if depth > MAX_DOCUMENT_DEPTH {
+            return Document::Null;
+        }
+        match value {
+            serde_json::Value::Object(members) => Document::Object(
+                members
+                    .iter()
+                    .map(|(name, member)| (name.clone(), walk(member, depth + 1)))
+                    .collect(),
+            ),
+            serde_json::Value::Array(items) => {
+                Document::Array(items.iter().map(|item| walk(item, depth + 1)).collect())
+            }
+            serde_json::Value::String(text) => Document::String(text.clone()),
+            serde_json::Value::Bool(flag) => Document::Bool(*flag),
+            serde_json::Value::Number(number) => {
+                if let Some(value) = number.as_u64() {
+                    Document::Number(Number::PosInt(value))
+                } else if let Some(value) = number.as_i64() {
+                    Document::Number(Number::NegInt(value))
+                } else if let Some(value) = number.as_f64() {
+                    Document::Number(Number::Float(value))
+                } else {
+                    Document::Null
+                }
+            }
+            serde_json::Value::Null => Document::Null,
+        }
+    }
+    walk(value, 0)
+}
+
+// ---------------------------------------------------------------------------
+// Tool arguments
+// ---------------------------------------------------------------------------
+
+/// The most elements an instantiated array argument carries.
+///
+/// `minItems` is a CALLER's number, so this is the EMULATOR's bound on it: a
+/// schema declaring an enormous one must not turn one request into an unbounded
+/// response. It is far above any argument list a tool declares.
+pub const MAX_ARGUMENT_ARRAY_ITEMS: usize = 8;
+
+/// The longest string an instantiated string argument carries, bounding
+/// `minLength` and `maxLength` for the same reason.
+pub const MAX_ARGUMENT_STRING_LENGTH: usize = 256;
+
+/// The most values ONE argument document carries, counting every member and
+/// element at every level.
+///
+/// Nesting MULTIPLIES: a schema that is small on the wire can describe a tree of
+/// arrays of objects whose instantiation is exponential in its depth. This is the
+/// EMULATOR's ceiling on the whole document, so the response one request composes
+/// stays bounded however the schema nests; it is far above the argument object of
+/// any tool a client declares. A schema asking for more is instantiated as far as
+/// the budget reaches: a member or an element past it is not carried at all, and
+/// a value the schema FIXES costs the number of values it itself carries (see
+/// [`fixed_value`]), so a large caller value cannot be reproduced many times
+/// over.
+pub const MAX_ARGUMENT_VALUES: usize = 4096;
+
+/// The most bytes ONE argument document is composed of: every value's own
+/// rendering, every member name, and a small allowance per value for the
+/// punctuation around it.
+///
+/// A value COUNT bounds how many values a document carries but not how large
+/// each one is, and a schema can fix a value of any size (a `const`, a
+/// `default`, an `enum` member) and name it from as many properties as it likes.
+/// This is the EMULATOR's ceiling on the SIZE of the document one request
+/// composes, so a schema cannot amplify a large caller value into a far larger
+/// response. It is far above the argument object of any tool a client declares.
+pub const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
+
+/// What one value costs before its own rendering: the separators, quotes and
+/// brackets a document spends on carrying it.
+const ARGUMENT_VALUE_OVERHEAD_BYTES: usize = 8;
+
+/// What is left of the ceilings ONE argument document is composed within:
+/// [`MAX_ARGUMENT_VALUES`] values and [`MAX_ARGUMENT_BYTES`] bytes.
+///
+/// Everything the projection emits is charged here — a member, an element, a
+/// member name, a placeholder and a value the schema fixes alike — so the
+/// document one request composes is bounded in both count and size.
+#[derive(Debug)]
+struct ArgumentBudget {
+    values: usize,
+    bytes: usize,
+}
+
+impl ArgumentBudget {
+    /// A whole budget, for one argument document.
+    fn new() -> Self {
+        Self {
+            values: MAX_ARGUMENT_VALUES,
+            bytes: MAX_ARGUMENT_BYTES,
+        }
+    }
+
+    /// Whether nothing more can be composed at all.
+    fn is_spent(&self) -> bool {
+        self.values == 0 || self.bytes == 0
+    }
+
+    /// Charge `values` values and `bytes` bytes, answering whether the budget
+    /// could pay: what it cannot pay for is not carried.
+    fn charge(&mut self, values: usize, bytes: usize) -> bool {
+        if values > self.values || bytes > self.bytes {
+            return false;
+        }
+        self.values -= values;
+        self.bytes -= bytes;
+        true
+    }
+}
+
+/// The argument document a tool request carries: the instantiation of the input
+/// schema the requested tool was DECLARED with.
+///
+/// A tool is called with the argument object its own
+/// `toolSpec.inputSchema.json` describes — a JSON Schema whose top-level type is
+/// `object` — so every name that schema REQUIRES is a key of the document,
+/// carrying a value of the type the schema declares for it, and where the schema
+/// requires nothing, every property it declares is a key. A tool entry that
+/// declares no schema (a system-defined tool) names no arguments, so its request
+/// carries an empty argument object.
+///
+/// No language model runs in this emulator, so a value the schema does not fix
+/// itself (`const`, `default`, an `enum`'s first member) is a placeholder of the
+/// declared type derived from the declaration ([`placeholder_string`] and the
+/// numeric placeholders below) — never invented content presented as inference.
+/// Which arguments a forced tool call carries is the schema's, not the model's.
+pub fn tool_input_arguments(
+    config: &ToolConfiguration,
+    tool_name: &str,
+) -> ::aws_smithy_types::Document {
+    let declared = config.tools.iter().find_map(|tool| match tool {
+        Tool::toolSpec(spec) if spec.name == tool_name => match &spec.input_schema {
+            ToolInputSchema::Json(schema) => Some(document_to_json(schema)),
+        },
+        // Another tool's specification, a system-defined tool and a cache-point
+        // marker all declare no schema for THIS request.
+        Tool::toolSpec(_) | Tool::systemTool(_) | Tool::cachePoint(_) => None,
+    });
+    let mut budget = ArgumentBudget::new();
+    let arguments = match &declared {
+        Some(schema) => instantiate_schema(schema, schema, "", 0, &mut budget),
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    // "The top level schema type must be object": a schema describing anything
+    // else names no arguments at all, so the tool is requested with an empty
+    // argument object rather than with an input that is not one.
+    let arguments = match arguments {
+        object @ serde_json::Value::Object(_) => object,
+        _ => serde_json::Value::Object(serde_json::Map::new()),
+    };
+    json_to_document(&arguments)
+}
+
+/// One instance of the JSON Schema `schema`: a value of the type it declares.
+///
+/// `root` is the whole schema a local `$ref` is resolved inside, `name` is the
+/// property this value is being composed for (what a string placeholder is
+/// derived from), `depth` bounds the walk at [`MAX_DOCUMENT_DEPTH`], so neither
+/// deep nesting nor a `$ref` cycle drives unbounded recursion, and `budget` is
+/// what is left of the document's ceilings ([`ArgumentBudget`]) — every value
+/// emitted is charged for what it is and what it renders as, so the whole
+/// document stays bounded whatever the schema nests, names or fixes.
+fn instantiate_schema(
+    schema: &serde_json::Value,
+    root: &serde_json::Value,
+    name: &str,
+    depth: usize,
+    budget: &mut ArgumentBudget,
+) -> serde_json::Value {
+    use serde_json::Value;
+    if depth > MAX_DOCUMENT_DEPTH || !budget.charge(1, ARGUMENT_VALUE_OVERHEAD_BYTES) {
+        return Value::Null;
+    }
+    // A schema that is not an object — `true`, the schema admitting anything —
+    // declares no type to instantiate.
+    let Some(members) = schema.as_object() else {
+        return Value::Null;
+    };
+    // A value the schema itself carries IS the value: nothing is composed for a
+    // property the declaration already pins down.
+    if let Some(fixed) = members.get("const") {
+        return fixed_value(fixed, budget);
+    }
+    if let Some(offered) = members
+        .get("enum")
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+    {
+        return fixed_value(offered, budget);
+    }
+    if let Some(default) = members.get("default") {
+        return fixed_value(default, budget);
+    }
+    if let Some(target) = members
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|reference| resolve_local_ref(root, reference))
+    {
+        return instantiate_schema(target, root, name, depth + 1, budget);
+    }
+    match declared_type(members) {
+        Some("object") => instantiate_object(members, root, depth, budget),
+        Some("array") => instantiate_array(members, root, name, depth, budget),
+        Some("string") => charged(Value::String(placeholder_string(members, name)), budget),
+        Some("integer") => charged(placeholder_integer(members), budget),
+        Some("number") => charged(placeholder_number(members), budget),
+        Some("boolean") => Value::Bool(false),
+        // `null`, and any type name this projection does not recognise: a value
+        // of no composable type.
+        Some(_) => Value::Null,
+        // A composed schema (`allOf`, `anyOf`, `oneOf`) declares its type in its
+        // branches, and the first branch that declares one is instantiated.
+        None => match composed_branch(members) {
+            Some(branch) => instantiate_schema(branch, root, name, depth + 1, budget),
+            None => Value::Null,
+        },
+    }
+}
+
+/// A composed scalar, charged for the bytes it renders as — a declared bound can
+/// make a number's rendering far longer than the allowance one value carries.
+/// What the budget cannot pay for is not carried.
+fn charged(value: serde_json::Value, budget: &mut ArgumentBudget) -> serde_json::Value {
+    if budget.charge(0, value.to_string().len()) {
+        value
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+/// The value a schema fixes (`const`, `default`, an `enum`'s first member),
+/// charged by the number of values it CARRIES and by the bytes it renders as.
+///
+/// A fixed value is a caller document of any size and any shape, so paying one
+/// value for it would let one schema amplify it into an arbitrarily large
+/// argument document — the more so as a `$ref` can name the same definition from
+/// as many properties as the schema likes. What the remaining budget cannot pay
+/// for is not carried at all.
+fn fixed_value(value: &serde_json::Value, budget: &mut ArgumentBudget) -> serde_json::Value {
+    let values = counted_values(value, budget.values);
+    if values > budget.values {
+        return serde_json::Value::Null;
+    }
+    let bytes = match value.as_str() {
+        // A string renders as itself between quotes, so an oversized one is
+        // refused without rendering it at all.
+        Some(text) => text.len().saturating_add(2),
+        None => value.to_string().len(),
+    };
+    if !budget.charge(values, bytes) {
+        return serde_json::Value::Null;
+    }
+    value.clone()
+}
+
+/// How many values `value` carries, counted no further than `ceiling`.
+///
+/// The count stops as soon as the ceiling is passed, so measuring an enormous
+/// caller value costs a bounded walk; the walk is iterative, so it is not
+/// bounded by the stack either.
+fn counted_values(value: &serde_json::Value, ceiling: usize) -> usize {
+    let mut pending = vec![value];
+    let mut counted = 0usize;
+    while let Some(next) = pending.pop() {
+        counted += 1;
+        if counted > ceiling {
+            return counted;
+        }
+        match next {
+            serde_json::Value::Object(members) => pending.extend(members.values()),
+            serde_json::Value::Array(items) => pending.extend(items.iter()),
+            _ => {}
+        }
+    }
+    counted
+}
+
+/// The JSON type `members` declares, or `None` when it declares none.
+///
+/// `type` is a single name or a list of names any of which is valid, in which
+/// case the first that is not `null` is the one instantiated. A schema naming no
+/// `type` but describing members or elements declares its type that way.
+fn declared_type(members: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    match members.get("type") {
+        Some(serde_json::Value::String(name)) => return Some(name.as_str()),
+        Some(serde_json::Value::Array(names)) => {
+            let mut first = None;
+            for name in names.iter().filter_map(serde_json::Value::as_str) {
+                if name != "null" {
+                    return Some(name);
+                }
+                first = first.or(Some(name));
+            }
+            if first.is_some() {
+                return first;
+            }
+        }
+        _ => {}
+    }
+    if members.contains_key("properties") || members.contains_key("required") {
+        return Some("object");
+    }
+    if members.contains_key("items") {
+        return Some("array");
+    }
+    None
+}
+
+/// The branch of a composed schema that is instantiated: the first entry of
+/// `allOf`, `anyOf` or `oneOf` that is a schema.
+fn composed_branch(
+    members: &serde_json::Map<String, serde_json::Value>,
+) -> Option<&serde_json::Value> {
+    ["allOf", "anyOf", "oneOf"].into_iter().find_map(|keyword| {
+        members
+            .get(keyword)?
+            .as_array()?
+            .iter()
+            .find(|branch| branch.is_object())
+    })
+}
+
+/// The object an `object` schema describes: one member per name it requires,
+/// and — where it requires none — one per property it declares, within what is
+/// left of the document's ceilings: EVERY member emitted is charged for, its
+/// name included and a member the schema declares no type for included, so a
+/// schema cannot amplify one request by naming members the ceiling does not
+/// cover.
+fn instantiate_object(
+    members: &serde_json::Map<String, serde_json::Value>,
+    root: &serde_json::Value,
+    depth: usize,
+    budget: &mut ArgumentBudget,
+) -> serde_json::Value {
+    use serde_json::Value;
+    let properties = members.get("properties").and_then(Value::as_object);
+    let required: Vec<String> = members
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let names: Vec<String> = if required.is_empty() {
+        properties
+            .map(|declared| declared.keys().cloned().collect())
+            .unwrap_or_default()
+    } else {
+        required
+    };
+    let mut arguments = serde_json::Map::new();
+    for name in names {
+        // The member's own name is part of the document, so it is charged for
+        // before anything is composed for it.
+        if budget.is_spent() || !budget.charge(0, name.len()) {
+            break;
+        }
+        // A name the schema requires without declaring a property for it takes
+        // whatever `additionalProperties` declares, and otherwise has no
+        // declared type at all.
+        let declared = properties.and_then(|declared| declared.get(&name)).or_else(|| {
+            members
+                .get("additionalProperties")
+                .filter(|schema| schema.is_object())
+        });
+        let value = match declared {
+            Some(schema) => instantiate_schema(schema, root, &name, depth + 1, budget),
+            None => {
+                // A member of no declared type is still a member, so it is
+                // charged for like any other.
+                if !budget.charge(1, ARGUMENT_VALUE_OVERHEAD_BYTES) {
+                    break;
+                }
+                Value::Null
+            }
+        };
+        arguments.insert(name, value);
+    }
+    Value::Object(arguments)
+}
+
+/// The array an `array` schema describes: its declared element type, as many
+/// times as the schema's own bounds ask for, within
+/// [`MAX_ARGUMENT_ARRAY_ITEMS`] and within what is left of the document's
+/// ceilings — an element the budget cannot pay for is not carried at all,
+/// rather than carried empty. A schema declaring no element type carries no
+/// element.
+fn instantiate_array(
+    members: &serde_json::Map<String, serde_json::Value>,
+    root: &serde_json::Value,
+    name: &str,
+    depth: usize,
+    budget: &mut ArgumentBudget,
+) -> serde_json::Value {
+    use serde_json::Value;
+    let Some(items) = members.get("items") else {
+        return Value::Array(Vec::new());
+    };
+    // The tuple form: each entry of `items` declares the element at its own
+    // position. Any other form declares one element type for the whole array,
+    // instantiated as many times as its `minItems` asks for.
+    let positional = items.as_array();
+    let count = match positional {
+        Some(schemas) => schemas.len().min(MAX_ARGUMENT_ARRAY_ITEMS),
+        None => {
+            let minimum = members.get("minItems").and_then(Value::as_u64).unwrap_or(1);
+            let maximum = members
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            usize::try_from(minimum.min(maximum))
+                .unwrap_or(MAX_ARGUMENT_ARRAY_ITEMS)
+                .min(MAX_ARGUMENT_ARRAY_ITEMS)
+        }
+    };
+    let mut elements = Vec::new();
+    for index in 0..count {
+        if budget.is_spent() {
+            break;
+        }
+        let element = match positional {
+            Some(schemas) => match schemas.get(index) {
+                Some(schema) => schema,
+                None => break,
+            },
+            None => items,
+        };
+        elements.push(instantiate_schema(element, root, name, depth + 1, budget));
+    }
+    Value::Array(elements)
+}
+
+/// The string a `string` property is instantiated with: a placeholder derived
+/// from the property's own NAME, cut to the schema's `maxLength` and padded to
+/// its `minLength` so the value meets the declared bounds.
+///
+/// No language model runs in this emulator, so a property whose value the schema
+/// does not fix carries no inferred content: the placeholder says which argument
+/// it is and nothing more.
+fn placeholder_string(members: &serde_json::Map<String, serde_json::Value>, name: &str) -> String {
+    let maximum = members
+        .get("maxLength")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(MAX_ARGUMENT_STRING_LENGTH, |max| {
+            usize::try_from(max)
+                .unwrap_or(usize::MAX)
+                .min(MAX_ARGUMENT_STRING_LENGTH)
+        });
+    let minimum = members
+        .get("minLength")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(0, |min| usize::try_from(min).unwrap_or(usize::MAX))
+        .min(maximum);
+    let declared = if name.is_empty() { "value" } else { name };
+    let mut text: String = declared.chars().take(maximum).collect();
+    while text.chars().count() < minimum {
+        text.push('_');
+    }
+    text
+}
+
+/// The integer an `integer` property is instantiated with: zero where the
+/// schema's declared range admits it, and otherwise the nearest value it does.
+fn placeholder_integer(members: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let lower = members
+        .get("minimum")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(i64::MIN);
+    let upper = members
+        .get("maximum")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(i64::MAX);
+    // A range whose bounds contradict each other admits nothing; its upper bound
+    // is what such a declaration is instantiated with.
+    let value = if upper < lower {
+        upper
+    } else {
+        0i64.clamp(lower, upper)
+    };
+    serde_json::Value::from(value)
+}
+
+/// The number a `number` property is instantiated with, by the same rule
+/// [`placeholder_integer`] states.
+fn placeholder_number(members: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    // A bound that is not a finite number is no bound at all, which is also
+    // what keeps the comparison below total.
+    let lower = members
+        .get("minimum")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|bound| bound.is_finite())
+        .unwrap_or(f64::NEG_INFINITY);
+    let upper = members
+        .get("maximum")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|bound| bound.is_finite())
+        .unwrap_or(f64::INFINITY);
+    let value = if upper < lower {
+        upper
+    } else {
+        0f64.clamp(lower, upper)
+    };
+    serde_json::Number::from_f64(value)
+        .map_or(serde_json::Value::from(0), serde_json::Value::Number)
+}
+
+/// The schema a local `$ref` names, resolved inside `root` as the JSON Pointer
+/// it is (`#/$defs/Name`), or `None` for a reference this projection cannot
+/// resolve: one into another document, or the whole schema itself.
+fn resolve_local_ref<'a>(
+    root: &'a serde_json::Value,
+    reference: &str,
+) -> Option<&'a serde_json::Value> {
+    let pointer = reference.strip_prefix('#')?;
+    if pointer.is_empty() {
+        return None;
+    }
+    root.pointer(pointer)
 }
 
 // ---------------------------------------------------------------------------
