@@ -272,7 +272,9 @@ fn bounded(
 /// `ConflictException` (409) is for, worded exactly as the create words the same
 /// clash. More `InterfaceMappings` than this emulator stores for one cluster is
 /// the create's own refusal, reported with the create's wording so an update
-/// cannot be refused differently from a create carrying the same list.
+/// cannot be refused differently from a create carrying the same list. A mapping
+/// naming a network this account does not hold is the create's refusal too,
+/// worded the same way.
 fn refused(
     refusal: crate::state::ClusterUpdateRefusal,
     cluster_id: &str,
@@ -296,9 +298,17 @@ fn refused(
         }),
         Refusal::TooManyInterfaceMappings { count } => {
             UpdateClusterErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "networkSettings.interfaceMappings takes at most {} entries, but was {count}",
-                    crate::state::MAX_CLUSTER_INTERFACE_MAPPINGS
+                message: Some(crate::state::too_many_cluster_interface_mappings_message(
+                    count,
+                )),
+            })
+        }
+        Refusal::UnknownMappedNetwork { index, network_id } => {
+            UpdateClusterErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::unknown_reference_message(
+                    &crate::state::mapped_network_member(index),
+                    "Network",
+                    &network_id,
                 )),
             })
         }

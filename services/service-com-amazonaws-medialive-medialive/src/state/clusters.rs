@@ -168,6 +168,10 @@ pub enum ClusterUpdateRefusal {
     /// The request named more `InterfaceMapping` entries than
     /// [`MAX_CLUSTER_INTERFACE_MAPPINGS`]. Carries how many it named.
     TooManyInterfaceMappings { count: usize },
+    /// One `InterfaceMapping` entry of the request named a `NetworkId` this
+    /// account holds no live network under. Carries the entry's position in the
+    /// list the request sent and the id it spelled, both read off the request.
+    UnknownMappedNetwork { index: usize, network_id: String },
 }
 
 /// What an `UpdateCluster` request asks to change.
@@ -225,6 +229,37 @@ pub enum ClusterRefusal {
     NameAlreadyInUse,
     /// The store already holds [`MAX_CLUSTERS`] clusters.
     StoreFull,
+    /// The request named more `InterfaceMapping` entries than
+    /// [`MAX_CLUSTER_INTERFACE_MAPPINGS`]. Carries how many it named.
+    TooManyInterfaceMappings { count: usize },
+    /// One `InterfaceMapping` entry of the request named a `NetworkId` this
+    /// account holds no live network under. Carries the entry's position in the
+    /// list the request sent and the id it spelled, both read off the request.
+    UnknownMappedNetwork { index: usize, network_id: String },
+}
+
+/// The message a write carrying more `InterfaceMapping` entries than this
+/// emulator stores for ONE cluster is refused with: the member as the wire
+/// spells it, the ceiling and the count the request carried.
+///
+/// One helper for both writers of the list, so a create and an update cannot
+/// word the one bound two ways. Every value is read off the request and the
+/// ceiling.
+pub fn too_many_cluster_interface_mappings_message(count: usize) -> String {
+    format!(
+        "networkSettings.interfaceMappings takes at most {MAX_CLUSTER_INTERFACE_MAPPINGS} entries, \
+         but was {count}"
+    )
+}
+
+/// The member path the wire spells the `NetworkId` of ONE `InterfaceMapping`
+/// entry under: the list member, the entry's position in the list the request
+/// sent, and the member inside the entry.
+///
+/// One helper, so the create and the update cannot name the member two ways in
+/// the refusal they word with it.
+pub fn mapped_network_member(index: usize) -> String {
+    format!("networkSettings.interfaceMappings[{index}].networkId")
 }
 
 /// One alert raised against a cluster.
@@ -492,10 +527,12 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// Store a cluster created in `region` and answer its minted id, or refuse.
     ///
-    /// The documented name uniqueness, the store's cap, the mint and the insert
-    /// live together here, so a handler cannot check one of them and write past
-    /// another; the handler's job is only to turn a [`ClusterRefusal`] into the
-    /// operation's own modelled error.
+    /// The documented name uniqueness, the bound on the mapping list, the
+    /// resolution of every network the request's mappings name
+    /// ([`Self::unresolved_mapped_network`]), the store's cap, the mint and the
+    /// insert live together here, so a handler cannot check one of them and
+    /// write past another; the handler's job is only to turn a
+    /// [`ClusterRefusal`] into the operation's own modelled error.
     ///
     /// A created cluster starts `CREATING` and owes `ACTIVE` once
     /// [`TRANSIENT_STATE_SPAN`] has passed, which is what the real service does:
@@ -506,6 +543,33 @@ impl ComAmazonawsMedialiveMedialiveState {
         new: NewCluster,
         now: SystemTime,
     ) -> Result<String, ClusterRefusal> {
+        // The list is bounded BEFORE anything is resolved or minted, for the
+        // reason on [`MAX_CLUSTER_INTERFACE_MAPPINGS`]: it is the bound that
+        // keeps both this store and the network side's per-read derivation
+        // bounded, so a refused create stores no cluster at all.
+        if let Some(count) = new
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.interface_mappings.as_ref())
+            .map(Vec::len)
+            .filter(|count| *count > MAX_CLUSTER_INTERFACE_MAPPINGS)
+        {
+            return Err(ClusterRefusal::TooManyInterfaceMappings { count });
+        }
+        // Every network the mappings name is resolved against this account
+        // BEFORE anything is minted, so a refused create stores no cluster and
+        // no stored cluster carries a reference no read of the account can
+        // resolve.
+        if let Some((index, network_id)) = self.unresolved_mapped_network(
+            new.network_settings
+                .as_ref()
+                .and_then(|settings| settings.interface_mappings.as_ref())
+                .into_iter()
+                .flatten()
+                .map(|mapping| mapping.network_id.as_deref()),
+        ) {
+            return Err(ClusterRefusal::UnknownMappedNetwork { index, network_id });
+        }
         if let Some(name) = new.name.as_deref() {
             if self.cluster_named(name).is_some() {
                 return Err(ClusterRefusal::NameAlreadyInUse);
@@ -549,9 +613,10 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// request carries at all: the hardware type, the instance role, the tags and
     /// the ARN are not something this operation can move.
     ///
-    /// The documented account-wide name uniqueness and the stored mapping bound
-    /// are the create's own rules, checked here too so the two cannot disagree
-    /// about what a stored cluster may look like. A rename is accepted: the
+    /// The documented account-wide name uniqueness, the stored mapping bound
+    /// and the resolution of every network the mappings name are the create's
+    /// own rules, checked here too so the two cannot disagree about what a
+    /// stored cluster may look like. A rename is accepted: the
     /// `Name` member exists on the update request to "change the current name of
     /// the Cluster", and the "You can't change the name" sentence beside it is
     /// the create's own wording carried over (see
@@ -586,6 +651,14 @@ impl ComAmazonawsMedialiveMedialiveState {
                     count: mappings.len(),
                 });
             }
+            // The create's own resolution, applied to the list this update
+            // would store: an update may no more leave a cluster mapped onto a
+            // network the account does not hold than a create may store one.
+            if let Some((index, network_id)) = self.unresolved_mapped_network(
+                mappings.iter().map(|mapping| mapping.network_id.as_deref()),
+            ) {
+                return Err(ClusterUpdateRefusal::UnknownMappedNetwork { index, network_id });
+            }
         }
         // A name another cluster of the account holds is refused, while
         // re-sending the cluster's own name is not a collision with itself.
@@ -610,6 +683,39 @@ impl ComAmazonawsMedialiveMedialiveState {
             update_cluster_network_settings(stored, settings);
         }
         Ok(())
+    }
+
+    /// The first `InterfaceMapping` entry of `network_ids` whose `NetworkId`
+    /// names no live network of this account, as its position in the list and
+    /// the id it spelled — or `None` when every entry that names a network
+    /// resolves.
+    ///
+    /// `NetworkId` is "The ID of the network that you want to connect to the
+    /// specified logicalInterfaceName. You can use the ListNetworks operation to
+    /// discover all the IDs" (`smithy_query(query="shape",
+    /// shape="InterfaceMappingUpdateRequest")`), so the ids that resolve are
+    /// exactly the ones a listing of this account reports — which is what
+    /// [`Self::live_network`] answers. A network whose delete this service has
+    /// accepted is on its way out of the account and resolves no longer, so
+    /// nothing new is connected to it.
+    ///
+    /// ONE resolution for every operation that WRITES a cluster's mappings
+    /// (`CreateCluster` through [`Self::insert_cluster`], `UpdateCluster`
+    /// through [`Self::apply_cluster_changes`]), taking the ids as the entries
+    /// spell them, so the two cannot accept a reference the other refuses
+    /// whichever of the three `InterfaceMapping` shapes the request carried. An
+    /// entry that names no network at all connects that interface to none, so it
+    /// is no dangling reference and is left as it is.
+    pub fn unresolved_mapped_network<'a>(
+        &self,
+        network_ids: impl IntoIterator<Item = Option<&'a str>>,
+    ) -> Option<(usize, String)> {
+        network_ids
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, network_id)| network_id.map(|id| (index, id)))
+            .find(|(_, network_id)| self.live_network(network_id).is_none())
+            .map(|(index, network_id)| (index, network_id.to_string()))
     }
 
     /// Record `token` as having created the cluster `cluster_id`, evicting the
@@ -776,9 +882,10 @@ impl ComAmazonawsMedialiveMedialiveState {
 ///
 /// Every member is the value the request supplied: an `InterfaceMapping`'s
 /// `NetworkId` names one of the Networks the cluster is associated with, and it
-/// is stored as spelled rather than resolved, because the network it names need
-/// not have been created yet. It is what the network side of the store reads
-/// that association back out of
+/// is stored as spelled — a network of this account, because the write that
+/// stored it resolved every mapped id first
+/// ([`ComAmazonawsMedialiveMedialiveState::unresolved_mapped_network`]). It is
+/// what the network side of the store reads that association back out of
 /// ([`ComAmazonawsMedialiveMedialiveState::clusters_using_network`]).
 pub fn described_cluster_network_settings(
     settings: &ClusterNetworkSettingsCreateRequest,

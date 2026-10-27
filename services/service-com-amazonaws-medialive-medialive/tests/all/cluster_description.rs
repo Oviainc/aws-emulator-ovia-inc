@@ -27,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
 use crate::channel_placement_groups::{create_channel, create_cluster as create_named_cluster, id_of};
-use crate::support::member;
+use crate::support::{member, resolved_network_ids};
 use crate::wire::{call, error_code, error_message, medialive, ACCOUNT, DEFAULT_REGION};
 
 /// The cluster collection URI (`smithy_query(query="operation",
@@ -166,8 +166,12 @@ async fn describe_cluster_reports_each_cluster_of_one_store() {
     // given rather than answer with "the cluster".
     let mut created: Vec<(&str, Value, Value)> = Vec::new();
     for Stored { case, body } in &table {
+        // The networks the row's mappings name are put in the account first: a
+        // mapping may only name a network this account holds, and the resolved
+        // body is what the read-back below is compared against.
+        let body = resolved_network_ids(&router, body.clone()).await;
         let response = create_cluster(&router, case, body.clone()).await;
-        created.push((*case, body.clone(), response));
+        created.push((*case, body, response));
     }
 
     let ids: Vec<String> = created

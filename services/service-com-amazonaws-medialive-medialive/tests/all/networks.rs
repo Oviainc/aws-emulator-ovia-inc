@@ -562,8 +562,8 @@ async fn a_retried_create_answers_with_the_network_the_token_created() {
     );
 }
 
-/// A network id nothing minted, which is what a cluster mapping that names no
-/// stored network carries.
+/// A network id nothing minted, which is what a request naming no stored network
+/// carries.
 pub(crate) const STRAY_NETWORK_ID: &str = "9999999";
 
 /// `CreateCluster`, answering the created cluster's id.
@@ -581,10 +581,13 @@ pub(crate) struct ClusterSpec {
     /// Whether the create carries a `NetworkSettings` block at all; `false` is a
     /// cluster created without one.
     pub(crate) settings: bool,
-    /// One `InterfaceMapping` per entry: `Some(index)` names the row's network at
-    /// that index and `None` names [`STRAY_NETWORK_ID`]. A repeated index is a
-    /// second interface mapped onto the same network.
-    pub(crate) mappings: &'static [Option<usize>],
+    /// One `InterfaceMapping` per entry, naming the row's network at that index.
+    /// A repeated index is a second interface mapped onto the same network.
+    ///
+    /// Every entry names a network the row CREATED, because a mapping may only
+    /// name a network this account holds — the refusal of one that does not is
+    /// `cluster_network_resolution`'s own table.
+    pub(crate) mappings: &'static [usize],
     /// When set, `DefaultRoute` is spelled with the id of the row's network at
     /// this index. `DefaultRoute` is "the network interface that is the default
     /// route for traffic to and from the node"
@@ -616,13 +619,10 @@ pub(crate) fn cluster_body(name: String, spec: &ClusterSpec, network_ids: &[Stri
         spec.mappings
             .iter()
             .enumerate()
-            .map(|(slot, mapping)| {
+            .map(|(slot, index)| {
                 json!({
                     "logicalInterfaceName": format!("eth{slot}"),
-                    "networkId": mapping.map_or_else(
-                        || STRAY_NETWORK_ID.to_string(),
-                        |index| network_ids[index].clone(),
-                    ),
+                    "networkId": network_ids[*index].clone(),
                 })
             })
             .collect(),
@@ -643,9 +643,8 @@ pub(crate) fn cluster_body(name: String, spec: &ClusterSpec, network_ids: &[Stri
 /// of the mapping that attaches them: none at all, one cluster on one network,
 /// one cluster across every network, two clusters on the same network, a cluster
 /// created without network settings, two interfaces of one cluster mapped onto
-/// one network, an empty mapping list, a mapping naming an id nothing minted, and
-/// a `DefaultRoute` spelled with a network id — because that is what the rule
-/// generalises over.
+/// one network, an empty mapping list, and a `DefaultRoute` spelled with a
+/// network id — because that is what the rule generalises over.
 #[tokio::test]
 async fn a_networks_associated_clusters_are_the_clusters_mapped_onto_it() {
     let table = [
@@ -659,7 +658,7 @@ async fn a_networks_associated_clusters_are_the_clusters_mapped_onto_it() {
             networks: 2,
             clusters: &[ClusterSpec {
                 settings: true,
-                mappings: &[Some(0)],
+                mappings: &[0],
                 default_route: None,
             }],
         },
@@ -668,7 +667,7 @@ async fn a_networks_associated_clusters_are_the_clusters_mapped_onto_it() {
             networks: 3,
             clusters: &[ClusterSpec {
                 settings: true,
-                mappings: &[Some(0), Some(1), Some(2)],
+                mappings: &[0, 1, 2],
                 default_route: Some(0),
             }],
         },
@@ -678,12 +677,12 @@ async fn a_networks_associated_clusters_are_the_clusters_mapped_onto_it() {
             clusters: &[
                 ClusterSpec {
                     settings: true,
-                    mappings: &[Some(1)],
+                    mappings: &[1],
                     default_route: None,
                 },
                 ClusterSpec {
                     settings: true,
-                    mappings: &[Some(1)],
+                    mappings: &[1],
                     default_route: None,
                 },
             ],
@@ -699,7 +698,7 @@ async fn a_networks_associated_clusters_are_the_clusters_mapped_onto_it() {
                 },
                 ClusterSpec {
                     settings: true,
-                    mappings: &[Some(1)],
+                    mappings: &[1],
                     default_route: None,
                 },
             ],
@@ -709,7 +708,7 @@ async fn a_networks_associated_clusters_are_the_clusters_mapped_onto_it() {
             networks: 1,
             clusters: &[ClusterSpec {
                 settings: true,
-                mappings: &[Some(0), Some(0)],
+                mappings: &[0, 0],
                 default_route: None,
             }],
         },
@@ -719,15 +718,6 @@ async fn a_networks_associated_clusters_are_the_clusters_mapped_onto_it() {
             clusters: &[ClusterSpec {
                 settings: true,
                 mappings: &[],
-                default_route: None,
-            }],
-        },
-        Attachment {
-            case: "a mapping naming an id nothing minted",
-            networks: 1,
-            clusters: &[ClusterSpec {
-                settings: true,
-                mappings: &[None],
                 default_route: None,
             }],
         },
@@ -787,9 +777,7 @@ async fn a_networks_associated_clusters_are_the_clusters_mapped_onto_it() {
             let expected: Value = clusters
                 .iter()
                 .zip(&cluster_ids)
-                .filter(|(spec, _)| {
-                    spec.settings && spec.mappings.contains(&Some(index))
-                })
+                .filter(|(spec, _)| spec.settings && spec.mappings.contains(&index))
                 .map(|(_, id)| json!(id))
                 .collect();
 
@@ -854,6 +842,19 @@ async fn a_retried_create_reports_the_clusters_attached_since() {
         first["associatedClusterIds"]
     );
 
+    // A second network, so the row below can map a cluster onto a network of
+    // this account that is NOT the one under test.
+    let elsewhere = created(
+        &router,
+        "the other network",
+        json!({
+            "name": "elsewhere",
+            "ipPools": [{ "cidr": "198.51.100.0/24" }],
+        }),
+    )
+    .await;
+    let elsewhere_id = id_of("the other network", &elsewhere);
+
     // Two clusters: one mapped onto this network and one mapped elsewhere, so
     // the retry reports the attachment rather than every cluster in the store.
     let attached = created_cluster(
@@ -878,7 +879,7 @@ async fn a_retried_create_reports_the_clusters_attached_since() {
             "clusterType": "ON_PREMISES",
             "networkSettings": {
                 "interfaceMappings": [
-                    { "logicalInterfaceName": "eth0", "networkId": STRAY_NETWORK_ID }
+                    { "logicalInterfaceName": "eth0", "networkId": elsewhere_id }
                 ]
             },
         }),
