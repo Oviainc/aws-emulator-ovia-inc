@@ -80,6 +80,8 @@ use crate::ops::types::{
     HostKeyAttributes, Instance,
     InstanceHardware, InstanceHealthSummary, InstanceMetadataOptions, InstanceNetworking,
     InstancePortInfo, InstanceState, KeyPair, LightsailDistribution, LoadBalancer,
+    LoadBalancerTlsCertificate, LoadBalancerTlsCertificateDomainValidationOption,
+    LoadBalancerTlsCertificateDomainValidationRecord, LoadBalancerTlsCertificateRenewalSummary,
     LoadBalancerTlsCertificateSummary,
     MonitoredResourceInfo, MonthlyTransfer, Operation, Origin, PartnerInfo, PrivateRegistryAccess,
     Region,
@@ -10736,6 +10738,71 @@ pub fn alternative_domain_names(primary: &str, requested: Vec<String>) -> Vec<St
     covered
 }
 
+/// The resource portion an ARN of a load balancer's SSL/TLS certificate carries
+/// before its id. Mirrors the `Instance/<uuid>` form the modelled
+/// `Instance$arn` documentation shows, with this resource's own `ResourceType`
+/// value.
+pub const LOAD_BALANCER_TLS_CERTIFICATE_ARN_RESOURCE_PREFIX: &str = "LoadBalancerTlsCertificate/";
+
+/// The ARN of the load balancer certificate `id` in `region`. A certificate
+/// belongs to the load balancer that holds it, which is a regional resource, so
+/// it carries that load balancer's Region.
+pub fn load_balancer_tls_certificate_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{LOAD_BALANCER_TLS_CERTIFICATE_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The `LoadBalancerTlsCertificate$status` a certificate this account just
+/// asked for is in, from the modelled `LoadBalancerTlsCertificateStatus` enum:
+/// Lightsail validates the certificate's domains before the certificate
+/// authority issues it. The same spelling as [`CERTIFICATE_STATUS_PENDING_VALIDATION`],
+/// which the certificate slice of this store reports.
+pub const LOAD_BALANCER_TLS_CERTIFICATE_STATUS_PENDING_VALIDATION: &str =
+    CERTIFICATE_STATUS_PENDING_VALIDATION;
+
+/// The `LoadBalancerTlsCertificate$status` of a validated certificate, from the
+/// same enum — the terminal status the clock owes a certificate this account
+/// asked for.
+pub const LOAD_BALANCER_TLS_CERTIFICATE_STATUS_ISSUED: &str = CERTIFICATE_STATUS_ISSUED;
+
+/// `LoadBalancerTlsCertificateRenewalSummary$renewalStatus` of an issued
+/// certificate, from the modelled `LoadBalancerTlsCertificateRenewalStatus`
+/// enum: "Lightsail is attempting to automatically validate the domain names of
+/// the certificate. No further action is required." The renewal summary
+/// "contains information about the status of Lightsail's managed renewal for the
+/// certificate", and there is a renewal to manage only once the certificate
+/// authority has issued one — so this is the only renewal status a certificate
+/// of this store reports, and a certificate still being validated for the first
+/// time reports no renewal summary at all.
+pub const LOAD_BALANCER_TLS_CERTIFICATE_RENEWAL_STATUS_PENDING_AUTO_RENEWAL: &str =
+    "PENDING_AUTO_RENEWAL";
+
+/// The algorithm the certificate authority signed the certificate with, as
+/// `LoadBalancerTlsCertificate$signatureAlgorithm` reports it.
+///
+/// It follows from [`CERTIFICATE_KEY_ALGORITHM`]: the certificate carries an RSA
+/// key, and AWS Certificate Manager — which is what issues a Lightsail SSL/TLS
+/// certificate — signs an RSA certificate with SHA-256, so the X.509 signature
+/// algorithm is `sha256WithRSAEncryption`, printed in the form a certificate's
+/// signature algorithm is reported in.
+pub const LOAD_BALANCER_TLS_CERTIFICATE_SIGNATURE_ALGORITHM: &str = "SHA256WITHRSA";
+
+/// The type of the DNS record a domain of a certificate is validated through, as
+/// `LoadBalancerTlsCertificateDomainValidationRecord$type` describes it ("The
+/// type of validation record. For example, `CNAME` for domain validation").
+pub const LOAD_BALANCER_TLS_CERTIFICATE_VALIDATION_RECORD_TYPE: &str = "CNAME";
+
+/// The `subject` of a certificate issued for `domain_name`: "the name of the
+/// entity that is associated with the public key contained in the certificate",
+/// which for an SSL/TLS certificate is the X.509 subject distinguished name,
+/// whose common name is the domain the certificate is for.
+fn load_balancer_tls_certificate_subject(domain_name: &str) -> String {
+    format!("CN={domain_name}")
+}
+
 /// The SSL/TLS certificate a load balancer holds: the one
 /// `CreateLoadBalancer`'s certificate members asked for, or one
 /// `CreateLoadBalancerTlsCertificate` added.
@@ -10744,6 +10811,14 @@ pub struct StoredLoadBalancerCertificate {
     /// The certificate name the request named, kept verbatim — it is what every
     /// certificate operation addresses this certificate by.
     pub name: String,
+    /// The ARN this certificate was minted with, from its own id — see
+    /// [`load_balancer_tls_certificate_arn`].
+    pub arn: String,
+    /// The support code built from that same id, so support can look the
+    /// certificate up from the value alone ([`support_code`]).
+    pub support_code: String,
+    /// The instant the request that asked for this certificate was served.
+    pub created_at_ms: i64,
     /// The domain the certificate is associated with.
     pub domain_name: String,
     /// The alternative domains and subdomains the certificate also covers, as
@@ -10759,6 +10834,154 @@ pub struct StoredLoadBalancerCertificate {
     /// The tags the request asked for, kept verbatim — "the tag keys and
     /// optional values to add to the resource during create".
     pub tags: Vec<Tag>,
+    /// The serial number the certificate was minted with, as
+    /// `LoadBalancerTlsCertificate$serial` reports it.
+    pub serial: String,
+    /// The current `LoadBalancerTlsCertificateStatus`.
+    pub status: &'static str,
+    /// The status the clock owes this certificate, while one is outstanding.
+    pub due: Option<DueNamedState>,
+    /// The instant the certificate authority issues this certificate — the same
+    /// instant the clock owes it
+    /// [`LOAD_BALANCER_TLS_CERTIFICATE_STATUS_ISSUED`] — which is what
+    /// `issuedAt`, `notBefore` and `notAfter` are reported from once it is
+    /// issued.
+    pub issued_at_ms: i64,
+}
+
+impl StoredLoadBalancerCertificate {
+    /// Whether the certificate authority has issued this certificate.
+    pub fn is_issued(&self) -> bool {
+        self.status == LOAD_BALANCER_TLS_CERTIFICATE_STATUS_ISSUED
+    }
+
+    /// Every domain this certificate covers: the primary domain it is for, then
+    /// each alternative domain it also covers.
+    ///
+    /// The alternative domains went through [`alternative_domain_names`] before
+    /// they were stored, so none of them repeats and none of them is the
+    /// primary domain — this list is the set of domains the certificate secures
+    /// traffic for, with its primary domain first.
+    pub fn domain_names(&self) -> Vec<String> {
+        let mut names = vec![self.domain_name.clone()];
+        names.extend(self.alternative_names.iter().cloned());
+        names
+    }
+
+    /// The `LoadBalancerTlsCertificateDomainStatus` every domain of this
+    /// certificate is in: a certificate the authority has issued is one whose
+    /// domains Lightsail validated, and one it has not issued yet is still
+    /// waiting for exactly that.
+    fn domain_validation_status(&self) -> &'static str {
+        if self.is_issued() {
+            DOMAIN_VALIDATION_STATUS_SUCCESS
+        } else {
+            DOMAIN_VALIDATION_STATUS_PENDING
+        }
+    }
+
+    /// This record as the modelled `LoadBalancerTlsCertificate`, on the load
+    /// balancer `load_balancer_name` at `location` — the load balancer that
+    /// holds it, which is what `loadBalancerName` and `location` report and
+    /// which the certificate is reached through.
+    pub fn view(
+        &self,
+        load_balancer_name: &str,
+        location: &StoredLocation,
+    ) -> LoadBalancerTlsCertificate {
+        let issued = self.is_issued();
+        let validation_status = self.domain_validation_status();
+        let domain_names = self.domain_names();
+        LoadBalancerTlsCertificate {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            support_code: Some(self.support_code.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(location.view()),
+            resource_type: Some(RESOURCE_TYPE_LOAD_BALANCER_TLS_CERTIFICATE.to_string()),
+            tags: Some(self.tags.clone()),
+            load_balancer_name: Some(load_balancer_name.to_string()),
+            is_attached: Some(self.is_attached),
+            status: Some(self.status.to_string()),
+            domain_name: Some(self.domain_name.clone()),
+            // One record per domain the certificate covers, each carrying the
+            // domain it is about, the kind of DNS record that validates it and
+            // the state that validation is in. `name` is that domain because
+            // that is what the member documents it to be: "A fully qualified
+            // domain name in the certificate. For example, `example.com`."
+            // `value` is left out and so is `dnsRecordCreationState`: this
+            // emulator owns no DNS zone to publish a validation record in, so
+            // there is no value a caller could create and no creation of one to
+            // report — the same choice the certificate slice of this store
+            // makes ([`StoredCertificate::detail`]).
+            domain_validation_records: Some(
+                domain_names
+                    .iter()
+                    .map(
+                        |domain_name| LoadBalancerTlsCertificateDomainValidationRecord {
+                            name: Some(domain_name.clone()),
+                            r#type: Some(
+                                LOAD_BALANCER_TLS_CERTIFICATE_VALIDATION_RECORD_TYPE.to_string(),
+                            ),
+                            domain_name: Some(domain_name.clone()),
+                            validation_status: Some(validation_status.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .collect(),
+            ),
+            // Nothing here fails a validation, so no certificate of this store
+            // carries a `failureReason`; and none is revoked, which is what
+            // `revocationReason` and `revokedAt` are "present only when" —
+            // their status is `REVOKED`.
+            failure_reason: None,
+            revocation_reason: None,
+            revoked_at: None,
+            // Nothing was issued while the certificate's domains were still
+            // being validated, so none of the issuance members is reported
+            // until it is: a certificate has no issuer, no validity window and
+            // no issue date before the certificate authority gives it one.
+            issued_at: issued.then(|| timestamp(self.issued_at_ms)),
+            issuer: issued.then(|| CERTIFICATE_ISSUER_CA.to_string()),
+            not_before: issued.then(|| timestamp(self.issued_at_ms)),
+            not_after: issued
+                .then(|| timestamp(self.issued_at_ms.saturating_add(CERTIFICATE_VALIDITY_MILLIS))),
+            key_algorithm: Some(CERTIFICATE_KEY_ALGORITHM.to_string()),
+            signature_algorithm: Some(
+                LOAD_BALANCER_TLS_CERTIFICATE_SIGNATURE_ALGORITHM.to_string(),
+            ),
+            serial: Some(self.serial.clone()),
+            subject: Some(load_balancer_tls_certificate_subject(&self.domain_name)),
+            // Lightsail manages the renewal of the certificate it ISSUED:
+            // nothing renews a certificate the authority has not issued yet, so
+            // a certificate still being validated for the first time reports no
+            // renewal summary. The renewal is of the same domains, so its
+            // options carry one entry per domain, in the same order the
+            // validation records are reported in.
+            renewal_summary: issued.then(|| LoadBalancerTlsCertificateRenewalSummary {
+                renewal_status: Some(
+                    LOAD_BALANCER_TLS_CERTIFICATE_RENEWAL_STATUS_PENDING_AUTO_RENEWAL.to_string(),
+                ),
+                domain_validation_options: Some(
+                    domain_names
+                        .iter()
+                        .map(
+                            |domain_name| LoadBalancerTlsCertificateDomainValidationOption {
+                                domain_name: Some(domain_name.clone()),
+                                validation_status: Some(validation_status.to_string()),
+                            },
+                        )
+                        .collect(),
+                ),
+            }),
+            // The X.509 subject alternative name extension of the certificate,
+            // which covers every domain it secures traffic for — its primary
+            // domain among them, because that is the domain its `subject`
+            // names. Last, because it takes the one list of covered domains
+            // every member above reads.
+            subject_alternative_names: Some(domain_names),
+        }
+    }
 }
 
 /// One instance registered with a load balancer: the instance it names, and the
@@ -10996,6 +11219,20 @@ impl StoredLoadBalancer {
             certificate.is_attached = certificate.name == name;
         }
         true
+    }
+
+    /// Every SSL/TLS certificate this load balancer holds, as the modelled
+    /// `LoadBalancerTlsCertificate`, in the order they were added — what
+    /// `GetLoadBalancerTlsCertificates` reports.
+    ///
+    /// A certificate is reported on the load balancer that holds it, so each
+    /// view carries this load balancer's name and location; the walk is bounded
+    /// by [`MAX_CERTIFICATES_PER_LOAD_BALANCER`].
+    pub fn certificate_views(&self) -> Vec<LoadBalancerTlsCertificate> {
+        self.certificates
+            .iter()
+            .map(|certificate| certificate.view(&self.name, &self.location))
+            .collect()
     }
 
     /// The modelled `configurationOptions` map: one entry per
@@ -14601,6 +14838,17 @@ impl ComAmazonawsLightsailLightsail20161128State {
             balancer.attached_instances.retain(|registration| {
                 registration.drains_at_ms.is_none_or(|at_ms| at_ms > now_ms)
             });
+            // A certificate whose validation has fallen due is issued: the
+            // certificate authority issued it at that instant whether or not
+            // anybody asked, so the clock is what moves its status rather than
+            // whoever happens to read the certificate next.
+            for certificate in &mut balancer.certificates {
+                let Some(due) = certificate.due.filter(|due| due.at_ms <= now_ms) else {
+                    continue;
+                };
+                certificate.status = due.state;
+                certificate.due = None;
+            }
             let Some(due) = balancer.due else { continue };
             if due.at_ms <= now_ms {
                 balancer.state = due.state;
