@@ -83,6 +83,8 @@ mod customer_managed_policy_references;
 mod discovered_instance_surface;
 #[path = "all/inline_policy.rs"]
 mod inline_policy;
+#[path = "all/inline_policy_delete.rs"]
+mod inline_policy_delete;
 #[path = "all/inline_policy_independence.rs"]
 mod inline_policy_independence;
 #[path = "all/instance_create.rs"]

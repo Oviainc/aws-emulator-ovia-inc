@@ -36,11 +36,11 @@ use crate::ssoadmin_permission_sets::{
 
 /// `PermissionSetPolicyDocument`'s published length bounds (`length(min: 1, max: 32768)`).
 const POLICY_DOCUMENT_MIN: usize = 1;
-const POLICY_DOCUMENT_MAX: usize = 32768;
+pub(crate) const POLICY_DOCUMENT_MAX: usize = 32768;
 
 /// A document of exactly `len` characters, built from ASCII only so its character count
 /// and its byte count agree, for the rows that sit on a published length bound.
-fn document_of_length(len: usize) -> String {
+pub(crate) fn document_of_length(len: usize) -> String {
     let prefix = "{\"Comment\":\"";
     let suffix = "\"}";
     assert!(
@@ -57,7 +57,7 @@ fn document_of_length(len: usize) -> String {
 /// bounds, the whitespace characters the pattern singles out (`\u{0009}`, `\u{000A}`,
 /// `\u{000D}`), the top of its `\u{0020}-\u{00FF}` character range, and the number of
 /// statements the policy carries. No row is one a recording happened to carry.
-fn policy_documents() -> Vec<(String, String)> {
+pub(crate) fn policy_documents() -> Vec<(String, String)> {
     vec![
         (
             format!("a document of the minimum length {POLICY_DOCUMENT_MIN}"),
@@ -114,7 +114,7 @@ fn refused_documents() -> Vec<(String, String)> {
 }
 
 /// Create a permission set named `name` on `instance_arn` and return its minted ARN.
-async fn create_permission_set(
+pub(crate) async fn create_permission_set(
     router: &MultiServiceRouter,
     instance_arn: &str,
     name: &str,
@@ -136,7 +136,7 @@ async fn create_permission_set(
 }
 
 /// `GetInlinePolicyForPermissionSet`, as `(status, InlinePolicy or Null)`.
-async fn get_policy(
+pub(crate) async fn get_policy(
     router: &MultiServiceRouter,
     instance_arn: &str,
     permission_set_arn: &str,
@@ -157,7 +157,7 @@ async fn get_policy(
 }
 
 /// A put of `document`, as `(status, body)`.
-async fn put_policy(
+pub(crate) async fn put_policy(
     router: &MultiServiceRouter,
     instance_arn: &str,
     permission_set_arn: &str,
