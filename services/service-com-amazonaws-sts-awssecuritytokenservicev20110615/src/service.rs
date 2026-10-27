@@ -48,6 +48,143 @@ use smithy_server_runtime::{
 use std::cell::RefCell;
 use std::sync::Arc;
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema::serde::{SerializableStruct, ShapeDeserializer};
+use aws_smithy_schema::{Schema, ShapeId};
+use aws_smithy_schema_server::{
+    ProtocolError, QueryServerProtocol, QueryShapeDeserializer, ServerProtocol,
+};
+
+/// The `awsQuery` field naming the operation a request is for.
+///
+/// The protocol carries it in the form-encoded body. A call signed under SigV4's
+/// query-parameter scheme carries it — and every other field of the call — in the query
+/// string instead; see [`QuerySignedCalls`].
+const ACTION_FIELD: &str = "Action";
+
+/// This service's XML namespace, as the model declares it
+/// (`smithy_query(query="service_info")` -> `xmlNamespace.uri`).
+///
+/// Stated here because [`Service::override_protocol`] constructs the protocol this
+/// service serves with, and the namespace is part of the envelope the generated one is
+/// built with: the override has to be the SAME protocol, differing only in where it reads
+/// a request from.
+const XML_NAMESPACE: &str = "https://sts.amazonaws.com/doc/2011-06-15/";
+
+/// This service's `awsQuery` protocol, reading a call from the query string when that is
+/// where SigV4 put it.
+///
+/// SigV4 has two schemes and this protocol was written for one of them. "Authenticating
+/// Requests: Using Authorization Header" signs a `POST` whose call is an
+/// `application/x-www-form-urlencoded` BODY, which is what the framework's
+/// [`QueryServerProtocol`] reads — the `Action` it routes by and every input member.
+/// "Authenticating Requests: Using Query Parameters" — the scheme a PRESIGNED URL uses,
+/// and the one `aws eks get-token` and aws-iam-authenticator hand over — signs a request
+/// whose call is the QUERY STRING, in the same `name=value&…` encoding, with no body at
+/// all. The emulator verifies both signatures, so both are calls this service has to
+/// serve; before this, a presigned call named no operation and was answered
+/// `InvalidAction`.
+///
+/// So the query string is read as the call when, and only when, the body does not name an
+/// action: a body-carried call keeps being read from its body exactly as before, so no
+/// request can be routed or deserialized from a query field in preference to the body it
+/// was signed over. Both halves move together — the operation and its input members come
+/// from the SAME place — so no call is ever served with the parameters it carried dropped.
+/// Everything else (the response envelope, the error envelope, the namespace) is the
+/// framework's unchanged.
+#[derive(Debug)]
+struct QuerySignedCalls {
+    inner: QueryServerProtocol,
+}
+
+impl QuerySignedCalls {
+    fn new() -> Self {
+        Self {
+            inner: QueryServerProtocol::aws_query().with_namespace(XML_NAMESPACE),
+        }
+    }
+}
+
+/// The query string a request carries its call in, when its BODY carries none.
+///
+/// `None` for a request whose body names an action (that body is the call) and for one
+/// whose query string names none either (nothing to read a call from, which stays the
+/// protocol's own `InvalidAction`).
+fn call_in_query_string(request: &RtRequest) -> Option<&str> {
+    let body_names_an_action = request
+        .body()
+        .bytes()
+        .and_then(|body| ::std::str::from_utf8(body).ok())
+        .is_some_and(|body| {
+            ::service_common::query_parameter(body, ACTION_FIELD).is_some()
+        });
+    if body_names_an_action {
+        return None;
+    }
+    let (_, query) = request.uri().split_once('?')?;
+    ::service_common::query_parameter(query, ACTION_FIELD).map(|_| query)
+}
+
+impl ServerProtocol for QuerySignedCalls {
+    type Request = RtRequest;
+    type Response = RtResponse;
+
+    fn protocol_id(&self) -> &ShapeId {
+        self.inner.protocol_id()
+    }
+
+    fn routing_key<'a>(&self, request: &'a RtRequest) -> Result<&'a str, ProtocolError> {
+        match call_in_query_string(request) {
+            Some(query) => ::service_common::query_parameter(query, ACTION_FIELD).ok_or_else(|| {
+                // Unreachable: `call_in_query_string` answers `Some` only for a query
+                // string this same reader found an action in.
+                ProtocolError::UnknownOperation("request is missing the `Action` field".into())
+            }),
+            None => self.inner.routing_key(request),
+        }
+    }
+
+    fn deserialize_input<'a>(
+        &self,
+        request: &'a RtRequest,
+        input_schema: &Schema,
+    ) -> Result<Box<dyn ShapeDeserializer + 'a>, ProtocolError> {
+        match call_in_query_string(request) {
+            // The same reader the framework uses over the body, over the query string the
+            // call was signed in: one encoding, so one deserializer, and the member bounds
+            // and depth limits it enforces are the framework's own. The `X-Amz-*` signing
+            // fields beside the members are not member names, so nothing reads them.
+            Some(query) => Ok(Box::new(QueryShapeDeserializer::new(
+                query.as_bytes(),
+                false,
+            ))),
+            None => self.inner.deserialize_input(request, input_schema),
+        }
+    }
+
+    fn serialize_output(
+        &self,
+        output: &dyn SerializableStruct,
+        output_schema: &Schema,
+        operation_name: &str,
+        success_status: u16,
+    ) -> Result<RtResponse, ProtocolError> {
+        self.inner
+            .serialize_output(output, output_schema, operation_name, success_status)
+    }
+
+    fn serialize_error(
+        &self,
+        error: &dyn SerializableStruct,
+        error_schema: &Schema,
+        error_code: &str,
+        http_status: u16,
+    ) -> Result<RtResponse, ProtocolError> {
+        self.inner
+            .serialize_error(error, error_schema, error_code, http_status)
+    }
+}
+
 /// The error code AWS answers a request whose signing credential it cannot resolve
 /// with: an access key id that was never issued, or one that has been deleted. It is
 /// distinct from an authorization denial — the call failed before any principal was
@@ -92,7 +229,7 @@ thread_local! {
 
 /// Record the access key id `parts` presented as the one this thread is serving.
 fn remember_presented_access_key_id(parts: &http::request::Parts) {
-    let access_key_id = ::engine::extract_akid(&parts.headers);
+    let access_key_id = ::service_common::request_access_key_id(parts);
     PRESENTED_ACCESS_KEY_ID.with(|presented| {
         *presented.borrow_mut() = Some(access_key_id);
     });
@@ -164,6 +301,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// the ones the handlers read ([`Self::account_holds_credential`]). Never a store of
     /// its own: it is the `Arc` the router handed to `new`.
     engine: Arc<Eng>,
+    /// Held, not built per request: [`Service::override_protocol`] returns a reference to
+    /// it. One instance for every request, as the framework's own protocols are
+    /// ("Server protocols are stateless").
+    protocol: QuerySignedCalls,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -174,6 +315,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             engine,
+            protocol: QuerySignedCalls::new(),
         }
     }
 
@@ -259,13 +401,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // The ROUTER names the operation from the model-derived protocol's routing key,
+        // which reads the form-encoded BODY — so the one request this service's routing
+        // key cannot name is a call signed under SigV4's query-parameter scheme, which
+        // carries its whole call in the query string and no body at all (see
+        // [`QuerySignedCalls`], the protocol that then READS that call). The two use the
+        // SAME reader, so the operation this resolves and the members the walk
+        // deserializes come from the same place; a body-carried call is left to the
+        // generated routing table exactly as before, and a query `Action` naming no
+        // modelled operation resolves to nothing, which leaves the request on the
+        // router's own routing-error path and this service's protocol-correct answer.
+        let query = call_in_query_string(req)?;
+        let action = ::service_common::query_parameter(query, ACTION_FIELD)?;
+        self.entry.routing_table().get(action)
     }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own `awsQuery`, plus SigV4's second scheme; see
+        // [`QuerySignedCalls`].
+        Some(&self.protocol)
+    }
+
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent

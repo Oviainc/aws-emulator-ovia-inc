@@ -1000,30 +1000,46 @@ pub fn now() -> DateTime {
     )
 }
 
-/// One call's `ResourceTags` array as the tag plane stores it for a resource THIS CALL
-/// CREATES — one entry per key, a key repeated inside the array keeping the last value
-/// it carried — or `Err(count)` with the number of distinct keys when storing them would
-/// leave the new resource holding more than [`MAX_RESOURCE_TAGS`].
+/// What the tag plane would hold for a resource once one call's `ResourceTags` array is
+/// written over the tags it holds now (`held`, `None` for a resource that holds none) —
+/// one entry per key, the array's value winning over the held one and a key the array
+/// names more than once keeping the last value it carried — or `Err(count)` with the
+/// number of distinct keys that write would leave on the resource when that is more than
+/// [`MAX_RESOURCE_TAGS`].
 ///
-/// A resource holds at most that many tags however the tags got there, so every write of
-/// tags decides this BEFORE it persists anything: the resource a create mints holds
-/// nothing yet, so its whole array counts, while `TagResource` counts only the keys the
-/// resource does not already hold. The refusal is the quota error the ANSWERING
-/// OPERATION models — `ServiceQuotaExceededException` where it declares one, otherwise
-/// the `ValidationException` it does declare — carried by
-/// [`TAG_QUOTA_EXCEEDED_MESSAGE`], and nothing of the refused create persists.
+/// A resource holds at most that many tags however the tags got there, so EVERY write of
+/// tags decides this BEFORE it persists anything, and decides it on the tag SET the write
+/// would leave on the resource rather than on how many entries the call's array carries:
+/// an entry whose key that set already accounts for — one the resource holds already, or
+/// one an earlier entry of the same array named — replaces a value instead of adding a
+/// key, so it is never a step towards the quota. Two writes that would leave the resource
+/// holding the same tags are therefore answered the same way, whichever call shape they
+/// arrived in. The refusal is the quota error the ANSWERING OPERATION models —
+/// `ServiceQuotaExceededException` where it declares one, otherwise the
+/// `ValidationException` it does declare — carried by [`TAG_QUOTA_EXCEEDED_MESSAGE`], and
+/// nothing of the refused write persists.
+pub fn resource_tags_after_write(
+    held: Option<&BTreeMap<String, String>>,
+    tags: Option<Vec<ResourceTag>>,
+) -> Result<BTreeMap<String, String>, usize> {
+    let mut stored = held.cloned().unwrap_or_default();
+    stored.extend(
+        tags.unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value)),
+    );
+    if stored.len() > MAX_RESOURCE_TAGS {
+        return Err(stored.len());
+    }
+    Ok(stored)
+}
+
+/// [`resource_tags_after_write`] for a resource THIS CALL CREATES: it holds no tags yet,
+/// so the write leaves it holding exactly the distinct keys the call's array names.
 pub fn resource_tags_for_new_resource(
     tags: Option<Vec<ResourceTag>>,
 ) -> Result<BTreeMap<String, String>, usize> {
-    let tags = tags
-        .unwrap_or_default()
-        .into_iter()
-        .map(|tag| (tag.key, tag.value))
-        .collect::<BTreeMap<_, _>>();
-    if tags.len() > MAX_RESOURCE_TAGS {
-        return Err(tags.len());
-    }
-    Ok(tags)
+    resource_tags_after_write(None, tags)
 }
 
 /// A tag map as the modelled `ResourceTagList`, in a deterministic key order.

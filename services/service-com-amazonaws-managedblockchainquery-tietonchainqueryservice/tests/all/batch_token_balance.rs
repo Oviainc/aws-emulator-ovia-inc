@@ -95,7 +95,9 @@ fn error_type_of(code: &str) -> &'static str {
 ///
 /// `BlockchainInstant$time` is "recorded up to the second", and an epoch-seconds
 /// timestamp serialises as a JSON number.
-fn instant_secs(value: &Value) -> Option<i64> {
+///
+/// `pub(crate)` because the sibling suites read the same member.
+pub(crate) fn instant_secs(value: &Value) -> Option<i64> {
     value.get("time").and_then(Value::as_f64).map(|t| t as i64)
 }
 

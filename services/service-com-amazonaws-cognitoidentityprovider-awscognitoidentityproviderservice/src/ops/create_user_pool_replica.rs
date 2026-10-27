@@ -205,15 +205,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Replicating a user pool to another Region is a feature-plan feature,
-        // so a pool on the plan that does not include it is refused the way
+        // so a pool on a plan that does not include it is refused the way
         // every other tier refusal of this service is.
-        if pool.user_pool_tier == crate::state::LITE_USER_POOL_TIER {
-            return Err(feature_unavailable_in_tier(
-                crate::state::feature_unavailable_in_tier_message(
-                    &pool.user_pool_tier,
-                    crate::state::REPLICATION_FEATURE,
-                ),
-            ));
+        if let Some(message) = crate::state::feature_plan_refusal(
+            &pool.user_pool_tier,
+            crate::state::ESSENTIALS_USER_POOL_TIER,
+            crate::state::REPLICATION_FEATURE,
+        ) {
+            return Err(feature_unavailable_in_tier(message));
         }
 
         // A replica lives in a Region OTHER than the pool's own: the pool

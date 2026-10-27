@@ -467,11 +467,12 @@ fn response_for(run: &crate::state::WorkflowRun) -> StartWorkflowRunOutput {
 
 /// A stable digest of the request, so a repeated `ClientToken` can be told apart
 /// from a token reused for a different request.
+///
+/// The version this run asks for and the override parameters it carries are both
+/// [`crate::state::DigestFields`] groups announcing their own extent, so a
+/// parameter's value can never be read as the version member's and two different
+/// requests never digest alike.
 fn request_fingerprint(input: &StartWorkflowRunInput) -> String {
-    let mut fields: Vec<String> = vec![
-        input.workflow_arn.clone(),
-        input.workflow_version.clone().unwrap_or_default(),
-    ];
     // `OverrideParameters` is an unordered map on the wire, so digest it in key order.
     let mut parameters: Vec<(String, String)> = input
         .override_parameters
@@ -481,10 +482,15 @@ fn request_fingerprint(input: &StartWorkflowRunInput) -> String {
         .map(|(key, value)| (key, format!("{value:?}")))
         .collect();
     parameters.sort();
-    for (key, value) in parameters {
-        fields.push(key);
-        fields.push(value);
-    }
-    let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
-    crate::state::digest(&borrowed)
+
+    let mut fields = crate::state::DigestFields::new();
+    fields
+        .field(input.workflow_arn.as_str())
+        .optional(input.workflow_version.as_deref())
+        .group(|entries| {
+            for (key, value) in &parameters {
+                entries.field(key.as_str()).field(value.as_str());
+            }
+        });
+    fields.digest()
 }

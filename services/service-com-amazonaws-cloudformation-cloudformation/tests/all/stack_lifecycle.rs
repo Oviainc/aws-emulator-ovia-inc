@@ -25,8 +25,9 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 pub(crate) use crate::harness::{
-    call, call_in, create_stack, get_template, member, router, router_with_engine, store,
-    wait_for_the_transition, xml_text, xml_texts, xml_unescape, REGION,
+    call, call_in, create_stack, get_template, list_imports_ok, member, router,
+    router_with_engine, store, wait_for_the_transition, xml_blocks, xml_text, xml_texts,
+    xml_unescape, REGION,
 };
 
 /// The emulator's canonical account id, as every ARN it emits carries.
@@ -188,38 +189,6 @@ pub(crate) async fn rds(
     let status = response.status().as_u16();
     let body = String::from_utf8_lossy(response.body()).to_string();
     (status, body)
-}
-
-/// The inner text of every non-nested `<tag …>…</tag>` BLOCK, in document order, left
-/// exactly as the serializer wrote it.
-///
-/// [`xml_texts`] is the leaf form of this scan: it unescapes what it finds, which is right
-/// for a value and wrong for a block that carries more elements. A caller reading a nested
-/// list (the `<member>`s inside one `<Details>`) takes the block first and scans INSIDE it,
-/// so a sibling list's members cannot be swept up with it.
-///
-/// The open tag may carry ATTRIBUTES — the query serializer puts an `xmlns` on the first
-/// member of a list it renders — so the element NAME is matched and whatever follows it up
-/// to the `>` is skipped. A longer element name that merely starts with `tag` is not that
-/// element (`<Tagging>` is not a `<Tag>`), so the scan moves past it.
-pub(crate) fn xml_blocks(xml: &str, tag: &str) -> Vec<String> {
-    let open = format!("<{tag}");
-    let close = format!("</{tag}>");
-    let mut found = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find(&open) {
-        let after = &rest[start + open.len()..];
-        if !after.starts_with('>') && !after.starts_with(char::is_whitespace) {
-            rest = &rest[start + 1..];
-            continue;
-        }
-        let Some(open_end) = after.find('>') else { break };
-        let inner = &after[open_end + 1..];
-        let Some(end) = inner.find(&close) else { break };
-        found.push(inner[..end].to_string());
-        rest = &inner[end + close.len()..];
-    }
-    found
 }
 
 /// The `ResourceStatusReason` a stack's event stream carries for the event in which

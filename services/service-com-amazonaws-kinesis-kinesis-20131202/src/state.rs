@@ -1624,8 +1624,9 @@ pub fn shard_not_open_message(shard_id: &str, stream_identifier: &str) -> String
 
 /// How `MergeShards` refuses two shards whose ranges do not meet: "two shards are
 /// considered adjacent if the union of the hash key ranges for the two shards form a
-/// contiguous set with no gaps" (`MergeShards`). Built FROM the request and the stored
-/// shards, so the pair at fault names it.
+/// contiguous set with no gaps" (`MergeShards`). The fixed text is the service's own; its
+/// variable parts are built FROM the request and the stored stream, so the pair at fault,
+/// the stream they belong to and the account that holds it all name the refusal.
 pub fn shards_not_adjacent_message(
     shard_to_merge: &str,
     adjacent_shard_to_merge: &str,
@@ -1633,8 +1634,7 @@ pub fn shards_not_adjacent_message(
 ) -> String {
     format!(
         "Shards {shard_to_merge} and {adjacent_shard_to_merge} in stream {stream_identifier} \
-         under account {} are not adjacent, so the union of their hash key ranges does not \
-         form a contiguous set with no gaps.",
+         under account {} are not an adjacent pair of shards eligible for merging",
         ::engine::emulator_account_id()
     )
 }

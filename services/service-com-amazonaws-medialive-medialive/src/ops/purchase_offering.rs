@@ -157,6 +157,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 'us-west-2'" and its `Arn` names that region too.
         let region = crate::state::request_region(ctx.parts());
 
+        // A tag key in the reserved namespace names a system tag, which is not
+        // the caller's to set, so a request carrying one is refused before
+        // anything is stored rather than purchasing a reservation that claims
+        // it — the same guard every operation storing a caller's own tag map
+        // applies.
+        if let Some(key) = crate::state::reserved_tag_key_in(input.tags.as_ref()) {
+            return Err(bad_request(crate::state::reserved_tag_key_message(key)));
+        }
+
         // The bounds every caller-chosen string of this service is held to. Both
         // members target bare `__string`, so the request boundary refuses nothing
         // for them.

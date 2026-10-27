@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateScheduledQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateScheduledQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateScheduledQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the configuration of one scheduled query the account holds, named by "The ARN or name
+//! of the scheduled query to update", and reports the query as it then stands.
+//!
+//! "This operation uses PUT semantics", so the stored configuration becomes exactly what the
+//! request states: every configuration member is written from the request — the ones it names to
+//! the values it names, the optional ones it omits back to naming nothing, and the state to the
+//! one it names or the documented default a query naming none holds
+//! ([`crate::state::SCHEDULED_QUERY_STATE_ENABLED`]). What a request cannot state is carried
+//! over: the query's name and the ARN derived from it (the identifier names the query, it does
+//! not rename it), the instant it was created, its schedule type, its tags, and its execution
+//! history, which records what RAN rather than what is configured. The instant of this call
+//! becomes the query's last-updated instant.
+//!
+//! An identifier the account holds no scheduled query under is refused the way every operation
+//! of this service refuses a missing resource. The query CloudWatch MANAGES for a log alarm is
+//! held by that alarm's own configuration ([`crate::state::log_alarm_queries`]), so it is not
+//! one a caller's write of a scheduled query configures and this operation refuses an identifier
+//! naming it rather than storing a second copy of it.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +221,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateScheduledQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateScheduledQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The Region the request was signed for, needed only to name the service-managed query
+        // of a log alarm whose configuration states no ARN of its own — the same way the readers
+        // of scheduled queries use it.
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateScheduledQueryError::from(
+                UpdateScheduledQueryErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let updated_at = crate::state::now_ms();
+
+        // "This operation uses PUT semantics": the stored configuration becomes exactly what
+        // this request states, so every configuration member is written from it — a member the
+        // request omits goes back to the value a query naming none holds rather than keeping
+        // what an earlier call put there. The name, the ARN derived from it, the creation
+        // instant, the schedule type, the tags and the execution history are not members of this
+        // request, so they stand.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateScheduledQuery"))
+        // The log store's guard is taken and released here, before the alarm store is read
+        // below, so the two services' stores are never locked at once.
+        let updated = state
+            .lock()
+            .scheduled_query_mut(&input.identifier)
+            .map(|record| {
+                record.query_language = input.query_language.clone();
+                record.query_string = input.query_string.clone();
+                record.schedule_expression = input.schedule_expression.clone();
+                record.execution_role_arn = input.execution_role_arn.clone();
+                record.description = input.description.clone();
+                record.log_group_identifiers =
+                    input.log_group_identifiers.clone().unwrap_or_default();
+                record.timezone = input.timezone.clone();
+                record.start_time_offset = input.start_time_offset;
+                record.end_time_offset = input.end_time_offset;
+                record.destination_configuration = input.destination_configuration.clone();
+                record.schedule_start_time = input.schedule_start_time;
+                record.schedule_end_time = input.schedule_end_time;
+                // "The updated state of the scheduled query", or — under the same PUT semantics
+                // as every other optional member — the state a scheduled query naming none is
+                // in, which is the documented default.
+                record.state = input
+                    .state
+                    .clone()
+                    .unwrap_or_else(|| crate::state::SCHEDULED_QUERY_STATE_ENABLED.to_string());
+                record.last_updated_time_ms = Some(updated_at);
+                record.clone()
+            });
+
+        let Some(query) = updated else {
+            // The scheduled query CloudWatch manages for a log alarm is a query this account
+            // holds, so an identifier naming one names something that IS there — but its
+            // configuration is the alarm's own, written by writing that alarm, so this
+            // operation's identifier names a query it cannot write.
+            if let Some(managed) = crate::state::log_alarm_queries::service_managed_scheduled_query(
+                &*self.engine,
+                &input.identifier,
+                &region,
+            ) {
+                return Err(UpdateScheduledQueryErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::log_alarm_queries::managed_query_not_writable_message(
+                                &managed.name,
+                            ),
+                        ),
+                    },
+                )
+                .into());
+            }
+            // An identifier this account holds no scheduled query under at all is refused the
+            // way every operation of this service refuses a resource that is not there.
+            return Err(
+                UpdateScheduledQueryErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message("scheduled query")),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The model gives this operation the same report of a scheduled query that
+        // `GetScheduledQuery` answers, as its own shape; both report it from the one stored
+        // record, so a read right after this write answers exactly what this write stored.
+        Ok(UpdateScheduledQueryOutput {
+            scheduled_query_arn: Some(query.arn.clone()),
+            name: Some(query.name.clone()),
+            description: query.description.clone(),
+            query_language: Some(query.query_language.clone()),
+            query_string: Some(query.query_string.clone()),
+            // `logGroupIdentifiers` is `@length(min: 1)`, so a query that names no log group
+            // reports no member at all rather than an empty list.
+            log_group_identifiers: (!query.log_group_identifiers.is_empty())
+                .then(|| query.log_group_identifiers.clone()),
+            schedule_expression: Some(query.schedule_expression.clone()),
+            timezone: query.timezone.clone(),
+            start_time_offset: query.start_time_offset,
+            end_time_offset: query.end_time_offset,
+            destination_configuration: query.destination_configuration.clone(),
+            state: Some(query.state.clone()),
+            schedule_type: Some(query.schedule_type.clone()),
+            // Both members report an execution that happened, so a query no execution has been
+            // recorded for reports neither — an update configures the query, it does not run it.
+            last_triggered_time: query.last_triggered_time_ms,
+            last_execution_status: query.last_execution_status.clone(),
+            schedule_start_time: query.schedule_start_time,
+            schedule_end_time: query.schedule_end_time,
+            execution_role_arn: Some(query.execution_role_arn.clone()),
+            // An instant the query's owner does not record is reported by nothing rather than
+            // invented.
+            creation_time: query.creation_time_ms,
+            last_updated_time: query.last_updated_time_ms,
+        })
     }
 }

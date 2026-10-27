@@ -45,6 +45,8 @@ mod rejected_validation_code_keeps_the_version;
 mod retired_units_and_portal_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_write_quota_counts_distinct_keys.rs"]
+mod tag_write_quota_counts_distinct_keys;
 #[path = "all/validation_message_wording.rs"]
 mod validation_message_wording;
 #[path = "all/wire_envelope_and_error_detail.rs"]

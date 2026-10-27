@@ -4,8 +4,10 @@
 //! Reconfigures one stored connector of a stored Amazon EVS environment and reports
 //! the record it wrote, which [`crate::ops::list_environment_connectors`] reads back.
 //! An `environmentId` this service holds no live environment for in the request's
-//! Region, or a `connectorId` that environment holds no live connector for, is a
-//! `ResourceNotFoundException`, and nothing is written for it.
+//! Region, or a `connectorId` that environment holds no live connector for
+//! ([`crate::state::live_connector_mut`]), is a `ResourceNotFoundException`, and nothing
+//! is written for it — a connector whose teardown has started included, because
+//! reconfiguring it would cancel a deletion the service already accepted.
 //!
 //! "You can update the Amazon Web Services Secrets Manager secret ARN or the appliance
 //! FQDN to reconfigure the connector metadata. You cannot update both the secret and
@@ -241,10 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
         let environment_id = environment.environment_id.clone();
-        let connector = environment
-            .connectors
-            .get_mut(&input.connector_id)
-            .filter(|connector| connector.state != crate::state::CONNECTOR_DELETED)
+        // The connector the request reconfigures must be one it can still act on: a
+        // connector whose teardown `DeleteEnvironmentConnector` (or the deletion of its
+        // environment) already started resolves to nothing, exactly as it does for every
+        // other request that uses a connector (`crate::state::live_connector`). Writing
+        // to such a record would cancel a deletion the service already accepted.
+        let connector = crate::state::live_connector_mut(environment, &input.connector_id)
             .ok_or_else(|| {
                 UpdateEnvironmentConnectorErrorModeled::ResourceNotFoundException(
                     crate::state::connector_not_found(&input.connector_id),

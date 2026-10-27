@@ -4,7 +4,9 @@
 //!
 //! Adds the request's `ResourceTags` to the resource the ARN names, in
 //! [`crate::state`], where `ListTagsForResource` reads them back. A key already set on
-//! the resource takes the new value; an ARN that names no resource in state is a
+//! the resource takes the new value, as does a key the request's array names more than
+//! once (`ResourceTagList` carries no `@uniqueItems`), which keeps the last value that
+//! array carried for it; an ARN that names no resource in state is a
 //! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
@@ -160,47 +162,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // What the write would leave the resource holding, decided BEFORE anything is
-        // written: a key already set is REPLACED rather than added, so re-tagging an
-        // existing key is never a quota step. The quota is on the RESOURCE
-        // (`MAX_RESOURCE_TAGS`), not on this call's array, so a caller tagging in
-        // batches reaches it; the whole write is refused or applied, because a partially
-        // tagged resource would leave the caller unable to tell which tags took, and the
-        // identical call succeeds once an `UntagResource` has freed the headroom.
-        let held = store
-            .resource_tags
-            .get(&input.resource_arn)
-            .map(std::collections::BTreeMap::len)
-            .unwrap_or_default();
-        let already_set = |key: &String| {
-            store
-                .resource_tags
-                .get(&input.resource_arn)
-                .is_some_and(|tags| tags.contains_key(key))
-        };
-        let added = input
-            .resource_tags
-            .iter()
-            .filter(|tag| !already_set(&tag.key))
-            .count();
-        if held + added > crate::state::MAX_RESOURCE_TAGS {
-            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: crate::state::TAG_QUOTA_EXCEEDED_MESSAGE.to_string(),
-                    // The tag plane keys the text as the model names the member; see
-                    // `crate::ops::types::MessageKey`.
-                    message_key: MessageKey::ModelMemberName,
-                },
-            )
-            .into());
-        }
+        // What the write would leave the resource holding, built BEFORE anything is
+        // written, by the one rule every write of tags in this service decides the quota
+        // by (`crate::state::resource_tags_after_write`): a key the resource already
+        // holds, and a key the call's array names a second time, are REPLACEMENTS of a
+        // value rather than additions of a key, so neither is a step towards the quota.
+        // The quota is on the RESOURCE (`crate::state::MAX_RESOURCE_TAGS`), not on this
+        // call's array, so a caller tagging in batches reaches it; the whole write is
+        // refused or applied, because a partially tagged resource would leave the caller
+        // unable to tell which tags took, and the identical call succeeds once an
+        // `UntagResource` has freed the headroom.
+        let stored = crate::state::resource_tags_after_write(
+            store.resource_tags.get(&input.resource_arn),
+            Some(input.resource_tags),
+        )
+        .map_err(|_| {
+            TagResourceErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+                message: crate::state::TAG_QUOTA_EXCEEDED_MESSAGE.to_string(),
+                // The tag plane keys the text as the model names the member; see
+                // `crate::ops::types::MessageKey`.
+                message_key: MessageKey::ModelMemberName,
+            })
+        })?;
 
-        let tags = store
-            .resource_tags
-            .entry(input.resource_arn.clone())
-            .or_default();
-        for tag in input.resource_tags {
-            tags.insert(tag.key, tag.value);
+        // A resource that carries no tags is not a tagged resource, so an empty write on
+        // an untagged resource leaves state holding one spelling of "no tags" — the same
+        // one `UntagResource` leaves behind.
+        if stored.is_empty() {
+            store.resource_tags.remove(&input.resource_arn);
+        } else {
+            store.resource_tags.insert(input.resource_arn, stored);
         }
         Ok(TagResourceOutput {})
     }

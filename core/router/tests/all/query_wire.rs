@@ -21,6 +21,13 @@
 //! their own element readers, written before this module existed; they are to be migrated
 //! onto [`opt_element`] / [`element`] by their own suites' issues. Nothing new should write
 //! another one — call this module.
+//!
+//! [`pairs_of`] and the two readers over it ([`outputs_of`], [`physical_ids_of`]) are here
+//! for the same reason: a suite that pairs a keyed list by zipping two document-ordered
+//! element lists reads the wrong pair the moment one member omits half of it, so the pairing
+//! is written once, over the `<member>` that carries both.
+
+use std::collections::BTreeMap;
 
 /// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC
 /// 3986's unreserved characters (`ALPHA / DIGIT / "-" / "." / "_" / "~"`) literal.
@@ -87,6 +94,48 @@ fn unescape(text: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
+}
+
+/// Each `<member>` block of an awsQuery answer's LIST, in document order.
+///
+/// The serializer writes the FIRST member of a list with the service's namespace attribute
+/// (`<member xmlns="…">`) and the rest bare, so a block starts after its tag's own closing
+/// bracket and ends at its closing tag. The lists read through this carry no member inside a
+/// member.
+pub(crate) fn members_of(xml: &str) -> Vec<&str> {
+    xml.split("<member")
+        .skip(1)
+        .filter_map(|block| block.split_once('>'))
+        .filter_map(|(_, body)| body.split("</member>").next())
+        .collect()
+}
+
+/// One pair of elements per list member, as the map a client reads a keyed list as.
+///
+/// Each pair is read from the member that carries BOTH, rather than by zipping two
+/// document-ordered lists: a member that ever omitted one of them would silently misalign the
+/// two lists, so a suite would compare the wrong pair instead of failing. A member carrying
+/// only one half contributes nothing.
+pub(crate) fn pairs_of(xml: &str, key: &str, value: &str) -> BTreeMap<String, String> {
+    members_of(xml)
+        .into_iter()
+        .filter_map(|member| {
+            let key = elements(member, key).into_iter().next()?;
+            let value = elements(member, value).into_iter().next()?;
+            Some((key, value))
+        })
+        .collect()
+}
+
+/// A `DescribeStacks` answer's `Outputs`, as the key/value map a client reads it as.
+pub(crate) fn outputs_of(xml: &str) -> BTreeMap<String, String> {
+    pairs_of(xml, "OutputKey", "OutputValue")
+}
+
+/// A `DescribeStackResources` answer as the logical-id -> physical-id map a client reads it
+/// as: each member carries one of each.
+pub(crate) fn physical_ids_of(xml: &str) -> BTreeMap<String, String> {
+    pairs_of(xml, "LogicalResourceId", "PhysicalResourceId")
 }
 
 #[cfg(test)]
@@ -176,5 +225,54 @@ mod tests {
                 "case {case:?}: expected {expected:?}, got {read:?}"
             );
         }
+    }
+
+    /// The list reader pairs the two elements of each member with EACH OTHER, over the member
+    /// forms this emulator's awsQuery serializer writes: the first member of a list carries
+    /// the service's namespace attribute, the rest are bare, a member missing one half of the
+    /// pair contributes nothing rather than stealing the next member's value, and a value the
+    /// serializer escaped comes back decoded.
+    #[test]
+    fn the_list_reader_pairs_within_each_member() {
+        let answer = concat!(
+            "<StackResources>",
+            "<member xmlns=\"http://cloudformation.amazonaws.com/doc/2010-05-15/\">",
+            "<LogicalResourceId>Record</LogicalResourceId>",
+            "<PhysicalResourceId>a.example.</PhysicalResourceId></member>",
+            "<member><LogicalResourceId>Zone</LogicalResourceId>",
+            "<PhysicalResourceId>Z0123456789ABCD</PhysicalResourceId></member>",
+            "<member><LogicalResourceId>Pending</LogicalResourceId></member>",
+            "</StackResources>"
+        );
+        let read = physical_ids_of(answer);
+        let expected: BTreeMap<String, String> =
+            [("Record", "a.example."), ("Zone", "Z0123456789ABCD")]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+        assert_eq!(
+            read, expected,
+            "case \"a namespaced member, a bare one and one with no physical id\": expected \
+             {expected:?}, got {read:?}"
+        );
+
+        let outputs = concat!(
+            "<Outputs><member xmlns=\"http://cloudformation.amazonaws.com/doc/2010-05-15/\">",
+            "<OutputKey>Zone</OutputKey><OutputValue>Z0123456789ABCD</OutputValue></member>",
+            "<member><OutputKey>Quoted</OutputValue></member>",
+            "<member><OutputKey>Escaped</OutputKey>",
+            "<OutputValue>a &amp; b</OutputValue></member></Outputs>"
+        );
+        let read = outputs_of(outputs);
+        let expected: BTreeMap<String, String> =
+            [("Zone", "Z0123456789ABCD"), ("Escaped", "a & b")]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+        assert_eq!(
+            read, expected,
+            "case \"an output list with a malformed member\": expected {expected:?}, got \
+             {read:?}"
+        );
     }
 }

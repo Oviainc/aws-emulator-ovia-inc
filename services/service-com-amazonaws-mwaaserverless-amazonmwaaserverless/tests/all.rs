@@ -53,6 +53,8 @@ mod validation_errors;
 mod workflow_configuration_digest;
 #[path = "all/workflow_deletion_teardown.rs"]
 mod workflow_deletion_teardown;
+#[path = "all/workflow_digest_member_boundaries.rs"]
+mod workflow_digest_member_boundaries;
 #[path = "all/workflow_lifecycle.rs"]
 mod workflow_lifecycle;
 #[path = "all/workflow_listing_cursor_scope.rs"]

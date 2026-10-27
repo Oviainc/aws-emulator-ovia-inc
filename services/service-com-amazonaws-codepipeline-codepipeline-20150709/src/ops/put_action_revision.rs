@@ -13,6 +13,12 @@
 //!   `PutActionRevision` trigger type the model declares for it and carrying the
 //!   reported revision as the action's `sourceRevisions` entry, and that execution's
 //!   id is reported as the pipeline's current workflow state;
+//! * that execution is admitted by the pipeline's own concurrent-execution accounting
+//!   ([`crate::state::ComAmazonawsCodepipelineCodepipeline20150709State::admit_execution`]),
+//!   the rule `StartPipelineExecution` admits one by as well: past the pipeline's
+//!   ceiling the report is refused with
+//!   `ConcurrentPipelineExecutionsLimitExceededException` and records nothing, and in a
+//!   mode that runs one execution at a time it waits for the one already running;
 //! * a revision that is not new starts nothing, and the pipeline's current execution
 //!   (the most recently started one still retained) is reported instead.
 //!
@@ -253,7 +259,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A new revision starts an execution, so everything that refuses a start
-        // refuses this call too — and nothing is recorded when it does.
+        // refuses this call too — and nothing is recorded when it does, so every
+        // refusal is settled before the pipeline's accounting is asked to make room.
         let variables =
             crate::state::resolve_execution_variables(&declaration, &[]).map_err(|message| {
                 PutActionRevisionError::from(PutActionRevisionErrorModeled::ValidationException(
@@ -262,24 +269,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 ))
             })?;
-        let execution_mode = crate::state::resolved_execution_mode(&declaration);
-        let limit = crate::state::max_concurrent_executions(&execution_mode);
-        let running = state.concurrent_execution_count(&input.pipeline_name);
-        if running >= limit {
-            return Err(
-                PutActionRevisionErrorModeled::ConcurrentPipelineExecutionsLimitExceededException(
-                    ConcurrentPipelineExecutionsLimitExceededException {
-                        message: Some(format!(
-                            "pipeline {} already has {running} execution(s) that have not \
-                             completed, the limit for a pipeline in {execution_mode} execution \
-                             mode",
-                            input.pipeline_name
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
 
         let now = ::std::time::SystemTime::now();
         // The execution this revision report starts runs the same plan a
@@ -300,6 +289,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The pipeline's concurrent-execution accounting, the rule both calls that
+        // start an execution admit it by (`state::admit_execution`): past the pipeline's
+        // ceiling the report is refused with the error the model declares for exactly
+        // that condition, and in a mode that runs one execution at a time the execution
+        // this revision starts WAITS for the one already running rather than being
+        // refused.
+        let execution_mode = crate::state::resolved_execution_mode(&declaration);
+        let queued = match state.admit_execution(&input.pipeline_name, &execution_mode, now) {
+            crate::state::ExecutionAdmission::AtLimit => {
+                return Err(
+                    PutActionRevisionErrorModeled::ConcurrentPipelineExecutionsLimitExceededException(
+                        ConcurrentPipelineExecutionsLimitExceededException {
+                            message: Some(
+                                crate::state::CONCURRENT_EXECUTION_LIMIT_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::ExecutionAdmission::Queued => true,
+            crate::state::ExecutionAdmission::Started => false,
+        };
+
         let record = crate::state::PipelineExecutionRecord {
             // Minted against the store, so the id this call reports is the one the
             // execution is filed under and no other execution can carry it.
@@ -344,9 +358,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stages: crate::state::plan_stages(&declaration, now),
             artifact_bucket,
             artifact_encryption_key,
-            // A revision report starts the execution at once: the concurrency gate
-            // above is what decided it may run.
-            queued: false,
+            // A revision report starts the execution the mode's way: the accounting
+            // above is what decided whether it runs now or waits for the one running.
+            queued,
             stop: None,
             artifacts: ::std::collections::BTreeMap::new(),
             manual_retry_attempts: 0,

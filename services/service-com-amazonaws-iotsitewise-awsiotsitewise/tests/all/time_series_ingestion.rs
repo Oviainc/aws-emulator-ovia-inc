@@ -70,7 +70,7 @@ fn ingest_table() -> Vec<IngestRow> {
 }
 
 /// Ingest one value against `alias` and assert the whole batch was accepted.
-async fn ingest_by_alias(
+pub(crate) async fn ingest_by_alias(
     router: &MultiServiceRouter,
     alias: &str,
     value: Value,

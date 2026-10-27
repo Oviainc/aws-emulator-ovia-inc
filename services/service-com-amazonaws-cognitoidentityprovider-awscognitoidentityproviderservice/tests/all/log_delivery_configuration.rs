@@ -483,7 +483,7 @@ async fn activity_logs_need_the_plan_that_includes_them() {
         let message = error_message(&payload);
         let expected = format!(
             "The following feature is not available for the {effective} pricing tier \
-             configured: User Activity Logs"
+             configured: Log Streaming"
         );
         assert_eq!(
             message, expected,

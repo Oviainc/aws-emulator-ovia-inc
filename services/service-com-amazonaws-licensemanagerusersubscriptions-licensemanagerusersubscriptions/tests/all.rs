@@ -39,6 +39,8 @@ mod list_instances;
 mod optional_settings_registration;
 #[path = "all/product_subscription_teardown.rs"]
 mod product_subscription_teardown;
+#[path = "all/product_user_removal_is_one_writer.rs"]
+mod product_user_removal_is_one_writer;
 #[path = "all/refusals.rs"]
 mod refusals;
 #[path = "all/registration_pair_resolution_is_shared.rs"]

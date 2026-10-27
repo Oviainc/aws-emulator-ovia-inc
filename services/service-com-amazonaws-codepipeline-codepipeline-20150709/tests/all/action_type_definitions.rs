@@ -3,34 +3,34 @@
 //! `UpdateActionType` and `GetActionType`, over the wire the service actually speaks
 //! (`awsJson1_1`, `POST /` with `X-Amz-Target: CodePipeline_20150709.<Operation>`).
 //!
-//! The rule under test: `UpdateActionType` stores the full `ActionTypeDeclaration` of
-//! an action type the account ALREADY holds in the Region the request was signed for
-//! — the catalog `ListActionTypes` reports, which is the action types the service
-//! provides itself plus this account's registrations — and refuses any other identity
-//! with `ActionTypeNotFoundException`; `GetActionType` reports back the definition
-//! stored for an identity in that Region, and refuses an identity no definition was
-//! stored for.
+//! The rule under test: an action type's DEFINITION belongs to the provider of that
+//! action type, so `UpdateActionType` stores the full `ActionTypeDeclaration` only for
+//! the caller that provides it — the partner the action type is registered to
+//! (`state::third_party_partners`, the registration a partner gets when it onboards,
+//! out of band of this API) — and refuses every other identity with
+//! `ActionTypeNotFoundException`, an action type the SERVICE provides itself included.
+//! `GetActionType` reports back the definition stored for an identity in the Region the
+//! read was signed for, and refuses an identity no definition was stored for.
 //!
-//! Each row of the round-trip table is a different catalog entry with a definition
-//! that differs along what the rule generalises over: which integration model the
-//! executor declares, how many properties it carries and with which flags, whether it
-//! states a description, permissions, urls, a policy template or a job timeout, and
-//! what its artifact-count bounds are. Every read goes through the router, so nothing
-//! here can pass by reading a handler's internals.
+//! Each row of the round-trip table is a different action type the caller provides,
+//! with a definition that differs along what the rule generalises over: which
+//! integration model the executor declares, how many properties it carries and with
+//! which flags, whether it states a description, permissions, urls, a policy template
+//! or a job timeout, and what its artifact-count bounds are. Every read goes through
+//! the router, so nothing here can pass by reading a handler's internals.
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_codepipeline_codepipeline_20150709::ops::types::{
-    ActionTypeDeclaration, ActionTypeIdentifier, ArtifactDetails,
+    ActionTypeDeclaration, ActionTypeId,
 };
 use service_com_amazonaws_codepipeline_codepipeline_20150709::state::{
-    ActionTypeKey, ActionTypeRecord, BuiltInActionType, BUILT_IN_ACTION_TYPES,
-    MAX_ACTION_TYPE_DEFINITIONS,
+    ActionTypeKey, BUILT_IN_ACTION_TYPES, MAX_ACTION_TYPE_DEFINITIONS,
 };
 use service_com_amazonaws_codepipeline_codepipeline_20150709::ComAmazonawsCodepipelineCodepipeline20150709State as ServiceState;
 
 use crate::custom_action_types::contains;
-use crate::pipeline_lifecycle::Emulator;
+use crate::pipeline_lifecycle::{Emulator, ACCOUNT_ID};
 
 /// The Region `Emulator::call` signs for.
 const HOME_REGION: &str = "us-east-1";
@@ -57,6 +57,11 @@ const MIN_JOB_TIMEOUT: i64 = 60;
 /// (`^arn:aws(-[\w]+)*:lambda:.+:[0-9]{12}:function:.+$`).
 const LAMBDA_ARN: &str = "arn:aws:lambda:us-east-1:123456789012:function:cp-action";
 
+/// The only owner an action type with a partner registration can carry: a `ThirdParty`
+/// action type is the one a partner provides, and `register_third_party_partner`
+/// refuses any other owner (an `AWS` one is provided by the service itself).
+const PARTNER_OWNER: &str = "ThirdParty";
+
 /// An `ActionTypeIdentifier` as a request carries it.
 ///
 /// `pub(crate)` so the other suites of this target drive these two operations through
@@ -68,6 +73,42 @@ pub(crate) fn identifier(category: &str, owner: &str, provider: &str, version: &
         "provider": provider,
         "version": version,
     })
+}
+
+/// The `ActionTypeId` the four members of `id` name.
+fn action_type_id(id: &Value) -> ActionTypeId {
+    ActionTypeId {
+        category: id["category"].as_str().unwrap_or_default().to_string(),
+        owner: id["owner"].as_str().unwrap_or_default().to_string(),
+        provider: id["provider"].as_str().unwrap_or_default().to_string(),
+        version: id["version"].as_str().unwrap_or_default().to_string(),
+    }
+}
+
+/// Register `account` as the partner that provides the action type `id`, in the shared
+/// store the handler reads — the registration AWS makes when a partner onboards, which
+/// the API surface models no operation for (the same seam `tests/all/third_party_jobs.rs`
+/// drives `PollForThirdPartyJobs` through). Every assertion still goes through the
+/// router.
+fn register_partner(emulator: &Emulator, id: &Value, account: &str) {
+    let registered = emulator
+        .engine()
+        .state::<ServiceState>()
+        .lock()
+        .register_third_party_partner(&action_type_id(id), account);
+    assert!(
+        registered,
+        "expected {id} to take a partner registration — only a {PARTNER_OWNER} action \
+         type can carry one"
+    );
+}
+
+/// An action type the caller provides: `id`, registered to the one account this
+/// emulator serves.
+fn provided(emulator: &Emulator, category: &str, provider: &str, version: &str) -> Value {
+    let id = identifier(category, PARTNER_OWNER, provider, version);
+    register_partner(emulator, &id, ACCOUNT_ID);
+    id
 }
 
 /// An `ActionTypeExecutor` for the integration `model`, carrying the
@@ -99,7 +140,7 @@ fn property(name: &str, optional: bool, no_echo: bool, queryable: bool) -> Value
     })
 }
 
-/// The definition to store for the catalog entry `id`, shaped by `variant` so that no
+/// The definition to store for the action type `id`, shaped by `variant` so that no
 /// two rows of the table state the same structure.
 fn definition(id: &Value, variant: usize) -> Value {
     let mut executor = executor(EXECUTOR_TYPES[variant % EXECUTOR_TYPES.len()]);
@@ -183,13 +224,28 @@ fn refusal(operation: &str, case: &str, status: u16, response: &Value) -> (u16, 
     (status, code)
 }
 
+/// RULE: the caller may define the action types it PROVIDES, and a definition it stored
+/// is what the read reports back.
+///
+/// The rows differ along every member of the identity the rule generalises over — each
+/// `ActionCategory` the model declares, providers and versions at the ends of their
+/// modelled `@length` (`ActionProvider` 1..35, `Version` 1..9) — and each carries a
+/// definition of a different structure.
 #[tokio::test]
-async fn a_definition_round_trips_for_every_action_type_the_catalog_holds() {
+async fn a_definition_round_trips_for_every_action_type_the_caller_provides() {
     let emulator = Emulator::new();
-    // The catalog the service provides itself, as `state::BUILT_IN_ACTION_TYPES`
-    // records it — every category and both the `AWS` and the `ThirdParty` owner.
-    for (variant, entry) in BUILT_IN_ACTION_TYPES.iter().enumerate() {
-        let id = identifier(entry.category, entry.owner, entry.provider, entry.version);
+    let identities = [
+        ("Source", "Partner-Source_1", "1"),
+        ("Build", "P", "123456789"),
+        ("Test", "Partner-Test_9", "2a"),
+        ("Deploy", "Partner-Provider-012345678901234567", "1"),
+        ("Invoke", "Partner-Invoke", "9"),
+        ("Approval", "Partner-Approval", "1"),
+        ("Compute", "Partner-Compute", "1"),
+    ];
+
+    for (variant, (category, provider, version)) in identities.iter().enumerate() {
+        let id = provided(&emulator, category, provider, version);
         let case = format!("{id} as definition {variant}");
         let declaration = definition(&id, variant);
 
@@ -215,7 +271,7 @@ async fn a_definition_round_trips_for_every_action_type_the_catalog_holds() {
 #[tokio::test]
 async fn a_definition_is_replaced_whole_by_the_next_call() {
     let emulator = Emulator::new();
-    let id = identifier("Source", "ThirdParty", "GitHub", "1");
+    let id = provided(&emulator, "Source", "Partner-Source", "1");
 
     // Two definitions of one identity that differ in every optional member, so a
     // read that reported the first one — or a merge of the two — fails.
@@ -244,13 +300,29 @@ async fn a_definition_is_replaced_whole_by_the_next_call() {
     }
 }
 
+/// RULE: an action type the caller does not PROVIDE has no definition for it to state,
+/// whether that is because nothing provides the identity at all, because the SERVICE
+/// provides it, or because another account is its registered partner — and every one of
+/// those is refused with the same code and the same message, so the refusal tells a
+/// caller nothing about an action type it does not provide.
 #[tokio::test]
-async fn an_action_type_the_catalog_does_not_hold_is_refused_as_not_found() {
+async fn an_action_type_the_caller_does_not_provide_is_refused_as_not_found() {
     let emulator = Emulator::new();
-    // Each row names an identity no entry of the catalog carries, differing from a
-    // real one in exactly one member: the provider, the version, the category or the
-    // owner.
-    let cases = [
+
+    // Every action type the service provides itself — each category and both the `AWS`
+    // and the `ThirdParty` owner (`state::BUILT_IN_ACTION_TYPES`): `ListActionTypes`
+    // reports them, and not one of them is the caller's to define.
+    let mut cases: Vec<(String, Value)> = BUILT_IN_ACTION_TYPES
+        .iter()
+        .map(|entry| {
+            let id = identifier(entry.category, entry.owner, entry.provider, entry.version);
+            (format!("the catalog's {id}"), id)
+        })
+        .collect();
+
+    // Identities no action type carries at all, each differing from a real one in
+    // exactly one member: the provider, the version, the category or the owner.
+    for (case, id) in [
         (
             "a provider no action type publishes",
             identifier("Build", "ThirdParty", "NoSuchProvider", "1"),
@@ -271,7 +343,15 @@ async fn an_action_type_the_catalog_does_not_hold_is_refused_as_not_found() {
             "a real ThirdParty provider claimed for the AWS owner",
             identifier("Source", "AWS", "GitHub", "1"),
         ),
-    ];
+    ] {
+        cases.push((case.to_string(), id));
+    }
+
+    // And one another account provides: the identity exists and has a partner, but the
+    // caller is not it.
+    let someone_elses = identifier("Build", PARTNER_OWNER, "Partner-Elsewhere", "1");
+    register_partner(&emulator, &someone_elses, "123456789012");
+    cases.push(("an action type another account provides".to_string(), someone_elses));
 
     for (case, id) in &cases {
         let (status, response) = update_in(&emulator, HOME_REGION, &definition(id, 0)).await;
@@ -281,6 +361,7 @@ async fn an_action_type_the_catalog_does_not_hold_is_refused_as_not_found() {
             "case {case:?}: expected a 400 ActionTypeNotFoundException, got {status} {response}"
         );
 
+        // Refused, so nothing was stored: the read is refused the same way.
         let (status, response) = get_in(&emulator, HOME_REGION, id).await;
         assert_eq!(
             refusal("GetActionType", case, status, &response),
@@ -288,14 +369,23 @@ async fn an_action_type_the_catalog_does_not_hold_is_refused_as_not_found() {
             "case {case:?}: expected a 400 ActionTypeNotFoundException, got {status} {response}"
         );
     }
+
+    assert_eq!(
+        emulator
+            .engine()
+            .state::<ServiceState>()
+            .lock()
+            .declared_action_type_count(),
+        0,
+        "expected every refused call to have stored nothing"
+    );
 }
 
 #[tokio::test]
 async fn a_catalog_entry_nobody_defined_has_no_definition_to_report() {
     let emulator = Emulator::new();
     // Every action type the catalog holds exists — `ListActionTypes` reports it — but
-    // a definition is reported only once `UpdateActionType` has stored one, so this
-    // read is refused for exactly the same identity the round-trip case accepts.
+    // a definition is reported only once an `UpdateActionType` call stored one.
     for entry in &BUILT_IN_ACTION_TYPES {
         let id = identifier(entry.category, entry.owner, entry.provider, entry.version);
         let case = format!("{id} before any UpdateActionType call");
@@ -311,7 +401,7 @@ async fn a_catalog_entry_nobody_defined_has_no_definition_to_report() {
 #[tokio::test]
 async fn a_definition_belongs_to_the_region_its_call_was_signed_for() {
     let emulator = Emulator::new();
-    let id = identifier("Invoke", "AWS", "Lambda", "1");
+    let id = provided(&emulator, "Invoke", "Partner-Invoke", "1");
     let declaration = definition(&id, 3);
 
     let (status, answered) = update_in(&emulator, HOME_REGION, &declaration).await;
@@ -328,8 +418,8 @@ async fn a_definition_belongs_to_the_region_its_call_was_signed_for() {
          in another Region, got {status} {response}"
     );
 
-    // The action types the service provides itself are available in every Region, so
-    // the same identity takes its own definition there.
+    // A partner provides its action type wherever it is used, so the same identity
+    // takes its own definition in another Region.
     let elsewhere = definition(&id, 4);
     let (status, answered) = update_in(&emulator, OTHER_REGION, &elsewhere).await;
     assert_eq!(
@@ -350,65 +440,9 @@ async fn a_definition_belongs_to_the_region_its_call_was_signed_for() {
 }
 
 #[tokio::test]
-async fn a_registration_is_as_much_of_the_catalog_as_a_built_in_action_type() {
-    let emulator = Emulator::new();
-    // A registration the account holds in ONE Region, put in the shared store the
-    // handler reads the way `CreateCustomActionType` writes it. Its owner is
-    // `ThirdParty` because `ActionTypeIdentifier$owner` is
-    // `@pattern("^AWS|ThirdParty$")`, so a definition never names a `Custom` one.
-    let key = ActionTypeKey {
-        category: "Build".to_string(),
-        owner: "ThirdParty".to_string(),
-        provider: "Partner-Build_1".to_string(),
-        version: "3".to_string(),
-    };
-    emulator.engine().state::<ServiceState>().lock().register_action_type(
-        key.clone(),
-        ActionTypeRecord {
-            settings: None,
-            configuration_properties: Vec::new(),
-            input_artifact_details: ArtifactDetails {
-                minimum_count: 0,
-                maximum_count: 1,
-            },
-            output_artifact_details: ArtifactDetails {
-                minimum_count: 0,
-                maximum_count: 1,
-            },
-            region: Some(HOME_REGION.to_string()),
-            tags: Vec::new(),
-        },
-    );
-
-    let id = identifier(&key.category, &key.owner, &key.provider, &key.version);
-    let declaration = definition(&id, 5);
-
-    let (status, answered) = update_in(&emulator, HOME_REGION, &declaration).await;
-    assert_eq!(
-        status, 200,
-        "expected the registration to be definable in its own Region, got {status} {answered}"
-    );
-    let (status, read) = get_in(&emulator, HOME_REGION, &id).await;
-    assert_eq!(status, 200, "expected the stored definition, got {status} {read}");
-    assert!(
-        contains(&declaration, &read["actionType"]),
-        "expected the definition {declaration}, got {read}"
-    );
-
-    // A registration belongs to the Region it was made in, so in another Region no
-    // action type carries this identity at all.
-    let (status, response) = update_in(&emulator, OTHER_REGION, &declaration).await;
-    assert_eq!(
-        refusal("UpdateActionType", OTHER_REGION, status, &response),
-        (400, "ActionTypeNotFoundException".to_string()),
-        "case {OTHER_REGION:?}: expected a 400 ActionTypeNotFoundException, got {status} {response}"
-    );
-}
-
-#[tokio::test]
 async fn a_definition_the_documented_rules_rule_out_is_refused_and_stores_nothing() {
     let emulator = Emulator::new();
-    let id = identifier("Test", "AWS", "DeviceFarm", "1");
+    let id = provided(&emulator, "Test", "Partner-Test", "1");
     let with = |member: &str, value: Value| {
         let mut declaration = definition(&id, 0);
         declaration[member] = value;
@@ -585,15 +619,15 @@ async fn a_definition_the_documented_rules_rule_out_is_refused_and_stores_nothin
 #[tokio::test]
 async fn the_definition_store_is_bounded_across_every_region() {
     let emulator = Emulator::new();
-    // The identity whose definition is already stored in the home Region, and one
-    // that is not: both are action types the catalog holds in EVERY Region.
-    let stored = BUILT_IN_ACTION_TYPES[0];
-    let fresh = BUILT_IN_ACTION_TYPES[1];
-    let key_of = |entry: &BuiltInActionType| ActionTypeKey {
-        category: entry.category.to_string(),
-        owner: entry.owner.to_string(),
-        provider: entry.provider.to_string(),
-        version: entry.version.to_string(),
+    // Two action types the caller provides: one whose definition is already stored in
+    // the home Region, and one that is not.
+    let stored_id = provided(&emulator, "Build", "Partner-Stored", "1");
+    let fresh_id = provided(&emulator, "Deploy", "Partner-Fresh", "1");
+    let key_of = |id: &Value| ActionTypeKey {
+        category: id["category"].as_str().unwrap_or_default().to_string(),
+        owner: id["owner"].as_str().unwrap_or_default().to_string(),
+        provider: id["provider"].as_str().unwrap_or_default().to_string(),
+        version: id["version"].as_str().unwrap_or_default().to_string(),
     };
 
     // Fill the store to the bound through the one gate every write goes through,
@@ -606,23 +640,15 @@ async fn the_definition_store_is_bounded_across_every_region() {
         for index in 0..MAX_ACTION_TYPE_DEFINITIONS - 1 {
             let accepted = state.declare_action_type(
                 &format!("us-fill-{index}"),
-                key_of(&fresh),
+                key_of(&fresh_id),
                 ActionTypeDeclaration::default(),
             );
             assert!(accepted, "case {index}: expected the store to take a definition below its bound");
         }
         let accepted = state.declare_action_type(
             HOME_REGION,
-            key_of(&stored),
-            ActionTypeDeclaration {
-                id: ActionTypeIdentifier {
-                    category: stored.category.to_string(),
-                    owner: stored.owner.to_string(),
-                    provider: stored.provider.to_string(),
-                    version: stored.version.to_string(),
-                },
-                ..ActionTypeDeclaration::default()
-            },
+            key_of(&stored_id),
+            ActionTypeDeclaration::default(),
         );
         assert!(accepted, "expected the store to take the definition at its bound");
         assert_eq!(
@@ -635,12 +661,6 @@ async fn the_definition_store_is_bounded_across_every_region() {
 
     // Re-defining an identity this Region already holds a definition for grows
     // nothing, so it is accepted at the bound.
-    let stored_id = identifier(
-        stored.category,
-        stored.owner,
-        stored.provider,
-        stored.version,
-    );
     let declaration = definition(&stored_id, 2);
     let (status, answered) = update_in(&emulator, HOME_REGION, &declaration).await;
     assert_eq!(
@@ -657,7 +677,6 @@ async fn the_definition_store_is_bounded_across_every_region() {
 
     // One definition past the bound is refused with the only error the operation
     // models for a request it cannot carry out.
-    let fresh_id = identifier(fresh.category, fresh.owner, fresh.provider, fresh.version);
     let (status, response) = update_in(&emulator, HOME_REGION, &definition(&fresh_id, 1)).await;
     assert_eq!(
         refusal("UpdateActionType", "one past the bound", status, &response),
@@ -681,13 +700,7 @@ async fn the_definition_store_is_bounded_across_every_region() {
 #[tokio::test]
 async fn reading_a_definition_leaves_the_store_as_it_was() {
     let emulator = Emulator::new();
-    let defined = BUILT_IN_ACTION_TYPES[0];
-    let defined_id = identifier(
-        defined.category,
-        defined.owner,
-        defined.provider,
-        defined.version,
-    );
+    let defined_id = provided(&emulator, "Build", "Partner-Defined", "1");
     let declaration = definition(&defined_id, 2);
     let (status, answered) = update_in(&emulator, HOME_REGION, &declaration).await;
     assert_eq!(
@@ -695,15 +708,10 @@ async fn reading_a_definition_leaves_the_store_as_it_was() {
         "expected UpdateActionType to store the definition, got {status} {answered}"
     );
 
-    // The identity nothing defined: a catalog entry in the same Region, so the only
-    // thing separating the two reads is whether a definition was stored.
-    let undefined = BUILT_IN_ACTION_TYPES[1];
-    let undefined_id = identifier(
-        undefined.category,
-        undefined.owner,
-        undefined.provider,
-        undefined.version,
-    );
+    // The identity nothing defined: another action type the caller provides, in the
+    // same Region, so the only thing separating the two reads is whether a definition
+    // was stored.
+    let undefined_id = provided(&emulator, "Test", "Partner-Undefined", "1");
 
     let count = || {
         emulator
@@ -750,29 +758,18 @@ async fn a_custom_owned_action_type_cannot_be_named() {
     // An action type the account really does hold — `CreateCustomActionType` mints it
     // under the `Custom` owner — so what the refusal turns on is the OWNER and not the
     // action type's existence.
-    {
-        let state = emulator.engine().state::<ServiceState>();
-        state.lock().register_action_type(
-            ActionTypeKey {
-                category: "Build".to_string(),
-                owner: "Custom".to_string(),
-                provider: "ExampleCustom".to_string(),
-                version: "1".to_string(),
-            },
-            ActionTypeRecord {
-                input_artifact_details: ArtifactDetails {
-                    minimum_count: 0,
-                    maximum_count: 1,
-                },
-                output_artifact_details: ArtifactDetails {
-                    minimum_count: 0,
-                    maximum_count: 1,
-                },
-                region: Some(HOME_REGION.to_string()),
-                ..ActionTypeRecord::default()
-            },
-        );
-    }
+    emulator
+        .ok(
+            "CreateCustomActionType",
+            &json!({
+                "category": "Build",
+                "provider": "ExampleCustom",
+                "version": "1",
+                "inputArtifactDetails": {"minimumCount": 0, "maximumCount": 1},
+                "outputArtifactDetails": {"minimumCount": 0, "maximumCount": 1},
+            }),
+        )
+        .await;
     let custom_id = identifier("Build", "Custom", "ExampleCustom", "1");
 
     let (status, response) = get_in(&emulator, HOME_REGION, &custom_id).await;

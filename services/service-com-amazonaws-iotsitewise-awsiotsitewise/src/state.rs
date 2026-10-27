@@ -3913,11 +3913,19 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// `UpdateAssetProperty` refuses such a request with the modelled conflict
     /// before reaching this helper; this keeps the store consistent for any caller
     /// whose own rule allows the rebind.
+    ///
+    /// An asset's `last_update_date` is the instant of the last accepted write to
+    /// it, and a property's alias binding is part of the asset that carries that
+    /// property — so an accepted change to the binding moves the owning asset's
+    /// instant to `now`, here and not in each caller, and the asset a displaced
+    /// binding is taken FROM moves with it. A call that leaves the binding as it
+    /// stood writes nothing, so a request that changes nothing cannot move it.
     pub fn set_property_alias(
         &mut self,
         asset_id: &str,
         property_id: &str,
         alias: Option<String>,
+        now: SystemTime,
     ) -> bool {
         let Some(asset) = self.assets.get_mut(asset_id) else {
             return false;
@@ -3931,6 +3939,9 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         let property_data_type_spec = property.data_type_spec.clone();
         let previous = property.alias.take();
         property.alias = alias.clone();
+        if previous != alias {
+            asset.last_update_date = now;
+        }
 
         if let Some(previous) = previous {
             let ours = self
@@ -3989,6 +4000,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                     if let Some(asset) = self.assets.get_mut(&held_by_asset) {
                         if let Some(at) = asset.property_position(&held_by_property) {
                             asset.properties[at].alias = None;
+                            asset.last_update_date = now;
                         }
                     }
                 }
@@ -4066,7 +4078,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 .and_then(|properties| properties.remove(&resolved_property_id))
                 .unwrap_or_default(),
         };
-        self.set_property_alias(asset_id, property_id, None);
+        self.set_property_alias(asset_id, property_id, None, now);
         self.keep_disassociated_time_series(record);
         true
     }
@@ -4334,8 +4346,12 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// exists, but the time series will no longer be associated with this asset
     /// property" — so a series removed by its alias and the same series removed by
     /// its `(assetId, propertyId)` pair leave the store in one state.
-    pub fn forget_property_series(&mut self, asset_id: &str, property_id: &str) {
-        self.set_property_alias(asset_id, property_id, None);
+    ///
+    /// Dropping the binding is an accepted write to the asset that carries the
+    /// property, so `now` is the instant its `last_update_date` moves to (see
+    /// [`Self::set_property_alias`]).
+    pub fn forget_property_series(&mut self, asset_id: &str, property_id: &str, now: SystemTime) {
+        self.set_property_alias(asset_id, property_id, None, now);
         if let Some(properties) = self.property_values.get_mut(asset_id) {
             properties.remove(property_id);
         }

@@ -509,6 +509,59 @@ pub fn routes_to_any(parts: &http::request::Parts, route_keys: &[&str]) -> bool 
     }
 }
 
+/// The access key id a request presents, wherever SigV4 put it.
+///
+/// SigV4 has two schemes. "Authenticating Requests: Using Authorization Header" carries
+/// the credential scope in the `Authorization` header, which is what
+/// `::emulator_server::extract_akid` reads; "Authenticating Requests: Using Query
+/// Parameters", the one a presigned URL uses, carries the same scope in the
+/// `X-Amz-Credential` query parameter instead. The framework VERIFIES both, so a service
+/// resolving who a request speaks for has to read both — a presigned call is made by the
+/// credential that signed the URL, not by nobody.
+///
+/// Answers `extract_akid`'s own sentinel for a request that presents no credential at all,
+/// so an unsigned request reads exactly as it does through that function alone. One reader
+/// for the tree: `extract_akid` does not export its sentinel and the framework's own
+/// presigned-field parsing is private, so without this every service that serves a
+/// presigned call grows its own copy.
+pub fn request_access_key_id(parts: &http::request::Parts) -> String {
+    let from_header = ::emulator_server::extract_akid(&parts.headers);
+    if from_header != UNSIGNED_ACCESS_KEY_ID {
+        return from_header;
+    }
+    presigned_credential_key_id(parts.uri.query().unwrap_or("")).unwrap_or(from_header)
+}
+
+/// What `::emulator_server::extract_akid` answers for a request carrying no SigV4
+/// credential scope. Stated here because that function does not export it.
+const UNSIGNED_ACCESS_KEY_ID: &str = "default";
+
+/// The key id of a presigned request's `X-Amz-Credential` scope
+/// (`<key id>/<date>/<region>/<name>/aws4_request`), whose `/` separators a client
+/// percent-encodes.
+///
+/// The key id itself carries neither separator — an access key id is `^[\w]*$` in every
+/// AWS model that constrains one — so the scope's first field ends at whichever of them
+/// comes first.
+fn presigned_credential_key_id(query: &str) -> Option<String> {
+    let credential = query_parameter(query, "X-Amz-Credential")?;
+    let key_id = credential.split(['/', '%']).next().unwrap_or_default();
+    (!key_id.is_empty()).then(|| key_id.to_string())
+}
+
+/// The value of the query parameter `name`, read off a URI's raw query string.
+///
+/// Parameter NAMES in a SigV4 query are spelled literally, so the name is compared as
+/// written; the value is returned as written, which is what its readers here need — a
+/// credential scope ([`request_access_key_id`]) and a query-protocol `Action` are drawn
+/// from character sets a client does not escape.
+pub fn query_parameter<'q>(query: &'q str, name: &str) -> Option<&'q str> {
+    query
+        .split('&')
+        .filter_map(|item| item.split_once('='))
+        .find_map(|(key, value)| (key == name).then_some(value))
+}
+
 /// The claim rule for a service whose signing name is SHARED and whose peers' modelled
 /// path spaces OVERLAP: the request's resolved routing key names this endpoint, and this
 /// service's own model binds a route for the request.
@@ -815,6 +868,72 @@ mod tests {
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/{signing_name}/aws4_request, \
              SignedHeaders=host, Signature=abc"
         )
+    }
+
+    /// Which SigV4 scheme a request presents its credential under decides where the key
+    /// id is read from, and nothing else: the `Authorization` header when it carries one,
+    /// the presigned `X-Amz-Credential` scope otherwise, and the framework's own sentinel
+    /// when the request presents neither.
+    ///
+    /// The last row also PINS that sentinel against the framework
+    /// ([`UNSIGNED_ACCESS_KEY_ID`] restates a value `extract_akid` does not export), so a
+    /// change to it fails here instead of silently turning an unsigned request into a
+    /// caller named `default`.
+    #[test]
+    fn a_credential_is_read_from_whichever_sigv4_scheme_presented_it() {
+        let presigned = |query: &str| {
+            http::Request::builder()
+                .method("GET")
+                .uri(format!("https://sts.amazonaws.com/?{query}"))
+                .body(())
+                .expect("a well-formed test request")
+                .into_parts()
+                .0
+        };
+        let unsigned = presigned("Action=GetCallerIdentity");
+        assert_eq!(
+            ::emulator_server::extract_akid(&unsigned.headers),
+            UNSIGNED_ACCESS_KEY_ID,
+            "the framework's sentinel for a request carrying no credential has changed"
+        );
+
+        // (case, the request, the key id it presents)
+        let rows: Vec<(&str, http::request::Parts, &str)> = vec![
+            (
+                "a header-signed request",
+                parts("sts", "/", None),
+                "AKIDEXAMPLE",
+            ),
+            (
+                "a presigned request whose scope separators are encoded",
+                presigned(
+                    "Action=GetCallerIdentity&X-Amz-Credential=\
+                     ASIAPRESIGNEDKEY0001%2F20260101%2Fus-east-1%2Fsts%2Faws4_request",
+                ),
+                "ASIAPRESIGNEDKEY0001",
+            ),
+            (
+                "a presigned request whose scope separators are literal",
+                presigned(
+                    "Action=GetCallerIdentity&X-Amz-Credential=\
+                     ASIAPRESIGNEDKEY0002/20260101/us-east-1/sts/aws4_request",
+                ),
+                "ASIAPRESIGNEDKEY0002",
+            ),
+            (
+                "a request carrying neither",
+                unsigned,
+                UNSIGNED_ACCESS_KEY_ID,
+            ),
+        ];
+
+        for (case, request, expected) in rows {
+            let actual = request_access_key_id(&request);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the key id {expected:?}, got {actual:?}"
+            );
+        }
     }
 
     fn parts(signing_name: &str, uri: &str, target: Option<&str>) -> http::request::Parts {

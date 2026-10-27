@@ -176,13 +176,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        // "You can tag resources with a key-value pair or with only a key" — so an empty
-        // VALUE is a tag, but a tag with no key names nothing.
-        if input.tags.keys().any(|key| key.is_empty()) {
-            return Err(TagResourceErrorModeled::BadRequestException(BadRequestException {
-                message: Some("Tags must not contain an empty tag key.".to_string()),
-            })
-            .into());
+        // The tests a tag set takes belong to the RECORD, so they live in one place for
+        // every door onto a record's tags (`crate::state::check_tags`): this door applies
+        // them to the pairs the request carried before the store is reached — a key with
+        // no characters names nothing, and a request carrying more than a record holds
+        // cannot be merged whatever the record already carries — and to the merge itself
+        // below.
+        let requested: ::std::collections::BTreeMap<String, String> =
+            input.tags.into_iter().collect();
+        if let Err(refusal) = crate::state::check_tags(&requested) {
+            return Err(tag_refusal_error(refusal).into());
         }
 
         let now = ::std::time::SystemTime::now();
@@ -201,22 +204,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The merge is computed before anything is written, so a call refused for growing
         // past the tag cap leaves the resource's tags exactly as they were.
         let mut merged = tags.clone();
-        for (key, value) in input.tags {
-            merged.insert(key, value);
-        }
-        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "A resource holds at most {} tags.",
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    )),
-                },
-            )
-            .into());
+        merged.extend(requested);
+        if let Err(refusal) = crate::state::check_tags(&merged) {
+            return Err(tag_refusal_error(refusal).into());
         }
         *tags = merged;
 
         Ok(TagResourceOutput {})
+    }
+}
+
+/// The modelled error this operation answers a tag-set refusal with: the request-shaped
+/// one is a bad request and the quota-shaped one the quota error, both worded by
+/// [`crate::state::TagRefusal`] so every door onto a record's tags refuses alike.
+fn tag_refusal_error(refusal: crate::state::TagRefusal) -> TagResourceErrorModeled {
+    let message = Some(refusal.message());
+    match refusal {
+        crate::state::TagRefusal::EmptyKey => {
+            TagResourceErrorModeled::BadRequestException(BadRequestException { message })
+        }
+        crate::state::TagRefusal::PastCap => {
+            TagResourceErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+                message,
+            })
+        }
     }
 }

@@ -549,33 +549,34 @@ async fn a_revision_the_model_rejects_never_reaches_the_store() {
     }
 }
 
-/// A pipeline holds only so many executions that have not completed: a new revision
-/// that would start one past that bound is refused with
-/// `ConcurrentPipelineExecutionsLimitExceededException`, whatever started the
-/// executions already running, and the refusal records nothing.
+/// RULE: a pipeline carries at most
+/// `state::MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE` executions that have not reached a
+/// terminal status, WHATEVER its `executionMode`; a new revision that would start one
+/// past that is refused with `ConcurrentPipelineExecutionsLimitExceededException` and
+/// records nothing. A mode that runs one execution at a time holds the extra execution
+/// instead of refusing it, so whether the slots fill at all is a property of the mode:
+/// `QUEUED` keeps every waiting execution, while `SUPERSEDED` supersedes the one that
+/// was waiting and therefore never holds more than two.
+///
+/// The rows span the `ExecutionMode` values the model declares plus the declaration
+/// that names none, which is the dimension the rule turns on.
 #[tokio::test]
 async fn a_new_revision_past_the_concurrency_bound_is_refused() {
-    // The bounds are the service crate's own, read from `crate::state` so this test
-    // cannot drift from them.
-    let superseded_limit =
-        service_com_amazonaws_codepipeline_codepipeline_20150709::state::MAX_CONCURRENT_EXECUTIONS_SUPERSEDED;
-    let parallel_limit =
-        service_com_amazonaws_codepipeline_codepipeline_20150709::state::MAX_CONCURRENT_EXECUTIONS_PARALLEL;
-    assert!(
-        superseded_limit < parallel_limit,
-        "a mode that holds several executions must allow more than SUPERSEDED, got \
-         {superseded_limit} and {parallel_limit}"
-    );
+    // The bound is the service crate's own, read from `crate::state` so this test
+    // cannot drift from it.
+    let limit =
+        service_com_amazonaws_codepipeline_codepipeline_20150709::state::MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE;
 
-    // (case, executionMode, the bound that mode allows)
-    let cases: Vec<(&str, Option<&str>, usize)> = vec![
-        ("the default mode", None, superseded_limit),
-        ("SUPERSEDED", Some("SUPERSEDED"), superseded_limit),
-        ("QUEUED", Some("QUEUED"), parallel_limit),
-        ("PARALLEL", Some("PARALLEL"), parallel_limit),
+    // (case, executionMode, whether reporting `limit` new revisions fills the
+    // pipeline's slots)
+    let cases: Vec<(&str, Option<&str>, bool)> = vec![
+        ("the default mode", None, false),
+        ("SUPERSEDED", Some("SUPERSEDED"), false),
+        ("QUEUED", Some("QUEUED"), true),
+        ("PARALLEL", Some("PARALLEL"), true),
     ];
 
-    for (case, execution_mode, limit) in cases {
+    for (case, execution_mode, fills) in cases {
         let emulator = Emulator::new();
         emulator
             .ok(
@@ -603,8 +604,8 @@ async fn a_new_revision_past_the_concurrency_bound_is_refused() {
             );
         }
 
-        let (status, code) = emulator
-            .expect_error(
+        let (status, response) = emulator
+            .call(
                 "PutActionRevision",
                 &json!({
                     "pipelineName": "demo",
@@ -614,10 +615,28 @@ async fn a_new_revision_past_the_concurrency_bound_is_refused() {
                 }),
             )
             .await;
+        if !fills {
+            // The mode holds one execution at a time and supersedes the one waiting,
+            // so the pipeline is nowhere near its ceiling however many revisions were
+            // reported: this one is admitted like the rest.
+            assert_eq!(
+                (status, response["newRevision"].clone()),
+                (200, json!(true)),
+                "case {case:?}: a mode that supersedes the waiting execution holds \
+                 fewer than {limit}, got {status} with {response}"
+            );
+            continue;
+        }
         assert_eq!(
-            (status, code.as_str()),
-            (400, "ConcurrentPipelineExecutionsLimitExceededException"),
-            "case {case:?}: revision {} is past the bound of {limit}",
+            (
+                status,
+                response["__type"].as_str().unwrap_or_default().to_string()
+            ),
+            (
+                400,
+                "ConcurrentPipelineExecutionsLimitExceededException".to_string()
+            ),
+            "case {case:?}: revision {} is past the bound of {limit}, got {response}",
             limit + 1
         );
 
@@ -649,10 +668,19 @@ async fn a_new_revision_past_the_concurrency_bound_is_refused() {
     }
 }
 
-/// The bound counts every execution that has not completed, whichever call started
-/// it: an execution `StartPipelineExecution` began occupies the same slot.
+/// RULE: the bound counts every execution that has not completed, whichever call
+/// started it, and the mode decides what a trigger that arrives while one is running
+/// does: an execution `StartPipelineExecution` began occupies the same slot a revision
+/// report would, and in the default (SUPERSEDED) mode the revision's execution WAITS
+/// for it rather than being refused.
 #[tokio::test]
 async fn an_execution_started_by_another_call_occupies_the_bound() {
+    let limit =
+        service_com_amazonaws_codepipeline_codepipeline_20150709::state::MAX_CONCURRENT_EXECUTIONS_PER_PIPELINE;
+
+    // The default mode: the pipeline is running the execution the start began, so the
+    // revision's execution is held rather than refused, and the pipeline then carries
+    // both.
     let emulator = Emulator::new();
     emulator
         .ok("CreatePipeline", &json!({"pipeline": declaration("demo")}))
@@ -665,8 +693,8 @@ async fn an_execution_started_by_another_call_occupies_the_bound() {
         .expect("an execution id")
         .to_string();
 
-    let (status, code) = emulator
-        .expect_error(
+    let put = emulator
+        .ok(
             "PutActionRevision",
             &json!({
                 // `declaration` builds a one-stage pipeline whose source action is
@@ -678,20 +706,57 @@ async fn an_execution_started_by_another_call_occupies_the_bound() {
             }),
         )
         .await;
+    let revision_execution = put["pipelineExecutionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an execution id, got {put}"))
+        .to_string();
+    assert_ne!(
+        revision_execution, execution_id,
+        "the revision starts an execution of its own, got {put}"
+    );
+    let ids: Vec<Value> = executions(&emulator, "demo")
+        .await
+        .iter()
+        .map(|summary| summary["pipelineExecutionId"].clone())
+        .collect();
+    assert!(
+        ids.contains(&json!(execution_id)) && ids.contains(&json!(revision_execution)),
+        "both executions occupy a slot of the pipeline, got {ids:?}"
+    );
+
+    // A PARALLEL pipeline whose slots are filled by starts alone: the revision report
+    // runs into the same ceiling, because the slot does not care which call took it.
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreatePipeline",
+            &json!({"pipeline": two_source_actions("parallel", Some("PARALLEL"))}),
+        )
+        .await;
+    for index in 0..limit {
+        let started = emulator
+            .call("StartPipelineExecution", &json!({"name": "parallel"}))
+            .await;
+        assert_eq!(
+            started.0, 200,
+            "start {index} is inside the bound of {limit}, got {started:?}"
+        );
+    }
+    let (status, code) = emulator
+        .expect_error(
+            "PutActionRevision",
+            &json!({
+                "pipelineName": "parallel",
+                "stageName": "Source",
+                "actionName": "SrcA",
+                "actionRevision": revision("rev-1", "change"),
+            }),
+        )
+        .await;
     assert_eq!(
         (status, code.as_str()),
         (400, "ConcurrentPipelineExecutionsLimitExceededException"),
-        "a SUPERSEDED pipeline already running an execution holds no second one"
-    );
-
-    let summaries = executions(&emulator, "demo").await;
-    assert_eq!(
-        summaries
-            .iter()
-            .map(|summary| summary["pipelineExecutionId"].clone())
-            .collect::<Vec<Value>>(),
-        vec![json!(execution_id)],
-        "the refused revision started nothing, got {summaries:?}"
+        "executions another call started fill the same {limit} slots"
     );
 }
 

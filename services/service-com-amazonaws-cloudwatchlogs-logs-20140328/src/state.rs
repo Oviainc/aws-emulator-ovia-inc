@@ -1171,6 +1171,18 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         })
     }
 
+    /// The same scheduled query, to write. See [`Self::scheduled_query`]: both forms of
+    /// `ScheduledQueryIdentifier` resolve to the one record, so a write addressed by an ARN
+    /// and a write addressed by a name reach the same query.
+    pub fn scheduled_query_mut(&mut self, identifier: &str) -> Option<&mut ScheduledQueryRecord> {
+        let key = if self.scheduled_queries.contains_key(identifier) {
+            identifier
+        } else {
+            scheduled_query_name_from_identifier(identifier)
+        };
+        self.scheduled_queries.get_mut(key)
+    }
+
     /// The same tag set, to write. See [`Self::resource_tags`].
     pub fn resource_tags_mut(
         &mut self,

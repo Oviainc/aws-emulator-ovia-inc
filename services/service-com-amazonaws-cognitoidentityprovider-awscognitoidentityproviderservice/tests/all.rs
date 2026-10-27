@@ -59,6 +59,8 @@ mod device_remembering;
 mod error_message_wording;
 #[path = "all/explicit_auth_flows.rs"]
 mod explicit_auth_flows;
+#[path = "all/feature_plan_gate.rs"]
+mod feature_plan_gate;
 #[path = "all/forgot_password_caller_identity.rs"]
 mod forgot_password_caller_identity;
 #[path = "all/get_client_token.rs"]

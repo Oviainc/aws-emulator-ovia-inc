@@ -369,6 +369,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // transition is owed on it: `AcceptAttachment` is what starts the settle span.
             available_at: (!claim.require_acceptance).then(|| now + crate::state::SETTLE_DELAY),
             accepted_at: None,
+            // Nothing has rejected this attachment's request either; see
+            // `AttachmentRecord::rejected_at`.
+            rejected_at: None,
             // Nothing has changed this attachment yet; see `AttachmentRecord::changed_at`.
             changed_at: None,
             attachment_policy_rule_number: claim.rule_number,

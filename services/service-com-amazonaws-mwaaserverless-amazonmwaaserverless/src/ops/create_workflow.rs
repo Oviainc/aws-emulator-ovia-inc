@@ -521,35 +521,41 @@ fn response_for(workflow: &crate::state::Workflow) -> CreateWorkflowOutput {
 /// A stable digest of the request, so a repeated `ClientToken` can be told apart
 /// from a token reused for a different request.
 ///
+/// Every member whose extent depends on what the request carries — the whole
+/// configuration, each optional member inside it, each id list, and the tag map —
+/// is a [`crate::state::DigestFields`] group announcing its own extent, so no
+/// member's values can be read as another member's and two different requests
+/// never digest alike.
+///
 /// The configuration walk is the shared one
-/// ([`crate::state::WorkflowConfigurationView::digest_fields`]), so a member added
+/// ([`crate::state::WorkflowConfigurationView::digest_group`]), so a member added
 /// to the configuration reaches this digest and every other one at once. The
 /// workflow's identity leads, and the tags this request asks for follow, because
 /// neither is part of the configuration a version freezes.
 fn request_fingerprint(input: &CreateWorkflowInput) -> String {
-    let mut fields: Vec<String> = vec![input.name.clone()];
-    fields.extend(
-        crate::state::WorkflowConfigurationView {
-            role_arn: &input.role_arn,
-            description: input.description.as_deref(),
-            trigger_mode: input.trigger_mode.as_deref(),
-            engine_version: input.engine_version,
-            definition_s3_location: &input.definition_s3_location,
-            code: input.code.as_ref(),
-            encryption_configuration: input.encryption_configuration.as_ref(),
-            logging_configuration: input.logging_configuration.as_ref(),
-            network_configuration: input.network_configuration.as_ref(),
-        }
-        .digest_fields(),
-    );
     // Tags are an unordered map on the wire, so fingerprint them in key order.
     let mut tags: Vec<(String, String)> =
         input.tags.clone().unwrap_or_default().into_iter().collect();
     tags.sort();
-    for (key, value) in tags {
-        fields.push(key);
-        fields.push(value);
+
+    let mut fields = crate::state::DigestFields::new();
+    fields.field(input.name.as_str());
+    crate::state::WorkflowConfigurationView {
+        role_arn: &input.role_arn,
+        description: input.description.as_deref(),
+        trigger_mode: input.trigger_mode.as_deref(),
+        engine_version: input.engine_version,
+        definition_s3_location: &input.definition_s3_location,
+        code: input.code.as_ref(),
+        encryption_configuration: input.encryption_configuration.as_ref(),
+        logging_configuration: input.logging_configuration.as_ref(),
+        network_configuration: input.network_configuration.as_ref(),
     }
-    let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
-    crate::state::digest(&borrowed)
+    .digest_group(&mut fields);
+    fields.group(|entries| {
+        for (key, value) in &tags {
+            entries.field(key.as_str()).field(value.as_str());
+        }
+    });
+    fields.digest()
 }

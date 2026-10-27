@@ -13,13 +13,16 @@
 //! exactly as they were. The tables span what the rule generalises over: the
 //! spelling of the prefix (its case, what follows it, where in the key it sits),
 //! the operation the key arrives through (`CreateTags`, `DeleteTags`, a create's
-//! `Tags`, an update's `Tags`), and the resource kind being created.
+//! `Tags`, an update's `Tags`, a purchase's `Tags`), and the resource kind being
+//! created.
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_medialive_medialive::ops::types::RESERVATION_RESOURCE_TYPE_VALUES;
 
 use crate::input_security_group::update_group;
+use crate::reservation_purchase::{describe, first_offering, purchase, reservation};
 use crate::resource_tags::{create_resource, create_tags, delete_tags, expected, listed_tags, tags};
-use crate::wire::{call, error_code, error_message, medialive};
+use crate::wire::{call, error_code, error_message, medialive, DEFAULT_REGION};
 
 /// Tag keys that lie IN the reserved namespace, so every write or removal of one
 /// is refused.
@@ -311,6 +314,94 @@ async fn a_create_refuses_the_reserved_namespace() {
         channels.is_empty(),
         "expected a refused create to have created no channel, got {channels:?}"
     );
+}
+
+/// Rule: a purchase that carries `Tags` stores a caller's own tag map too, so
+/// `PurchaseOffering` is held to the same namespace: a reserved key is refused
+/// with `BadRequestException` (400) and no reservation is created.
+///
+/// The rows are the reserved-spelling table, and the offerings bought against
+/// are one per reservable resource type the model declares — so what is refused
+/// is the tag key and not the configuration being reserved.
+#[tokio::test]
+async fn a_purchase_refuses_the_reserved_namespace() {
+    for resource_type in RESERVATION_RESOURCE_TYPE_VALUES {
+        for (spelling, key) in RESERVED_KEYS {
+            let router = medialive();
+            let case = format!("a {resource_type} offering purchased with {spelling}");
+            let offering_id = first_offering(&router, &case, &format!("resourceType={resource_type}")).await;
+            let (status, body) = purchase(
+                &router,
+                DEFAULT_REGION,
+                &offering_id,
+                json!({ "count": 1, "tags": tags(&[(key, "x")]) }),
+            )
+            .await;
+            assert_refused(&case, key, status, &body);
+
+            // A refused purchase reserves nothing: the collection is still empty.
+            let (status, listed) = call(&router, "GET", "/prod/reservations", None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: ListReservations: expected 200, got {status}: {listed}"
+            );
+            let reservations = listed["reservations"].as_array().cloned().unwrap_or_default();
+            assert!(
+                reservations.is_empty(),
+                "case {case:?}: expected a refused purchase to have reserved nothing, got {reservations:?}"
+            );
+        }
+    }
+
+    // The same purchase with the keys that only LOOK reserved is accepted, and
+    // every one of them is read back — through the reservation's own describe
+    // and through `ListTagsForResource` on its ARN.
+    let router = medialive();
+    let case = "a purchase carrying the near-miss keys";
+    let offering_id = first_offering(&router, case, "resourceType=CHANNEL").await;
+    let accepted: Vec<(&str, &str)> = ALLOWED_KEYS
+        .iter()
+        .map(|(_, key)| (*key, "value"))
+        .collect();
+    let (status, body) = purchase(
+        &router,
+        DEFAULT_REGION,
+        &offering_id,
+        json!({ "count": 1, "tags": tags(&accepted) }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected the purchase to be accepted, got {status}: {body}"
+    );
+    let purchased = reservation(case, &body);
+    let id = purchased["reservationId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a minted reservationId, got {purchased}"))
+        .to_string();
+    let arn = purchased["arn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a minted reservation arn, got {purchased}"))
+        .to_string();
+
+    let (status, described) = describe(&router, DEFAULT_REGION, &id).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeReservation: expected 200, got {status}: {described}"
+    );
+    let listed = listed_tags(&router, case, &arn).await;
+    for (spelling, key) in ALLOWED_KEYS {
+        assert_eq!(
+            described["tags"].get(key),
+            Some(&json!("value")),
+            "case {spelling:?}: expected the reservation's describe to report {key:?}, got {described}"
+        );
+        assert_eq!(
+            listed.get(key),
+            Some(&json!("value")),
+            "case {spelling:?}: expected {key:?} among the reservation's stored tags, got {listed:?}"
+        );
+    }
 }
 
 /// Rule: an update that carries `Tags` is held to the same namespace, so

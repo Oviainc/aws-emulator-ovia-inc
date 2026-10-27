@@ -337,6 +337,12 @@ pub const RULE_ASSOCIATION_STATUS_DELETING: &str = "DELETING";
 /// shared with another.
 pub const SHARE_STATUS_NOT_SHARED: &str = "NOT_SHARED";
 
+/// `SortOrder` for the descending order a list operation may be asked for, from
+/// the model's enum (`smithy_query(query="shape",shape="SortOrder")`,
+/// re-exported as [`crate::ops::types::SORT_ORDER_VALUES`]); the other value,
+/// `ASCENDING`, is the order a sorted list reports when the request names none.
+pub const SORT_ORDER_DESCENDING: &str = "DESCENDING";
+
 /// The most Resolver rules, and rule associations, this store holds.
 ///
 /// Both creates admit any new request (`CreateResolverRule` any unseen
@@ -2410,11 +2416,18 @@ pub const MAX_STORED_QUERY_LOG_CONFIGS: usize = 1_000;
 /// `arn:aws:kinesis:us-east-2:0123456789:stream/my_stream_name`). A Firehose
 /// delivery stream also carries its own `firehose` service with a
 /// `deliverystream/` resource.
-const QUERY_LOG_DESTINATIONS: [(&str, &str); 4] = [
-    ("s3", ""),
-    ("logs", "log-group:"),
-    ("kinesis", "stream/"),
-    ("firehose", "deliverystream/"),
+///
+/// The third field is the name that kind of destination is selected by, from the
+/// `Destination` filter `ListResolverQueryLogConfigs` documents
+/// (`smithy_query(query="doc",shape="Filter",member="Name")`, section
+/// **ListResolverQueryLogConfigs**: `S3`, `CloudWatchLogs`, `KinesisFirehose`),
+/// so one table states both which destinations are well formed and what names
+/// each of them.
+const QUERY_LOG_DESTINATIONS: [(&str, &str, &str); 4] = [
+    ("s3", "", "S3"),
+    ("logs", "log-group:", "CloudWatchLogs"),
+    ("kinesis", "stream/", "KinesisFirehose"),
+    ("firehose", "deliverystream/", "KinesisFirehose"),
 ];
 
 /// Whether `destination_arn` names one of the destinations Resolver can send
@@ -2436,7 +2449,24 @@ pub fn query_log_destination_is_wellformed(destination_arn: &str) -> bool {
     }
     QUERY_LOG_DESTINATIONS
         .iter()
-        .any(|(name, resource_prefix)| *name == *service && resource.starts_with(resource_prefix))
+        .any(|(name, resource_prefix, _)| *name == *service && resource.starts_with(resource_prefix))
+}
+
+/// The Amazon Web Services service a stored `DestinationArn` delivers to, by the
+/// name the `Destination` filter selects it with (see
+/// [`QUERY_LOG_DESTINATIONS`]), or `None` for an ARN that names no destination
+/// Resolver delivers to.
+pub fn query_log_destination_kind(destination_arn: &str) -> Option<&'static str> {
+    let fields: Vec<&str> = destination_arn.splitn(6, ':').collect();
+    let [_, _, service, _, _, resource] = fields.as_slice() else {
+        return None;
+    };
+    QUERY_LOG_DESTINATIONS
+        .iter()
+        .find(|(name, resource_prefix, _)| {
+            *name == *service && resource.starts_with(resource_prefix)
+        })
+        .map(|(_, _, kind)| *kind)
 }
 
 /// The form a query logging destination is STORED in.
@@ -2660,6 +2690,69 @@ impl ResolverQueryLogConfigRecord {
         }
     }
 
+    /// Whether this configuration satisfies one `ListResolverQueryLogConfigs`
+    /// filter: whether the value it presents for that member is among the
+    /// filter's values, as [`ResolverRuleRecord::matches_filter`] decides it for
+    /// a rule. The status it is matched on is the one it reports as of `now`, so
+    /// a filtered page and a read of the same configuration cannot disagree.
+    pub fn matches_filter(
+        &self,
+        key: QueryLogConfigFilterKey,
+        values: &HashSet<String>,
+        now: Instant,
+    ) -> bool {
+        match key {
+            QueryLogConfigFilterKey::Arn => values.contains(self.arn.as_str()),
+            QueryLogConfigFilterKey::AssociationCount => {
+                values.contains(&self.association_count().to_string())
+            }
+            QueryLogConfigFilterKey::CreationTime => values.contains(self.creation_time.as_str()),
+            QueryLogConfigFilterKey::CreatorRequestId => {
+                values.contains(self.creator_request_id.as_str())
+            }
+            QueryLogConfigFilterKey::Destination => query_log_destination_kind(&self.destination_arn)
+                .is_some_and(|kind| values.contains(kind)),
+            QueryLogConfigFilterKey::DestinationArn => {
+                values.contains(self.destination_arn.as_str())
+            }
+            QueryLogConfigFilterKey::Id => values.contains(self.id.as_str()),
+            QueryLogConfigFilterKey::Name => values.contains(self.name.as_str()),
+            QueryLogConfigFilterKey::OwnerId => values.contains(self.owner_id.as_str()),
+            QueryLogConfigFilterKey::ShareStatus => values.contains(self.share_status.as_str()),
+            QueryLogConfigFilterKey::Status => values.contains(self.status_at(now)),
+        }
+    }
+
+    /// The value this configuration is ordered by when a request sorts on `key`:
+    /// the member's own value, as a number for the two members that are not text
+    /// and as text for the rest (see [`QueryLogConfigSortValue`]).
+    pub fn sort_value(&self, key: QueryLogConfigSortKey, now: Instant) -> QueryLogConfigSortValue {
+        match key {
+            QueryLogConfigSortKey::Arn => QueryLogConfigSortValue::Text(self.arn.clone()),
+            QueryLogConfigSortKey::AssociationCount => {
+                QueryLogConfigSortValue::Number(i128::from(self.association_count()))
+            }
+            QueryLogConfigSortKey::CreationTime => {
+                QueryLogConfigSortValue::Number(rfc3339_epoch_nanos(&self.creation_time))
+            }
+            QueryLogConfigSortKey::CreatorRequestId => {
+                QueryLogConfigSortValue::Text(self.creator_request_id.clone())
+            }
+            QueryLogConfigSortKey::DestinationArn => {
+                QueryLogConfigSortValue::Text(self.destination_arn.clone())
+            }
+            QueryLogConfigSortKey::Id => QueryLogConfigSortValue::Text(self.id.clone()),
+            QueryLogConfigSortKey::Name => QueryLogConfigSortValue::Text(self.name.clone()),
+            QueryLogConfigSortKey::OwnerId => QueryLogConfigSortValue::Text(self.owner_id.clone()),
+            QueryLogConfigSortKey::ShareStatus => {
+                QueryLogConfigSortValue::Text(self.share_status.clone())
+            }
+            QueryLogConfigSortKey::Status => {
+                QueryLogConfigSortValue::Text(self.status_at(now).to_string())
+            }
+        }
+    }
+
     /// Project the record onto the modelled `ResolverQueryLogConfig`.
     pub fn to_query_log_config(&self, now: Instant) -> ResolverQueryLogConfig {
         ResolverQueryLogConfig {
@@ -2675,6 +2768,159 @@ impl ResolverQueryLogConfigRecord {
             creation_time: Some(self.creation_time.clone()),
         }
     }
+}
+
+/// The member a `ListResolverQueryLogConfigs` filter selects on.
+///
+/// The catalog is exactly the one the model documents for this operation
+/// (`smithy_query(query="doc",shape="Filter",member="Name")`, section
+/// **ListResolverQueryLogConfigs**): `Arn`, `AssociationCount`, `CreationTime`,
+/// `CreatorRequestId`, `Destination`, `DestinationArn`, `Id`, `Name`, `OwnerId`,
+/// `ShareStatus`, `Status`. It is a different catalog from [`FilterKey`]'s,
+/// because the valid filter names "depend on the action that you're including
+/// the filter in".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryLogConfigFilterKey {
+    Arn,
+    AssociationCount,
+    CreationTime,
+    CreatorRequestId,
+    /// "The Amazon Web Services service that you want to forward query logs to",
+    /// which is the KIND of the configuration's destination and not its ARN (see
+    /// [`query_log_destination_kind`]).
+    Destination,
+    DestinationArn,
+    Id,
+    Name,
+    OwnerId,
+    ShareStatus,
+    Status,
+}
+
+impl QueryLogConfigFilterKey {
+    /// The canonical name of this key, used to describe a filter set in a
+    /// pagination cursor's scope.
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Arn => "Arn",
+            Self::AssociationCount => "AssociationCount",
+            Self::CreationTime => "CreationTime",
+            Self::CreatorRequestId => "CreatorRequestId",
+            Self::Destination => "Destination",
+            Self::DestinationArn => "DestinationArn",
+            Self::Id => "Id",
+            Self::Name => "Name",
+            Self::OwnerId => "OwnerId",
+            Self::ShareStatus => "ShareStatus",
+            Self::Status => "Status",
+        }
+    }
+
+    /// Resolve a wire filter name, or `None` when it is outside the documented
+    /// catalog. The name is folded by [`fold_filter_name`], as
+    /// [`FilterKey::parse`] folds the endpoint catalog's names.
+    pub fn parse(name: &str) -> Option<Self> {
+        match fold_filter_name(name).as_str() {
+            "ARN" => Some(Self::Arn),
+            "ASSOCIATIONCOUNT" => Some(Self::AssociationCount),
+            "CREATIONTIME" => Some(Self::CreationTime),
+            "CREATORREQUESTID" => Some(Self::CreatorRequestId),
+            "DESTINATION" => Some(Self::Destination),
+            "DESTINATIONARN" => Some(Self::DestinationArn),
+            "ID" => Some(Self::Id),
+            "NAME" => Some(Self::Name),
+            "OWNERID" => Some(Self::OwnerId),
+            "SHARESTATUS" => Some(Self::ShareStatus),
+            "STATUS" => Some(Self::Status),
+            _ => None,
+        }
+    }
+}
+
+/// The member a `ListResolverQueryLogConfigs` request sorts its configurations
+/// by.
+///
+/// The catalog is exactly the one that operation's `SortBy` documents
+/// (`smithy_query(query="doc",shape="ListResolverQueryLogConfigsRequest",member="SortBy")`):
+/// `Arn`, `AssociationCount`, `CreationTime`, `CreatorRequestId`,
+/// `DestinationArn`, `Id`, `Name`, `OwnerId`, `ShareStatus`, `Status`. It is NOT
+/// the filter catalog: `Destination` can be filtered on but not sorted by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryLogConfigSortKey {
+    Arn,
+    AssociationCount,
+    CreationTime,
+    CreatorRequestId,
+    DestinationArn,
+    Id,
+    Name,
+    OwnerId,
+    ShareStatus,
+    Status,
+}
+
+impl QueryLogConfigSortKey {
+    /// The canonical name of this key, used to describe one query's ordering in
+    /// a pagination cursor's scope.
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Arn => "Arn",
+            Self::AssociationCount => "AssociationCount",
+            Self::CreationTime => "CreationTime",
+            Self::CreatorRequestId => "CreatorRequestId",
+            Self::DestinationArn => "DestinationArn",
+            Self::Id => "Id",
+            Self::Name => "Name",
+            Self::OwnerId => "OwnerId",
+            Self::ShareStatus => "ShareStatus",
+            Self::Status => "Status",
+        }
+    }
+
+    /// Resolve a wire `SortBy`, or `None` when it names no member of the
+    /// documented catalog. Folded by [`fold_filter_name`] for the same reason a
+    /// filter name is: the service accepts the upper-snake spelling of a member
+    /// name as well as the documented one.
+    pub fn parse(name: &str) -> Option<Self> {
+        match fold_filter_name(name).as_str() {
+            "ARN" => Some(Self::Arn),
+            "ASSOCIATIONCOUNT" => Some(Self::AssociationCount),
+            "CREATIONTIME" => Some(Self::CreationTime),
+            "CREATORREQUESTID" => Some(Self::CreatorRequestId),
+            "DESTINATIONARN" => Some(Self::DestinationArn),
+            "ID" => Some(Self::Id),
+            "NAME" => Some(Self::Name),
+            "OWNERID" => Some(Self::OwnerId),
+            "SHARESTATUS" => Some(Self::ShareStatus),
+            "STATUS" => Some(Self::Status),
+            _ => None,
+        }
+    }
+}
+
+/// The value one configuration is ordered by under a `SortBy`.
+///
+/// `AssociationCount` is a count and `CreationTime` a point in time, so both are
+/// ordered as NUMBERS — a count of 10 after one of 9, and an earlier instant
+/// before a later one whatever subsecond digits either timestamp was rendered
+/// with. Every other sortable member is a string and is ordered as text. One
+/// query sorts on one member, so every value compared in it is built by the same
+/// arm.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum QueryLogConfigSortValue {
+    Number(i128),
+    Text(String),
+}
+
+/// A stored `Rfc3339TimeString` as nanoseconds since the epoch, so two
+/// timestamps are ordered by the instants they name rather than by their text.
+///
+/// A string this service did not render (there is none: every stored timestamp
+/// comes from [`now_rfc3339`]) orders as the epoch.
+fn rfc3339_epoch_nanos(raw: &str) -> i128 {
+    aws_smithy_types::DateTime::from_str(raw, aws_smithy_types::date_time::Format::DateTime)
+        .map(|at| i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos()))
+        .unwrap_or_default()
 }
 
 /// Mint the `Id` of a query logging configuration from the id sequence. AWS names
@@ -3058,6 +3304,18 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             .values()
             .flat_map(|config| config.associations.iter())
             .find(|record| record.id == association_id)
+    }
+
+    /// Every stored query logging configuration in creation order — the order
+    /// `ListResolverQueryLogConfigs`' unsorted pages and its cursor are defined
+    /// over, for the same reason as [`Self::endpoints_in_creation_order`]: a
+    /// page is cut at an offset into this sequence, so the sequence must not
+    /// depend on the hash order of the map that holds the records.
+    pub fn query_log_configs_in_creation_order(&self) -> Vec<&ResolverQueryLogConfigRecord> {
+        let mut all: Vec<&ResolverQueryLogConfigRecord> =
+            self.resolver_query_log_configs.values().collect();
+        all.sort_by_key(|record| record.seq);
+        all
     }
 
     /// Every stored Resolver on an Outpost in creation order — the order
@@ -3557,6 +3815,30 @@ fn filter_list_scope<'a>(
         }
     }
     format!("{operation}/{}", hex::encode(&hasher.finalize()[..8]))
+}
+
+/// The cursor scope of one `ListResolverQueryLogConfigs` query.
+///
+/// The offset a cursor carries is an index into the filtered, sorted collection,
+/// so — as for [`endpoint_list_scope`] — the filter set belongs in the scope;
+/// the ordering does too, because "if you submit a second or subsequent
+/// ListResolverQueryLogConfigs request and specify the NextToken parameter, you
+/// must use the same value for SortBy / SortOrder, if any, as in the previous
+/// request": a resume that changes either is answered as a cursor this query
+/// does not accept, rather than with a page cut at the wrong position.
+pub fn query_log_config_list_scope(
+    filters: &[(QueryLogConfigFilterKey, HashSet<String>)],
+    sort_by: Option<QueryLogConfigSortKey>,
+    sort_order: Option<&str>,
+) -> String {
+    let base = filter_list_scope(
+        "ListResolverQueryLogConfigs",
+        filters
+            .iter()
+            .map(|(key, values)| (key.canonical_name(), values)),
+    );
+    let sort_by = sort_by.map_or("", QueryLogConfigSortKey::canonical_name);
+    format!("{base}/{sort_by}/{}", sort_order.unwrap_or_default())
 }
 
 /// The cursor scope of one `ListOutpostResolvers` query.

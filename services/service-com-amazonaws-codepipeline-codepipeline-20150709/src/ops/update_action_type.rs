@@ -2,8 +2,12 @@
 
 //! @op UpdateActionType
 //!
-//! `UpdateActionType` stores the definition of an action type the account already
-//! holds; `GetActionType` is what reports it back.
+//! `UpdateActionType` stores the definition of an action type the CALLER provides —
+//! the partner the action type is registered to — and `GetActionType` is what reports
+//! it back. A caller that is not the action type's registered provider has no action
+//! type to define, which is the `ActionTypeNotFoundException` the operation models;
+//! that is as true of an action type the service provides itself (an `AWS`-owned one
+//! the catalog carries) as of an identity nothing provides.
 //!
 //! ## Shape of an operation
 //!
@@ -175,14 +179,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region this request was signed for — and it is that Region's catalog the
         // identity has to be held in.
         let region = crate::state::request_region(&ctx.parts().headers);
+        // The one account this emulator serves — the caller's, since every request it
+        // answers is signed by it.
+        let caller = ::engine::emulator_account_id();
 
         let mut state = state.lock();
-        // This operation UPDATES: it defines an action type the account already holds,
-        // and the service models no operation that creates one with an `AWS` or
-        // `ThirdParty` owner. An identity no action type in this Region's catalog
-        // carries is refused with the error the model declares for exactly that
-        // condition ("The specified action type cannot be found").
-        if !state.action_type_available_in(&key, &region) {
+        // This operation defines an action type "that was created with any supported
+        // integration model, where the action type is to be used by CUSTOMERS of the
+        // action type provider": the definition belongs to the provider, so the only
+        // caller that may state it is the provider itself. An `AWS`-owned action type
+        // is provided by the service and a `ThirdParty`-owned one by the partner
+        // registered for it when that partner onboarded, out of band of this API
+        // (`state::third_party_partners`, the same registration `PollForThirdPartyJobs`
+        // authorizes a worker against) — so a caller that is not this action type's
+        // registered partner cannot define it, whether or not the action-type CATALOG
+        // carries that identity: a service-provided action type is as undefinable as
+        // one nothing provides at all.
+        //
+        // Refused with the error the model declares for exactly that condition ("The
+        // specified action type cannot be found"), and with the same message an
+        // identity nothing provides is refused with: a caller learns no more about an
+        // action type it does not provide than that it has none.
+        if state.third_party_partner(&key.to_id()) != Some(caller) {
             return Err(UpdateActionTypeErrorModeled::ActionTypeNotFoundException(
                 ActionTypeNotFoundException {
                     message: Some(crate::state::action_type_declaration_not_found_message(

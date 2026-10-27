@@ -173,13 +173,13 @@ pub(crate) fn encode_component(value: &str) -> String {
 }
 
 /// The `/tags/{resourceArn}` path for `arn`.
-fn tags_path(arn: &str) -> String {
+pub(crate) fn tags_path(arn: &str) -> String {
     format!("/tags/{}", encode_component(arn))
 }
 
 /// The `/tags/{resourceArn}?tagKeys=..` path `UntagResource` is called on. `tagKeys`
 /// is `@httpQuery`, so a list travels as one parameter per key.
-fn untag_path(arn: &str, keys: &[String]) -> String {
+pub(crate) fn untag_path(arn: &str, keys: &[String]) -> String {
     let mut path = tags_path(arn);
     for (index, key) in keys.iter().enumerate() {
         let separator = if index == 0 { '?' } else { '&' };
@@ -207,7 +207,7 @@ fn keys(prefix: &str, count: usize) -> Vec<String> {
 }
 
 /// A JSON object as a sorted map of strings.
-fn as_map(case: &str, value: &Value) -> BTreeMap<String, String> {
+pub(crate) fn as_map(case: &str, value: &Value) -> BTreeMap<String, String> {
     value
         .as_object()
         .unwrap_or_else(|| panic!("case {case:?}: expected a map, got {value}"))
@@ -216,21 +216,27 @@ fn as_map(case: &str, value: &Value) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The tags `ListTagsForResource` reports for `arn`, as a sorted map.
-async fn listed_tags(harness: &Harness, case: &str, arn: &str) -> BTreeMap<String, String> {
+/// The tags `ListTagsForResource` reports for `arn`, as a sorted map. An ABSENT `tags`
+/// member is the empty set: `Tags`' floor is one entry, so a resource carrying none is
+/// reported by leaving the member out (see `tests/all/empty_collection_members.rs`),
+/// exactly as [`deployment_tags`] already reads the other reader of the same field.
+pub(crate) async fn listed_tags(
+    harness: &Harness,
+    case: &str,
+    arn: &str,
+) -> BTreeMap<String, String> {
     let body = harness
         .expect_ok(case, "GET", &tags_path(arn), None)
         .await;
-    let tags = body
-        .get("tags")
-        .cloned()
-        .unwrap_or_else(|| panic!("case {case:?}: ListTagsForResource reported no tags: {body}"));
-    as_map(case, &tags)
+    match body.get("tags") {
+        Some(tags) => as_map(case, tags),
+        None => BTreeMap::new(),
+    }
 }
 
 /// The tags `GetDeployment` reports for `deployment_id` — the second reader, so a
 /// write is proven to have landed on the deployment record itself.
-async fn deployment_tags(
+pub(crate) async fn deployment_tags(
     harness: &Harness,
     case: &str,
     deployment_id: &str,
@@ -246,7 +252,7 @@ async fn deployment_tags(
 
 /// Create a deployment to tag, checking its minted id is in the form the tagging APIs
 /// parse out of a resource ARN.
-async fn deployment_to_tag(harness: &Harness, name: &str) -> String {
+pub(crate) async fn deployment_to_tag(harness: &Harness, name: &str) -> String {
     let id = create(harness, "a deployment to tag", "SAP", "SapHanaSingle", name).await;
     // A `deploymentId` is a hyphenated UUID: that is the form a deployment ARN carries
     // and the form `ListTagsForResource`/`TagResource`/`UntagResource` parse.
@@ -572,7 +578,8 @@ async fn tags_written_by_tagresource_are_read_back_and_removed_by_untagresource(
     }
 
     // Removing every remaining key leaves an empty set, which is still an answer: the
-    // resource exists and carries no tags.
+    // resource exists and carries no tags (reported by an absent `tags` member — see
+    // `tests/all/empty_collection_members.rs`).
     let rest: Vec<String> = expected.keys().cloned().collect();
     harness
         .expect_ok(
@@ -586,7 +593,7 @@ async fn tags_written_by_tagresource_are_read_back_and_removed_by_untagresource(
         listed_tags(&harness, "an untagged deployment", &arn)
             .await
             .is_empty(),
-        "a deployment with no tags must report an empty tag map"
+        "a deployment with no tags must report no tags"
     );
 }
 

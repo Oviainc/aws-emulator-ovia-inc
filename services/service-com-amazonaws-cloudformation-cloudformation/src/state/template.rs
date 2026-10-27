@@ -2871,6 +2871,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     "AWS::RDS::DBCluster",
     "AWS::RDS::DBInstance",
     "AWS::RUM::AppMonitor",
+    ROUTE53_HOSTED_ZONE,
     S3_BUCKET,
     S3VECTORS_INDEX,
     S3VECTORS_VECTOR_BUCKET,
@@ -3865,6 +3866,27 @@ fn return_values(
             attributes.insert("Id".to_string(), id.clone());
             (id, attributes)
         }
+        // "Ref returns the hosted zone ID"; Fn::GetAtt: Id, NameServers. Route 53 ASSIGNS
+        // that id — `CreateHostedZone` takes no identifier, and the zone's `Name` is only
+        // the DNS name it answers for — so a declaration reports an identifier of Route 53's
+        // own shape rather than the name, which no operation of that service would accept as
+        // a zone id. `NameServers` is a LIST, so no attribute carries it. This is also the
+        // type `super::provisioning` creates in Route 53 itself, which reports the id IT
+        // minted back over the `Id` attribute — and THAT id, not this one, is what the stack
+        // reports for a zone Route 53 created.
+        ROUTE53_HOSTED_ZONE => {
+            let id = format!(
+                "{HOSTED_ZONE_ID_PREFIX}{}",
+                derived_digits(
+                    HOSTED_ZONE_ID_SALT,
+                    name,
+                    HOSTED_ZONE_ID_DIGITS,
+                    Alphabet::Upper,
+                )
+            );
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
         // "Ref returns the key ID"; Fn::GetAtt: Arn, KeyId. KMS ASSIGNS that id —
         // `CreateKey` takes no identifier — so a declaration reports an identifier of KMS's
         // own shape (a version-4 UUID) rather than CloudFormation's
@@ -4025,6 +4047,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         APIGATEWAYV2_API_MAPPING => &["ApiMappingId"],
         APIGATEWAYV2_DOMAIN_NAME => &["DomainNameArn", "RegionalDomainName"],
         GUARDDUTY_DETECTOR => &["Id"],
+        ROUTE53_HOSTED_ZONE => &["Id"],
         KMS_KEY => &["Arn", "KeyId"],
         MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => &["Arn"],
         MQ_BROKER => &["Arn"],
@@ -4085,6 +4108,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// assigned, that type's `Ref` returns the key id, and the key ARN that identifier is
 /// embedded in is what a queue's `KmsMasterKeyId` (or any other reference to the key)
 /// resolves through.
+///
+/// An Amazon Route 53 hosted zone is one more: `CreateHostedZone` takes no identifier and
+/// answers the `Z…` id Route 53 assigned, and "Ref returns the hosted zone ID" — the zone's
+/// `Name` is only the DNS name it answers for, and no operation of that service takes a name
+/// where it takes a zone id. (An `AWS::Route53::RecordSet` is NOT one of them: "Ref returns
+/// the record name", which is the `Name` its own declaration states.)
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == APIGATEWAYV2_API
         || resource_type == APIGATEWAYV2_API_MAPPING
@@ -4108,6 +4137,7 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == ROUTE53RESOLVER_ENDPOINT
         || resource_type == ROUTE53RESOLVER_RULE
         || resource_type == ROUTE53RESOLVER_RULE_ASSOCIATION
+        || resource_type == ROUTE53_HOSTED_ZONE
         || resource_type == TRANSFER_SERVER
         // An Amazon MQ broker is one more: `CreateBroker` takes the broker's NAME and
         // answers with the `brokerId` Amazon MQ generated for it, which is the id that
@@ -4453,6 +4483,36 @@ pub const ROUTE53RESOLVER_ENDPOINT: &str = "AWS::Route53Resolver::ResolverEndpoi
 pub const ROUTE53RESOLVER_RULE: &str = "AWS::Route53Resolver::ResolverRule";
 pub const ROUTE53RESOLVER_RULE_ASSOCIATION: &str =
     "AWS::Route53Resolver::ResolverRuleAssociation";
+
+/// The two Amazon Route 53 resource types a stack creates in that service (the Route 53
+/// model: `cloudFormationName: Route53`).
+///
+/// A hosted zone's identifier is Route 53's OWN to mint: "Ref returns the hosted zone ID",
+/// `CreateHostedZone` takes no identifier and answers the `Z…` id it assigned, and that id
+/// — not the zone's DNS name, which is only what the zone is CALLED — is what every
+/// operation on the zone takes (`GetHostedZone$Id`, `TestDNSAnswer$HostedZoneId` and a
+/// record set's own `HostedZoneId`, each a `ResourceId` of at most 32 characters). A record
+/// set's identifier is CloudFormation's: "Ref returns the record name", which is the `Name`
+/// its declaration states.
+pub const ROUTE53_HOSTED_ZONE: &str = "AWS::Route53::HostedZone";
+pub const ROUTE53_RECORD_SET: &str = "AWS::Route53::RecordSet";
+
+/// The first character of a hosted zone id, and how many follow it.
+///
+/// Route 53 publishes a hosted zone id as `Z` followed by uppercase alphanumerics
+/// (`Z1D633PJN98FT9` in `ChangeResourceRecordSets`' own examples), inside the 32-character
+/// bound its `ResourceId` shape fixes. What [`return_values`] computes is a STAND-IN of that
+/// shape: this is also the type `super::provisioning` creates in Route 53 itself, which
+/// answers with the id IT minted — and THAT id is what the stack reports for a zone Route 53
+/// created.
+const HOSTED_ZONE_ID_PREFIX: &str = "Z";
+const HOSTED_ZONE_ID_DIGITS: usize = 14;
+
+/// What the digest behind that stand-in is salted with: the resource TYPE, so the digits are
+/// this type's own and cannot collide with another arm's for a resource of the same name
+/// ([`derived_digits`] — "the `salt` keeps two identifiers OF ONE resource … from being the
+/// same digits").
+const HOSTED_ZONE_ID_SALT: &str = "route53-hosted-zone";
 
 /// An AWS Certificate Manager ACME endpoint's resource type (the ACM model:
 /// `cloudFormationName: CertificateManager`). This is a type `super::provisioning`

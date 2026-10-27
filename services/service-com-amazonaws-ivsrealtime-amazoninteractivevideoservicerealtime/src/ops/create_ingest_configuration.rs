@@ -205,20 +205,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before anything is minted or persisted, so a refused request leaves no
         // configuration behind. The same limit, measured the same way, as the one
         // `CreateParticipantToken` and `CreateStage` enforce on a token's attributes.
-        let size = crate::state::attributes_size(&attributes);
-        if size > crate::state::MAX_ATTRIBUTES_BYTES {
-            return Err(crate::state::validation_failed(
-                CreateIngestConfigurationErrorModeled::ValidationException,
-                // Worded in the construction this service states every constraint refusal
-                // with (`crate::state::violation_clause`): the operation, the member and
-                // the bound it violated, with what the request actually sent.
-                format!(
-                    "{}.attributes is required to have a maximum size of {} bytes, found {size}",
-                    Self::NAME,
-                    crate::state::MAX_ATTRIBUTES_BYTES,
-                ),
-            ));
-        }
+        crate::state::check_attributes_size(Self::NAME, "attributes", &attributes).map_err(
+            |message| {
+                crate::state::validation_failed(
+                    CreateIngestConfigurationErrorModeled::ValidationException,
+                    message,
+                )
+            },
+        )?;
 
         // The documented pairing of the two members (see [`CLEARTEXT_INGEST_PROTOCOL`]):
         // cleartext ingest is refused unless the request also allows insecure ingest.
