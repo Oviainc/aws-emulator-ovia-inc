@@ -53,6 +53,24 @@ pub const CHECK_UNKNOWN: &str = "UNKNOWN";
 /// See [`CHECK_PASSED`].
 pub const CHECK_FAILED: &str = "FAILED";
 
+/// Roll a set of `CheckResult` values up into the ONE `CheckResult` that reports them
+/// all — the roll-up both `Environment$environmentStatus` and `Connector$status` are of
+/// their own check list.
+///
+/// A failed check makes the roll-up `FAILED`; otherwise a check that passed makes it
+/// `PASSED`; and where nothing decided anything the roll-up is `UNKNOWN`. So a check this
+/// emulator could not decide never impairs a subject whose other checks passed, and a
+/// subject nothing checked never reports health nothing verified.
+pub fn roll_up_results<'a>(mut results: impl Iterator<Item = &'a str> + Clone) -> &'static str {
+    if results.clone().any(|result| result == CHECK_FAILED) {
+        CHECK_FAILED
+    } else if results.any(|result| result == CHECK_PASSED) {
+        CHECK_PASSED
+    } else {
+        CHECK_UNKNOWN
+    }
+}
+
 /// The `CheckType` of one environment health check this service RUNS — the checks that
 /// are decidable from facts this emulator holds. `CheckType` declares thirteen values
 /// (`smithy_query(query="shape", shape="CheckType")`); these three are the ones whose
@@ -68,10 +86,15 @@ pub const CHECK_FAILED: &str = "FAILED";
 /// * `HOST_COUNT` — "Verifies that the environment meets the minimum host count": the
 ///   environment's hosts decide it against [`MINIMUM_HOST_COUNT`].
 ///
-/// Of the other ten types, FOUR have a connector for their subject rather than the
-/// environment's own record — `CONNECTOR_HEALTH` and the three per-appliance
-/// reachability checks — and are reported on the connector they are about, decided by
-/// that connector's own stored record ([`StoredConnector::checks`]).
+/// A FOURTH check has the environment for its subject without reading the environment's
+/// own record: [`CHECK_TYPE_CONNECTOR_HEALTH`], the roll-up over the connectors the
+/// environment holds, which [`StoredEnvironment::refresh_checks`] reports beside these
+/// three.
+///
+/// Of the other nine types, THREE have ONE connector's appliance for their subject rather
+/// than the environment — the per-appliance reachability checks — and are reported on the
+/// connector they are about, decided by that connector's own stored record
+/// ([`StoredConnector::checks`]).
 ///
 /// The remaining six each probe something OUTSIDE this emulator — the SDDC Manager
 /// inventory, a vCenter Server inventory's virtual machines, or an appliance that no
@@ -207,11 +230,18 @@ pub const CONNECTOR_TYPE_SDDC_MANAGER: &str = "SDDC_MANAGER";
 /// appliance that monitoring can run through (`CreateEnvironmentConnector` doc).
 pub const CONNECTOR_TYPE_OPERATIONS_MANAGER: &str = "OPERATIONS_MANAGER";
 
-/// The `CheckType` of the check run on EVERY connector, whatever appliance type it
-/// connects to: a `ConnectorCheck` is "A check on a connector to identify connectivity
-/// health" (`smithy_query(query="shape", shape="ConnectorCheck")`), and the connector's
-/// own `ConnectorState` is the record of whether the connection to the appliance is
-/// established ([`StoredConnector::decided_result`]).
+/// The `CheckType` of the ENVIRONMENT check that reports the health of the connectors the
+/// environment holds: "<code>CONNECTOR_HEALTH</code>: Aggregate health across all
+/// connectors in the environment" (`smithy_query(query="shape", shape="Check")`, member
+/// `type`).
+///
+/// Its subject is the environment, not any one connector, so it is reported in
+/// `Environment$checks` — "A check on the environment to identify connector health"
+/// (`Environment$checks` doc) — and its result is the roll-up of what each connector's own
+/// record decides ([`StoredConnector::decided_result`], rolled up by
+/// [`roll_up_results`]): one impaired connector impairs the aggregate, and an environment
+/// whose connectors have decided nothing (including one holding none) aggregates nothing,
+/// so the check reports `UNKNOWN`.
 pub const CHECK_TYPE_CONNECTOR_HEALTH: &str = "CONNECTOR_HEALTH";
 
 /// The `CheckType` of the reachability check of a vCenter Server appliance.
@@ -224,8 +254,9 @@ pub const CHECK_TYPE_SDDC_MANAGER_REACHABILITY: &str = "SDDC_MANAGER_REACHABILIT
 pub const CHECK_TYPE_OPERATIONS_MANAGER_REACHABILITY: &str = "OPERATIONS_MANAGER_REACHABILITY";
 
 /// The `CheckType` of the check that reports whether the appliance ONE connector
-/// connects to is reachable — the type-specific half of a connector's connectivity
-/// health, beside [`CHECK_TYPE_CONNECTOR_HEALTH`].
+/// connects to is reachable — the connector-scoped check, whose subject is that one
+/// connector's connectivity rather than the environment
+/// ([`CHECK_TYPE_CONNECTOR_HEALTH`] is the environment-scoped aggregate).
 ///
 /// `CheckType` declares one reachability type per `ConnectorType` the model declares
 /// (`smithy_query(query="shape", shape="CheckType,ConnectorType")`), so the appliance a
@@ -748,11 +779,16 @@ impl StoredConnector {
     ///
     /// A DERIVED value — a pure function of the stored record — so every operation that
     /// reports this connector reports the same checks and a read changes nothing a later
-    /// caller sees. Two checks are run on a connector whose record has decided one
-    /// ([`Self::decided_result`]): [`CHECK_TYPE_CONNECTOR_HEALTH`], which every connector
-    /// runs, and the reachability check of the appliance type this connector connects to
-    /// ([`reachability_check_type`]). A connector whose record has decided nothing runs
-    /// neither, rather than reporting a result nothing concluded.
+    /// caller sees. The check a connector runs is the one whose subject is THIS connector:
+    /// the reachability check of the appliance type it connects to
+    /// ([`reachability_check_type`]), carrying the result its own record has decided
+    /// ([`Self::decided_result`]). A connector whose record has decided nothing runs none,
+    /// rather than reporting a result nothing concluded.
+    ///
+    /// [`CHECK_TYPE_CONNECTOR_HEALTH`] is NOT among them: its subject is the environment
+    /// ("Aggregate health across all connectors in the environment"), so it is reported
+    /// once per environment over every connector the environment holds
+    /// ([`StoredEnvironment::refresh_checks`]) and never as one connector's own result.
     ///
     /// Both stamps are STORED instants, never the reading instant: `lastCheckAttempt`
     /// ("The date and time of the last check attempt") is when the connection attempt
@@ -766,26 +802,19 @@ impl StoredConnector {
         };
         let attempted_at = timestamp(self.modified_at_ms);
         let impaired_since = (result == CHECK_FAILED).then(|| timestamp(self.modified_at_ms));
-        [
-            Some(CHECK_TYPE_CONNECTOR_HEALTH),
-            reachability_check_type(&self.connector_type),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|check_type| ConnectorCheck {
-            r#type: Some(check_type.to_string()),
-            result: Some(result.to_string()),
-            last_check_attempt: Some(attempted_at),
-            impaired_since,
-        })
-        .collect()
+        reachability_check_type(&self.connector_type)
+            .into_iter()
+            .map(|check_type| ConnectorCheck {
+                r#type: Some(check_type.to_string()),
+                result: Some(result.to_string()),
+                last_check_attempt: Some(attempted_at),
+                impaired_since,
+            })
+            .collect()
     }
 
     /// `status`: the roll-up of the connector's [`Self::checks`], which identify
-    /// "connectivity health".
-    ///
-    /// A failed check makes it `FAILED`; otherwise a check that passed makes it `PASSED`;
-    /// and a connector no check has decided anything for is `UNKNOWN` — the same roll-up
+    /// "connectivity health" — [`roll_up_results`], the same roll-up
     /// `environmentStatus` is of an environment's checks
     /// ([`StoredEnvironment::environment_status`]), because both members are the same
     /// `CheckResult` over the same kind of list.
@@ -796,14 +825,7 @@ impl StoredConnector {
     /// The roll-up itself, over checks already in hand, so [`Self::to_wire`] derives both
     /// members from ONE computation of them.
     fn roll_up(checks: &[ConnectorCheck]) -> &'static str {
-        let results = || checks.iter().filter_map(|check| check.result.as_deref());
-        if results().any(|result| result == CHECK_FAILED) {
-            CHECK_FAILED
-        } else if results().any(|result| result == CHECK_PASSED) {
-            CHECK_PASSED
-        } else {
-            CHECK_UNKNOWN
-        }
+        roll_up_results(checks.iter().filter_map(|check| check.result.as_deref()))
     }
 
     /// This connector as the modelled `Connector` shape, reported for the environment
@@ -1621,23 +1643,11 @@ impl StoredEnvironment {
 
     /// `environmentStatus`: the roll-up of the environment's `checks`, which
     /// "reports impaired functionality that stems from issues internal to the
-    /// environment".
-    ///
-    /// A failed check makes it `FAILED`; otherwise a check that passed makes it
-    /// `PASSED`; and an environment NO check has decided — one whose checks cannot have
-    /// run yet because it is not `CREATED`, or one whose every check was undecidable —
-    /// is `UNKNOWN`. So a check this emulator could not decide never impairs an
-    /// environment whose other checks passed, and an environment nothing checked never
-    /// reports health nothing verified.
+    /// environment" — [`roll_up_results`] over them, so an environment NO check has
+    /// decided (one whose checks cannot have run yet because it is not `CREATED`, or one
+    /// whose every check was undecidable) is `UNKNOWN`.
     pub fn environment_status(&self) -> &'static str {
-        let results = || self.checks.iter().filter_map(|check| check.result.as_deref());
-        if results().any(|result| result == CHECK_FAILED) {
-            CHECK_FAILED
-        } else if results().any(|result| result == CHECK_PASSED) {
-            CHECK_PASSED
-        } else {
-            CHECK_UNKNOWN
-        }
+        roll_up_results(self.checks.iter().filter_map(|check| check.result.as_deref()))
     }
 
     /// Every VCF license key this environment carries: the solution key and the vSAN key
@@ -1688,7 +1698,8 @@ impl StoredEnvironment {
     }
 
     /// The latest instant a fact the environment health checks read was changed: this
-    /// environment's own `modifiedAt`, and that of every host it holds.
+    /// environment's own `modifiedAt`, and that of every host and every connector it
+    /// holds.
     ///
     /// A check that has started failing has been failing since no earlier than this, so
     /// it is the instant [`Self::refresh_checks`] dates an impairment from. A STORED
@@ -1697,6 +1708,11 @@ impl StoredEnvironment {
         self.hosts
             .values()
             .map(|host| host.modified_at_ms)
+            .chain(
+                self.connectors
+                    .values()
+                    .map(|connector| connector.modified_at_ms),
+            )
             .chain(::std::iter::once(self.modified_at_ms))
             .max()
             .unwrap_or(self.modified_at_ms)
@@ -1714,6 +1730,10 @@ impl StoredEnvironment {
     /// A check whose facts the environment does not carry reports `UNKNOWN` — "the check
     /// result" of a check that could not be decided — rather than `PASSED`, which would
     /// claim a verification nothing performed.
+    ///
+    /// The last of the checks is the one whose facts are the environment's CHILD records
+    /// rather than its own fields: [`CHECK_TYPE_CONNECTOR_HEALTH`], the aggregate over the
+    /// connectors the environment holds.
     pub fn refresh_checks(
         &mut self,
         key_users: &BTreeMap<String, usize>,
@@ -1758,6 +1778,17 @@ impl StoredEnvironment {
         } else {
             CHECK_FAILED
         };
+        // "Aggregate health across all connectors in the environment": the roll-up of what
+        // each connector the environment holds has decided about its own connectivity
+        // ([`StoredConnector::decided_result`]). One impaired connector impairs the
+        // aggregate; an environment whose connectors have decided nothing — including one
+        // holding no connector at all — aggregates nothing, so it is UNKNOWN rather than
+        // PASSED, which would claim health nothing verified.
+        let connector_health = roll_up_results(
+            self.connectors
+                .values()
+                .filter_map(|connector| connector.decided_result()),
+        );
 
         let impaired_at_ms = self.health_changed_at_ms();
         let environment_id = self.environment_id.clone();
@@ -1765,6 +1796,7 @@ impl StoredEnvironment {
             (CHECK_TYPE_KEY_REUSE, key_reuse),
             (CHECK_TYPE_KEY_COVERAGE, key_coverage),
             (CHECK_TYPE_HOST_COUNT, host_count),
+            (CHECK_TYPE_CONNECTOR_HEALTH, connector_health),
         ];
         let mut checks = Vec::with_capacity(results.len());
         for (check_type, result) in results {
@@ -2338,9 +2370,9 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
     /// environment reports the checks that hold at this instant.
     ///
     /// The checks are a DERIVED value — a pure function of the stored environments,
-    /// their hosts and the account's settings — so recomputing them on a read changes
-    /// nothing a later caller sees; the only thing carried over from one recomputation
-    /// to the next is when a failing check started failing
+    /// their hosts, their connectors and the account's settings — so recomputing them on
+    /// a read changes nothing a later caller sees; the only thing carried over from one
+    /// recomputation to the next is when a failing check started failing
     /// ([`StoredEnvironment::impaired_since_ms`]).
     ///
     /// The two facts no single environment carries are gathered once here: how many live
