@@ -202,7 +202,7 @@ async fn execute(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
 }
 
 /// `GET /actions/{actionId}`.
-async fn describe_action(router: &MultiServiceRouter, action_id: &str) -> (u16, Value) {
+pub(crate) async fn describe_action(router: &MultiServiceRouter, action_id: &str) -> (u16, Value) {
     call(router, "GET", &format!("/actions/{action_id}"), None).await
 }
 
