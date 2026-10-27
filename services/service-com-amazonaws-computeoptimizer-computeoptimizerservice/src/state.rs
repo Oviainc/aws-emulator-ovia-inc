@@ -1588,6 +1588,34 @@ pub const CPU_ARCHITECTURE_CURRENT: &str = "CURRENT";
 /// See [`CPU_ARCHITECTURE_CURRENT`].
 pub const CPU_ARCHITECTURE_AWS_ARM64: &str = "AWS_ARM64";
 
+/// Whether an option of `architecture` is one a request asking for `requested` CPU vendor
+/// architectures admits: "when you specify `AWS_ARM64` with a … request, Compute Optimizer
+/// returns [or exports] recommendations that consist of Graviton instance types only"
+/// (`RecommendationPreferences$cpuVendorArchitectures`). A request that asks for none
+/// restricts nothing.
+///
+/// The ONE rule in this service, so a recommendation READER and an EXPORT of the same
+/// recommendations cannot admit different options for the same preference.
+pub fn architecture_admitted(requested: &[String], architecture: &str) -> bool {
+    requested.is_empty() || requested.iter().any(|value| value == architecture)
+}
+
+/// The `cpuVendorArchitectures` an answer states for a resource whose admitted options are
+/// `options`: "describes the CPU vendor and architecture for … recommendations" — the
+/// architectures the reported options actually consist of, each once, in option order.
+///
+/// Stated here once for the same reason [`architecture_admitted`] is: a reader and an export of
+/// one resource's recommendation report the same architectures.
+pub fn stated_architectures<'a>(options: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut architectures: Vec<String> = Vec::new();
+    for architecture in options {
+        if !architectures.iter().any(|held| held == architecture) {
+            architectures.push(architecture.to_string());
+        }
+    }
+    architectures
+}
+
 /// The `SavingsEstimationMode` preference value that activates reporting savings net of
 /// Savings Plans and Reserved Instances discounts: "Specify the `AfterDiscounts` status
 /// to activate the preference, or specify `BeforeDiscounts` to deactivate" it.

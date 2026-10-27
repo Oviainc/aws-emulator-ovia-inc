@@ -41,6 +41,8 @@ mod ecs_service_recommendations_export;
 mod enrollment_and_preferences;
 #[path = "all/export_preference_gated_columns.rs"]
 mod export_preference_gated_columns;
+#[path = "all/export_recommendation_preferences.rs"]
+mod export_recommendation_preferences;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/idle_recommendations.rs"]

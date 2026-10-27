@@ -252,6 +252,28 @@ pub fn instance_not_found_message(instance_arn: &str) -> String {
     format!("No IAM Identity Center instance {instance_arn} exists in this account")
 }
 
+/// The refusal an operation OTHER than the instance's own describe and delete earns while
+/// that instance's creation has not finished, as the message of the modelled
+/// `ConflictException`.
+///
+/// The rule is `DescribeInstance`'s own documentation of the status: "CREATE_IN_PROGRESS -
+/// The instance is in the process of being created. … While the instance is in the
+/// CREATE_IN_PROGRESS state, you can call only DescribeInstance and DeleteInstance
+/// operations." A `ConflictException` is how the service reports exactly that — "a conflict
+/// with a previous successful write … A retry (with appropriate backoff logic) is the
+/// recommended response" — since the previous successful write is the `CreateInstance`
+/// still in flight and the same call is served once it finishes.
+///
+/// Built from the request and the stored record: it names the ARN whose instance was
+/// resolved and the status that instance is in.
+pub fn instance_creation_in_progress_message(instance_arn: &str) -> String {
+    format!(
+        "Instance {instance_arn} is in status {STATUS_CREATE_IN_PROGRESS}. While the \
+         instance is in the {STATUS_CREATE_IN_PROGRESS} state, you can call only \
+         DescribeInstance and DeleteInstance operations."
+    )
+}
+
 /// The refusal a `Scope` an application does not carry earns, as the message of the
 /// modelled `ResourceNotFoundException`.
 ///
@@ -1378,6 +1400,18 @@ impl Instance {
     /// Whether the clock already owes this instance its REMOVAL from the store.
     pub fn removal_due(&self, now: SystemTime) -> bool {
         self.deleted_due.is_some_and(|due| due <= now)
+    }
+
+    /// Whether this instance's CREATION has not finished yet — the window
+    /// `DescribeInstance` documents as serving only the instance's own describe and
+    /// delete.
+    ///
+    /// Asked of the STATUS the record carries, which
+    /// [`ComAmazonawsSsoadminSwbexternalserviceState::on_request`] has already brought up
+    /// to this instant, so it answers exactly what a read at the same instant reports: an
+    /// instance whose activation has fallen due is `ACTIVE` and no longer in this window.
+    pub fn creation_in_progress(&self) -> bool {
+        self.status == STATUS_CREATE_IN_PROGRESS
     }
 
     /// Enable this instance in one MORE Region, or refuse the add when the instance
@@ -2565,6 +2599,21 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.instances.get_mut(instance_arn)
     }
 
+    /// Whether the instance `instance_arn` names is still being CREATED
+    /// ([`Instance::creation_in_progress`]) — what every operation that MUTATES an
+    /// instance, or a resource held under it, asks before it writes: only the instance's
+    /// own describe and delete are available in that window, so everything else is
+    /// refused on its modelled conflict channel
+    /// ([`instance_creation_in_progress_message`]).
+    ///
+    /// `false` for an ARN this account holds no instance for: that request is a missing
+    /// resource, which each operation answers on its own not-found channel — the same
+    /// division [`Self::permission_set_surface_withdrawn`] keeps.
+    pub fn instance_creation_in_progress(&self, instance_arn: &str) -> bool {
+        self.instance(instance_arn)
+            .is_some_and(Instance::creation_in_progress)
+    }
+
     /// Apply every transition the CLOCK already owes: see [`Instance::materialize_due`],
     /// plus the REMOVAL a `DeleteInstance` owes — an instance whose deletion instant has
     /// passed no longer exists, whether or not anybody called.
@@ -2938,6 +2987,17 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.trusted_token_issuers
             .get(resource_arn)
             .map(|record| (record.instance_arn.as_str(), &record.tags))
+    }
+
+    /// The INSTANCE that holds the taggable resource `resource_arn` names, or `None` for
+    /// an ARN this account holds no resource under.
+    ///
+    /// What a tagging write asks to reach the status of the instance the resource lives
+    /// under ([`Self::instance_creation_in_progress`]): an instance is itself taggable, so
+    /// this answers the instance's own ARN for it and the holding instance's for a
+    /// permission set, an application or a trusted token issuer.
+    pub fn taggable_resource_instance(&self, resource_arn: &str) -> Option<&str> {
+        self.taggable_resource(resource_arn).map(|(owner, _)| owner)
     }
 
     /// The tags the taggable resource `resource_arn` names carries, for an operation that

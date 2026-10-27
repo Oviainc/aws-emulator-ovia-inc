@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut state = state.lock();
-        state.materialize_due(::std::time::SystemTime::now());
+        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
 
         // `i32` is the modelled width of every member here, and both counts are
         // bounded by the maxima beside them, so neither conversion can be lossy.

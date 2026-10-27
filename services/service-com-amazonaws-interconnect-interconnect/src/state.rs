@@ -599,6 +599,37 @@ pub fn remote_account_violation(
     })
 }
 
+/// Why `bandwidth` is not one a connection on the Environment `environment_id` names
+/// may hold — or `None` when the Environment currently offers it.
+///
+/// `Environment$bandwidths.available` is "the list of currently available bandwidths",
+/// so a bandwidth outside it cannot be allocated on that Environment even when the
+/// Environment `supported`s it (which is exactly what `limited` means). Both of this
+/// service's bandwidth writers (the create that allocates the first one and the update
+/// that allocates a new one on the SAME Environment) judge their input here, so one
+/// rule decides which bandwidths a stored connection can hold however it was reached,
+/// including what an Environment offering no list at all offers: nothing.
+///
+/// `environment` is an `Option` because a writer that reaches the catalog by id may
+/// find no record there, and `environment_id` is taken separately for exactly that
+/// case — the refusal names the Environment the request resolved against whether or
+/// not the catalog still holds it.
+pub fn bandwidth_availability_violation(
+    environment: Option<&Environment>,
+    environment_id: &str,
+    bandwidth: &str,
+) -> Option<String> {
+    let available = environment
+        .and_then(|environment| environment.bandwidths.available.as_deref())
+        .unwrap_or_default();
+    (!available.iter().any(|offered| offered == bandwidth)).then(|| {
+        format!(
+            "bandwidth '{bandwidth}' is not available on environment '{environment_id}'; available bandwidths are [{}]",
+            available.join(", ")
+        )
+    })
+}
+
 /// The `ConnectionId` prefix an Environment's provider kind dictates.
 ///
 /// The model's `Provider` members say it: a `cloudServiceProvider` environment
