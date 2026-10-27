@@ -122,6 +122,17 @@ pub const STATE_CREATING: &str = "CREATING";
 /// the clock owes begins.
 pub const STATE_PENDING_ATTACHMENT_ACCEPTANCE: &str = "PENDING_ATTACHMENT_ACCEPTANCE";
 
+/// The TERMINAL state of an attachment whose attachment request was turned down
+/// (`RejectAttachment`, [`AttachmentRecord::reject_at`]). One of `AttachmentState`'s own
+/// values (`smithy_query shape=AttachmentState`, mirrored in
+/// `ops::types::ATTACHMENT_STATE_VALUES`).
+///
+/// Like [`STATE_PENDING_ATTACHMENT_ACCEPTANCE`] this is not a wait on the clock, and unlike
+/// it nothing moves an attachment out of it: the request was never granted, so the
+/// attachment is never created and no transition is ever owed on it. The record stays
+/// stored and readable in this state until `DeleteAttachment` removes it.
+pub const STATE_REJECTED: &str = "REJECTED";
+
 /// The ARN namespace the model declares for this service (`arnNamespace: networkmanager`).
 const ARN_NAMESPACE: &str = "networkmanager";
 
@@ -2510,7 +2521,8 @@ impl PeeringRecord {
 /// clock ([`Self::state_at`]), so reporting an attachment never writes. The one thing the
 /// clock does NOT decide is the acceptance an `attachment-policies` rule can ask for: an
 /// attachment waiting for one stays in [`STATE_PENDING_ATTACHMENT_ACCEPTANCE`] until
-/// `AcceptAttachment` grants it ([`Self::accept_at`]).
+/// `AcceptAttachment` grants it ([`Self::accept_at`]) or `RejectAttachment` turns it down
+/// ([`Self::reject_at`]), which leaves it [`STATE_REJECTED`] for good.
 #[derive(Debug, Clone)]
 pub struct AttachmentRecord {
     pub id: String,
@@ -2547,6 +2559,11 @@ pub struct AttachmentRecord {
     /// last changed before the transition above falls due. `None` for an attachment no rule
     /// asked acceptance for, which never waited for one.
     pub accepted_at: Option<SystemTime>,
+    /// When the attachment request was TURNED DOWN, or `None` for one nothing rejected.
+    /// Terminal: an attachment holding an instant here is [`STATE_REJECTED`] from that
+    /// instant on, is never created, and has no transition owed on it
+    /// ([`Self::reject_at`]).
+    pub rejected_at: Option<SystemTime>,
     /// The instant a CHANGE to this attachment was last requested — what
     /// `UpdateVpcAttachment` records — or `None` for one nothing has changed since it was
     /// created. What [`Self::state_at`] tells a creation in flight from a change in flight
@@ -2650,6 +2667,9 @@ impl AttachmentRecord {
     /// on whether anything has changed the attachment since it was created
     /// ([`Self::changed_at`]).
     pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if self.rejected_at.is_some() {
+            return STATE_REJECTED;
+        }
         match self.available_at {
             None => STATE_PENDING_ATTACHMENT_ACCEPTANCE,
             Some(available_at) if now >= available_at => STATE_AVAILABLE,
@@ -2659,9 +2679,10 @@ impl AttachmentRecord {
     }
 
     /// Whether this attachment is still waiting for the acceptance its core network policy
-    /// asked for — the one thing `AcceptAttachment` can act on.
+    /// asked for — the one thing `AcceptAttachment` and `RejectAttachment` can act on. An
+    /// attachment already rejected waits for nothing: that decision was taken.
     pub fn awaits_acceptance(&self) -> bool {
-        self.available_at.is_none()
+        self.available_at.is_none() && self.rejected_at.is_none()
     }
 
     /// Grant the acceptance this attachment is waiting for, at `now`: the attachment starts
@@ -2677,15 +2698,29 @@ impl AttachmentRecord {
         true
     }
 
+    /// Turn down the attachment request this attachment is waiting for, at `now`: it is
+    /// never created, so no transition is owed on it and it is [`STATE_REJECTED`] from here
+    /// on. Answers `false`, writing nothing, when the attachment was not waiting for an
+    /// acceptance — the mirror of [`Self::accept_at`], so the two decisions are taken on
+    /// exactly the same attachments and neither can overtake the other.
+    pub fn reject_at(&mut self, now: SystemTime) -> bool {
+        if !self.awaits_acceptance() {
+            return false;
+        }
+        self.rejected_at = Some(now);
+        true
+    }
+
     /// When this attachment last changed, as of `now`: the create, the acceptance that
-    /// started it, the change an update requested, or the transition to `AVAILABLE` once
-    /// that has fallen due. DERIVED from the stored instants, so a read reports a current
-    /// `UpdatedAt` without writing one.
+    /// started it, the rejection that turned its request down, the change an update
+    /// requested, or the transition to `AVAILABLE` once that has fallen due. DERIVED from
+    /// the stored instants, so a read reports a current `UpdatedAt` without writing one.
     pub fn updated_at(&self, now: SystemTime) -> SystemTime {
         match self.available_at {
             Some(available_at) if now >= available_at => available_at,
             _ => self
-                .changed_at
+                .rejected_at
+                .or(self.changed_at)
                 .or(self.accepted_at)
                 .unwrap_or(self.created_at),
         }
