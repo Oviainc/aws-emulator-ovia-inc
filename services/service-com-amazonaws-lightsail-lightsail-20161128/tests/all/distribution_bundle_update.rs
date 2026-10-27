@@ -18,16 +18,18 @@
 //!
 //! So the cases are TABLES: one row per direction a plan can move in (up, down,
 //! and onto the plan already applied), covering every active plan the published
-//! catalog holds as a target; one row per rule a refused request breaks; and, for
-//! the `isActive` dimension the published catalog cannot show (Lightsail has
-//! retired no CDN plan), rows over a catalog that holds a retired one.
+//! catalog holds as a target; one row per rule a refused request breaks; the two
+//! sides of the allowance the cycle owns (spent within it, available in the next
+//! one); and, for the `isActive` dimension the published catalog cannot show
+//! (Lightsail has retired no CDN plan), rows over a catalog that holds a retired
+//! one.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lightsail_lightsail_20161128::state::{
-    distribution_bundle_is_applicable, distribution_bundle_is_applicable_in,
-    DistributionBundleSpec, DISTRIBUTION_BUNDLE_SPECS,
+    billing_cycle, distribution_bundle_is_applicable, distribution_bundle_is_applicable_in, now_ms,
+    with_state, DistributionBundleSpec, DISTRIBUTION_BUNDLE_SPECS,
 };
 
 // The harness, the wire error code, the minted-id check and the distribution
@@ -364,6 +366,97 @@ async fn a_second_bundle_update_within_the_billing_cycle_is_refused() {
             "case {case}: expected the refused update to change nothing, got {after:?}"
         );
     }
+}
+
+/// Milliseconds in one day. Used to put a stored change far enough back to be in
+/// an earlier calendar month than the one the case runs in, whichever day of the
+/// month that is.
+const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+
+/// RULE, the other side of the same allowance: it belongs to the billing cycle the
+/// change was made in, so a distribution whose bundle was last changed in an
+/// earlier cycle can be moved again, and that move spends the cycle it is made in.
+///
+/// Nothing moves this emulator's clock a month on, so the earlier cycle is reached
+/// through the store the handlers read, as every other clock-bound case here does.
+#[tokio::test]
+async fn a_distribution_moved_in_an_earlier_billing_cycle_can_be_moved_again() {
+    let emulator = Emulator::new();
+    stand_up(&emulator).await;
+
+    let name = "bundle-cdn-next-cycle";
+    create_distribution(&emulator, name, SMALL).await;
+    emulator
+        .ok(
+            "UpdateDistributionBundle",
+            json!({"distributionName": name, "bundleId": MEDIUM}),
+        )
+        .await;
+
+    // Backdate the change out of the cycle this case runs in. 60 days is more
+    // than any month is long, so the instant is in an earlier calendar month
+    // whatever day the case runs on — asserted rather than assumed.
+    let at = now_ms();
+    let earlier = at - 60 * DAY_MS;
+    assert_ne!(
+        billing_cycle(earlier),
+        billing_cycle(at),
+        "case the earlier cycle: expected {earlier} to be in a cycle before {at}"
+    );
+    with_state(emulator.engine(), |store| {
+        let stored = store
+            .distribution_mut(name)
+            .expect("this case created the distribution through CreateDistribution");
+        stored.bundle_updated_at_ms = Some(earlier);
+    })
+    .expect("this case's engine is the shared in-memory one");
+
+    // A read reports the allowance of the cycle the READ is made in, with nothing
+    // having had to be materialised in between.
+    let ready = distribution(&emulator, name).await;
+    assert_eq!(
+        ready["ableToUpdateBundle"].as_bool(),
+        Some(true),
+        "case the next cycle: expected the allowance of this cycle to be available, got {ready:?}"
+    );
+
+    let (status, moved) = emulator
+        .call(
+            "UpdateDistributionBundle",
+            json!({"distributionName": name, "bundleId": LARGE}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case the next cycle: expected HTTP 200, got {status} {moved:?}"
+    );
+    assert_logged_entry("the next cycle", &moved["operation"], name);
+    let after = distribution(&emulator, name).await;
+    assert_only_expected_changed("the next cycle", &ready, &after, &expected_after(LARGE));
+
+    // And that move spent THIS cycle's change: another one is refused.
+    let (status, refused) = emulator
+        .call(
+            "UpdateDistributionBundle",
+            json!({"distributionName": name, "bundleId": SMALL}),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case a second change of the new cycle: expected HTTP 400, got {status} {refused:?}"
+    );
+    let code = error_code(&refused);
+    assert_eq!(
+        code, "OperationFailureException",
+        "case a second change of the new cycle: expected OperationFailureException, got {code} \
+         {refused:?}"
+    );
+    let unchanged = distribution(&emulator, name).await;
+    assert_eq!(
+        unchanged, after,
+        "case a second change of the new cycle: expected the refused update to change nothing, \
+         got {unchanged:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

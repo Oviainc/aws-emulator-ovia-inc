@@ -2082,10 +2082,11 @@ pub struct StoredBucket {
     /// One of [`OBJECT_VERSIONING_ENABLED`], [`OBJECT_VERSIONING_SUSPENDED`] or
     /// [`OBJECT_VERSIONING_NEVER_ENABLED`].
     pub object_versioning: String,
-    /// Whether the applied bundle may still be changed. A bucket's bundle can be
-    /// updated only once within a monthly billing cycle, so a bucket that has not
-    /// been moved yet can be.
-    pub able_to_update_bundle: bool,
+    /// When this bucket's bundle was last changed; `None` on one that has never
+    /// been moved. A bucket's bundle can be updated only once within a monthly
+    /// billing cycle, so the instant of that change is what says whether another
+    /// one is available — see [`StoredBucket::able_to_update_bundle`].
+    pub bundle_updated_at_ms: Option<i64>,
     /// The anonymous access permissions of the bucket's objects.
     pub access_rules: AccessRules,
     /// Accounts given read-only access to the bucket.
@@ -2138,7 +2139,7 @@ impl StoredBucket {
             bundle_id: Some(self.bundle_id.clone()),
             url: endpoint.map(|endpoint| bucket_url(endpoint, &self.name)),
             object_versioning: Some(self.object_versioning.clone()),
-            able_to_update_bundle: Some(self.able_to_update_bundle),
+            able_to_update_bundle: Some(self.able_to_update_bundle(now_ms())),
             access_rules: Some(self.access_rules.clone()),
             readonly_access_accounts: Some(self.readonly_access_accounts.clone()),
             resources_receiving_access: include_connected_resources
@@ -2154,6 +2155,12 @@ impl StoredBucket {
                 rules: Some(self.cors_rules.clone()),
             }),
         }
+    }
+
+    /// Whether the one bundle change this bucket's monthly billing cycle allows
+    /// is available at `now_ms` — the `ableToUpdateBundle` a read reports.
+    pub fn able_to_update_bundle(&self, now_ms: i64) -> bool {
+        bundle_change_available(self.bundle_updated_at_ms, now_ms)
     }
 
     /// Give the resource `name` of kind `resource_type` access to this bucket
@@ -12039,12 +12046,13 @@ pub struct StoredDistribution {
     pub is_enabled: bool,
     /// The bundle currently applied, an id of [`DISTRIBUTION_BUNDLE_SPECS`].
     pub bundle_id: String,
-    /// Whether the applied bundle may still be changed. A distribution's bundle
-    /// can be updated "only one time within your monthly Amazon Web Services
-    /// billing cycle" (`UpdateDistributionBundle`), so one that has not been
-    /// moved yet can be, and the call that moves it is what spends the
-    /// allowance — which is the `ableToUpdateBundle` a later read reports.
-    pub able_to_update_bundle: bool,
+    /// When this distribution's bundle was last changed; `None` on one that has
+    /// never been moved. A distribution's bundle can be updated "only one time
+    /// within your monthly Amazon Web Services billing cycle"
+    /// (`UpdateDistributionBundle`), so the instant of that change is what says
+    /// whether another one is available — see
+    /// [`StoredDistribution::able_to_update_bundle`].
+    pub bundle_updated_at_ms: Option<i64>,
     /// The SSL/TLS certificate attached to the distribution, if the request
     /// named one or `AttachCertificateToDistribution` attached one.
     pub certificate_name: Option<String>,
@@ -12095,6 +12103,12 @@ impl StoredDistribution {
         self.alternative_domain_names = Vec::new();
     }
 
+    /// Whether the one bundle change this distribution's monthly billing cycle
+    /// allows is available at `now_ms` — the `ableToUpdateBundle` a read reports.
+    pub fn able_to_update_bundle(&self, now_ms: i64) -> bool {
+        bundle_change_available(self.bundle_updated_at_ms, now_ms)
+    }
+
     /// This record as the modelled `LightsailDistribution`.
     pub fn view(&self) -> LightsailDistribution {
         LightsailDistribution {
@@ -12117,7 +12131,7 @@ impl StoredDistribution {
             default_cache_behavior: Some(self.default_cache_behavior.clone()),
             cache_behavior_settings: self.cache_behavior_settings.clone(),
             cache_behaviors: Some(self.cache_behaviors.clone()),
-            able_to_update_bundle: Some(self.able_to_update_bundle),
+            able_to_update_bundle: Some(self.able_to_update_bundle(now_ms())),
             ip_address_type: Some(self.ip_address_type.clone()),
             tags: Some(self.tags.clone()),
             viewer_minimum_tls_protocol_version: self
@@ -15497,6 +15511,34 @@ pub fn utc_date(epoch_millis: i64) -> String {
                 .map(|(date, _)| date.to_string())
         })
         .unwrap_or_default()
+}
+
+/// The monthly billing cycle `epoch_millis` falls in, as the UTC calendar month
+/// it belongs to (`YYYY-MM`): an account is billed per calendar month, so two
+/// instants of the same month are the same cycle and the month after it is the
+/// next one.
+///
+/// The calendar conversion is [`utc_date`]'s, so no month arithmetic is
+/// re-derived here.
+pub fn billing_cycle(epoch_millis: i64) -> String {
+    let date = utc_date(epoch_millis);
+    match date.rsplit_once('-') {
+        Some((cycle, _day)) => cycle.to_string(),
+        None => date,
+    }
+}
+
+/// Whether the one bundle change a monthly billing cycle allows is available at
+/// `now_ms` to a resource whose bundle was last changed at `last_changed_at_ms`
+/// (`None` on one that has never been moved).
+///
+/// The allowance belongs to the CYCLE the change was made in: a further request
+/// in that same cycle finds it spent, and it is available again once that cycle
+/// has passed, with nothing to materialise for the resource in between. A
+/// bucket's and a distribution's bundle update document the one rule, so both
+/// ask here instead of latching a flag of their own.
+pub fn bundle_change_available(last_changed_at_ms: Option<i64>, now_ms: i64) -> bool {
+    last_changed_at_ms.is_none_or(|changed| billing_cycle(changed) != billing_cycle(now_ms))
 }
 
 /// Order two modelled timestamps. A `DateTime` carries seconds plus a
