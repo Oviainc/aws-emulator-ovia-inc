@@ -71,15 +71,19 @@ use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AnalyzableServerSummary, AppUnitError, ApplicationComponentDetail, ApplicationComponentStrategy,
+    AnalyzableServerSummary, AppUnitError, ApplicationComponentDetail,
+    ApplicationComponentStatusSummary, ApplicationComponentStrategy, ApplicationComponentSummary,
     ApplicationPreferences,
+    AssessmentSummary,
     AssessmentTarget, AssociatedApplication, Collector, ConfigurationSummary, ConflictException,
     DataCollectionDetails, DatabaseConfigDetail,
     DatabasePreferences, GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
     OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
-    ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy, SourceCodeRepository,
+    ResourceNotFoundException, ServerDetail, ServerError, ServerStatusSummary, ServerStrategy,
+    ServerSummary, SourceCodeRepository,
     StrategyOption, StrategySummary, SystemInfo, TransformationTool, ValidationException,
-    GROUP_NAME_VALUES, STRATEGY_VALUES, TARGET_DESTINATION_VALUES, TRANSFORMATION_TOOL_NAME_VALUES,
+    GROUP_NAME_VALUES, SERVER_OS_TYPE_VALUES, STRATEGY_VALUES, TARGET_DESTINATION_VALUES,
+    TRANSFORMATION_TOOL_NAME_VALUES,
 };
 
 /// The Region partitioning of this store: the per-service state struct itself, the Region
@@ -850,6 +854,12 @@ pub const CRITERIA_NOT_DEFINED: &str = "NOT_DEFINED";
 /// [`CRITERIA_NOT_DEFINED`] under the name the server inventory reads it by.
 pub const SERVER_CRITERIA_NOT_DEFINED: &str = CRITERIA_NOT_DEFINED;
 
+/// The `ServerCriteria` value that names a server's OPERATING SYSTEM, which is the
+/// attribute both the filter on it ([`ServerRecord::matches_criteria`]) and the operating
+/// system a portfolio summary groups by ([`ServerRecord::summarised_os_type`]) resolve
+/// through [`ServerRecord::attribute_values`].
+pub const OS_NAME_ATTRIBUTE: &str = "OS_NAME";
+
 /// `SortOrder`'s ascending value, which is the order a list is reported in when the
 /// request names no `sort`.
 pub const SORT_ASCENDING: &str = "ASC";
@@ -866,6 +876,14 @@ pub const SORT_DESCENDING: &str = "DESC";
 /// strategy nothing recommended is reported with no status at all rather than with a rank
 /// nothing computed.
 pub const STRATEGY_RECOMMENDED: &str = "recommended";
+
+/// `ServerOsType`'s value for an operating system the rest of that catalog
+/// ([`SERVER_OS_TYPE_VALUES`](crate::ops::types::SERVER_OS_TYPE_VALUES)) does not name.
+///
+/// It is the catch-all of that enumeration, so it is what a portfolio summary groups a
+/// server whose recorded operating system is none of the named ones under
+/// ([`ServerRecord::summarised_os_type`]).
+pub const SERVER_OS_TYPE_OTHER: &str = "Other";
 
 /// `SrcCodeOrDbAnalysisStatus`'s value for an application component whose source code
 /// and/or database credentials are configured and for which no analysis was asked for.
@@ -911,37 +929,79 @@ fn recommendation_of(
     )
 }
 
+/// How many resources hold each value of ONE of their attributes: every value at least
+/// one of them holds, paired with the number holding it, in the values' own order.
+///
+/// It is the one counting rule behind every summary this service reports — a strategy
+/// summary, a count per operating system, per application type or per analysis status —
+/// so two summaries over the same records cannot count them differently. A resource
+/// holding NO value for the attribute counts towards no group, which is what keeps a
+/// count from standing for a value nothing recorded, and a value nothing holds gets no
+/// group at all rather than a zero.
+fn counted_by_value<'a>(values: impl Iterator<Item = Option<&'a str>>) -> Vec<(String, i32)> {
+    let mut counted: BTreeMap<&str, usize> = BTreeMap::new();
+    for value in values.flatten() {
+        *counted.entry(value).or_default() += 1;
+    }
+    counted
+        .into_iter()
+        .map(|(value, holding)| (value.to_string(), count_of(holding)))
+        .collect()
+}
+
+/// The `StrategySummary` list a group of resources amounts to — "the summary of the
+/// strategy recommendations", whose `count` is "the count of recommendations per
+/// strategy".
+///
+/// Counted off the resources' own recommended strategies ([`counted_by_value`]), so a
+/// summary and the resources it summarises cannot disagree, and a resource the analysis
+/// recommended nothing for counts towards no strategy.
+fn strategy_summary<'a>(strategies: impl Iterator<Item = Option<&'a str>>) -> Vec<StrategySummary> {
+    counted_by_value(strategies)
+        .into_iter()
+        .map(|(strategy, count)| StrategySummary {
+            strategy: Some(strategy),
+            count: Some(count),
+        })
+        .collect()
+}
+
+/// One operating-system name as it is COMPARED against the `ServerOsType` catalog:
+/// lower-cased, with everything that is not a letter or a digit dropped.
+///
+/// A server's operating system is free text (`SystemInfo$osInfo$version`), so the same
+/// system is written in many ways; folding away case, spaces and punctuation is what makes
+/// the one written "Amazon Linux 2" and the one written "AmazonLinux2" the same
+/// `ServerOsType`.
+fn fold_os_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
 /// The `StrategySummary` list a server reports for the application components running on
 /// it — `ServerDetail$applicationComponentStrategySummary`, "a list of strategy
 /// summaries", whose `count` is "the count of recommendations per strategy".
 ///
-/// It is counted off the component records themselves, grouped by the strategy the
-/// analysis recommended for each one, so the summary and the components cannot disagree. A
-/// component the analysis recommended nothing for counts towards no strategy, and one kept
-/// out of the assessment counts towards nothing at all: `inclusionStatus` "indicates
-/// whether the application component has been included for server recommendation or not".
-/// The groups come out in the strategies' own order, and a server nothing runs on gets an
-/// EMPTY list, which its read reports as no summary at all.
+/// It is counted off the component records themselves ([`strategy_summary`]), grouped by
+/// the strategy the analysis recommended for each one, so the summary and the components
+/// cannot disagree. A component the analysis recommended nothing for counts towards no
+/// strategy, and one kept out of the assessment counts towards nothing at all:
+/// `inclusionStatus` "indicates whether the application component has been included for
+/// server recommendation or not". The groups come out in the strategies' own order, and a
+/// server nothing runs on gets an EMPTY list, which its read reports as no summary at all.
 fn component_strategy_summary(
     server_id: &str,
     components: &BTreeMap<String, ApplicationComponentRecord>,
 ) -> Vec<StrategySummary> {
-    let mut counted: BTreeMap<&str, i32> = BTreeMap::new();
-    for component in components.values() {
-        if !component.recommended_for_server(server_id) {
-            continue;
-        }
-        if let Some(strategy) = component.strategy.as_deref() {
-            *counted.entry(strategy).or_default() += 1;
-        }
-    }
-    counted
-        .into_iter()
-        .map(|(strategy, count)| StrategySummary {
-            strategy: Some(strategy.to_string()),
-            count: Some(count),
-        })
-        .collect()
+    strategy_summary(
+        components
+            .values()
+            .filter(|component| component.recommended_for_server(server_id))
+            .map(|component| component.strategy.as_deref()),
+    )
 }
 
 /// How many application components running on the server `server_id` the analysis
@@ -1260,7 +1320,7 @@ impl ServerRecord {
     fn attribute_values(&self, name: &str) -> Vec<&str> {
         match name {
             "SERVER_ID" => vec![self.id.as_str()],
-            "OS_NAME" => [self.os_type.as_deref(), self.os_version.as_deref()]
+            OS_NAME_ATTRIBUTE => [self.os_type.as_deref(), self.os_version.as_deref()]
                 .into_iter()
                 .flatten()
                 .collect(),
@@ -1360,6 +1420,45 @@ impl ServerRecord {
     /// [`in_any_group`], over the groups this record holds.
     pub fn in_any_group(&self, groups: &[Group]) -> bool {
         in_any_group(&self.group_id, groups)
+    }
+
+    /// The `ServerOsType` a portfolio summary groups this server under —
+    /// `ServerSummary$ServerOsType`, "type of operating system for the servers" — or
+    /// `None` when the service holds no operating system for it at all, so it counts
+    /// towards no group rather than towards one nothing recorded.
+    ///
+    /// `ServerOsType` is a CATALOG of operating systems with a catch-all
+    /// ([`SERVER_OS_TYPE_OTHER`]), while a server's own record holds its `OSType` and the
+    /// free-text system it reports: so the server is grouped under the catalog value its
+    /// recorded operating system NAMES, compared with case, spaces and punctuation folded
+    /// away ([`fold_os_name`]), and under the catch-all when what it records is none of
+    /// them. The longest catalog value a record names wins, because one of them contains
+    /// another as text: a server reporting an end-of-support Windows Server is not grouped
+    /// with the supported ones.
+    ///
+    /// The operating system is read through the one place that resolves an attribute name
+    /// to the members holding it ([`Self::attribute_values`]), so the type a summary groups
+    /// by and the member `ListServers` filters on cannot come from different members.
+    pub fn summarised_os_type(&self) -> Option<&'static str> {
+        let held: Vec<String> = self
+            .attribute_values(OS_NAME_ATTRIBUTE)
+            .into_iter()
+            .map(fold_os_name)
+            .collect();
+        if held.is_empty() {
+            return None;
+        }
+        let mut catalog: Vec<&'static str> = SERVER_OS_TYPE_VALUES
+            .iter()
+            .copied()
+            .filter(|value| *value != SERVER_OS_TYPE_OTHER)
+            .collect();
+        catalog.sort_by_key(|value| ::std::cmp::Reverse(value.len()));
+        let named = catalog.into_iter().find(|value| {
+            let wanted = fold_os_name(value);
+            held.iter().any(|held| held.contains(&wanted))
+        });
+        Some(named.unwrap_or(SERVER_OS_TYPE_OTHER))
     }
 }
 
@@ -2223,6 +2322,116 @@ impl RegionState {
             collectors,
             next_token,
         })
+    }
+
+    /// The `AssessmentSummary` a read of this Region's portfolio reports — "the summary of
+    /// the assessment results", which is what `GetPortfolioSummary` answers with.
+    ///
+    /// Every list is COUNTED off the records the portfolio holds ([`counted_by_value`]),
+    /// grouped by the member the list's own element type names: the servers by the
+    /// operating system they run ([`ServerRecord::summarised_os_type`]) and by the status
+    /// of their assessment (`ServerDetail$dataCollectionStatus`, a
+    /// `RunTimeAssessmentStatus`), the application components by their `AppType` and by the
+    /// status of their analysis (`SrcCodeOrDbAnalysisStatus`), and each of the two kinds by
+    /// the strategy the analysis recommended for it ([`strategy_summary`]) — so the summary
+    /// and the reads of the resources themselves cannot disagree. `lastAnalyzedTimestamp`,
+    /// "the time the assessment was performed", is the latest instant an analysis was
+    /// recorded on any of those resources ([`Self::last_analyzed`]).
+    ///
+    /// A group nothing falls into is not reported, and a list with nothing in it is
+    /// reported as absent rather than as an empty list — the same way the records' own
+    /// reads report theirs, so an account that holds no portfolio summarises as the empty
+    /// portfolio it is instead of as a tree of empty objects. The anti-pattern members are
+    /// left unset for the reason [`ServerRecord::to_server_detail`] leaves its own unset:
+    /// nothing in this emulator generates an anti-pattern report, so there are no
+    /// anti-patterns to count by severity and no report object to name.
+    pub fn to_assessment_summary(&self) -> AssessmentSummary {
+        let server_strategies =
+            strategy_summary(self.servers.values().map(|server| server.strategy.as_deref()));
+        let component_strategies = strategy_summary(
+            self.application_components
+                .values()
+                .map(|component| component.strategy.as_deref()),
+        );
+        let server_os_types: Vec<ServerSummary> =
+            counted_by_value(self.servers.values().map(ServerRecord::summarised_os_type))
+                .into_iter()
+                .map(|(os_type, count)| ServerSummary {
+                    server_os_type: Some(os_type),
+                    count: Some(count),
+                })
+                .collect();
+        let server_statuses: Vec<ServerStatusSummary> = counted_by_value(
+            self.servers
+                .values()
+                .map(|server| server.data_collection_status.as_deref()),
+        )
+        .into_iter()
+        .map(|(status, count)| ServerStatusSummary {
+            run_time_assessment_status: Some(status),
+            count: Some(count),
+        })
+        .collect();
+        let app_types: Vec<ApplicationComponentSummary> = counted_by_value(
+            self.application_components
+                .values()
+                .map(|component| component.app_type.as_deref()),
+        )
+        .into_iter()
+        .map(|(app_type, count)| ApplicationComponentSummary {
+            app_type: Some(app_type),
+            count: Some(count),
+        })
+        .collect();
+        let component_statuses: Vec<ApplicationComponentStatusSummary> = counted_by_value(
+            self.application_components
+                .values()
+                .map(|component| component.analysis_status.as_deref()),
+        )
+        .into_iter()
+        .map(|(status, count)| ApplicationComponentStatusSummary {
+            src_code_or_db_analysis_status: Some(status),
+            count: Some(count),
+        })
+        .collect();
+
+        AssessmentSummary {
+            list_server_strategy_summary: (!server_strategies.is_empty())
+                .then_some(server_strategies),
+            list_application_component_strategy_summary: (!component_strategies.is_empty())
+                .then_some(component_strategies),
+            list_antipattern_severity_summary: None,
+            list_application_component_summary: (!app_types.is_empty()).then_some(app_types),
+            list_server_summary: (!server_os_types.is_empty()).then_some(server_os_types),
+            antipattern_report_s3_object: None,
+            antipattern_report_status: None,
+            antipattern_report_status_message: None,
+            last_analyzed_timestamp: self.last_analyzed().map(::aws_smithy_types::DateTime::from),
+            list_application_component_status_summary: (!component_statuses.is_empty())
+                .then_some(component_statuses),
+            list_server_status_summary: (!server_statuses.is_empty()).then_some(server_statuses),
+        }
+    }
+
+    /// The latest instant an analysis was recorded on any resource of this portfolio, or
+    /// `None` while nothing in it has been analysed.
+    ///
+    /// `AssessmentSummary$lastAnalyzedTimestamp` is "the time the assessment was
+    /// performed", and the instant an assessment's analysis was recorded is what each
+    /// resource it covered reports as its own `lastAnalyzedTimestamp`
+    /// ([`Self::analyze_covered_resources`]) — so the summary reports the latest of those
+    /// rather than a second clock reading, and a portfolio nothing has analysed reports no
+    /// time at all.
+    fn last_analyzed(&self) -> Option<SystemTime> {
+        self.servers
+            .values()
+            .filter_map(|server| server.last_analyzed)
+            .chain(
+                self.application_components
+                    .values()
+                    .filter_map(|component| component.last_analyzed),
+            )
+            .max()
     }
 
     /// Whether this account has a data source for an assessment to collect from in this
