@@ -231,6 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The token resumes THIS listing: one minted for a different selector
         // indexes into a different sequence.
         let scope = crate::state::charge_scope(
+            Self::NAME,
             input.agreement_id.as_deref(),
             input.agreement_type.as_deref(),
             input.catalog.as_deref(),
