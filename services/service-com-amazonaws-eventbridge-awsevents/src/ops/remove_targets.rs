@@ -153,11 +153,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
         let mut store = state.lock();
-        let Some(rule) = store.rule_mut(&bus_name, &input.rule) else {
+        let Some(rule) = store.rule_mut(&region, &bus_name, &input.rule) else {
             return Err(RemoveTargetsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_rule(&bus_name, &input.rule)),

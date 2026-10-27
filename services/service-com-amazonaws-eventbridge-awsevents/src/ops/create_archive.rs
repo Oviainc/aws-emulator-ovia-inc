@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        if store.bus(&bus_name).is_none() {
+        if store.bus(&region, &bus_name).is_none() {
             return Err(CreateArchiveErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_event_bus(&bus_name)),
@@ -267,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let rule = crate::state::archive_rule(&region, &stored);
-        if let Some(bus) = store.bus_mut(&bus_name) {
+        if let Some(bus) = store.bus_mut(&region, &bus_name) {
             bus.rules.insert(rule.name.clone(), rule);
         }
 

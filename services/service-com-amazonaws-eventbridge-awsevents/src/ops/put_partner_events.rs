@@ -230,17 +230,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let ingesting = store.partner_source(&accepted.source).is_some_and(|record| {
                     store.event_source_state(record) == crate::state::EVENT_SOURCE_STATE_ACTIVE
                 });
-                let bus = ingesting
-                    .then(|| store.matching_bus(&accepted.source).map(|bus| bus.name.clone()))
-                    .flatten();
-                if let Some(bus) = bus.as_deref() {
-                    if !routing.contains_key(bus) {
-                        let rules = store
-                            .bus(bus)
-                            .map(crate::state::EventBus::matchable_rules)
-                            .unwrap_or_default();
-                        routing.insert(bus.to_string(), rules);
-                    }
+                // The bus the source matched, WHEREVER the account created it:
+                // a partner event source is not a Region-keyed resource, so the
+                // bus matched with it is found through the source rather than in
+                // one Region ([`crate::state::ComAmazonawsEventbridgeAwseventsState::matching_bus`]).
+                let matched = ingesting
+                    .then(|| store.matching_bus(&accepted.source))
+                    .flatten()
+                    .map(|bus| (bus.name.clone(), bus.matchable_rules()));
+                let bus = matched.as_ref().map(|(name, _)| name.clone());
+                if let Some((name, rules)) = matched {
+                    routing.entry(name).or_insert(rules);
                 }
 
                 let event_id = store.next_event_id(now);

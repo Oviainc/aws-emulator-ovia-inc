@@ -135,7 +135,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
 
         // A page token is only ever one this service minted; anything else is a
         // bad request, not an empty page.
@@ -154,7 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let bus_name = crate::state::effective_bus_name(input.event_bus_name.as_deref());
         let store = state.lock();
-        let Some(rule) = store.rule(&bus_name, &input.rule) else {
+        let Some(rule) = store.rule(&region, &bus_name, &input.rule) else {
             return Err(ListTargetsByRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::no_such_rule(&bus_name, &input.rule)),

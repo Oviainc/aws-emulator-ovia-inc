@@ -144,7 +144,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The managed rule that fed this archive exists only for it, so it goes
         // with the archive rather than being left on the bus pointing at nothing.
         let rule_name = crate::state::archive_rule_name(&removed.name);
-        if let Some(bus) = store.bus_mut(&removed.event_bus_name) {
+        // The bus that rule sits on is the one in the archive's OWN Region, which
+        // its ARN carries ([`crate::state::archive_arn`]) — a bus is a regional
+        // resource, so the Region is half of its identity.
+        let region = crate::state::arn_region(&removed.arn).unwrap_or(crate::state::FALLBACK_REGION);
+        if let Some(bus) = store.bus_mut(region, &removed.event_bus_name) {
             bus.rules
                 .retain(|name, rule| name != &rule_name || rule.managed_by.is_none());
         }
