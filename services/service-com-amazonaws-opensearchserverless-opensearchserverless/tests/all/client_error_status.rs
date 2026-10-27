@@ -415,17 +415,18 @@ async fn a_pattern_refusal_states_the_regex_without_the_traits_anchors() {
     // (case, operation, request, member, the offending value, the regex the clause states)
     //
     // The third column of each row is the member's `@pattern` with its `^`/`$` anchors
-    // dropped: `smithy_query(query="shape", shape="CollectionName,CollectionGroupName,PolicyName,PolicyVersion")`
-    // gives `^[a-z][a-z0-9-]+$` for the three name shapes and the base64 pattern below for
+    // dropped: `smithy_query(query="shape", shape="CollectionGroupName,PolicyName,PolicyVersion")`
+    // gives `^[a-z][a-z0-9-]+$` for the two name shapes and the base64 pattern below for
     // `PolicyVersion`. The rows span three shapes and two members, so the rule is about a
-    // pattern clause and not about one member.
+    // pattern clause and not about one member. A member typed `CollectionName` reports the
+    // class its own validator applies instead, which `tests/all/reported_pattern.rs` owns.
     let rows: [(&str, &str, Value, &str, &str, &str); 4] = [
         (
-            "a collection name outside CollectionName",
+            "a collection group name beside a collection's own name",
             "CreateCollection",
-            json!({ "name": "1invalid-name" }),
-            "name",
-            "1invalid-name",
+            json!({ "name": "valid-collection", "collectionGroupName": "1invalid-group" }),
+            "collectionGroupName",
+            "1invalid-group",
             "[a-z][a-z0-9-]+",
         ),
         (
