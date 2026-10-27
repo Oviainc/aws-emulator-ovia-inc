@@ -186,13 +186,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name carries the modelled length and pattern, so the centralized walk
         // refused anything outside them before this body ran. What is left is
         // what the model cannot express: the bundle must name a plan this service
-        // publishes, the caller-sized tag list must be within its bound, and the
+        // still offers, the caller-sized tag list must be within its bound, and the
         // name must still be free in this region. Each is checked BEFORE the
         // first write, so a refused request creates nothing.
-        let bundle = crate::state::bucket_bundle_spec(&input.bundle_id).ok_or_else(|| {
+        let bundle = crate::state::applicable_bucket_bundle(&input.bundle_id).ok_or_else(|| {
             invalid(format!(
-                "bundleId '{}' is not a bucket bundle this service offers; use GetBucketBundles \
-                 to list the bundle IDs you can specify",
+                "bundleId '{}' is not an active bucket bundle this service offers; use \
+                 GetBucketBundles to list the bundle IDs you can specify",
                 input.bundle_id
             ))
         })?;

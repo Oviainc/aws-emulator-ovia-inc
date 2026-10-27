@@ -633,6 +633,8 @@ pub const OPERATION_TYPE_DELETE_BUCKET: &str = "DeleteBucket";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_UPDATE_BUCKET: &str = "UpdateBucket";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_UPDATE_BUCKET_BUNDLE: &str = "UpdateBucketBundle";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK: &str = "CreateDisk";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_ATTACH_DISK: &str = "AttachDisk";
@@ -1586,6 +1588,34 @@ pub fn bucket_bundle_spec(bundle_id: &str) -> Option<BucketBundleSpec> {
         .iter()
         .find(|spec| spec.bundle_id == bundle_id)
         .copied()
+}
+
+/// The plan out of `specs` that a bucket may be PUT ON — created on, or moved
+/// onto — or `None` when `bundle_id` names none.
+///
+/// A plan qualifies when the catalog holds it and it is still active:
+/// `BucketBundle$isActive` is what says a bundle can be used — "Indicates
+/// whether the bundle is active. Use for a new or existing bucket." — so a
+/// retired plan is reportable (and still resolves for a bucket already running
+/// on it, see [`bucket_bundle_spec`]) without being one a request can name.
+///
+/// Taking the catalog as an argument is what lets this rule be exercised against
+/// a catalog that holds a retired plan, which the published one does not yet.
+pub fn applicable_bucket_bundle_in(
+    specs: &[BucketBundleSpec],
+    bundle_id: &str,
+) -> Option<BucketBundleSpec> {
+    specs
+        .iter()
+        .find(|spec| spec.bundle_id == bundle_id && spec.is_active)
+        .copied()
+}
+
+/// The plan a bucket may be put on, out of this service's published catalog:
+/// [`applicable_bucket_bundle_in`] over [`BUCKET_BUNDLE_SPECS`]. The one owner of
+/// that rule, which `CreateBucket` and `UpdateBucketBundle` both ask.
+pub fn applicable_bucket_bundle(bundle_id: &str) -> Option<BucketBundleSpec> {
+    applicable_bucket_bundle_in(BUCKET_BUNDLE_SPECS, bundle_id)
 }
 
 // ---------------------------------------------------------------------------
