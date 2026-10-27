@@ -135,6 +135,13 @@ impl From<CreateWorkspaceInstanceErrorModeled> for CreateWorkspaceInstanceError 
 ///   the modelled `^([a-z0-9-]+)\.([a-z0-9]+)$` admits any `<family>.<size>` name,
 ///   including families and sizes AWS offers nowhere. The whole member is looked up as
 ///   one key, so nothing here splits, indexes or counts a caller value;
+/// * a placement names WHERE the instance is launched, and the instance is launched in
+///   the Region the call was signed for, so `Placement.AvailabilityZone` — when the
+///   request names one — must be a zone THAT Region publishes, through the crate's one
+///   zone rule ([`crate::state::require_zone_in_region`]); the modelled pattern admits
+///   every Region's zone names and letters a Region does not publish, and a placement
+///   this service kept but could not place the instance in would leave an instance no
+///   volume of its Region could ever be attached to;
 /// * the configuration asked for must be one that instance type publishes
 ///   (`SupportedInstanceConfigurations` — "the complete set of configuration options
 ///   available for this instance type"): the tenancy `Placement` asks for, and the
@@ -158,10 +165,11 @@ impl From<CreateWorkspaceInstanceErrorModeled> for CreateWorkspaceInstanceError 
 /// submitted value ([`crate::state::field_validation_failed`]).
 fn validate_launch_configuration(
     input: &CreateWorkspaceInstanceInput,
+    region: &str,
 ) -> Result<(), ValidationException> {
     use crate::state::{
-        configuration_tenancy, field_validation_failed, instance_type_spec, DEFAULT_BILLING_MODE,
-        PLACEMENT_TENANCY_DEFAULT,
+        configuration_tenancy, field_validation_failed, instance_type_spec,
+        require_zone_in_region, DEFAULT_BILLING_MODE, PLACEMENT_TENANCY_DEFAULT,
     };
 
     let managed_instance = &input.managed_instance;
@@ -201,6 +209,19 @@ fn validate_launch_configuration(
             "ManagedInstance.SubnetId must not be specified together with a subnet on \
              ManagedInstance.NetworkInterfaces: a launch names its subnet in one place",
         ));
+    }
+
+    // The zone the placement asks for has to be one the signed Region publishes: an
+    // instance is launched in ONE Region, so a zone of another Region, or a letter
+    // this one does not publish, names no place this service could launch it. A
+    // placement that names no zone leaves the service to choose one, which is what EC2
+    // does, so nothing is required here.
+    if let Some(zone) = managed_instance
+        .placement
+        .as_ref()
+        .and_then(|placement| placement.availability_zone.as_deref())
+    {
+        require_zone_in_region("ManagedInstance.Placement.AvailabilityZone", region, zone)?;
     }
 
     // The tenancy the placement asks for, which is shared hardware when the request
@@ -350,7 +371,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request neither replays an idempotency token nor is charged against the
         // quota, nothing is written for a request that is going to be refused, and no
         // store guard is held while the request is inspected.
-        validate_launch_configuration(&input)
+        validate_launch_configuration(&input, &region)
             .map_err(CreateWorkspaceInstanceErrorModeled::ValidationException)?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
