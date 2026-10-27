@@ -11,16 +11,16 @@
 //!
 //! It owns the channel records the same way ([`Channel`]): the destination, logging and
 //! encryption configuration `CreateChannel` resolves every documented default into, the ARN
-//! and id a channel is addressed by, and the `CREATING` -> `ACTIVE` transition the clock
-//! owes it ([`Channel::status`]).
+//! and id a channel is addressed by, and the `CREATING` -> `ACTIVE` and `UPDATING` ->
+//! `ACTIVE` transitions the clock owes it ([`Channel::status`]).
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     ChannelDescription, ChannelEncryptionConfiguration, ChannelLoggingConfiguration,
-    ChannelStreamDescription, ChannelStreamIdentifier, ChannelSummary, ChildShard, Consumer,
-    ConsumerDescription, EnhancedMetrics, HashKeyRange, Record, S3DestinationDescription,
+    ChannelStreamDescription, ChannelStreamIdentifier, ChannelSummary, ChildShard, CloudWatchLogs,
+    Consumer, ConsumerDescription, EnhancedMetrics, HashKeyRange, Record, S3DestinationDescription,
     S3TablesDestinationDescription, SequenceNumberRange, Shard, StreamDescription,
     StreamDescriptionSummary, StreamModeDetails, StreamSummary, Tag, WarmThroughputObject,
     METRICS_NAME_VALUES,
@@ -317,6 +317,10 @@ pub const CHANNEL_CREATING: &str = "CREATING";
 /// records" (`ChannelSummary$ChannelStatus`).
 pub const CHANNEL_ACTIVE: &str = "ACTIVE";
 
+/// A channel whose accepted configuration change is still being applied: "UPDATING - The
+/// channel configuration is being updated" (`ChannelDescription$ChannelStatus`).
+pub const CHANNEL_UPDATING: &str = "UPDATING";
+
 /// How long after the `CreateChannel` call a channel's `CREATING` -> `ACTIVE` transition
 /// falls due. A CHOSEN span, not an AWS-documented duration ("Creating a channel is an
 /// asynchronous operation. Upon receiving the request, Amazon Kinesis Data Streams returns
@@ -325,6 +329,17 @@ pub const CHANNEL_ACTIVE: &str = "ACTIVE";
 /// non-zero, so a caller that describes the channel straight after creating it still
 /// observes `CREATING`. The instant it falls due is stored on the record and never slept on.
 pub const CHANNEL_ACTIVATION_DELAY: Duration = Duration::from_secs(3);
+
+/// How long after an accepted `UpdateChannel` call the channel's `UPDATING` -> `ACTIVE`
+/// transition falls due. A CHOSEN span, not an AWS-documented duration ("Updating a channel
+/// is an asynchronous operation. Upon receiving the request, Amazon Kinesis Data Streams sets
+/// the channel to the UPDATING state and returns immediately. After the change is applied,
+/// Amazon Kinesis Data Streams sets the channel back to the ACTIVE state" names no value):
+/// it only has to be non-zero, so a caller that describes the channel straight after
+/// updating it still observes `UPDATING`, and a second change that overlaps the first is
+/// refused rather than served. The instant it falls due is stored on the record and never
+/// slept on.
+pub const CHANNEL_UPDATE_DELAY: Duration = Duration::from_secs(3);
 
 /// A channel that delivers to a general purpose bucket: "S3 - Delivery to a general purpose
 /// Amazon S3 bucket" (`ChannelSummary$ChannelDestinationType`).
@@ -1593,15 +1608,24 @@ pub struct Channel {
     pub logging_configuration: ChannelLoggingConfiguration,
     /// The tags the create carried.
     pub tags: HashMap<String, String>,
+    /// When the channel's `UPDATING` -> `ACTIVE` transition falls due, once a configuration
+    /// change has been accepted for it: "Upon receiving the request, Amazon Kinesis Data
+    /// Streams sets the channel to the UPDATING state and returns immediately. After the
+    /// change is applied, Amazon Kinesis Data Streams sets the channel back to the ACTIVE
+    /// state" (`UpdateChannel`). `None` on a channel no change has been accepted for.
+    pub updating_until: Option<SystemTime>,
 }
 
 impl Channel {
     /// The channel's status at `now`: `CREATING` until the transition the create armed falls
-    /// due, `ACTIVE` from then on. Derived from the stored instant, so two reads at the same
+    /// due, `UPDATING` until the one an accepted configuration change armed falls due,
+    /// `ACTIVE` from then on. Derived from the stored instants, so two reads at the same
     /// instant agree and no read has to write.
     pub fn status(&self, now: SystemTime) -> &'static str {
         if now < self.active_at {
             CHANNEL_CREATING
+        } else if self.updating_until.is_some_and(|due| now < due) {
+            CHANNEL_UPDATING
         } else {
             CHANNEL_ACTIVE
         }
@@ -1610,7 +1634,9 @@ impl Channel {
     /// Where the channel delivers, as `ChannelDestinationType` spells it: "S3 - Delivery to
     /// a general purpose Amazon S3 bucket", "S3_TABLES - Delivery to streaming tables on
     /// Apache Iceberg" (`ChannelSummary$ChannelDestinationType`). Derived from the stored
-    /// destination, exactly one of which a channel carries.
+    /// destination, exactly one of which a channel carries — which is also the one thing an
+    /// update cannot change: "You cannot change the destination ... of an existing channel"
+    /// (`UpdateChannel`).
     pub fn destination_type(&self) -> &'static str {
         if self.s3_tables_destination.is_some() {
             CHANNEL_DESTINATION_S3_TABLES
@@ -1942,6 +1968,15 @@ impl ComAmazonawsKinesisKinesis20131202State {
     pub fn channel_by_arn(&self, region: &str, arn: &str) -> Option<&Channel> {
         self.channels
             .values()
+            .find(|channel| channel.region == region && channel.arn == arn)
+    }
+
+    /// [`Self::channel_by_arn`] for a caller that WRITES the record it finds — the lookup a
+    /// configuration change makes, so the status it reads and the fields it writes belong to
+    /// one borrow of the store and no second change can slip between them.
+    pub fn channel_by_arn_mut(&mut self, region: &str, arn: &str) -> Option<&mut Channel> {
+        self.channels
+            .values_mut()
             .find(|channel| channel.region == region && channel.arn == arn)
     }
 
@@ -2452,6 +2487,40 @@ pub fn channel_already_exists_message(channel_name: &str) -> String {
     )
 }
 
+/// How an operation that needs a ready channel refuses one that is not ready yet: the rule
+/// `ResourceInUseException` publishes ("The resource is not available for this operation. For
+/// successful operation, the resource must be in the ACTIVE state"). Built FROM the request
+/// and the stored record, so the identifier and the status at fault name it.
+pub fn channel_not_active_message(identifier: &str, status: &str) -> String {
+    format!(
+        "channel {identifier} is in state {status}, not {CHANNEL_ACTIVE}; the channel must be \
+         {CHANNEL_ACTIVE} for this operation"
+    )
+}
+
+/// How an update refuses a request naming the destination the channel does NOT deliver to:
+/// "You cannot change the destination, source stream, record format, schema, encryption
+/// configuration, or service execution role of an existing channel" (`UpdateChannel`). Built
+/// FROM the request and the stored record, so the channel and the destination it delivers to
+/// name it.
+pub fn channel_destination_not_updatable_message(
+    identifier: &str,
+    destination_type: &str,
+) -> String {
+    format!(
+        "channel {identifier} delivers to the {destination_type} destination; you cannot \
+         change the destination of an existing channel"
+    )
+}
+
+/// How an update refuses a request that names nothing to update: an update "Updates the data
+/// freshness interval or the Amazon CloudWatch Logs configuration of an existing channel"
+/// (`UpdateChannel`), so one of the three updatable members has to be there. FIXED text for
+/// this refusal — it carries no request- or state-derived value.
+pub const CHANNEL_UPDATE_REQUIRED_MESSAGE: &str =
+    "Specify at least one of S3DestinationConfiguration, S3TablesDestinationConfiguration or \
+     LoggingConfiguration to update.";
+
 /// How a create refuses a `StreamConfigurationList` naming more source streams than one
 /// channel carries: "Currently, one stream is supported per channel"
 /// (`CreateChannelInput$StreamConfigurationList`). Built FROM the request, so the count at
@@ -2619,6 +2688,43 @@ const CHANNEL_ID_DIGEST_BYTES: usize = 16;
 /// to /aws/kinesis/{channelName}/{channelId}" (`CloudWatchLogs$LogGroupName`).
 pub fn channel_log_group_name(channel_name: &str, channel_id: &str) -> String {
     format!("/aws/kinesis/{channel_name}/{channel_id}")
+}
+
+/// The CloudWatch Logs configuration a channel REPORTS for the settings a request states:
+/// the single place the documented default names are resolved, for the create that first
+/// states them and the update that re-states them alike.
+///
+/// A channel that logs and names neither takes the documented defaults ([`channel_log_group_name`],
+/// [`DEFAULT_CHANNEL_LOG_STREAM_NAME`]); a channel that logs nothing needs no default, so the
+/// names are reported exactly as they arrived.
+pub fn resolved_channel_logging(
+    enabled: bool,
+    log_group_name: Option<String>,
+    log_stream_name: Option<String>,
+    channel_name: &str,
+    channel_id: &str,
+) -> ChannelLoggingConfiguration {
+    if !enabled {
+        return ChannelLoggingConfiguration {
+            cloud_watch_logs: CloudWatchLogs {
+                enabled: false,
+                log_group_name,
+                log_stream_name,
+            },
+        };
+    }
+    ChannelLoggingConfiguration {
+        cloud_watch_logs: CloudWatchLogs {
+            enabled: true,
+            log_group_name: Some(
+                log_group_name
+                    .unwrap_or_else(|| channel_log_group_name(channel_name, channel_id)),
+            ),
+            log_stream_name: Some(
+                log_stream_name.unwrap_or_else(|| DEFAULT_CHANNEL_LOG_STREAM_NAME.to_string()),
+            ),
+        },
+    }
 }
 
 /// Whether `key_id` is shaped like a KMS key identifier at all.
