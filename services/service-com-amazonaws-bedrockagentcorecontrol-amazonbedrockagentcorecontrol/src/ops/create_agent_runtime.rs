@@ -6,10 +6,13 @@
 //! configuration the caller supplied, and the `CREATING` -> `READY` transition the
 //! clock owes it. Every later read of the runtime comes from that record.
 //!
-//! The runtime RUNS AS the execution role the caller names, so that role is resolved
-//! against IAM FIRST — a request naming a role that does not exist in this account, or
-//! whose trust policy does not let this service assume it, is refused with the
-//! operation's modelled validation error and nothing is stored.
+//! The runtime RUNS the artifact the caller names, so a `codeConfiguration` artifact's
+//! object-storage location is resolved FIRST — a request naming an object that is not
+//! there is refused with the operation's modelled validation error and nothing is
+//! stored — and it RUNS AS the execution role the caller names, so that role is
+//! resolved against IAM next: a request naming a role that does not exist in this
+//! account, or whose trust policy does not let this service assume it, is refused the
+//! same way.
 //!
 //! ## Shape of an operation
 //!
@@ -212,6 +215,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             replayed_output(&state.lock(), Self::NAME, input.client_token.as_deref(), now)
         {
             return Ok(replayed);
+        }
+
+        // The runtime RUNS the code its artifact names, so a `codeConfiguration`
+        // artifact's object-storage location is resolved before anything is
+        // written: a location object storage holds no object at is the
+        // operation's modelled validation error and no runtime is stored.
+        if crate::state::code_object_is_absent(ctx, &region, &input.agent_runtime_artifact).await {
+            return Err(CreateAgentRuntimeErrorModeled::ValidationException(
+                crate::state::code_object_not_found(),
+            )
+            .into());
         }
 
         // The runtime RUNS AS the role the caller names, so the role is resolved
