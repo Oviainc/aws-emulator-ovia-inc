@@ -1037,13 +1037,12 @@ async fn a_reserved_tag_key_is_refused_by_every_create_that_accepts_tags() {
         );
     }
 
-    // Nothing the refused creates named is in the store: the resource types whose listing
-    // this service implements report only the resource their accepted create made.
-    // (`ListEncoderConfigurations` is still a stub, so the encoder row is covered by its
-    // create's answer above.)
+    // Nothing the refused creates named is in the store: each resource type's listing
+    // reports only the resource their accepted create made.
     for (operation, member_name) in [
         ("ListStages", "stages"),
         ("ListIngestConfigurations", "ingestConfigurations"),
+        ("ListEncoderConfigurations", "encoderConfigurations"),
         ("ListStorageConfigurations", "storageConfigurations"),
     ] {
         let reply = realtime.call(operation, &json!({})).await;

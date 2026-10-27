@@ -336,14 +336,13 @@ fn listed_count(response: &Value, member: &str) -> usize {
 /// listing's own region.
 ///
 /// The rows are the resource kinds this service both mints and lists — a stage, a storage
-/// configuration, an ingest configuration and a composition — each with the listing that
-/// reports it. (`ListEncoderConfigurations` is still a 501 stub, so an encoder
-/// configuration is covered by the by-ARN table below instead.) The two regions differ per
-/// row, so the rule is exercised over more than one pair.
+/// configuration, an encoder configuration, an ingest configuration and a composition —
+/// each with the listing that reports it. The two regions differ per row, so the rule is
+/// exercised over more than one pair.
 #[tokio::test]
 async fn a_listing_reports_only_the_resources_of_the_region_it_was_processed_in() {
     // (case, kind, listing, the page member holding the summaries, home region, other)
-    let rows: [(&str, Kind, &str, &str, &str, &str); 4] = [
+    let rows: [(&str, Kind, &str, &str, &str, &str); 5] = [
         (
             "stages",
             Kind::Stage,
@@ -351,6 +350,14 @@ async fn a_listing_reports_only_the_resources_of_the_region_it_was_processed_in(
             "stages",
             "us-east-1",
             "eu-west-1",
+        ),
+        (
+            "encoder configurations",
+            Kind::EncoderConfiguration,
+            "ListEncoderConfigurations",
+            "encoderConfigurations",
+            "eu-west-1",
+            "ap-southeast-2",
         ),
         (
             "storage configurations",

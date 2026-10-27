@@ -45,6 +45,14 @@ const UNTOUCHED_MEMBERS: [&str; 6] = [
     "tags",
 ];
 
+/// A workspace in ANOTHER account — the cross-account case `roleConfiguration` exists to
+/// enable — so this store holds nothing that could contradict it and the reference is taken
+/// as given. Used by the row that updates every member at once, keeping that row about
+/// per-member replacement; whether a destination's reference RESOLVES is the rule asserted
+/// in [`crate::scraper_destination_resolution`].
+const CROSS_ACCOUNT_WORKSPACE_ARN: &str =
+    "arn:aws:aps:us-west-2:123456789012:workspace/ws-99999999-9999-9999-9999-999999999999";
+
 /// The wire form of a `ScrapeConfiguration`: a union whose `configurationBlob` member is a
 /// blob, and `restJson1` carries a blob as base-64 — encoded with the runtime's own
 /// encoder, so no second encoding rule is written here.
@@ -198,10 +206,7 @@ async fn an_update_replaces_the_members_it_carries_and_leaves_the_rest() {
                 "scrapeConfiguration": scrape_configuration_json("scrape_configs: []\n"),
                 "destination": {
                     "ampConfiguration": {
-                        "workspaceArn": format!(
-                            "arn:aws:aps:us-west-2:{}:workspace/ws-99999999-9999-9999-9999-999999999999",
-                            engine::emulator_account_id()
-                        ),
+                        "workspaceArn": CROSS_ACCOUNT_WORKSPACE_ARN,
                     },
                 },
                 "roleConfiguration": role_configuration_json(),
@@ -217,10 +222,7 @@ async fn an_update_replaces_the_members_it_carries_and_leaves_the_rest() {
                     "destination",
                     serde_json::json!({
                         "ampConfiguration": {
-                            "workspaceArn": format!(
-                                "arn:aws:aps:us-west-2:{}:workspace/ws-99999999-9999-9999-9999-999999999999",
-                                engine::emulator_account_id()
-                            ),
+                            "workspaceArn": CROSS_ACCOUNT_WORKSPACE_ARN,
                         },
                     }),
                 ),

@@ -4,11 +4,12 @@
 //! (`awsJson1_0`) through the same multi-service router the emulator boots.
 //!
 //! The rule under test: a summary is the recommendation catalog aggregated along
-//! one `groupBy` dimension — one group per distinct value of that dimension,
-//! carrying the number of recommendations that fall under it and what they save
-//! per month together — while `estimatedTotalDedupedSavings` is that total taken
-//! over one recommendation per resource, so a resource several recommendation
-//! types cover is counted once.
+//! one `groupBy` dimension over ONE recommendation per resource — one group per
+//! distinct value of that dimension, carrying the number of those
+//! recommendations that fall under it and what they save per month together —
+//! so a resource several recommendation types cover contributes its best saving
+//! once, to both a group's `estimatedMonthlySavings` and the response's
+//! `estimatedTotalDedupedSavings`.
 //!
 //! Every case checks that rule against the SAME rows read through
 //! `ListRecommendations`, aggregated by the test: the oracle is the other view of
@@ -168,11 +169,13 @@ async fn set_mode(router: &MultiServiceRouter, mode: &str) {
 
 /// Every grouping dimension aggregates the catalog along the member it names:
 /// one group per distinct value, counting the recommendations under it and
-/// totalling what they save, with the request's `groupBy` echoed back.
+/// totalling what they save, with the request's `groupBy` echoed back. The rows
+/// aggregated are one per resource, which is the view
+/// `ListRecommendations` serves without `includeAllRecommendations`.
 #[tokio::test]
 async fn a_summary_aggregates_the_catalog_along_the_grouping_dimension() {
     let router = enrolled_router().await;
-    let items = listed(&router, &json!({}), false).await;
+    let items = listed(&router, &json!({}), true).await;
 
     for (group_by, member) in GROUPINGS {
         let payload = ok(
@@ -202,7 +205,7 @@ async fn a_summary_aggregates_the_catalog_along_the_grouping_dimension() {
             items[0]["currencyCode"].as_str(),
             "case groupBy {group_by:?}: expected the catalog's currency, got {payload}"
         );
-        // Every recommendation lands in exactly one group.
+        // Every summarised recommendation lands in exactly one group.
         let counted: i64 = actual.iter().map(|group| group.count).sum();
         assert_eq!(
             counted,
@@ -211,12 +214,22 @@ async fn a_summary_aggregates_the_catalog_along_the_grouping_dimension() {
             items.len()
         );
         // A group's savings is the sum of its rows', so the groups together are
-        // the whole (not de-duped) saving.
+        // the de-duped saving the same answer reports overall.
         let grouped: i64 = actual.iter().map(|group| group.savings_cents).sum();
         assert_eq!(
             grouped,
             total_savings(&items),
-            "case groupBy {group_by:?}: expected the listed savings in total, got {payload}"
+            "case groupBy {group_by:?}: expected the de-duped savings in total, got {payload}"
+        );
+        assert_eq!(
+            grouped,
+            cents(
+                payload["estimatedTotalDedupedSavings"]
+                    .as_f64()
+                    .unwrap_or_default()
+            ),
+            "case groupBy {group_by:?}: the groups must total what the same answer \
+             reports overall, got {payload}"
         );
     }
 }
@@ -281,6 +294,87 @@ async fn the_total_is_deduped_across_recommendation_types() {
     }
 }
 
+/// A group counts a resource once. `RecommendationSummary` is modelled as "the
+/// summary of rightsizing recommendations, including de-duped savings from all
+/// types of recommendations" (`smithy_query(query="shape",
+/// shape="RecommendationSummary")`), so a resource several recommendation types
+/// cover contributes only the recommendation a caller would adopt — the one that
+/// saves the most, which is the row `ListRecommendations` keeps without
+/// `includeAllRecommendations` — and the groups therefore total exactly the
+/// `estimatedTotalDedupedSavings` of the same answer.
+///
+/// The table spans every grouping dimension (including the ones that separate a
+/// resource's alternatives into different groups, such as `ActionType` and
+/// `RecommendedResourceType`) and each `savingsEstimationMode` preference, under
+/// which a different alternative can be the best one. The discounted mode is
+/// reachable only where the organization has made its member accounts' discounts
+/// visible (`preference_gates`), so the account is the organization's management
+/// account with that preference set.
+#[tokio::test]
+async fn a_group_counts_a_resource_covered_by_several_types_once() {
+    let router = enrolled_router_with_discounts_visible().await;
+
+    // (case, the mode to store first) — the absent preference is the store's
+    // initial value, read under the mode the service applies by default.
+    let modes: [(&str, Option<&str>); 3] = [
+        ("no stored preference", None),
+        ("BeforeDiscounts", Some("BeforeDiscounts")),
+        ("AfterDiscounts", Some("AfterDiscounts")),
+    ];
+
+    for (case, mode) in modes {
+        if let Some(mode) = mode {
+            set_mode(&router, mode).await;
+        }
+        let all = listed(&router, &json!({}), false).await;
+        let deduped = listed(&router, &json!({}), true).await;
+        assert!(
+            deduped.len() < all.len(),
+            "case {case:?}: the catalog must hold a resource with several recommendations"
+        );
+
+        for (group_by, member) in GROUPINGS {
+            let payload = ok(
+                &router,
+                "ListRecommendationSummaries",
+                &json!({"groupBy": group_by}),
+            )
+            .await;
+            let actual = groups(&payload);
+            let expected = expected_groups(&deduped, member);
+            assert_eq!(
+                actual, expected,
+                "case {case:?} groupBy {group_by:?}: expected {expected:?}, got {payload}"
+            );
+
+            let grouped: i64 = actual.iter().map(|group| group.savings_cents).sum();
+            assert_eq!(
+                grouped,
+                cents(
+                    payload["estimatedTotalDedupedSavings"]
+                        .as_f64()
+                        .unwrap_or_default()
+                ),
+                "case {case:?} groupBy {group_by:?}: the groups must total the de-duped \
+                 savings the same answer reports, got {payload}"
+            );
+            assert!(
+                grouped < total_savings(&all),
+                "case {case:?} groupBy {group_by:?}: a group must drop the alternative \
+                 recommendations for the shared resource, got {payload}"
+            );
+            let counted: i64 = actual.iter().map(|group| group.count).sum();
+            assert_eq!(
+                counted,
+                deduped.len() as i64,
+                "case {case:?} groupBy {group_by:?}: expected {} recommendations across \
+                 the groups, got {payload}",
+                deduped.len()
+            );
+        }
+    }
+}
+
 /// Each `filter` class narrows the rows before they are grouped, so a filtered
 /// summary is the summary of exactly the rows the same filter selects from
 /// `ListRecommendations`.
@@ -307,7 +401,6 @@ async fn a_filter_narrows_the_rows_before_they_are_grouped() {
     ];
 
     for filter in &filters {
-        let items = listed(&router, filter, false).await;
         let deduped = listed(&router, filter, true).await;
 
         for (group_by, member) in GROUPINGS {
@@ -317,7 +410,7 @@ async fn a_filter_narrows_the_rows_before_they_are_grouped() {
                 &json!({"groupBy": group_by, "filter": filter}),
             )
             .await;
-            let expected = expected_groups(&items, member);
+            let expected = expected_groups(&deduped, member);
             let actual = groups(&payload);
             assert_eq!(
                 actual, expected,

@@ -9557,6 +9557,24 @@ pub const KEY_GROUP_ALREADY_EXISTS_MESSAGE: &str =
     "A key group with this name already exists. You must provide a unique name. To modify \
      an existing key group, use UpdateKeyGroup.";
 
+/// The modelled `NoSuchResource` (HTTP 404) for a key group id the store does not hold.
+///
+/// `NoSuchResource` is the one error shape every operation of the key group surface models
+/// for a missing resource, and CloudFront words it for the resource that operation
+/// ADDRESSES — a key group, here — rather than with the generic sentence the tagging
+/// surface answers for an arbitrary ARN ([`no_such_resource`]). The sentence states a
+/// property of the store, so nothing from the request belongs in it.
+pub fn no_such_key_group() -> NoSuchResource {
+    NoSuchResource {
+        message: Some(NO_SUCH_KEY_GROUP_MESSAGE.to_string()),
+    }
+}
+
+/// The key group surface's `NoSuchResource` message, in the form CloudFront answers a
+/// missing named resource with — "The specified <resource> does not exist.", as
+/// [`NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE`] and [`NO_SUCH_CACHE_POLICY_MESSAGE`] carry it.
+pub const NO_SUCH_KEY_GROUP_MESSAGE: &str = "The specified key group does not exist.";
+
 /// The modelled `TooManyKeyGroups` (HTTP 400) for a create that would take the store past
 /// [`MAX_KEY_GROUPS`].
 ///
