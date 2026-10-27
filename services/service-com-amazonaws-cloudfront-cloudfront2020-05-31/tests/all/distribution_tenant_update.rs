@@ -63,7 +63,10 @@ use crate::web_acl_association::{Stated, WEB_ACLS};
 
 /// `PUT /2020-05-31/distribution-tenant/{Id}`: the update travels in the request document,
 /// the version in the `If-Match` header.
-async fn update_tenant(
+///
+/// `pub(crate)` so the sibling connection group delete suite moves a tenant off the group it
+/// routes through over this one wire path rather than growing a copy of it.
+pub(crate) async fn update_tenant(
     router: &MultiServiceRouter,
     id: &str,
     body: &str,
@@ -80,7 +83,7 @@ async fn update_tenant(
 }
 
 /// Wrap `members` in the request document an `UpdateDistributionTenant` carries.
-fn update_xml(members: &str) -> String {
+pub(crate) fn update_xml(members: &str) -> String {
     format!(
         "<UpdateDistributionTenantRequest \
          xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">{members}\
