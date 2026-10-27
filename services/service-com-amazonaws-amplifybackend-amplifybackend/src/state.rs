@@ -41,8 +41,44 @@ pub const RESOURCE_TYPE_BACKEND_AUTH: &str = "backend-auth";
 /// [`ERROR_MESSAGE_PREFIX`] and no call site can forget it.
 pub fn not_found(resource_type: &str, sentence: impl AsRef<str>) -> NotFoundException {
     NotFoundException {
-        message: Some(format!("{ERROR_MESSAGE_PREFIX}{}", sentence.as_ref())),
+        message: Some(prefixed(sentence)),
         resource_type: Some(resource_type.to_string()),
+    }
+}
+
+/// `sentence` behind this service's fixed [`ERROR_MESSAGE_PREFIX`]: the ONE place the
+/// prefix is written, so a message cannot reach the wire with it missing, doubled or
+/// spelled a second way.
+///
+/// Every builder below renders through this, as does the pre-handler refusal in
+/// `crate::service`, which words a `Refused` rather than a modelled payload and so cannot
+/// use one of the builders.
+pub fn prefixed(sentence: impl AsRef<str>) -> String {
+    format!("{ERROR_MESSAGE_PREFIX}{}", sentence.as_ref())
+}
+
+/// The modelled `BadRequestException` payload for a request this service will not read as
+/// properly formed — "An error returned if a request is not formed properly".
+///
+/// `sentence` is the service's own sentence, WITHOUT the prefix, which this function adds,
+/// for the reason [`not_found`] does: a handler passes the SENTENCE and never the whole
+/// message, so no client-input refusal of this service reaches the wire without
+/// [`ERROR_MESSAGE_PREFIX`].
+pub fn bad_request(sentence: impl AsRef<str>) -> BadRequestException {
+    BadRequestException {
+        message: Some(prefixed(sentence)),
+    }
+}
+
+/// The modelled `GatewayTimeoutException` payload for a failure on this service's OWN side
+/// — "An error returned if there's a temporary issue with the service".
+///
+/// `sentence` is the service's own sentence, WITHOUT the prefix, which this function adds:
+/// the prefix is a property of this service's message channel and not of one status class,
+/// so a server-side failure is worded like every other failure it renders.
+pub fn gateway_timeout(sentence: impl AsRef<str>) -> GatewayTimeoutException {
+    GatewayTimeoutException {
+        message: Some(prefixed(sentence)),
     }
 }
 
@@ -52,10 +88,17 @@ pub fn not_found(resource_type: &str, sentence: impl AsRef<str>) -> NotFoundExce
 /// "An error occurred while processing your request: " followed by the service's own
 /// sentence, whatever the error code — "Invalid appId passed.", "App <appId> not found.",
 /// "BackendEnvironment <name> does not exist." — and where that sentence names a resource
-/// it names it from the request. The prefix is therefore applied by the message builders
-/// themselves ([`not_found`], [`resource_not_found`], [`limit_exceeded`],
-/// [`bound_identifier`], and the fixed-message refusals below), so a handler passes the
-/// SENTENCE and never the whole message.
+/// it names it from the request. The prefix is written in ONE place, [`prefixed`], and
+/// reached through the message builders ([`not_found`], [`resource_not_found`],
+/// [`bad_request`], [`gateway_timeout`], [`limit_exceeded`], [`bound_identifier`], and the
+/// fixed-message refusals below), so a handler passes the SENTENCE and never the whole
+/// message.
+///
+/// It is a property of this service's error CHANNEL and not of one status class or one
+/// error shape: a client-input refusal, a missing resource, a bound this emulator holds and
+/// a failure on the service's own side are all worded this way, so every modelled payload
+/// this crate constructs comes from one of those builders and no call site builds a message
+/// of its own.
 pub const ERROR_MESSAGE_PREFIX: &str = "An error occurred while processing your request: ";
 
 /// The sentence a lookup of a backend environment that does not exist answers with:
@@ -101,11 +144,10 @@ pub fn environment_name_is_valid(name: &str) -> bool {
 /// The sentence states the RULE and quotes nothing back: it is the same text for every
 /// name that breaks it, which is what the recording shows.
 pub fn environment_name_message() -> String {
-    format!(
-        "{ERROR_MESSAGE_PREFIX}Environment name must be between \
-         {ENVIRONMENT_NAME_MIN_CHARS} and {ENVIRONMENT_NAME_MAX_CHARS} characters, \
-         and lowercase only."
-    )
+    prefixed(format!(
+        "Environment name must be between {ENVIRONMENT_NAME_MIN_CHARS} and \
+         {ENVIRONMENT_NAME_MAX_CHARS} characters, and lowercase only."
+    ))
 }
 
 /// Refuse the request unless `name` is a backend environment name this service may create
@@ -133,7 +175,7 @@ pub fn require_environment_name<E>(name: &str) -> Result<(), crate::scaffolded::
 /// app, which the service will not echo back, so the same sentence answers every
 /// unregistered app id.
 pub fn invalid_app_id_message() -> String {
-    format!("{ERROR_MESSAGE_PREFIX}Invalid appId passed.")
+    prefixed("Invalid appId passed.")
 }
 
 /// The message an operation AWS has withdrawn from SDK and AWS CLI callers IN FAVOUR OF
@@ -148,10 +190,10 @@ pub fn invalid_app_id_message() -> String {
 /// values read from the request, so nothing here is built from the request either. The
 /// status (400) and the error code (`ValidationException`) come from the same recordings.
 pub fn amplify_cli_only_message() -> String {
-    format!(
-        "{ERROR_MESSAGE_PREFIX}Operation not supported through SDK/AWS CLI. \
+    prefixed(
+        "Operation not supported through SDK/AWS CLI. \
          Please use \"amplify pull --appId <appId> --envName staging \
-         && amplify add env && amplify push\" from Amplify CLI"
+         && amplify add env && amplify push\" from Amplify CLI",
     )
 }
 
@@ -172,9 +214,9 @@ pub fn amplify_cli_only<E>() -> crate::scaffolded::Scaffolded<E> {
 /// `ValidationException` and this fixed text. The status and the code are the
 /// requirement; the sentence is the one the recordings of this family carry.
 pub fn studio_only_message() -> String {
-    format!(
-        "{ERROR_MESSAGE_PREFIX}Operation not supported through SDK/AWS CLI. \
-         Please use Amplify Studio"
+    prefixed(
+        "Operation not supported through SDK/AWS CLI. \
+         Please use Amplify Studio",
     )
 }
 
@@ -208,10 +250,7 @@ pub fn studio_only<E>() -> crate::scaffolded::Scaffolded<E> {
 /// `sentence` is the service's own sentence, WITHOUT the prefix, which this function
 /// adds: a caller passes "no storage resource … exists …", never the whole message.
 pub fn resource_not_found<E>(sentence: impl AsRef<str>) -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::resource_not_found(format!(
-        "{ERROR_MESSAGE_PREFIX}{}",
-        sentence.as_ref()
-    ))
+    crate::scaffolded::Scaffolded::resource_not_found(prefixed(sentence))
 }
 
 /// The sentence a JOB READ whose address resolves to no job is refused with, WITHOUT the
@@ -413,13 +452,15 @@ pub fn require_known_app<Eng: Send + Sync + 'static, E>(
     }
 }
 
+/// The sentence a request that could not reach this service's store at all is answered
+/// with, WITHOUT the prefix [`gateway_timeout`] adds.
+pub const STORE_UNAVAILABLE_SENTENCE: &str = "The AmplifyBackend store is unavailable.";
+
 /// The modelled server-side failure for a request that could not reach this service's
 /// store at all. `GatewayTimeoutException` is the only server-side error every
 /// AmplifyBackend operation declares, so it is what an unreachable store answers with.
 pub fn store_unavailable() -> GatewayTimeoutException {
-    GatewayTimeoutException {
-        message: Some("the AmplifyBackend store is unavailable".to_string()),
-    }
+    gateway_timeout(STORE_UNAVAILABLE_SENTENCE)
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +594,7 @@ pub const LIMIT_TYPE_CHALLENGE_TOKENS: &str = "challenge-tokens-per-app";
 pub fn limit_exceeded(limit_type: &str, sentence: impl AsRef<str>) -> TooManyRequestsException {
     TooManyRequestsException {
         limit_type: Some(limit_type.to_string()),
-        message: Some(format!("{ERROR_MESSAGE_PREFIX}{}", sentence.as_ref())),
+        message: Some(prefixed(sentence)),
     }
 }
 
@@ -567,12 +608,9 @@ pub fn limit_exceeded(limit_type: &str, sentence: impl AsRef<str>) -> TooManyReq
 pub fn bound_identifier(member: &str, value: &str) -> Result<(), BadRequestException> {
     let chars = value.chars().count();
     if chars > MAX_IDENTIFIER_CHARS {
-        return Err(BadRequestException {
-            message: Some(format!(
-                "{ERROR_MESSAGE_PREFIX}{member} may be at most {MAX_IDENTIFIER_CHARS} \
-                 characters, got {chars}."
-            )),
-        });
+        return Err(bad_request(format!(
+            "{member} may be at most {MAX_IDENTIFIER_CHARS} characters, got {chars}."
+        )));
     }
     Ok(())
 }
@@ -734,7 +772,8 @@ impl ChallengeToken {
 /// somebody else's challenge code.
 ///
 /// `None` when the store minted no session-token secret, which leaves `CreateToken` to
-/// refuse rather than report a code it made up.
+/// refuse rather than report a code it made up — with
+/// [`CHALLENGE_CODE_UNAVAILABLE_SENTENCE`].
 pub fn mint_challenge_token(
     store: &::emulator_server::CredentialStore,
 ) -> Option<(String, String)> {
@@ -748,6 +787,12 @@ pub fn mint_challenge_token(
     let _ = store.delete(&minted.id);
     Some((minted.id, challenge_code?))
 }
+
+/// The sentence a `CreateToken` the credential store minted no challenge code for is
+/// answered with, WITHOUT the prefix [`gateway_timeout`] adds. A failure on this service's
+/// own side, like [`STORE_UNAVAILABLE_SENTENCE`]: nothing in the request decides it.
+pub const CHALLENGE_CODE_UNAVAILABLE_SENTENCE: &str =
+    "No challenge code could be minted for this request.";
 
 /// Per-service state for com-amazonaws-amplifybackend-amplifybackend. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
