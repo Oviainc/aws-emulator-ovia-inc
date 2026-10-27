@@ -23,7 +23,8 @@ use smithy_server_runtime::{Violation, ViolationKind};
 use crate::ops::types::{
     AutoParticipantRecordingConfiguration, Composition, CompositionSummary, ConflictException,
     CreateIngestConfigurationOutput, Destination, DestinationConfiguration, DestinationDetail,
-    DestinationSummary, EncoderConfiguration, Event, GridConfiguration, IngestConfiguration,
+    DestinationSummary, EncoderConfiguration, EncoderConfigurationSummary, Event,
+    GridConfiguration, IngestConfiguration,
     IngestConfigurationSummary, InternalServerException, LayoutConfiguration, Participant,
     ParticipantRecordingHlsConfiguration, ParticipantReplica, ParticipantSummary,
     ParticipantThumbnailConfiguration, ParticipantToken, PipConfiguration,
@@ -509,6 +510,12 @@ pub fn effective_video(requested: Option<Video>) -> Video {
     }
 }
 
+/// Page size `ListEncoderConfigurations` uses when the request omits `maxResults`.
+///
+/// The model documents it on `ListEncoderConfigurationsRequest$maxResults`: "Maximum
+/// number of results to return. Default: 100."
+pub const DEFAULT_ENCODER_CONFIGURATION_PAGE_SIZE: usize = 100;
+
 /// Storage configurations this emulator keeps for one engine. Not an AWS quota — this
 /// emulator's own resource guard on the one store `CreateStorageConfiguration` grows,
 /// set the same way [`MAX_STAGES`] is and answered with the same modelled
@@ -882,6 +889,10 @@ const PARTICIPANT_EVENT_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-participant-even
 /// token issued by one listing names no position in another and is refused there.
 const COMPOSITION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-composition-after:";
 
+/// The same marker for a `ListEncoderConfigurations` page, kept distinct from the others
+/// so a token issued by one listing names no position in another and is refused there.
+const ENCODER_CONFIGURATION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-encoder-configuration-after:";
+
 /// The same marker for a `ListIngestConfigurations` page, kept distinct from the others
 /// so a token issued by one listing names no position in another and is refused there.
 const INGEST_CONFIGURATION_PAGE_TOKEN_PREFIX: &str = "ivs-realtime-ingest-configuration-after:";
@@ -1165,8 +1176,8 @@ pub struct EncoderConfigurationRecord {
     /// ([`effective_video`]).
     pub video: Video,
     pub tags: HashMap<String, String>,
-    /// Creation order, the stable key a listing of encoder configurations pages over
-    /// (`ListEncoderConfigurations`, its own gap issue), set the way a stage's is.
+    /// Creation order, and the stable key `ListEncoderConfigurations` pages over — the
+    /// same role [`StageRecord::sequence`] plays for `ListStages`.
     pub sequence: u64,
 }
 
@@ -1179,6 +1190,21 @@ impl EncoderConfigurationRecord {
             video: Some(self.video.clone()),
             // Always reported, empty map included: `tags` is how a caller reads the tags
             // back, exactly as on a stage.
+            tags: Some(self.tags.clone()),
+        }
+    }
+
+    /// The modelled `EncoderConfigurationSummary` a page of this record reports.
+    ///
+    /// `EncoderConfigurationSummary` carries three of the four members
+    /// `EncoderConfiguration` does — `arn`, `name` and `tags`, but not `video`
+    /// (`smithy_query(query="shape",shape="EncoderConfiguration,EncoderConfigurationSummary")`)
+    /// — and each is projected off this one record, so a summary and a read answer alike
+    /// on every member both carry.
+    pub fn to_summary(&self) -> EncoderConfigurationSummary {
+        EncoderConfigurationSummary {
+            arn: self.arn.clone(),
+            name: self.name.clone(),
             tags: Some(self.tags.clone()),
         }
     }
@@ -3136,6 +3162,19 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
         configurations
     }
 
+    /// Every encoder configuration of `region` in creation order — the order
+    /// `ListEncoderConfigurations` pages over, so a configuration created or deleted
+    /// mid-pagination cannot shift a later page onto an already-returned one.
+    pub fn encoder_configurations_in_order(&self, region: &str) -> Vec<&EncoderConfigurationRecord> {
+        let mut configurations: Vec<&EncoderConfigurationRecord> = self
+            .encoder_configurations
+            .values()
+            .filter(|record| in_request_region(&record.arn, region))
+            .collect();
+        configurations.sort_by_key(|record| record.sequence);
+        configurations
+    }
+
     /// Every storage configuration of `region` in creation order — the order
     /// `ListStorageConfigurations` pages over.
     pub fn storage_configurations_in_order(
@@ -4045,6 +4084,20 @@ pub fn encode_storage_configuration_page_token(after_sequence: u64) -> String {
 /// token from another listing included.
 pub fn decode_storage_configuration_page_token(token: &str) -> Option<u64> {
     decode_after(STORAGE_CONFIGURATION_PAGE_TOKEN_PREFIX, token)
+}
+
+/// [`encode_page_token`] for a `ListEncoderConfigurations` page: the creation sequence
+/// the next page of encoder configurations resumes after, under that listing's own
+/// marker.
+pub fn encode_encoder_configuration_page_token(after_sequence: u64) -> String {
+    encode_after(ENCODER_CONFIGURATION_PAGE_TOKEN_PREFIX, after_sequence)
+}
+
+/// The creation sequence an encoder-configuration `nextToken` resumes after, or `None`
+/// when the token was not issued by [`encode_encoder_configuration_page_token`] — a
+/// token from another listing included.
+pub fn decode_encoder_configuration_page_token(token: &str) -> Option<u64> {
+    decode_after(ENCODER_CONFIGURATION_PAGE_TOKEN_PREFIX, token)
 }
 
 /// [`encode_page_token`] for a `ListIngestConfigurations` page: the creation sequence the

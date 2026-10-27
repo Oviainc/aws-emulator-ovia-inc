@@ -57,6 +57,8 @@ mod get_storage_configuration;
 mod ingest_configurations;
 #[path = "all/list_compositions.rs"]
 mod list_compositions;
+#[path = "all/list_encoder_configurations.rs"]
+mod list_encoder_configurations;
 #[path = "all/list_ingest_configurations.rs"]
 mod list_ingest_configurations;
 #[path = "all/list_participant_replicas_paging.rs"]
