@@ -206,9 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeConfigurationRevisionErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some("Revision".to_string()),
-                    message: Some(format!(
-                        "Configuration {} has no revision {}",
-                        input.arn, input.revision
+                    message: Some(crate::state::configuration_revision_missing_message(
+                        &input.arn,
+                        input.revision,
                     )),
                 })
                 .into(),

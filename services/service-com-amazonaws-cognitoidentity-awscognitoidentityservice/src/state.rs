@@ -13,7 +13,7 @@
 /// writes anything.
 pub mod authorization;
 
-use crate::ops::types::{CognitoIdentityProvider, RoleMapping};
+use crate::ops::types::{CognitoIdentityProvider, MappingRule, RoleMapping};
 use emulator_server::CredentialStore;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -456,6 +456,37 @@ impl IdentityPoolRoles {
         self.roles.get(role_type).map(String::as_str)
     }
 
+    /// The role the IDENTITY PROVIDER's own mapping resolves for an exchange presenting
+    /// `logins` against `pool`, and `None` when no mapping of this configuration resolves
+    /// one.
+    ///
+    /// A `RoleMappings` entry is how a pool has the SERVICE pick the role from the token
+    /// the exchange presents, so it decides the vend before the pool-wide
+    /// `authenticated`/`unauthenticated` role does ([`IdentityPoolRoles::role_for`], which
+    /// is the fallback). The entry that decides is the one keyed by the identity provider
+    /// the login was made under ([`mapping_key_names_provider`]), and what it resolves is
+    /// read from that token's claims ([`mapping_resolved_role_arn`]).
+    ///
+    /// The logins are considered in provider-name order, so which mapping decides an
+    /// exchange presenting several logins does not depend on the iteration order of the
+    /// request's map.
+    pub fn mapped_role_arn(
+        &self,
+        pool: &IdentityPool,
+        logins: &HashMap<String, String>,
+    ) -> Option<String> {
+        let role_mappings = self.role_mappings.as_ref()?;
+        let mut presented: Vec<(&String, &String)> = logins.iter().collect();
+        presented.sort();
+        presented.into_iter().find_map(|(provider, token)| {
+            let claims = presented_token_claims(token)?;
+            role_mappings
+                .iter()
+                .filter(|(key, _)| mapping_key_names_provider(key, provider, pool, &claims))
+                .find_map(|(_, mapping)| mapping_resolved_role_arn(mapping, &claims))
+        })
+    }
+
     /// Whether this configuration names `role_arn` — as one of the pool's two roles, or
     /// as the role a mapping rule resolves to. This is the set of roles the pool can vend
     /// credentials for, which is what a `CustomRoleArn` has to be drawn from.
@@ -470,6 +501,157 @@ impl IdentityPoolRoles {
                 })
             })
     }
+}
+
+/// The `RoleMappingType` this emulator resolves a role for: "Rules will attempt to match
+/// claims from the token to map to a role" (`RoleMapping$Type`, this service's model).
+///
+/// The other modelled type, `Token`, maps the user's GROUPS to roles through the
+/// `cognito:roles`/`cognito:preferred_role` claims of a user-pool token, which the tokens
+/// this emulator's user pools mint do not carry yet, so no such mapping resolves a role
+/// here and the pool's own role for the flow stays the one assumed.
+const RULES_ROLE_MAPPING_TYPE: &str = "Rules";
+
+/// The role ONE mapping resolves for a token carrying `claims`, and `None` when it
+/// resolves none — the case the mapping's `AmbiguousRoleResolution` decides, whose
+/// `AuthenticatedRole` value is the pool's own authenticated role this falls back to.
+///
+/// For a `Rules` mapping that is the first rule to match: "Rules are evaluated in order.
+/// The first one to match specifies the role" (`RulesConfigurationType$Rules`, this
+/// service's model), in the DECLARED order the list was stored in.
+fn mapping_resolved_role_arn(
+    mapping: &RoleMapping,
+    claims: &::serde_json::Map<String, ::serde_json::Value>,
+) -> Option<String> {
+    if mapping.r#type != RULES_ROLE_MAPPING_TYPE {
+        return None;
+    }
+    mapping
+        .rules_configuration
+        .as_ref()?
+        .rules
+        .iter()
+        .find(|rule| rule_matches_claims(rule, claims))
+        .map(|rule| rule.role_arn.clone())
+}
+
+/// Whether `rule`'s match condition holds for `claims`: "the match condition that specifies
+/// how closely the claim value in the IdP token must match `Value`"
+/// (`MappingRule$MatchType`, this service's model), over the values the token carries for
+/// the claim the rule names.
+///
+/// A claim the token does not carry satisfies no condition at all, `NotEqual` included —
+/// the rule's claim is one "that must be present in the token" (`MappingRule$Claim`) — and
+/// a match type the model does not define is one no claim value satisfies.
+fn rule_matches_claims(
+    rule: &MappingRule,
+    claims: &::serde_json::Map<String, ::serde_json::Value>,
+) -> bool {
+    let values = claim_values(claims, &rule.claim);
+    if values.is_empty() {
+        return false;
+    }
+    // The `MappingRuleMatchType` values, from the model
+    // (`crate::ops::types::MAPPING_RULE_MATCH_TYPE_VALUES`).
+    match rule.match_type.as_str() {
+        "Equals" => values.contains(&rule.value),
+        "Contains" => values.iter().any(|value| value.contains(&rule.value)),
+        "StartsWith" => values.iter().any(|value| value.starts_with(&rule.value)),
+        "NotEqual" => !values.contains(&rule.value),
+        _ => false,
+    }
+}
+
+/// The values a token carries for the claim `name`, as the strings a mapping rule compares
+/// against.
+///
+/// A claim is ONE value where the token carries a string, a number or a boolean, and every
+/// element where it carries a list of those — a group or role membership claim is a list,
+/// and an audience may be one (RFC 7519 §4.1.3) — so a rule decides a multi-valued claim on
+/// the values it actually carries rather than on a rendering of the list. A claim the token
+/// does not carry, or carries as a structure no claim value is, has no values at all.
+fn claim_values(
+    claims: &::serde_json::Map<String, ::serde_json::Value>,
+    name: &str,
+) -> Vec<String> {
+    fn value_of(claim: &::serde_json::Value) -> Option<String> {
+        match claim {
+            ::serde_json::Value::String(text) => Some(text.clone()),
+            ::serde_json::Value::Number(number) => Some(number.to_string()),
+            ::serde_json::Value::Bool(flag) => Some(flag.to_string()),
+            _ => None,
+        }
+    }
+    match claims.get(name) {
+        Some(::serde_json::Value::Array(elements)) => {
+            elements.iter().filter_map(value_of).collect()
+        }
+        Some(claim) => value_of(claim).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Whether the `RoleMappings` key `key` names the identity provider a `Logins` entry made
+/// under `provider` was authenticated by.
+///
+/// A role mapping is keyed by the identity provider's own identifier. A provider that
+/// issues its tokens to an APP CLIENT — an Amazon Cognito user pool of the pool's
+/// `CognitoIdentityProviders`, an OpenID Connect issuer — is identified by that client as
+/// well as by its name, as `<provider name>:<client id>`; every other provider is
+/// identified by its name alone.
+///
+/// The client a presented token was issued to is the one the token's own audience claim
+/// names (RFC 7519 §4.1.3), so that claim is what decides such a key: a pool fronted by two
+/// app clients of one provider holds a mapping per client, and a token issued to one of them
+/// is not the other's. A token carrying no audience at all names no client, and for it the
+/// clients the pool itself stores for that provider are what the key can be matched against.
+fn mapping_key_names_provider(
+    key: &str,
+    provider: &str,
+    pool: &IdentityPool,
+    claims: &::serde_json::Map<String, ::serde_json::Value>,
+) -> bool {
+    if key == provider {
+        return true;
+    }
+    let Some(client_id) = key
+        .strip_prefix(provider)
+        .and_then(|rest| rest.strip_prefix(PROVIDER_CLIENT_SEPARATOR))
+    else {
+        return false;
+    };
+    let audiences = claim_values(claims, AUDIENCE_CLAIM);
+    if !audiences.is_empty() {
+        return audiences.iter().any(|audience| audience.as_str() == client_id);
+    }
+    pool.cognito_identity_providers
+        .iter()
+        .flatten()
+        .filter(|configured| configured.provider_name.as_deref() == Some(provider))
+        .any(|configured| configured.client_id.as_deref() == Some(client_id))
+}
+
+/// What separates an identity provider's name from the app client it issues tokens to in
+/// the identifier a `RoleMappings` entry is keyed by.
+const PROVIDER_CLIENT_SEPARATOR: char = ':';
+
+/// The claim naming who a token was issued to (RFC 7519 §4.1.3), which for a provider that
+/// issues tokens to an app client is that client.
+const AUDIENCE_CLAIM: &str = "aud";
+
+/// The claim set of the identity token a `Logins` entry presents, when the value presented
+/// is a token at all.
+///
+/// The reading is [`::service_common::jwt::read`], the tree's one bounded reading of a
+/// compact JWS: a value that is no JSON Web Token, or one nothing signed, carries no claim
+/// a role mapping could resolve a role from. The signature is not VERIFIED here — that needs
+/// the issuing provider's published verification key, which this emulator makes no outbound
+/// connection to fetch — so what the claims can decide is which of the roles the POOL's own
+/// stored configuration names is assumed, and never a role the configuration does not name.
+fn presented_token_claims(token: &str) -> Option<::serde_json::Map<String, ::serde_json::Value>> {
+    ::service_common::jwt::read(token)
+        .ok()
+        .map(|read| read.claims)
 }
 
 /// A stored identity, as `GetId` minted it. `logins` holds the PROVIDER NAMES the

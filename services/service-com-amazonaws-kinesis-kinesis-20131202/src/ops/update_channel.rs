@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a configuration change to the channel `crate::state`'s `channels` store holds
+//! under the `ChannelARN` the request carries, inside the region the request was signed for,
+//! and answers the stored record projected onto `ChannelDescription`.
+//!
+//! ONE change at a time: a channel is only open to a change while it is `ACTIVE`, so the
+//! status is read and the change written under ONE borrow of the store. The accepted change
+//! leaves the channel `UPDATING` and stores the instant its `UPDATING` -> `ACTIVE`
+//! transition falls due, which is what any later overlapping call reads — so of several
+//! overlapping changes exactly one is admitted, every other is refused with the modelled
+//! `ResourceInUseException`, and the channel settles on exactly one caller's values rather
+//! than a mixture of theirs.
+//!
+//! Only what the update names changes: the data-freshness window of the destination the
+//! channel already delivers to, and the CloudWatch Logs settings. A request naming the
+//! destination the channel does not deliver to is refused, since "You cannot change the
+//! destination ... of an existing channel".
 //!
 //! ## Shape of an operation
 //!
@@ -111,7 +119,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `UpdateChannelError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#UpdateChannel")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#UpdateChannel",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models it,
+    // the operation shape does not list it, and it is the only honest answer for a service
+    // mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum UpdateChannelErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -120,6 +134,7 @@ pub enum UpdateChannelErrorModeled {
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -145,6 +160,176 @@ impl From<UpdateChannelErrorModeled> for UpdateChannelError {
 /// concrete engine where it mounts the service, not here.
 pub struct UpdateChannel<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the channel lives in, and how the call
+/// ended. No channel name and no ARN: a log sink needs neither to attribute the change.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "UpdateChannel",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// Refuse the request with the error this operation models for a parameter that "exceeds its
+/// restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> UpdateChannelError {
+    UpdateChannelErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request because the channel it names is "not available for this operation": a
+/// channel whose create or whose previous change is still due is one no further change may
+/// be applied to, since "For successful operation, the resource must be in the ACTIVE state"
+/// (`ResourceInUseException`).
+fn resource_in_use(message: String) -> UpdateChannelError {
+    UpdateChannelErrorModeled::ResourceInUseException(ResourceInUseException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request because the `ChannelARN` it names is one this account and region do
+/// not hold, worded exactly as the reads word it: one rule, one phrasing, for every
+/// operation that addresses a channel.
+fn not_found(message: String) -> UpdateChannelError {
+    UpdateChannelErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The CloudWatch Logs configuration the channel reports once `update` is merged into the
+/// `current` one.
+///
+/// `Enabled` is modelled required on `CloudWatchLogsUpdateInput`, so an update always states
+/// it; a log group or log stream name the update does not name keeps the value the channel
+/// already carries, which is the same partial-update rule the destination follows ("Only
+/// DataFreshnessInSeconds can be updated", `S3DestinationUpdateInput`, leaving every other
+/// member of the stored destination as it was). Resolving the documented default names for a
+/// channel that carries none is the create's own step, shared with it rather than restated
+/// ([`crate::state::resolved_channel_logging`]).
+fn updated_logging(
+    current: &ChannelLoggingConfiguration,
+    update: &ChannelLoggingUpdateInput,
+    channel_name: &str,
+    channel_id: &str,
+) -> ChannelLoggingConfiguration {
+    let logs = &update.cloud_watch_logs;
+    let held = &current.cloud_watch_logs;
+    crate::state::resolved_channel_logging(
+        logs.enabled,
+        logs.log_group_name
+            .clone()
+            .or_else(|| held.log_group_name.clone()),
+        logs.log_stream_name
+            .clone()
+            .or_else(|| held.log_stream_name.clone()),
+        channel_name,
+        channel_id,
+    )
+}
+
+/// Apply the change the request names to the channel it addresses, or answer the modelled
+/// refusal that stands in the way.
+///
+/// The whole read-and-write lives here so the caller holds the store's lock for exactly this
+/// long — which is what admits exactly ONE of several overlapping changes: the one that gets
+/// the lock first leaves the channel `UPDATING`, and every later one reads that status and is
+/// refused, so the stored configuration is the winner's and never a mixture.
+fn update_channel(
+    store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &UpdateChannelInput,
+) -> Result<ChannelDescription, UpdateChannelError> {
+    // What the request says on its own first: an update "Updates the data freshness interval
+    // or the Amazon CloudWatch Logs configuration of an existing channel" (`UpdateChannel`),
+    // so a request naming none of the three updatable members asks for nothing and is
+    // refused whatever the store holds.
+    if input.s3_destination_configuration.is_none()
+        && input.s3_tables_destination_configuration.is_none()
+        && input.logging_configuration.is_none()
+    {
+        return Err(invalid_argument(
+            crate::state::CHANNEL_UPDATE_REQUIRED_MESSAGE.to_string(),
+        ));
+    }
+
+    // `ChannelARN` is the only identifier this operation takes (`@required`), and a channel
+    // "is unique within your Amazon Web Services account and Amazon Web Services Region", so
+    // the region the request was signed for is the one whose channels it addresses.
+    let identifier = input.channel_arn.clone();
+    let channel = store
+        .channel_by_arn_mut(region, &identifier)
+        .ok_or_else(|| not_found(crate::state::channel_not_found_message(&identifier)))?;
+
+    // The serialisation gate: a channel whose create or whose PREVIOUS change is still due
+    // is not open to another one, so of two overlapping calls the second is refused and the
+    // stored configuration is left exactly as the first one set it.
+    let status = channel.status(now);
+    if status != crate::state::CHANNEL_ACTIVE {
+        return Err(resource_in_use(crate::state::channel_not_active_message(
+            &identifier,
+            status,
+        )));
+    }
+
+    // "You cannot change the destination ... of an existing channel" (`UpdateChannel`): a
+    // request naming the destination kind the channel does not deliver to is asking for the
+    // one change this operation cannot make, and nothing is written for it.
+    let destination_type = channel.destination_type();
+    if (input.s3_destination_configuration.is_some() && channel.s3_destination.is_none())
+        || (input.s3_tables_destination_configuration.is_some()
+            && channel.s3_tables_destination.is_none())
+    {
+        return Err(invalid_argument(
+            crate::state::channel_destination_not_updatable_message(
+                &identifier,
+                destination_type,
+            ),
+        ));
+    }
+
+    // Only the members the update names change. `DataFreshnessInSeconds` is modelled required
+    // on both update inputs and carries no `@range`, so any value the boundary validator
+    // admits is stored as submitted.
+    if let (Some(update), Some(destination)) = (
+        input.s3_destination_configuration.as_ref(),
+        channel.s3_destination.as_mut(),
+    ) {
+        destination.data_freshness_in_seconds = update.data_freshness_in_seconds;
+    }
+    if let (Some(update), Some(destination)) = (
+        input.s3_tables_destination_configuration.as_ref(),
+        channel.s3_tables_destination.as_mut(),
+    ) {
+        destination.data_freshness_in_seconds = update.data_freshness_in_seconds;
+    }
+    if let Some(update) = input.logging_configuration.as_ref() {
+        let logging = updated_logging(
+            &channel.logging_configuration,
+            update,
+            &channel.name,
+            &channel.id,
+        );
+        channel.logging_configuration = logging;
+    }
+
+    // UPDATING is not terminal: the channel is owed the `ACTIVE` it goes back to, and the
+    // instant that is due is stored rather than slept on.
+    channel.updating_until = Some(now + crate::state::CHANNEL_UPDATE_DELAY);
+
+    // "The configuration and current status of the channel after the update ... Immediately
+    // after the request, the state is UPDATING" (`UpdateChannelOutput$ChannelDescription`).
+    Ok(channel.to_description(now))
 }
 
 impl<Eng> UpdateChannel<Eng> {
@@ -173,18 +358,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannel"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region whose channels this request
+        // addresses, since a channel name "is unique within your Amazon Web Services account
+        // and Amazon Web Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            UpdateChannelError::from(UpdateChannelErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the channel store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let updated = {
+            let mut store = state.lock();
+            update_channel(&mut store, &region, now, &input)
+        };
+        match updated {
+            Ok(channel_description) => {
+                audit(&akid, &region, "updated");
+                Ok(UpdateChannelOutput {
+                    channel_description,
+                })
+            }
+            Err(refusal) => {
+                audit(&akid, &region, "refused");
+                Err(refusal)
+            }
+        }
     }
 }

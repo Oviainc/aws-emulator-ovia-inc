@@ -339,11 +339,10 @@ fn destination(input: &CreateChannelInput) -> Result<Destination, CreateChannelE
     }
 }
 
-/// The CloudWatch Logs configuration the channel reports: the one the create named, with
-/// the documented default names resolved for a channel that logs ("Defaults to
-/// /aws/kinesis/{channelName}/{channelId}", `CloudWatchLogs$LogGroupName`; "Defaults to
-/// DestinationDelivery", `CloudWatchLogs$LogStreamName`). A create that names no logging
-/// configuration leaves the channel logging nothing, so it names no log group either.
+/// The CloudWatch Logs configuration the channel reports: the one the create named, with the
+/// documented default names resolved by the single helper every channel write shares
+/// ([`crate::state::resolved_channel_logging`]). A create that names no logging configuration
+/// leaves the channel logging nothing, so it names no log group either.
 fn logging_description(
     configuration: Option<&ChannelLoggingConfiguration>,
     channel_name: &str,
@@ -352,26 +351,13 @@ fn logging_description(
     let logs = configuration.map_or_else(CloudWatchLogs::default, |configuration| {
         configuration.cloud_watch_logs.clone()
     });
-    if !logs.enabled {
-        return ChannelLoggingConfiguration {
-            cloud_watch_logs: CloudWatchLogs {
-                enabled: false,
-                ..logs
-            },
-        };
-    }
-    ChannelLoggingConfiguration {
-        cloud_watch_logs: CloudWatchLogs {
-            enabled: true,
-            log_group_name: Some(logs.log_group_name.unwrap_or_else(|| {
-                crate::state::channel_log_group_name(channel_name, channel_id)
-            })),
-            log_stream_name: Some(
-                logs.log_stream_name
-                    .unwrap_or_else(|| crate::state::DEFAULT_CHANNEL_LOG_STREAM_NAME.to_string()),
-            ),
-        },
-    }
+    crate::state::resolved_channel_logging(
+        logs.enabled,
+        logs.log_group_name,
+        logs.log_stream_name,
+        channel_name,
+        channel_id,
+    )
 }
 
 /// The modelled refusal the request's `EncryptionConfiguration` earns, if any.
@@ -551,6 +537,9 @@ fn create_channel(
         s3_tables_destination: destination.s3_tables,
         encryption_configuration: input.encryption_configuration.clone(),
         tags: input.tags.clone().unwrap_or_default(),
+        // No configuration change has been accepted for a channel this call has just minted,
+        // so the only transition it is owed is the one to `ACTIVE` above.
+        updating_until: None,
     };
 
     let description = channel.to_description(now);

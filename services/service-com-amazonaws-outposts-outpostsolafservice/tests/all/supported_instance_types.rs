@@ -36,8 +36,8 @@
 //!
 //! Where the recorded assets come from: an asset is a PHYSICAL unit of hardware that
 //! Amazon Web Services installs, so no call in this API creates one — the rows below
-//! therefore record their own hardware on the stored Outpost, while it is still
-//! provisioning, through the same store seam [`crate::outpost_assets`] records its
+//! therefore record their own hardware on the stored Outpost, which nothing has been
+//! ordered for, through the same store seam [`crate::outpost_assets`] records its
 //! assets through, and then ask over the wire. What a unit of the hardware an Outpost
 //! settles with reports, and what this report answers when scoped to one of those
 //! units, is [`crate::outpost_hardware_installation`].

@@ -200,8 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let topic_name = &unknown.topic_name;
             return Err(CreateContactErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "Topic with name: {topic_name} doesn't exist in list: {list_name}."
+                message: Some(crate::state::contact_list_topic_not_found(
+                    &list_name, topic_name,
                 )),
             })
             .into());

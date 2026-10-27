@@ -40,7 +40,7 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::{
 };
 
 use crate::quote_lifecycle::{create_quote, get_quote, request as quote_request};
-use crate::site_and_outpost_lifecycle::{segment, settle, text, Outposts};
+use crate::site_and_outpost_lifecycle::{segment, text, Outposts};
 
 /// The HTTP status the unimplemented-operation channel answers with, and the wire
 /// error code it carries. No row below may ever see these: an operation that is served
@@ -112,6 +112,10 @@ fn settled(order: &Value) -> Value {
 }
 
 /// Where a stored order's clock-owed transition stands when a row reads the order.
+///
+/// The transition in question is the FIRST step the clock owes an order, the one that
+/// takes a submitted order to being built and shipped; the steps past it are held out
+/// of reach by [`arrange`], so no row's order runs on past it.
 #[derive(Clone, Copy, Debug)]
 enum Clock {
     /// The transition falls due further out than this suite runs for.
@@ -146,26 +150,41 @@ fn arrange(outposts: &Outposts, case: &str, order_id: &str, clock: Clock) {
         .orders
         .get_mut(order_id)
         .unwrap_or_else(|| panic!("case {case:?}: the create persisted order {order_id}"));
-    match clock {
-        Clock::NotYetDue => record.in_progress_at = Some(Instant::now() + FAR_OUT),
-        Clock::AlreadyDue => record.in_progress_at = Some(Instant::now()),
-        Clock::Materialised => assert!(
-            record.in_progress_at.is_none(),
+    // Every step past the first is pushed out of reach whatever the row asks for, so an
+    // order never runs on to being delivered and installed under a row.
+    let out_of_reach = Instant::now() + FAR_OUT;
+    for (step, transition) in record.pending.iter_mut().enumerate() {
+        transition.due = match (step, clock) {
+            (0, Clock::AlreadyDue) => Instant::now(),
+            _ => out_of_reach,
+        };
+    }
+    if let Clock::Materialised = clock {
+        assert!(
+            !owes_first_step(record),
             "case {case:?}: this row reads an order whose transition is already \
              materialised, got {:?}",
-            record.in_progress_at
-        ),
+            record.pending
+        );
     }
+}
+
+/// Whether `record` still owes the first step of its progression — the one
+/// [`Clock`] is about.
+fn owes_first_step(
+    record: &service_com_amazonaws_outposts_outpostsolafservice::state::OrderRecord,
+) -> bool {
+    record
+        .pending
+        .front()
+        .is_some_and(|transition| transition.status == ORDER_STATUS_IN_PROGRESS)
 }
 
 /// Whether `order_id`'s transition is still owed in the store.
 fn transition_is_owed(outposts: &Outposts, order_id: &str) -> bool {
     let store = outposts.store();
     let store = store.lock();
-    store
-        .orders
-        .get(order_id)
-        .is_some_and(|record| record.in_progress_at.is_some())
+    store.orders.get(order_id).is_some_and(owes_first_step)
 }
 
 /// Every stored order record rendered as text, keyed by its `OrderId`: the value rule 2
@@ -310,10 +329,9 @@ async fn every_get_order_call_is_served_from_the_modelled_outcomes() {
 async fn reading_an_order_reports_the_stored_record_and_changes_nothing_else() {
     let outposts = Outposts::new();
     let (outpost_id, _) = outposts.site_and_outpost("order-reporting").await;
-    // Past the Outpost's own clock-owed transition before any row runs, so the Outpost
-    // this suite compares before and after a read is already in its terminal status and
-    // cannot move under the comparison.
-    settle();
+    // The Outpost this suite compares before and after a read is owed no transition of
+    // its own: it is installed only by an order's fulfilment, and every row holds the
+    // step that fulfils its order out of reach, so it cannot move under the comparison.
     let quote_id = text(&a_quote(&outposts, &outpost_id).await, "QuoteId");
 
     let created: Vec<(&str, Value)> = vec![

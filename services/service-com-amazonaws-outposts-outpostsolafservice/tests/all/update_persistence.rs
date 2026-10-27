@@ -26,7 +26,7 @@
 use serde_json::{json, Value};
 
 use super::site_and_outpost_lifecycle::{
-    address, refusal, segment, settle, text, Outposts, ABSENT_OUTPOST_ID, ABSENT_SITE_ID,
+    address, install_hardware, refusal, segment, text, Outposts, ABSENT_OUTPOST_ID, ABSENT_SITE_ID,
     OUTPOST_ARN_PREFIX, SITE_ARN_PREFIX,
 };
 
@@ -175,11 +175,10 @@ async fn update_outpost_applies_present_members_and_reads_back() {
         .await;
     let outpost_id = text(&created, "OutpostId");
     let outpost_arn = text(&created, "OutpostArn");
-    // An Outpost is created provisioning and the service materialises its
-    // `PENDING` -> `ACTIVE` transition when the clock makes it due; this suite is
-    // about what an update writes, so it waits for that transition to fall due
-    // first and then reads the settled record as its baseline.
-    settle();
+    // An Outpost reaches its settled lifecycle status when hardware ordered for it has
+    // been installed; this suite is about what an update writes, so it has that install
+    // behind it first and then reads the settled record as its baseline.
+    install_hardware(&outposts, &outpost_id).await;
     let created = outposts.get_outpost(&outpost_id).await;
 
     let cases: Vec<(&str, &str, Value)> = vec![

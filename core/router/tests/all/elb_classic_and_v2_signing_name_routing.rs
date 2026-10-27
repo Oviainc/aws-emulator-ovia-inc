@@ -56,6 +56,21 @@ const EC2_VERSION: &str = "2016-11-15";
 const FIRST_SUBNET: &str = "@subnet-1";
 const SECOND_SUBNET: &str = "@subnet-2";
 
+/// The same for the VPC and for a target group's ARN, which are the account's and Elastic
+/// Load Balancing's to mint: the driver substitutes the VPC the suite created through EC2,
+/// and the ARN the row named by [`HEALTH_GROUP_CASE`] was answered.
+const VPC_ID: &str = "@vpc-id";
+const TARGET_GROUP_ARN: &str = "@target-group-arn";
+
+/// The row whose answer names the target group the target-health rows act on. Its ARN is
+/// what [`TARGET_GROUP_ARN`] stands for.
+const HEALTH_GROUP_CASE: &str = "elbv2 CreateTargetGroup for an ip target in the suite's VPC";
+
+/// A well-formed target group ARN this emulator holds no target group for, for the row that
+/// pins the health read's own modelled refusal.
+const ABSENT_TARGET_GROUP_ARN: &str =
+    "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/router-no-such-tg/0123456789abcdef";
+
 /// The API version the Classic model declares.
 const CLASSIC_VERSION: &str = "2012-06-01";
 
@@ -84,8 +99,9 @@ struct Call {
     action: &'static str,
     /// The `Version` the envelope carries, or `None` to send no `Version` field at all.
     version: Option<&'static str>,
-    /// The form parameters beyond `Action` and `Version`. Values are plain ASCII, so the
-    /// body needs no escaping.
+    /// The form parameters beyond `Action` and `Version`, form-encoded into the body by the
+    /// driver — as the ec2 setup calls beside them are — so a value carrying the `:` and `/`
+    /// of an ARN crosses the wire intact.
     params: &'static [(&'static str, &'static str)],
     expected_status: u16,
     /// The awsQuery `<Code>` the answer must carry, when the row pins one.
@@ -144,7 +160,7 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
             // action — one only the Classic model declares, one only the ELBv2 model
             // declares, and `CreateLoadBalancer`/`DescribeLoadBalancers`, which BOTH
             // declare with different inputs and outputs.
-            let calls: [Call; 24] = [
+            let calls: [Call; 29] = [
                 Call {
                     // The request the issue reports as `500 AmbiguousService`: a Classic
                     // DescribeLoadBalancers on the shared signing name.
@@ -295,6 +311,95 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                         "<TargetGroupName>router-v2-tg</TargetGroupName>",
                         "<VpcId>vpc-12345678</VpcId>",
                     ],
+                },
+                Call {
+                    // A target group for `ip` targets in the VPC the suite created through
+                    // EC2, which is what lets the registration below resolve the address it
+                    // names against that VPC's subnets.
+                    case: HEALTH_GROUP_CASE,
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "CreateTargetGroup",
+                    version: Some(V2_VERSION),
+                    params: &[
+                        ("Name", "router-health-tg"),
+                        ("Protocol", "HTTP"),
+                        ("Port", "80"),
+                        ("VpcId", VPC_ID),
+                        ("TargetType", "ip"),
+                    ],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<TargetGroupName>router-health-tg</TargetGroupName>",
+                        "<TargetGroupArn>",
+                    ],
+                },
+                Call {
+                    // Targets registered with that group through the SHARED signing name,
+                    // which is the only name an AWS SDK ELBv2 client signs: the write half
+                    // of the deploy-then-verify loop a client runs against a target group.
+                    case: "elbv2 RegisterTargets on the shared signing name",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "RegisterTargets",
+                    version: Some(V2_VERSION),
+                    params: &[
+                        ("TargetGroupArn", TARGET_GROUP_ARN),
+                        // An address inside the first subnet the suite created
+                        // (`10.60.1.0/24`, `us-east-1a`), on a port of its own.
+                        ("Targets.member.1.Id", "10.60.1.17"),
+                        ("Targets.member.1.Port", "8080"),
+                    ],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &["<RegisterTargetsResponse"],
+                },
+                Call {
+                    // …and the read half, the action the issue behind these rows reports as
+                    // `InvalidAction`: the health of that group's targets, reported from
+                    // what the registration above persisted — the address, the port it was
+                    // registered on and the zone of the subnet that holds it — in this
+                    // model's own document.
+                    case: "elbv2 DescribeTargetHealth on the shared signing name",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DescribeTargetHealth",
+                    version: Some(V2_VERSION),
+                    params: &[("TargetGroupArn", TARGET_GROUP_ARN)],
+                    expected_status: 200,
+                    expected_code: None,
+                    expected_body_contains: &[
+                        "<DescribeTargetHealthResponse",
+                        "http://elasticloadbalancing.amazonaws.com/doc/2015-12-01/",
+                        "<Id>10.60.1.17</Id>",
+                        "<Port>8080</Port>",
+                        "<AvailabilityZone>us-east-1a</AvailabilityZone>",
+                        "<TargetHealth>",
+                    ],
+                },
+                Call {
+                    // The same action for a target group nothing holds: the operation's OWN
+                    // modelled refusal (`TargetGroupNotFound`, HTTP 400), which is what
+                    // tells a client the group is absent rather than the action.
+                    case: "elbv2 DescribeTargetHealth for a target group nothing holds",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DescribeTargetHealth",
+                    version: Some(V2_VERSION),
+                    params: &[("TargetGroupArn", ABSENT_TARGET_GROUP_ARN)],
+                    expected_status: 400,
+                    expected_code: Some("TargetGroupNotFound"),
+                    expected_body_contains: &["<ErrorResponse", ABSENT_TARGET_GROUP_ARN],
+                },
+                Call {
+                    // The same action for a target group nothing holds: the operation's OWN
+                    // modelled refusal (`TargetGroupNotFound`, HTTP 400), which is what
+                    // tells a client the group is absent rather than the action.
+                    case: "elbv2 DescribeTargetHealth for a target group nothing holds",
+                    addressed: Addressed::Signed("elasticloadbalancing"),
+                    action: "DescribeTargetHealth",
+                    version: Some(V2_VERSION),
+                    params: &[("TargetGroupArn", ABSENT_TARGET_GROUP_ARN)],
+                    expected_status: 400,
+                    expected_code: Some("TargetGroupNotFound"),
+                    expected_body_contains: &["<ErrorResponse", ABSENT_TARGET_GROUP_ARN],
                 },
                 Call {
                     // The ELBv2 load balancer created above: the same action name as the
@@ -530,6 +635,11 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                 },
             ];
 
+            // The ARN of the first target group a row creates, which the rows that act on
+            // that group name by placeholder: Elastic Load Balancing mints its id, so no
+            // `'static` table can carry it.
+            let mut target_group_arn = String::new();
+
             for call in calls {
                 let mut body = format!("Action={}", call.action);
                 if let Some(version) = call.version {
@@ -540,9 +650,11 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                     let value = match *value {
                         FIRST_SUBNET => subnets[0].as_str(),
                         SECOND_SUBNET => subnets[1].as_str(),
+                        VPC_ID => vpc.as_str(),
+                        TARGET_GROUP_ARN => target_group_arn.as_str(),
                         literal => literal,
                     };
-                    body.push_str(&format!("&{name}={value}"));
+                    body.push_str(&format!("&{name}={}", form_encode(value)));
                 }
                 let mut builder = http::Request::builder()
                     .method("POST")
@@ -601,6 +713,13 @@ fn classic_elb_and_elbv2_route_apart_under_one_signing_name() {
                         "case {case:?}: expected {expected:?} in the owning model's \
                          answer, got {status} with {rendered}"
                     );
+                }
+
+                // The target group the health rows act on: its ARN carries the id Elastic
+                // Load Balancing minted, so it is read off the create's answer rather than
+                // carried by this `'static` table.
+                if case == HEALTH_GROUP_CASE {
+                    target_group_arn = element(&rendered, "TargetGroupArn");
                 }
             }
         })

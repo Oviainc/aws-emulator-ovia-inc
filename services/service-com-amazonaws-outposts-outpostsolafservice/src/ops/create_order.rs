@@ -7,10 +7,10 @@
 //! and the status a just-submitted item carries; an order taken from a quote records
 //! that quote and moves it to `ORDER_SUBMITTED`, naming this order in the quote's
 //! `SubmittedOrderId`. The order is submitted in the non-terminal `PREPARING` status
-//! and the clock carries it to `IN_PROGRESS`
-//! ([`crate::state::ORDER_PREPARATION`]); nothing here reports it delivered or
-//! complete, because those are claims about hardware installed on the Outpost that
-//! this emulator has no record of (see [`crate::state::ORDER_STATUS_IN_PROGRESS`]).
+//! and the clock carries it through being built and shipped, to the site, and to
+//! being installed ([`crate::state::order_progression`]); that last step is the one
+//! that puts hardware on the Outpost the order was placed on and takes it out of the
+//! pending lifecycle status.
 //!
 //! ## Shape of an operation
 //!
@@ -298,6 +298,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let (order_id, sequence) = store.mint_id("oo");
+        // The wall clock this order was submitted at, which is also what the
+        // transitions it owes the clock are dated from.
+        let submitted_at = std::time::SystemTime::now();
         // Each line item of the order gets its own minted `LineItemId`, and reports
         // the catalog item and quantity the request asked for. What it does NOT
         // report is anything that would be a claim about hardware: a
@@ -331,8 +334,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             quote_option_identifier: crate::state::non_empty(input.quote_option_identifier),
             order_id: Some(order_id.clone()),
             // A just-submitted order is received and being prepared, so it reports
-            // that non-terminal status until the transition the clock owes falls due;
-            // every read materialises it through `settle_orders`.
+            // that non-terminal status until each transition the clock owes falls due;
+            // every read materialises them through `settle_orders`.
             status: Some(crate::state::ORDER_STATUS_PREPARING.to_string()),
             // An order taken from a quote with no line items of its own has the
             // line items AWS built out of the quote option it was ordered from. A
@@ -345,10 +348,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 false => Some(line_items),
             },
             payment_option: Some(input.payment_option),
-            order_submission_date: Some(crate::state::now_timestamp()),
-            // "The fulfillment date for the order": nothing is fulfilled by
-            // submitting it, and the emulator never carries an order as far as being
-            // installed, so the member stays absent.
+            order_submission_date: Some(crate::state::timestamp(submitted_at)),
+            // "The fulfillment date for the order": nothing is fulfilled by submitting
+            // it, so the member stays absent until the hardware it was placed for is
+            // installed, which is the step that completes the order
+            // (`crate::state::settle_orders`).
             order_fulfilled_date: None,
             payment_term: crate::state::non_empty(input.payment_term),
             order_type: Some(crate::state::ORDER_TYPE_OUTPOST.to_string()),
@@ -364,7 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The site the order's Outpost belongs to, so the order stays placed
                 // at that site for as long as the store holds it.
                 site_id,
-                in_progress_at: Some(std::time::Instant::now() + crate::state::ORDER_PREPARATION),
+                pending: crate::state::order_progression(submitted_at),
             },
         );
         // An order submitted from a quote is what makes that quote's status

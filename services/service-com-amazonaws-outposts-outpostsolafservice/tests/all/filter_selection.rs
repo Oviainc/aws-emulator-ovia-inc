@@ -42,7 +42,7 @@ use service_com_amazonaws_outposts_outpostsolafservice::state::{
 
 use crate::blocking_instances::{instance, instance_id, record as record_instances, OTHER_ACCOUNT};
 use crate::outpost_assets::{asset, compute, record as record_assets};
-use crate::site_and_outpost_lifecycle::{address, segment, settle, text, Outposts};
+use crate::site_and_outpost_lifecycle::{address, install_hardware, segment, text, Outposts};
 
 /// What one list under test is reached and read by: the operation, the route the
 /// model binds it to, the output member its page arrives in, and the member that
@@ -140,9 +140,13 @@ async fn outpost_list_selects_by_the_rule() {
             .await,
         "OutpostId",
     );
-    // Every Outpost above was created provisioning, so the status rows are exact only
-    // once the transition the clock owes has fallen due.
-    settle();
+    // An Outpost carries the provisioning status until hardware ordered for it has
+    // been installed, so the status rows are exact only once each Outpost above holds
+    // the status the row names: hardware is ordered and installed for every one of
+    // them here, and the row for the provisioning status is the one no record matches.
+    for outpost_id in placed.iter().chain(std::iter::once(&zoneless)) {
+        install_hardware(&outposts, outpost_id).await;
+    }
 
     let (first, second, third) = (
         placed[0].clone(),
@@ -195,12 +199,12 @@ async fn outpost_list_selects_by_the_rule() {
             Vec::new(),
         ),
         row(
-            "the status every settled Outpost carries",
+            "the status every Outpost whose ordered hardware is installed carries",
             "?LifeCycleStatusFilter=ACTIVE".to_string(),
             every.clone(),
         ),
         row(
-            "a status no settled Outpost carries",
+            "a status no installed Outpost carries",
             "?LifeCycleStatusFilter=PENDING".to_string(),
             Vec::new(),
         ),

@@ -91,6 +91,8 @@ mod container_service_public_endpoint;
 mod container_service_update;
 #[path = "all/cost_estimate.rs"]
 mod cost_estimate;
+#[path = "all/disk_attach_outstanding_settle.rs"]
+mod disk_attach_outstanding_settle;
 #[path = "all/disk_attachment.rs"]
 mod disk_attachment;
 #[path = "all/disk_block_storage.rs"]

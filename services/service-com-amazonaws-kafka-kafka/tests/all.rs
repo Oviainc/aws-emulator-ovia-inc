@@ -49,6 +49,8 @@ mod create_cluster_v2;
 mod describe_cluster_v2;
 #[path = "all/kafka_harness.rs"]
 mod kafka_harness;
+#[path = "all/kafka_version_update.rs"]
+mod kafka_version_update;
 #[path = "all/kafka_versions.rs"]
 mod kafka_versions;
 #[path = "all/list_clusters_v2.rs"]

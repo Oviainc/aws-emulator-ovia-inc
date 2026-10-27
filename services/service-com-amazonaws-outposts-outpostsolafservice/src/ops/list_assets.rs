@@ -207,10 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let size = crate::state::page_size(input.max_results);
 
-        // An Outpost's hardware is installed as its provisioning finishes, so the
-        // installation the clock has already made due is materialised before the
-        // list is read: this answers the hardware the Outpost holds at the instant it
-        // is asked for, and writes nothing a later caller would not have seen anyway.
+        // An Outpost's hardware is installed when an order placed on it has delivered
+        // some, so the installation the clock has already made due is materialised
+        // before the list is read: this answers the hardware the Outpost holds at the
+        // instant it is asked for, and writes nothing a later caller would not have
+        // seen anyway.
         let mut store = state.lock();
         store.settle_outposts();
         // An Outpost's assets are listed OFF that Outpost, so one the store does not
