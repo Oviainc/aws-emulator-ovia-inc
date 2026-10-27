@@ -319,6 +319,30 @@ pub(crate) async fn describe_job(batch: &Batch, job_id: &str) -> Value {
     jobs[0].clone()
 }
 
+/// How many times [`until_status`] looks before it gives up.
+///
+/// Each clock-owed move falls due [`state::JOB_PHASE_MILLIS`] after the one before it and
+/// a job makes a handful of them, so this is many phases of headroom on a slow machine.
+const STATUS_POLLS: usize = 240;
+
+/// Poll `job_id` until `DescribeJobs` reports `wanted`, then answer that `JobDetail`;
+/// panic naming `case` and the last detail seen if it never gets there.
+///
+/// The single polling helper this target shares: driven off OBSERVED state rather than a
+/// fixed sleep, so a suite never races the clock-owed transitions.
+pub(crate) async fn until_status(batch: &Batch, case: &str, job_id: &str, wanted: &str) -> Value {
+    let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
+    for _ in 0..STATUS_POLLS {
+        let detail = describe_job(batch, job_id).await;
+        if detail["status"].as_str() == Some(wanted) {
+            return detail;
+        }
+        tokio::time::sleep(Duration::from_millis((span / 10).max(5))).await;
+    }
+    let detail = describe_job(batch, job_id).await;
+    panic!("case {case}: expected the job to reach {wanted}, got {detail}");
+}
+
 /// How long to wait for every clock-owed job transition to fall due. Each one takes
 /// [`state::JOB_PHASE_MILLIS`]; a job with no dependencies makes ONE (SUBMITTED ->
 /// RUNNABLE) and then RESTS there, and the margin covers a slow machine.

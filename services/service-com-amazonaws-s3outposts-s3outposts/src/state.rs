@@ -23,22 +23,32 @@
 //! materialises everything already owed, so nothing sleeps and nothing depends
 //! on being called.
 //!
-//! ## Why the store starts with NO Outposts
+//! ## Where the Outposts come from
 //!
 //! An Outpost is hardware Amazon installs at a customer site, and this service
 //! models NO operation that creates one — `ListOutpostsWithS3` only reports the
 //! Outposts "that have S3 provisioned ... to which the calling Amazon Web
-//! Services account has access". A resource no operation of the API creates
-//! exists only where something outside the API provisioned it, so an account
-//! that was never provisioned has none and `ListOutpostsWithS3` reports an empty
-//! inventory. The store therefore starts EMPTY: inventing Outposts would report
-//! capacity, and a cross-account owner, for hardware nobody installed.
+//! Services account has access". The service that DOES own that resource is AWS
+//! Outposts, which this emulator co-hosts, so the Outposts reported here are the
+//! ones that control plane holds: this service keeps no copy of them and resolves
+//! the inventory from it on every call ([`outpost_inventory`]), so an Outpost
+//! created, ordered for or decommissioned through the `outposts` API is one this
+//! service answers for at the same instant.
 //!
-//! The one thing outside the API that can say an Outpost was provisioned is the
-//! operator running this emulator, through [`PROVISIONED_OUTPOSTS_ENV`]: each
-//! entry it names enters the inventory as an [`OutpostRecord`], and
-//! `CreateEndpoint` then has a parent Outpost to attach an endpoint to. Unset —
-//! the default — means no capacity, which is what a new AWS account has.
+//! Which of them belong in the inventory is GATED, not assumed: S3 capacity is
+//! installed on an Outpost by ordering hardware that carries it, so an Outpost
+//! enters this inventory only once the orders placed on it buy S3 storage
+//! capacity, and only while it is the "Active (not pending any provisioning nor
+//! decommissioned)" Outpost its own control plane reports — otherwise this
+//! service would report capacity, and endpoints, for hardware nobody ordered.
+//! [`OutpostRecord::capacity_in_bytes`] is that ordered capacity.
+//!
+//! An Outpost of ANOTHER account — one shared with the caller through Resource
+//! Access Manager, which the emulated control plane holds none of, since it serves
+//! one account — is declared by the operator running this emulator instead,
+//! through [`PROVISIONED_OUTPOSTS_ENV`]. Unset — the default — means no shared
+//! capacity, and an account whose control plane holds no S3-capable Outpost
+//! either has none at all, which is what a new AWS account has.
 //!
 //! ## Which Region a resource belongs to
 //!
@@ -46,7 +56,7 @@
 //! Outposts endpoints on it are reached through that Region's endpoint, so each
 //! resource here belongs to one Region and is reachable only through it:
 //! [`OutpostRecord::region`] records the Outpost's own (home) Region, an endpoint
-//! takes the Region of the Outpost it is on ([`ComAmazonawsS3outpostsS3outpostsState::outpost_region`]),
+//! takes the Region of the Outpost it is on ([`outpost_region`]),
 //! and every lookup and listing resolves inside the Region the request was signed
 //! for alone ([`request_region`]) — so a resource of another Region is reported by
 //! no listing and resolves to the modelled 404, exactly as if the store held one
@@ -73,6 +83,8 @@
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
+
+use ::service_com_amazonaws_outposts_outpostsolafservice::state as outposts_state;
 
 use crate::ops::types::{
     Endpoint, NetworkInterface, Outpost, ResourceNotFoundException, ValidationException,
@@ -120,15 +132,17 @@ pub const ENDPOINT_TRANSITION: Duration = Duration::from_millis(500);
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// The environment variable an operator uses to tell this emulated service which
-/// Outposts have S3 on Outposts capacity provisioned, since the API models no
-/// operation that provisions one: comma-separated
+/// FURTHER Outposts have S3 on Outposts capacity the caller reaches — the ones
+/// its own AWS Outposts control plane cannot hold, because that control plane
+/// serves one account: comma-separated
 /// `<OutpostId>:<CapacityInBytes>[:<OwnerAccountId>[:<Region>]]` entries, read
 /// once when this service's store is created
 /// (`S3_OUTPOSTS_PROVISIONED_OUTPOSTS="op-0a1b2c3d4e5f60718:52776558133248"`).
 ///
-/// Unset means no capacity at all, which is what an account that never had S3 on
-/// Outposts provisioned has: `ListOutpostsWithS3` reports an empty inventory and
-/// every reference to an Outpost is the modelled 404. An entry whose owner is
+/// Unset means the inventory is exactly what that control plane has S3 capacity
+/// on ([`outpost_inventory`]) — none, for an account that never ordered any,
+/// where `ListOutpostsWithS3` reports an empty inventory and every reference to
+/// an Outpost is the modelled 404. An entry whose owner is
 /// another account is one shared with the caller through Resource Access
 /// Manager, which is what `Outpost$OwnerId` ("useful for comparing owned versus
 /// shared outposts") distinguishes and what a caller can create endpoints on and
@@ -340,7 +354,7 @@ impl EndpointRecord {
     /// id that pattern does not admit ([`ENDPOINT_ARN_BRANCHES`]).
     ///
     /// `home_region` is the Region of the Outpost this endpoint is on
-    /// ([`ComAmazonawsS3outpostsS3outpostsState::outpost_region`]), which is the
+    /// ([`outpost_region`]), which is the
     /// endpoint's own Region: an endpoint has no Region apart from its parent
     /// Outpost's, so the two ARNs always agree on it.
     pub fn endpoint_arn(&self, home_region: &str) -> Option<String> {
@@ -437,15 +451,18 @@ impl EndpointRecord {
 /// Per-service state for com-amazonaws-s3outposts-s3outposts. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsS3outpostsS3outpostsState {
-    /// Every Outpost with S3 capacity, keyed by its id — which names ONE
-    /// Outpost, installed in the one home Region its record carries
-    /// ([`OutpostRecord::region`]), so the key needs no Region beside it and
-    /// [`Self::outpost_in`] is what resolves an id for the Region being served.
-    /// The `BTreeMap` is what gives `ListOutpostsWithS3` the one stable total
-    /// order its pagination cursor indexes into.
+    /// The Outposts of ANOTHER account that are shared with this one, keyed by
+    /// id — which names ONE Outpost, installed in the one home Region its record
+    /// carries ([`OutpostRecord::region`]), so the key needs no Region beside it.
+    ///
+    /// These are the entries the AWS Outposts control plane cannot hold, because
+    /// it serves one account: an Outpost shared through Resource Access Manager
+    /// belongs to its owner's account. They join the control plane's own Outposts
+    /// into the one inventory every call resolves ([`outpost_inventory`]), which
+    /// is what the listings page over and every `OutpostId` resolves against.
     ///
     /// BOUNDED: nothing a client can send adds an entry — the API models no
-    /// operation that provisions an Outpost, so the only writer is
+    /// operation that shares or provisions an Outpost, so the only writer is
     /// [`Self::provision_outpost`], reached from [`PROVISIONED_OUTPOSTS_ENV`]
     /// once when the store is created.
     pub outposts: BTreeMap<String, OutpostRecord>,
@@ -453,7 +470,7 @@ pub struct ComAmazonawsS3outpostsS3outpostsState {
     /// `DeleteEndpoint` names — which is also the stable order the endpoint
     /// listings page over. The `OutpostId` half is what puts the endpoint in a
     /// Region: it is the Outpost's, and so the endpoint's
-    /// ([`Self::outpost_region`]).
+    /// ([`outpost_region`]).
     ///
     /// BOUNDED: an endpoint is only stored once [`Self::allocate_cidr_block`]
     /// has committed one of the `ENDPOINT_CIDR_BLOCK_COUNT` ranges the emulator
@@ -484,14 +501,14 @@ pub struct ComAmazonawsS3outpostsS3outpostsState {
 }
 
 impl Default for ComAmazonawsS3outpostsS3outpostsState {
-    /// An account with NO resources: no endpoints, and no Outposts beyond the
-    /// ones [`PROVISIONED_OUTPOSTS_ENV`] says were provisioned (none, unless it
-    /// is set).
+    /// An account with NO resources: no endpoints, and no shared Outposts beyond
+    /// the ones [`PROVISIONED_OUTPOSTS_ENV`] says were shared with it (none,
+    /// unless it is set).
     ///
-    /// Nothing is invented here. The API models no operation that provisions an
-    /// Outpost, so an account nobody provisioned capacity for reports none, and
-    /// every answer that mentions an Outpost is computed from the records the
-    /// operator declared.
+    /// Nothing is invented here. The Outposts of the account itself are the ones
+    /// its AWS Outposts control plane holds, resolved per call by
+    /// [`outpost_inventory`] rather than copied in here, so a store this fresh
+    /// still answers for every Outpost that control plane has S3 capacity on.
     fn default() -> Self {
         let mut state = Self {
             outposts: BTreeMap::new(),
@@ -515,42 +532,16 @@ impl Default for ComAmazonawsS3outpostsS3outpostsState {
 }
 
 impl ComAmazonawsS3outpostsS3outpostsState {
-    /// Put `record` in the inventory `ListOutpostsWithS3` reports, replacing the
-    /// record of an Outpost already there.
+    /// Record that the Outpost `record` describes is shared with this account,
+    /// replacing the record of an Outpost already declared.
     ///
-    /// This is the ONLY way an Outpost enters the store, because the API models
-    /// no operation that provisions one: it is reached from
+    /// This is the ONLY way an Outpost of ANOTHER account enters the store,
+    /// because the API models no operation that shares one: it is reached from
     /// [`PROVISIONED_OUTPOSTS_ENV`] at init, and from a test standing up an
-    /// account that does have capacity.
+    /// account that has one shared with it. The account's OWN Outposts come from
+    /// its AWS Outposts control plane instead ([`outpost_inventory`]).
     pub fn provision_outpost(&mut self, record: OutpostRecord) {
         self.outposts.insert(record.outpost_id.clone(), record);
-    }
-
-    /// The Outpost `outpost_id` as it is reached from `region`, or `None` when the
-    /// store holds no such Outpost in that Region.
-    ///
-    /// An `OutpostId` names one Outpost, which sits in one home Region, so an
-    /// Outpost of another Region resolves to nothing here: every reference a
-    /// request makes to an Outpost — creating an endpoint on it, listing its
-    /// endpoints, deleting one — goes through this lookup, so a resource of
-    /// another Region is the modelled 404 rather than something this Region's
-    /// endpoint serves.
-    pub fn outpost_in(&self, region: &str, outpost_id: &str) -> Option<&OutpostRecord> {
-        self.outposts
-            .get(outpost_id)
-            .filter(|outpost| outpost.region == region)
-    }
-
-    /// The home Region of the Outpost `outpost_id`, or `None` when the store holds
-    /// no such Outpost.
-    ///
-    /// This is the Region of every endpoint on that Outpost, and the Region their
-    /// ARNs name: an endpoint is reached through the Outpost it is on, so it has
-    /// no Region of its own to disagree with.
-    pub fn outpost_region(&self, outpost_id: &str) -> Option<&str> {
-        self.outposts
-            .get(outpost_id)
-            .map(|outpost| outpost.region.as_str())
     }
 
     /// Mint an unused endpoint id matching `EndpointId`'s `^[a-zA-Z0-9]{19}$`.
@@ -686,6 +677,133 @@ impl ComAmazonawsS3outpostsS3outpostsState {
         }
         Some(removed)
     }
+}
+
+/// Every Outpost with S3 on Outposts capacity the caller reaches, keyed by
+/// `OutpostId`.
+///
+/// This is what the inventory listing pages over and what every `OutpostId` a
+/// request names resolves against. The `BTreeMap` is what gives
+/// `ListOutpostsWithS3` the one stable total order its pagination cursor indexes
+/// into: the ids of a store are the same set in the same order on every call, so a
+/// cursor minted by one page names the same place in the next.
+pub type OutpostInventory = BTreeMap<String, OutpostRecord>;
+
+/// The inventory this request is served: the Outposts the AWS Outposts control
+/// plane has S3 capacity provisioned on, plus the ones of other accounts the
+/// operator declared as shared with this one ([`PROVISIONED_OUTPOSTS_ENV`]).
+///
+/// Resolved per call rather than copied into this service's store: AWS Outposts
+/// owns the Outpost, so what this service reports has to be what that control
+/// plane holds NOW — an Outpost created, ordered for or decommissioned there is one
+/// this service answers for from the next call on. A declared entry for an id the
+/// control plane also holds is overridden by the control plane's own record, which
+/// is the authority on that resource.
+///
+/// `store` is this service's own store, already locked by the caller; the control
+/// plane's store is locked for the length of the projection and released before the
+/// answer is built. The lock is only ever taken in that order — this service reads
+/// AWS Outposts and never the other way round.
+pub fn outpost_inventory<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    store: &ComAmazonawsS3outpostsS3outpostsState,
+) -> OutpostInventory {
+    let mut inventory = store.outposts.clone();
+    for record in control_plane_outposts(engine) {
+        inventory.insert(record.outpost_id.clone(), record);
+    }
+    inventory
+}
+
+/// The Outposts the co-hosted AWS Outposts control plane has S3 on Outposts
+/// capacity provisioned on, or none at all when this process hosts no such control
+/// plane: an emulator without it holds no Outposts of the account's own, exactly as
+/// an account with no Outposts does.
+fn control_plane_outposts<Eng: Send + Sync + 'static>(engine: &Eng) -> Vec<OutpostRecord> {
+    let Some(control_plane) = outposts_state::service_state(engine) else {
+        return Vec::new();
+    };
+    let mut control_plane = control_plane.lock();
+    // Whether an Outpost has finished provisioning is a fact about the instant it is
+    // asked for, so the lifecycle transitions the clock ALREADY owed at this instant
+    // are materialised before the statuses are read — the same thing every read of
+    // that control plane's own does, and nothing a later caller would not have seen
+    // anyway.
+    control_plane.settle_outposts();
+    let control_plane = &*control_plane;
+    // The capacity of every Outpost at once, totalled in one pass over the orders, so
+    // resolving the whole inventory costs the orders the control plane holds rather
+    // than their product with its Outposts.
+    let provisioned = control_plane.provisioned_s3_capacity();
+    control_plane
+        .outposts
+        .values()
+        .filter_map(|record| s3_provisioned_outpost(&provisioned, record))
+        .collect()
+}
+
+/// The Outpost `record` describes as this service reports it, or `None` when it is
+/// not one with S3 on Outposts capacity for this account to reach.
+///
+/// `ListOutpostsWithS3` reports the Outposts "that have S3 provisioned", are
+/// "Active (not pending any provisioning nor decommissioned)" and are ones "to
+/// which the the calling Amazon Web Services account has access", so all three hold
+/// of every record here: one still provisioning or already being decommissioned is
+/// left out, and so is one no order has bought S3 storage capacity for, whose
+/// capacity would be zero — an Outpost with no S3 capacity is not one this listing
+/// reports at all ([`OutpostRecord::provisioned`]).
+///
+/// `provisioned` is the capacity each Outpost's orders bought, by region and id.
+fn s3_provisioned_outpost(
+    provisioned: &BTreeMap<String, BTreeMap<String, i64>>,
+    record: &outposts_state::OutpostRecord,
+) -> Option<OutpostRecord> {
+    if record.outpost.life_cycle_status.as_deref() != Some(outposts_state::LIFE_CYCLE_STATUS_ACTIVE)
+    {
+        return None;
+    }
+    if record.decommission_requested_at.is_some() {
+        return None;
+    }
+    let outpost_id = record.outpost.outpost_id.as_deref()?;
+    let owner_id = record.outpost.owner_id.as_deref()?;
+    let capacity_in_bytes = provisioned
+        .get(&record.region)
+        .and_then(|in_region| in_region.get(outpost_id))
+        .copied()
+        .unwrap_or_default();
+    OutpostRecord::provisioned(outpost_id, owner_id, capacity_in_bytes, &record.region)
+}
+
+/// The Outpost `outpost_id` as it is reached from `region`, or `None` when the
+/// inventory holds no such Outpost in that Region.
+///
+/// An `OutpostId` names one Outpost, which sits in one home Region, so an
+/// Outpost of another Region resolves to nothing here: every reference a
+/// request makes to an Outpost — creating an endpoint on it, listing its
+/// endpoints, deleting one — goes through this lookup, so a resource of
+/// another Region is the modelled 404 rather than something this Region's
+/// endpoint serves.
+pub fn outpost_in<'a>(
+    inventory: &'a OutpostInventory,
+    region: &str,
+    outpost_id: &str,
+) -> Option<&'a OutpostRecord> {
+    inventory
+        .get(outpost_id)
+        .filter(|outpost| outpost.region == region)
+}
+
+/// The home Region of the Outpost `outpost_id`, or `None` when the inventory holds
+/// no such Outpost.
+///
+/// This is the Region of every endpoint on that Outpost, and the Region their
+/// ARNs name: an endpoint is reached through the Outpost it is on, so it has
+/// no Region of its own to disagree with.
+pub fn outpost_region<'a>(inventory: &'a OutpostInventory, outpost_id: &str) -> Option<&'a str> {
+    inventory
+        .get(outpost_id)
+        .map(|outpost| outpost.region.as_str())
 }
 
 /// The account this emulator serves every request for: the one canonical
@@ -941,22 +1059,22 @@ pub fn outpost_cursor(
     list_cursor(next_token, operation, decode_outpost_cursor)
 }
 
-/// The page the Outpost inventory serves: the Outposts the store holds IN
+/// The page the Outpost inventory serves: the Outposts the inventory holds IN
 /// `region`, in its own `OutpostId` order, starting at `resume` and at most
 /// [`page_size`] of them.
 ///
-/// Every Outpost in the store has S3 capacity provisioned and is either owned by
+/// Every Outpost in the inventory has S3 capacity provisioned and is either owned by
 /// this caller or shared with it, which is what the inventory reports — so the
 /// one thing this listing filters on is the Region: an Outpost is installed at a
 /// site in one Region and reported only through that Region's endpoint.
 pub fn outpost_page(
-    store: &ComAmazonawsS3outpostsS3outpostsState,
+    inventory: &OutpostInventory,
     region: &str,
     max_results: i32,
     resume: Option<String>,
 ) -> ListPage<Outpost> {
     list_page(
-        &store.outposts,
+        inventory,
         max_results,
         resume,
         |outpost| outpost.region == region,
@@ -1032,6 +1150,7 @@ pub fn check_coip_pool(
 /// same key.
 pub fn endpoint_page(
     store: &mut ComAmazonawsS3outpostsS3outpostsState,
+    inventory: &OutpostInventory,
     now: SystemTime,
     region: &str,
     max_results: i32,
@@ -1042,21 +1161,12 @@ pub fn endpoint_page(
     // already owes is materialised before the page is taken.
     store.settle_all(now);
 
-    // The two maps are read side by side: the endpoint records the walk pages
-    // over, and the Outposts they hang off, which is where their Region lives.
-    let ComAmazonawsS3outpostsS3outpostsState {
-        endpoints,
-        outposts,
-        ..
-    } = &*store;
-    let home_region = |endpoint: &EndpointRecord| {
-        outposts
-            .get(&endpoint.outpost_id)
-            .map(|outpost| outpost.region.as_str())
-    };
+    // The endpoint records the walk pages over are read beside the inventory the
+    // Outposts they hang off live in, which is where their Region comes from.
+    let home_region = |endpoint: &EndpointRecord| outpost_region(inventory, &endpoint.outpost_id);
 
     list_page(
-        endpoints,
+        &store.endpoints,
         max_results,
         resume,
         |endpoint| home_region(endpoint) == Some(region) && include(endpoint),

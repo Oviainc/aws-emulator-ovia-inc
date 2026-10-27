@@ -26,6 +26,11 @@
 //! those tokens name, so an otherwise-permitted call carrying an unrelated or stale token
 //! is refused here, where the real service treats a grant token as additive.
 //!
+//! A request that presents NO grant token draws its permission from the policy of the key
+//! that sealed the ciphertext, and the one thing that policy decides without a caller
+//! identity is judged: [`crate::state::authorization`] refuses the request when every
+//! statement granting this action is gated on a condition the request does not satisfy.
+//!
 //! ## `KeyOrigin`
 //!
 //! The response reports the ORIGIN of the key that opened the ciphertext, beside the

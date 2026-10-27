@@ -45,6 +45,8 @@ mod scratch_dump;
 mod key_phrases;
 #[path = "all/key_phrases_jobs.rs"]
 mod key_phrases_jobs;
+#[path = "all/phone_number_forms.rs"]
+mod phone_number_forms;
 #[path = "all/pii_detection.rs"]
 mod pii_detection;
 #[path = "all/pii_entities.rs"]

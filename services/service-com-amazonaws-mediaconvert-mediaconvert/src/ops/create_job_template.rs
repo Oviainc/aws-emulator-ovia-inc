@@ -242,6 +242,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that resolves to nothing is the same modelled 404, naming the member it came
         // from.
         let hop_destinations = input.hop_destinations.unwrap_or_default();
+        // A `Queue` carrying no characters is no reference at all, on this member as on the
+        // one above: the modelled 400 naming the member it arrived in, taken before the
+        // store is consulted.
+        if let Some(problem) =
+            crate::state::hop_destination_blank_queue_problem(&hop_destinations)
+        {
+            return Err(CreateJobTemplateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(problem),
+                },
+            )
+            .into());
+        }
         if crate::state::hop_destination_queues(&hop_destinations)
             .any(|reference| !state.holds_queue(reference))
         {

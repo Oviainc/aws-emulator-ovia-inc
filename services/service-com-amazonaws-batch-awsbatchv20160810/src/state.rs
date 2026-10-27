@@ -1571,6 +1571,23 @@ pub fn is_terminal_status(status: &str) -> bool {
     matches!(status, JOB_SUCCEEDED | JOB_FAILED)
 }
 
+/// Whether `job` still REQUIRES the consumable resources its
+/// `consumableResourceProperties` name.
+///
+/// A requirement lasts exactly as long as the job can still consume the resource: a job in
+/// a terminal `JobStatus` ([`is_terminal_status`]) will never be placed again, so it holds
+/// nothing and requires nothing, whatever took it there (the clock, `CancelJob`,
+/// `TerminateJob`, the deletion of its queue). `ListJobsByConsumableResource` — whose
+/// result set is "Batch jobs that require a specific consumable resource" — therefore
+/// stops reporting a job from the instant it becomes terminal, and does so under every
+/// filter, the status filters among them.
+///
+/// The job KEEPS its `consumableResourceProperties`: they are part of what was submitted,
+/// so `DescribeJobs` still replays them. What ends is the requirement, not the record.
+pub fn requires_consumable_resources(job: &Job) -> bool {
+    !is_terminal_status(&job.status)
+}
+
 /// A service job, as `SubmitServiceJob` accepted it: the record `DescribeServiceJob`
 /// reports and `TerminateServiceJob` ends.
 ///

@@ -25,6 +25,11 @@
 //! effect here is narrower than AWS: an otherwise-permitted call that carries an
 //! unrelated or stale grant token is refused.
 //!
+//! A request that presents NO grant token draws its permission from the key's own policy,
+//! and the one thing that policy decides without a caller identity is judged:
+//! [`crate::state::authorization`] refuses the request when every statement granting this
+//! action is gated on a condition the request does not satisfy.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

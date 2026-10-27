@@ -1038,6 +1038,20 @@ impl ComAmazonawsRbinAmazonrecyclebinState {
         })
     }
 
+    /// Materialise every transition the CLOCK has already made due for each rule
+    /// `region` holds — [`Rule::settle`] applied across the Region a reader walks.
+    ///
+    /// The write-side twin of [`Self::rules_in_region`], for an operation that reads
+    /// MANY rules at once: each of those transitions was owed at this instant whether
+    /// or not anybody called, so a pager that settles first reports — and filters on —
+    /// the state the clock reached rather than the one the last writer left behind, and
+    /// agrees with what a single-rule reader answers for the same record.
+    pub fn settle_rules_in_region(&mut self, region: &str, now: SystemTime) {
+        for rule in self.rules.values_mut().filter(|rule| rule.region == region) {
+            rule.settle(now);
+        }
+    }
+
     /// The rules of `region` to walk for a page, starting after `after` when a
     /// `NextToken` named one.
     ///

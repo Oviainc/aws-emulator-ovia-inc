@@ -19,6 +19,8 @@ mod cancel_job;
 mod compute_environment_update;
 #[path = "all/consumable_resource_listing.rs"]
 mod consumable_resource_listing;
+#[path = "all/consumable_resource_release.rs"]
+mod consumable_resource_release;
 #[path = "all/consumable_resource_update_concurrency.rs"]
 mod consumable_resource_update_concurrency;
 #[path = "all/consumable_resource_updates.rs"]
