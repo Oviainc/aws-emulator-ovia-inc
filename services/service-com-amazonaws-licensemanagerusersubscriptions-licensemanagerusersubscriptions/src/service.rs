@@ -65,20 +65,21 @@ struct InstanceGatedRoute {
 
 /// Every route the authorization gate covers.
 ///
-/// An operation belongs here exactly when it requires an `InstanceId` and gates on the
-/// account's ownership of that instance before it looks anything else up — which is
-/// `AssociateUser` and `ListUserAssociations`, the two operations whose input declares
-/// `InstanceId` `@required`
-/// (`smithy_query(query="operation", operation="AssociateUser,ListUserAssociations")`) and
-/// whose handler opens with that predicate. Listing them in ONE table is what keeps the
-/// hoisted gate from covering some of them and not others: the refusal a caller gets for an
-/// instance this service will not authorize cannot depend on which of those operations it
-/// called, nor on what else the request got wrong.
+/// An operation belongs here exactly when its input carries an `InstanceId`: the account's
+/// ownership of the EC2 instance a request names is what decides whether this service acts
+/// on that request at all, so the decision is taken for every operation that names one.
+/// That is `AssociateUser`, `ListUserAssociations` and `DisassociateUser`, the three whose
+/// input declares the member (`smithy_query(query="operation",
+/// operation="AssociateUser,ListUserAssociations,DisassociateUser")`), and whose handlers
+/// each open with that predicate. Listing them in ONE table is what keeps the hoisted gate
+/// from covering some of them and not others: the refusal a caller gets for an instance
+/// this service will not authorize cannot depend on which of those operations it called,
+/// nor on what else the request got wrong.
 ///
-/// `DisassociateUser` is deliberately NOT here. Its `InstanceId` is optional and it gates on
-/// something else — whether an association resolves at all — and it refuses a request that
-/// addresses no association BEFORE resolving anything, so there is no instance-ownership
-/// decision in front of it to hoist.
+/// Whether the model marks the member `@required` changes only WHEN the gate applies, not
+/// whether it does: `DisassociateUser` marks nothing required and can address an
+/// association by `InstanceUserArn` alone, so a request of it that names no instance has
+/// nothing to authorize and goes on to the modelled operation ([`named_instance`]).
 static INSTANCE_GATED_ROUTES: &[InstanceGatedRoute] = &[
     InstanceGatedRoute {
         uri: "/user/AssociateUser",
@@ -87,6 +88,10 @@ static INSTANCE_GATED_ROUTES: &[InstanceGatedRoute] = &[
     InstanceGatedRoute {
         uri: "/user/ListUserAssociations",
         operation: "ListUserAssociations",
+    },
+    InstanceGatedRoute {
+        uri: "/user/DisassociateUser",
+        operation: "DisassociateUser",
     },
 ];
 
