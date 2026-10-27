@@ -113,15 +113,14 @@ use std::collections::BTreeMap;
 /// HTTP 409).
 ///
 /// A CONSTANT, naming neither the caller reference nor the health check it
-/// already names: the shape's own documentation states the rule without either
-/// ("The same value for CallerReference as an existing health check, and one or
-/// more values that differ from the existing health check that has the same
-/// caller reference"), and the health check's id is server-generated, so a
-/// refusal quoting it would differ on every run. The health check that reference
-/// names is in state, where `GetHealthCheck` reads it.
+/// already names: the sentence carries no request or state values at all, and
+/// its second half is the part a caller needs — a caller reference stays held
+/// for some days after the health check that used it is deleted, so retrying the
+/// create with that reference cannot succeed yet.
 const HEALTH_CHECK_ALREADY_EXISTS_MESSAGE: &str =
-    "A health check has already been created with the specified caller reference and a \
-     different configuration.";
+    "A different health check has already been created with the specified caller reference. \
+     If that health check has been deleted, Route 53 will still maintain the caller reference \
+     for a number of days.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -235,27 +234,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Route 53 returns the health check configuration in the response" —
         // and "with different settings, Route 53 returns a
         // HealthCheckAlreadyExists error".
-        let already_named = store
+        let named_id = store
             .health_check_by_caller_reference
             .get(&input.caller_reference)
-            .and_then(|id| store.health_checks.get(id))
             .cloned();
-        if let Some(existing) = already_named {
-            if existing.config != config {
-                return Err(CreateHealthCheckErrorModeled::HealthCheckAlreadyExists(
-                    HealthCheckAlreadyExists {
-                        message: Some(HEALTH_CHECK_ALREADY_EXISTS_MESSAGE.to_string()),
-                    },
-                )
-                .into());
+        if let Some(named_id) = named_id {
+            // The health check the reference names, or none when it was created
+            // and later deleted: the index outlives the health check, because
+            // the reference stays held after a delete.
+            match store.health_checks.get(&named_id).cloned() {
+                // The same request again: the health check it asked for is
+                // already there, so it is reported rather than duplicated —
+                // nothing is created and no version moves.
+                Some(existing) if existing.config == config => {
+                    return Ok(CreateHealthCheckOutput {
+                        health_check: existing.to_health_check(),
+                        location: resource_location(ctx, &format!("healthcheck/{}", existing.id)),
+                    });
+                }
+                // Everything else is the collision: "the same value for
+                // CallerReference as an existing health check, and one or more
+                // values that differ from the existing health check that has
+                // the same caller reference", and "the same value for
+                // CallerReference as a health check that you created and later
+                // deleted, regardless of the other settings in the request".
+                _ => {
+                    return Err(CreateHealthCheckErrorModeled::HealthCheckAlreadyExists(
+                        HealthCheckAlreadyExists {
+                            message: Some(HEALTH_CHECK_ALREADY_EXISTS_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                }
             }
-            // The same request again: the health check it asked for is already
-            // there, so it is reported rather than duplicated — nothing is
-            // created and no version moves.
-            return Ok(CreateHealthCheckOutput {
-                health_check: existing.to_health_check(),
-                location: resource_location(ctx, &format!("healthcheck/{}", existing.id)),
-            });
         }
 
         // The account's own quota: a caller chooses `CallerReference` freely, so

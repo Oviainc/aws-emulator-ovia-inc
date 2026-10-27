@@ -808,6 +808,35 @@ pub fn check_probes_per_subnet<'a>(
     Ok(())
 }
 
+/// Check the per-monitor probe limit for a request that would ADD probes to a
+/// monitor ([`MAX_PROBES_PER_MONITOR`]).
+///
+/// The limit bounds the probes ONE monitor holds, so the probes `existing`
+/// already holds and the `requested` count the call adds are counted together:
+/// one call adding several probes is bounded exactly as several calls adding one
+/// each are. `existing` is `None` for a monitor the request is creating, which
+/// holds no probe yet.
+///
+/// Shared by every operation that ADDS a probe to a monitor (`CreateProbe`, and
+/// `CreateMonitor`'s inline `probes` list), so the limit cannot be enforced on
+/// one path and not the other. `Err` carries
+/// [`PROBES_PER_MONITOR_MESSAGE`].
+pub fn check_probes_per_monitor(
+    existing: Option<&Monitor>,
+    requested: usize,
+) -> Result<(), String> {
+    // Every probe the monitor holds occupies a slot, including one whose
+    // teardown is still draining: such a probe is still attached, and the store
+    // drops it once the teardown has run its course
+    // ([`Probe::is_forgotten_at`]), which frees the slot — the same population
+    // [`check_probes_per_subnet`] counts.
+    let held = existing.map_or(0, |monitor| monitor.probes.len());
+    if held.saturating_add(requested) > MAX_PROBES_PER_MONITOR {
+        return Err(PROBES_PER_MONITOR_MESSAGE.to_string());
+    }
+    Ok(())
+}
+
 /// The dotted path of one member of the probe sitting at `probe_path`, which is
 /// empty for an operation that binds a probe's members at the top level of its
 /// own input (`UpdateProbe`).

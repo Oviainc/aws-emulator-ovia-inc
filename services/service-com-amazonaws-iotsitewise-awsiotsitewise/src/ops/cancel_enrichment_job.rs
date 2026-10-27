@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelEnrichmentJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelEnrichmentJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelEnrichmentJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a cancellation on one enrichment job of a workspace and answers the
+//! status that job then stands in. The cancellation is WRITTEN to the stored job
+//! (`crate::state::EnrichmentJobRecord::cancelled_at`), so every later reader of
+//! that job — `DescribeEnrichmentJob`, `ListEnrichmentJobs` and the duplicate-job
+//! rule a create reads — reports the same terminal status.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +179,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelEnrichmentJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelEnrichmentJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelEnrichmentJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // The workspace the path names is resolved FIRST, as every handler in this
+        // crate resolves the resource its path names before the one inside it, so a
+        // request that names neither reports the workspace that is absent.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
+
+        // A job of one workspace is not reachable through another, which is what the
+        // key the store holds a job under states, so a job id this workspace does not
+        // hold is the modelled not-found refusal.
+        let key = crate::state::enrichment_job_key(&input.workspace_name, &input.job_id);
+        let record = store
+            .enrichment_jobs
+            .get_mut(&key)
+            .ok_or_else(|| not_found(crate::state::RESOURCE_ENRICHMENT_JOB, &input.job_id))?;
+
+        if record.cancelled_at.is_none() {
+            if record.is_active(now) {
+                // "Jobs in PENDING or RUNNING status transition to CANCELLED" and
+                // "the API responds immediately after recording the cancellation":
+                // the cancel is RECORDED here, and from this instant every reader of
+                // the job reports the terminal status it took the job to.
+                record.record_cancel(now);
+            } else {
+                // "Jobs already in terminal states (COMPLETED, FAILED, TIMED_OUT)
+                // cannot be cancelled; the operation returns a
+                // ConflictingOperationException."
+                let status = record.status(now);
+                let job_id = record.job_id.clone();
+                let region = crate::state::request_region(ctx.parts());
+                return Err(conflict(
+                    format!(
+                        "The enrichment job {job_id} is in the {status} status; only a job \
+                         that has not reached a terminal status can be cancelled."
+                    ),
+                    &job_id,
+                    &crate::state::enrichment_job_arn(&region, &job_id),
+                ));
+            }
+        }
+        // A job a cancel was ALREADY recorded on is left exactly as it stands: the
+        // operation is modelled `@idempotent` and "cancelling an already-CANCELLED
+        // job is a no-op and returns the current status", so a retry records no
+        // second cancellation and moves the instant the first one stamped the job
+        // with no further on.
+
+        Ok(CancelEnrichmentJobOutput {
+            job_id: record.job_id.clone(),
+            // "The status of the enrichment job after cancellation", derived from the
+            // record exactly as every reader of a job derives it, so this response
+            // and a read that follows it cannot disagree.
+            status: record.status(now).to_string(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` for the resource of `kind` the request
+/// named: a workspace this service does not hold, or a job the named workspace
+/// does not hold. A job is addressed within a workspace, so the second is also
+/// what a cancel naming a job of ANOTHER workspace answers.
+fn not_found(kind: &str, identifier: &str) -> CancelEnrichmentJobError {
+    CancelEnrichmentJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::not_found_message(kind, identifier),
+    })
+    .into()
+}
+
+/// HTTP 409 `ConflictingOperationException` naming the job the cancellation
+/// could not be applied to — the resource the operation is on, as the error's
+/// required members state it.
+fn conflict(message: String, job_id: &str, job_arn: &str) -> CancelEnrichmentJobError {
+    CancelEnrichmentJobErrorModeled::ConflictingOperationException(ConflictingOperationException {
+        message,
+        resource_id: job_id.to_string(),
+        resource_arn: job_arn.to_string(),
+    })
+    .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> CancelEnrichmentJobError {
+    CancelEnrichmentJobErrorModeled::InternalFailureException(InternalFailureException { message })
+        .into()
 }

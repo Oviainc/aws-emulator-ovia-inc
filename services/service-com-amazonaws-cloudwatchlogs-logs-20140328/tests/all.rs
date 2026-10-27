@@ -59,6 +59,8 @@ mod destinations;
 mod event_cursor_envelope;
 #[path = "all/export_task_cancellation.rs"]
 mod export_task_cancellation;
+#[path = "all/export_task_status_messages.rs"]
+mod export_task_status_messages;
 #[path = "all/export_tasks.rs"]
 mod export_tasks;
 #[path = "all/export_time_windows.rs"]

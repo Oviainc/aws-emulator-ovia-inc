@@ -47,7 +47,7 @@ const MAX_QUERY_CONTENT: usize = 1024;
 /// Every value `AutomatedReasoningCheckResult` admits
 /// (`smithy_query(query="shape",shape="AutomatedReasoningCheckResult")`), so the rule is
 /// asserted over the whole enum rather than over the one value a recording carried.
-const CHECK_RESULTS: &[&str] = &[
+pub(crate) const CHECK_RESULTS: &[&str] = &[
     "VALID",
     "INVALID",
     "SATISFIABLE",
@@ -78,7 +78,9 @@ pub(crate) async fn create_policy(emu: &Emulator, name: &str) -> String {
     reply.text("policyArn")
 }
 
-async fn create_test_case(emu: &Emulator, policy_arn: &str, body: Value) -> Reply {
+/// `pub(crate)` so the sibling suite that drives the DELETE of a stored test creates one
+/// the SAME way rather than carrying a second copy of this request.
+pub(crate) async fn create_test_case(emu: &Emulator, policy_arn: &str, body: Value) -> Reply {
     emu.call(
         "POST",
         &format!(
@@ -90,7 +92,8 @@ async fn create_test_case(emu: &Emulator, policy_arn: &str, body: Value) -> Repl
     .await
 }
 
-async fn list_test_cases(emu: &Emulator, policy_arn: &str, query: &str) -> Reply {
+/// `pub(crate)` for the same reason [`create_test_case`] is.
+pub(crate) async fn list_test_cases(emu: &Emulator, policy_arn: &str, query: &str) -> Reply {
     let path = format!(
         "/automated-reasoning-policies/{}/test-cases",
         label(policy_arn)
@@ -103,7 +106,8 @@ async fn list_test_cases(emu: &Emulator, policy_arn: &str, query: &str) -> Reply
     emu.call("GET", &path, None).await
 }
 
-async fn get_test_case(emu: &Emulator, policy_arn: &str, test_case_id: &str) -> Reply {
+/// `pub(crate)` for the same reason [`create_test_case`] is.
+pub(crate) async fn get_test_case(emu: &Emulator, policy_arn: &str, test_case_id: &str) -> Reply {
     emu.call(
         "GET",
         &format!(

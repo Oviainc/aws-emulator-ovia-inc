@@ -37,6 +37,8 @@ mod create_app_authorization_credential_idempotency;
 mod idempotent_replay_before_preconditions;
 #[path = "all/ingestion_deletion.rs"]
 mod ingestion_deletion;
+#[path = "all/ingestion_destination_accepted_status.rs"]
+mod ingestion_destination_accepted_status;
 #[path = "all/ingestion_destination_lifecycle.rs"]
 mod ingestion_destination_lifecycle;
 #[path = "all/ingestion_destination_loss.rs"]

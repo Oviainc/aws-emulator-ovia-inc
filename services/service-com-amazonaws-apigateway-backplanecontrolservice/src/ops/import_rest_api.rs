@@ -559,13 +559,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stages: BTreeMap::new(),
             deployments: BTreeMap::new(),
             // Nor with a customized gateway response, a documentation part, a
-            // documentation version, an authorizer or a request validator: each is
-            // written by the operation that owns it.
+            // documentation version, an authorizer, a request validator or a model: each
+            // is written by the operation that owns it. An imported definition's schemas
+            // are left to the issue that owns importing them.
             gateway_responses: BTreeMap::new(),
             documentation_parts: BTreeMap::new(),
             documentation_versions: BTreeMap::new(),
             authorizers: BTreeMap::new(),
             request_validators: BTreeMap::new(),
+            models: BTreeMap::new(),
             sequence,
         };
 

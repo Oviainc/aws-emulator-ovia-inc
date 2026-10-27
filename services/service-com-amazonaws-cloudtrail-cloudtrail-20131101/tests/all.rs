@@ -172,3 +172,8 @@ mod event_data_store_restore;
 // a refusal moves none.
 #[path = "all/dashboard_update_status.rs"]
 mod dashboard_update_status;
+// `dashboard_termination_protection_wording` pins the WORDING of the refusal a delete of
+// a termination-protected dashboard carries: one fixed sentence, with no part of the
+// request or of the dashboard interpolated into it.
+#[path = "all/dashboard_termination_protection_wording.rs"]
+mod dashboard_termination_protection_wording;

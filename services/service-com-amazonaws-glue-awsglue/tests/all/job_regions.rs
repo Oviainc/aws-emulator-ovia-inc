@@ -14,6 +14,8 @@
 //! in `JobsNotFound` and `ListJobs` does not list it — and the same name in two Regions
 //! names two independent jobs.
 
+use std::collections::HashMap;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::messages::{
     JOB_METADATA_MISSING, JOB_RUNS_JOB_NOT_FOUND,
@@ -48,12 +50,31 @@ async fn create_job_in(router: &MultiServiceRouter, region: &str, name: &str) {
     );
 }
 
-/// The `(Jobs, JobsNotFound)` names `BatchGetJobs` reports in `region` for `names`.
-async fn batch_get_in(
+/// Where a job created through `region` under `name` keeps its script. The location names
+/// the Region, so a definition a read reports can be traced to the record ONE Region
+/// stored — two Regions holding that name hold two different records.
+fn regional_script(region: &str, name: &str) -> String {
+    format!("s3://etl-scripts/{region}/{name}.py")
+}
+
+/// Create `name` through `region`'s endpoint, carrying that Region's own script location.
+async fn create_regional_job(router: &MultiServiceRouter, region: &str, name: &str) {
+    let mut body = job_body(name);
+    body["Command"]["ScriptLocation"] = json!(regional_script(region, name));
+    let (status, answer) = call_in_region(router, region, "CreateJob", &body).await;
+    assert_eq!(
+        status, 200,
+        "case {region} / {name}: CreateJob must answer 200, got {status} with {answer}"
+    );
+}
+
+/// The `(Jobs, JobsNotFound)` `BatchGetJobs` reports in `region` for `names`, each found
+/// job as its `(Name, Command.ScriptLocation)` pair — the pair says WHICH record answered.
+async fn batch_get_records_in(
     router: &MultiServiceRouter,
     region: &str,
-    names: &[&str],
-) -> (Vec<String>, Vec<String>) {
+    names: &[String],
+) -> (Vec<(String, String)>, Vec<String>) {
     let (status, body) = call_in_region(
         router,
         region,
@@ -69,7 +90,18 @@ async fn batch_get_in(
         .as_array()
         .expect("Jobs is a list")
         .iter()
-        .map(|job| job["Name"].as_str().expect("Job.Name is a string").to_string())
+        .map(|job| {
+            (
+                job["Name"]
+                    .as_str()
+                    .expect("Job.Name is a string")
+                    .to_string(),
+                job["Command"]["ScriptLocation"]
+                    .as_str()
+                    .expect("Command.ScriptLocation is a string")
+                    .to_string(),
+            )
+        })
         .collect();
     let missing = body["JobsNotFound"]
         .as_array()
@@ -78,6 +110,21 @@ async fn batch_get_in(
         .map(|name| name.as_str().expect("a name is a string").to_string())
         .collect();
     (found, missing)
+}
+
+/// The `(Jobs, JobsNotFound)` names `BatchGetJobs` reports in `region` for `names`: the
+/// same answer as [`batch_get_records_in`], with each found job reduced to its name.
+async fn batch_get_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    names: &[&str],
+) -> (Vec<String>, Vec<String>) {
+    let owned: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
+    let (found, missing) = batch_get_records_in(router, region, &owned).await;
+    (
+        found.into_iter().map(|(name, _)| name).collect(),
+        missing,
+    )
 }
 
 /// The names `ListJobs` reports in `region`.
@@ -497,4 +544,133 @@ async fn the_same_name_in_two_regions_names_two_jobs() {
         Some("s3://etl-scripts/etl.py"),
         "the first Region's definition must be untouched by the others, got {job}"
     );
+}
+
+/// A batch read resolves EVERY requested name in the endpoint's Region alone: the names
+/// that Region holds a job of come back in `Jobs`, carrying that Region's own record, and
+/// every other requested name comes back in `JobsNotFound` — so two endpoints asked the
+/// same batch answer the mirrored split, and the two lists together still account for
+/// each requested name once, in the order the request listed it.
+///
+/// The rows differ along which endpoint asks, how many names the batch carries, their
+/// order, whether a name repeats, and whether the name is held by one Region, by two, or
+/// by none at all. The expectation is derived from which Region each name was created
+/// through, not written out per row, so no row can agree with a merged store.
+#[tokio::test]
+async fn a_batch_read_resolves_each_name_in_the_endpoints_region() {
+    let router = emulator();
+    let regions: Vec<&str> = [REGION].into_iter().chain(OTHER_REGIONS).collect();
+
+    // One job per Region named after it, plus one name the first two Regions each hold a
+    // job of — so whichever endpoint asks, a batch over every name has both a hit and
+    // misses in it, and a name held twice is held by two independent records.
+    const SHARED: &str = "batch-shared-job-name";
+    let mut holders: HashMap<String, Vec<&str>> = HashMap::new();
+    let mut every_name: Vec<String> = Vec::new();
+    for region in &regions {
+        let name = format!("batch-{region}");
+        create_regional_job(&router, region, &name).await;
+        holders.entry(name.clone()).or_default().push(region);
+        every_name.push(name);
+    }
+    for region in regions.iter().take(2) {
+        create_regional_job(&router, region, SHARED).await;
+        holders.entry(SHARED.to_string()).or_default().push(region);
+    }
+    every_name.push(SHARED.to_string());
+    // A name no Region holds: a miss from every endpoint, and never an error.
+    let unheld = "batch-never-created".to_string();
+
+    /// Whether `region` holds a job under `name`.
+    fn holds(holders: &HashMap<String, Vec<&str>>, region: &str, name: &str) -> bool {
+        holders
+            .get(name)
+            .is_some_and(|regions| regions.contains(&region))
+    }
+
+    for region in &regions {
+        let own: Vec<String> = every_name
+            .iter()
+            .filter(|name| holds(&holders, region, name))
+            .cloned()
+            .collect();
+        let foreign: Vec<String> = every_name
+            .iter()
+            .filter(|name| !holds(&holders, region, name))
+            .cloned()
+            .collect();
+        let mut reversed = every_name.clone();
+        reversed.reverse();
+        let mut with_unheld = every_name.clone();
+        with_unheld.push(unheld.clone());
+
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            ("every name, in create order", every_name.clone()),
+            ("every name, reversed", reversed),
+            ("only the names this Region holds", own.clone()),
+            ("only names of other Regions", foreign.clone()),
+            (
+                "one of its own names repeated around a foreign one",
+                vec![own[0].clone(), foreign[0].clone(), own[0].clone()],
+            ),
+            ("a name no Region holds", vec![unheld.clone()]),
+            ("every name plus one no Region holds", with_unheld),
+        ];
+
+        for (label, requested) in cases {
+            let case = format!("{region} / {label}");
+            let expected_found: Vec<(String, String)> = requested
+                .iter()
+                .filter(|name| holds(&holders, region, name))
+                .map(|name| (name.clone(), regional_script(region, name)))
+                .collect();
+            let expected_missing: Vec<String> = requested
+                .iter()
+                .filter(|name| !holds(&holders, region, name))
+                .cloned()
+                .collect();
+
+            let (found, missing) = batch_get_records_in(&router, region, &requested).await;
+            assert_eq!(
+                found, expected_found,
+                "case {case}: expected Jobs {expected_found:?}, got {found:?}"
+            );
+            assert_eq!(
+                missing, expected_missing,
+                "case {case}: expected JobsNotFound {expected_missing:?}, got {missing:?}"
+            );
+            assert_eq!(
+                found.len() + missing.len(),
+                requested.len(),
+                "case {case}: every requested name must be reported exactly once, got \
+                 {found:?} and {missing:?}"
+            );
+        }
+    }
+
+    // Mirrored, name by name: the endpoints whose batch resolves a name are exactly the
+    // Regions the name was created through — one Region for a name created once, both for
+    // the name created twice, none for a name created nowhere.
+    for name in every_name.iter().chain(std::iter::once(&unheld)) {
+        let mut resolving: Vec<&str> = Vec::new();
+        for region in &regions {
+            let (found, missing) =
+                batch_get_records_in(&router, region, std::slice::from_ref(name)).await;
+            if found.is_empty() {
+                assert_eq!(
+                    missing,
+                    vec![name.clone()],
+                    "case {region} / {name}: a name this Region holds no job of must be \
+                     reported missing, got {missing:?}"
+                );
+            } else {
+                resolving.push(region);
+            }
+        }
+        let expected: Vec<&str> = holders.get(name.as_str()).cloned().unwrap_or_default();
+        assert_eq!(
+            resolving, expected,
+            "case {name}: expected the name to resolve in {expected:?}, got {resolving:?}"
+        );
+    }
 }

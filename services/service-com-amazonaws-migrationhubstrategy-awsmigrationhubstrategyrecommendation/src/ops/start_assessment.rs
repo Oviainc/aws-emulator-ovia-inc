@@ -93,8 +93,9 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-migrationhubstrategy-aw
 // `ValidationException` is widened in with `extra_errors`: it is a shape the SERVICE
 // models (`httpError` 400, "The request body isn't valid.") that this operation's own
 // `errors` list omits, and without it the handler has no way to refuse a request the
-// service refuses — an assessment that named no analysis-data bucket, or a bucket name
-// that breaks the documented `migrationhub-strategy-` prefix rule.
+// service refuses — an assessment that named no analysis-data bucket, a bucket name
+// that breaks the documented `migrationhub-strategy-` prefix rule, or criteria listing
+// more values than the service selects on (`crate::state::MAX_ASSESSMENT_TARGET_VALUES`).
 #[smithy_macros::operation_error(
     "com.amazonaws.migrationhubstrategy#StartAssessment",
     extra_errors = ["ValidationException"]
@@ -224,9 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // boundary validator does not enforce an enum's value list, so a value the model
         // does not declare is refused here — the same refusal `ListServers` and
         // `StartRecommendationReportGeneration` give an undeclared value of their own —
-        // rather than being persisted and echoed back by `GetAssessment` as a condition
-        // that does not exist. Decided before the store is touched, so a refused start
-        // leaves no assessment behind.
+        // rather than being persisted as a criterion whose condition compares nothing and
+        // echoed back by `GetAssessment` as a condition that does not exist. Decided
+        // before the store is touched, so a refused start leaves no assessment behind.
         crate::state::check_enum(
             input.assessment_data_source_type.as_deref(),
             ASSESSMENT_DATA_SOURCE_TYPE_VALUES,
@@ -236,6 +237,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for target in &assessment_targets {
             crate::state::check_enum(Some(target.condition.as_str()), CONDITION_VALUES)
                 .map_err(StartAssessmentErrorModeled::ValidationException)?;
+        }
+        // And the bound on how much selecting one request may ask for: every criterion
+        // value is compared to every server of the portfolio when the scope is resolved,
+        // and the model bounds the criteria but not the values one of them lists, so a
+        // request listing more than the service accepts is refused here — before the
+        // inventory is read — rather than scanning it once per value.
+        let criterion_values: usize = assessment_targets
+            .iter()
+            .map(|target| target.values.len())
+            .sum();
+        if criterion_values > crate::state::MAX_ASSESSMENT_TARGET_VALUES {
+            return Err(StartAssessmentErrorModeled::ValidationException(
+                crate::state::invalid_request_body(),
+            )
+            .into());
         }
 
         // The assessment is started in the portfolio of the Region this request was
@@ -286,20 +302,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // An assessment collects data for the servers the portfolio holds when it starts,
-        // so count them with every completion the clock already owed materialised first —
-        // including the records an import whose completion is now due brought in.
+        // An assessment collects data for the servers of this portfolio its CRITERIA
+        // select, so resolve that scope with every completion the clock already owed
+        // materialised first — including the records an import whose completion is now due
+        // brought in, which are part of the inventory the criteria are applied to.
         let id = store.mint_assessment_id(&region);
         let portfolio = store.region_entry(&region);
         portfolio.settle_all(now);
-        let servers = portfolio.server_count();
+        let covered_servers = portfolio.servers_covered_by(&assessment_targets);
+        // Every server this assessment covers is collecting while it runs.
+        let in_progress = crate::state::count_of(covered_servers.len());
 
         let assessment = crate::state::Assessment {
             id: id.clone(),
             // Data collection is not done the instant the call returns; the clock owes
             // the assessment `COMPLETE` once the completion span has passed, and
             // `StopAssessment` can still stop it until then. Reaching `COMPLETE` is what
-            // records the analysis on the portfolio this assessment covers
+            // records the analysis on the resources this assessment covers
             // (`RegionState::finish_assessment`), so an assessment that is stopped before
             // then recommends nothing.
             status: crate::state::ASSESSMENT_IN_PROGRESS.to_string(),
@@ -310,18 +329,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             start_time: now,
             completion_time: None,
             status_message: None,
-            servers,
             success: 0,
             failed: 0,
-            // Every server this assessment covers is collecting while it runs.
-            in_progress: servers,
+            in_progress,
             completion_due: Some(now + crate::state::COMPLETION_SPAN),
+            covered_servers: covered_servers.clone(),
         };
         portfolio.assessments.insert(id.clone(), assessment);
-        // The assessment is observable on the SERVERS as well as on its own record:
-        // `ServerDetail$dataCollectionStatus` is "the status of assessment for the
-        // server", so every server this assessment covers is now collecting.
-        portfolio.begin_server_collection();
+        // The assessment is observable on the SERVERS it covers as well as on its own
+        // record: `ServerDetail$dataCollectionStatus` is "the status of assessment for the
+        // server", so every server this assessment covers is now collecting — and one it
+        // does not cover is not collecting for it, so it is left alone.
+        portfolio.begin_server_collection(&covered_servers);
         // `GetLatestAssessmentId` answers with the most recently started assessment of
         // the Region it is asked in.
         portfolio.latest_assessment_id = Some(id.clone());

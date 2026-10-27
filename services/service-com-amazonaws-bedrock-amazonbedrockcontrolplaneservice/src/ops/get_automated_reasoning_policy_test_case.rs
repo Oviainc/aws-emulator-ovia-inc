@@ -165,10 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(test_case) =
             store.automated_reasoning_policy_test_case(&input.policy_arn, &input.test_case_id)
         else {
-            return Err(not_found(&format!(
-                "no test {} exists for automated reasoning policy {}",
-                input.test_case_id, input.policy_arn
-            )));
+            return Err(not_found(
+                &crate::state::automated_reasoning_policy_test_case_not_found_message(
+                    &input.test_case_id,
+                    &input.policy_arn,
+                ),
+            ));
         };
 
         Ok(GetAutomatedReasoningPolicyTestCaseOutput {
@@ -179,7 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The modelled 404 this operation answers for a policy or a test this account holds none
-/// of — one wording for both, because the test is addressed by the PAIR.
+/// of — the test is addressed by the PAIR, so either half missing is "the resource was not
+/// found". The wording for a missing test is the service's own for that resource
+/// ([`crate::state::automated_reasoning_policy_test_case_not_found_message`]), so a request
+/// addressing one gets the same message wherever it came from.
 fn not_found(message: &str) -> GetAutomatedReasoningPolicyTestCaseError {
     GetAutomatedReasoningPolicyTestCaseErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {

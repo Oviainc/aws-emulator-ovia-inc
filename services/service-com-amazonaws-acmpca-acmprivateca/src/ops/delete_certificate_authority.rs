@@ -239,8 +239,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // A delete of a CA whose deletion is ALREADY pending has nothing to delete: the
+        // CA is in DELETED, inside the restoration window the first delete opened, so the
+        // call is idempotent — it answers the modelled success and leaves the pending
+        // deletion, the window it closes in and the status a restore puts the CA back
+        // into exactly as the first delete left them. A second delete must not record
+        // DELETED as the status to restore to.
+        if record.is_deleted() {
+            return Ok(DeleteCertificateAuthorityOutput);
+        }
+
         // A CA is deletable only from the statuses the operation documents; an ACTIVE CA
-        // has to be disabled first, and one already DELETED is not deleted again.
+        // has to be disabled first.
         if !record.is_deletable() {
             return Err(DeleteCertificateAuthorityErrorModeled::InvalidStateException(
                 InvalidStateException {

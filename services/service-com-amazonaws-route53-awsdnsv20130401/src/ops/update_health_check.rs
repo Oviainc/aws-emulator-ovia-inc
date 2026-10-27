@@ -174,14 +174,24 @@ use crate::state::{
 /// The refusal text this operation answers a `HealthCheckVersion` that is not
 /// the health check's current one with (`HealthCheckVersionMismatch`, HTTP 409).
 ///
-/// A CONSTANT, naming neither version: the shape's own documentation states the
-/// rule without either ("The value of HealthCheckVersion in the request doesn't
-/// match the value of HealthCheckVersion in the health check"), and the health
-/// check's current version is in state, where `GetHealthCheck` reads it — which
-/// is what the member's documentation tells a caller to do before retrying.
-const HEALTH_CHECK_VERSION_MISMATCH_MESSAGE: &str =
-    "The value of HealthCheckVersion in the request doesn't match the value of \
-     HealthCheckVersion in the health check.";
+/// The sentence names BOTH versions and the health check they belong to: the
+/// caller is doing the read-modify-write loop the `HealthCheckVersion` member
+/// documents ("use GetHealthCheck or ListHealthChecks to get the current value
+/// of HealthCheckVersion ... and include that value in your UpdateHealthCheck
+/// request"), so the refusal has to say which version the health check holds for
+/// the loop to be resolvable from the response alone. The id comes from the
+/// request's label, `held` from the stored health check and `requested` from the
+/// request's member — none of them is a constant of this handler.
+fn health_check_version_mismatch_message(
+    health_check_id: &str,
+    held: i64,
+    requested: i64,
+) -> String {
+    format!(
+        "Health check with id {health_check_id} has version {held}, but expected to have \
+         version {requested}. Could not proceed with update."
+    )
+}
 
 /// The `ResettableElementName` that resets `FullyQualifiedDomainName`.
 const RESET_FULLY_QUALIFIED_DOMAIN_NAME: &str = "FullyQualifiedDomainName";
@@ -420,13 +430,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same version cannot both observe it as current — one is applied and
         // the other is refused here, and the counter moves once. Never read the
         // version, drop the guard and write under a second one.
-        if input
+        if let Some(requested) = input
             .health_check_version
-            .is_some_and(|requested| requested != existing.version)
+            .filter(|requested| *requested != existing.version)
         {
             return Err(UpdateHealthCheckErrorModeled::HealthCheckVersionMismatch(
                 HealthCheckVersionMismatch {
-                    message: Some(HEALTH_CHECK_VERSION_MISMATCH_MESSAGE.to_string()),
+                    message: Some(health_check_version_mismatch_message(
+                        &input.health_check_id,
+                        existing.version,
+                        requested,
+                    )),
                 },
             )
             .into());

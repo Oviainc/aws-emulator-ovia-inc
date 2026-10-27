@@ -1207,7 +1207,13 @@ pub(crate) async fn deliver(
         .role_arn
         .as_deref()
         .filter(|_| kind.invoked_under_target_role());
-    let outcome = match role_refusal(iam, role_arn, &target.arn, kind.action()) {
+    let attempt = crate::state::DeliveryAttempt {
+        rule: handover.rule,
+        target_id: &target.id,
+        action: kind.action(),
+        resource: &target.arn,
+    };
+    let outcome = match role_refusal(iam, role_arn, &attempt) {
         Some((code, message)) => crate::state::InvocationOutcome::Failed { code, message },
         None => {
             kind.invoke(ctx, clients, region, target, body, &mut retries, budget)
@@ -1254,18 +1260,17 @@ pub(crate) async fn deliver(
     Some(outcome)
 }
 
-/// Why EventBridge may not invoke the target `arn` names under `role_arn`, as the
-/// account's IAM records show it — the shared decision in
+/// Why EventBridge may not make `attempt` under `role_arn`, as the account's IAM
+/// records show it — the shared decision in
 /// [`crate::state::delivery_refusal`], asked here with the IAM guard held for the
 /// read alone.
 fn role_refusal(
     iam: Option<&::engine::ServiceState<crate::state::IamState>>,
     role_arn: Option<&str>,
-    arn: &str,
-    action: &str,
+    attempt: &crate::state::DeliveryAttempt<'_>,
 ) -> Option<(String, String)> {
     let iam = iam?;
-    crate::state::delivery_refusal(role_arn, action, arn, &iam.lock())
+    crate::state::delivery_refusal(role_arn, attempt, &iam.lock())
 }
 
 /// The kind of target an ARN names: which service is invoked, and how.

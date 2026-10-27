@@ -321,11 +321,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if specs.len() > crate::state::MAX_PROBES_PER_MONITOR {
-            return Err(validation(
-                crate::state::PROBES_PER_MONITOR_MESSAGE.to_string(),
-            ));
-        }
+        // The probes this request creates inline are probes of this monitor, so
+        // they are bounded as a whole exactly as `CreateProbe`'s are — here
+        // against each other, since the monitor being created holds none yet.
+        crate::state::check_probes_per_monitor(None, specs.len()).map_err(validation)?;
         // Each requested probe has to satisfy the probe rules on its own before
         // the request is judged on how many probes it asks for, so a malformed
         // probe is refused for what it says rather than for the company it

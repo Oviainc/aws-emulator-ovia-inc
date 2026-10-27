@@ -23,6 +23,8 @@ mod archive_registry;
 mod archive_replay;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/dead_letter_error_code.rs"]
+mod dead_letter_error_code;
 #[path = "all/entry_level_semantics.rs"]
 mod entry_level_semantics;
 #[path = "all/event_bus_configuration.rs"]

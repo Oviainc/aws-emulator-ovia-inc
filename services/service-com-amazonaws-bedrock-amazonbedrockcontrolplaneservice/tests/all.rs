@@ -21,6 +21,8 @@ mod arn_inputs;
 mod automated_reasoning_policies;
 #[path = "all/automated_reasoning_policy_build_workflows.rs"]
 mod automated_reasoning_policy_build_workflows;
+#[path = "all/automated_reasoning_policy_test_case_deletion.rs"]
+mod automated_reasoning_policy_test_case_deletion;
 #[path = "all/automated_reasoning_policy_test_cases.rs"]
 mod automated_reasoning_policy_test_cases;
 #[path = "all/automated_reasoning_policy_test_workflows.rs"]

@@ -56,7 +56,7 @@ use crate::response_headers_policy_lifecycle::escape;
 /// `POST /2020-05-31/field-level-encryption-profile` with the
 /// `FieldLevelEncryptionProfileConfig` document `body` — the member the operation binds to
 /// the HTTP payload.
-async fn create_profile(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_profile(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -125,18 +125,18 @@ async fn upload_key(router: &MultiServiceRouter, index: usize) -> String {
 
 /// One `EncryptionEntity`, as a client submits it.
 #[derive(Debug, Clone)]
-struct Entity {
-    public_key_id: String,
-    provider_id: String,
-    field_patterns: Vec<String>,
+pub(crate) struct Entity {
+    pub(crate) public_key_id: String,
+    pub(crate) provider_id: String,
+    pub(crate) field_patterns: Vec<String>,
     /// The `Quantity` the request STATES for `FieldPatterns`, which a well-formed request
     /// sets to the number of patterns it carries.
-    patterns_quantity: i32,
+    pub(crate) patterns_quantity: i32,
 }
 
 impl Entity {
     /// One entity over `public_key_id`, stating the quantity its patterns actually number.
-    fn new(public_key_id: &str, provider_id: &str, field_patterns: &[&str]) -> Self {
+    pub(crate) fn new(public_key_id: &str, provider_id: &str, field_patterns: &[&str]) -> Self {
         Self {
             public_key_id: public_key_id.to_string(),
             provider_id: provider_id.to_string(),
@@ -147,7 +147,7 @@ impl Entity {
 
     /// The `EncryptionEntity` XML a client sends, in the model's member declaration order
     /// (`PublicKeyId`, `ProviderId`, `FieldPatterns`).
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = String::from("<EncryptionEntity>");
         out.push_str(&format!(
             "<PublicKeyId>{}</PublicKeyId>",
@@ -174,7 +174,7 @@ impl Entity {
 
     /// Assert that `entity` — an `EncryptionEntity` element the emulator serialised —
     /// reports exactly this entity.
-    fn assert_matches(&self, entity: &Node, case: &str, context: &str, raw: &str) {
+    pub(crate) fn assert_matches(&self, entity: &Node, case: &str, context: &str, raw: &str) {
         for (member, expected) in [
             ("PublicKeyId", self.public_key_id.clone()),
             ("ProviderId", self.provider_id.clone()),
@@ -216,22 +216,22 @@ impl Entity {
 
 /// One `FieldLevelEncryptionProfileConfig`, as a client submits it.
 #[derive(Debug, Clone)]
-struct Profile {
+pub(crate) struct Profile {
     /// What this row is a case of, named in every assertion it drives.
-    case: String,
-    name: String,
-    caller_reference: String,
+    pub(crate) case: String,
+    pub(crate) name: String,
+    pub(crate) caller_reference: String,
     /// `Comment`, or `None` to leave the optional member out entirely.
-    comment: Option<String>,
-    entities: Vec<Entity>,
+    pub(crate) comment: Option<String>,
+    pub(crate) entities: Vec<Entity>,
     /// The `Quantity` the request STATES for `EncryptionEntities`, which a well-formed
     /// request sets to the number of entities it carries.
-    entities_quantity: i32,
+    pub(crate) entities_quantity: i32,
 }
 
 impl Profile {
     /// One profile over `entities`, stating the quantity they actually number.
-    fn new(case: &str, reference: &str, comment: Option<&str>, entities: Vec<Entity>) -> Self {
+    pub(crate) fn new(case: &str, reference: &str, comment: Option<&str>, entities: Vec<Entity>) -> Self {
         Self {
             case: case.to_string(),
             name: format!("profile-{reference}"),
@@ -245,7 +245,7 @@ impl Profile {
     /// The `FieldLevelEncryptionProfileConfig` XML a client sends for this configuration, in
     /// the model's member declaration order (`Name`, `CallerReference`, `Comment`,
     /// `EncryptionEntities`).
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<FieldLevelEncryptionProfileConfig \
              xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
@@ -322,7 +322,7 @@ impl Profile {
 /// (`P280MFCLSYOCVU`).
 ///
 /// Spelled out here rather than taken from the crate, so a changed mint fails this suite.
-fn is_profile_id(value: &str) -> bool {
+pub(crate) fn is_profile_id(value: &str) -> bool {
     match value.strip_prefix('P') {
         Some(body) => {
             body.len() == 13
@@ -336,7 +336,7 @@ fn is_profile_id(value: &str) -> bool {
 
 /// Whether `value` is an instant written the way this service's wire format writes one: an
 /// ISO-8601 date and time at UTC, which is what a restXml `timestamp` carries.
-fn is_wire_timestamp(value: &str) -> bool {
+pub(crate) fn is_wire_timestamp(value: &str) -> bool {
     value.contains('T') && value.ends_with('Z') && value.len() >= "2026-01-01T00:00:00Z".len()
 }
 
@@ -347,7 +347,7 @@ fn is_wire_timestamp(value: &str) -> bool {
 /// trailing wildcard, a long name, one carrying XML metacharacters); and the comment forms
 /// (absent, empty, plain ASCII, XML metacharacters, and the published 128-character bound)
 /// cycled across them.
-fn table(keys: &[String]) -> Vec<Profile> {
+pub(crate) fn table(keys: &[String]) -> Vec<Profile> {
     // "The comment cannot be longer than 128 characters": the bound itself is admissible, so
     // one row sits exactly on it.
     let on_the_bound = "c".repeat(MAX_FIELD_LEVEL_ENCRYPTION_PROFILE_COMMENT);
@@ -423,7 +423,7 @@ pub(crate) async fn store_profile(router: &MultiServiceRouter, reference: &str) 
 }
 
 /// Upload the public keys the table's rows encrypt with.
-async fn upload_keys(router: &MultiServiceRouter) -> Vec<String> {
+pub(crate) async fn upload_keys(router: &MultiServiceRouter) -> Vec<String> {
     let mut keys = Vec::new();
     for index in 0..3 {
         keys.push(upload_key(router, index).await);

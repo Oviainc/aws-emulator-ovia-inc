@@ -64,6 +64,12 @@ const PROTECTED_STATUS: u16 = 400;
 /// See [`PROTECTED_STATUS`].
 const PROTECTED_CODE: &str = "ValidationException";
 
+/// The one fixed sentence that refusal carries, written out here rather than taken from
+/// the production constant, for the same reason as [`NOT_FOUND_MESSAGE`]. It reports no
+/// part of the request: `tests/all/dashboard_termination_protection_wording.rs` spans
+/// the dashboards and identifiers it stays fixed over.
+const PROTECTED_MESSAGE: &str = "This dashboard has termination protection enabled.";
+
 /// A margin on top of [`state::DASHBOARD_SETTLE_AFTER`], so a case that has to wait for
 /// the clock does not race the instant a handler reads.
 fn past_settle() -> Duration {
@@ -489,18 +495,12 @@ async fn termination_protection_refuses_the_delete() {
         let arn = dashboard_arn(region, name);
         let identifier = if *by_arn { arn.clone() } else { name.to_string() };
         let refused = delete(&emulator, region, &identifier).await;
-        assert_eq!(
-            (refused.status, refused.error_code()),
-            (PROTECTED_STATUS, PROTECTED_CODE),
-            "case {case:?}: a protected dashboard cannot be deleted, got {refused:?}"
-        );
-        // AWS publishes no wording for this refusal, so what is asserted is that the
-        // message names the dashboard the request addressed — the caller has to know
-        // which resource refused.
-        assert!(
-            refused.message().contains(&arn),
-            "case {case:?}: the refusal must name the dashboard {arn}, got {:?}",
-            refused.message()
+        expect_refusal(
+            case,
+            &refused,
+            PROTECTED_STATUS,
+            PROTECTED_CODE,
+            PROTECTED_MESSAGE,
         );
 
         // Nothing was released: the dashboard reads back exactly as it was, still

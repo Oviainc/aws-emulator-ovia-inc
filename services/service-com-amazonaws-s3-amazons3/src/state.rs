@@ -4032,6 +4032,31 @@ pub const MAX_METADATA_RECORD_EXPIRATION_DAYS: i32 = 2_147_483_647;
 /// AWS accepts anywhere in an IAM request.
 pub const MAX_METADATA_TABLE_ROLE_CHARS: usize = 2048;
 
+/// The `InvalidArgument` message the encryption configuration carried in the request member
+/// `member` earns, or `None` when there is nothing wrong with it.
+///
+/// "If server-side encryption with Key Management Service (KMS) keys (SSE-KMS) is specified,
+/// you must also specify the KMS key Amazon Resource Name (ARN)"
+/// (`MetadataTableEncryptionConfiguration$KmsKeyArn`): ONE rule for every table that carries
+/// that container, so the create that names all three tables and each update that names one
+/// cannot drift apart on it. The other algorithm `TableSseAlgorithm` publishes, `AES256`, is
+/// S3 managed encryption and takes no key.
+pub fn metadata_table_encryption_refusal(
+    member: &str,
+    encryption: Option<&crate::ops::types::MetadataTableEncryptionConfiguration>,
+) -> Option<String> {
+    let encryption = encryption?;
+    (encryption.sse_algorithm == METADATA_TABLE_SSE_KMS_ALGORITHM
+        && encryption.kms_key_arn.is_none())
+    .then(|| {
+        format!(
+            "{member}.EncryptionConfiguration names SseAlgorithm {:?} without a \
+             KmsKeyArn; a KMS key ARN is required with that algorithm",
+            encryption.sse_algorithm
+        )
+    })
+}
+
 /// One table of a bucket's S3 Metadata configuration: its name, and when it falls due to
 /// be in service.
 ///
@@ -4092,6 +4117,37 @@ pub struct MetadataTableConfiguration {
     /// "The ARN of the IAM role used to manage the annotation table"
     /// (`AnnotationTableConfiguration$Role`), for the annotation table and nothing else.
     pub role: Option<String>,
+}
+
+/// Record `configuration_state` as the state of the optional table configuration `slot`,
+/// with `table_name` the name a table this creates is created under and `now` the instant of
+/// the call asking for it.
+///
+/// The shape of enabling or disabling one of a metadata configuration's optional tables: the
+/// state the request names becomes the table's state, and the table behind it follows —
+/// enabling a table the configuration has none of creates one, being created from `now`
+/// ([`METADATA_TABLE_ACTIVATION_DELAY`] later in service), and disabling one drops it, which
+/// is what leaves the reported result carrying a state with no table name, status or ARN.
+/// Enabling a table that is already there leaves that table exactly as it is, so a repeated
+/// enable neither restarts its creation nor renames it.
+fn set_optional_metadata_table_state(
+    slot: &mut Option<MetadataTableConfiguration>,
+    configuration_state: String,
+    table_name: &str,
+    now: SystemTime,
+) {
+    let enabled = configuration_state == METADATA_CONFIGURATION_STATE_ENABLED;
+    let carried = slot.take();
+    let carried_table = carried.as_ref().and_then(|table| table.table.clone());
+    *slot = Some(MetadataTableConfiguration {
+        configuration_state,
+        table: enabled.then(|| {
+            carried_table.unwrap_or_else(|| MetadataTable::creating(table_name.to_string(), now))
+        }),
+        // The IAM role is the annotation table's own member and no update to the state of a
+        // table names one, so whatever role the configuration carried it carries still.
+        role: carried.and_then(|table| table.role),
+    });
 }
 
 /// The S3 Metadata configuration a general purpose bucket carries, as
@@ -5143,6 +5199,39 @@ impl Bucket {
     /// `GetBucketMetadataConfiguration` reporting it from then on.
     pub fn set_metadata_configuration(&mut self, configuration: BucketMetadataConfiguration) {
         self.metadata_configuration = Some(configuration);
+    }
+
+    /// Record `configuration_state` as the inventory table state of the bucket's S3 Metadata
+    /// configuration, with `table_name` the name an inventory table this creates is created
+    /// under — reporting whether the bucket carries a configuration to record it on.
+    ///
+    /// What `UpdateBucketMetadataInventoryTableConfiguration` does: it "enables or disables a
+    /// live inventory table for an S3 Metadata configuration on a general purpose bucket"
+    /// (that operation's own documentation), so the state the request names replaces the one
+    /// the configuration carried and the inventory table behind it follows
+    /// ([`set_optional_metadata_table_state`]). Scoped to that one table: the journal table,
+    /// its record expiration and the annotation table are left exactly as they were, the way
+    /// [`Self::clear_replication`] is scoped to the one subresource it names.
+    ///
+    /// `false` is a bucket carrying NO metadata configuration, in which case nothing is
+    /// written: there is no configuration to enable a table for, and the caller answers
+    /// [`NO_SUCH_CONFIGURATION_CODE`].
+    pub fn update_metadata_inventory_table(
+        &mut self,
+        configuration_state: String,
+        table_name: &str,
+        now: SystemTime,
+    ) -> bool {
+        let Some(configuration) = self.metadata_configuration.as_mut() else {
+            return false;
+        };
+        set_optional_metadata_table_state(
+            &mut configuration.inventory,
+            configuration_state,
+            table_name,
+            now,
+        );
+        true
     }
 
     /// Associate `configuration` with the bucket as its whole replication configuration.

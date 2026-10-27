@@ -215,7 +215,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // sentence the handler emits for an ARN that satisfies the member's constraints
         // yet names no resource of that kind. The two paths differ only in WHERE the
         // value is read, never in what the caller is told, so a client cannot tell a
-        // boundary refusal from a handler rejection.
+        // boundary refusal from a handler rejection. A violation's value is one the
+        // validation layer has ALREADY put through its echo ceiling, which is why it is
+        // worded by the entry point that does not apply that ceiling a second time while
+        // the handler path, holding the value as sent, does.
         //
         // Every other refusal keeps the framework's wording: an absent required member
         // and a bound on another member are request-SHAPE constraints, reported by the
@@ -226,7 +229,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                     code: INVALID_INPUT_EXCEPTION.to_string(),
                     // `Some`, because `resource_arn_violation` selects only a violation
                     // that carries the value it refused.
-                    message: kind.invalid_arn_message(violation.value.as_deref().unwrap_or_default()),
+                    message: kind.invalid_arn_message_pre_elided(
+                        violation.value.as_deref().unwrap_or_default(),
+                    ),
                 })
             }
             _ => None,

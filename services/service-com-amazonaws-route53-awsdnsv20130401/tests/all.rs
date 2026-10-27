@@ -35,12 +35,16 @@ mod health_check_creation;
 // length bound, which the creation suite's tables do not reach.
 #[path = "all/health_check_child_list_bound.rs"]
 mod health_check_child_list_bound;
+#[path = "all/health_check_deletion.rs"]
+mod health_check_deletion;
 #[path = "all/health_check_last_failure_reason.rs"]
 mod health_check_last_failure_reason;
 #[path = "all/health_check_listing.rs"]
 mod health_check_listing;
 #[path = "all/health_check_not_found_message.rs"]
 mod health_check_not_found_message;
+#[path = "all/health_check_refusal_messages.rs"]
+mod health_check_refusal_messages;
 #[path = "all/health_check_status.rs"]
 mod health_check_status;
 #[path = "all/health_check_update_contention.rs"]

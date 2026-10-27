@@ -3273,8 +3273,10 @@ pub fn matches_filters(agreement: &Agreement, filters: &[Filter]) -> bool {
 /// caller supplies can imitate the delimiters and make two different queries
 /// hash alike.
 ///
-/// The one spelling of that rule: [`search_scope`] and
-/// [`billing_adjustment_scope`] both build their scope from it.
+/// The one spelling of that rule: every page-token scope in this module —
+/// [`search_scope`], [`payment_request_scope`], [`charge_scope`],
+/// [`billing_adjustment_scope`] and [`invoice_line_item_scope`] — builds its
+/// scope from it.
 pub fn query_scope(parts: &[&str]) -> String {
     parts.iter().copied().map(counted).collect()
 }
@@ -3313,6 +3315,10 @@ pub fn search_scope(
 /// The scope a `ListAgreementPaymentRequests` page token belongs to: every
 /// parameter that selects which payment requests the list reports, so a token
 /// minted for one list cannot resume another.
+///
+/// Built from [`query_scope`] like every other scope in this module, so no value
+/// a caller supplies can imitate the delimiters and make two different listings
+/// hash alike.
 pub fn payment_request_scope(
     party_type: &str,
     agreement_id: Option<&str>,
@@ -3320,14 +3326,13 @@ pub fn payment_request_scope(
     catalog: Option<&str>,
     status: Option<&str>,
 ) -> String {
-    format!(
-        "{}{}{}{}{}",
-        counted(party_type),
-        counted(agreement_id.unwrap_or_default()),
-        counted(agreement_type.unwrap_or_default()),
-        counted(catalog.unwrap_or_default()),
-        counted(status.unwrap_or_default())
-    )
+    query_scope(&[
+        party_type,
+        agreement_id.unwrap_or_default(),
+        agreement_type.unwrap_or_default(),
+        catalog.unwrap_or_default(),
+        status.unwrap_or_default(),
+    ])
 }
 
 /// The scope a `ListAgreementCharges` page token belongs to: every parameter
