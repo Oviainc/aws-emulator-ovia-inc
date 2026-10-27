@@ -10,17 +10,19 @@
 //! The rule these cases pin: a configuration set created by name stays addressable by
 //! that name — an event destination attached to it is persisted exactly as the
 //! definition described it and reported by a read of that set's destinations, repeated
-//! reads report the same thing, and a delete of the set removes it together with
-//! everything configured under it — while a call naming a set the account does not hold
-//! is refused `NotFoundException`, a destination name the set already holds
+//! reads report the same thing, a delete of a destination by name removes exactly that
+//! destination from exactly that set and frees the name for a new definition, and a
+//! delete of the set removes it together with everything configured under it — while a
+//! call naming a set the account does not hold is refused `NotFoundException`, as is one
+//! naming a destination the set does not hold, a destination name the set already holds
 //! `AlreadyExistsException`, and a name or enum value outside its documented rule
 //! `BadRequestException`.
 //!
 //! The tables below span what the rule generalises over: which destination object the
 //! definition carries (each of the five modelled kinds), whether it is enabled, how many
 //! event types it matches (none, one, several, every modelled value), how many
-//! destinations one set holds, and the refusal legs of each operation that takes a
-//! `ConfigurationSetName`.
+//! destinations one set holds, which of them a delete addresses, and the refusal legs of
+//! each operation that takes a `ConfigurationSetName`.
 
 use serde_json::{json, Value};
 
@@ -30,6 +32,7 @@ use crate::configuration_sets::{Reply, Ses};
 trait EventDestinations {
     async fn create_destination(&self, set: &str, name: &str, definition: Value) -> Reply;
     async fn get_destinations(&self, set: &str) -> Reply;
+    async fn delete_destination(&self, set: &str, name: &str) -> Reply;
     async fn delete_set(&self, set: &str) -> Reply;
 }
 
@@ -47,6 +50,15 @@ impl EventDestinations for Ses {
         self.call(
             "GET",
             &format!("/v2/email/configuration-sets/{set}/event-destinations"),
+            None,
+        )
+        .await
+    }
+
+    async fn delete_destination(&self, set: &str, name: &str) -> Reply {
+        self.call(
+            "DELETE",
+            &format!("/v2/email/configuration-sets/{set}/event-destinations/{name}"),
             None,
         )
         .await
@@ -655,4 +667,335 @@ async fn a_name_or_enum_value_outside_its_documented_rule_is_refused() {
         reported.is_empty(),
         "no refused create may store a destination, got {reported:?}"
     );
+}
+
+/// The names `set` reports, sorted, so a case compares sets of names and not an order
+/// the map does not promise.
+async fn reported_names(ses: &Ses, set: &str) -> Vec<String> {
+    let mut names: Vec<String> = reported_destinations(ses, set)
+        .await
+        .iter()
+        .map(|destination| {
+            destination
+                .get("Name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Attach every row of the create-and-read table to `set`, which must already exist.
+async fn attach_every_destination(ses: &Ses, set: &str) {
+    for case in destination_cases() {
+        let created = ses.create_destination(set, case.name, case.definition).await;
+        assert_eq!(
+            created.status,
+            200,
+            "case {:?}: attaching the destination to {set:?}: expected 200, got {} {}",
+            case.case,
+            created.status,
+            created.message()
+        );
+    }
+}
+
+/// Create `set`, which must answer 200.
+async fn create_set(ses: &Ses, set: &str) {
+    let created = ses.create_set(json!({"ConfigurationSetName": set})).await;
+    assert_eq!(
+        created.status,
+        200,
+        "creating configuration set {set:?}: expected 200, got {} {}",
+        created.status,
+        created.message()
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_destination_removes_exactly_that_one_from_exactly_that_set() {
+    // The rule generalises over which destination of a set is removed and how many the
+    // set holds, so every row of the create-and-read table is deleted in turn — the only
+    // destination of its set, and one of the five a set holding all of them has.
+    for case in destination_cases() {
+        for (shape, every) in [("the only destination of the set", false), ("one of five", true)] {
+            let ses = Ses::new();
+            let set = "set-under-test";
+            // A second set holds a destination under the SAME name, so a delete that
+            // reached beyond the set the URI names would show up here.
+            let other_set = "other-set";
+            create_set(&ses, set).await;
+            create_set(&ses, other_set).await;
+            if every {
+                attach_every_destination(&ses, set).await;
+            } else {
+                let created = ses
+                    .create_destination(set, case.name, case.definition.clone())
+                    .await;
+                assert_eq!(
+                    created.status,
+                    200,
+                    "case {:?} ({shape}): attaching the destination: expected 200, got {} {}",
+                    case.case,
+                    created.status,
+                    created.message()
+                );
+            }
+            let created_elsewhere = ses
+                .create_destination(other_set, case.name, case.definition.clone())
+                .await;
+            assert_eq!(
+                created_elsewhere.status,
+                200,
+                "case {:?} ({shape}): attaching the same name to another set: expected 200, got \
+                 {} {}",
+                case.case,
+                created_elsewhere.status,
+                created_elsewhere.message()
+            );
+
+            let deleted = ses.delete_destination(set, case.name).await;
+            assert_eq!(
+                deleted.status,
+                200,
+                "case {:?} ({shape}): expected 200, got {} {} ({})",
+                case.case,
+                deleted.status,
+                deleted.error_code(),
+                deleted.message()
+            );
+            assert!(
+                deleted.is_empty_body(),
+                "case {:?} ({shape}): DeleteConfigurationSetEventDestinationResponse declares no \
+                 members, so the body must be empty, got {:?}",
+                case.case,
+                deleted.member("EventDestinations")
+            );
+
+            // The deleted name is gone immediately, and only that name.
+            let mut expected: Vec<String> = if every {
+                destination_cases()
+                    .iter()
+                    .map(|row| row.name.to_string())
+                    .filter(|name| name != case.name)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            expected.sort();
+            let remaining = reported_names(&ses, set).await;
+            assert_eq!(
+                remaining, expected,
+                "case {:?} ({shape}): after the delete the set must report {expected:?}, got \
+                 {remaining:?}",
+                case.case
+            );
+            assert!(
+                reported_destination(&ses, set, case.name).await.is_none(),
+                "case {:?} ({shape}): the deleted destination is still reported",
+                case.case
+            );
+
+            // The set the URI did not name kept its identically named destination.
+            assert_eq!(
+                reported_names(&ses, other_set).await,
+                vec![case.name.to_string()],
+                "case {:?} ({shape}): another set's destination of the same name must survive",
+                case.case
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_destination_the_set_does_not_hold_is_refused_as_not_found() {
+    let ses = Ses::new();
+    let set = "holds-one";
+    let empty_set = "holds-nothing";
+    create_set(&ses, set).await;
+    create_set(&ses, empty_set).await;
+    let present = "kept";
+    assert_eq!(
+        ses.create_destination(set, present, json!({"Enabled": true}))
+            .await
+            .status,
+        200,
+        "attaching the destination that must survive: expected 200"
+    );
+    // One delete succeeds, so the refusals below are about the name asked for and not
+    // about the operation refusing everything.
+    let removed = "removed";
+    assert_eq!(
+        ses.create_destination(set, removed, json!({"Enabled": false}))
+            .await
+            .status,
+        200,
+        "attaching the destination to delete: expected 200"
+    );
+    assert_eq!(
+        ses.delete_destination(set, removed).await.status,
+        200,
+        "the first delete of {removed:?}: expected 200"
+    );
+
+    for (case, target_set, name) in [
+        ("a name the set never held", set, "never-there"),
+        ("a name an earlier delete removed", set, removed),
+        ("a name only another set holds", empty_set, present),
+        ("a name differing only in case", set, "KEPT"),
+    ] {
+        let reply = ses.delete_destination(target_set, name).await;
+        assert_eq!(
+            reply.status,
+            404,
+            "case {case:?} ({target_set}/{name}): expected 404, got {} {}",
+            reply.status,
+            reply.message()
+        );
+        assert_eq!(
+            reply.error_code(),
+            "NotFoundException",
+            "case {case:?} ({target_set}/{name}): expected NotFoundException, got {:?} ({})",
+            reply.error_code(),
+            reply.message()
+        );
+        assert!(
+            reply.message().contains(name) && reply.message().contains(target_set),
+            "case {case:?} ({target_set}/{name}): the refusal must name the destination and the \
+             set, got {:?}",
+            reply.message()
+        );
+    }
+
+    // A set the account does not hold is refused for the set, whichever destination name
+    // the URI carries.
+    for missing in ["absent", "absent-2", "Absent_3"] {
+        let reply = ses.delete_destination(missing, present).await;
+        assert_eq!(
+            reply.status,
+            404,
+            "a delete under the absent set {missing:?}: expected 404, got {} {}",
+            reply.status,
+            reply.message()
+        );
+        assert_eq!(
+            reply.error_code(),
+            "NotFoundException",
+            "a delete under the absent set {missing:?}: expected NotFoundException, got {:?} ({})",
+            reply.error_code(),
+            reply.message()
+        );
+        assert!(
+            reply.message().contains(missing),
+            "a delete under the absent set {missing:?}: the refusal must name the set, got {:?}",
+            reply.message()
+        );
+    }
+
+    // None of the refused deletes removed anything.
+    assert_eq!(
+        reported_names(&ses, set).await,
+        vec![present.to_string()],
+        "a refused delete must leave the set's destinations alone"
+    );
+}
+
+#[tokio::test]
+async fn a_set_name_outside_its_documented_rule_is_refused_by_a_destination_delete() {
+    let ses = Ses::new();
+    // `ConfigurationSetName`: "The name can contain up to 64 alphanumeric characters,
+    // including letters, numbers, hyphens (-) and underscores (_) only" — so a name with
+    // another character, or one character past the bound, is outside the rule, while the
+    // bound itself is inside it and the refusal is then about the set not existing.
+    let past_the_bound = "x".repeat(65);
+    let at_the_bound = "x".repeat(64);
+    for (name, status, code) in [
+        ("has.a.dot".to_string(), 400, "BadRequestException"),
+        ("has~a~tilde".to_string(), 400, "BadRequestException"),
+        (past_the_bound, 400, "BadRequestException"),
+        (at_the_bound, 404, "NotFoundException"),
+        ("ok_name-1".to_string(), 404, "NotFoundException"),
+    ] {
+        let reply = ses.delete_destination(&name, "d").await;
+        assert_eq!(
+            reply.status, status,
+            "DeleteConfigurationSetEventDestination on {name:?}: expected {status}, got {} {}",
+            reply.status,
+            reply.message()
+        );
+        assert_eq!(
+            reply.error_code(),
+            code,
+            "DeleteConfigurationSetEventDestination on {name:?}: expected {code}, got {:?} ({})",
+            reply.error_code(),
+            reply.message()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_name_can_be_attached_again_as_a_new_destination() {
+    // The name identifies a destination within the set, so once the delete frees it the
+    // same name takes a different definition — the rewire leg of an eventing workflow.
+    let ses = Ses::new();
+    let set = "rewired";
+    create_set(&ses, set).await;
+    let name = "events";
+
+    for case in destination_cases() {
+        let created = ses
+            .create_destination(set, name, case.definition.clone())
+            .await;
+        assert_eq!(
+            created.status,
+            200,
+            "case {:?}: re-attaching {name:?}: expected 200, got {} {}",
+            case.case,
+            created.status,
+            created.message()
+        );
+
+        let reported = reported_destination(&ses, set, name)
+            .await
+            .unwrap_or_else(|| panic!("case {:?}: {name:?} is not reported at all", case.case));
+        let (destination_member, expected) = case.destination_member;
+        assert_eq!(
+            member(&reported, destination_member),
+            expected,
+            "case {:?}: after the re-attach the set must report {destination_member} {expected}, \
+             got {reported:?}",
+            case.case
+        );
+        assert_eq!(
+            list(&reported, "MatchingEventTypes"),
+            case.matching_event_types,
+            "case {:?}: after the re-attach, expected MatchingEventTypes {:?}, got {reported:?}",
+            case.case,
+            case.matching_event_types
+        );
+        assert_eq!(
+            flag(&reported, "Enabled"),
+            case.enabled,
+            "case {:?}: after the re-attach, expected Enabled {}, got {reported:?}",
+            case.case,
+            case.enabled
+        );
+
+        let deleted = ses.delete_destination(set, name).await;
+        assert_eq!(
+            deleted.status,
+            200,
+            "case {:?}: deleting {name:?} again: expected 200, got {} {}",
+            case.case,
+            deleted.status,
+            deleted.message()
+        );
+        assert!(
+            reported_names(&ses, set).await.is_empty(),
+            "case {:?}: the set must hold nothing after the delete",
+            case.case
+        );
+    }
 }
