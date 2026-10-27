@@ -22,7 +22,9 @@
 //! NOT mint a second session: the same request replayed answers with the session the first
 //! call issued, and that same token carrying a DIFFERENT request is refused with the
 //! modelled `ValidationException` ([`crate::state::request_fingerprint`] is what tells the
-//! two apart).
+//! two apart). Both the key and that comparison are taken from the RESOLVED identifiers
+//! ([`resolved_fingerprint`]), so whichever accepted form a call names the endpoint by, a
+//! replay of it is still a replay.
 //!
 //! ## Shape of an operation
 //!
@@ -201,10 +203,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The request this `clientToken` stands for, digested before the store is locked:
-        // it depends on nothing in state, and the lock is what serialises racing requests
-        // that share one token.
-        let fingerprint = crate::state::request_fingerprint(&input);
         let mut state = store.lock();
         state.settle();
 
@@ -240,8 +238,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the first call issued rather than minting a second credential. The same token
         // carrying a DIFFERENT request is not a replay — answering it with the first
         // session would silently drop the duration or the role this call asked for — so it
-        // is refused.
+        // is refused. The scope and the digest of the request it is compared against are
+        // both taken from the ids resolved above, so the two halves of this rule decide a
+        // replay on one and the same request identity.
         let scope = crate::state::endpoint_session_scope(&virtual_cluster_id, &endpoint_id);
+        let fingerprint = resolved_fingerprint(&input, &virtual_cluster_id, &endpoint_id);
         if let Some(client_token) = input.client_token.as_deref() {
             let replayed = state
                 .replayed_idempotency(&region, &scope, client_token)
@@ -321,6 +322,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         Ok(stored.to_session_credentials())
     }
+}
+
+/// The digest of this request with every identifier in the form the store RESOLVED it to,
+/// which is the form the idempotency key is built from.
+///
+/// A member that names a resource is compared by the resource it names, not by the
+/// spelling the request chose for it: a bare id and the resource's own ARN resolve to one
+/// record, so a replay that names the same pair the other accepted way carries the same
+/// request and digests the same. Digesting the raw input instead would let a key hit while
+/// its comparison missed, and a true replay would be refused as a different request.
+fn resolved_fingerprint(
+    input: &GetManagedEndpointSessionCredentialsInput,
+    virtual_cluster_id: &str,
+    endpoint_id: &str,
+) -> String {
+    let mut resolved = input.clone();
+    resolved.virtual_cluster_identifier = virtual_cluster_id.to_string();
+    resolved.endpoint_identifier = endpoint_id.to_string();
+    crate::state::request_fingerprint(&resolved)
 }
 
 /// The modelled `ValidationException` (HTTP 400) for a request this operation cannot

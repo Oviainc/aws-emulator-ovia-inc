@@ -137,6 +137,82 @@ pub fn type_version_arn(extension_arn: &str, version_id: &str) -> String {
     format!("{extension_arn}/{version_id}")
 }
 
+/// Mint the ARN of one CONFIGURATION of an extension held in this account and Region:
+/// `arn:aws:cloudformation:<region>:<account>:type-configuration/<kind>/<Type-Name>/<alias>`,
+/// the `type-configuration/` form the modelled `TypeConfigurationArn` pattern carries
+/// (`^arn:aws…:cloudformation:…:([0-9]{12})?:type-configuration/.+$`).
+///
+/// Built from the extension the configuration belongs to and the alias it was set under —
+/// the two things that identify it — so the ARN `SetTypeConfiguration` answers is the one a
+/// later read of the same extension and alias resolves.
+pub fn type_configuration_arn(
+    region: &str,
+    type_kind: &str,
+    type_name: &str,
+    configuration_alias: &str,
+) -> String {
+    ::emulator_server::emulator_arn(
+        crate::state::ARN_NAMESPACE,
+        region,
+        &format!(
+            "type-configuration/{}/{}/{configuration_alias}",
+            arn_kind_segment(type_kind),
+            arn_type_name(type_name)
+        ),
+    )
+}
+
+/// The alias a configuration set under no alias of its own is held under.
+///
+/// `SetTypeConfiguration`'s `ConfigurationAlias` is "an alias by which to refer to this
+/// extension configuration data", required only "when setting a configuration for a resource
+/// type extension"; the configuration an extension has when nothing named an alias is its
+/// DEFAULT one, which is what `TypeConfigurationDetails$IsDefaultConfiguration` reports.
+pub const DEFAULT_CONFIGURATION_ALIAS: &str = "default";
+
+/// How many configurations the registry holds for ONE extension before the oldest is
+/// reclaimed.///
+/// A configuration is keyed by a CALLER-CHOSEN alias, so the set would otherwise grow with
+/// the aliases a caller invents; this is the bound that makes it finite, the same shape
+/// [`MAX_PUBLISHED_VERSIONS`] gives a record's versions. Chosen: AWS publishes no ceiling on
+/// an extension's configuration aliases, and this is well past the one alias a Hook and the
+/// handful a resource type are configured under.
+pub const MAX_TYPE_CONFIGURATIONS: usize = 50;
+
+/// How many extension RECORDS this account and Region's registry holds before the oldest is
+/// reclaimed.
+///
+/// A registry writer adds a record under a name the caller chose (`ActivateType`'s
+/// `TypeNameAlias`, `RegisterType`'s `TypeName`), so the set of records is a caller-counted
+/// growth site and needs a ceiling of its own, like every other store this service keeps.
+/// Chosen: AWS publishes a quota of 50 registered resource extension versions and no ceiling
+/// on activations, and this is well past the extensions one account and Region works with
+/// while keeping the registry's size bounded.
+pub const MAX_EXTENSIONS: usize = 200;
+
+/// One account-level CONFIGURATION of an extension: the configuration data
+/// `SetTypeConfiguration` persisted, the alias it was set under, the ARN that write
+/// answered, and when it was written.
+///
+/// `BatchDescribeTypeConfigurations` reports exactly these
+/// (`TypeConfigurationDetails$Configuration`/`Alias`/`Arn`/`LastUpdated`), so a read is
+/// served from the record the write left rather than from the request that read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTypeConfiguration {
+    /// `Alias`: "the alias specified for this configuration, if one was specified when the
+    /// configuration was set" ([`DEFAULT_CONFIGURATION_ALIAS`] otherwise).
+    pub alias: String,
+    /// `Arn`: "the ARN for the configuration data, in this account and Region"
+    /// ([`type_configuration_arn`]).
+    pub arn: String,
+    /// `Configuration`: "a JSON string specifying the configuration data for the extension,
+    /// in this account and Region", as the write submitted it.
+    pub configuration: String,
+    /// `LastUpdated`: "when the configuration data was last updated for this extension".
+    pub last_updated: SystemTime,
+}
+
+
 /// The ARN of a PUBLIC extension: `arn:aws:cloudformation:<region>::type/<kind>/<Name>`.
 ///
 /// A public extension belongs to no account, so its ARN carries an EMPTY account segment —
@@ -469,6 +545,10 @@ pub struct StoredExtension {
     /// `AutoUpdate`: whether CloudFormation updates an activated public extension when the
     /// publisher releases a new minor version.
     pub auto_update: Option<bool>,
+    /// The account-level CONFIGURATIONS this Region's registry holds for the extension, one
+    /// per alias `SetTypeConfiguration` has written under, in the order they were first
+    /// written. Bounded at [`MAX_TYPE_CONFIGURATIONS`], oldest reclaimed first.
+    pub configurations: Vec<StoredTypeConfiguration>,
     /// Every version the registry holds, in the order they entered it.
     pub versions: Vec<StoredTypeVersion>,
 }
@@ -491,8 +571,59 @@ impl StoredExtension {
             latest_public_version: None,
             is_activated: None,
             auto_update: None,
+            configurations: Vec::new(),
             versions: Vec::new(),
         }
+    }
+
+    /// Persist the account-level configuration of this extension under `alias`, and answer
+    /// the ARN of the configuration data — what `SetTypeConfiguration` hands back.
+    ///
+    /// Setting a configuration under an alias the record already holds REPLACES that
+    /// configuration (the call "specifies the configuration data for… an extension in the
+    /// given account and Region", so there is one configuration per alias, not a history),
+    /// keeping its place and its ARN. A new alias is added, and the oldest is reclaimed past
+    /// [`MAX_TYPE_CONFIGURATIONS`] so the record cannot grow without limit.
+    pub fn set_configuration(
+        &mut self,
+        alias: &str,
+        configuration: &str,
+        now: SystemTime,
+    ) -> String {
+        let arn = type_configuration_arn(&self.region, &self.type_kind, &self.type_name, alias);
+        if let Some(held) = self
+            .configurations
+            .iter_mut()
+            .find(|held| held.alias == alias)
+        {
+            held.configuration = configuration.to_string();
+            held.last_updated = now;
+            return held.arn.clone();
+        }
+        let over_the_bound =
+            (self.configurations.len() + 1).saturating_sub(MAX_TYPE_CONFIGURATIONS);
+        if over_the_bound > 0 {
+            self.configurations.drain(..over_the_bound);
+        }
+        self.configurations.push(StoredTypeConfiguration {
+            alias: alias.to_string(),
+            arn: arn.clone(),
+            configuration: configuration.to_string(),
+            last_updated: now,
+        });
+        arn
+    }
+
+    /// The configuration this record holds under `alias`, if any.
+    pub fn configuration_with_alias(&self, alias: &str) -> Option<&StoredTypeConfiguration> {
+        self.configurations
+            .iter()
+            .find(|held| held.alias == alias)
+    }
+
+    /// The configuration this record holds under one configuration ARN, if any.
+    pub fn configuration_by_arn(&self, arn: &str) -> Option<&StoredTypeConfiguration> {
+        self.configurations.iter().find(|held| held.arn == arn)
     }
 
     /// Whether this is a private extension — the ones the members documented as applying
@@ -836,6 +967,9 @@ pub fn published_record(
         // automatically updates the extension in this account and Region when a new minor
         // version is published"), so a record nobody has activated carries none.
         auto_update: None,
+        // A configuration is what `SetTypeConfiguration` writes against an extension in an
+        // account and Region; publishing one configures it nowhere.
+        configurations: Vec::new(),
         versions: vec![version],
     }
 }
@@ -929,6 +1063,8 @@ fn aws_published_record(region: &str, type_name: &str) -> StoredExtension {
         latest_public_version: None,
         is_activated: None,
         auto_update: None,
+        // Nothing has configured it: a configuration is what `SetTypeConfiguration` writes.
+        configurations: Vec::new(),
         versions: vec![version],
     }
 }

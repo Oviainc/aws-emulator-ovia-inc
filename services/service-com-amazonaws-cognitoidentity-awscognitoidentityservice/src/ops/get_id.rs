@@ -364,6 +364,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetId<Eng> {
                         identity_id: identity_id.clone(),
                         identity_pool_id: input.identity_pool_id.clone(),
                         logins: providers.clone(),
+                        // A freshly minted identity has had no unlink, so an unauthenticated
+                        // one is linked to nothing WITHOUT being a disabled one.
+                        disabled: false,
                         creation_date: now,
                         last_modified_date: now,
                     },

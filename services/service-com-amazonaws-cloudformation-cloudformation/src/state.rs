@@ -3027,7 +3027,10 @@ impl StoredStack {
                 .iter()
                 .find(|barrier| barrier.logical_id() == deployed.resource.logical_id)
                 .map(|barrier| {
-                    (barrier.opened_at, in_progress_resource_status(&self.status))
+                    (
+                        barrier.opened_at,
+                        self.in_progress_status_of(&deployed.resource.logical_id),
+                    )
                 });
             let gated = waiting_at.or_else(|| {
                 self.stabilisations
@@ -3055,6 +3058,31 @@ impl StoredStack {
             }
         }
         reported
+    }
+
+    /// The resource-level status of a resource the operation in flight has STARTED and not
+    /// finished.
+    ///
+    /// `StackResource$ResourceStatus` is "Current status of the resource", so it names what
+    /// is being done to THAT resource rather than what the stack-level operation is: a
+    /// resource the operation is bringing into the stack is being CREATED, whether the
+    /// operation around it is a create or an update, and only one the stack already holds is
+    /// being UPDATED. It is the same rule [`installed_resources`] applies once the operation
+    /// finishes, read while it is still under way.
+    ///
+    /// A record the stack kept at `DELETE_COMPLETE` is not a resource the stack holds: the
+    /// operation that disposed of it took it away, so a deployment declaring that logical id
+    /// again creates the resource.
+    fn in_progress_status_of(&self, logical_id: &str) -> &'static str {
+        let held = self.resources.iter().any(|deployed| {
+            deployed.resource.logical_id == logical_id
+                && deployed.status != resource_status::DELETE_COMPLETE
+        });
+        if held {
+            resource_status::UPDATE_IN_PROGRESS
+        } else {
+            resource_status::CREATE_IN_PROGRESS
+        }
     }
 
     /// The resources the stack has RIGHT NOW: the ones the operation in flight is about to
@@ -3592,15 +3620,6 @@ fn failed_status_of(in_progress: &str) -> &'static str {
     match in_progress {
         status::UPDATE_IN_PROGRESS => status::UPDATE_FAILED,
         _ => status::CREATE_FAILED,
-    }
-}
-
-/// The resource-level status of a resource the operation in `stack_status` has STARTED and
-/// not finished — what a wait condition the operation is waiting at reports.
-fn in_progress_resource_status(stack_status: &str) -> &'static str {
-    match stack_status {
-        status::UPDATE_IN_PROGRESS => resource_status::UPDATE_IN_PROGRESS,
-        _ => resource_status::CREATE_IN_PROGRESS,
     }
 }
 

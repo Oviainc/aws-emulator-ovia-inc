@@ -347,11 +347,14 @@ async fn a_second_create_for_one_resource_writes_the_record_it_already_has() {
             }),
         ),
         (
-            "a create carrying only tags leaves both sides stored",
+            "tags sent beside a write of the stored side leave both sides as stored",
             json!({
                 "SourceProcessingProperties": { "RoleArn": "arn:aws:iam::000000000000:role/tags-source" },
             }),
-            json!({ "Tags": [{ "key": "owner", "value": "data-platform" }] }),
+            json!({
+                "SourceProcessingProperties": { "RoleArn": "arn:aws:iam::000000000000:role/tags-source" },
+                "Tags": [{ "key": "owner", "value": "data-platform" }],
+            }),
             json!({
                 "SourceProcessingProperties": { "RoleArn": "arn:aws:iam::000000000000:role/tags-source" },
             }),
@@ -415,6 +418,198 @@ async fn a_second_create_for_one_resource_writes_the_record_it_already_has() {
 // ---------------------------------------------------------------------------
 // Refusals
 // ---------------------------------------------------------------------------
+
+/// The sentence a create that states neither processing side is refused with: fixed text
+/// naming the two sides, carrying no value read off the request or the store.
+const NEITHER_SIDE_MESSAGE: &str = "Either source processing properties or target \
+     processing properties must be provided in the request.";
+
+/// What a create writes is a side of the integration, so a request stating NEITHER
+/// `SourceProcessingProperties` nor `TargetProcessingProperties` is refused with the
+/// modelled `ValidationException` and persists nothing — whichever resource kind it
+/// addresses, whatever else it carries, and whether or not that resource already has a
+/// record — while a request stating either side, or both, is served. The rows differ along
+/// which sides the request states, how many members those sides carry, and what the request
+/// carries beside them.
+#[tokio::test]
+async fn a_create_stating_neither_processing_side_is_refused() {
+    let router = emulator();
+
+    // (case, whether the ARN names a connection, the members beside `ResourceArn`, whether
+    // the create must be served)
+    let cases: Vec<(&str, bool, Value, bool)> = vec![
+        (
+            // The recorded case: a database ARN and nothing else.
+            "neither side, on a database",
+            false,
+            json!({}),
+            false,
+        ),
+        ("neither side, on a connection", true, json!({}), false),
+        (
+            "neither side, with tags alone",
+            false,
+            json!({ "Tags": [{ "key": "owner", "value": "data-platform" }] }),
+            false,
+        ),
+        (
+            "the source side alone",
+            true,
+            json!({
+                "SourceProcessingProperties": {
+                    "RoleArn": format!("arn:aws:iam::{ACCOUNT_ID}:role/glue-source"),
+                },
+            }),
+            true,
+        ),
+        (
+            "the target side alone",
+            false,
+            json!({
+                "TargetProcessingProperties": {
+                    "RoleArn": format!("arn:aws:iam::{ACCOUNT_ID}:role/glue-target"),
+                },
+            }),
+            true,
+        ),
+        (
+            "both sides at once",
+            true,
+            json!({
+                "SourceProcessingProperties": {
+                    "RoleArn": format!("arn:aws:iam::{ACCOUNT_ID}:role/glue-both-source"),
+                },
+                "TargetProcessingProperties": {
+                    "RoleArn": format!("arn:aws:iam::{ACCOUNT_ID}:role/glue-both-target"),
+                    "ConnectionName": "both-sides-connection",
+                },
+            }),
+            true,
+        ),
+        (
+            "a side stated beside tags",
+            false,
+            json!({
+                "TargetProcessingProperties": {
+                    "RoleArn": format!("arn:aws:iam::{ACCOUNT_ID}:role/glue-tagged-target"),
+                },
+                "Tags": [{ "key": "tier", "value": "gold" }],
+            }),
+            true,
+        ),
+    ];
+
+    for (index, (case, is_connection, members, served)) in cases.iter().enumerate() {
+        let name = format!("side-required-{index}");
+        let resource_arn = if *is_connection {
+            create_connection(&router, &name).await;
+            connection_arn(&name)
+        } else {
+            create_database(&router, &name).await;
+            database_arn(&name)
+        };
+
+        let mut request = members.clone();
+        request["ResourceArn"] = json!(resource_arn);
+        let (status, body) = call(&router, "CreateIntegrationResourceProperty", &request).await;
+        if *served {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a create stating a side must be served, got {status} with {body}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a create stating neither side is refused, got {status} with {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("ValidationException"),
+            "case {case:?}: expected ValidationException, got {}",
+            error_code(&body)
+        );
+        assert_eq!(
+            error_message(&body),
+            NEITHER_SIDE_MESSAGE,
+            "case {case:?}: expected the fixed refusal sentence, got {:?}",
+            error_message(&body)
+        );
+
+        // The refusal persisted nothing, so the resource still has no record.
+        let (read_status, read_body) = call(
+            &router,
+            "GetIntegrationResourceProperty",
+            &json!({ "ResourceArn": resource_arn }),
+        )
+        .await;
+        assert_eq!(
+            read_status, 400,
+            "case {case:?}: the refused create must have stored nothing, got {read_status} with \
+             {read_body}"
+        );
+        assert!(
+            error_code(&read_body).ends_with("EntityNotFoundException"),
+            "case {case:?}: expected EntityNotFoundException from the read, got {}",
+            error_code(&read_body)
+        );
+        assert_eq!(
+            error_message(&read_body),
+            format!("The target resource {resource_arn} is not found."),
+            "case {case:?}: expected the record miss to name the resource it was asked for, got \
+             {:?}",
+            error_message(&read_body)
+        );
+    }
+
+    // The requirement is on the REQUEST, not on what the store already holds: a create
+    // stating neither side is refused for a resource that already has a record too, and
+    // leaves that record exactly as it was.
+    create_connection(&router, "already-recorded").await;
+    let resource_arn = connection_arn("already-recorded");
+    let stored_role = format!("arn:aws:iam::{ACCOUNT_ID}:role/glue-stored");
+    let created = create_property(
+        &router,
+        &json!({
+            "ResourceArn": resource_arn,
+            "SourceProcessingProperties": { "RoleArn": &stored_role },
+        }),
+    )
+    .await;
+    let record_arn = property_arn("a resource that already has a record", &created);
+
+    let (status, body) = call(
+        &router,
+        "CreateIntegrationResourceProperty",
+        &json!({ "ResourceArn": resource_arn }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {:?}: a create stating neither side is refused, got {status} with {body}",
+        "a resource that already has a record"
+    );
+    assert_eq!(
+        error_message(&body),
+        NEITHER_SIDE_MESSAGE,
+        "case {:?}: expected the fixed refusal sentence, got {:?}",
+        "a resource that already has a record",
+        error_message(&body)
+    );
+    let read = get_property(&router, &resource_arn).await;
+    assert_echoed(
+        "a resource that already has a record",
+        &json!({ "SourceProcessingProperties": { "RoleArn": &stored_role } }),
+        &read,
+    );
+    assert_eq!(
+        property_arn("a resource that already has a record", &read),
+        record_arn,
+        "case {:?}: the record keeps the ResourcePropertyArn the first create minted, expected \
+         {record_arn}, got {read}",
+        "a resource that already has a record"
+    );
+}
 
 /// A `ResourceArn` that cannot name a Glue connection or a Glue database is a bad
 /// parameter: the write is refused with the modelled `InvalidInputException` and stores

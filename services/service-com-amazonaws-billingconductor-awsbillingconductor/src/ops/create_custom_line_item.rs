@@ -393,10 +393,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             presentation_service: input
                 .presentation_details
                 .map(|presentation| presentation.service),
-            // The billing periods the item applies in: the range the create named, or
-            // the one fully open stretch when it named none, which applies to every
-            // billing period.
-            spans: vec![crate::state::BillingPeriodSpan::new(
+            // The billing periods the item applies in: the range the create named, or —
+            // when it named none — the one stretch that runs from the billing period
+            // this create was made in on, because a billing period that closed before
+            // the item existed never carries it
+            // ([`crate::state::BillingPeriodSpan::started_now`]).
+            spans: vec![crate::state::BillingPeriodSpan::started_now(
                 period_range
                     .as_ref()
                     .map(|range| range.inclusive_start_billing_period.clone()),

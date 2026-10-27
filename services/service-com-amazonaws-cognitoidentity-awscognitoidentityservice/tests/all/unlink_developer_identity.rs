@@ -12,7 +12,10 @@
 //!   presenting the unlinked identifier again is seen as a NEW identity;
 //! * the identity record survives, keeping the developer provider only while it still has
 //!   an identifier registered under it, and keeping every federated login it had;
-//! * a call naming a mapping this pool does not hold is a 403 `NotAuthorizedException`,
+//! * a call naming a developer provider that is not the pool's configured one is a 400
+//!   `InvalidParameterException` — a bad input parameter, not an access decision — while
+//!   one naming an identifier the pool has registered against no identity is a 403
+//!   `NotAuthorizedException`,
 //!   one naming a mapping held against another identity is a 409
 //!   `ResourceConflictException`, one naming a pool or an identity this service does not
 //!   hold is a 404 `ResourceNotFoundException`, one naming an identity of ANOTHER pool is a
@@ -514,8 +517,8 @@ async fn a_call_the_mapping_cannot_act_on_is_refused() {
                 Some("another.example.app"),
                 Some("user-1"),
             ),
-            403,
-            "NotAuthorizedException",
+            400,
+            "InvalidParameterException",
         ),
         (
             "a pool that names no developer provider at all",
@@ -525,8 +528,8 @@ async fn a_call_the_mapping_cannot_act_on_is_refused() {
                 Some(developer_provider),
                 Some("user-1"),
             ),
-            403,
-            "NotAuthorizedException",
+            400,
+            "InvalidParameterException",
         ),
         (
             "an identifier registered under ANOTHER identity of the same pool",

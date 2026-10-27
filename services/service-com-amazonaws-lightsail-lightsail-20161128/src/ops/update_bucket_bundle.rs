@@ -9,6 +9,9 @@
 //! billing cycle, so the change the request asks for also SPENDS that allowance: the
 //! `ableToUpdateBundle` a later read reports is what says whether another change is
 //! still available, and a request made once it is gone is refused and moves nothing.
+//! The allowance belongs to the CYCLE the change was made in — a calendar month, which
+//! is what an account is billed by — so the next cycle brings another one without
+//! anything having to be materialised for the bucket in between.
 //!
 //! A plan a bucket may be put on is one this service still offers, which is the same
 //! rule the create applies, so both ask the one owner of it in [`crate::state`] rather
@@ -218,11 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // bucket's bundle, use the GetBuckets action. The ableToUpdateBundle
             // parameter in the response will indicate whether you can currently
             // update a bucket's bundle." — so a bucket that has already spent
-            // that one change cannot be moved again, and this operation models no
-            // separate failure for a state like that, so it is the modelled
+            // that one change within the billing cycle this call is made in
+            // cannot be moved again, and this operation models no separate
+            // failure for a state like that, so it is the modelled
             // `InvalidInputException` naming the rule. Refused BEFORE the first
             // write, so it changes nothing.
-            if !bucket.able_to_update_bundle {
+            if !bucket.able_to_update_bundle(now) {
                 return Err(invalid(format!(
                     "The bundle of the bucket {} has already been updated within this monthly \
                      Amazon Web Services billing cycle. You can update a bucket's bundle only \
@@ -239,12 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // being short-circuited. The plan is named by the id the catalog
             // carries rather than by whatever the request spelled it.
             bucket.bundle_id = bundle.bundle_id.to_string();
-            // Spending the allowance is one-way here: this store keeps no billing
-            // cycle boundary, so nothing makes the allowance due again and a
-            // bucket is moved at most once. The refusal above is what a caller
-            // sees after that, which is the rule's answer for the rest of the
-            // cycle.
-            bucket.able_to_update_bundle = false;
+            // The instant of the change is what spends the allowance: the billing
+            // cycle this call is made in holds no further change for this bucket,
+            // and the one the next cycle allows becomes available as the clock
+            // passes that boundary, with nothing to materialise in between — so a
+            // read reports the allowance of the cycle IT is made in.
+            bucket.bundle_updated_at_ms = Some(now);
             // The bucket's own state is left alone: a bundle names the monthly
             // cost, the storage space and the data transfer quota, none of what
             // makes the bucket serve, so this change takes nothing offline and
