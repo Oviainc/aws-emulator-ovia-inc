@@ -205,17 +205,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An IAM policy document is a JSON object whose top-level elements are
         // `Version` and `Id` (both optional) and `Statement` (required) — the IAM
-        // JSON policy grammar. The rule itself, and the note on how far it checks,
-        // live on `crate::state::is_policy_document`, which every operation taking
-        // a policy document shares.
-        if !crate::state::is_policy_document(&input.policy_document) {
+        // JSON policy grammar. The rule itself, the note on how far it checks and the
+        // fixed sentence each defect is refused with live on
+        // `crate::state::policy_document_defect`, which every operation taking a policy
+        // document shares.
+        if let Some(defect) = crate::state::policy_document_defect(&input.policy_document) {
             return Err(PutGroupPolicyErrorModeled::MalformedPolicyDocumentException(
                 MalformedPolicyDocumentException {
-                    message: Some(
-                        "Syntax errors in policy: the policy document must be a JSON object \
-                         carrying a Statement element"
-                            .to_string(),
-                    ),
+                    message: Some(defect.message().to_string()),
                 },
             )
             .into());
@@ -237,9 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if would_embed > crate::state::MAX_GROUP_INLINE_POLICY_CHARACTERS {
             return Err(PutGroupPolicyErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "Maximum policy size of {} bytes exceeded for group {}",
-                        crate::state::MAX_GROUP_INLINE_POLICY_CHARACTERS, input.group_name
+                    message: Some(crate::state::inline_policy_size_exceeded(
+                        crate::state::MAX_GROUP_INLINE_POLICY_CHARACTERS,
+                        "group",
+                        &input.group_name,
                     )),
                 },
             )

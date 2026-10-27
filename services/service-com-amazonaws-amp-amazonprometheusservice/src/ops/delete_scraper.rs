@@ -151,7 +151,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteScraperErrorModeled::InternalServerException(
                 InternalServerException {
@@ -222,6 +221,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // This call CHANGED the stored scraper, which is what
             // `ScraperSummary$lastModifiedAt` reports.
             scraper.last_modified_at = now;
+            // A changed record is an audited one: this handler leaves the audit record
+            // every mutating handler of this crate leaves — the operation, the resource
+            // it changed and the access-key id the REQUEST presented (see
+            // [`crate::state::record_state_change`]). A replay of the pending deletion
+            // writes nothing, so it records nothing, exactly as `UpdateScraper`'s replay
+            // does not.
+            crate::state::record_state_change(Self::NAME, &scraper.arn, ctx.parts());
         }
 
         // Reported from the record this call wrote, never from a literal.

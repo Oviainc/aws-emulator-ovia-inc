@@ -202,14 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // content of a managed policy must be an IAM JSON policy, not merely a
         // non-empty string, which is all `policyDocumentType`'s own pattern asks for.
         // The rule is the shared one every operation taking a policy document applies.
-        if !crate::state::is_policy_document(&input.policy_document) {
+        if let Some(defect) = crate::state::policy_document_defect(&input.policy_document) {
             return Err(CreatePolicyErrorModeled::MalformedPolicyDocumentException(
                 MalformedPolicyDocumentException {
-                    message: Some(
-                        "Syntax errors in policy: PolicyDocument must be a JSON object \
-                         carrying a Statement element"
-                            .to_string(),
-                    ),
+                    message: Some(defect.message().to_string()),
                 },
             )
             .into());
@@ -222,10 +218,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if characters > crate::state::MAX_MANAGED_POLICY_CHARACTERS {
             return Err(CreatePolicyErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "Maximum policy size of {} characters exceeded for policy {}",
+                    message: Some(crate::state::policy_size_quota_exceeded(
                         crate::state::MAX_MANAGED_POLICY_CHARACTERS,
-                        input.policy_name
                     )),
                 },
             )

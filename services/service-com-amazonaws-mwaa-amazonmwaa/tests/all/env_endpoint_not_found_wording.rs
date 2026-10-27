@@ -15,7 +15,9 @@
 //! whether the request carries a body, crossed with every form of environment name
 //! `EnvironmentName`'s own constraints allow. The host prefix of each row is quoted from
 //! the model, and the positive control proves the refusals are the name lookup failing
-//! rather than the service answering nothing.
+//! rather than the service answering nothing. WHICH SHAPE the sentence travels in is a
+//! separate rule with its own suites (`tests/all/env_endpoint_front_door.rs` for the data
+//! endpoint, `tests/all/env_endpoint_payload.rs` for every other refusal).
 
 use std::sync::Arc;
 
@@ -79,15 +81,20 @@ impl Answer {
         })
     }
 
-    /// The sentence the refusal carries: the `message` of the serialized modelled
-    /// exception, which is where every endpoint of this service puts it.
+    /// The sentence the refusal carries, the way an SDK's JSON error parser reads it: the
+    /// `message` member of a document body, and the body itself when the body is not a
+    /// document — which is how the environment data endpoint's front door answers (its
+    /// shape is pinned by `tests/all/env_endpoint_front_door.rs`).
     fn refusal_message(&self) -> String {
-        let body = self.json();
-        body.get("message")
-            .or_else(|| body.get("Message"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
+        match serde_json::from_slice(&self.body).unwrap_or(Value::Null) {
+            Value::Object(object) => object
+                .get("message")
+                .or_else(|| object.get("Message"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            _ => self.text(),
+        }
     }
 
     fn member(&self, name: &str) -> String {

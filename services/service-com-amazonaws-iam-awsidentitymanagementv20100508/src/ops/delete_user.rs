@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if has_inline_policies {
             return Err(DeleteUserErrorModeled::DeleteConflictException(
                 DeleteConflictException {
-                    message: Some("Cannot delete entity, must delete policies first.".to_string()),
+                    message: Some(crate::state::DELETE_CONFLICT_DELETE_POLICIES.to_string()),
                 },
             )
             .into());
@@ -219,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteUserErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(
-                        "Cannot delete entity, must detach all policies first.".to_string(),
+                        crate::state::DELETE_CONFLICT_DETACH_POLICIES.to_string(),
                     ),
                 },
             )
@@ -231,7 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteUserErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(
-                        "Cannot delete entity, must delete access keys first.".to_string(),
+                        crate::state::DELETE_CONFLICT_DELETE_ACCESS_KEYS.to_string(),
                     ),
                 },
             )
@@ -246,8 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteUserErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(
-                        "Cannot delete entity, must delete signing certificates first."
-                            .to_string(),
+                        crate::state::DELETE_CONFLICT_DELETE_SIGNING_CERTIFICATES.to_string(),
                     ),
                 },
             )
@@ -262,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteUserErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(
-                        "Cannot delete entity, must delete login profile first.".to_string(),
+                        crate::state::DELETE_CONFLICT_DELETE_LOGIN_PROFILE.to_string(),
                     ),
                 },
             )
@@ -277,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteUserErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(
-                        "Cannot delete entity, must remove users from group first.".to_string(),
+                        crate::state::DELETE_CONFLICT_REMOVE_USERS_FROM_GROUP.to_string(),
                     ),
                 },
             )

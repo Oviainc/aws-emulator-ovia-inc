@@ -7,16 +7,17 @@
 //! generalises over — never over one recorded request:
 //!
 //! 1. Every operation addressed by `Name` resolves the name in the stored environments
-//!    first and refuses one that resolves to nothing with its modelled
-//!    `ResourceNotFoundException` (HTTP 404). The message depends on the endpoint the model
+//!    first and refuses one that resolves to nothing with HTTP 404 and the wire code
+//!    `ResourceNotFoundException`. The message depends on the endpoint the model
 //!    hosts the operation on: a control-plane (`api.`) lookup names the environment the
 //!    request asked for (`Environment <Name> not found.`), while an operation hosted on the
 //!    environment data endpoint (`env.`) is refused by that front door, whose sentence is
 //!    fixed and names no environment. Rows vary the name (length, case, the `-`/`_`
 //!    characters `EnvironmentName`'s pattern allows) and the operation; the wording rule
-//!    itself has its own suite (`tests/all/env_endpoint_not_found_wording.rs`), and the
-//!    envelope every refusal travels in has another
-//!    (`tests/all/env_endpoint_payload.rs`).
+//!    itself has its own suite (`tests/all/env_endpoint_not_found_wording.rs`), the BODY
+//!    SHAPE the front door's refusal arrives in has another
+//!    (`tests/all/env_endpoint_front_door.rs`), and the envelope every other refusal
+//!    travels in a third (`tests/all/env_endpoint_payload.rs`).
 //! 2. The `/tags/{ResourceArn}` operations refuse a well-formed ARN that resolves to no
 //!    environment with HTTP 404 and the WIRE error code the service publishes for them,
 //!    `NotFoundException` — the code a client's error dispatch branches on. Rows vary the
@@ -74,25 +75,46 @@ impl Answer {
         })
     }
 
-    /// The wire error code, which restJson1 carries in `__type`.
+    /// The body as a JSON document when it is one, and `Value::Null` when it is not — the
+    /// refusals the environment data endpoint's front door answers carry the sentence as
+    /// plain text rather than a document.
+    fn document(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap_or(Value::Null)
+    }
+
+    /// The wire error code a restJson1 client resolves: the `x-amzn-errortype` header
+    /// first, then the body's own `__type` discriminator.
     fn error_code(&self) -> String {
-        self.json()
-            .get("__type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
+        let named = self.error_type_header.clone().unwrap_or_else(|| {
+            self.document()
+                .get("__type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        });
+        named
             .rsplit(['#', '/'])
+            .next()
+            .unwrap_or_default()
+            .split(':')
             .next()
             .unwrap_or_default()
             .to_string()
     }
 
+    /// The sentence a client reads off a refusal, the way an SDK's JSON error parser reads
+    /// it: the `message` member of a document body, and the body itself when the body is
+    /// not a document.
     fn message(&self) -> String {
-        let body = self.json();
-        body.get("message")
-            .or_else(|| body.get("Message"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
+        match self.document() {
+            Value::Object(object) => object
+                .get("message")
+                .or_else(|| object.get("Message"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            _ => self.text(),
+        }
     }
 
     fn member(&self, name: &str) -> String {
@@ -202,8 +224,7 @@ fn unknown_names() -> Vec<String> {
 /// Every operation addressed by `Name`, as `(label, method, uri template, body, host
 /// prefix)`. The template's `{}` takes the name, and the host prefix is the one the model's
 /// `@endpoint` trait declares for the operation — which is what decides the refusal's
-/// wording. Each one's refusal is the serialized modelled exception, the proxied operation
-/// included.
+/// wording, and the shape it travels in.
 type NamedCall = (
     &'static str,
     &'static str,
