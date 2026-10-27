@@ -34,6 +34,7 @@ use crate::ops::types::{
 
 pub mod extension_actions;
 pub mod feature_flags;
+pub mod validators;
 
 /// `DeploymentState` values this service moves a deployment through. Each is a member
 /// of `DEPLOYMENT_STATE_VALUES` in `crate::ops::types` (the model's `DeploymentState`

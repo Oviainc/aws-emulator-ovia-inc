@@ -26,6 +26,10 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
+/// Whether IAM lets a request perform the action it asks for — the authorization step
+/// an index operation takes before it reads or writes the index the request names.
+pub mod authorization;
+
 use crate::ops::types::{
     AIMLOptionsInput, AIMLOptionsOutput, AIMLOptionsStatus, AWSDomainInformation,
     AccessPoliciesStatus, AdditionalLimit,
@@ -1493,7 +1497,8 @@ pub const INDEX_SCHEMA_QUOTA: usize = 10_000;
 /// set in it and every element of every list in it.
 ///
 /// What [`INDEX_SCHEMA_QUOTA`] bounds. Iterative rather than recursive, so a deeply
-/// nested document costs no stack.
+/// nested document costs no stack, and each pending entry is one borrow, so it costs
+/// no heap beyond that either.
 pub fn index_schema_values(schema: &::aws_smithy_types::Document) -> usize {
     use ::aws_smithy_types::Document;
 
@@ -1508,6 +1513,57 @@ pub fn index_schema_values(schema: &::aws_smithy_types::Document) -> usize {
         }
     }
     values
+}
+
+/// How deeply ONE index's schema may nest, before the request carrying it is refused.
+///
+/// Like [`INDEX_SCHEMA_QUOTA`] this is the emulator's OWN bound — the model publishes
+/// none — and it is what keeps the cost of accepting a document tied to its SIZE: the
+/// walks over a schema ([`merged_index_schema`], [`mapping_type_conflict`]) address a
+/// member by its path, and this service's own bound on a path's length is what stops a
+/// small request naming paths that cost more than the bytes it carried. It sits below
+/// the depth the request boundary's own deserializer admits, so this is the bound a
+/// caller meets, and comfortably above the nesting a mapping document needs (a search
+/// engine's own limit on the object fields one field may nest under is an order of
+/// magnitude smaller), so no schema a caller would write reaches it.
+pub const INDEX_SCHEMA_MAX_DEPTH: usize = 100;
+
+/// How deeply `schema` nests: 1 for a document carrying no set and no list, one more
+/// for each level of nesting under it.
+///
+/// What [`INDEX_SCHEMA_MAX_DEPTH`] bounds. Iterative rather than recursive, so
+/// measuring even a document past the bound costs no stack, and each pending entry is
+/// one borrow and one counter.
+pub fn index_schema_depth(schema: &::aws_smithy_types::Document) -> usize {
+    use ::aws_smithy_types::Document;
+
+    let mut deepest = 0_usize;
+    let mut pending = vec![(1_usize, schema)];
+    while let Some((depth, node)) = pending.pop() {
+        deepest = deepest.max(depth);
+        match node {
+            Document::Object(members) => {
+                pending.extend(members.values().map(|child| (depth.saturating_add(1), child)));
+            }
+            Document::Array(elements) => {
+                pending.extend(elements.iter().map(|child| (depth.saturating_add(1), child)));
+            }
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// The `ValidationException` payload for an `IndexSchema` nesting deeper than
+/// [`INDEX_SCHEMA_MAX_DEPTH`]. It reports both numbers, the same way
+/// [`index_schema_over_quota`] does, so a caller knows how much nesting to drop.
+pub fn index_schema_too_deep(depth: usize) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "IndexSchema nests {depth} levels deep, more than the maximum of \
+             {INDEX_SCHEMA_MAX_DEPTH} for one index."
+        )),
+    }
 }
 
 /// The `ValidationException` payload for an update whose merged schema would hold
@@ -1545,11 +1601,14 @@ pub struct MappingTypeConflict {
 /// the stored schema does not map yet has no type to conflict with, and a field the
 /// update does not mention is not touched.
 ///
-/// Iterative rather than recursive, so a deeply nested schema costs no stack, and
-/// the conflicts it finds are ordered by field path so the same pair of documents
-/// always reports the same one. A field literally named `properties` or `fields` is
-/// addressed by its parent's path, since those two names are how a mapping document
-/// nests rather than field names.
+/// Iterative rather than recursive, so a deeply nested schema costs no stack, and the
+/// field path is held as a parent chain rather than on each pending entry, so a
+/// pending entry costs one borrow and the whole walk one name per mapping node —
+/// never a copy of the path per child. Only the SMALLEST conflict is kept, so the
+/// walk's cost does not grow with how many fields conflict. The conflict it reports is
+/// the least field path, so the same pair of documents always reports the same one. A
+/// field literally named `properties` or `fields` is addressed by its parent's path,
+/// since those two names are how a mapping document nests rather than field names.
 pub fn mapping_type_conflict(
     stored: &::aws_smithy_types::Document,
     update: &::aws_smithy_types::Document,
@@ -1566,10 +1625,14 @@ pub fn mapping_type_conflict(
         return None;
     };
 
-    let mut conflicts: Vec<MappingTypeConflict> = Vec::new();
-    let mut pending = vec![(String::new(), stored_mappings, update_mappings)];
-    while let Some((path, stored_node, update_node)) = pending.pop() {
-        if !path.is_empty() {
+    // The field names walked so far, each entry naming its parent entry: the path of
+    // a node is read off this chain ([`mapping_field_path`]) only where a conflict has
+    // to be reported, so no pending entry carries a path of its own.
+    let mut names: Vec<(&str, Option<usize>)> = Vec::new();
+    let mut least: Option<MappingTypeConflict> = None;
+    let mut pending = vec![(None, stored_mappings, update_mappings)];
+    while let Some((at, stored_node, update_node)) = pending.pop() {
+        if at.is_some() {
             if let (Some(from), Some(to)) =
                 (stored_node.get(MAPPING_TYPE), update_node.get(MAPPING_TYPE))
             {
@@ -1578,11 +1641,17 @@ pub fn mapping_type_conflict(
                 // still settled by the write that first made it rather than
                 // rewritten by the next one.
                 if from != to {
-                    conflicts.push(MappingTypeConflict {
-                        field: path.clone(),
+                    let conflict = MappingTypeConflict {
+                        field: mapping_field_path(&names, at),
                         from: mapping_type_label(from),
                         to: mapping_type_label(to),
-                    });
+                    };
+                    if least
+                        .as_ref()
+                        .is_none_or(|best| conflict.field < best.field)
+                    {
+                        least = Some(conflict);
+                    }
                 }
             }
         }
@@ -1595,19 +1664,31 @@ pub fn mapping_type_conflict(
             let Some(Document::Object(stored_child)) = stored_node.get(name) else {
                 continue;
             };
-            let child_path = if MAPPING_CONTAINERS.contains(&name.as_str()) {
-                path.clone()
-            } else if path.is_empty() {
-                name.clone()
+            let child = if MAPPING_CONTAINERS.contains(&name.as_str()) {
+                at
             } else {
-                format!("{path}.{name}")
+                names.push((name.as_str(), at));
+                Some(names.len() - 1)
             };
-            pending.push((child_path, stored_child, update_child));
+            pending.push((child, stored_child, update_child));
         }
     }
-    conflicts
-        .into_iter()
-        .min_by(|left, right| left.field.cmp(&right.field))
+    least
+}
+
+/// The dotted path of the mapping node `at` names, read off the parent chain
+/// [`mapping_type_conflict`] records its walk in — the way a mapping document
+/// addresses a field of an object field (`author.name`).
+fn mapping_field_path(names: &[(&str, Option<usize>)], at: Option<usize>) -> String {
+    let mut path: Vec<&str> = Vec::new();
+    let mut cursor = at;
+    while let Some(index) = cursor {
+        let (name, parent) = names[index];
+        path.push(name);
+        cursor = parent;
+    }
+    path.reverse();
+    path.join(".")
 }
 
 /// How a field's `type` member reads in a refusal: the type name the mapping names,
@@ -1637,7 +1718,13 @@ fn mapping_type_label(value: &::aws_smithy_types::Document) -> String {
 /// values, so one of those replaces whatever the stored schema held there, and an
 /// object that names no member changes nothing.
 ///
-/// Iterative rather than recursive, so a deeply nested document costs no stack.
+/// Iterative rather than recursive, so a deeply nested document costs no stack, and
+/// the path of a member is held as a parent chain rather than on each pending entry,
+/// so a pending entry costs one borrow and the whole walk one name per member — never
+/// a copy of the path per child. With the depth of an accepted document bounded
+/// ([`INDEX_SCHEMA_MAX_DEPTH`]) and its value count bounded
+/// ([`INDEX_SCHEMA_QUOTA`]), the heap this needs is tied to the size of the request
+/// that carried it.
 pub fn merged_index_schema(
     stored: &::aws_smithy_types::Document,
     update: &::aws_smithy_types::Document,
@@ -1648,22 +1735,41 @@ pub fn merged_index_schema(
         return update.clone();
     }
     let mut merged = stored.clone();
-    let mut pending: Vec<(Vec<String>, &Document)> = vec![(Vec::new(), update)];
-    while let Some((path, node)) = pending.pop() {
+    // The member names walked so far, each entry naming its parent entry: a value's
+    // path is read off this chain where the value is written.
+    let mut names: Vec<(&str, Option<usize>)> = Vec::new();
+    let mut pending: Vec<(Option<usize>, &Document)> = vec![(None, update)];
+    while let Some((at, node)) = pending.pop() {
         match node {
             // A named set of members names no value of its own: it is the way to the
             // members under it, so one that names none changes nothing.
             Document::Object(members) => {
                 for (name, child) in members {
-                    let mut child_path = path.clone();
-                    child_path.push(name.clone());
-                    pending.push((child_path, child));
+                    names.push((name.as_str(), at));
+                    pending.push((Some(names.len() - 1), child));
                 }
             }
-            value => write_member(&mut merged, &path, value.clone()),
+            value => {
+                let path = member_path(&names, at);
+                write_member(&mut merged, &path, value.clone());
+            }
         }
     }
     merged
+}
+
+/// The path of the member `at` names, root first, read off the parent chain
+/// [`merged_index_schema`] records its walk in.
+fn member_path<'a>(names: &[(&'a str, Option<usize>)], at: Option<usize>) -> Vec<&'a str> {
+    let mut path: Vec<&str> = Vec::new();
+    let mut cursor = at;
+    while let Some(index) = cursor {
+        let (name, parent) = names[index];
+        path.push(name);
+        cursor = parent;
+    }
+    path.reverse();
+    path
 }
 
 /// Write `value` at `path` in `document`, as [`merged_index_schema`]'s one writing
@@ -1671,7 +1777,7 @@ pub fn merged_index_schema(
 /// nested member is written without dropping the members beside it.
 fn write_member(
     document: &mut ::aws_smithy_types::Document,
-    path: &[String],
+    path: &[&str],
     value: ::aws_smithy_types::Document,
 ) {
     use ::aws_smithy_types::Document;
@@ -1690,14 +1796,14 @@ fn write_member(
             return;
         };
         node = members
-            .entry(ancestor.clone())
+            .entry((*ancestor).to_string())
             .or_insert_with(|| Document::Object(::std::collections::HashMap::new()));
     }
     if !matches!(node, Document::Object(_)) {
         *node = Document::Object(::std::collections::HashMap::new());
     }
     if let Document::Object(members) = node {
-        members.insert(name.clone(), value);
+        members.insert((*name).to_string(), value);
     }
 }
 

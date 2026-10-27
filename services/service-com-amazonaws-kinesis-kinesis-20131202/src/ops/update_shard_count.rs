@@ -294,24 +294,25 @@ fn update_shard_count(
     // Modelled `range 1..`, so the boundary validator has already refused a non-positive
     // target; every ceiling below is checked BEFORE a shard map is sized from it.
     let target = u32::try_from(input.target_shard_count).unwrap_or(u32::MAX);
-    let current = u32::try_from(stream.open_shard_count()).unwrap_or(u32::MAX);
+    let current_open = stream.open_shard_count();
+    let current = u32::try_from(current_open).unwrap_or(u32::MAX);
 
     // "You cannot do the following: ... scale up to more than double your current shard
     // count for a stream[, or] scale down below half your current shard count for a
-    // stream."
+    // stream." Both bounds are taken against the stream's LIVE open shard count, and a
+    // target outside them is a parameter that "can't be used" rather than capacity the
+    // account has run out of — so the refusal is the modelled `InvalidArgumentException`,
+    // and the stored shard map is left exactly as it was.
     if target > current.saturating_mul(SCALING_FACTOR) {
-        return Err(limit_exceeded(format!(
-            "a target shard count of {target} is more than double the {current} shards \
-             stream {identifier} currently has; you cannot scale up to more than double \
-             your current shard count for a stream"
+        return Err(invalid_argument(crate::state::scale_up_over_double_message(
+            current_open,
+            input.target_shard_count,
         )));
     }
     if target.saturating_mul(SCALING_FACTOR) < current {
-        return Err(limit_exceeded(format!(
-            "a target shard count of {target} is below half the {current} shards stream \
-             {identifier} currently has; you cannot scale down below half your current \
-             shard count for a stream"
-        )));
+        return Err(invalid_argument(
+            crate::state::scale_down_below_half_message(current_open, input.target_shard_count),
+        ));
     }
 
     // "You cannot ... scale more than ten times per rolling 24-hour period per stream."

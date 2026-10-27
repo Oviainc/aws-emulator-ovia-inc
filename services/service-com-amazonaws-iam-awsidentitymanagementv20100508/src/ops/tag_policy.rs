@@ -3,7 +3,8 @@
 //! @op TagPolicy
 //!
 //! IMPLEMENTED: the tags supplied here are merged into the persisted customer managed
-//! policy in this service's state (`crate::state`) and read back by `GetPolicy`.
+//! policy in this service's state (`crate::state`) and read back by `GetPolicy`, after
+//! the calling principal's identity-based policies are checked for the action.
 //!
 //! A 501 from an operation in this service means "nobody has written it yet", never
 //! "the emulator is broken".
@@ -182,9 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; tagging a policy depends on nothing in
-        // it — IAM is global, and the policy is named by the request's ARN.
-        let _ = ctx;
+        // `ctx` carries request metadata only; what this operation reads out of it is
+        // the signing key id of the caller the request is authorized as. The policy
+        // itself is named by the request's ARN — IAM is global, so no region is read.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagPolicyErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -247,6 +248,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any tag is stored, and before the STORE is consulted for the
+        // policy — so a caller that may not change a policy's tags learns that it may not,
+        // never whether the account holds that policy. (The refusals above are about the
+        // request the caller supplied, which it already knows.) The decision is made on
+        // the ARN the request addresses, while the refusal NAMES the entity that ARN
+        // identifies: a managed policy, named by its type followed by the ARN the request
+        // carried — the same spelling `UntagPolicy` refuses with.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::TAG_POLICY,
+            &input.policy_arn,
+            &format!("policy {}", input.policy_arn),
+        )?;
+
+        // The keys the request named, collected here because the merge below consumes
+        // the supplied list. Only the keys are recorded, never the values.
+        let supplied_keys: Vec<String> = input.tags.iter().map(|tag| tag.key.clone()).collect();
+
         // The write is addressed exactly as a read of the same ARN is, so it reaches
         // the one record `GetPolicy` reports; an ARN the account holds no policy under
         // "referenced a resource entity that does not exist".
@@ -282,6 +303,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policy's `UpdateDate` is left alone — it reports when the policy's CONTENT
         // was last updated, and a tag call creates no policy version.
         held.policy.tags = (!merged.is_empty()).then_some(merged);
+
+        // Audit record for the change: the acting principal, the operation and what it
+        // added to which policy, so a state-changing call leaves a local record — the
+        // same shape `UntagPolicy` and the credential operations in this crate emit. The
+        // tag VALUES are not recorded, only the keys the request named.
+        ::tracing::info!(
+            audit = true,
+            operation = "TagPolicy",
+            outcome = "tagged",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            policy_arn = %input.policy_arn,
+            tag_keys = ?supplied_keys,
+            "tags were added to a managed policy"
+        );
         Ok(TagPolicyOutput)
     }
 }

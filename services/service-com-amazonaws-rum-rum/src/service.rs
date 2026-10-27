@@ -68,6 +68,17 @@
 //! `override_protocol` is not the seam for it: the codec is right, and swapping in
 //! another protocol would swap away the URI-based routing this REST service needs.
 //!
+//! ## How a refused request is worded
+//!
+//! A request whose input breaks a modelled constraint is refused with the code and the
+//! words [`stated`] chooses, and the clauses themselves are
+//! [`crate::state::validation`]'s — the one place this service words a constraint refusal.
+//! It is reached from two places, which is why the choice lives in one function: the gate
+//! in front of every operation, which collects the violations against that operation's own
+//! input schema together with the request's own lists
+//! ([`AnnouncedMediaType::stated_refusal`]), and [`Service::override_refusal`], for a
+//! refusal the centralized walk finds anyway and hands back as the violations alone.
+//!
 //! Two things the gate deliberately does not touch: authentication, which the router
 //! settles before any operation runs and reads off the MODELLED operation the routing
 //! key names (so a gate cannot weaken an operation's auth schemes), and the refusals
@@ -77,9 +88,12 @@
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+use aws_smithy_schema_server::ProtocolError;
 use smithy_server_runtime::{
-    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused,
+    ServerHttpProtocol, Service,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The error code RUM words a refused TAG call with: `BadRequestException`.
@@ -255,15 +269,18 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 }
 
-/// This service's response envelope in front of one request: the media type every RUM
-/// response announces, and nothing else. See the module docs.
+/// This service's envelope in front of one request: the media type every RUM response
+/// announces, and the words a request refused on a modelled constraint is stated in. See
+/// the module docs.
 ///
-/// It owns no behaviour of its own: the operation that serves the request is the one the
-/// model's routing table names, reached through its own `run`, so that operation stays
-/// the single owner of the request — its telemetry included. The exceptions are the two
-/// routes the protocol's routing key cannot name ([`UNTAG_RESOURCE_ROUTE`] and
+/// It decides nothing else. The operation that serves the request is the one the model's
+/// routing table names, reached through its own `run`, so that operation stays the single
+/// owner of the request — its telemetry included. The exceptions are the two routes the
+/// protocol's routing key cannot name ([`UNTAG_RESOURCE_ROUTE`] and
 /// [`BATCH_DELETE_METRIC_DEFINITIONS_ROUTE`]), which the gate serves from the operations it
-/// holds.
+/// holds, and a request the framework's own constraint walk refuses, which the gate states
+/// in front of the operation because that is the only place the request's own values are
+/// still in hand ([`AnnouncedMediaType::stated_refusal`]).
 struct AnnouncedMediaType<Eng> {
     /// `UntagResource`, built from the SAME shared engine the generated entry threads
     /// into every operation, so this gate and the rest of the service read one store.
@@ -278,6 +295,27 @@ struct AnnouncedMediaType<Eng> {
         crate::ops::batch_delete_rum_metric_definitions::BatchDeleteRumMetricDefinitions<Eng>,
 }
 
+/// Read one `crate::ops::<module>::<Operation>`'s refusal per line, choosing the arm by the
+/// routing key — the operation shape name, which is the key the protocol resolves and the
+/// generated routing table is keyed by. EVERY modelled operation is listed, because the
+/// rule is the service's and not one operation's: an operation whose input declares no
+/// constraint simply never has a violation to state, which [`collected_refusal`] reads off
+/// that operation's own input schema. An operation added later is listed here too, or it
+/// answers a refusal with the value the framework elided rather than the one its caller
+/// sent.
+macro_rules! stated_refusal_for_key {
+    ($key:expr, $protocol:expr, $req:expr, $engine:ident, $($module:ident :: $operation:ident),+ $(,)?) => {
+        match $key {
+            $(
+                stringify!($operation) => collected_refusal::<
+                    crate::ops::$module::$operation<$engine>,
+                >($protocol, $req),
+            )+
+            _ => None,
+        }
+    };
+}
+
 impl<Eng: Send + Sync + 'static> AnnouncedMediaType<Eng> {
     fn new(engine: Arc<Eng>) -> Self {
         Self {
@@ -288,6 +326,110 @@ impl<Eng: Send + Sync + 'static> AnnouncedMediaType<Eng> {
                 ),
         }
     }
+
+    /// How this service states every modelled constraint `req` breaks, with the two facts
+    /// a clause needs that a [`Violation`] does not carry, or `None` when the request
+    /// breaks none.
+    ///
+    /// The collecting half is the tree's shared one,
+    /// `service_common::validation::refusing_violations_with_lists`: ONE read of the
+    /// request yields the framework's own violations — the protocol's deserializer for an
+    /// absent `@required` member, `constraints::validate` over the built input — with each
+    /// echoed value restored to the bytes the caller sent, plus the request's own lists,
+    /// which is the value a clause reported at a LIST member states and no violation
+    /// holds. Nothing is re-checked and nothing is refused that the framework's own walk
+    /// would not refuse; the cost is that a request this gate does not refuse is read
+    /// twice, once here and once in the operation's own sequence, because the framework
+    /// hands no already-built input to an operation. The structurally right place for the
+    /// collecting half is the frozen crate, which `services/common/src/validation.rs`
+    /// records as the core seam this re-read exists only until.
+    ///
+    /// WHICH operation's input schema the violations are read against is the model's
+    /// answer: the routing key the protocol resolves, the same key the generated routing
+    /// table is keyed by. A key this service does not serve — and the two routes that key
+    /// cannot name, which bind no body at all — is left to the centralized walk, which
+    /// refuses it and comes back through [`Service::override_refusal`].
+    fn stated_refusal(
+        &self,
+        svc: &dyn Service,
+        req: &RtRequest,
+    ) -> Option<(Vec<Violation>, Refused)> {
+        let key = svc.definition().protocol().routing_key(req).ok()?;
+        let protocol = svc.definition().protocol();
+        stated_refusal_for_key!(
+            key,
+            protocol,
+            req,
+            Eng,
+            batch_create_rum_metric_definitions::BatchCreateRumMetricDefinitions,
+            batch_delete_rum_metric_definitions::BatchDeleteRumMetricDefinitions,
+            batch_get_rum_metric_definitions::BatchGetRumMetricDefinitions,
+            create_app_monitor::CreateAppMonitor,
+            delete_app_monitor::DeleteAppMonitor,
+            delete_resource_policy::DeleteResourcePolicy,
+            delete_rum_metrics_destination::DeleteRumMetricsDestination,
+            get_app_monitor::GetAppMonitor,
+            get_app_monitor_data::GetAppMonitorData,
+            get_resource_policy::GetResourcePolicy,
+            list_app_monitors::ListAppMonitors,
+            list_rum_metrics_destinations::ListRumMetricsDestinations,
+            list_tags_for_resource::ListTagsForResource,
+            put_resource_policy::PutResourcePolicy,
+            put_rum_events::PutRumEvents,
+            put_rum_metrics_destination::PutRumMetricsDestination,
+            tag_resource::TagResource,
+            untag_resource::UntagResource,
+            update_app_monitor::UpdateAppMonitor,
+            update_rum_metric_definition::UpdateRumMetricDefinition,
+        )
+    }
+}
+
+/// The violations `req` breaks against operation `O`'s own input schema, and the words this
+/// service states them in — the shared collection, and this service's one wording
+/// ([`stated`]).
+fn collected_refusal<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<(Vec<Violation>, Refused)> {
+    let (violations, lists) =
+        service_common::validation::refusing_violations_with_lists::<O>(protocol, req);
+    let chosen = stated(&violations, &lists)?;
+    Some((violations, chosen))
+}
+
+/// How this service words a constraint refusal, wherever it was collected: the ONE place
+/// that decision is made, so the refusal a request gets cannot depend on which of the two
+/// paths found it ([`AnnouncedMediaType::stated_refusal`] before the operation runs, or
+/// [`Service::override_refusal`] after the centralized walk).
+///
+/// A refused TAG call is worded by that frontend (see [`TAGGING_BAD_REQUEST_CODE`]): its
+/// code is `BadRequestException`, and a `ResourceArn` that is not an ARN gets its own
+/// sentence for it. Any other tag refusal keeps the framework's request-derived envelope
+/// under that code — what that frontend words those in is not known, so nothing about them
+/// is reworded. Every other constraint refusal is an app-monitor call's, worded the way
+/// this service words one (`crate::state::validation`).
+///
+/// `lists` holds the request's lists where the caller has them, keyed by the member path
+/// the walk reports that list at and already rendered.
+fn stated(violations: &[Violation], lists: &HashMap<String, String>) -> Option<Refused> {
+    if violations.is_empty() {
+        return None;
+    }
+    if is_tagging_refusal(violations) {
+        return Some(Refused {
+            code: TAGGING_BAD_REQUEST_CODE.to_string(),
+            message: if is_resource_arn_syntax_violation(violations) {
+                INVALID_RESOURCE_ARN_MESSAGE.to_string()
+            } else {
+                aws_smithy_schema_server::constraints::envelope(violations)?
+            },
+        });
+    }
+    Some(Refused {
+        code: crate::state::validation::VALIDATION_EXCEPTION.to_string(),
+        message: crate::state::validation::message(violations, lists)?,
+    })
 }
 
 impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
@@ -298,6 +440,24 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            // A request that breaks a modelled constraint is stated BEFORE the operation
+            // runs, because two of the facts such a clause states are only readable from
+            // the request itself and not from the violations the centralized walk hands
+            // `override_refusal`: the value a caller submitted, unelided, and the whole
+            // LIST a clause about one of its elements is reported at (see
+            // [`stated_refusal`]). Nothing is re-checked here — the violations are the
+            // framework's own — and a request that breaks none is handed straight on, so
+            // this cannot refuse a request the framework would accept. The definition is
+            // read, used and dropped inside each statement: `&dyn
+            // ErasedServiceDefinition` is not `Sync`, so holding one across the await
+            // below would make this future non-`Send`.
+            let refused = self.stated_refusal(svc, req);
+            if let Some((violations, chosen)) = refused {
+                let response = svc
+                    .definition()
+                    .refusal_response(ProtocolError::Invalid(violations), Some(chosen));
+                return announced(req, response);
+            }
             // The generated operation serves the request through the framework's own
             // deserialize -> validate -> handle -> serialize sequence, so a modelled
             // success, a handler's modelled error and a boundary refusal all pass back
@@ -422,27 +582,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording, which is what every operation but the tagging ones uses: an
-        // app-monitor call refused on a modelled constraint answers
-        // `ValidationException`, the code this service's model declares.
-        //
-        // A refused TAG call is the one exception (see [`TAGGING_BAD_REQUEST_CODE`]):
-        // its code is `BadRequestException`, and a `ResourceArn` that is not an ARN gets
-        // that frontend's own sentence for it. Any other tag refusal keeps the
-        // framework's request-derived envelope, which names the member and the constraint
-        // it failed, under the tag frontend's code.
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. The words are [`stated`]'s — the one place this service makes that
+        // choice — so a refusal that reaches here and one the gate in front of the
+        // operation stated ([`AnnouncedMediaType::stated_refusal`]) are worded the same
+        // way. What is missing on THIS path is only what the violations do not carry: the
+        // request's own lists, so a clause about a list element states the elements that
+        // offended rather than the whole list.
         match refusal {
-            Refusal::Invalid(violations) if is_tagging_refusal(violations) => Some(Refused {
-                code: TAGGING_BAD_REQUEST_CODE.to_string(),
-                message: if is_resource_arn_syntax_violation(violations) {
-                    INVALID_RESOURCE_ARN_MESSAGE.to_string()
-                } else {
-                    aws_smithy_schema_server::constraints::envelope(violations)?
-                },
-            }),
-            // Every other refusal, including an unauthenticated caller, keeps the
+            Refusal::Invalid(violations) => stated(violations, &HashMap::new()),
+            // An unauthenticated caller and every other refusal class keep the
             // framework's protocol-correct default.
             _ => None,
         }
