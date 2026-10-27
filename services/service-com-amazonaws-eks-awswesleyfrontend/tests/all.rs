@@ -71,6 +71,8 @@ mod identity_provider_config;
 mod identity_provider_config_not_found;
 #[path = "all/identity_provider_configs.rs"]
 mod identity_provider_configs;
+#[path = "all/insights_listing.rs"]
+mod insights_listing;
 #[path = "all/insights_refresh.rs"]
 mod insights_refresh;
 #[path = "all/list_pod_identity_associations.rs"]
