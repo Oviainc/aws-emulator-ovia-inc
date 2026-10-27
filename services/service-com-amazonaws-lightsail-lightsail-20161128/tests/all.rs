@@ -217,6 +217,8 @@ mod relational_database_log_events;
 mod relational_database_log_streams;
 #[path = "all/relational_database_master_user_password.rs"]
 mod relational_database_master_user_password;
+#[path = "all/relational_database_metric_data.rs"]
+mod relational_database_metric_data;
 #[path = "all/relational_database_parameter_updates.rs"]
 mod relational_database_parameter_updates;
 #[path = "all/relational_database_parameters.rs"]
