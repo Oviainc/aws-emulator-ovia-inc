@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAcmeExternalAccountBindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAcmeExternalAccountBindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the external account bindings the endpoint `AcmeEndpointArn`
+//! names holds, as `AcmeExternalAccountBindingSummary` values projected from the stored
+//! records ([`crate::state::acme_external_account_binding_summary`]), in one
+//! deterministic order (by binding ARN) and paged by `MaxResults` with a `NextToken` that
+//! resumes where the previous page stopped ([`crate::state::encode_page_cursor`], the
+//! token form this service's parent-scoped paginated reads share). An ARN naming another
+//! account is `ValidationException` before the store is read; an ARN of this account that
+//! no stored endpoint answers to is `ResourceNotFoundException`, and a `NextToken` this
+//! service did not issue for that endpoint is `ValidationException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAcmeExternalAccountBindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting, not mutating: the only write it makes is
+//! [`crate::state::ComAmazonawsAcmCertificatemanagerState::materialize_due`], which
+//! applies the status transitions the clock already owed at this instant whether or not
+//! anybody listed — so a listed binding and a `DescribeAcmeExternalAccountBinding` of the
+//! same binding cannot disagree. It creates nothing and re-mints no credential: bindings
+//! are created by `CreateAcmeExternalAccountBinding`, so an endpoint holding none is
+//! reported as an empty list. The credentials are no members of the summary shape, so a
+//! listing reports no secret.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +161,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAcmeExternalAccountBindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAcmeExternalAccountBindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAcmeExternalAccountBindings"))
+        // No request metadata is needed: the `AcmeEndpointArn` the request names carries
+        // the Region its endpoint was minted in, and every one of that endpoint's binding
+        // ARNs is a path under it, so the records are found by that ARN alone.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator (the engine IS the shared store);
+            // this operation models a server fault, so that is the honest answer.
+            return Err(
+                ListAcmeExternalAccountBindingsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the acm acme external account binding store is unavailable".into(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The endpoint ARN is INPUT this operation validates, and its account segment is
+        // part of what it validates: a caller addresses only their own account's
+        // resources, so an endpoint ARN carrying another account's id names nothing they
+        // could read. That is a verdict on the ARN the request is addressed to, so it is
+        // reached before anything else the request carries is read and before the store
+        // is consulted at all — never reported as a resource this account happens not to
+        // hold.
+        if !crate::state::arn_is_in_caller_account(&input.acme_endpoint_arn) {
+            return Err(cross_account_arn(crate::state::ACME_ENDPOINT_RESOURCE_TYPE));
+        }
+
+        // A token is only ever read against the endpoint it was issued for, so it is
+        // decoded before the store is locked. A token this service did not issue for that
+        // endpoint names no position to resume from, and is refused rather than answered
+        // with a page.
+        let resume_after = input
+            .next_token
+            .as_deref()
+            .map(|token| {
+                crate::state::decode_page_cursor(token, &input.acme_endpoint_arn)
+                    .ok_or_else(invalid_next_token)
+            })
+            .transpose()?;
+
+        let mut store = state.lock();
+        // A read of the binding records, except for the transitions the clock already
+        // owes: whichever call reaches the store first materialises them, so this page and
+        // a describe of the same resources cannot disagree.
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // The bindings are listed FOR an endpoint, so an ARN this account holds no
+        // endpoint for is a missing resource rather than an empty list: that is the
+        // difference between "this endpoint has no bindings yet" and "there is no such
+        // endpoint".
+        if !store.acme_endpoints.contains_key(&input.acme_endpoint_arn) {
+            return Err(
+                ListAcmeExternalAccountBindingsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::acme_endpoint_not_found_message(
+                            &input.acme_endpoint_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every binding of this endpoint, in the store's own ARN order — the order a
+        // `NextToken` from this operation resumes against. The store is keyed by the
+        // binding ARN, which begins with the endpoint's own ARN, so the range walk is
+        // already in that order; the assertion pins the invariant the resume below depends
+        // on, so a future change to the store surfaces here rather than as a skewed page.
+        let bindings: Vec<&crate::state::AcmeExternalAccountBindingRecord> = store
+            .acme_external_account_bindings_of(&input.acme_endpoint_arn)
+            .collect();
+        debug_assert!(
+            bindings.windows(2).all(|pair| pair[0].arn <= pair[1].arn),
+            "the binding store must enumerate one endpoint's bindings in ARN order"
+        );
+
+        // `NextToken` carries the binding ARN the previous page stopped at, so this page
+        // starts at the first binding that sorts strictly after it — whether or not that
+        // binding still exists. A caller paging while bindings are deleted therefore keeps
+        // the tail instead of losing it.
+        let start = match resume_after.as_deref() {
+            None => 0,
+            Some(cursor) => bindings
+                .iter()
+                .position(|binding| binding.arn.as_str() > cursor)
+                .unwrap_or(bindings.len()),
+        };
+        let page = &bindings[start.min(bindings.len())..];
+
+        // Page size: the caller's `MaxResults`, else the server-side default. The member's
+        // modelled range (1..100) is already refused before this handler runs, so the
+        // clamp is a post-validation defence rather than the check: a value outside the
+        // range yields the nearest bound, not the default page size, so one response can
+        // never serialise more bindings than the member admits even if the member's
+        // constraint is ever relaxed.
+        let limit = input
+            .max_results
+            .map(|max| {
+                usize::try_from(max.clamp(1, i32::try_from(MAX_PAGE_SIZE).unwrap_or(i32::MAX)))
+                    .unwrap_or(MAX_PAGE_SIZE)
+            })
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        let emitted = page.len().min(limit);
+
+        let summaries: Vec<AcmeExternalAccountBindingSummary> = page[..emitted]
+            .iter()
+            .copied()
+            .map(crate::state::acme_external_account_binding_summary)
+            .collect();
+        // A token is issued only when this page stopped short of the stored bindings, and
+        // it names the last binding the page emitted.
+        let next_token = if emitted < page.len() {
+            page[..emitted].last().map(|binding| {
+                crate::state::encode_page_cursor(&input.acme_endpoint_arn, &binding.arn)
+            })
+        } else {
+            None
+        };
+
+        Ok(ListAcmeExternalAccountBindingsOutput {
+            external_account_bindings: Some(summaries),
+            next_token,
+        })
     }
+}
+
+/// The most summaries one `ListAcmeExternalAccountBindings` response carries, which is
+/// also the page size used when the caller names no `MaxResults`: the maximum the model
+/// allows for that member (`MaxResults`, `range 1..100`).
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The refusal for a `NextToken` this service did not issue for the endpoint the request
+/// names.
+///
+/// `ValidationException` — "the supplied input failed to satisfy constraints of an Amazon
+/// Web Services service" — is the shape this service models for that class, and the
+/// sentence is the one every paginated read in this service renders
+/// ([`crate::state::INVALID_NEXT_TOKEN_MESSAGE`]), since a caller cannot repair an opaque
+/// value and can only restart the walk.
+fn invalid_next_token() -> ListAcmeExternalAccountBindingsError {
+    ListAcmeExternalAccountBindingsErrorModeled::ValidationException(ValidationException {
+        message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The refusal for an ARN input member addressing `resource_type` that names another
+/// account's resource: the same `ValidationException` class, worded once for the whole
+/// service ([`crate::service::cross_account_arn_refusal`]).
+fn cross_account_arn(resource_type: &str) -> ListAcmeExternalAccountBindingsError {
+    ListAcmeExternalAccountBindingsErrorModeled::ValidationException(ValidationException {
+        message: Some(crate::service::cross_account_arn_refusal(resource_type)),
+    })
+    .into()
 }
