@@ -210,16 +210,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // role on your behalf" (`UnmodifiableEntityException`) — so this call, which
         // is not that service, cannot delete one. The role's PATH is what says it is
         // service-linked, exactly as this crate's `AttachRolePolicy` reads it, and the
-        // principal that path names is the service the refusal points the caller at.
+        // refusal is stated in the one sentence this service words that protection
+        // with (`crate::state::protected_role_message`).
         if crate::state::is_service_linked_role_path(&role.path) {
-            let linked_to = crate::state::service_linked_role_principal(&role.path)
-                .unwrap_or("the service it is linked to");
             return Err(DeleteRoleErrorModeled::UnmodifiableEntityException(
                 UnmodifiableEntityException {
-                    message: Some(format!(
-                        "Service role {} cannot be deleted: only {linked_to} can delete it",
-                        role.role_name
-                    )),
+                    message: Some(crate::state::protected_role_message(&input.role_name)),
                 },
             )
             .into());

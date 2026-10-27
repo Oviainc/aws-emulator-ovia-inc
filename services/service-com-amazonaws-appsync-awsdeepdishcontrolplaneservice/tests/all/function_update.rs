@@ -395,7 +395,7 @@ async fn the_addressed_api_and_function_are_resolved_before_the_body() {
         );
         assert_eq!(
             answer.message,
-            format!("Function {unheld} not found"),
+            format!("function id {unheld} not found"),
             "case UpdateFunction on the unheld id {unheld:?}: expected the function not-found \
              text, got {answer:?}"
         );

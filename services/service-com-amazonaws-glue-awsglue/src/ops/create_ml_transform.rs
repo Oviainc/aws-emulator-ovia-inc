@@ -10,6 +10,11 @@
 //! nothing has taught yet, and the schema of the catalog tables it reads — so every later
 //! read reports what this create stored.
 //!
+//! The `Name` the request chooses has to be free: a create naming a transform this
+//! account already holds is refused, because that resource already exists. The name is
+//! the client's choice at CREATE time only — every later operation addresses a transform
+//! by the id this create minted.
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -230,6 +235,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The `Name` a create chooses has to be free: "A resource to be created or added
+        // already exists" (`AlreadyExistsException`) is what a create naming a transform
+        // this account already holds asks for. The name is checked only HERE, where the
+        // client chooses it — afterwards a transform is addressed by its id alone, because
+        // "Names are not guaranteed unique and can be changed at any time"
+        // (`MLTransform$Name`).
+        if store.ml_transform_by_name(&input.name).is_some() {
+            return Err(CreateMLTransformErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(crate::state::messages::ml_transform_already_exists(
+                        &input.name,
+                    )),
+                },
+            )
+            .into());
+        }
         // The store is resident memory and this create is reachable by any caller, so the
         // number of records one process will hold is bounded. Past the ceiling the request
         // is refused with the operation's own modelled limit error.
@@ -255,9 +276,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // claim — it simply contributes no column.
         let schema = store.ml_transform_schema(&input.input_record_tables);
         // The id is minted only once the request is going to be served, so a refusal above
-        // hands out none. A transform's NAME is deliberately not checked for uniqueness:
-        // "Names are not guaranteed unique and can be changed at any time"
-        // (`MLTransform$Name`), so two creates under one name are two transforms.
+        // hands out none. The name the create chose is free, which is what the refusal
+        // above establishes: a transform is ADDRESSED by this id and never by its name,
+        // since "Names are not guaranteed unique and can be changed at any time"
+        // (`MLTransform$Name`) — an update may move a name onto one another transform
+        // already carries.
         let transform_id = crate::state::new_ml_transform_id();
         store.ml_transforms.insert(
             transform_id.clone(),

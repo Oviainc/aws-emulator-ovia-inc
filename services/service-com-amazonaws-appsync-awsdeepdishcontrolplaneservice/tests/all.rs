@@ -43,6 +43,8 @@ mod environment_variables;
 mod error_contract;
 #[path = "all/event_api.rs"]
 mod event_api;
+#[path = "all/function_delete.rs"]
+mod function_delete;
 #[path = "all/function_update.rs"]
 mod function_update;
 #[path = "all/functions.rs"]

@@ -15,8 +15,8 @@
 //! The rows span the whole member set and differ along what the rule generalises
 //! over: which member, the value's type and truthiness (a stated `false` is still
 //! stated), a list's element count including the empty list and the model's
-//! maximum, each published interval bound, where the member was stated, and
-//! whether the request is a create or an update.
+//! maximum, each published interval bound a member stated on its own can reach,
+//! where the member was stated, and whether the request is a create or an update.
 
 use std::sync::Arc;
 
@@ -213,9 +213,16 @@ fn default_policy_only_parameters() -> Vec<Parameter> {
             reported_verbatim: true,
         },
         Parameter {
-            case: "CreateInterval at the documented maximum of 7 days",
+            // Every row here states its member ALONE, so this policy's retention
+            // period is the documented default of 7 days and the documented
+            // ordering ("it must be greater than the creation frequency") admits
+            // a creation frequency of at most 6. The member's own ceiling of 7
+            // days, which only a request also stating a longer retention period
+            // can reach, belongs to the cadence pair's rule — `interval_validation.rs`
+            // and `effective_cadence_ordering.rs`.
+            case: "CreateInterval at 6 days, the most the retention default leaves room for",
             member: "CreateInterval",
-            value: json!(7),
+            value: json!(6),
             in_request_body: true,
             reported_verbatim: true,
         },

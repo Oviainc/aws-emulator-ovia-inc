@@ -43,6 +43,11 @@ use crate::ops::types::{
     ConformancePackDetail, ConformancePackInputParameter, ConformancePackStatusDetail,
 };
 
+// `ConformancePackEvaluationResult` is named separately for the same reason as the
+// shapes above: it is how ONE evaluation result recorded for a rule a conformance pack
+// deployed is REPORTED in that pack's compliance details.
+use crate::ops::types::ConformancePackEvaluationResult;
+
 // `AggregateResourceIdentifier` and `ConfigurationItem` are named separately for the
 // same reason: the first is how an aggregate read path NAMES one resource, the second
 // is the FULL configuration item the single-resource aggregate read reports.
@@ -650,18 +655,17 @@ pub fn no_such_conformance_pack_message(missing: &[String]) -> String {
 }
 
 /// How Config words `NoSuchConfigRuleInConformancePackException` ("Config rule that you
-/// passed in the filter does not exist") for the `missing` rule names a filter carried
-/// that the pack holds no rule for.
+/// passed in the filter does not exist") for a filter that named a rule the pack holds
+/// none of.
 ///
-/// The message is BUILT FROM THE REQUEST, and worded as the pack-shaped refusal beside
-/// it ([`no_such_conformance_pack_message`]) is: the fixed sentence names the class of
-/// failure, and the names it lists are the ones the caller sent that resolved to no rule
-/// of the pack, in the order they were sent.
-pub fn no_such_config_rule_in_conformance_pack_message(missing: &[String]) -> String {
-    format!(
-        "One or more config rules in the conformance pack are not valid. Name(s): {}",
-        missing.join(", ")
-    )
+/// The message is BUILT FROM THE REQUEST: the fixed sentence names the class of failure,
+/// and its two variable parts are the rule name the caller sent that resolved to no rule
+/// of the pack and the pack the caller asked about. It is about ONE rule, so a filter
+/// carrying several unknown names is reported for the first of them the request carried —
+/// ONE template for every operation whose filter takes rule names of a pack, so the two
+/// compliance reads cannot word the one refusal two ways.
+pub fn no_such_config_rule_in_conformance_pack_message(rule_name: &str, pack_name: &str) -> String {
+    format!("No rule with name {rule_name} exists in conformance pack {pack_name}")
 }
 
 /// The most rule names one `ConformancePackComplianceFilters` may name
@@ -676,6 +680,29 @@ pub const CONFORMANCE_PACK_COMPLIANCE_FILTER_NAMES_MAX: usize = 10;
 /// `ConformancePackRuleComplianceList` one response carries, so it is the largest page
 /// the model lets one response carry.
 pub const DESCRIBE_CONFORMANCE_PACK_COMPLIANCE_PAGE_SIZE: usize = 1000;
+
+/// How many evaluation results one `GetConformancePackComplianceDetails` page carries
+/// when the request does not ask for a page size
+/// (`GetConformancePackComplianceDetailsRequest$Limit`: "The maximum number of
+/// evaluation results returned on each page. If you do no specify a number, Config uses
+/// the default. The default is 100"), which is also that member's own maximum (range
+/// 0..100) and the length maximum of the `ConformancePackRuleEvaluationResultsList` one
+/// response carries.
+pub const GET_CONFORMANCE_PACK_COMPLIANCE_DETAILS_PAGE_SIZE: usize = 100;
+
+/// Every `ComplianceType` a conformance pack's EVALUATION filter may name
+/// (`ConformancePackEvaluationFilters$ComplianceType`: "The allowed values are COMPLIANT
+/// and NON_COMPLIANT. INSUFFICIENT_DATA is not supported").
+///
+/// It is narrower than the values such a report can CARRY
+/// (`ConformancePackComplianceType`, which `INSUFFICIENT_DATA` belongs to), so a filter
+/// naming one outside it is a bad parameter rather than a filter matching nothing.
+pub const CONFORMANCE_PACK_EVALUATION_FILTER_COMPLIANCE_TYPES: [&str; 2] =
+    [COMPLIANCE_TYPE_COMPLIANT, COMPLIANCE_TYPE_NON_COMPLIANT];
+
+/// The most resource ids one `ConformancePackEvaluationFilters` may name
+/// (`ConformancePackComplianceResourceIds`, `@length(min: 0, max: 5)`).
+pub const CONFORMANCE_PACK_EVALUATION_FILTER_RESOURCE_IDS_MAX: usize = 5;
 
 /// The third-party cloud service provider a connector connects to
 /// (`com.amazonaws.configservice#Provider`, whose only published value is `AZURE`;
@@ -1549,6 +1576,36 @@ impl EvaluationResultEntry {
             account_id: Some(account_id.to_string()),
             aws_region: Some(region.to_string()),
         }
+    }
+
+    /// The modelled `ConformancePackEvaluationResult` a CONFORMANCE PACK's compliance
+    /// details report this result as: the same verdict, the same identifier and the same
+    /// timestamps the rule's own evaluation-details read reports
+    /// ([`Self::to_shape`]), under the name the pack's deployment gave the rule.
+    ///
+    /// `None` when the result's `ComplianceType` is not one a conformance pack's
+    /// compliance holds (`ConformancePackEvaluationResult$ComplianceType` targets
+    /// `ConformancePackComplianceType`, whose values are `COMPLIANT`, `NON_COMPLIANT`
+    /// and `INSUFFICIENT_DATA`), so a result recorded with a value outside that set has
+    /// nothing this report can carry and is left out rather than reported as another
+    /// type.
+    pub fn to_conformance_pack_shape(
+        &self,
+        config_rule_name: &str,
+    ) -> Option<ConformancePackEvaluationResult> {
+        if !crate::ops::types::CONFORMANCE_PACK_COMPLIANCE_TYPE_VALUES
+            .contains(&self.compliance_type.as_str())
+        {
+            return None;
+        }
+        let reported = self.to_shape(config_rule_name);
+        Some(ConformancePackEvaluationResult {
+            compliance_type: self.compliance_type.clone(),
+            evaluation_result_identifier: reported.evaluation_result_identifier?,
+            config_rule_invoked_time: timestamp(self.config_rule_invoked_time),
+            result_recorded_time: timestamp(self.result_recorded_time),
+            annotation: self.annotation.clone(),
+        })
     }
 }
 
@@ -5348,6 +5405,36 @@ pub fn decode_resource_compliance_detail_token(
 ) -> Option<ResourceComplianceDetailKey> {
     let mut fields = decode_length_prefixed_token(token, 2)?.into_iter();
     Some((fields.next()?, fields.next()?))
+}
+
+/// What identifies one evaluation result within a CONFORMANCE PACK's compliance
+/// details: the Config rule the pack deployed that recorded it, and that result's own
+/// identity within the rule ([`EvaluationResultKey`]).
+///
+/// A pack's details span every rule it deployed, so the rule name is part of the key;
+/// ordering the pair gives the report a stable total order a page can resume at.
+pub type ConformancePackComplianceDetailKey = (String, EvaluationResultKey);
+
+/// Encode the [`ConformancePackComplianceDetailKey`] a
+/// `GetConformancePackComplianceDetails` page should resume at as an opaque `NextToken`.
+pub fn encode_conformance_pack_compliance_detail_token(
+    key: &ConformancePackComplianceDetailKey,
+) -> String {
+    let (rule_name, (resource_type, resource_id, evaluation_mode)) = key;
+    encode_length_prefixed_token(&[rule_name, resource_type, resource_id, evaluation_mode])
+}
+
+/// The [`ConformancePackComplianceDetailKey`] a `NextToken` resumes at, or `None` when
+/// the token is malformed — i.e. not something
+/// [`encode_conformance_pack_compliance_detail_token`] produced.
+pub fn decode_conformance_pack_compliance_detail_token(
+    token: &str,
+) -> Option<ConformancePackComplianceDetailKey> {
+    let mut fields = decode_length_prefixed_token(token, 4)?.into_iter();
+    Some((
+        fields.next()?,
+        (fields.next()?, fields.next()?, fields.next()?),
+    ))
 }
 
 /// What identifies one resource in a report ABOUT resources: the
