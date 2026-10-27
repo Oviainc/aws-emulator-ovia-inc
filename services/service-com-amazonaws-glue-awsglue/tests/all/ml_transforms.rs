@@ -14,6 +14,10 @@
 //! reports each selected transform's id, narrowed further to the transforms carrying every
 //! pair its `Tags` filter names.
 //!
+//! A create's `Name` has to be FREE: a create naming a transform this account already
+//! holds is refused with the operation's modelled `AlreadyExistsException` — "a resource
+//! to be created or added already exists" — whatever definition it carries.
+//!
 //! Every call goes over the wire through the shared [`crate::wire`] harness, so what is
 //! asserted is HTTP behaviour and not a direct call into a handler.
 //!
@@ -32,15 +36,15 @@ use service_com_amazonaws_glue_awsglue::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{assert_echoed, call, emulator, emulator_on, error_code, ok};
+use crate::wire::{assert_echoed, call, emulator, emulator_on, error_code, error_message, ok};
 
 /// The IAM role every create below names: "The name or Amazon Resource Name (ARN) of the
 /// IAM role with the required permissions" (`CreateMLTransform$Role`).
-const ROLE: &str = "arn:aws:iam::000000000000:role/glue-ml-transform-role";
+pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/glue-ml-transform-role";
 
 /// The only `TransformType` the model publishes (`smithy_query shape=TransformType`,
 /// values `FIND_MATCHES`), so every create's `Parameters` names it.
-const TRANSFORM_TYPE: &str = "FIND_MATCHES";
+pub(crate) const TRANSFORM_TYPE: &str = "FIND_MATCHES";
 
 /// Every `TransformSortColumnType` the model publishes. Source: the generated
 /// `TRANSFORM_SORT_COLUMN_TYPE_VALUES` (`smithy_query shape=TransformSortColumnType`).
@@ -80,7 +84,7 @@ type SchemaRow<'a> = (&'a str, Value, &'a [(&'a str, &'a str)]);
 type CreatedRow<'a> = (&'a str, &'a str, String, &'a Value);
 
 /// A create body naming the four `@required` members, plus whatever `extra` adds.
-fn create_body(name: &str, extra: Value) -> Value {
+pub(crate) fn create_body(name: &str, extra: Value) -> Value {
     let mut body = json!({
         "Name": name,
         "InputRecordTables": [],
@@ -99,7 +103,11 @@ fn create_body(name: &str, extra: Value) -> Value {
 }
 
 /// Register one transform and answer the `TransformId` the create reports.
-async fn given_transform(router: &MultiServiceRouter, name: &str, extra: Value) -> String {
+pub(crate) async fn given_transform(
+    router: &MultiServiceRouter,
+    name: &str,
+    extra: Value,
+) -> String {
     let created = ok(router, "CreateMLTransform", &create_body(name, extra)).await;
     created
         .get("TransformId")
@@ -111,7 +119,7 @@ async fn given_transform(router: &MultiServiceRouter, name: &str, extra: Value) 
 /// Store `database` holding `table` with the columns `columns` names (name and type), so a
 /// transform over that table has a catalog schema to report. A database several rows share
 /// is created once.
-async fn store_table(
+pub(crate) async fn store_table(
     router: &MultiServiceRouter,
     database: &str,
     table: &str,
@@ -149,7 +157,7 @@ async fn store_table(
 }
 
 /// The `Transforms` of one answer, in the order the service returned them.
-fn listed(page: &Value) -> Vec<Value> {
+pub(crate) fn listed(page: &Value) -> Vec<Value> {
     page["Transforms"]
         .as_array()
         .unwrap_or_else(|| panic!("GetMLTransforms must report a Transforms list, got {page}"))
@@ -463,33 +471,231 @@ async fn a_listed_transform_carries_the_create_and_the_documented_defaults() {
     }
 }
 
+/// One row of the duplicate-name table: the case, the members the FIRST create sends
+/// beside the required ones, and the members the second create under that same name sends.
+type RepeatRow<'a> = (&'a str, Value, Value);
+
+/// `base` with `member` set to `value`, so a row states only how it differs from the
+/// definition the first create stored.
+fn with(base: &Value, member: &str, value: Value) -> Value {
+    let mut extra = base.clone();
+    extra[member] = value;
+    extra
+}
+
+/// `base` with `member` left out altogether.
+fn without(base: &Value, member: &str) -> Value {
+    let mut extra = base.clone();
+    extra
+        .as_object_mut()
+        .unwrap_or_else(|| panic!("the definition is an object, got {base}"))
+        .remove(member);
+    extra
+}
+
+/// Every member a create can set beside the four `@required` ones, so a row below can
+/// differ from it in any one of them.
+fn full_definition() -> Value {
+    json!({
+        "Description": "dedupes the customer records",
+        "GlueVersion": "3.0",
+        "Timeout": 30,
+        "MaxRetries": 1,
+        "MaxCapacity": 12.0,
+        "Tags": { "team": "data" },
+        "InputRecordTables": [{ "DatabaseName": "marketing", "TableName": "contacts" }],
+        "TransformEncryption": {
+            "MlUserDataEncryption": {
+                "MlUserDataEncryptionMode": "SSE-KMS",
+                "KmsKeyId": "alias/glue-ml",
+            },
+            "TaskRunSecurityConfigurationName": "ml-security",
+        },
+    })
+}
+
 #[tokio::test]
-async fn a_name_addresses_no_transform_so_two_creates_under_one_name_are_two_transforms() {
+async fn a_create_naming_a_stored_transform_is_refused_because_that_resource_exists() {
+    let definition = full_definition();
+    // The second create is refused whatever it describes, so the rows span the definition
+    // it carries: the stored one repeated exactly, the bare required members, and one row
+    // per member a create can set — the refusal is keyed to the NAME and to no member of
+    // the definition.
+    let rows: &[RepeatRow<'_>] = &[
+        (
+            "the stored definition repeated exactly",
+            definition.clone(),
+            definition.clone(),
+        ),
+        (
+            "the required members alone, twice",
+            Value::Null,
+            Value::Null,
+        ),
+        (
+            "the documented defaults spelled out",
+            Value::Null,
+            json!({
+                "GlueVersion": DEFAULT_ML_TRANSFORM_GLUE_VERSION,
+                "MaxCapacity": DEFAULT_ML_TRANSFORM_DPUS,
+                "Timeout": DEFAULT_ML_TRANSFORM_TIMEOUT_MINUTES,
+            }),
+        ),
+        (
+            "a different description",
+            definition.clone(),
+            with(&definition, "Description", json!("something else")),
+        ),
+        (
+            "the description dropped",
+            definition.clone(),
+            without(&definition, "Description"),
+        ),
+        (
+            "a different Glue version",
+            definition.clone(),
+            with(&definition, "GlueVersion", json!("4.0")),
+        ),
+        (
+            "a different timeout",
+            definition.clone(),
+            with(&definition, "Timeout", json!(45)),
+        ),
+        (
+            "a different retry count",
+            definition.clone(),
+            with(&definition, "MaxRetries", json!(2)),
+        ),
+        (
+            "a different capacity",
+            definition.clone(),
+            with(&definition, "MaxCapacity", json!(24.0)),
+        ),
+        (
+            "a worker configuration instead of a capacity",
+            definition.clone(),
+            with(
+                &without(&definition, "MaxCapacity"),
+                "WorkerType",
+                json!("G.1X"),
+            ),
+        ),
+        (
+            "a different tag set",
+            definition.clone(),
+            with(&definition, "Tags", json!({ "team": "ops" })),
+        ),
+        (
+            "a different input table",
+            definition.clone(),
+            with(
+                &definition,
+                "InputRecordTables",
+                json!([{ "DatabaseName": "marketing", "TableName": "leads" }]),
+            ),
+        ),
+        (
+            "different algorithm parameters",
+            definition.clone(),
+            with(
+                &definition,
+                "Parameters",
+                json!({
+                    "TransformType": TRANSFORM_TYPE,
+                    "FindMatchesParameters": { "PrimaryKeyColumnName": "email" },
+                }),
+            ),
+        ),
+        (
+            "different encryption settings",
+            definition.clone(),
+            with(
+                &definition,
+                "TransformEncryption",
+                json!({ "TaskRunSecurityConfigurationName": "other-security" }),
+            ),
+        ),
+        (
+            "a different role",
+            definition.clone(),
+            with(
+                &definition,
+                "Role",
+                json!("arn:aws:iam::000000000000:role/other-role"),
+            ),
+        ),
+    ];
+
+    for (case, first_extra, second_extra) in rows {
+        let router = emulator();
+        store_table(
+            &router,
+            "marketing",
+            "contacts",
+            &[("email", "string"), ("zip", "int")],
+        )
+        .await;
+        // The name differs per row, so the refusal's wording is read off the REQUEST
+        // rather than being one sentence that happens to fit one name.
+        let name = format!("taken-{}", case.replace(' ', "-"));
+        let first = given_transform(&router, &name, first_extra.clone()).await;
+
+        // "A resource to be created or added already exists" (`AlreadyExistsException`):
+        // the `Name` a create chooses has to be free.
+        let (status, body) = call(
+            &router,
+            "CreateMLTransform",
+            &create_body(&name, second_extra.clone()),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the modelled AlreadyExistsException's 400, got {status} \
+             with {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("AlreadyExistsException"),
+            "case {case:?}: expected AlreadyExistsException, got {}",
+            error_code(&body)
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("Transform with name {name} already exists"),
+            "case {case:?}: expected the refusal to name the name the create asked for, \
+             got {body}"
+        );
+
+        // A refused create stored nothing and minted nothing: the transform the first
+        // create stored is still the only one this account holds.
+        let seen = walk(&router, case, &json!({}), None, 2).await;
+        assert_eq!(
+            ids(&seen),
+            vec![first.clone()],
+            "case {case:?}: a refused create must store no transform, got {seen:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_name_per_transform_leaves_every_other_name_free() {
     let router = emulator();
-    // "Names are not guaranteed unique and can be changed at any time"
-    // (`MLTransform$Name`), so a second create under a stored name is accepted and the two
-    // records are told apart by the ids the creates minted.
-    let first = given_transform(&router, "shared-name", Value::Null).await;
-    let second = given_transform(
-        &router,
-        "shared-name",
-        json!({ "Description": "the second one" }),
-    )
-    .await;
+    // Only the name a stored transform carries is taken, so a create under a free name is
+    // a new transform even where every other member repeats a stored one.
+    let first = given_transform(&router, "first-name", Value::Null).await;
+    let second = given_transform(&router, "second-name", Value::Null).await;
     assert_ne!(
         first, second,
-        "case two creates under one name: each create must mint its own TransformId, got \
-         {first} twice"
+        "case two names: each create must mint its own TransformId, got {first} twice"
     );
 
-    let seen = walk(&router, "two creates under one name", &json!({}), None, 2).await;
+    let seen = walk(&router, "two names", &json!({}), None, 2).await;
     let mut listed_ids = ids(&seen);
     listed_ids.sort();
     let mut expected = vec![first, second];
     expected.sort();
     assert_eq!(
         listed_ids, expected,
-        "case two creates under one name: both transforms must be listed, got {seen:?}"
+        "case two names: both transforms must be listed, got {seen:?}"
     );
 }
 

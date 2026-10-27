@@ -156,9 +156,11 @@
 //! ([`ComAmazonawsGlueAwsglueState::ml_transforms`]), because every operation that
 //! addresses one takes that id alone and no `CatalogId`, and a transform's NAME is no
 //! address at all: "Names are not guaranteed unique and can be changed at any time"
-//! (`MLTransform$Name`). The catalog TABLES a transform reads are recorded on the
-//! transform as the create named them ([`MlTransformEntry::input_record_tables`]), which is
-//! where its reported schema is taken from.
+//! (`MLTransform$Name`). That name is still the one the CREATE's client chooses, and a
+//! create has to choose a free one ([`ComAmazonawsGlueAwsglueState::ml_transform_by_name`]).
+//! The catalog TABLES a transform reads are recorded
+//! on the transform as the create named them ([`MlTransformEntry::input_record_tables`]),
+//! which is where its reported schema is taken from.
 //!
 //! Database and table names are folded to lowercase on the way in — the model says
 //! so for both `DatabaseInput$Name` ("For Hive compatibility, this is folded to
@@ -1614,6 +1616,19 @@ impl ComAmazonawsGlueAwsglueState {
     /// [`MAX_ML_TRANSFORMS`].
     pub fn can_store_ml_transform(&self) -> bool {
         self.ml_transforms.len() < MAX_ML_TRANSFORMS
+    }
+
+    /// The machine learning transform stored under `name`, if this account holds one.
+    ///
+    /// A `Name` is not a transform's ADDRESS — every operation that addresses one takes
+    /// the minted `TransformId` — but it IS the name the client chooses at create time, so
+    /// a create resolves it to refuse a name this account already holds a transform under.
+    /// At most one transform is ever stored under one name, because such a create is
+    /// refused. Bounded by [`MAX_ML_TRANSFORMS`].
+    pub fn ml_transform_by_name(&self, name: &str) -> Option<&MlTransformEntry> {
+        self.ml_transforms
+            .values()
+            .find(|transform| transform.name == name)
     }
 
     /// Every stored machine learning transform `filter` admits, in the order `sort` names,
@@ -6711,6 +6726,25 @@ pub mod messages {
     /// whole address of a run.
     pub fn data_quality_rule_recommendation_run_not_found(run_id: &str) -> String {
         format!("Data quality rule recommendation run with id {run_id} does not exist")
+    }
+
+    /// A machine learning transform lookup (`GetMLTransform`) for a `TransformId` no
+    /// transform in this account has. NOT recorded: the sentence follows the per-resource
+    /// template of [`column_statistics_task_run_not_found`], built from the requested id,
+    /// which is the whole address of a transform — a `Name` is not, because "Names are not
+    /// guaranteed unique and can be changed at any time" (`MLTransform$Name`).
+    pub fn ml_transform_not_found(transform_id: &str) -> String {
+        format!("Machine learning transform with id {transform_id} does not exist")
+    }
+
+    /// `CreateMLTransform` for a `Name` this account already holds a transform under.
+    ///
+    /// RECORDED template: the sentence is fixed and its one variable part is the `Name` the
+    /// request itself sent, which is the name the create asked to take. The create is
+    /// refused with the operation's modelled `AlreadyExistsException`, "a resource to be
+    /// created or added already exists".
+    pub fn ml_transform_already_exists(name: &str) -> String {
+        format!("Transform with name {name} already exists")
     }
 
     /// `StartDataQualityRuleRecommendationRun` for a data source whose recommendation run
