@@ -13,7 +13,7 @@
 //! which state the alarm moved to, and the form and size of the state reason data), so no
 //! assertion is keyed to one recorded request.
 
-use crate::harness::{build_router, ok};
+use crate::harness::{build_router, ok, same_json_value};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -109,15 +109,6 @@ const CONFIGURATION_MEMBERS: &[(&str, &str)] = &[
     ("ThresholdMetricId", "thresholdMetricId"),
 ];
 
-/// Whether a request's value and the value a document recorded for it are the same, comparing
-/// numbers by value so an integral double and an integer are not reported as a difference.
-fn same_value(asked: &Value, recorded: &Value) -> bool {
-    match (asked.as_f64(), recorded.as_f64()) {
-        (Some(asked), Some(recorded)) => (asked - recorded).abs() <= f64::EPSILON,
-        _ => asked == recorded,
-    }
-}
-
 /// Assert that `recorded` carries every configuration member `request` named.
 fn assert_records_configuration(case: &str, request: &Value, recorded: &Value) {
     for (member, name) in CONFIGURATION_MEMBERS {
@@ -126,7 +117,7 @@ fn assert_records_configuration(case: &str, request: &Value, recorded: &Value) {
         };
         let got = recorded.get(name);
         assert!(
-            got.is_some_and(|got| same_value(asked, got)),
+            got.is_some_and(|got| same_json_value(asked, got)),
             "case {case:?}: {member} must be recorded as {name}={asked}, got {got:?} in {recorded}"
         );
     }

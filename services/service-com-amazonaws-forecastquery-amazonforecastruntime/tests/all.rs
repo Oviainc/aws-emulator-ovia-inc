@@ -19,6 +19,8 @@ mod date_layout_walk;
 mod forecast_not_active;
 #[path = "all/forecastquery.rs"]
 mod forecastquery;
+#[path = "all/invalid_arn_echo_ceiling.rs"]
+mod invalid_arn_echo_ceiling;
 #[path = "all/invalid_arn_message.rs"]
 mod invalid_arn_message;
 #[path = "all/resource_not_found_message.rs"]

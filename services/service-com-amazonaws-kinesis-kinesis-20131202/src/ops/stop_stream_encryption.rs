@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopStreamEncryption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopStreamEncryption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopStreamEncryption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns server-side encryption OFF on the stream the request addresses: the stream stops
+//! naming a KMS key and reports `EncryptionType` `NONE`, going back to `ACTIVE` once the
+//! asynchronous update falls due. A stream nothing has encrypted has no encryption to
+//! disable, so such a request is REFUSED and the stream is left exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -130,7 +126,14 @@ impl ::aws_smithy_schema::serde::SerializableStruct for StopStreamEncryptionOutp
 // here — hence the `StopStreamEncryptionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#StopStreamEncryption")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#StopStreamEncryption",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models it
+    // ("The processing of the request failed because of an unknown error, exception, or
+    // failure"), the operation shape does not list it, and it is the only honest answer
+    // for a service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum StopStreamEncryptionErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -138,6 +141,7 @@ pub enum StopStreamEncryptionErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -163,6 +167,150 @@ impl From<StopStreamEncryptionErrorModeled> for StopStreamEncryptionError {
 /// concrete engine where it mounts the service, not here.
 pub struct StopStreamEncryption<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the stream lives in, and how the call
+/// ended. No stream name and no ARN: a log sink needs neither to attribute the change.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "StopStreamEncryption",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// Refuse the request with the error this operation models for a parameter that "exceeds
+/// its restrictions, is not supported, or can't be used".
+fn invalid_argument(message: String) -> StopStreamEncryptionError {
+    StopStreamEncryptionErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The identifier the request addressed the stream by, which is what a refusal names.
+/// `StreamId` is documented "Not Implemented. Reserved for future use", so no stream
+/// carries one and a request naming only that member names no stream.
+fn stream_identifier(input: &StopStreamEncryptionInput) -> &str {
+    input
+        .stream_name
+        .as_deref()
+        .or(input.stream_arn.as_deref())
+        .unwrap_or_default()
+}
+
+/// The modelled refusal for a request whose `StreamName` / `StreamARN` pair names no stream
+/// of this account and region, worded exactly as the reads word it: one rule, one phrasing,
+/// for every operation that addresses a stream.
+fn lookup_refusal(
+    failure: crate::state::StreamLookupFailure,
+    identifier: &str,
+) -> StopStreamEncryptionError {
+    match failure {
+        crate::state::StreamLookupFailure::Unspecified => {
+            invalid_argument(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::Mismatch => {
+            invalid_argument(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string())
+        }
+        crate::state::StreamLookupFailure::NotFound => {
+            StopStreamEncryptionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::stream_not_found_message(identifier)),
+            })
+            .into()
+        }
+    }
+}
+
+/// Turn server-side encryption off on the stream the request names, or answer the modelled
+/// refusal that stands in the way. The whole write lives here so the caller holds the
+/// store's lock for exactly this long, which is what serialises two overlapping calls: the
+/// configuration the later one stores is the one that stands.
+fn stop_stream_encryption(
+    store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &StopStreamEncryptionInput,
+) -> Result<(), StopStreamEncryptionError> {
+    // "The encryption type. The only valid value is KMS"
+    // (`StopStreamEncryptionInput$EncryptionType`): `NONE` is a value the enum admits on
+    // the wire but not one this operation serves, so it is refused BEFORE any stream is
+    // read.
+    let encryption_type = input.encryption_type.as_str();
+    if encryption_type != crate::state::ENCRYPTION_TYPE_KMS {
+        return Err(invalid_argument(
+            crate::state::encryption_type_unsupported_message(encryption_type),
+        ));
+    }
+
+    let identifier = stream_identifier(input).to_string();
+    let stream = store
+        .resolve_stream_mut(
+            now,
+            region,
+            input.stream_name.as_deref(),
+            input.stream_arn.as_deref(),
+        )
+        .map_err(|failure| lookup_refusal(failure, &identifier))?;
+    let named = if identifier.is_empty() {
+        stream.name.clone()
+    } else {
+        identifier
+    };
+
+    // "The resource is not available for this operation. For successful operation, the
+    // resource must be in the ACTIVE state" (`ResourceInUseException`) — and this operation
+    // publishes which streams that leaves out: "You can continue to read and write data to
+    // your stream while its status is UPDATING", so a stream whose encryption change is
+    // still in flight is still serving, and a change that arrives then is served too (the
+    // configuration it stores is the one that stands). What is refused is a stream that is
+    // not serving at all: one whose create has not fallen due yet, or whose removal has
+    // been accepted.
+    let status = stream.status(now);
+    if !matches!(
+        status,
+        crate::state::STREAM_ACTIVE | crate::state::STREAM_UPDATING
+    ) {
+        return Err(StopStreamEncryptionErrorModeled::ResourceInUseException(
+            ResourceInUseException {
+                message: Some(crate::state::stream_not_active_message(&named, status)),
+            },
+        )
+        .into());
+    }
+
+    // This operation DISABLES encryption, so there has to be encryption on the stream for
+    // it to disable: a stream reporting `EncryptionType` `NONE` is refused with the
+    // modelled client error and nothing about it changes — no key is cleared and no update
+    // is armed.
+    if !stream.is_encrypted() {
+        return Err(invalid_argument(
+            crate::state::UNENCRYPTED_STREAM_MESSAGE.to_string(),
+        ));
+    }
+
+    // "You can successfully disable server-side encryption 25 times in a rolling 24-hour
+    // period": a stream that has used up the window's disables keeps the encryption it has.
+    let stopped = stream.encryption_stops_in_window(now);
+    if stopped >= crate::state::MAX_ENCRYPTION_CHANGES_PER_WINDOW {
+        return Err(StopStreamEncryptionErrorModeled::LimitExceededException(
+            LimitExceededException {
+                message: Some(crate::state::encryption_change_limit_message(
+                    &named, stopped,
+                )),
+            },
+        )
+        .into());
+    }
+
+    // The stream keeps its shard map and the records in it; what changes is that the
+    // service no longer encrypts what is written to it from here on.
+    stream.stop_encryption(now);
+    Ok(())
 }
 
 impl<Eng> StopStreamEncryption<Eng> {
@@ -191,18 +339,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopStreamEncryption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopStreamEncryptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopStreamEncryption"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region whose streams this request
+        // addresses, since a stream name "is also scoped by Amazon Web Services Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            StopStreamEncryptionError::from(
+                StopStreamEncryptionErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the stream store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let outcome = {
+            let mut store = state.lock();
+            stop_stream_encryption(&mut store, &region, now, &input)
+        };
+        audit(
+            &akid,
+            &region,
+            if outcome.is_ok() { "stopped" } else { "refused" },
+        );
+        outcome?;
+
+        // `StopStreamEncryption` models no output members: the encryption configuration it
+        // cleared is what `DescribeStreamSummary` and `DescribeStream` report for the
+        // stream, and the records written to it from here on carry that type.
+        Ok(StopStreamEncryptionOutput)
     }
 }

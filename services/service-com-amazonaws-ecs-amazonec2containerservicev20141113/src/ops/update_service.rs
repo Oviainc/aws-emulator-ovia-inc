@@ -904,7 +904,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Scaling the service is not one: the tasks change but the service revision the
         // service runs does not.
         if redeploy {
-            guard.start_service_deployment(&key, &region, updated_at);
+            guard.start_service_deployment(&key, &region, updated_at, now);
         }
 
         let stored = guard

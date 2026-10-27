@@ -8,7 +8,9 @@
 //! that resource, a wait condition the operation is waiting AT proceeds once it has the
 //! number of signals its `Count` asks for ([`crate::state::wait_conditions`]), and a
 //! `FAILURE` signal fails the operation at once (a failed create then rolls back, as
-//! `CreateStack`'s own `OnFailure` default says). Every other signal is accepted and
+//! `CreateStack`'s own `OnFailure` default says, and a failed update is rolled back to the
+//! previous stack configuration, as `UpdateStack`'s own failure path does). Every other
+//! signal is accepted and
 //! recorded and changes nothing; only a `StackName` that names no live stack in the
 //! request's Region is refused, with `ValidationError`.
 //!
@@ -300,13 +302,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             status::CREATE_FAILED
                         };
                         stack.fail_transition(now, failed_status, reason.clone());
-                        // A failed CREATE is rolled back unless the request that started it
-                        // asked for the failed state to be kept ("DO_NOTHING: Do nothing if
-                        // stack creation fails", which `DisableRollback` also spells), and
-                        // the rollback removes what the create had already made. A failed
-                        // UPDATE stops at its failed status, as this service's own update
-                        // does.
-                        if updating || stack.disable_rollback {
+                        // A failed operation is rolled back unless the request that started
+                        // it asked for the failed state to be kept ("DO_NOTHING: Do nothing
+                        // if stack creation fails", which `DisableRollback` also spells): a
+                        // failed CREATE's rollback removes what the create had already made,
+                        // and a failed UPDATE's puts the previous stack configuration back
+                        // in the services that own the resources it changed
+                        // ([`crate::state::settle_due_rollbacks`], driven below).
+                        if updating {
+                            stack.begin_owed_update_rollback(now, reason);
+                            (stack.stack_id.clone(), None)
+                        } else if stack.disable_rollback {
                             (stack.stack_id.clone(), None)
                         } else {
                             stack.begin_rollback(now, reason);
@@ -336,6 +342,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
+
+        // A FAILURE signal that failed an UPDATE owes the rollback that update's handler
+        // planned: the previous configuration goes back in the services that own the
+        // resources, with the store unlocked, exactly as the create's unwind above runs.
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
 
         Ok(SignalResourceOutput)
     }

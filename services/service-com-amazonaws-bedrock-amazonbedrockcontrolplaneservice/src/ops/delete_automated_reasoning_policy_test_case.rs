@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAutomatedReasoningPolicyTestCase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAutomatedReasoningPolicyTestCase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAutomatedReasoningPolicyTestCase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one stored test of an Automated Reasoning policy, addressed by the
+//! `(policyArn, testCaseId)` pair every read of a test is addressed by, once
+//! `lastUpdatedAt` names the write that test currently holds.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAutomatedReasoningPolicyTestCase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAutomatedReasoningPolicyTestCaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAutomatedReasoningPolicyTestCase"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_error());
+        };
+        let mut store = state.lock();
+
+        // The ARN is matched as the caller spelled it, exactly as a read of the policy
+        // matches it, so an ARN of another region — and a versioned ARN of a version
+        // nothing has minted — names no policy this account holds, and a test hangs off
+        // the policy it was created under.
+        if store.automated_reasoning_policy(&input.policy_arn).is_none() {
+            return Err(not_found(format!(
+                "no automated reasoning policy {} exists in this account",
+                input.policy_arn
+            )));
+        }
+
+        // "This operation is idempotent; if you delete a test more than once, each call
+        // succeeds": a pair this policy holds no test under is ALREADY in the state this
+        // call asks for, and there is no stored write left for the token to be held
+        // against — so a repeated delete succeeds rather than reporting the test missing.
+        let Some(stored) =
+            store.automated_reasoning_policy_test_case(&input.policy_arn, &input.test_case_id)
+        else {
+            return Ok(DeleteAutomatedReasoningPolicyTestCaseOutput {});
+        };
+
+        // `lastUpdatedAt` is the concurrency token the member documents: the delete goes
+        // through only while it names the write the test currently holds, so a delete
+        // issued against a test somebody has written since is refused instead of dropping
+        // that write with the test.
+        let held = crate::state::date_time(stored.updated_at);
+        if epoch_millis(&input.last_updated_at) != epoch_millis(&held) {
+            return Err(conflict(format!(
+                "test {} of automated reasoning policy {} was last updated at {}, not at \
+                 {}; read the test again and retry the delete with the updatedAt that read \
+                 reports",
+                input.test_case_id,
+                input.policy_arn,
+                rendered(&held),
+                rendered(&input.last_updated_at)
+            )));
+        }
+
+        if store
+            .automated_reasoning_policy_test_cases
+            .remove(&(input.policy_arn.clone(), input.test_case_id.clone()))
+            .is_none()
+        {
+            return Err(server_error());
+        }
+        // No replayed idempotency token may hand a later caller the test that is now gone,
+        // and a run of that test is addressed and reported THROUGH it, so nothing could
+        // read a run that outlived it either: both go with the test rather than staying
+        // behind as state no caller can reach.
+        store
+            .automated_reasoning_policy_test_case_create_tokens
+            .retain(|(policy_arn, _), minted| {
+                !(*policy_arn == input.policy_arn && *minted == input.test_case_id)
+            });
+        store
+            .automated_reasoning_policy_test_runs
+            .retain(|(policy_arn, _, test_case_id), _| {
+                !(*policy_arn == input.policy_arn && *test_case_id == input.test_case_id)
+            });
+
+        Ok(DeleteAutomatedReasoningPolicyTestCaseOutput {})
     }
+}
+
+/// The instant a wire timestamp names, in whole milliseconds since the epoch.
+///
+/// The token is compared at this resolution, and not finer, because it is a value the
+/// caller echoes back from a read of the same test: a `date-time` instant travels through
+/// clients that carry milliseconds, so holding the echoed value to the nanosecond the store
+/// minted would refuse a caller naming the very write it just read. A millisecond still
+/// distinguishes two writes, which is what the token is for.
+fn epoch_millis(at: &::aws_smithy_types::DateTime) -> i128 {
+    i128::from(at.secs()) * 1_000 + i128::from(at.subsec_nanos() / 1_000_000)
+}
+
+/// A wire timestamp as the `date-time` text this service reports it as, so a refusal names
+/// an instant in the spelling the caller sent and read.
+fn rendered(at: &::aws_smithy_types::DateTime) -> String {
+    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| at.as_secs_f64().to_string())
+}
+
+/// The modelled 404 this operation answers for a `policyArn` this account holds no policy
+/// under — the test is stored UNDER a policy, so there is nothing there to delete from.
+fn not_found(message: String) -> DeleteAutomatedReasoningPolicyTestCaseError {
+    DeleteAutomatedReasoningPolicyTestCaseErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 400 this operation answers when `lastUpdatedAt` does not name the write the
+/// addressed test holds.
+fn conflict(message: String) -> DeleteAutomatedReasoningPolicyTestCaseError {
+    DeleteAutomatedReasoningPolicyTestCaseErrorModeled::ConflictException(ConflictException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 500 this operation answers when the engine carries no store for this
+/// service — never a fresh engine, which would drop the delete on return.
+fn server_error() -> DeleteAutomatedReasoningPolicyTestCaseError {
+    DeleteAutomatedReasoningPolicyTestCaseErrorModeled::InternalServerException(
+        InternalServerException {
+            message: Some(
+                "automated reasoning policy state is not available on this engine".to_string(),
+            ),
+        },
+    )
+    .into()
 }

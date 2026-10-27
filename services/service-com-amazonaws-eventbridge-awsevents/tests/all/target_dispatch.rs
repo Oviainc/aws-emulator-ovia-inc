@@ -54,12 +54,12 @@ const DEFINITION: &str = r#"{"StartAt":"Done","States":{"Done":{"Type":"Succeed"
 
 /// The emulator: EventBridge and every service a target of these tests lives in,
 /// on ONE engine — the shape `core/router/src/lib.rs` mounts them in.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -213,7 +213,7 @@ async fn query(
     (status, body)
 }
 
-async fn iam(
+pub(crate) async fn iam(
     emulator: &Emulator,
     action: &str,
     params: &[(&str, &str)],
@@ -230,7 +230,7 @@ async fn sns(
 }
 
 /// The text of the first `<tag>` of an XML body.
-fn xml_text(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml.find(&open)? + open.len();
@@ -239,7 +239,7 @@ fn xml_text(xml: &str, tag: &str) -> Option<String> {
 }
 
 /// A queue called `name`; answers its url and the ARN a rule names it by.
-async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
+pub(crate) async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
     let (status, body) = sqs(emulator, "CreateQueue", &json!({ "QueueName": name })).await;
     assert_eq!(status, 200, "case {name}: CreateQueue answered {status} {body}");
     let url = body["QueueUrl"]
@@ -264,7 +264,7 @@ async fn given_queue(emulator: &Emulator, name: &str) -> (String, String) {
 }
 
 /// Every message waiting on the queue at `url`, with its attributes.
-async fn drain(emulator: &Emulator, url: &str) -> Vec<Value> {
+pub(crate) async fn drain(emulator: &Emulator, url: &str) -> Vec<Value> {
     let (status, body) = sqs(
         emulator,
         "ReceiveMessage",
@@ -283,7 +283,7 @@ async fn drain(emulator: &Emulator, url: &str) -> Vec<Value> {
 }
 
 /// A rule called `name` matching the published event, carrying `targets`.
-async fn given_rule(emulator: &Emulator, name: &str, targets: Value) {
+pub(crate) async fn given_rule(emulator: &Emulator, name: &str, targets: Value) {
     let pattern = json!({ "source": [SOURCE], "detail-type": [DETAIL_TYPE] }).to_string();
     let (status, body) = events(
         emulator,
@@ -307,7 +307,7 @@ async fn given_rule(emulator: &Emulator, name: &str, targets: Value) {
 }
 
 /// Publish the one event every test below routes, and answer its `EventId`.
-async fn publish(emulator: &Emulator) -> String {
+pub(crate) async fn publish(emulator: &Emulator) -> String {
     let (status, body) = events(
         emulator,
         "PutEvents",
@@ -329,7 +329,7 @@ async fn publish(emulator: &Emulator) -> String {
 }
 
 /// What EventBridge recorded about each handover: `(rule, target arn, outcome)`.
-fn invocations(emulator: &Emulator) -> Vec<(String, String, InvocationOutcome)> {
+pub(crate) fn invocations(emulator: &Emulator) -> Vec<(String, String, InvocationOutcome)> {
     emulator
         .engine
         .state::<ComAmazonawsEventbridgeAwseventsState>()
@@ -513,7 +513,7 @@ async fn given_target(emulator: &Emulator, kind: Kind) -> (String, Observe) {
 }
 
 /// A state machine called `name`, answered with its ARN.
-async fn given_state_machine(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn given_state_machine(emulator: &Emulator, name: &str) -> String {
     let role = format!(
         "arn:aws:iam::{}:role/state-machine-execution",
         engine::emulator_account_id()
@@ -535,7 +535,7 @@ async fn given_state_machine(emulator: &Emulator, name: &str) -> String {
 }
 
 /// A trust policy with one statement, written as a client sends it.
-fn trust_policy(principal: &str) -> String {
+pub(crate) fn trust_policy(principal: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -678,8 +678,10 @@ async fn a_delivery_the_targets_role_bars_is_dead_lettered_and_counted() {
             role_exists: true,
             // The condition's own name, asserted as the LITERAL EventBridge
             // reports rather than through the constant the service words it
-            // with, so a change to that constant's value fails this row.
-            expected: Expected::Failed("NO_PERMISSIONS"),
+            // with, so a change to that constant's value fails this row. A role
+            // EventBridge cannot assume at all failed at the assume-role step,
+            // before any target API call was made.
+            expected: Expected::Failed("FAILED_TO_ASSUME_ROLE"),
         },
         RoleCase {
             case: "the role's policy names another action",
@@ -687,7 +689,7 @@ async fn a_delivery_the_targets_role_bars_is_dead_lettered_and_counted() {
             principal: SERVICE_PRINCIPAL,
             allowed: Some("sqs:SendMessage"),
             role_exists: true,
-            expected: Expected::Failed("ACCESS_DENIED"),
+            expected: Expected::Failed("NO_PERMISSIONS"),
         },
         RoleCase {
             case: "the role's policies state nothing about the call",
@@ -695,7 +697,7 @@ async fn a_delivery_the_targets_role_bars_is_dead_lettered_and_counted() {
             principal: SERVICE_PRINCIPAL,
             allowed: None,
             role_exists: true,
-            expected: Expected::Failed("ACCESS_DENIED"),
+            expected: Expected::Failed("NO_PERMISSIONS"),
         },
         RoleCase {
             // A queue target is invoked under the QUEUE's resource policy, not

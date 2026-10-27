@@ -7,7 +7,8 @@
 //! no workload carries — whatever its syntax — is `ResourceNotFoundException` (404).
 //! Every invariant of the resource is judged on the record the merge WOULD leave
 //! behind, so an update cannot reach a workload a create would have refused: a
-//! workload always names at least one Region.
+//! workload always names at least one Region, every Region it names is a Region, and
+//! its industry type is one the service publishes.
 //!
 //! ## Shape of an operation
 //!
@@ -230,6 +231,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(exception) = crate::state::unknown_aws_region_exception(regions) {
                 return Err(UpdateWorkloadErrorModeled::ValidationException(exception).into());
             }
+        }
+        // The same rule `CreateWorkload` applies: an `IndustryType` is one of the set the
+        // member's documentation publishes, so an update cannot leave the stored workload
+        // carrying one the service does not publish.
+        if let Some(exception) =
+            crate::state::unknown_industry_type_exception(input.industry_type.as_deref())
+        {
+            return Err(UpdateWorkloadErrorModeled::ValidationException(exception).into());
         }
 
         let mut store = state.lock();

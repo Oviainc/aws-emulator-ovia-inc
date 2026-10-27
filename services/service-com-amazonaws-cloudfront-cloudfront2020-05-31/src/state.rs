@@ -76,6 +76,7 @@ use crate::ops::types::{
     DistributionTenant, DistributionTenantSummary, DomainResult, EntityAlreadyExists,
     EntityNotFound, FieldLevelEncryption, FieldLevelEncryptionConfig,
     FieldLevelEncryptionProfile, FieldLevelEncryptionProfileConfig,
+    FieldLevelEncryptionProfileSummary,
     ForwardedValues,
     FunctionAssociations, GeoRestriction, Invalidation, InvalidationBatch, InvalidationSummary,
     InvalidTagging, IpamCidrConfig, IpamConfig, KGKeyPairIds, KeyGroup, KeyGroupConfig,
@@ -3776,6 +3777,23 @@ impl StoredFieldLevelEncryptionProfile {
             field_level_encryption_profile_config: self.config.clone(),
         }
     }
+
+    /// The `FieldLevelEncryptionProfileSummary` a listing reports for this profile.
+    ///
+    /// Every member is the stored record's: the summary repeats the configuration's `Name`,
+    /// `EncryptionEntities` and `Comment` beside the identity the create minted and the
+    /// instant that record was last written, and `Comment` is optional on both, so a profile
+    /// created without one is summarised without one rather than with an empty element
+    /// invented by the read.
+    pub fn to_summary(&self) -> FieldLevelEncryptionProfileSummary {
+        FieldLevelEncryptionProfileSummary {
+            id: self.id.clone(),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            name: self.config.name.clone(),
+            encryption_entities: self.config.encryption_entities.clone(),
+            comment: self.config.comment.clone(),
+        }
+    }
 }
 
 /// One CloudFront field-level encryption CONFIGURATION, as this emulator persists it.
@@ -6885,6 +6903,18 @@ pub fn is_public_key_id(value: &str) -> bool {
     is_prefixed_token(value, PUBLIC_KEY_ID_PREFIX)
 }
 
+/// Whether `value` has the shape of a field-level encryption profile id this service mints
+/// ([`FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX`] followed by [`ID_BODY_LEN`] characters of
+/// the id alphabet).
+///
+/// `ListFieldLevelEncryptionProfiles`'s `Marker` is a profile id — "set the Marker to the
+/// value of the NextMarker from the current page's response (which is also the ID of the
+/// last profile on that page)" — and the model constrains it no further than `string`, so
+/// this is what tells a resume point the service issued from a value a client made up.
+pub fn is_field_level_encryption_profile_id(value: &str) -> bool {
+    is_prefixed_token(value, FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX)
+}
+
 /// The longest name a key value store carries, and the length its own name constraint
 /// bounds every store name by.
 ///
@@ -9486,6 +9516,25 @@ pub fn invalid_public_key_marker() -> crate::ops::types::InvalidArgument {
 
 /// The message `ListPublicKeys` refuses an unusable `Marker` with, on the wire.
 pub const INVALID_PUBLIC_KEY_MARKER_MESSAGE: &str = "Marker must be a valid CF public key Id";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a `ListFieldLevelEncryptionProfiles`
+/// `Marker` that is no resume point this service handed out.
+///
+/// ONE CONSTANT for the condition, for the same reason [`invalid_public_key_marker`] is one:
+/// what the refusal states is the CONSTRAINT on the parameter — a marker is a field-level
+/// encryption profile id — which is a property of the parameter rather than of the value
+/// submitted, so nothing from the request belongs in the text.
+pub fn invalid_field_level_encryption_profile_marker() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_FIELD_LEVEL_ENCRYPTION_PROFILE_MARKER_MESSAGE.to_string()),
+    }
+}
+
+/// The message `ListFieldLevelEncryptionProfiles` refuses an unusable `Marker` with: the
+/// constraint on the parameter, worded as [`INVALID_PUBLIC_KEY_MARKER_MESSAGE`] words the
+/// same constraint on the other listing's marker, naming this listing's own resource.
+pub const INVALID_FIELD_LEVEL_ENCRYPTION_PROFILE_MARKER_MESSAGE: &str =
+    "Marker must be a valid CF field-level encryption profile Id";
 
 /// The modelled `InvalidArgument` (HTTP 400) for a `ListCloudFrontOriginAccessIdentities`
 /// `Marker` that is no resume point this service handed out.

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ContinueServiceDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ContinueServiceDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Continues or rolls back a service deployment that is paused at a lifecycle hook.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ContinueServiceDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rule: the action a request names is taken on the ONE `PAUSE` lifecycle hook the
+//! rollout the ARN names is currently waiting at, and only there — `CONTINUE` takes the
+//! rollout on to its next hooked stage, or to its end when it has none left, `ROLLBACK`
+//! puts the service back onto the revision the rollout before it released; a request that
+//! names a rollout nothing recorded, or a hook that is not the one waiting for an action,
+//! is refused and changes nothing. The state it reads and writes is the service deployment
+//! in [`crate::state`]; the waits themselves are the clock's
+//! (`state::ServiceDeploymentRecord`).
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +167,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ContinueServiceDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ContinueServiceDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ContinueServiceDeployment"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ContinueServiceDeploymentErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let deployment_arn = input.service_deployment_arn.trim().to_string();
+        let hook_id = input.hook_id.trim().to_string();
+        // "The action to take on the paused lifecycle hook. ... If no value is specified,
+        // the default action is CONTINUE."
+        let action = input
+            .action
+            .clone()
+            .unwrap_or_else(|| crate::state::LIFECYCLE_HOOK_ACTION_CONTINUE.to_string());
+
+        let mut guard = state.lock();
+        let now = ::std::time::SystemTime::now();
+        // The stage a paused rollout stands at is one the clock took it to, so the hook
+        // this call acts on is the one that is waiting as of NOW.
+        guard.advance_clock(now);
+
+        match guard.act_on_lifecycle_hook(&deployment_arn, &hook_id, &action, now) {
+            Ok(()) => Ok(ContinueServiceDeploymentOutput {
+                // "The ARN of the service deployment that was continued or rolled back."
+                service_deployment_arn: Some(deployment_arn),
+            }),
+            Err(crate::state::LifecycleHookRefusal::NoSuchDeployment) => Err(
+                ContinueServiceDeploymentErrorModeled::ServiceDeploymentNotFoundException(
+                    ServiceDeploymentNotFoundException {
+                        message: Some(crate::state::service_deployment_not_found_message(
+                            &deployment_arn,
+                        )),
+                    },
+                )
+                .into(),
+            ),
+            Err(crate::state::LifecycleHookRefusal::NotAwaitingAction) => Err(
+                ContinueServiceDeploymentErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::lifecycle_hook_not_awaiting_message(
+                            &hook_id,
+                            &deployment_arn,
+                        )),
+                    },
+                )
+                .into(),
+            ),
+            Err(crate::state::LifecycleHookRefusal::NoPreviousRevision) => Err(
+                ContinueServiceDeploymentErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::no_previous_service_revision_message(
+                            &deployment_arn,
+                        )),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }

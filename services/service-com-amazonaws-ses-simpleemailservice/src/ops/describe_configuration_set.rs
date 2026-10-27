@@ -207,14 +207,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|custom_redirect_domain| TrackingOptions {
                     custom_redirect_domain: Some(custom_redirect_domain),
                 }),
-            // `deliveryOptions`: a TLS policy is stored only by
-            // `PutConfigurationSetDeliveryOptions`, which is still a scaffold, so
-            // no stored set carries one and the group is reported absent whether
-            // or not the request asks for it. The model documents no default for
-            // `DeliveryOptions$TlsPolicy`, so answering one here would report a
-            // policy the service never stored; the group becomes answerable when
-            // that operation is implemented.
-            delivery_options: None,
+            // `deliveryOptions`: present exactly while the set carries the TLS
+            // policy `PutConfigurationSetDeliveryOptions` writes. The model
+            // documents no default for `DeliveryOptions$TlsPolicy`, so a set
+            // nobody has written delivery options for reports none rather than a
+            // policy the service never stored.
+            delivery_options: asked_for("deliveryOptions")
+                .then(|| configuration_set.tls_policy.clone())
+                .flatten()
+                .map(|tls_policy| DeliveryOptions {
+                    tls_policy: Some(tls_policy),
+                }),
             // `reputationOptions`: `SendingEnabled` is the set's stored sending
             // state and `ReputationMetricsEnabled` is the set's stored
             // publishing state, which

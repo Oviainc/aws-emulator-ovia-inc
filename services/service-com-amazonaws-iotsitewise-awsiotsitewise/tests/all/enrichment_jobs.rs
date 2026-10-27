@@ -825,6 +825,7 @@ fn job_record(
         }),
         client_token: None,
         created_at,
+        cancelled_at: None,
     }
 }
 
