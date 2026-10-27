@@ -245,21 +245,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // `ContentMD5` is "the Base64-encoded MD5 digest of the message", so when the
-        // request carries it, it is CHECKED against the payload actually received: a
-        // mismatch means the body is not the body the client hashed. S3 answers `BadDigest`
-        // (400), which this model carries no shape for, so it goes out through the
-        // unmodelled channel with the code and the published text — the way `UploadPart`
-        // answers the same header.
-        if let Some(declared) = input.content_md5.as_deref() {
-            if declared != crate::state::content_md5(&input.annotation_payload) {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::BAD_DIGEST_CODE,
-                    crate::state::BAD_DIGEST_STATUS,
-                    crate::state::BAD_DIGEST_MESSAGE,
-                ));
-            }
-        }
+        // The integrity values this write DECLARED: `Content-MD5` is "the Base64-encoded
+        // MD5 digest of the message" and each `Checksum*` member is the client's digest of
+        // the same payload under one algorithm, so each is checked against the payload
+        // actually received — first for its SHAPE, then against the digest — before the
+        // annotation is recorded. The codes and the sentences are the store's
+        // ([`crate::state::verify_declared_integrity`]), the same ones `PutObject` and
+        // `UploadPart` answer the same headers with.
+        crate::state::verify_declared_integrity(
+            input.content_md5.as_deref(),
+            &crate::state::DeclaredChecksums {
+                crc32: input.checksum_crc32.as_deref(),
+                crc32c: input.checksum_crc32_c.as_deref(),
+                crc64nvme: input.checksum_crc64_nvme.as_deref(),
+                sha1: input.checksum_sha1.as_deref(),
+                sha256: input.checksum_sha256.as_deref(),
+                sha512: input.checksum_sha512.as_deref(),
+                md5: input.checksum_md5.as_deref(),
+                xxhash64: input.checksum_xxhash64.as_deref(),
+                xxhash3: input.checksum_xxhash3.as_deref(),
+                xxhash128: input.checksum_xxhash128.as_deref(),
+            },
+            &input.annotation_payload,
+        )
+        .map_err(|rejection| {
+            crate::scaffolded::Scaffolded::unmodeled(
+                rejection.code(),
+                rejection.status(),
+                rejection.to_string(),
+            )
+        })?;
 
         // The NAME, judged against its own documented bounds before anything else about
         // the request is: `AnnotationName` carries no `length` trait in the model, so
