@@ -412,8 +412,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // outside the comparison: `TagResource` / `UntagResource` own them after the
         // create.) A name stored in ANOTHER Region is a different environment and no
         // obstacle here: a name identifies an environment only within its Region.
+        //
+        // An environment whose teardown is running still HOLDS its name, so the name is
+        // not free yet; but it is on its way out, so there is no live environment for a
+        // replay to answer with and a create of that name is refused until the teardown
+        // frees it.
         if let Some(existing) = store.environment(&region, &input.name) {
-            if existing.spec == spec {
+            if existing.spec == spec && !existing.is_deleting() {
                 return Ok(CreateEnvironmentOutput {
                     arn: Some(existing.arn.clone()),
                 });

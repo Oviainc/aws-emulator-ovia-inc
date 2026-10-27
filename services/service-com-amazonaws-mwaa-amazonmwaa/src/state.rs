@@ -23,11 +23,13 @@ pub const ARN_SERVICE: &str = "airflow";
 /// unsigned request still routes by endpoint host).
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// How long a new environment stays `CREATING`, and an environment under update stays in
-/// the non-terminal statuses of its update, before the clock owes it `AVAILABLE`.
+/// How long a new environment stays `CREATING`, an environment under update stays in the
+/// non-terminal statuses of its update before the clock owes it `AVAILABLE`, and an
+/// environment being torn down stays [`STATUS_DELETING`] before its record goes.
 ///
-/// `CREATING`, `CREATING_SNAPSHOT` and `UPDATING` are non-terminal `EnvironmentStatus`
-/// values, so the move to `AVAILABLE` is a transition the clock owes. The span is the
+/// `CREATING`, `CREATING_SNAPSHOT`, `UPDATING` and `DELETING` are non-terminal
+/// `EnvironmentStatus` values, so the move out of each of them is a transition the clock
+/// owes. The span is the
 /// emulator's own choice (no AWS-documented duration applies to MWAA provisioning) and is
 /// deliberately non-zero, so a caller reading straight after the call still observes the
 /// transient status as it does against the real service. The instant it comes due is
@@ -176,6 +178,23 @@ pub const STATUS_PENDING: &str = "PENDING";
 /// `EnvironmentStatus` once the create gave up — "The request to create the environment
 /// failed and the environment was not created." (the `Status` member's own doc).
 pub const STATUS_CREATE_FAILED: &str = "CREATE_FAILED";
+
+/// `EnvironmentStatus` while the environment is being torn down — "The request to delete
+/// the environment is in progress." (the `Status` member's own doc).
+///
+/// A non-terminal status: `DeleteEnvironment` only STARTS the teardown, so the environment
+/// stays stored — and readable, and listed — in this status until the clock owes its
+/// removal one [`TRANSITION_SPAN`] later.
+pub const STATUS_DELETING: &str = "DELETING";
+
+/// `EnvironmentStatus` once the teardown finished — "The request to delete the environment
+/// is complete, and the environment has been deleted." (the `Status` member's own doc).
+///
+/// Reaching it is what RETIRES the record: the environment has been deleted, so the same
+/// [`ComAmazonawsMwaaAmazonmwaaState::settle`] that lands this status drops the record and
+/// its ARN index entry, and every later read answers as it does for a name the store never
+/// held.
+pub const STATUS_DELETED: &str = "DELETED";
 
 /// `UpdateStatus` while the update the clock owes has not landed yet.
 pub const UPDATE_STATUS_PENDING: &str = "PENDING";
@@ -858,6 +877,40 @@ impl EnvironmentRecord {
         self.status == STATUS_AVAILABLE && self.pending.is_empty()
     }
 
+    /// Whether the teardown of this environment has already been started, so it is on its
+    /// way out: its name is still taken and it still reads back, but nothing can be
+    /// applied to it and the clock owes its removal.
+    pub fn is_deleting(&self) -> bool {
+        self.status == STATUS_DELETING
+    }
+
+    /// Start the teardown a `DeleteEnvironment` asks for: the environment enters
+    /// [`STATUS_DELETING`] and the clock owes it [`STATUS_DELETED`] — the status whose
+    /// arrival retires the record — one [`TRANSITION_SPAN`] later.
+    ///
+    /// Nothing is DROPPED here. The record, its tags and its Apache Airflow metadata go
+    /// when the removal lands, which is what makes the status the request put the
+    /// environment in observable to a reader or a listing, exactly as the transient
+    /// statuses of a create and of an update are. Whatever the environment was doing is
+    /// abandoned: the transitions owed to a create or an update that had not landed are
+    /// dropped, so nothing moves a record on its way out back to a settled status.
+    ///
+    /// Idempotent: repeating the delete of an environment already tearing down neither
+    /// restarts the teardown nor moves its deadline, so a caller polling the teardown
+    /// cannot postpone it.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        if self.is_deleting() {
+            return;
+        }
+        self.status = STATUS_DELETING.to_string();
+        self.pending = [PendingTransition {
+            to: STATUS_DELETED.to_string(),
+            last_update_status: None,
+            due_at: now + TRANSITION_SPAN,
+        }]
+        .into();
+    }
+
     /// Begin an accepted update: enter [`STATUS_CREATING_SNAPSHOT`] with a `PENDING`
     /// `LastUpdate`, then owe [`STATUS_UPDATING`] one [`UPDATE_PHASE_SPAN`] later and
     /// [`STATUS_AVAILABLE`] with a `SUCCESS` `LastUpdate` one phase after that.
@@ -1003,12 +1056,33 @@ pub struct ComAmazonawsMwaaAmazonmwaaState {
 }
 
 impl ComAmazonawsMwaaAmazonmwaaState {
-    /// Materialise every status transition the clock already owes. Called at the top of
-    /// each handler, reporting ones included: they may write only a change that was
-    /// already due at this instant.
+    /// Materialise every status transition the clock already owes, and retire every
+    /// environment whose teardown that leaves finished. Called at the top of each handler,
+    /// reporting ones included: they may write only a change that was already due at this
+    /// instant.
     pub fn settle(&mut self, now: SystemTime) {
         for environment in self.environments.values_mut() {
             environment.settle(now);
+        }
+        self.reap_deleted_environments();
+    }
+
+    /// Drop every environment that has reached [`STATUS_DELETED`] — the status that says
+    /// its teardown is complete — and with it its ARN index entry, so a finished teardown
+    /// frees the name and the ARN for good.
+    ///
+    /// Part of the one write a reporting operation may make: the removal was owed at the
+    /// instant [`EnvironmentRecord::settle`] landed that status, whether or not anybody
+    /// called, so what a reader answers is what the store would hold unpolled.
+    fn reap_deleted_environments(&mut self) {
+        let torn_down: Vec<EnvironmentKey> = self
+            .environments
+            .iter()
+            .filter(|(_, record)| record.status == STATUS_DELETED)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (region, name) in torn_down {
+            self.remove(&region, &name);
         }
     }
 
