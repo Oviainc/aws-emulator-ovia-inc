@@ -22,7 +22,7 @@
 //!    a start-after key, so no value is invalid and it answers a page instead of
 //!    refusing — see `describe_launch_configurations.rs`.)
 
-use crate::support::{new_engine, query, router_with, tag_value, tag_values};
+use crate::support::{new_engine, query, router_with, tag_value, tag_values, xml_unescape};
 
 /// The launch source a group in this suite is created from — a launch TEMPLATE, because
 /// no account can create a launch configuration (see
@@ -169,16 +169,6 @@ type ActionCase<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
 /// One row of a table whose action must FAIL: [`ActionCase`] plus the status and the wire
 /// code it must fail with.
 type RefusedCase<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>, u16, &'a str);
-
-/// Decode the five XML entities the envelope's text is escaped with, so an assertion
-/// compares the value the client parses rather than its wire spelling.
-fn xml_unescape(text: &str) -> String {
-    text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-}
 
 /// The request id of an error response, checked to be where AWS puts it: exactly one
 /// `<RequestId>`, a sibling AFTER `<Error>` and inside `<ErrorResponse>`.

@@ -406,10 +406,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
 
+        // A name no group answers to is refused with the wording THIS operation
+        // answers with, which carries no part of the request: the detail field after
+        // the dash is the literal token `null`, left unfilled, so the message is the
+        // same for every name. The sibling mutations that do fill that field with the
+        // group name keep doing so in their own handlers.
         let Some(group) = state.groups.get(&name) else {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "AutoScalingGroup name not found - AutoScalingGroup: {name} not found"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "AutoScalingGroup name not found - null",
+            ));
         };
 
         // The bounds this update leaves the group with: a member the request omits

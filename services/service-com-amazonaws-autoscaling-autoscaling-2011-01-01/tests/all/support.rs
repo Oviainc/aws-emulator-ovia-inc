@@ -161,6 +161,19 @@ pub fn tag_values(xml: &str, tag: &str) -> Vec<String> {
     out
 }
 
+/// Decode the five XML entities the envelope escapes its text with, so an assertion
+/// compares the value a client parses rather than its wire spelling.
+///
+/// THE ONE COPY in this crate's tests: every suite that reads an escaped `<Message>`
+/// or `<Value>` back decodes it through here.
+pub fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 /// The text of the first `<tag>…</tag>`, or `""` when the member is absent.
 pub fn tag_value(xml: &str, tag: &str) -> String {
     tag_values(xml, tag).first().cloned().unwrap_or_default()
