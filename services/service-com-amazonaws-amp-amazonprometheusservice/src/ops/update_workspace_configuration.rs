@@ -316,6 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // replaces the stored value, and a member it omits leaves the stored value
         // alone — which is what lets one call set the retention period without
         // dropping the label set limits another call established.
+        let workspace_arn = workspace.arn.clone();
         let configuration = &mut workspace.configuration;
         if let Some(limits) = stored_limits {
             configuration.limits_per_label_set = limits;
@@ -338,7 +339,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         configuration.status_due = Some(now + crate::state::TRANSITION_DELAY);
         configuration.update_token = input.client_token;
 
-        Ok(status_response(configuration))
+        let response = status_response(configuration);
+        // This call CHANGED this service's state, so it leaves the audit record every
+        // mutating handler of this crate leaves: the operation, the resource it changed
+        // and the access-key id the REQUEST presented — see
+        // [`crate::state::record_state_change`]. The replayed `clientToken` above wrote
+        // nothing, so it records nothing.
+        crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
+        Ok(response)
     }
 }
 

@@ -7258,12 +7258,24 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// [`Self::delete_profile_tokens`] is NOT among them, exactly as in
     /// [`Self::remove_workload`]: a token that names the delete itself has to survive the
     /// resource the delete removed, or the retry it was issued for could not be replayed.
-    pub fn remove_profile(&mut self, profile_arn: &str) -> Option<ProfileRecord> {
+    ///
+    /// `at` is the instant the removal is served at, and every workload that LOSES an
+    /// association here records it as its `UpdatedAt`: the profiles are a member of the
+    /// workload (`Workload$Profiles`), so dropping one changes the workload, and
+    /// `Workload$UpdatedAt` is what every read of the workload reports that change by —
+    /// the same rule the operation that drops an association directly writes it under.
+    /// A workload that held no association with this profile is not changed, so its own
+    /// instant stands where it stood.
+    pub fn remove_profile(&mut self, profile_arn: &str, at: SystemTime) -> Option<ProfileRecord> {
         let record = self.profiles.remove(profile_arn)?;
         self.create_profile_tokens
             .retain(|token| token.profile_arn != profile_arn);
         for workload in self.workloads.values_mut() {
+            if !workload.associates_profile(profile_arn) {
+                continue;
+            }
             workload.disassociate_profile(profile_arn);
+            workload.updated_at = at;
         }
         // An upgrade token resolves to the upgrade of an association OF this profile, so
         // it goes with the associations dropped just above.

@@ -171,7 +171,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteWorkspaceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -235,6 +234,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             workspace.status_code = crate::state::STATUS_DELETING.to_string();
             workspace.transition_due = Some(now + crate::state::TRANSITION_DELAY);
             workspace.delete_token = input.client_token;
+            // This call CHANGED this service's state, so it leaves the audit record
+            // every mutating handler of this crate leaves: the operation, the resource
+            // it changed and the access-key id the REQUEST presented — see
+            // [`crate::state::record_state_change`]. A replay of the pending deletion
+            // writes nothing, so it records nothing.
+            crate::state::record_state_change(Self::NAME, &workspace.arn, ctx.parts());
         }
 
         Ok(DeleteWorkspaceOutput)

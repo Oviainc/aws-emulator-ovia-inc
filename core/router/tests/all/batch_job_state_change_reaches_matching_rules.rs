@@ -2,12 +2,15 @@
 
 //! A Batch job's state changes reach the EventBridge rules that match them, and no others.
 //!
-//! The RULE under test: **every status an AWS Batch job takes is published once onto the
-//! account's DEFAULT EventBridge bus as `source` `aws.batch` / `detail-type`
+//! The RULE under test: **every status an AWS Batch job MOVES INTO is published once onto
+//! the account's DEFAULT EventBridge bus as `source` `aws.batch` / `detail-type`
 //! `Batch Job State Change`, carrying that job's own description as the event `detail`
 //! and the job's ARN in `resources`; EventBridge then routes it by its CONTENT, so each
 //! rule whose `EventPattern` matches the envelope delivers it to that rule's targets and a
-//! rule whose pattern does not match receives none of them.** Source: the EventBridge
+//! rule whose pattern does not match receives none of them.** The status the submit itself
+//! stored is not a move, so no envelope carries it ("events aren't created for the initial
+//! job submission" — the Batch User Guide's "Job state change events"). Source: the
+//! EventBridge
 //! reference page "AWS Batch events" (`events-ref-batch.html`), which names the source,
 //! the detail type and the default bus, and
 //! `smithy_query(query="shape", shape="com.amazonaws.batch#JobStatus")` for the statuses a
@@ -30,7 +33,9 @@
 //! `services/service-com-amazonaws-batch-awsbatchv20160810/tests/all/job_state_change_events.rs`
 //! pins the same rule over a table of job LIFECYCLES (left to the clock, terminated,
 //! cancelled, waiting on a dependency) and pins each published `detail` against what
-//! `DescribeJobs` reports for the same job, and
+//! `DescribeJobs` reports for the same job,
+//! `services/service-com-amazonaws-batch-awsbatchv20160810/tests/all/job_submission_publishes_no_event.rs`
+//! pins the exclusion of the submitted status over a table of first moves, and
 //! `core/router/tests/all/events_fan_out_to_each_matched_target.rs` pins the fan-out to
 //! several targets of several services. What only this suite can reach is the pair those
 //! two leave out: routing a Batch event by its CONTENT (a pattern reaching into `detail`)
@@ -339,16 +344,18 @@ struct Row {
     expected: &'static [&'static str],
 }
 
-/// The statuses a job takes here: `SUBMITTED` when the submit stores it, `RUNNABLE` when
-/// the clock releases it, and the terminal `FAILED` a caller's `TerminateJob` writes.
-/// Nothing in this emulator places a job on compute capacity, so a job left alone rests in
-/// `RUNNABLE`.
-const RESTING: &[&str] = &["RUNNABLE", "SUBMITTED"];
-const TERMINATED: &[&str] = &["FAILED", "RUNNABLE", "SUBMITTED"];
+/// The statuses a job MOVES INTO here: `RUNNABLE` when the clock releases it, and the
+/// terminal `FAILED` a caller's `TerminateJob` writes. The status the submit stored is not
+/// one of them — no event is created for the submission itself — so a job's stream begins
+/// at `RUNNABLE`. Nothing in this emulator places a job on compute capacity, so a job left
+/// alone rests in `RUNNABLE`.
+const RESTING: &[&str] = &["RUNNABLE"];
+const TERMINATED: &[&str] = &["FAILED", "RUNNABLE"];
 const RUNNABLE_ONLY: &[&str] = &["RUNNABLE"];
 
-/// RULE: each status a Batch job takes is published to the default bus and delivered to
-/// every rule whose pattern matches the envelope — and to no rule whose pattern does not.
+/// RULE: each status a Batch job moves into is published to the default bus and delivered
+/// to every rule whose pattern matches the envelope — and to no rule whose pattern does
+/// not.
 #[tokio::test]
 async fn every_job_state_change_reaches_the_rules_that_match_it_and_no_others() {
     let rows = [

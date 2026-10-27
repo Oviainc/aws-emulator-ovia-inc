@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartGUISession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartGUISession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts the Amazon DCV graphical user interface session of a stored virtual
+//! computer, and answers the operation-log entry that records the start.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartGUISession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! ## What this operation does
+//!
+//! A GUI session runs ON the virtual computer the request names, so what this
+//! call does depends on the state of the stored instance:
+//!
+//! * the computer holds a session that is still inside its active window — the
+//!   call is accepted and that session is left exactly as it is: the session is
+//!   the resource, so a second start neither mints a second one for one computer
+//!   nor silently restarts the window AWS documents it stays active for;
+//! * the computer holds no session, or one whose window has run out — a session
+//!   is started on it ("Use this action to resume the session after it expires"),
+//!   addressed by a token the store's own allocator minted, and it is `starting`
+//!   until the clock owes it `started`. A resumed session is addressed by a NEW
+//!   token: the window that ran out is what the old address belonged to, so
+//!   expiry means the URLs it was published under reach nothing;
+//! * the computer is still coming up — the session is started on it and comes up
+//!   once the computer does, which is one transition span after the instant the
+//!   clock already owes that computer its running state;
+//! * the computer is stopping or stopped — there is nothing to run a session on,
+//!   so the request is refused rather than a session being recorded against a
+//!   computer that cannot serve it.
+//!
+//! The two URLs the session is reached through are NOT this call's answer:
+//! `CreateGUISessionAccessDetails` builds them from the endpoint ITS own request
+//! arrived at, and reports how far this session has got.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +175,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartGUISession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartGUISessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartGUISession"))
+        // `ctx` carries request metadata only, and nothing this call stores comes
+        // from it: the session runs on a virtual computer that already exists, so
+        // the start is recorded where that computer is rather than where the
+        // request signed for. The session's URLs are built per request from the
+        // endpoint the request asking for them arrived at, which is
+        // `CreateGUISessionAccessDetails`' business, not this call's.
+        let _ = ctx;
+
+        // `resourceName` is a modelled `@required` member carrying the modelled
+        // `ResourceName` pattern, so the centralized walk refused anything
+        // outside it before this body ran.
+        let name = input.resource_name;
+
+        let started = crate::state::with_state(&*self.engine, |store| {
+            // Read after the store is held, so the instant this call records is
+            // never earlier than the one the clock has already been advanced to:
+            // a record cannot be created already due.
+            let now = crate::state::now_ms();
+            // The session runs on the named virtual computer, so a name this
+            // account holds no computer under is refused rather than a session
+            // being started against nothing.
+            let Some(instance) = store.instance(&name) else {
+                return Err(not_found(&name));
+            };
+            let state = instance.state;
+            let location = instance.location.clone();
+            let live = instance
+                .gui_session
+                .clone()
+                .filter(|session| session.is_live_at(now));
+
+            // An Amazon DCV session runs ON the computer: one that is on its way
+            // down, or down, has nothing to run a session on, and the clock has
+            // already released whatever session it held. Lightsail declares no
+            // `OperationFailureException` for this call, so the refusal is its
+            // modelled 400 — the request names a computer that cannot serve what
+            // it asks for — and it comes BEFORE any write, so a refused request
+            // records nothing.
+            if state == crate::state::STOPPING || state == crate::state::STOPPED {
+                return Err(invalid(format!(
+                    "The instance {name} is {}: a GUI session runs on the virtual computer, \
+                     so one can be started only while that computer is {} or coming up. \
+                     Start the instance first.",
+                    state.name,
+                    crate::state::RUNNING.name,
+                )));
+            }
+
+            // A session that is still inside its active window is the session
+            // this call asked for: it is left exactly as it is, so a second
+            // start neither mints a second session for one computer nor restarts
+            // the window. Anything else — no session, or one whose window has
+            // run out — is started now, by the store's own mint, which writes
+            // the session as it mints it so no caller is answered for a session
+            // the store does not hold.
+            let session = match live {
+                Some(session) => session,
+                // The instance was resolved above under the same held store, so
+                // the mint cannot fail to find it; the arm is kept because the
+                // store answers an Option rather than asserting, and refusing
+                // the same way a missing computer is refused is the only honest
+                // answer if it ever did.
+                None => match store.create_gui_session(&name, now) {
+                    Some(session) => session,
+                    None => return Err(not_found(&name)),
+                },
+            };
+
+            // The session is not up as the call returns — it comes up on the
+            // computer after the call, and only once that computer is itself
+            // serving — so the log entry is answered non-terminal and the clock
+            // owes it its `Succeeded` status at the instant the session starts.
+            // A session that is already up has nothing left to come up, so the
+            // entry recording that start is terminal.
+            let settles_at_ms = (now < session.starts_at_ms).then_some(session.starts_at_ms);
+            // `operations` is a list because other Lightsail calls act on several
+            // resources at once; this one acts on exactly one virtual computer,
+            // so it answers exactly one entry, located where that computer is.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_START_GUI_SESSION,
+                crate::state::RESOURCE_TYPE_INSTANCE,
+                &name,
+                &location,
+                settles_at_ms,
+            );
+            Ok((
+                StartGUISessionOutput {
+                    operations: Some(vec![operation.view()]),
+                },
+                operation.id.clone(),
+                session.status_at(now),
+            ))
+        })
+        .ok_or_else(unavailable)?;
+
+        let (output, operation_id, session_status) = started?;
+        // Audit record for a call that opens access to a virtual computer: the
+        // operation, the computer it acted on, where the session has got to and
+        // the log entry it wrote. The token the session is addressed by is NOT
+        // logged — it is what an access URL carries — and neither is any
+        // credential.
+        ::tracing::info!(
+            audit = true,
+            operation = "StartGUISession",
+            outcome = "started",
+            resource_name = %name,
+            session_status,
+            operation_id = %operation_id,
+            "GUI session started on a Lightsail virtual computer"
+        );
+        Ok(output)
     }
+}
+
+/// No virtual computer of that name is stored: Lightsail's `DoesNotExist`
+/// rejection — HTTP 400, wire error `NotFoundException`, body `code`
+/// `DoesNotExist` and a message naming the resource type and the requested name.
+fn not_found(name: &str) -> StartGUISessionError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        name,
+    )
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// cannot serve: the modelled `InvalidInputException`, whose message names the
+/// virtual computer and the state that stops a session being started on it.
+fn invalid(message: String) -> StartGUISessionError {
+    StartGUISessionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> StartGUISessionError {
+    StartGUISessionErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

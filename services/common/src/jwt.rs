@@ -17,11 +17,19 @@
 //! refusal: this module reports WHY a value is not a token ([`FormDefect`], which renders
 //! the reason), never what any one service should answer for it.
 //!
-//! The SIGNATURE is not verified, and cannot be: verifying it needs the issuer's
-//! verification key, published at that issuer's own key-set endpoint, and this emulator
-//! makes no outbound connection to fetch one. What IS decidable from the token alone is
-//! refused — a token whose header names the unsecured algorithm of RFC 7519 §6 (`alg`
-//! `none`), or whose signature segment is empty, is one no issuer signed.
+//! [`read`] checks the FORM only and verifies no signature: verifying one needs the
+//! issuer's verification key, published at that issuer's own key-set endpoint, and this
+//! emulator makes no outbound connection to fetch one. What IS decidable from the token
+//! alone is refused there — a token whose header names the unsecured algorithm of
+//! RFC 7519 §6 (`alg` `none`), or whose signature segment is empty, is one no issuer
+//! signed.
+//!
+//! A service that CAN read the issuer's key set — because the issuer is one this emulator
+//! serves, so the key set it publishes is held in this same process — verifies the
+//! signature with [`verify`], which is the RFC 7515 §5.2 check: find the key the header's
+//! `kid` names in the published set and check the signature over the token's own encoded
+//! header and payload. That check lives here, beside the reading, so two services handed
+//! one token and one key set cannot disagree about whether the issuer signed it.
 //!
 //! A service that MINTED the token it is reading is the one case where that unsecured form
 //! is the expected one, because the emulator publishes no verification key to sign with:
@@ -194,6 +202,175 @@ fn read_form(presented: &str) -> Result<(CompactJws, bool), FormDefect> {
     ))
 }
 
+/// The JOSE header parameter naming WHICH of an issuer's keys signed a JWS — "a hint
+/// indicating which key was used to secure the JWS" (RFC 7515 §4.1.4).
+const KEY_ID_HEADER: &str = "kid";
+
+/// The `alg` a signature is CHECKED under here: ECDSA using P-256 and SHA-256, whose
+/// signature is the 64-byte `R || S` form (RFC 7518 §3.1/§3.4). It is the algorithm the
+/// issuers this emulator serves sign with, and the one its published keys advertise; a
+/// token naming any other algorithm is reported as one this module cannot check rather
+/// than as one that failed to check out.
+const VERIFIABLE_ALGORITHM: &str = "ES256";
+
+/// The `kty` of a key [`VERIFIABLE_ALGORITHM`] is defined over (RFC 7518 §6.2).
+const EC_KEY_TYPE: &str = "EC";
+
+/// The `crv` of that same key (RFC 7518 §6.2.1.1).
+const P256_CURVE: &str = "P-256";
+
+/// The width of one P-256 coordinate: RFC 7518 §6.2.1.2 publishes each as the field
+/// element's full-width octet string, which on this curve is 32 bytes.
+const P256_COORDINATE_BYTES: usize = 32;
+
+/// The JWK member each published key carries its own key id in (RFC 7517 §4.5).
+const JWK_KEY_ID: &str = "kid";
+
+/// Why a token is not one the issuer whose key set was presented signed.
+///
+/// `Display` renders the reason as a clause about the token, the same way [`FormDefect`]
+/// does, so a service states its own refusal without holding a second copy of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignatureDefect {
+    /// The value is not a compact JWS at all, so there is no signature to check.
+    Form(FormDefect),
+    /// The presented key set holds no key the token's header names, so nothing in it
+    /// signed the token.
+    UnknownKey,
+    /// The token names a signature algorithm this module cannot check, so whether the
+    /// issuer signed it is UNDECIDED here — not decided against it.
+    UnsupportedAlgorithm(String),
+    /// The key the issuer published for this token is not one this module can check a
+    /// signature under (another key type or curve). Also UNDECIDED, and about the KEY
+    /// rather than about the token, which named an algorithm this module does check.
+    UnsupportedKey,
+    /// The key the header names is in the set, and the signature over the token's own
+    /// bytes does not check out against it.
+    Invalid,
+}
+
+impl ::std::fmt::Display for SignatureDefect {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Form(defect) => defect.fmt(f),
+            Self::UnknownKey => {
+                f.write_str("no key the token issuer publishes carries the key id it names")
+            }
+            Self::UnsupportedAlgorithm(algorithm) => write!(
+                f,
+                "its signature algorithm {algorithm} is not one the token issuer's key set \
+                 publishes"
+            ),
+            Self::UnsupportedKey => f.write_str(
+                "the key its issuer publishes for it is not one a signature can be checked \
+                 under here",
+            ),
+            Self::Invalid => f.write_str("signature is invalid"),
+        }
+    }
+}
+
+/// Verify `presented` against `key_set` — the JSON Web Key Set (RFC 7517 §5) its issuer
+/// publishes — and report the token's header and claim set.
+///
+/// The steps are the ones RFC 7515 §5.2 defines, which is what every consumer of such a
+/// token does: read `alg` and `kid` out of the header, find THAT key in the set the
+/// issuer published, rebuild the public key from the parameters the set carries
+/// (RFC 7518 §6.2.1) and check the signature over `base64url(header) '.'
+/// base64url(payload)` — the exact bytes the token carries, so a payload rewritten after
+/// signing no longer checks out. Only PUBLIC key parameters are read, so a token that
+/// verifies here is one any third party holding the same key set could have verified.
+///
+/// Total: every failure is a [`SignatureDefect`], never a panic — nothing is indexed,
+/// sliced or unwrapped on the way through.
+pub fn verify(
+    presented: &str,
+    key_set: &::serde_json::Value,
+) -> Result<CompactJws, SignatureDefect> {
+    let token = read(presented).map_err(SignatureDefect::Form)?;
+    if !token.algorithm.eq_ignore_ascii_case(VERIFIABLE_ALGORITHM) {
+        return Err(SignatureDefect::UnsupportedAlgorithm(token.algorithm.clone()));
+    }
+    // `read` already established that the value is three `.`-separated segments; they are
+    // re-split here because the SIGNATURE is computed over the encoded ones, which the
+    // decoded header and claim set no longer carry.
+    let mut segments = presented.trim().split('.');
+    let (Some(header), Some(claims), Some(signature)) =
+        (segments.next(), segments.next(), segments.next())
+    else {
+        return Err(SignatureDefect::Form(FormDefect::Segments));
+    };
+    let named_key = token.header.get(KEY_ID_HEADER).and_then(::serde_json::Value::as_str);
+    let keys = key_set
+        .get("keys")
+        .and_then(::serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let candidates: Vec<&::serde_json::Value> = keys
+        .iter()
+        .filter(|jwk| match named_key {
+            // A token naming a key verifies against that key and no other.
+            Some(kid) => jwk.get(JWK_KEY_ID).and_then(::serde_json::Value::as_str) == Some(kid),
+            // One naming none verifies against ANY key the set holds — which is every key
+            // of an issuer that is rotating, so each is tried before the token is refused.
+            None => true,
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err(SignatureDefect::UnknownKey);
+    }
+    // A signature segment that is not base64url, or not the 64-byte `R || S` form, is no
+    // signature of any key: the algorithm below accepts only that encoding.
+    let signature = decode_segment(signature).ok_or(SignatureDefect::Invalid)?;
+    let signing_input = format!("{header}.{claims}");
+    let mut refused = None;
+    for key in candidates {
+        match checks_out(key, signing_input.as_bytes(), &signature) {
+            Ok(()) => return Ok(token),
+            // A key this module cannot check a signature under leaves the question
+            // UNDECIDED, so a key that could be checked and did not match wins: that is
+            // the specific answer.
+            Err(defect) => {
+                if refused != Some(SignatureDefect::Invalid) {
+                    refused = Some(defect);
+                }
+            }
+        }
+    }
+    Err(refused.unwrap_or(SignatureDefect::Invalid))
+}
+
+/// Whether `key` — one entry of a published key set — signed `signing_input` with
+/// `signature`.
+///
+/// `Err(SignatureDefect::UnsupportedKey)` for a key this module cannot check a signature
+/// under, which says nothing about the token; `Err(SignatureDefect::Invalid)` for a key it
+/// can, that did not sign these bytes.
+fn checks_out(
+    key: &::serde_json::Value,
+    signing_input: &[u8],
+    signature: &[u8],
+) -> Result<(), SignatureDefect> {
+    let member = |name: &str| key.get(name).and_then(::serde_json::Value::as_str);
+    if member("kty") != Some(EC_KEY_TYPE) || member("crv") != Some(P256_CURVE) {
+        return Err(SignatureDefect::UnsupportedKey);
+    }
+    // SEC 1 §2.3.3: the uncompressed point a verifier reads the key's two published
+    // coordinates into is `0x04 || X || Y`, each coordinate the curve's full width.
+    let mut point = Vec::with_capacity(1 + 2 * P256_COORDINATE_BYTES);
+    point.push(0x04_u8);
+    for coordinate in ["x", "y"] {
+        let bytes = member(coordinate)
+            .and_then(decode_segment)
+            .filter(|bytes| bytes.len() == P256_COORDINATE_BYTES)
+            .ok_or(SignatureDefect::Invalid)?;
+        point.extend_from_slice(&bytes);
+    }
+    ::ring::signature::UnparsedPublicKey::new(&::ring::signature::ECDSA_P256_SHA256_FIXED, point)
+        .verify(signing_input, signature)
+        .map_err(|_| SignatureDefect::Invalid)
+}
+
 /// One base64url segment of a token, read as a JSON object. `None` when the segment is not
 /// base64url or does not decode to a JSON object — neither is a JOSE header or a claim set.
 fn json_segment(segment: &str) -> Option<::serde_json::Map<String, ::serde_json::Value>> {
@@ -229,14 +406,22 @@ mod tests {
     //! behaviour — which refusal each defect becomes — is pinned by the suites of the
     //! services that call it.
 
-    use super::{read, read_unsecured, CompactJws, FormDefect, MAX_TOKEN_BYTES};
+    use super::{
+        read, read_unsecured, verify, CompactJws, FormDefect, SignatureDefect, MAX_TOKEN_BYTES,
+        P256_COORDINATE_BYTES,
+    };
 
-    /// One base64url segment (unpadded, as a compact JWS carries it) of `value`.
-    fn segment(value: &str) -> String {
-        ::aws_smithy_types::base64::encode(value)
+    /// `bytes` as one base64url segment (unpadded, as a compact JWS carries it).
+    fn base64url(bytes: &[u8]) -> String {
+        ::aws_smithy_types::base64::encode(bytes)
             .trim_end_matches('=')
             .replace('+', "-")
             .replace('/', "_")
+    }
+
+    /// One base64url segment (unpadded, as a compact JWS carries it) of `value`.
+    fn segment(value: &str) -> String {
+        base64url(value.as_bytes())
     }
 
     /// A token whose header and claim set are `header` and `claims`.
@@ -404,6 +589,221 @@ mod tests {
                 "case {case:?}: a value that is no token must be refused, got {:?}",
                 read_unsecured(&presented)
             );
+        }
+    }
+
+    /// The signing algorithm a test key is generated for and signs with: the same ECDSA
+    /// P-256 / SHA-256 in the fixed `R || S` encoding [`verify`] checks.
+    const TEST_SIGNING: &::ring::signature::EcdsaSigningAlgorithm =
+        &::ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+
+    /// A freshly generated P-256 key pair, with the key id its published JWK carries.
+    struct TestKey {
+        pair: ::ring::signature::EcdsaKeyPair,
+        kid: &'static str,
+    }
+
+    impl TestKey {
+        fn generate(kid: &'static str) -> Self {
+            let rng = ::ring::rand::SystemRandom::new();
+            let document = ::ring::signature::EcdsaKeyPair::generate_pkcs8(TEST_SIGNING, &rng)
+                .expect("the operating system CSPRNG yields a P-256 key pair");
+            let pair =
+                ::ring::signature::EcdsaKeyPair::from_pkcs8(TEST_SIGNING, document.as_ref(), &rng)
+                    .expect("a freshly generated P-256 key pair parses");
+            Self { pair, kid }
+        }
+
+        /// This key's PUBLIC half as the JWK an issuer publishes (RFC 7518 §6.2.1).
+        fn jwk(&self) -> ::serde_json::Value {
+            use ::ring::signature::KeyPair as _;
+            let point = self.pair.public_key().as_ref();
+            let coordinate = |from: usize| {
+                base64url(
+                    point
+                        .get(from..from + P256_COORDINATE_BYTES)
+                        .expect("an uncompressed P-256 point carries both coordinates"),
+                )
+            };
+            ::serde_json::json!({
+                "alg": "ES256",
+                "crv": "P-256",
+                "kid": self.kid,
+                "kty": "EC",
+                "use": "sig",
+                "x": coordinate(1),
+                "y": coordinate(1 + P256_COORDINATE_BYTES),
+            })
+        }
+
+        /// `claims` as a compact JWS this key signed, naming this key in its header.
+        fn sign(&self, claims: &str) -> String {
+            self.sign_under(
+                &format!(r#"{{"alg":"ES256","kid":"{}","typ":"JWT"}}"#, self.kid),
+                claims,
+            )
+        }
+
+        /// The same, under a header naming NO key — which a verifier must then try every
+        /// key of the set against.
+        fn sign_without_key_id(&self, claims: &str) -> String {
+            self.sign_under(r#"{"alg":"ES256","typ":"JWT"}"#, claims)
+        }
+
+        /// `claims` as a compact JWS this key signed under `header`.
+        fn sign_under(&self, header: &str, claims: &str) -> String {
+            let signing_input = format!("{}.{}", segment(header), segment(claims));
+            let rng = ::ring::rand::SystemRandom::new();
+            let signature = self
+                .pair
+                .sign(&rng, signing_input.as_bytes())
+                .expect("the key signs");
+            format!("{signing_input}.{}", base64url(signature.as_ref()))
+        }
+    }
+
+    /// A token verifies against the key its issuer published for it, and against nothing
+    /// else: the rows differ along what a presenter can change — the payload, the
+    /// signature bytes, which key signed it, which key set is presented and what the
+    /// header claims — and only the untouched token signed by a key in the set verifies.
+    #[test]
+    fn a_token_verifies_only_against_the_key_its_issuer_published() {
+        let key = TestKey::generate("key-1");
+        let other = TestKey::generate("key-2");
+        let key_set = ::serde_json::json!({ "keys": [key.jwk()] });
+        let claims = r#"{"sub":"subject","iss":"issuer"}"#;
+        let issued = key.sign(claims);
+        let signature = issued
+            .rsplit('.')
+            .next()
+            .expect("a signed token has a signature segment")
+            .to_string();
+
+        // The payload rewritten while the signature is kept: the one case an
+        // unverified reading of the claims would wave through.
+        let rewritten = {
+            let mut parts = issued.split('.');
+            let header = parts.next().unwrap_or_default();
+            format!(
+                "{header}.{}.{signature}",
+                segment(r#"{"sub":"subject","iss":"issuer","admin":true}"#)
+            )
+        };
+        // One byte of the signature flipped, inside the base64url alphabet.
+        let flipped = {
+            let mut characters: Vec<char> = signature.chars().collect();
+            let last = characters.len() - 1;
+            characters[last] = if characters[last] == 'A' { 'B' } else { 'A' };
+            let tail: String = characters.into_iter().collect();
+            let signing_input = issued
+                .rsplit_once('.')
+                .map(|(input, _)| input.to_string())
+                .unwrap_or_default();
+            format!("{signing_input}.{tail}")
+        };
+
+        let rows: Vec<(&str, String, ::serde_json::Value, Option<SignatureDefect>)> = vec![
+            (
+                "the token as issued",
+                issued.clone(),
+                key_set.clone(),
+                None,
+            ),
+            (
+                "its payload rewritten, its signature kept",
+                rewritten,
+                key_set.clone(),
+                Some(SignatureDefect::Invalid),
+            ),
+            (
+                "one signature byte flipped",
+                flipped,
+                key_set.clone(),
+                Some(SignatureDefect::Invalid),
+            ),
+            (
+                "a token another key signed, presented against this key set",
+                other.sign(claims),
+                key_set.clone(),
+                Some(SignatureDefect::UnknownKey),
+            ),
+            (
+                "the key set of another issuer",
+                issued.clone(),
+                ::serde_json::json!({ "keys": [other.jwk()] }),
+                Some(SignatureDefect::UnknownKey),
+            ),
+            (
+                "a key set holding no key",
+                issued.clone(),
+                ::serde_json::json!({ "keys": [] }),
+                Some(SignatureDefect::UnknownKey),
+            ),
+            (
+                "a kid-less token against a set holding the signing key beside another",
+                key.sign_without_key_id(claims),
+                ::serde_json::json!({ "keys": [other.jwk(), key.jwk()] }),
+                None,
+            ),
+            (
+                "a kid-less token against a set holding only another issuer's key",
+                key.sign_without_key_id(claims),
+                ::serde_json::json!({ "keys": [other.jwk()] }),
+                Some(SignatureDefect::Invalid),
+            ),
+            (
+                "a key published under the token's key id with another key's coordinates",
+                issued.clone(),
+                ::serde_json::json!({ "keys": [{
+                    "alg": "ES256", "crv": "P-256", "kid": "key-1", "kty": "EC", "use": "sig",
+                    "x": other.jwk()["x"], "y": other.jwk()["y"],
+                }] }),
+                Some(SignatureDefect::Invalid),
+            ),
+            (
+                "an unsecured token",
+                token(r#"{"alg":"none"}"#, claims),
+                key_set.clone(),
+                Some(SignatureDefect::Form(FormDefect::Unsecured)),
+            ),
+            (
+                "a token naming an algorithm this verifier does not check",
+                token(r#"{"alg":"RS256","kid":"key-1"}"#, claims),
+                key_set.clone(),
+                Some(SignatureDefect::UnsupportedAlgorithm("RS256".to_string())),
+            ),
+            (
+                "a key published on another curve",
+                issued.clone(),
+                ::serde_json::json!({ "keys": [{
+                    "alg": "ES256", "crv": "P-384", "kid": "key-1", "kty": "EC", "use": "sig",
+                    "x": key.jwk()["x"], "y": key.jwk()["y"],
+                }] }),
+                Some(SignatureDefect::UnsupportedKey),
+            ),
+        ];
+
+        for (case, presented, published, expected) in rows {
+            let outcome = verify(&presented, &published);
+            let actual = outcome.as_ref().err().cloned();
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+            if let Ok(verified) = outcome {
+                assert_eq!(
+                    verified.claim_str("sub"),
+                    Some("subject"),
+                    "case {case:?}: a verified token reports its claims, got {:?}",
+                    verified.claims
+                );
+            }
+            if let Some(defect) = expected {
+                assert!(
+                    !defect.to_string().is_empty(),
+                    "case {case:?}: every defect must render a reason"
+                );
+            }
         }
     }
 

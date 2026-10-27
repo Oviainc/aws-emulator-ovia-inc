@@ -3941,9 +3941,52 @@ pub const METADATA_TABLE_STATUS_CREATING: &str = "CREATING";
 
 /// The `TableStatus` a metadata table carries once it is in service: "`ACTIVE` - The
 /// journal table has been created successfully, and records are being delivered to the
-/// table" (same member's documentation). The third value that member publishes, `FAILED`,
-/// is the one this emulator never reports: nothing here fails to create a table.
+/// table" (same member's documentation).
 pub const METADATA_TABLE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `TableStatus` a metadata table carries when it could not be created: "`FAILED` -
+/// Amazon S3 is unable to create the journal table, or Amazon S3 is unable to deliver
+/// records" (same member's documentation). A table in this status carries the `ErrorDetails`
+/// saying why — see [`MetadataTableFailure`].
+pub const METADATA_TABLE_STATUS_FAILED: &str = "FAILED";
+
+/// The `ErrorDetails$ErrorCode` provisioning reports when the journal table it would create
+/// is already in the managed table bucket's namespace: "`JournalTableAlreadyExists` - A
+/// journal table already exists in the Amazon Web Services managed table bucket's namespace"
+/// (`smithy_query(query="doc",shape="ErrorDetails",member="ErrorCode")`, the V2 list).
+pub const METADATA_JOURNAL_TABLE_EXISTS_CODE: &str = "JournalTableAlreadyExists";
+
+/// The `ErrorDetails$ErrorMessage` that code carries — the FIXED sentence S3 sends with it,
+/// naming neither the table nor the bucket.
+pub const METADATA_JOURNAL_TABLE_EXISTS_MESSAGE: &str =
+    "A journal table already exists in the AWS managed table bucket's namespace. Delete the \
+     journal table, and then try again. To create a new S3 Metadata table, you must delete \
+     the S3 Metadata configuration for this bucket, and then create a new S3 Metadata \
+     configuration.";
+
+/// The same, for the INVENTORY table: "`InventoryTableAlreadyExists` - An inventory table
+/// already exists in the Amazon Web Services managed table bucket's namespace" (same list).
+pub const METADATA_INVENTORY_TABLE_EXISTS_CODE: &str = "InventoryTableAlreadyExists";
+
+/// See [`METADATA_INVENTORY_TABLE_EXISTS_CODE`].
+pub const METADATA_INVENTORY_TABLE_EXISTS_MESSAGE: &str =
+    "An inventory table already exists in the AWS managed table bucket's namespace. Delete \
+     the inventory table, and then try again. To create a new S3 Metadata table, you must \
+     delete the S3 Metadata configuration for this bucket, and then create a new S3 \
+     Metadata configuration.";
+
+/// The code an inventory table carries when the journal table it depends on could not be
+/// created: "`JournalTableNotAvailable` - The journal table that the inventory table relies
+/// on has a `FAILED` status. An inventory table requires a journal table with an `ACTIVE`
+/// status" (same published list).
+pub const METADATA_JOURNAL_TABLE_UNAVAILABLE_CODE: &str = "JournalTableNotAvailable";
+
+/// See [`METADATA_JOURNAL_TABLE_UNAVAILABLE_CODE`].
+pub const METADATA_JOURNAL_TABLE_UNAVAILABLE_MESSAGE: &str =
+    "The journal table that the inventory table relies on has a FAILED status. An inventory \
+     table requires a journal table with an ACTIVE status. To create a new journal or \
+     inventory table, you must delete the metadata configuration for this bucket, along with \
+     any journal or inventory tables, and then create a new metadata configuration.";
 
 /// How long after the call that asked for it a metadata table reaches
 /// [`METADATA_TABLE_STATUS_ACTIVE`] in this emulator.
@@ -4032,6 +4075,19 @@ pub const MAX_METADATA_RECORD_EXPIRATION_DAYS: i32 = 2_147_483_647;
 /// AWS accepts anywhere in an IAM request.
 pub const MAX_METADATA_TABLE_ROLE_CHARS: usize = 2048;
 
+/// The most metadata tables this emulator records in the managed table bucket's namespace
+/// ([`ComAmazonawsS3Amazons3State::metadata_namespace_holds`]).
+///
+/// An emulator resource guard, NOT an AWS quota. The namespace is the one record here that
+/// nothing releases — a table OUTLIVES the configuration that created it, and nothing in
+/// this service's API deletes a table from an S3 Tables namespace — so without a ceiling a
+/// caller creating and deleting buckets could grow it for the life of the process. Three
+/// tables (journal, inventory, annotation) for as many general purpose buckets as this
+/// account may hold ([`MAX_BUCKETS_PER_ACCOUNT`]) is the most any sequence of creates can
+/// legitimately need; a create that would carry the namespace past it is refused with
+/// nothing recorded.
+pub const MAX_METADATA_NAMESPACE_TABLES: usize = 3 * MAX_BUCKETS_PER_ACCOUNT;
+
 /// The `InvalidArgument` message the encryption configuration carried in the request member
 /// `member` earns, or `None` when there is nothing wrong with it.
 ///
@@ -4072,6 +4128,27 @@ pub struct MetadataTable {
     /// When the table falls due to be in service — the instant it stops being reported as
     /// `CREATING`, [`METADATA_TABLE_ACTIVATION_DELAY`] after the call that asked for it.
     pub active_at: SystemTime,
+    /// Why the table could not be created, or `None` for one whose creation is under way.
+    ///
+    /// A table that cannot be created never reaches `ACTIVE`: it is reported `FAILED` with
+    /// the `ErrorDetails` this record carries ([`MetadataTableFailure`]), from the create
+    /// onwards.
+    pub failure: Option<MetadataTableFailure>,
+}
+
+/// Why a metadata table could not be created: the `ErrorDetails` a reader reports beside its
+/// `FAILED` status.
+///
+/// The members are `ErrorDetails`' own
+/// (`smithy_query(query="shape",shape="com.amazonaws.s3#ErrorDetails")`): the error code and
+/// the message, each a published pair from that shape's own documentation — so the code and
+/// the sentence a caller reads are AWS's rather than anything built here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataTableFailure {
+    /// An `ErrorDetails$ErrorCode` value, e.g. [`METADATA_JOURNAL_TABLE_EXISTS_CODE`].
+    pub code: &'static str,
+    /// The `ErrorDetails$ErrorMessage` that code publishes.
+    pub message: &'static str,
 }
 
 impl MetadataTable {
@@ -4081,13 +4158,25 @@ impl MetadataTable {
         Self {
             name,
             active_at: created_at + METADATA_TABLE_ACTIVATION_DELAY,
+            failure: None,
         }
     }
 
-    /// The `TableStatus` the table is in at `instant`: being created until it falls due,
-    /// in service from then on.
+    /// The table `name` that could not be created, with `failure` saying why: reported
+    /// `FAILED` from the create onwards rather than ever falling due.
+    pub fn failed(name: String, created_at: SystemTime, failure: MetadataTableFailure) -> Self {
+        Self {
+            failure: Some(failure),
+            ..Self::creating(name, created_at)
+        }
+    }
+
+    /// The `TableStatus` the table is in at `instant`: `FAILED` for a table that could not
+    /// be created, else being created until it falls due and in service from then on.
     pub fn status_at(&self, instant: SystemTime) -> &'static str {
-        if instant < self.active_at {
+        if self.failure.is_some() {
+            METADATA_TABLE_STATUS_FAILED
+        } else if instant < self.active_at {
             METADATA_TABLE_STATUS_CREATING
         } else {
             METADATA_TABLE_STATUS_ACTIVE
@@ -5199,6 +5288,19 @@ impl Bucket {
     /// `GetBucketMetadataConfiguration` reporting it from then on.
     pub fn set_metadata_configuration(&mut self, configuration: BucketMetadataConfiguration) {
         self.metadata_configuration = Some(configuration);
+    }
+
+    /// Take the bucket's S3 Metadata configuration away, reporting whether it carried one.
+    ///
+    /// What `DeleteBucketMetadataConfiguration` does: it "deletes an S3 Metadata
+    /// configuration from a general purpose bucket" (that operation's own documentation), so
+    /// the whole subresource goes and a read of it reports none again. It does NOT delete the
+    /// tables the configuration created — those live in the managed table bucket's namespace
+    /// ([`ComAmazonawsS3Amazons3State::metadata_namespace_holds`]), which is why a later
+    /// create of the same configuration provisions into
+    /// [`METADATA_TABLE_STATUS_FAILED`] with [`METADATA_JOURNAL_TABLE_EXISTS_CODE`].
+    pub fn clear_metadata_configuration(&mut self) -> bool {
+        self.metadata_configuration.take().is_some()
     }
 
     /// Record `configuration_state` as the inventory table state of the bucket's S3 Metadata
@@ -6979,6 +7081,67 @@ impl Object {
             .map(|(key, value)| key.len() + value.len())
             .sum()
     }
+
+    /// Whether this object's bytes are ARCHIVED at `instant` — in a storage class that
+    /// holds no copy a read can serve, with no restored temporary copy available.
+    ///
+    /// "The storage class of the object can't be `GLACIER` or `DEEP_ARCHIVE` unless you first
+    /// restore a copy of the object" (`InvalidObjectState`'s own condition, from
+    /// `GetObject`'s documentation of it): the two classes [`ARCHIVED_STORAGE_CLASSES`]
+    /// names, and the restore that lifts the bar is the one `RestoreObject` initiated on THIS
+    /// version — in force only once the temporary copy has fallen due
+    /// ([`ObjectRestore::header_value`] reports the same three states) and only until it
+    /// expires, after which the version is archived again.
+    pub fn archived_at(&self, instant: SystemTime) -> bool {
+        if !ARCHIVED_STORAGE_CLASSES.contains(&self.storage_class.as_str()) {
+            return false;
+        }
+        self.restore
+            .as_ref()
+            .is_none_or(|restore| restore.in_progress_at(instant) || restore.header_value(instant).is_none())
+    }
+
+    /// How many parts a multipart upload assembled this object from, or `None` for an object
+    /// one write stored whole.
+    ///
+    /// What a part-scoped read reports as `PartsCount`: "the count of parts this object has.
+    /// This value is only returned if you specify `partNumber` in your request and the object
+    /// was uploaded as a multipart upload" (`GetObjectOutput$PartsCount`) — so an object that
+    /// was NOT uploaded as a multipart upload reports no count, whatever the read asked for.
+    pub fn parts_count(&self) -> Option<i32> {
+        (!self.parts.is_empty())
+            .then(|| i32::try_from(self.parts.len()).unwrap_or(i32::MAX))
+    }
+
+    /// The span of this object's bytes that `part_number` names, or `None` when the object
+    /// has no such part.
+    ///
+    /// A part-scoped read "effectively performs a 'ranged' GET request for the part
+    /// specified" (`GetObjectRequest$PartNumber`), so the span is the part's own place in the
+    /// object: the parts were concatenated "in ascending order by part number"
+    /// (`CompleteMultipartUpload`'s own documentation), which makes a part's first byte the
+    /// sum of the sizes before it.
+    ///
+    /// An object stored by ONE write has a single part — the whole object — because that is
+    /// what a part-scoped read of it answers; it reports no `PartsCount`
+    /// ([`Self::parts_count`]) all the same, since it was not uploaded as a multipart upload.
+    /// A part holding no bytes names no span, because `Content-Range` cannot state one.
+    pub fn part_span(&self, part_number: i32) -> Option<ByteSpan> {
+        if self.parts.is_empty() {
+            return (part_number == MIN_PART_NUMBER)
+                .then(|| ByteSpan::new(0, self.body.len().checked_sub(1)?))
+                .flatten();
+        }
+        let mut first = 0usize;
+        for part in &self.parts {
+            let size = usize::try_from(part.size).unwrap_or(0);
+            if part.part_number == part_number {
+                return ByteSpan::new(first, first + size.checked_sub(1)?);
+            }
+            first += size;
+        }
+        None
+    }
 }
 
 /// One in-progress multipart upload this emulator holds, as the
@@ -7201,6 +7364,80 @@ pub fn etag_value(etag: &str) -> &str {
     etag.trim_matches('"')
 }
 
+/// Whether a conditional WRITE at a key whose current object carries `held_etag` (`None`
+/// for a key holding nothing) must be refused, given the `If-Match` and `If-None-Match` the
+/// request carried.
+///
+/// The two documented conditions, each quoted from the member that carries it:
+///
+/// * "Uploads the object only if the ETag (entity tag) value provided during the WRITE
+///   operation matches the ETag of the object in S3. If the ETag values do not match, the
+///   operation returns a 412 Precondition Failed error" (`PutObjectRequest$IfMatch`) — so a
+///   key holding nothing at all matches no tag either.
+/// * "Uploads the object only if the object key name does not already exist in the bucket
+///   specified. Otherwise, Amazon S3 returns a 412 Precondition Failed error"
+///   (`PutObjectRequest$IfNoneMatch`), whose value "expects the '*' (asterisk) character":
+///   what it asks is that the key hold nothing.
+///
+/// The tags are compared by VALUE ([`etag_value`]): a client may send a tag back with or
+/// without the double quotes HTTP's quoted-string syntax wraps it in, and both name the same
+/// object.
+///
+/// ONE place for the rule, so every conditional write in this service — the one-shot write
+/// and the completion of a multipart upload — refuses exactly the same requests.
+pub fn write_precondition_fails(
+    held_etag: Option<&str>,
+    if_match: Option<&str>,
+    if_none_match: Option<&str>,
+) -> bool {
+    let none_match_fails = if_none_match.is_some() && held_etag.is_some();
+    let match_fails = if_match.is_some_and(|expected| {
+        held_etag.is_none_or(|held| etag_value(held) != etag_value(expected))
+    });
+    none_match_fails || match_fails
+}
+
+/// Whether a conditional READ of an object whose entity tag is `etag` and which was last
+/// modified at `last_modified` must be refused, given the `If-Match` and
+/// `If-Unmodified-Since` the request carried.
+///
+/// The two conditions a read is REFUSED for, as `GetObjectRequest` documents them: "Return
+/// the object only if its entity tag (ETag) is the same as the one specified in this header;
+/// otherwise, return a 412 Precondition Failed error" (`$IfMatch`), and "Return the object
+/// only if it has not been modified since the specified time; otherwise, return a 412
+/// Precondition Failed error" (`$IfUnmodifiedSince`). The same member documents the
+/// precedence when both are present: "If-Match condition evaluates to true, and;
+/// If-Unmodified-Since condition evaluates to false; then, S3 returns 200 OK and the data
+/// requested" — so an `If-Match` that holds decides the read on its own.
+///
+/// `If-Unmodified-Since` is compared at the one-second resolution an HTTP date has (RFC 9110
+/// §5.6.7), so an object stored within the same second as the date it is judged against
+/// counts as unmodified since it.
+///
+/// ONE place for the rule, so a GET and a HEAD of the same object cannot disagree about
+/// whether its preconditions hold.
+pub fn read_precondition_fails(
+    etag: &str,
+    last_modified: SystemTime,
+    if_match: Option<&str>,
+    if_unmodified_since: Option<SystemTime>,
+) -> bool {
+    if let Some(expected) = if_match {
+        return etag_value(etag) != etag_value(expected);
+    }
+    if_unmodified_since.is_some_and(|since| whole_seconds(last_modified) > whole_seconds(since))
+}
+
+/// `instant` truncated to whole seconds since the epoch, the resolution an HTTP date carries
+/// — `None` for an instant before the epoch, which no object this store holds was written
+/// at.
+fn whole_seconds(instant: SystemTime) -> Option<u64> {
+    instant
+        .duration_since(::std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_secs())
+}
+
 /// The same digest as [`object_etag`], Base64 encoded the way the `Content-MD5` header
 /// carries it: "The Base64 encoded 128-bit MD5 digest of the data"
 /// (`PutObjectRequest$ContentMD5`), which is what makes that header checkable.
@@ -7390,6 +7627,169 @@ impl ObjectPartRecord {
         self.checksum.as_ref().map_or(0, String::len)
     }
 }
+
+/// One span of an object's bytes: the first and last byte INCLUSIVE, the way HTTP's
+/// `Content-Range` and `Range` both state a span.
+///
+/// Non-empty by construction ([`ByteSpan::new`]), because an empty span is not a span HTTP
+/// can state: `Content-Range` names a first and a last byte, so a response can only report
+/// one that holds at least one byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ByteSpan {
+    /// The first byte of the span, counted from zero.
+    first: usize,
+    /// The LAST byte of the span, inclusive.
+    last: usize,
+}
+
+impl ByteSpan {
+    /// The span from `first` to `last` inclusive, or `None` when that is no span at all
+    /// (`last` before `first`).
+    pub fn new(first: usize, last: usize) -> Option<Self> {
+        (first <= last).then_some(Self { first, last })
+    }
+
+    /// The first byte of the span.
+    pub fn first(self) -> usize {
+        self.first
+    }
+
+    /// The last byte of the span, inclusive.
+    pub fn last(self) -> usize {
+        self.last
+    }
+
+    /// How many bytes the span holds — what `Content-Length` reports for a response carrying
+    /// it, since "Content-Length is the length of the body actually being returned".
+    pub fn len(self) -> usize {
+        self.last - self.first + 1
+    }
+
+    /// Never empty: see [`ByteSpan`].
+    pub fn is_empty(self) -> bool {
+        false
+    }
+
+    /// Those bytes of `body`, clamped to what it holds so a span can never read past it.
+    pub fn slice(self, body: &[u8]) -> Vec<u8> {
+        let first = self.first.min(body.len());
+        let end = (self.last + 1).min(body.len());
+        body[first..end].to_vec()
+    }
+
+    /// The `Content-Range` header value for this span of a representation of `total` bytes:
+    /// `bytes <first>-<last>/<total>`, the one form RFC 9110 (HTTP Semantics, "Content-Range")
+    /// defines for a `bytes` range.
+    pub fn content_range(self, total: usize) -> String {
+        format!("bytes {}-{}/{}", self.first, self.last, total)
+    }
+}
+
+/// What a `Range` header asks of a representation of a given size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeRequest {
+    /// The header asks for exactly this span.
+    Span(ByteSpan),
+    /// The header is well formed but asks for bytes the representation does not have, which
+    /// is the one range condition HTTP answers with a refusal ([`INVALID_RANGE_CODE`]).
+    Unsatisfiable,
+    /// The header asks for nothing this emulator can answer as a single range — a form the
+    /// `bytes` unit does not define, or several ranges at once, which "Amazon S3 doesn't
+    /// support retrieving multiple ranges of data per `GET` request"
+    /// (`GetObjectRequest$Range`). RFC 9110 lets a server "ignore a Range header field",
+    /// which is what S3 does: the whole representation is served.
+    Ignored,
+}
+
+/// What the `Range` header `header` asks of a representation of `total` bytes.
+///
+/// The `bytes` unit's three forms, from RFC 9110's "Range" grammar: `bytes=<first>-<last>`,
+/// `bytes=<first>-` (to the end) and `bytes=-<suffix>` (the last `<suffix>` bytes). A
+/// `<last>` past the end is clamped to it, because the span is "the remaining bytes of the
+/// representation" in that case, and a suffix longer than the representation selects the
+/// whole of it.
+///
+/// One place for the rule, so every reader that serves a ranged request ([`Object`]'s own
+/// readers) answers the same span, the same refusal and the same ignored header.
+pub fn requested_range(header: &str, total: usize) -> RangeRequest {
+    let Some(set) = header.trim().strip_prefix("bytes=") else {
+        // Another unit entirely: "An origin server MUST ignore a Range header field that
+        // contains a range unit it does not understand" (RFC 9110).
+        return RangeRequest::Ignored;
+    };
+    let mut spans = set.split(',');
+    let (Some(single), None) = (spans.next(), spans.next()) else {
+        return RangeRequest::Ignored;
+    };
+    let Some((first, last)) = single.trim().split_once('-') else {
+        return RangeRequest::Ignored;
+    };
+    let (first, last) = (first.trim(), last.trim());
+    match (first.parse::<usize>(), last.parse::<usize>()) {
+        // `bytes=-<suffix>`: the last `suffix` bytes. A zero-length suffix selects nothing,
+        // which is unsatisfiable, and so is any suffix of an empty representation.
+        (Err(_), Ok(suffix)) if first.is_empty() => {
+            if suffix == 0 || total == 0 {
+                return RangeRequest::Unsatisfiable;
+            }
+            let first = total.saturating_sub(suffix);
+            ByteSpan::new(first, total - 1).map_or(RangeRequest::Unsatisfiable, RangeRequest::Span)
+        }
+        // `bytes=<first>-` : from `first` to the end of the representation.
+        (Ok(first), Err(_)) if last.is_empty() => {
+            if first >= total {
+                return RangeRequest::Unsatisfiable;
+            }
+            ByteSpan::new(first, total - 1).map_or(RangeRequest::Unsatisfiable, RangeRequest::Span)
+        }
+        // `bytes=<first>-<last>` : the span, with `last` clamped to the final byte. A
+        // `<last>` BEFORE `<first>` makes the spec "syntactically invalid" (RFC 9110's
+        // `byte-range-spec` grammar), which is a header to ignore rather than a range to
+        // refuse: the refusal is for a valid range the representation cannot satisfy.
+        (Ok(first), Ok(last)) => {
+            if last < first {
+                return RangeRequest::Ignored;
+            }
+            if first >= total {
+                return RangeRequest::Unsatisfiable;
+            }
+            ByteSpan::new(first, last.min(total - 1))
+                .map_or(RangeRequest::Unsatisfiable, RangeRequest::Span)
+        }
+        _ => RangeRequest::Ignored,
+    }
+}
+
+/// The code S3 answers a read whose `Range` asks for bytes the object does not have:
+/// `InvalidRange`, HTTP 416 — not a shape in this model, so it travels through the
+/// unmodelled channel.
+pub const INVALID_RANGE_CODE: &str = "InvalidRange";
+/// See [`INVALID_RANGE_CODE`] — the status that code's entry in Amazon S3's "Error
+/// responses" list publishes: "416 Requested Range Not Satisfiable".
+pub const INVALID_RANGE_STATUS: u16 = 416;
+/// The `<Message>` that same entry publishes — FIXED text, naming neither the range asked
+/// for nor the object's size.
+pub const INVALID_RANGE_MESSAGE: &str = "The requested range is not satisfiable";
+
+/// The code S3 answers a read whose `partNumber` names no part of the object:
+/// `InvalidPartNumber`, HTTP 416 — also unmodelled in this model, from the same published
+/// list.
+pub const INVALID_PART_NUMBER_CODE: &str = "InvalidPartNumber";
+/// See [`INVALID_PART_NUMBER_CODE`].
+pub const INVALID_PART_NUMBER_STATUS: u16 = 416;
+/// The `<Message>` that code's entry publishes — FIXED text, which is why it names no part
+/// number.
+pub const INVALID_PART_NUMBER_MESSAGE: &str = "The requested partnumber is not satisfiable";
+
+/// The value `accept-ranges` carries for an object S3 can serve byte ranges of: "Indicates
+/// that a range of bytes was specified in the request" (`GetObjectOutput$AcceptRanges`).
+///
+/// The one range unit HTTP defines over a representation's bytes, and the unit
+/// [`requested_range`] reads a `Range` header in — so the header a read ADVERTISES and the
+/// unit a read is SERVED in cannot drift apart, and the two readers that advertise it
+/// (`GetObject` and `HeadObject`) answer the same value.
+pub const ACCEPT_RANGES_BYTES: &str = "bytes";
+
 
 /// The `Checksum*` members a reader reports for a stored checksum: the one its algorithm
 /// names, and the `ChecksumType` beside it. Every other member is `None`, because an object
@@ -7803,6 +8203,21 @@ pub struct ComAmazonawsS3Amazons3State {
     /// Private: the two methods below are the only way in or out, so the quota and the
     /// release cannot be applied in one place and skipped in another.
     vended_sessions: BTreeMap<String, SystemTime>,
+    /// The metadata tables that exist in the managed table bucket's namespace
+    /// ([`METADATA_TABLE_NAMESPACE`]), by table name.
+    ///
+    /// ONE namespace for the whole store, because that is its scope: the managed table
+    /// bucket is one per Region and every bucket's metadata tables are created inside it, so
+    /// a table name is taken or free for the store rather than for one bucket.
+    ///
+    /// Kept apart from the bucket's own configuration because the two have different
+    /// lifetimes: deleting a metadata configuration deletes the configuration, NOT the
+    /// tables it created ("Delete the journal table, and then try again", the
+    /// `ErrorDetails$ErrorCode` documentation for `JournalTableAlreadyExists`), so a later
+    /// create of the same configuration finds its table name still taken and provisions into
+    /// [`METADATA_TABLE_STATUS_FAILED`]. Nothing in this service's API deletes a table from
+    /// the namespace: it is an S3 Tables resource, which this service owns no part of.
+    metadata_namespace_tables: BTreeSet<String>,
 }
 
 impl Default for ComAmazonawsS3Amazons3State {
@@ -7825,6 +8240,7 @@ impl Default for ComAmazonawsS3Amazons3State {
             published_retained_bytes: 0,
             published_versions: 0,
             vended_sessions: BTreeMap::new(),
+            metadata_namespace_tables: BTreeSet::new(),
         };
         store.record_published_buckets();
         store
@@ -7872,6 +8288,45 @@ impl ComAmazonawsS3Amazons3State {
     /// so a request presenting it presents a credential the emulator ISSUED.
     pub fn holds_vended_session(&self, access_key_id: &str) -> bool {
         self.vended_sessions.contains_key(access_key_id)
+    }
+
+    /// Whether the managed table bucket's namespace already holds a metadata table named
+    /// `table` — see [`Self::metadata_namespace_tables`].
+    ///
+    /// What a create of a metadata configuration asks before it provisions a table: a name
+    /// already in the namespace is one S3 cannot create a second table under, which is the
+    /// `*AlreadyExists` provisioning failure the configuration then reports.
+    pub fn metadata_namespace_holds(&self, table: &str) -> bool {
+        self.metadata_namespace_tables.contains(table)
+    }
+
+    /// How many more tables the managed table bucket's namespace has room for
+    /// ([`MAX_METADATA_NAMESPACE_TABLES`]).
+    ///
+    /// The namespace is the one record here that nothing releases — a table outlives the
+    /// configuration that created it, which is the whole point of it — so what keeps it
+    /// bounded is this ceiling: a create that would carry it past the maximum is refused
+    /// instead, with nothing recorded. Read under the guard the caller already holds, so two
+    /// concurrent creates cannot both fit in room only one of them has.
+    pub fn metadata_namespace_room(&self) -> usize {
+        MAX_METADATA_NAMESPACE_TABLES.saturating_sub(self.metadata_namespace_tables.len())
+    }
+
+    /// Record `table` as a table of the managed table bucket's namespace, reporting whether
+    /// the namespace had room for it ([`Self::metadata_namespace_room`]).
+    ///
+    /// Called for each table a create really provisions, so the namespace holds exactly the
+    /// tables this store has created — and keeps holding them once the configuration that
+    /// created them is deleted, which is what the namespace is for. `false` records nothing.
+    pub fn record_metadata_namespace_table(&mut self, table: &str) -> bool {
+        if self.metadata_namespace_tables.contains(table) {
+            return true;
+        }
+        if self.metadata_namespace_room() == 0 {
+            return false;
+        }
+        self.metadata_namespace_tables.insert(table.to_string());
+        true
     }
 
     /// Every bucket this account holds, as `(name, bucket)` in bucket-name order — the
@@ -9396,6 +9851,16 @@ pub const INVALID_OBJECT_STATE_STATUS: u16 = 403;
 /// code/message pairs rather than being built in the handler.
 pub const RESTORE_NOT_ALLOWED_MESSAGE: &str =
     "Restore is not allowed for the object's current storage class";
+
+/// The `<Message>` S3 sends beside [`INVALID_OBJECT_STATE_CODE`] when a read is barred by
+/// the storage class the object's bytes are in: "The operation is not valid for the object's
+/// storage class."
+///
+/// A fixed sentence for that one condition — it names neither the object nor its class, so
+/// nothing in it is derived from the request — which is why it lives here beside the other
+/// code/message pairs rather than being built in the handler.
+pub const INVALID_OBJECT_STATE_READ_MESSAGE: &str =
+    "The operation is not valid for the object's storage class";
 
 /// The code `RestoreObject` answers when a retrieval is already running on the version it
 /// names: `RestoreAlreadyInProgress`, with HTTP 409 Conflict — the special error that

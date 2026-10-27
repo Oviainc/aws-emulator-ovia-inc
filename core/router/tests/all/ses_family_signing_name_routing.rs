@@ -123,10 +123,22 @@ pub(crate) fn authorization(signing_name: &str) -> String {
     )
 }
 
-/// An `awsQuery` request body: the `Action` form field the query protocol routes on, plus
-/// SES v1's API version.
-fn query_body(action: &str) -> String {
-    format!("Action={action}&Version=2010-12-01")
+/// SES v1's API version, which an `awsQuery` body carries beside its `Action`
+/// (`smithy_query(query="service_info")`: version 2010-12-01).
+pub(crate) const SES_V1_API_VERSION: &str = "2010-12-01";
+
+/// An `awsQuery` request body: the `Action` form field the query protocol routes on, SES v1's
+/// API version, and the operation's own input members, each percent-encoded as a form
+/// component.
+fn query_body(action: &str, fields: &[(&str, &str)]) -> String {
+    let mut body = format!("Action={action}&Version={SES_V1_API_VERSION}");
+    for (name, value) in fields {
+        body.push('&');
+        body.push_str(name);
+        body.push('=');
+        body.push_str(&crate::query_wire::form_encode(value));
+    }
+    body
 }
 
 /// The text of the one `<name>…</name>` element in an XML body, or `None`.
@@ -156,8 +168,12 @@ pub(crate) fn error_code(body: &str) -> String {
         .unwrap_or_default()
 }
 
-/// A signed `awsQuery` SES v1 call: `POST /` with the `Action` in the form body.
-fn ses_v1_call(case: &'static str, action: &str) -> Call {
+/// A signed `awsQuery` SES v1 call: `POST /` with the `Action` in the form body, and the
+/// operation's own input members beside it.
+///
+/// Shared with the sibling suites named on [`BOOT_STACK_SIZE`], so no suite writes its own
+/// account of what an SES v1 request looks like.
+pub(crate) fn ses_v1_call(case: &'static str, action: &str, fields: &[(&str, &str)]) -> Call {
     Call {
         case,
         method: "POST",
@@ -166,7 +182,7 @@ fn ses_v1_call(case: &'static str, action: &str) -> Call {
         signing_name: Some("ses"),
         content_type: Some("application/x-www-form-urlencoded"),
         target: None,
-        body: query_body(action),
+        body: query_body(action, fields),
     }
 }
 
@@ -195,7 +211,11 @@ fn rows() -> Vec<(Call, Expect)> {
         // and answered in SES v1's own XML envelope — never a JSON `__type` body an
         // XML-protocol client cannot parse.
         (
-            ses_v1_call("ses v1 VerifyEmailIdentity, signed", "VerifyEmailIdentity"),
+            ses_v1_call(
+                "ses v1 VerifyEmailIdentity, signed",
+                "VerifyEmailIdentity",
+                &[],
+            ),
             Expect {
                 status: None,
                 code: None,
@@ -204,7 +224,7 @@ fn rows() -> Vec<(Call, Expect)> {
             },
         ),
         (
-            ses_v1_call("ses v1 ListIdentities, signed", "ListIdentities"),
+            ses_v1_call("ses v1 ListIdentities, signed", "ListIdentities", &[]),
             Expect {
                 status: None,
                 code: None,
@@ -223,7 +243,7 @@ fn rows() -> Vec<(Call, Expect)> {
                 signing_name: None,
                 content_type: Some("application/x-www-form-urlencoded"),
                 target: None,
-                body: query_body("GetSendQuota"),
+                body: query_body("GetSendQuota", &[]),
             },
             Expect {
                 status: None,
@@ -461,7 +481,7 @@ fn unclaimed_rows() -> Vec<Call> {
             signing_name: None,
             content_type: Some("application/x-www-form-urlencoded"),
             target: None,
-            body: query_body("ListIdentities"),
+            body: query_body("ListIdentities", &[]),
         },
         Call {
             // A SESv2 path at MailManager's endpoint host, for the same reason.

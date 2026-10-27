@@ -534,8 +534,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
             headers: &[],
             status: 400,
             code: "InvalidPartOrder",
-            message: "The list of parts was not in ascending order. The parts list must be \
-                      specified in order by part number.",
+            message: "The list of parts was not in ascending order. Parts must be ordered by \
+                      part number.",
         },
         RefusalCase {
             case: "one part number named twice",
@@ -548,8 +548,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
             headers: &[],
             status: 400,
             code: "InvalidPartOrder",
-            message: "The list of parts was not in ascending order. The parts list must be \
-                      specified in order by part number.",
+            message: "The list of parts was not in ascending order. Parts must be ordered by \
+                      part number.",
         },
         RefusalCase {
             case: "a part number the upload holds nothing under",
@@ -561,8 +561,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
             status: 400,
             code: "InvalidPart",
             message: "One or more of the specified parts could not be found. The part may \
-                      not have been uploaded, or the specified entity tag may not have \
-                      matched the part's entity tag.",
+                      not have been uploaded, or the specified entity tag may not match \
+                      the part's entity tag.",
         },
         RefusalCase {
             case: "an entity tag that is not the named part's",
@@ -574,8 +574,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
             status: 400,
             code: "InvalidPart",
             message: "One or more of the specified parts could not be found. The part may \
-                      not have been uploaded, or the specified entity tag may not have \
-                      matched the part's entity tag.",
+                      not have been uploaded, or the specified entity tag may not match \
+                      the part's entity tag.",
         },
         RefusalCase {
             case: "a part other than the last one below the published minimum part size",

@@ -3831,6 +3831,68 @@ pub fn storage_configuration_arn(region: &str, storage_configuration_id: &str) -
     )
 }
 
+/// An identity this store has just minted for a resource it is about to hold.
+#[derive(Debug)]
+pub struct MintedResource {
+    /// The store sequence the identity was drawn at, which the record keeps as its page
+    /// position so a list pages the resources in creation order.
+    pub sequence: u64,
+    /// The id itself: [`mint_id`] over the drawn sequence, at the length the resource's
+    /// modelled id allows.
+    pub id: String,
+    /// The ARN naming [`Self::id`], built by the resource's own ARN constructor.
+    pub arn: String,
+}
+
+/// A fresh id of `id_len` characters that no resource `taken` reports as already named,
+/// re-minted from a fresh sequence while it is, with the sequence first drawn.
+///
+/// The ONE place this service's "mint a fresh id, re-mint on collision" rule lives, so
+/// every identity it issues is unique by construction and not by probability. The id and
+/// the drawn sequence are independent: the sequence is the record's page position, kept
+/// whatever re-minting the collision check needed.
+fn mint_unique_id<T>(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    id_len: usize,
+    taken: T,
+) -> (u64, String)
+where
+    T: Fn(&ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState, &str) -> bool,
+{
+    let sequence = state.next_sequence();
+    let mut id = mint_id(sequence, id_len);
+    while taken(state, &id) {
+        let retry = state.next_sequence();
+        id = mint_id(retry, id_len);
+    }
+    (sequence, id)
+}
+
+/// A fresh identity for a resource keyed by its ARN: an id of `id_len` characters, the
+/// ARN `arn_of` builds around it, and the sequence the record keeps.
+///
+/// `holds` answers whether this store already holds a resource under a candidate ARN —
+/// the lookup of the map the caller is about to insert into — and the identity is
+/// re-minted while it does, through the one rule [`mint_unique_id`] states. Every
+/// creating operation of this service mints through here, so one ARN can never denote
+/// two resources and the five creates cannot drift apart on how they ensure it.
+pub fn mint_unique_arn<A, H>(
+    state: &mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    id_len: usize,
+    arn_of: A,
+    holds: H,
+) -> MintedResource
+where
+    A: Fn(&str) -> String,
+    H: Fn(&ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState, &str) -> bool,
+{
+    let (sequence, id) = mint_unique_id(state, id_len, |state, candidate| {
+        holds(state, &arn_of(candidate))
+    });
+    let arn = arn_of(&id);
+    MintedResource { sequence, id, arn }
+}
+
 /// When a token issued now for `duration_minutes` expires.
 pub fn expiration_time(duration_minutes: i32) -> SystemTime {
     let minutes = u64::try_from(duration_minutes).unwrap_or(0);
@@ -4126,24 +4188,22 @@ pub fn issue_token_record(
     requested: RequestedToken,
 ) -> Option<ParticipantTokenRecord> {
     // A fresh id per issuance, re-minted on the (vanishingly unlikely) chance it already
-    // names a participant of this stage — stored or minted earlier in this same request —
-    // the same uniqueness rule `CreateStage` applies to a minted stage ARN, so both ids
-    // this service mints are unique by construction and not by probability.
-    let mut participant_id = mint_id(state.next_sequence(), PARTICIPANT_ID_LEN);
-    while in_flight
-        .iter()
-        .any(|record| record.participant_id == participant_id)
-        || state
-            .participant_tokens
-            .get(stage_arn)
-            .is_some_and(|records| {
-                records
-                    .iter()
-                    .any(|record| record.participant_id == participant_id)
-            })
-    {
-        participant_id = mint_id(state.next_sequence(), PARTICIPANT_ID_LEN);
-    }
+    // names a participant of this stage — stored or minted earlier in this same request.
+    // Minted through the one place this service applies that rule, so the id a token
+    // carries is unique by construction and not by probability.
+    let (_, participant_id) = mint_unique_id(state, PARTICIPANT_ID_LEN, |state, candidate| {
+        in_flight
+            .iter()
+            .any(|record| record.participant_id == candidate)
+            || state
+                .participant_tokens
+                .get(stage_arn)
+                .is_some_and(|records| {
+                    records
+                        .iter()
+                        .any(|record| record.participant_id == candidate)
+                })
+    });
 
     let token = mint_participant_token(credentials)?;
     let duration_minutes = requested

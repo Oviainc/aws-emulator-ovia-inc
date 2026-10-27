@@ -45,15 +45,18 @@
 //! a later call publishes the capacity it asked for
 //! ([`ComAmazonawsBatchAwsbatchv20160810State::rearm_resting_service_jobs`]).
 //!
-//! # Every job state change is published to EventBridge
+//! # Every job state CHANGE is published to EventBridge
 //!
 //! AWS Batch notifies the account's default EventBridge bus as a job moves through
-//! its statuses, which is the documented, polling-free way to observe a job. So
-//! every write of a job's status — the `SUBMITTED` a submit stores, the moves the
-//! clock materialises, and the terminal status a cancel or a terminate writes —
-//! records a [`JobStateChange`] here, and the operation that caused it drains the
-//! queue and publishes the changes once this store's lock is released
-//! ([`publish_job_state_changes`]).
+//! its statuses, which is the documented, polling-free way to observe a job. An event
+//! reports a TRANSITION of a job the service already holds, so the initial status a
+//! submit stores is not one: a job's event stream begins at its FIRST move out of that
+//! initial status ("Events aren't created for the initial job submission" — the User
+//! Guide's "Job state change events"). So every write of a job's status that MOVES it —
+//! the moves the clock materialises, and the terminal status a cancel, a terminate or a
+//! queue deletion writes — records a [`JobStateChange`] here, and the operation that
+//! caused it drains the queue and publishes the changes once this store's lock is
+//! released ([`publish_job_state_changes`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3080,21 +3083,22 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         if let Some(due) = due {
             self.jobs_due.insert((due, id.clone()));
         }
-        // A job enters `SUBMITTED` here, which is a state change like any other:
-        // AWS Batch publishes one for every status a job takes, the first included.
-        let created_at = self.jobs.get(&id).map_or(0, |job| job.created_at);
-        self.record_job_state_change(&id, created_at);
+        // A job's INITIAL status is not a state change: a job state change event reports
+        // a job the service already holds MOVING, so nothing is queued for the status a
+        // submit stores. This job's stream starts at its first move out of it, which
+        // `set_job_status`/`finish_job` record.
         Ok(())
     }
 
     /// Queue the job state change `id` has just taken at `at`, for publication to
     /// EventBridge.
     ///
-    /// Called from the ONE place each status is written (`insert_job`,
-    /// [`Self::set_job_status`], [`Self::finish_job`]), so every transition a job
+    /// Called from the ONE place each status MOVE is written
+    /// ([`Self::set_job_status`], [`Self::finish_job`]), so every transition a job
     /// makes — clock-owed or caller-driven — is recorded exactly once and none can
-    /// be published twice. The detail is rendered here, while the record still
-    /// holds the status this change is about.
+    /// be published twice. The status a job is CREATED in is not a transition and is
+    /// never recorded here (`Self::insert_job`). The detail is rendered here, while the
+    /// record still holds the status this change is about.
     fn record_job_state_change(&mut self, id: &str, at: i64) {
         let Some(job) = self.jobs.get(id) else {
             return;

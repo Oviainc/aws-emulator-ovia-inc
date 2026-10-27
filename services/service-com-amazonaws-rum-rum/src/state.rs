@@ -1691,6 +1691,31 @@ pub fn access_denied(denial: &authorization::Denied) -> AccessDeniedException {
     }
 }
 
+/// `AccessDeniedException` for a write whose target this service cannot resolve, so there
+/// is no resource to authorize it against.
+///
+/// A write addressed by the minted `AppMonitorId` (`PutRumEvents`, the data plane) is
+/// authorized against the monitor that id names: the decision needs that monitor's ARN and
+/// its resource-based policy. An id no stored monitor holds — never minted, or minted for a
+/// monitor since deleted — leaves nothing to decide against, so the grant cannot be
+/// established and the write is refused as an authorization failure rather than as a
+/// missing resource. The body carries [`CALLER_LACKS_PERMISSIONS_MESSAGE`] alone: it names
+/// neither the id nor the action, so a caller learns nothing about whether a monitor with
+/// that id exists.
+pub fn caller_lacks_permissions() -> AccessDeniedException {
+    AccessDeniedException {
+        message: CALLER_LACKS_PERMISSIONS_MESSAGE.to_string(),
+    }
+}
+
+/// The whole message of [`caller_lacks_permissions`].
+///
+/// A CONSTANT rather than a format string: nothing of the request appears in it, which is
+/// the point of this refusal — the resource it was asked about is exactly what it must not
+/// describe.
+pub const CALLER_LACKS_PERMISSIONS_MESSAGE: &str =
+    "Caller principal does not have permissions for that resource.";
+
 /// The wire error code, and the HTTP status, a request IAM does not allow is refused with.
 ///
 /// One definition for the whole service, beside the body [`access_denied`] builds: the

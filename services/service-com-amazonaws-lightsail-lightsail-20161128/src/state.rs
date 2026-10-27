@@ -801,6 +801,9 @@ pub const OPERATION_TYPE_SET_RESOURCE_ACCESS_FOR_BUCKET: &str = "SetResourceAcce
 /// carries, the modelled `OperationType` enum's own
 /// `UpdateInstanceMetadataOptions` member.
 pub const OPERATION_TYPE_UPDATE_INSTANCE_METADATA_OPTIONS: &str = "UpdateInstanceMetadataOptions";
+/// The `operationType` the log entry of a `StartGUISession` call carries, the
+/// modelled `OperationType` enum's own `StartGUISession` member.
+pub const OPERATION_TYPE_START_GUI_SESSION: &str = "StartGUISession";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -4843,10 +4846,10 @@ pub struct StoredInstance {
     pub state: Lifecycle,
     /// The state the clock owes this instance, while one is outstanding.
     pub due: Option<DueTransition>,
-    /// The GUI (Amazon DCV) session access `CreateGUISessionAccessDetails`
-    /// created for this virtual computer, while one exists. A session runs ON
-    /// the instance, so it lives on the instance's own record: deleting the
-    /// instance takes its session with it.
+    /// The GUI (Amazon DCV) session access `StartGUISession` and
+    /// `CreateGUISessionAccessDetails` created for this virtual computer, while
+    /// one exists. A session runs ON the instance, so it lives on the instance's
+    /// own record: deleting the instance takes its session with it.
     pub gui_session: Option<StoredGuiSession>,
     /// How this instance's metadata service is configured — what
     /// `UpdateInstanceMetadataOptions` sets and `Instance$metadataOptions`
@@ -5335,10 +5338,24 @@ impl StoredGuiSession {
     /// span, so a caller that reads straight after the call still observes the
     /// transient status — and `started` after it.
     pub fn starting(token: String, now_ms: i64) -> Self {
+        Self::starting_once_ready(token, now_ms, now_ms)
+    }
+
+    /// Access details minted at `now_ms` carrying `token`, for a session on a
+    /// virtual computer that is itself serving from `ready_at_ms`.
+    ///
+    /// A session runs ON the computer, so it cannot be up before the computer
+    /// is: the session comes up [`STATE_TRANSITION_MILLIS`] after the LATER of
+    /// the two instants, which is `now_ms` for a computer that is already
+    /// running and the instant the clock owes that computer its running state
+    /// for one that is still coming up.
+    pub fn starting_once_ready(token: String, now_ms: i64, ready_at_ms: i64) -> Self {
         Self {
             token,
             created_at_ms: now_ms,
-            starts_at_ms: now_ms.saturating_add(STATE_TRANSITION_MILLIS),
+            starts_at_ms: ready_at_ms
+                .max(now_ms)
+                .saturating_add(STATE_TRANSITION_MILLIS),
         }
     }
 
@@ -12607,12 +12624,22 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// no instance must not consume an identifier, and the mint and the write
     /// live together here so no caller can be answered with a session the store
     /// does not hold.
+    ///
+    /// A session started on a virtual computer that is still coming up is up
+    /// once that computer is: the session is a session ON the computer, so the
+    /// instant it finishes coming up follows the one the clock already owes the
+    /// computer its running state (see
+    /// [`StoredGuiSession::starting_once_ready`]).
     pub fn create_gui_session(&mut self, name: &str, now_ms: i64) -> Option<StoredGuiSession> {
-        if !self.instances.contains_key(name) {
-            return None;
-        }
+        let instance = self.instances.get(name)?;
+        // Only a transition INTO `running` makes the computer ready; one into
+        // any other state leaves the session's start where this call is.
+        let ready_at_ms = instance
+            .due
+            .filter(|due| due.state == RUNNING)
+            .map_or(now_ms, |due| due.at_ms);
         let token = self.mint_uuid();
-        let session = StoredGuiSession::starting(token, now_ms);
+        let session = StoredGuiSession::starting_once_ready(token, now_ms, ready_at_ms);
         self.instances.get_mut(name)?.gui_session = Some(session.clone());
         Some(session)
     }
@@ -14398,7 +14425,14 @@ impl ComAmazonawsLightsailLightsail20161128State {
             // session whose hour has run out WHILE the computer kept running is
             // left where it is: `CreateGUISessionAccessDetails` reports it as
             // `startExpired`, which is what tells a caller to resume it.
-            if instance.state != RUNNING && instance.gui_session.is_some() {
+            //
+            // A session on a computer that is still COMING UP is left where it
+            // is: that computer has not stopped serving, it has not started
+            // yet, and the session's own start already waits for it
+            // (`StoredGuiSession::starting_once_ready`).
+            if (instance.state == STOPPING || instance.state == STOPPED)
+                && instance.gui_session.is_some()
+            {
                 instance.gui_session = None;
             }
         }

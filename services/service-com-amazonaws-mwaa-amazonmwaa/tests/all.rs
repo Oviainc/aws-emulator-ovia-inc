@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/airflow_rest_api.rs"]
 mod airflow_rest_api;
+#[path = "all/env_endpoint_front_door.rs"]
+mod env_endpoint_front_door;
 #[path = "all/env_endpoint_not_found_wording.rs"]
 mod env_endpoint_not_found_wording;
 #[path = "all/env_endpoint_payload.rs"]

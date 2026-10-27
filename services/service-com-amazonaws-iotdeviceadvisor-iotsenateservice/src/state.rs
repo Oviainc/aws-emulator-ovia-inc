@@ -333,7 +333,8 @@ pub struct SuiteRun {
     /// Set only once the status is terminal.
     pub end_at: Option<SystemTime>,
     pub error_reason: Option<String>,
-    /// The Device Advisor endpoint a device under test connects to for this run.
+    /// The Device Advisor endpoint this run's primary device connects to, as
+    /// [`endpoint_for`] derives it from that device.
     pub endpoint: String,
     /// The instant the next status transition becomes due, while one is owed.
     pub next_transition_at: Option<SystemTime>,
@@ -911,10 +912,12 @@ fn host_region(label_length: usize, region: &str) -> &str {
 /// The ACCOUNT-LEVEL Device Advisor endpoint for this account in `region`.
 ///
 /// Device Advisor vends one account-scoped host of the form
-/// `<account>.deviceadvisor.iot.<region>.amazonaws.com`, which is what a suite run reports
-/// and what a device under test connects to. It is derived here rather than stored, so
-/// every operation that has to report it — `StartSuiteRun`, the suite-run reads, and
-/// `GetEndpoint` — answers the same host for the same account and region.
+/// `<account>.deviceadvisor.iot.<region>.amazonaws.com`, and this is the host reported to a
+/// caller that names NO device under test. It is derived here rather than stored, so the
+/// same account and region always answer the same host.
+///
+/// An operation that REPORTS an endpoint reaches it through [`endpoint_for`] rather than
+/// calling this directly, so no two operations can report different hosts for one device.
 pub fn endpoint_for_region(region: &str) -> String {
     let label = ::emulator_server::emulator_account_id();
     endpoint_host(label, host_region(label.len(), region))
@@ -1177,6 +1180,23 @@ pub fn endpoint_for_device(region: &str, device: &DeviceIdentity<'_>) -> String 
         })
         .collect();
     endpoint_host(&label, region)
+}
+
+/// The Device Advisor host the device `device` names connects to, in `region`: the ONE
+/// derivation every operation that reports an endpoint goes through.
+///
+/// A caller or a run that names no device is reported the account-level host
+/// ([`endpoint_for_region`]); one that names a device — by its thing, its certificate or the
+/// role it assumes — is reported that device's own host ([`endpoint_for_device`]). Both are
+/// a function of the account, the region and the identity alone, with nothing stored and
+/// nothing per call, so the host a suite run reports for its primary device and the host
+/// `GetEndpoint` vends for that same device are the same string.
+pub fn endpoint_for(region: &str, device: &DeviceIdentity<'_>) -> String {
+    if device.names_no_device() {
+        endpoint_for_region(region)
+    } else {
+        endpoint_for_device(region, device)
+    }
 }
 
 /// True when `value` is an Amazon Resource Name of `service`.

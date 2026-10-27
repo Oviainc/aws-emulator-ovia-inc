@@ -156,7 +156,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 UpdateLoggingConfigurationErrorModeled::InternalServerException(
@@ -196,6 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let workspace_status = workspace.status_code.clone();
+        let workspace_arn = workspace.arn.clone();
 
         // This operation UPDATES an existing configuration: a workspace that holds none
         // has nothing to point elsewhere, which is the modelled 404 that
@@ -259,8 +259,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         logging.transition_due = Some(now + crate::state::TRANSITION_DELAY);
         logging.update_token = input.client_token;
 
-        Ok(UpdateLoggingConfigurationOutput {
+        let response = UpdateLoggingConfigurationOutput {
             status: crate::state::logging_configuration_status(logging),
-        })
+        };
+        // This call CHANGED this service's state, so it leaves the audit record every
+        // mutating handler of this crate leaves: the operation, the resource it changed
+        // and the access-key id the REQUEST presented — nothing of the configuration
+        // itself (see [`crate::state::record_state_change`]). The replayed `clientToken`
+        // above wrote nothing, so it records nothing. A logging configuration has no ARN
+        // of its own, so the resource is the workspace it hangs off — the same resource
+        // `DeleteLoggingConfiguration` records.
+        crate::state::record_state_change(Self::NAME, &workspace_arn, ctx.parts());
+        Ok(response)
     }
 }
