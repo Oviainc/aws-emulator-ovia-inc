@@ -324,6 +324,44 @@ impl CallerScope {
 /// account-level suppression list".
 pub const DEFAULT_SUPPRESSION_SCOPE: &str = "ACCOUNT";
 
+/// The `(SuppressedReasons, SuppressionScope)` pair a write of one tenant's
+/// `TenantSuppressionAttributes` stores, from the members the request carried, or
+/// the refusal wording for a value outside the modelled set.
+///
+/// Shared by every operation that writes a tenant's suppression preferences, so the
+/// preferences a tenant ends up with do not depend on which one wrote them: a member
+/// the request omits takes its documented default rather than whatever happened to be
+/// stored — `TenantSuppressionAttributes$SuppressionScope` "defaults to ACCOUNT scope"
+/// when the request names none, and a tenant that names no reason adds nothing to its
+/// list automatically. Both enums carry their values as plain strings here, so the
+/// value set is the caller's to enforce; the wording is the service's shared one (see
+/// [`modelled_enum_value`]).
+pub fn tenant_suppression_preferences(
+    suppressed_reasons: Option<Vec<String>>,
+    suppression_scope: Option<String>,
+) -> Result<(Vec<String>, String), String> {
+    let reasons = suppressed_reasons
+        .unwrap_or_default()
+        .into_iter()
+        .map(|reason| {
+            modelled_enum_value(
+                "SuppressedReasons",
+                reason,
+                crate::ops::types::SUPPRESSION_LIST_REASON_VALUES,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let scope = match suppression_scope {
+        Some(scope) => modelled_enum_value(
+            "SuppressionScope",
+            scope,
+            crate::ops::types::SUPPRESSION_LIST_SCOPE_VALUES,
+        )?,
+        None => DEFAULT_SUPPRESSION_SCOPE.to_string(),
+    };
+    Ok((reasons, scope))
+}
+
 /// The AWS-Region this request executes in, which is also the region to stamp into
 /// the ARNs it mints: the SigV4 credential scope's region, else [`DEFAULT_REGION`].
 ///
@@ -1480,6 +1518,16 @@ impl TenantRecord {
             // computed.
             reputation_impact: None,
         }
+    }
+
+    /// Write this tenant's suppression preferences, as a request that carries
+    /// `TenantSuppressionAttributes` asks for.
+    ///
+    /// Both members are replaced together: the preferences a request states are the
+    /// tenant's whole preferences afterwards, never merged with what was there.
+    pub fn set_suppression_preferences(&mut self, suppressed_reasons: Vec<String>, scope: String) {
+        self.suppressed_reasons = suppressed_reasons;
+        self.suppression_scope = scope;
     }
 
     /// Write the customer-managed sending status of this tenant's reputation entity,

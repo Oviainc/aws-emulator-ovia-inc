@@ -17,6 +17,8 @@ mod access_log_group_names;
 mod channel_lifecycle;
 #[path = "all/cmaf_child_manifest_name.rs"]
 mod cmaf_child_manifest_name;
+#[path = "all/cmaf_child_manifest_name_follows_the_endpoint.rs"]
+mod cmaf_child_manifest_name_follows_the_endpoint;
 #[path = "all/dash_live_manifest_defaults.rs"]
 mod dash_live_manifest_defaults;
 #[path = "all/duration_floor_one_implementation.rs"]
