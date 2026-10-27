@@ -179,6 +179,16 @@ pub const TRANSIT_GATEWAY_REGISTRATION_KIND: &str = "transit-gateway-registratio
 /// not-found refusal spells the resource type.
 pub const TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATION_KIND: &str =
     "transit-gateway-connect-peer-association";
+/// The resource kind a CORE NETWORK CONNECT PEER association reports in a refusal that
+/// names it.
+///
+/// Like [`TRANSIT_GATEWAY_CONNECT_PEER_ASSOCIATION_KIND`] this is not an ARN resource type
+/// and no id is minted for it: "Describes a core network Connect peer association"
+/// (`smithy_query shape=ConnectPeerAssociation`) carries no id of its own, so the PEER is
+/// its identity ([`ConnectPeerAssociationRecord`]) and this name is only how a not-found
+/// refusal spells the resource type of the association, as against the
+/// [`CONNECT_PEER_KIND`] of the peer itself.
+pub const CONNECT_PEER_ASSOCIATION_KIND: &str = "connect-peer-association";
 /// See [`GLOBAL_NETWORK_KIND`]. The model constrains this one's id itself:
 /// `CoreNetworkId` carries `pattern ^core-network-([0-9a-f]{8,17})$`
 /// (`smithy_query shape=CoreNetworkId`), which the 17 hex digits of
@@ -3142,12 +3152,20 @@ impl ConnectPeerAssociationRecord {
 
     /// The modelled `ConnectPeerAssociation` for this record, as of `now`.
     pub fn to_shape(&self, now: SystemTime) -> ConnectPeerAssociation {
+        self.to_shape_with_state(self.state_at(now))
+    }
+
+    /// The modelled `ConnectPeerAssociation` for this record, forcing `state` — used by
+    /// `DisassociateConnectPeer`, which reports the association it just removed as
+    /// `DELETING`, exactly as [`TransitGatewayConnectPeerAssociationRecord::to_shape_with_state`]
+    /// serves its own disassociate.
+    pub fn to_shape_with_state(&self, state: &str) -> ConnectPeerAssociation {
         ConnectPeerAssociation {
             connect_peer_id: Some(self.connect_peer_id.clone()),
             global_network_id: Some(self.global_network_id.clone()),
             device_id: Some(self.device_id.clone()),
             link_id: self.link_id.clone(),
-            state: Some(self.state_at(now).to_string()),
+            state: Some(state.to_string()),
         }
     }
 }
