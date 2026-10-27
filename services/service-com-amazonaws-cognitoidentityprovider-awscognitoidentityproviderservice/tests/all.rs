@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/add_custom_attributes.rs"]
 mod add_custom_attributes;
+#[path = "all/add_user_pool_client_secret.rs"]
+mod add_user_pool_client_secret;
 #[path = "all/admin_confirm_sign_up.rs"]
 mod admin_confirm_sign_up;
 #[path = "all/admin_group_listing.rs"]

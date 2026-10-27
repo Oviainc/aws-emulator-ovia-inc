@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIdentityMailFromDomainAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIdentityMailFromDomainAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIdentityMailFromDomainAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the custom MAIL FROM setup of the identities a call names.
+//!
+//! Every member comes from the identity's own stored record
+//! ([`crate::state::MailFromSettings`], written by `SetIdentityMailFromDomain`);
+//! the only write is materialising the status move the clock already owes a
+//! `Pending` setup ([`crate::state::MailFromSettings::settle`]), which was due at
+//! that instant whether or not anybody read it.
 //!
 //! ## Shape of an operation
 //!
@@ -132,18 +131,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIdentityMailFromDomainAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIdentityMailFromDomainAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIdentityMailFromDomainAttributes"))
+        // `ctx` carries the request's Region, which is the Region an identity ARN
+        // this request names has to be in; nothing else here needs it.
+        let region = crate::state::region_from_request(ctx.parts());
+        // "Can only get custom MAIL FROM attributes for up to 100 identities at a
+        // time" (this operation's own documentation), read from the one bound every
+        // per-identity reporting operation shares.
+        if input.identities.len() > crate::state::MAX_IDENTITIES_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                format!(
+                    "Identities may name at most {} identities per call, got {}",
+                    crate::state::MAX_IDENTITIES_PER_CALL,
+                    input.identities.len()
+                ),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and it models no server
+            // error of its own.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetIdentityMailFromDomainAttributes",
+            ));
+        };
+        let mut state = state.lock();
+        // One instant for the whole report, so every setup it settles is settled
+        // against the same clock reading.
+        let now = std::time::SystemTime::now();
+
+        // Only identities that are actually in the list get an entry, exactly as
+        // `GetIdentityNotificationAttributes` reports its own map: the output is a
+        // MAP keyed by identity with no per-identity failure member and this
+        // operation models no error at all, so "this account has no such identity"
+        // can only be said by leaving the entry out.
+        let mut mail_from_domain_attributes = std::collections::HashMap::new();
+        for requested in &input.identities {
+            // Keyed the way the writer keys it, with the ARN form the `Identity`
+            // member documents resolved to the identity it names; a value naming no
+            // identity of this account gets no entry.
+            let Ok(key) = crate::state::resolve_identity(requested, &region) else {
+                continue;
+            };
+            let key = key.to_string();
+            let Some(identity) = state.identities.get_mut(&key) else {
+                continue;
+            };
+            let name = identity.name.clone();
+            let attributes = match identity.mail_from.as_mut() {
+                // An identity with no custom MAIL FROM domain still has a behaviour
+                // to report — `BehaviorOnMXFailure` is `@required` — and no custom
+                // domain and no setup status to report with it, so both of those
+                // read back empty.
+                None => IdentityMailFromDomainAttributes {
+                    mail_from_domain: String::new(),
+                    mail_from_domain_status: String::new(),
+                    behavior_on_mx_failure: crate::state::BehaviorOnMxFailure::default()
+                        .as_wire()
+                        .to_string(),
+                },
+                Some(settings) => IdentityMailFromDomainAttributes {
+                    mail_from_domain: settings.domain.clone(),
+                    // The move out of `Pending` the clock already owes is
+                    // materialised here, so the status reported is the one that was
+                    // due at `now` rather than the one last written.
+                    mail_from_domain_status: settings.settle(now).as_wire().to_string(),
+                    behavior_on_mx_failure: settings.behavior_on_mx_failure.as_wire().to_string(),
+                },
+            };
+            mail_from_domain_attributes.insert(name, attributes);
+        }
+
+        Ok(GetIdentityMailFromDomainAttributesOutput {
+            mail_from_domain_attributes,
+        })
     }
 }

@@ -174,11 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !crate::state::name_satisfies_pattern(&input.name) {
             return Err(CreateFirewallDomainListErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(
-                        "Name must carry at least one letter, digit, hyphen, underscore, \
-                         apostrophe or space, and cannot consist of only digits"
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::name_pattern_violation(&input.name)),
                 },
             )
             .into());
