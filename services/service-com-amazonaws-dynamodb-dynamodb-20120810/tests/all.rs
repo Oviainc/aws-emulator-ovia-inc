@@ -71,6 +71,9 @@ mod paging_start_keys;
 mod partiql_statements;
 #[path = "all/partiql_transactions.rs"]
 mod partiql_transactions;
+#[path = "all/refusal_contracts_and_expression_pre_images.rs"]
+mod refusal_contracts_and_expression_pre_images;
+
 #[path = "all/region_from_the_request_endpoint.rs"]
 mod region_from_the_request_endpoint;
 #[path = "all/regions_indexes_and_capacity.rs"]

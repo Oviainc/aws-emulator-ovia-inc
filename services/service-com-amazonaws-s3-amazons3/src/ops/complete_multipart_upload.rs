@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CompleteMultipartUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CompleteMultipartUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CompleteMultipartUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this is the close of the multipart upload loop — it assembles the parts
+//! the request names, in ascending part-number order, into the object at the upload's key
+//! ([`crate::state::ComAmazonawsS3Amazons3State::complete_multipart_upload`]), answers that
+//! object's multipart entity tag ([`crate::state::multipart_object_etag`]), and leaves the
+//! upload id naming nothing. `GetObject` and `HeadObject` read the assembled object back,
+//! and `ListParts` reports the upload is gone.
 //!
 //! ## Shape of an operation
 //!
@@ -264,14 +262,25 @@ use super::types::*;
 // `CompleteMultipartUploadError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `CompleteMultipartUploadError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#CompleteMultipartUpload")]
+// The operation's MODELED errors — this operation declares NONE
+// (`smithy_query(query="operation",operation="CompleteMultipartUpload")` reports an empty
+// error list), so the enum is widened with `extra_errors` by the three shapes this SERVICE
+// models for the failures a completion really has: the bucket (`NoSuchBucket`, HTTP 404),
+// the upload itself (`NoSuchUpload`, "The specified multipart upload does not exist", HTTP
+// 404 — the same shape `UploadPart`, `ListParts` and `AbortMultipartUpload` are widened by,
+// so one address is refused one way), and `InvalidRequest` (HTTP 400) for the one mismatch
+// the model names an error for: "if there's a mismatch between the specified object size
+// value and the actual object size value, it results in an HTTP 400 InvalidRequest error"
+// (`CompleteMultipartUploadRequest$MpuObjectSize`).
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#CompleteMultipartUpload",
+    extra_errors = ["NoSuchBucket", "NoSuchUpload", "InvalidRequest"]
+)]
 #[derive(Debug)]
 pub enum CompleteMultipartUploadErrorModeled {
+    NoSuchBucket(NoSuchBucket),
+    NoSuchUpload(NoSuchUpload),
+    InvalidRequest(InvalidRequest),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -325,18 +334,537 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CompleteMultipartUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CompleteMultipartUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A completion needs nothing from the request beyond its deserialized input: the
+        // upload it assembles is named by the bucket, the key and the upload id, and the
+        // parts to assemble arrive as the `@httpPayload` member `MultipartUpload`.
+        let _ = ctx;
+
+        // What this emulator cannot carry out faithfully, refused rather than answered with
+        // an object that would claim it. The SSE-C members carry a customer-provided KEY
+        // that S3 itself does not store, so no upload here was initiated with one
+        // (`CreateMultipartUpload` and `UploadPart` refuse them identically), `RequestPayer`
+        // asks to be charged for the request, which nothing here does, and `If-None-Match`
+        // "expects the '*' (asterisk) character"
+        // (`CompleteMultipartUploadRequest$IfNoneMatch`) — any other value asks for a
+        // conditional S3 itself answers `NotImplemented`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CompleteMultipartUpload"))
+        // The checksum members are NOT in this list: each carries the client's own value for
+        // bytes this emulator holds, and the checksum the response reports is the one it
+        // computes itself from the parts it assembled, under the algorithm the initiation
+        // named — so nothing is claimed about a value that was merely sent.
+        if let Some(unserved) = unserved_feature(&input) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "CompleteMultipartUpload with {unserved}"
+            )));
+        }
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `CompleteMultipartUploadRequest$ExpectedBucketOwner`, judged the way
+        // every other operation here judges it: this emulator serves one account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        // "In the CompleteMultipartUpload request, you must provide the parts list and
+        // ensure that the parts list is complete" (this operation's own documentation), and
+        // "if you do not supply a valid Part with your request, the service sends back an
+        // HTTP 400 response" (`CompletedMultipartUpload$Parts`). A body carrying no part at
+        // all does not validate against the schema the API publishes for it, which is
+        // `MalformedXML` (400).
+        let named_parts = input
+            .multipart_upload
+            .as_ref()
+            .and_then(|upload| upload.parts.as_deref())
+            .unwrap_or_default();
+        if named_parts.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_XML_CODE,
+                MALFORMED_XML_STATUS,
+                crate::state::MALFORMED_XML_MESSAGE,
+            ));
+        }
+
+        // The parts are assembled "in ascending order by part number", so the list has to
+        // BE in that order: a number that does not rise above the one before it — a
+        // descending pair or the same number twice — is `InvalidPartOrder` (400). Judged
+        // before the upload is looked at, because it is a property of the request alone.
+        let mut previous: Option<i32> = None;
+        for named in named_parts {
+            let number = named.part_number.unwrap_or_default();
+            if previous.is_some_and(|earlier| earlier >= number) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    INVALID_PART_ORDER_CODE,
+                    INVALID_PART_ORDER_STATUS,
+                    INVALID_PART_ORDER_MESSAGE,
+                ));
+            }
+            previous = Some(number);
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the upload cannot be assembled at all, and none of the
+            // modelled errors says that — each would be a false statement about the upload —
+            // so the documented code for a request this emulator could not carry out goes
+            // out rather than a 501, which would claim this operation is unwritten.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        let mut store = state.lock();
+        let Some(bucket_record) = store.bucket(&input.bucket) else {
+            return Err(CompleteMultipartUploadErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        // An upload is addressed by its id AND the key it was initiated for, exactly as
+        // `UploadPart` and `AbortMultipartUpload` address it, so an id named under another
+        // key names no upload — and so does one a completion or an abort already took away,
+        // which is what makes a second completion of one upload `NoSuchUpload` (404).
+        let Some(upload) = bucket_record
+            .multipart_upload(&input.upload_id)
+            .filter(|upload| upload.key == input.key)
+        else {
+            return Err(CompleteMultipartUploadErrorModeled::NoSuchUpload(NoSuchUpload {}).into());
+        };
+
+        // "For each part in the list, you must provide the PartNumber value and the ETag
+        // value that are returned after that part was uploaded" (this operation's own
+        // documentation), so each named part is matched against the part the upload really
+        // holds under that number, by the tag that part upload answered. A number the upload
+        // holds no part for, and a tag that is not that part's, are both `InvalidPart` (400).
+        //
+        // The entity tags are compared by VALUE: a client may send the tag back with or
+        // without the double quotes HTTP's quoted-string syntax wraps it in, and both name
+        // the same part.
+        let mut assembled: Vec<&[u8]> = Vec::with_capacity(named_parts.len());
+        for (position, named) in named_parts.iter().enumerate() {
+            let number = named.part_number.unwrap_or_default();
+            let Some(held) = upload.part(number) else {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    INVALID_PART_CODE,
+                    INVALID_PART_STATUS,
+                    INVALID_PART_MESSAGE,
+                ));
+            };
+            let named_etag = named.e_tag.as_deref().unwrap_or_default();
+            if crate::state::etag_value(named_etag) != crate::state::etag_value(&held.etag) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    INVALID_PART_CODE,
+                    INVALID_PART_STATUS,
+                    INVALID_PART_MESSAGE,
+                ));
+            }
+            // "Part size: 5 MiB to 5 GiB. There is no minimum size limit on the last part of
+            // your multipart upload" (Amazon S3 User Guide, Amazon S3 multipart upload
+            // limits) — the LAST part of the list being assembled, whatever its number, is
+            // the one that is exempt. A smaller part anywhere else is `EntityTooSmall` (400),
+            // which is why a part is judged against this ceiling at completion rather than
+            // when it was uploaded: nothing knows which part is last until this list says so.
+            let last = position + 1 == named_parts.len();
+            if !last && held.body.len() < crate::state::MIN_MULTIPART_PART_BYTES {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    ENTITY_TOO_SMALL_CODE,
+                    ENTITY_TOO_SMALL_STATUS,
+                    ENTITY_TOO_SMALL_MESSAGE,
+                ));
+            }
+            assembled.push(&held.body);
+        }
+
+        // "Upon receiving this request, Amazon S3 concatenates all the parts in ascending
+        // order by part number to create a new object": the object's bytes are the parts'
+        // bytes, in the order the list named them, and its entity tag is the multipart tag
+        // over those same parts ([`crate::state::multipart_object_etag`]) rather than the
+        // digest of the assembled bytes.
+        let etag = crate::state::multipart_object_etag(&assembled);
+        // The checksum the completed object carries, under the algorithm the INITIATING
+        // request named: "when you perform a CreateMultipartUpload request, you specify the
+        // checksum algorithm" and the checksum type "determines how part-level checksums are
+        // combined to create an object-level checksum for multipart objects"
+        // (`CompleteMultipartUploadRequest$ChecksumType`). Computed here from the parts this
+        // completion assembled — the only place that sees them all — so the value describes
+        // the object that was written; an upload that named no algorithm stores no checksum.
+        //
+        // The `Checksum*` members THIS request carries, on the parts and on the object, are
+        // the client's own values for the same bytes: the response reports what the emulator
+        // computed itself rather than anything echoed back.
+        let checksum = crate::state::multipart_checksum(
+            upload.checksum_algorithm.as_deref(),
+            upload.checksum_type.as_deref(),
+            &assembled,
+        );
+        let reported = crate::state::reported_checksums(checksum.as_ref());
+        // How the object was assembled, kept with it: the parts are gone as parts once this
+        // completion takes the upload away, so this is the only record of "a collection of
+        // parts associated with a multipart upload" (`GetObjectAttributesParts`) a later read
+        // of the object's attributes can report. Each part's own checksum is under the
+        // object's algorithm, over that part's bytes.
+        let parts: Vec<crate::state::ObjectPartRecord> = named_parts
+            .iter()
+            .zip(assembled.iter())
+            .map(|(named, body)| crate::state::ObjectPartRecord {
+                part_number: named.part_number.unwrap_or_default(),
+                size: i64::try_from(body.len()).unwrap_or(i64::MAX),
+                checksum: upload
+                    .checksum_algorithm
+                    .as_deref()
+                    .and_then(|algorithm| crate::state::full_object_checksum(algorithm, body)),
+            })
+            .collect();
+        let body: Vec<u8> = assembled.concat();
+
+        // "The expected total object size of the multipart upload request. If there's a
+        // mismatch between the specified object size value and the actual object size
+        // value, it results in an HTTP 400 InvalidRequest error"
+        // (`CompleteMultipartUploadRequest$MpuObjectSize`) — judged against the size the
+        // assembled parts really come to, so nothing is written when the caller expected
+        // another object.
+        let assembled_size = i64::try_from(body.len()).unwrap_or(i64::MAX);
+        if input
+            .mpu_object_size
+            .is_some_and(|declared| declared != assembled_size)
+        {
+            return Err(CompleteMultipartUploadErrorModeled::InvalidRequest(InvalidRequest {}).into());
+        }
+
+        // The conditional members, judged against what the key holds NOW — the write is what
+        // they make conditional, so they are judged here, immediately before it, rather than
+        // on anything the parts were uploaded against:
+        //
+        // * "Uploads the object only if the object key name does not already exist in the
+        //   bucket specified. Otherwise, Amazon S3 returns a 412 Precondition Failed error"
+        //   (`CompleteMultipartUploadRequest$IfNoneMatch`).
+        // * "Uploads the object only if the ETag (entity tag) value provided during the
+        //   WRITE operation matches the ETag of the object in S3. If the ETag values do not
+        //   match, the operation returns a 412 Precondition Failed error"
+        //   (`CompleteMultipartUploadRequest$IfMatch`) — so a key holding nothing at all
+        //   matches no tag either.
+        //
+        // A refused completion leaves the upload in progress with every part it held, so the
+        // caller can read the object's tag and retry.
+        let held_etag = bucket_record
+            .object(&input.key)
+            .map(|object| object.etag.clone());
+        let condition_fails = (input.if_none_match.is_some() && held_etag.is_some())
+            || input.if_match.as_deref().is_some_and(|expected| {
+                held_etag
+                    .as_deref()
+                    .is_none_or(|held| crate::state::etag_value(held) != crate::state::etag_value(expected))
+            });
+        if condition_fails {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::PRECONDITION_FAILED_CODE,
+                crate::state::PRECONDITION_FAILED_STATUS,
+                crate::state::PRECONDITION_FAILED_MESSAGE,
+            ));
+        }
+
+        // Everything else about the object is what the INITIATING request settled — "when
+        // you initiate a multipart upload, you specify the options you want on the finished
+        // object" — read off the recorded upload rather than off this request, which carries
+        // none of it. The members a later call places on a stored version (its Object Lock
+        // retention and legal hold, its restore, its annotations and its ACL) are unset,
+        // which is the state any write leaves a version in.
+        let encryption = upload.encryption.clone();
+        let object = crate::state::Object {
+            etag: etag.clone(),
+            // The instant the object came into being, which is what `Last-Modified` reports:
+            // a completed upload is last modified when it was completed, not when its parts
+            // or its initiation arrived.
+            last_modified: ::std::time::SystemTime::now(),
+            storage_class: upload.storage_class.clone(),
+            content_type: upload.content_type.clone(),
+            cache_control: upload.cache_control.clone(),
+            content_disposition: upload.content_disposition.clone(),
+            content_encoding: upload.content_encoding.clone(),
+            content_language: upload.content_language.clone(),
+            expires: upload.expires.clone(),
+            website_redirect_location: upload.website_redirect_location.clone(),
+            metadata: upload.metadata.clone(),
+            tags: upload.tags.clone(),
+            // Minted by the store, which is the only place that sees the bucket's versioning
+            // state: a completion carries no id of its own either.
+            version_id: None,
+            encryption: encryption.clone(),
+            retention: None,
+            legal_hold: None,
+            restore: None,
+            annotations: ::std::collections::BTreeMap::new(),
+            acl: None,
+            checksum,
+            parts,
+            body,
+        };
+        let region = bucket_record.region.clone();
+
+        // The store performs the completion: the upload comes out, the object goes in under
+        // the key, and the write is subject to exactly the ceilings a one-shot write is.
+        let outcome = store.complete_multipart_upload(
+            &input.bucket,
+            &input.upload_id,
+            &input.key,
+            object,
+        );
+        let Some(outcome) = outcome else {
+            return Err(CompleteMultipartUploadErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        match outcome {
+            crate::state::UploadCompletion::Completed(_) => {}
+            crate::state::UploadCompletion::NoSuchUpload => {
+                return Err(
+                    CompleteMultipartUploadErrorModeled::NoSuchUpload(NoSuchUpload {}).into(),
+                );
+            }
+            // The write the completion performs can be refused for the same reasons a
+            // one-shot write can: an over-long key (the modelled `InvalidRequest`, as
+            // `PutObject` answers it) and the emulator's own ceilings, which no AWS error
+            // code describes and which therefore go out through the framework's 400
+            // `ValidationException` channel, the same channel `PutObject` and `UploadPart`
+            // answer their own byte budgets through. The upload is left in progress either
+            // way, so nothing of it is lost.
+            crate::state::UploadCompletion::Refused(refusal) => {
+                return Err(refused_write(&input, refusal));
+            }
+        }
+
+        Ok(CompleteMultipartUploadOutput {
+            // "The URI that identifies the newly created object"
+            // (`CompleteMultipartUploadOutput$Location`) — the virtual-hosted address of the
+            // key in the Region its bucket lives in, which is the form the operation's own
+            // example answers (`<Location>http://Example-Bucket.s3.<Region>.amazonaws.com/Example-Object</Location>`).
+            location: Some(location_of(&input.bucket, &region, &input.key)),
+            // "The name of the bucket that contains the newly created object" and "the
+            // object key of the newly created object" — the address the object was really
+            // written at.
+            bucket: Some(input.bucket.clone()),
+            key: Some(input.key.clone()),
+            // "Entity tag that identifies the newly created object's data" — the multipart
+            // tag over the parts that were assembled.
+            e_tag: Some(etag),
+            // "Version ID of the newly created object, in case the bucket has versioning
+            // turned on" — read back off the STORED object, so the caller is told the id the
+            // object is addressable by and nothing else.
+            version_id: version_id_of(&store, &input.bucket, &input.key),
+            // "If the object expiration is configured, this will contain the expiration date
+            // (expiry-date) and rule ID (rule-id)": the bucket's own lifecycle configuration
+            // applied to the object just stored, computed from it rather than stamped on it.
+            expiration: expiration_of(&store, &input.bucket, &input.key),
+            // The encryption the upload was initiated under, which is what the object is
+            // stored under and what every later read of it reports.
+            server_side_encryption: encryption.sse_algorithm.clone(),
+            ssekms_key_id: encryption.kms_key_id.clone(),
+            bucket_key_enabled: encryption.bucket_key_enabled,
+            // The checksum of the object that was assembled, under the member its algorithm
+            // names, with the `ChecksumType` that says how it was computed — read off the
+            // one record every later read of the object reports it from
+            // ([`crate::state::reported_checksums`]), so a `GetObject` that asks for the
+            // checksum answers exactly this value.
+            checksum_crc32: reported.crc32,
+            checksum_crc32_c: reported.crc32c,
+            checksum_crc64_nvme: reported.crc64nvme,
+            checksum_sha1: reported.sha1,
+            checksum_sha256: reported.sha256,
+            checksum_sha512: reported.sha512,
+            checksum_md5: reported.md5,
+            checksum_xxhash64: reported.xxhash64,
+            checksum_xxhash3: reported.xxhash3,
+            checksum_xxhash128: reported.xxhash128,
+            checksum_type: reported.checksum_type,
+            // Everything else this output can carry describes something no completed upload
+            // here has: `RequestCharged` reports a Requester Pays charge nothing here makes.
+            ..CompleteMultipartUploadOutput::default()
+        })
     }
+}
+
+/// The code and status S3 answers a request whose `x-amz-expected-bucket-owner` names
+/// another account with: "the request fails with the HTTP status code 403 Forbidden (access
+/// denied)" (`CompleteMultipartUploadRequest$ExpectedBucketOwner`), carrying the `AccessDenied`
+/// code and the text that code's entry in Amazon S3's "Error responses" list publishes.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+/// See [`ACCESS_DENIED_CODE`].
+const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The HTTP status [`crate::state::MALFORMED_XML_CODE`] is rendered with: 400, as that
+/// code's own entry in Amazon S3's "Error responses" list publishes.
+const MALFORMED_XML_STATUS: u16 = 400;
+
+/// The code S3 answers a completion naming a part it cannot match: `InvalidPart`, HTTP 400.
+///
+/// This service's model declares no shape for it (`smithy_query(query="shape",
+/// shape="com.amazonaws.s3#InvalidPart")` finds none), so it goes out through the
+/// unmodelled channel with the code and status Amazon S3's "Error responses" list of error
+/// codes publishes for it.
+const INVALID_PART_CODE: &str = "InvalidPart";
+/// See [`INVALID_PART_CODE`].
+const INVALID_PART_STATUS: u16 = 400;
+/// The `<Message>` that code's entry in the same list publishes — the FIXED text S3 sends
+/// whichever way the named part failed to match.
+const INVALID_PART_MESSAGE: &str =
+    "One or more of the specified parts could not be found. The part may not have been \
+     uploaded, or the specified entity tag may not have matched the part's entity tag.";
+
+/// The code S3 answers a completion whose parts list is not in ascending part-number order:
+/// `InvalidPartOrder`, HTTP 400 — also unmodelled in this service's model, from the same
+/// published list.
+const INVALID_PART_ORDER_CODE: &str = "InvalidPartOrder";
+/// See [`INVALID_PART_ORDER_CODE`].
+const INVALID_PART_ORDER_STATUS: u16 = 400;
+/// The `<Message>` that code's entry in the same list publishes.
+const INVALID_PART_ORDER_MESSAGE: &str =
+    "The list of parts was not in ascending order. The parts list must be specified in \
+     order by part number.";
+
+/// The code S3 answers a completion naming a part smaller than the published minimum part
+/// size: `EntityTooSmall`, HTTP 400 — also unmodelled in this service's model, from the same
+/// published list.
+const ENTITY_TOO_SMALL_CODE: &str = "EntityTooSmall";
+/// See [`ENTITY_TOO_SMALL_CODE`].
+const ENTITY_TOO_SMALL_STATUS: u16 = 400;
+/// The `<Message>` S3 sends with that code — the FIXED text it carries whichever part of
+/// the list was too small, and whatever the minimum it was judged against is (the sizes S3
+/// reports beside it travel in the `MinSizeAllowed`, `ProposedSize`, `PartNumber` and `ETag`
+/// members of the error document, which this service's model declares no shape for).
+const ENTITY_TOO_SMALL_MESSAGE: &str = "Your proposed upload is smaller than the minimum allowed size";
+
+/// The feature `input` asks for that this emulator does not serve, if any — named for the
+/// 501 that refuses it, the way `UploadPart` and `AbortMultipartUpload` name their own.
+fn unserved_feature(input: &CompleteMultipartUploadInput) -> Option<&'static str> {
+    [
+        (
+            input.sse_customer_algorithm.is_some(),
+            "SSECustomerAlgorithm",
+        ),
+        (input.sse_customer_key.is_some(), "SSECustomerKey"),
+        (input.request_payer.is_some(), "RequestPayer"),
+        (
+            // "Expects the '*' (asterisk) character"
+            // (`CompleteMultipartUploadRequest$IfNoneMatch`): any other value asks for a
+            // conditional on a tag, which S3 itself does not serve on this operation.
+            input
+                .if_none_match
+                .as_deref()
+                .is_some_and(|value| value.trim() != "*"),
+            "an If-None-Match other than '*'",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(asked, name)| asked.then_some(name))
+}
+
+/// The refusal a completion whose object write the store refused answers with, named the
+/// way `PutObject` names the same refusals of the same write.
+fn refused_write(
+    input: &CompleteMultipartUploadInput,
+    refusal: crate::state::ObjectWrite,
+) -> CompleteMultipartUploadError {
+    match refusal {
+        // Cannot be reached from here — the store reports these only for a write it
+        // performed, and a completion that got this far named a stored upload — but the
+        // match is total so a new outcome cannot be ignored silently.
+        crate::state::ObjectWrite::Created | crate::state::ObjectWrite::Replaced => {
+            crate::scaffolded::Scaffolded::validation(format!(
+                "completing the multipart upload of {:?} reported a write that was not \
+                 refused",
+                input.key
+            ))
+        }
+        // "The name for a key is a sequence of Unicode characters whose UTF-8 encoding is at
+        // most 1,024 bytes long" (Amazon S3 User Guide). A longer key is a parameter that is
+        // not valid for this request, which is what the modelled `InvalidRequest` reports.
+        crate::state::ObjectWrite::KeyTooLong { .. }
+        | crate::state::ObjectWrite::MetadataTooLarge { .. } => {
+            CompleteMultipartUploadErrorModeled::InvalidRequest(InvalidRequest {}).into()
+        }
+        crate::state::ObjectWrite::ObjectCountReached => {
+            crate::scaffolded::Scaffolded::validation(format!(
+                "the bucket {:?} already holds the maximum of {} objects this emulator \
+                 keeps per bucket; delete an object before completing the upload of {:?}",
+                input.bucket,
+                crate::state::MAX_OBJECTS_PER_BUCKET,
+                input.key
+            ))
+        }
+        crate::state::ObjectWrite::ByteBudgetReached { would_hold } => {
+            crate::scaffolded::Scaffolded::validation(format!(
+                "assembling {:?} would leave the bucket {:?} holding {would_hold} bytes of \
+                 objects, past the {} bytes this emulator keeps per bucket",
+                input.key,
+                input.bucket,
+                crate::state::MAX_OBJECT_BYTES_PER_BUCKET
+            ))
+        }
+        crate::state::ObjectWrite::TotalObjectCountReached => {
+            crate::scaffolded::Scaffolded::validation(format!(
+                "this emulator already holds the maximum of {} objects across every \
+                 bucket; delete an object before completing the upload of {:?}",
+                crate::state::MAX_OBJECTS_TOTAL,
+                input.key
+            ))
+        }
+        crate::state::ObjectWrite::TotalByteBudgetReached { would_hold } => {
+            crate::scaffolded::Scaffolded::validation(format!(
+                "assembling {:?} would leave this emulator holding {would_hold} bytes of \
+                 objects across every bucket, past the {} bytes it keeps in total",
+                input.key,
+                crate::state::MAX_OBJECT_BYTES_TOTAL
+            ))
+        }
+    }
+}
+
+/// The `Location` a completed upload reports: the virtual-hosted URI of `key` in the bucket
+/// named `bucket`, which lives in `region`.
+///
+/// "The URI that identifies the newly created object"
+/// (`CompleteMultipartUploadOutput$Location`), in the form this operation's own example
+/// answers — `<bucket>.s3.<region>.amazonaws.com/<key>` — so the Region is the one the
+/// bucket was created in rather than anything the request named. The key is percent-encoded
+/// per path SEGMENT, which leaves the `/` separators of a key prefix as the path separators
+/// they are while every other character that a URI path cannot carry verbatim is encoded.
+fn location_of(bucket: &str, region: &str, key: &str) -> String {
+    let path = key
+        .split('/')
+        .map(crate::state::url_encoded_key)
+        .collect::<Vec<String>>()
+        .join("/");
+    format!("https://{bucket}.s3.{region}.amazonaws.com/{path}")
+}
+
+/// The version id the object stored at `bucket`/`key` is addressable by, or `None` when it
+/// is the `null` version — one written while the bucket's versioning status was not
+/// `Enabled`, which has no id of its own.
+fn version_id_of(
+    store: &crate::state::ComAmazonawsS3Amazons3State,
+    bucket: &str,
+    key: &str,
+) -> Option<String> {
+    store
+        .bucket(bucket)
+        .and_then(|bucket| bucket.object(key))
+        .and_then(|object| object.version_id.clone())
+}
+
+/// The `Expiration` the bucket's lifecycle configuration gives the object stored at
+/// `bucket`/`key`, or `None` when the bucket carries no configuration that expires it.
+///
+/// Read off the STORED object, so the expiry date is dated from the instant the store
+/// recorded and the rule is matched against the tag set and size the object actually has.
+fn expiration_of(
+    store: &crate::state::ComAmazonawsS3Amazons3State,
+    bucket: &str,
+    key: &str,
+) -> Option<String> {
+    let bucket = store.bucket(bucket)?;
+    bucket.object_expiration_header(key, bucket.object(key)?)
 }

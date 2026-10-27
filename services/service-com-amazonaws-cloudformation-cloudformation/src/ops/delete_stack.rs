@@ -352,11 +352,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A resource the owning service refused to delete: the stack stays, in
                 // DELETE_FAILED with that service's own refusal as the reason, rather
                 // than reporting a deletion that did not happen.
-                stack.fail_transition(
-                    ::std::time::SystemTime::now(),
-                    status::DELETE_FAILED,
-                    failure,
-                );
+                let concluded = ::std::time::SystemTime::now();
+                // Each resource's own record takes the status this deletion left it in,
+                // so the per-resource view reports what became of it — the refusal on the
+                // one that could not be deleted, the completed deletion on the ones that
+                // were — rather than the status its create left behind.
+                stack.record_resource_deletion_statuses(&deleted.transitions, concluded);
+                stack.fail_transition(concluded, status::DELETE_FAILED, failure);
             }
         }
 

@@ -242,6 +242,42 @@ impl SerializableStruct for AccessDeniedException {
     }
 }
 
+/// The namespace a DynamoDB error body names its shape in.
+///
+/// It is the API-VERSION-qualified form of the model's namespace
+/// (`com.amazonaws.dynamodb`, with the service's `20120810` version as `v20120810`),
+/// which is the shape id this service puts on the wire. Spelled here because the
+/// generated per-operation error enums report the shape NAME only.
+const ERROR_SHAPE_NAMESPACE: &str = "com.amazonaws.dynamodb.v20120810";
+
+/// `shape_name` qualified by [`ERROR_SHAPE_NAMESPACE`].
+///
+/// [`OperationError::shape_name`] hands back a `&'static str`, so the qualified id is
+/// built once per distinct error shape and kept for the life of the process. The set it
+/// can hold is the set of error shapes this service's model declares — a constant of the
+/// model, not a function of the traffic — so it neither grows with requests nor needs
+/// eviction.
+///
+/// Built rather than matched: spelling the qualified ids out would be a second copy of
+/// the model's error list, which nothing keeps in step with the model, and the generated
+/// per-operation error enums are what own that list.
+fn qualified_shape_id(shape_name: &'static str) -> &'static str {
+    static QUALIFIED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<&'static str, &'static str>>,
+    > = std::sync::OnceLock::new();
+    let mut cache = QUALIFIED
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(qualified) = cache.get(shape_name) {
+        return qualified;
+    }
+    let qualified: &'static str =
+        Box::leak(format!("{ERROR_SHAPE_NAMESPACE}#{shape_name}").into_boxed_str());
+    cache.insert(shape_name, qualified);
+    qualified
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -354,12 +390,18 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
 
     /// The wire error code (`__type` on JSON/CBOR, `<Code>` on XML).
     ///
-    /// Keep the literal as it is: changing it changes the wire error code clients match
-    /// on. It is intentionally not tied to the Rust variant name.
+    /// A MODELED error is named by its API-version-qualified shape id — the form this
+    /// awsJson service puts in the error body, so a client or proxy that classifies an
+    /// error by the body's `__type` rather than by a header reads the whole shape id.
+    /// The three synthetic shapes below are not in the model, so they carry no shape id
+    /// to qualify and keep their bare names.
+    ///
+    /// Keep the literals as they are: changing one changes the wire error code clients
+    /// match on. They are intentionally not tied to the Rust variant names.
     fn shape_name(&self) -> &'static str {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
-            Self::Modeled(e) => e.shape_name(),
+            Self::Modeled(e) => qualified_shape_id(e.shape_name()),
             Self::ValidationException(_) => "ValidationException",
             Self::AccessDenied(_) => "AccessDeniedException",
         }

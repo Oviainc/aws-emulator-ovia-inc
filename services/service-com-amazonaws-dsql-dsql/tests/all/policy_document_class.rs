@@ -16,8 +16,11 @@
 //! characters), in nesting, in member count, in whitespace and in character set —
 //! not over one recorded document: the read reports back exactly the bytes that
 //! were persisted, never a re-serialised or normalised rendering of them. Every row
-//! is a parseable JSON document, which is what `PutClusterPolicy` accepts, so no
-//! row pins either entry point's answer to an unparseable one.
+//! is a parseable JSON document, which is what both entry points accept, so no
+//! row pins either entry point's answer to an unparseable one; the create each row
+//! drives sets `bypassPolicyLockoutSafetyCheck`, so the class is not narrowed to
+//! the documents the lockout safety check admits either — what is persisted and
+//! read back is the same record whichever way it was accepted.
 
 use serde_json::json;
 
@@ -137,7 +140,14 @@ async fn get_cluster_policy_reports_the_persisted_document_verbatim() {
     for case in policy_cases() {
         let dsql = Dsql::new();
         let created = dsql
-            .create(json!({"deletionProtectionEnabled": false, "policy": case.policy}))
+            .create(json!({
+                "deletionProtectionEnabled": false,
+                "policy": case.policy,
+                // This suite is about the document CLASS, not about which
+                // documents the lockout safety check admits, so every row accepts
+                // the risk explicitly and the check is out of the way.
+                "bypassPolicyLockoutSafetyCheck": true,
+            }))
             .await;
         assert_eq!(
             created.status, 200,

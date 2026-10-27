@@ -7,9 +7,11 @@
 //! resource does not hold is removed vacuously — the request asks for an absence and
 //! gets it — so repeating an untag answers the same success and changes nothing.
 //!
-//! An ARN this service holds no resource for is refused with the modelled
-//! `ClientException` (HTTP 400), exactly as `TagResource` refuses it, as is a `tagKeys`
-//! entry outside the bounds `TagKey` declares ([`crate::state::validate_tag_keys`]).
+//! A `resourceArn` this service holds no resource for is refused by the tag layer that
+//! resolves it, under that layer's not-found code
+//! ([`crate::state::unknown_resource_arn`]), exactly as `TagResource` refuses it; a
+//! `tagKeys` entry outside the bounds `TagKey` declares is the modelled `ClientException`
+//! (HTTP 400) ([`crate::state::validate_tag_keys`]).
 //!
 //! ## Shape of an operation
 //!
@@ -168,10 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(tags) = state.resource_tags_mut(&input.resource_arn) else {
-            return Err(UntagResourceErrorModeled::ClientException(
-                batch::not_found_exception("Resource", &input.resource_arn),
-            )
-            .into());
+            // A well-formed ARN that resolves to nothing is the tag layer's not-found,
+            // which is a different classification from the malformed ARN above: an
+            // idempotent teardown swallows this one and re-raises that one.
+            return Err(batch::unknown_resource_arn());
         };
 
         if let Some(held) = tags.as_mut() {

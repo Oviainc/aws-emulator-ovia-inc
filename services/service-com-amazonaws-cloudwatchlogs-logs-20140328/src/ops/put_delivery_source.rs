@@ -13,8 +13,9 @@
 //!
 //! The resource must also be one this endpoint serves: a resource of a global service is
 //! reached through its partition's single global endpoint, so a put naming one from any other
-//! Region is refused with `ValidationException`
-//! ([`crate::state::misplaced_delivery_source_message`]).
+//! Region is refused with `ValidationException`, telling the caller that this action is not
+//! supported for that kind of log in the Region the request reached
+//! ([`crate::state::unsupported_log_type_region_message`]).
 //!
 //! ## Shape of an operation
 //!
@@ -214,10 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reached through that partition's single global endpoint, so that endpoint's Region is
         // the only one that can hold a delivery source for it: a put naming such a resource
         // from any other Region names a resource this endpoint does not serve and is refused as
-        // the invalid parameter it is. A regional resource pins nothing here — its Region is
+        // the invalid parameter it is — this action is not served for that kind of log in the
+        // Region the request reached. A regional resource pins nothing here — its Region is
         // the caller's to name.
-        if let Some(message) = crate::state::misplaced_delivery_source_message(
-            "resourceArn",
+        if let Some(message) = crate::state::unsupported_log_type_region_message(
+            Self::NAME,
             &input.resource_arn,
             &region,
         ) {

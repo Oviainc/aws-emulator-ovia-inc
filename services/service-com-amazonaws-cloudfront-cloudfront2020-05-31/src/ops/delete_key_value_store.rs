@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteKeyValueStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteKeyValueStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteKeyValueStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a stored key value store under its version token: the record a later read
+//! answered from is REMOVED, so the name names nothing afterwards and is free for another
+//! create to claim. A store a stored function configuration still associates is refused
+//! with `CannotDeleteEntityWhileInUse` and stays readable.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +67,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -169,18 +169,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteKeyValueStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteKeyValueStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteKeyValueStore"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this
+        // call reads it: what a stored function configuration associates is decided
+        // against the store as it stands at this instant.
+        store.settle(SystemTime::now());
+
+        // A name no store holds names no resource to delete — "the entity was not found" —
+        // and is answered before the precondition, which can only be checked against a
+        // stored version.
+        let Some(stored) = store.key_value_store(&input.name) else {
+            return Err(DeleteKeyValueStoreErrorModeled::EntityNotFound(
+                crate::state::key_value_store_not_found(),
+            )
+            .into());
+        };
+        let current_etag = stored.etag.clone();
+        let arn = stored.arn.clone();
+
+        // The precondition is checked first, the way HTTP evaluates one: a caller holding a
+        // version that is no longer current is told that before anything about what the
+        // store is attached to. A token that is not a version token at all is "missing or
+        // not valid", and a well-formed token that is not the current one is a failed
+        // precondition.
+        match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(DeleteKeyValueStoreErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(DeleteKeyValueStoreErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // A store a function still associates is in use, so the delete is refused and the
+        // store stays readable: the association names the store by the ARN its own create
+        // minted, so the question is answered against the stored function configurations.
+        if store.key_value_store_is_associated(&arn) {
+            return Err(
+                DeleteKeyValueStoreErrorModeled::CannotDeleteEntityWhileInUse(
+                    crate::state::entity_in_use(),
+                )
+                .into(),
+            );
+        }
+
+        // Gone means gone: the record every read answered from is removed — with the tags
+        // it carried, which were held on it — so the name names no store afterwards and a
+        // later create may claim it again.
+        store.key_value_stores.remove(&input.name);
+
+        Ok(DeleteKeyValueStoreOutput)
     }
 }

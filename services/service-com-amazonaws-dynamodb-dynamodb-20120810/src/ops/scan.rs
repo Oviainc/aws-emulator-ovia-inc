@@ -342,6 +342,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
 
+        // A `FilterExpression` the request sends is VALIDATED whether or not the
+        // filtering itself is served: whether the expression is one this service's
+        // language accepts — a bare reserved word, an undefined `#name`, a syntax
+        // error — is a fact of the request, and refusing it as unwritten would answer
+        // "nobody implemented this" for a request no implementation could serve.
+        if let Some(expression) = input.filter_expression.as_deref() {
+            crate::state::ParsedCondition::parse(
+                "FilterExpression",
+                expression,
+                crate::state::Substitutions::new(
+                    input.expression_attribute_names.as_ref(),
+                    input.expression_attribute_values.as_ref(),
+                ),
+            )
+            .map_err(lift)?;
+        }
+        // A `ProjectionExpression` the request sends is validated the same way, and for
+        // the same reason.
+        if let Some(expression) = input.projection_expression.as_deref() {
+            crate::state::projection_expression_attributes(
+                "ProjectionExpression",
+                expression,
+                crate::state::Substitutions::new(input.expression_attribute_names.as_ref(), None),
+            )
+            .map_err(lift)?;
+        }
         if let Some(member) = unsupported_member(&input) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "Scan with {member}"

@@ -27,9 +27,10 @@
 //! * a `SamplingRule$ResourceARN` is judged on ARN SYNTAX, so a value that
 //!   constrains no resource is accepted and one that is not ARN syntax is
 //!   refused with a template naming the value and the syntax rule it broke;
-//! * a `RetrievalToken` of a form the service never mints is refused with a
-//!   template naming the value, while a well-formed token nothing stands behind
-//!   is a different class (`ResourceNotFoundException`, 404); and
+//! * a `RetrievalToken` of a form the service never mints is refused, on every
+//!   operation that takes one, with a template naming the value ONCE and
+//!   closing on one fixed detail phrase, while a well-formed token nothing
+//!   stands behind is a different class (`ResourceNotFoundException`, 404); and
 //! * a member outside its modelled `@pattern` is refused with AWS's validation
 //!   envelope quoting that pattern WITHOUT the anchors wrapping it, so the
 //!   expression the refusal reports is the one the client can re-apply.
@@ -38,7 +39,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_xray_awsxray::state::{
     retrieval_token_check, INVALID_INPUT_PARAMETERS_PREAMBLE, INVERTED_WINDOW_MESSAGE,
-    MAX_TRACE_IDS_PER_CALL,
+    MALFORMED_RETRIEVAL_TOKEN_DETAIL, MAX_TRACE_IDS_PER_CALL,
 };
 
 use super::xray_wire::{array, trace_id, Answer, Xray};
@@ -697,24 +698,33 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
         ("the minted width, carrying no check", "a".repeat(32)),
     ];
     for (label, token) in tokens {
-        let expected = format!(
-            "Invalid execution id {token} passed: Invalid execution id provided: {token}"
-        );
-        for (operation, body) in [
+        // Every operation that takes a `RetrievalToken`
+        // (`smithy_query(query="operation",operation="CancelTraceRetrieval,
+        // ListRetrievedTraces,GetRetrievedTracesGraph")`), with the leading
+        // clause it names the member by. The detail after `passed: ` is the
+        // SAME fixed phrase on all of them and carries no part of the request.
+        for (operation, path, clause, body) in [
             (
                 "ListRetrievedTraces",
+                "/ListRetrievedTraces",
+                "execution id",
                 json!({"RetrievalToken": token, "TraceFormat": "XRAY"}),
             ),
             (
                 "GetRetrievedTracesGraph",
+                "/GetRetrievedTracesGraph",
+                "execution id",
+                json!({"RetrievalToken": token}),
+            ),
+            (
+                "CancelTraceRetrieval",
+                "/CancelTraceRetrieval",
+                "retrieval token",
                 json!({"RetrievalToken": token}),
             ),
         ] {
-            let path = if operation == "ListRetrievedTraces" {
-                "/ListRetrievedTraces"
-            } else {
-                "/GetRetrievedTracesGraph"
-            };
+            let expected =
+                format!("Invalid {clause} {token} passed: {MALFORMED_RETRIEVAL_TOKEN_DETAIL}");
             let refused = xray.call(path, &body).await;
             assert_eq!(
                 (refused.status, refused.error_type.as_deref()),
@@ -726,6 +736,14 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
                 said(&refused),
                 expected,
                 "case {label:?} on {operation}: expected {expected:?}, got {:?}",
+                said(&refused)
+            );
+            // The detail is fixed text: the rejected value appears ONCE, as the
+            // sentence's only variable, so the sentence does not grow with it.
+            assert_eq!(
+                said(&refused).matches(token.as_str()).count(),
+                1,
+                "case {label:?} on {operation}: the rejected value must be named once, got {:?}",
                 said(&refused)
             );
         }
@@ -750,7 +768,7 @@ async fn a_token_of_no_minted_form_is_refused_with_the_services_template() {
          {missing:?}"
     );
     assert!(
-        !said(&missing).contains("Invalid execution id provided"),
+        !said(&missing).contains(MALFORMED_RETRIEVAL_TOKEN_DETAIL),
         "a token that is not there must not be stated as a malformed one, got {:?}",
         said(&missing)
     );

@@ -295,6 +295,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         let index_updates = validated_index_updates(&input).map_err(lift)?;
+        // "You can create or delete only one global secondary index per UpdateTable
+        // operation" (`UpdateTable$GlobalSecondaryIndexUpdates`). That is a LIMIT on
+        // the work one call may ask for rather than a malformed request, so it is
+        // answered with the control plane's modelled limit error — the code a client
+        // backs off and retries one index at a time on.
+        // A CREATE and a DELETE in one call are two different limits, so each is
+        // counted on its own.
+        if let Some(message) = index_lifecycle_actions_over_limit(&index_updates) {
+            return Err(UpdateTableErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // What the request's `StreamSpecification` asks for, resolved before the
         // store lock is taken: a specification that cannot hold together refuses the
         // whole update.
@@ -393,6 +408,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let declared = merged_definitions(table, &declared_definitions);
         let indexes = resolve_indexes(table, &billing_mode, &declared, &index_updates, now)
             .map_err(lift)?;
+        // The projection budget is summed across EVERY secondary index the table would
+        // carry after this update, the table's local indexes included: an index added
+        // here spends from the same budget as the ones created with the table.
+        crate::state::check_projection_budget(
+            indexes.iter().map(|index| &index.projection).chain(
+                table
+                    .local_secondary_indexes
+                    .iter()
+                    .map(|index| &index.projection),
+            ),
+        )
+        .map_err(lift)?;
         // Only the attribute definitions some key schema still uses are kept, so a
         // repeated UpdateTable cannot grow the stored list, and a definition the
         // request declares for no key at all is refused the way CreateTable refuses it.
@@ -407,7 +434,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stream = match (&stream_request, table.stream.clone()) {
             (StreamRequest::Unchanged, stored) => stored,
             (StreamRequest::Enable(_), Some(stored)) if stored.enabled => {
-                return Err(stream_in_use(&name, "already has a stream"))
+                return Err(stream_specification_invalid(&name, STREAM_ALREADY_ENABLED))
             }
             // A table with no stream, or one whose stream was disabled, gets a NEW
             // stream: a stream's identity is its ARN and label, and the disabled one
@@ -441,7 +468,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             }
             (StreamRequest::Disable, _) => {
-                return Err(stream_in_use(&name, "does not have a stream"))
+                return Err(stream_specification_invalid(&name, STREAM_NOT_ENABLED))
             }
         };
 
@@ -556,19 +583,29 @@ fn stream_not_registered(fault: crate::state::StreamFault) -> UpdateTableError {
     }
 }
 
-/// The modelled refusal for a `StreamSpecification` that contradicts the table's
-/// stored stream, which the model declares for exactly these two cases: "You receive
-/// a ResourceInUseException if you try to enable a stream on a table that already
-/// has a stream, or if you try to disable a stream on a table that doesn't have a
-/// stream" (`UpdateTable$StreamSpecification`).
-fn stream_in_use(name: &str, state: &str) -> UpdateTableError {
-    UpdateTableErrorModeled::ResourceInUseException(ResourceInUseException {
-        message: Some(format!(
-            "Attempt to change a resource which is still in use: Table {name} {state}"
-        )),
-    })
-    .into()
+/// The refusal a `StreamSpecification` that contradicts the table's stored stream gets:
+/// a request that asks to enable a stream the table already has, that asks to change the
+/// view type of a stream in place (which is the same request), or that asks to disable
+/// one the table does not have.
+///
+/// Classified as a `ValidationException` (HTTP 400) rather than as a resource-state
+/// conflict: neither is a state the table will leave on its own, so the request can
+/// never succeed as sent and the caller has to change it. The model's prose for
+/// `StreamSpecification` names `ResourceInUseException`, but the service answers the
+/// parameter error — and the CODE is what a client branches on, so a
+/// transient-conflict code would have an SDK retry an input that cannot succeed.
+///
+/// The sentence states what the table's stream is and the table it belongs to, both
+/// facts of the request and of the stored table.
+fn stream_specification_invalid(name: &str, state: &str) -> UpdateTableError {
+    crate::scaffolded::Scaffolded::validation(format!("{state}: TableName: {name}"))
 }
+
+/// What the table's stream already is, when a request asks to enable one.
+const STREAM_ALREADY_ENABLED: &str = "Table already has an enabled stream";
+
+/// What it is not, when a request asks to disable one.
+const STREAM_NOT_ENABLED: &str = "Table has no stream to disable";
 
 /// What a request's `StreamSpecification` asks of the table's stream.
 #[derive(Debug)]
@@ -591,10 +628,15 @@ fn requested_stream_change(
     let Some(specification) = input.stream_specification.as_ref() else {
         return Ok(StreamRequest::Unchanged);
     };
-    Ok(match crate::state::stream_view_type(specification)? {
-        Some(view_type) => StreamRequest::Enable(view_type.to_string()),
-        None => StreamRequest::Disable,
-    })
+    Ok(
+        match crate::state::stream_view_type(
+            specification,
+            crate::state::STREAM_VIEW_TYPE_REQUIRED_ON_ENABLE,
+        )? {
+            Some(view_type) => StreamRequest::Enable(view_type.to_string()),
+            None => StreamRequest::Disable,
+        },
+    )
 }
 
 /// One input member that can ASK FOR A CHANGE: its name, and the test for whether this
@@ -820,8 +862,6 @@ fn validated_index_updates(
         )));
     }
     let mut named: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
-    let mut creates = 0usize;
-    let mut deletes = 0usize;
     for update in &updates {
         let actions = usize::from(update.create.is_some())
             + usize::from(update.update.is_some())
@@ -833,24 +873,11 @@ fn validated_index_updates(
             )));
         }
         let index_name = match (&update.create, &update.update, &update.delete) {
-            (Some(create), _, _) => {
-                creates += 1;
-                create.index_name.as_str()
-            }
+            (Some(create), _, _) => create.index_name.as_str(),
             (_, Some(update), _) => update.index_name.as_str(),
-            (_, _, Some(delete)) => {
-                deletes += 1;
-                delete.index_name.as_str()
-            }
+            (_, _, Some(delete)) => delete.index_name.as_str(),
             _ => unreachable!("exactly one action is present"),
         };
-        if creates > 1 || deletes > 1 {
-            return Err(crate::state::RequestError::Validation(
-                "Invalid GlobalSecondaryIndexUpdates: you can create or delete only one global \
-                 secondary index per UpdateTable operation"
-                    .to_string(),
-            ));
-        }
         if !named.insert(index_name) {
             return Err(crate::state::RequestError::Validation(format!(
                 "Invalid GlobalSecondaryIndexUpdates: index {index_name} is named more than once"
@@ -858,6 +885,36 @@ fn validated_index_updates(
         }
     }
     Ok(updates)
+}
+
+/// Why one request asks for more index lifecycle work than a single `UpdateTable` may
+/// carry, or `None` when it stays inside the limit: "You can create or delete only one
+/// global secondary index per UpdateTable operation"
+/// (`UpdateTable$GlobalSecondaryIndexUpdates`).
+///
+/// A CREATE and a DELETE in one call are two different limits, so each is counted on
+/// its own and the sentence names the one the request broke and how many it asked for.
+fn index_lifecycle_actions_over_limit(updates: &[GlobalSecondaryIndexUpdate]) -> Option<String> {
+    /// How many indexes one `UpdateTable` may create, and how many it may delete.
+    const PER_CALL: usize = 1;
+    let creates = updates
+        .iter()
+        .filter(|update| update.create.is_some())
+        .count();
+    let deletes = updates
+        .iter()
+        .filter(|update| update.delete.is_some())
+        .count();
+    if creates <= PER_CALL && deletes <= PER_CALL {
+        return None;
+    }
+    // AWS's text for this limit is FIXED: it states the limit and nothing of which
+    // index or how many the request named, so it reads the same whichever side of the
+    // lifecycle the request asked twice for.
+    Some(format!(
+        "Subscriber limit exceeded: Only {PER_CALL} online index can be created or deleted \
+         simultaneously per table"
+    ))
 }
 
 /// The table's provisioned throughput after the update: "When switching from
@@ -871,7 +928,8 @@ fn resolve_table_throughput(
     if billing_mode == "PAY_PER_REQUEST" {
         if input.provisioned_throughput.is_some() {
             return Err(crate::state::RequestError::Validation(
-                "ProvisionedThroughput cannot be specified when BillingMode is PAY_PER_REQUEST"
+                "One or more parameter values were invalid: Neither ReadCapacityUnits nor \
+                 WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST"
                     .to_string(),
             ));
         }
@@ -893,7 +951,9 @@ fn resolve_table_throughput(
             Ok(Some(throughput))
         }
         None => Err(crate::state::RequestError::Validation(
-            "ProvisionedThroughput must be specified when BillingMode is PROVISIONED".to_string(),
+            "One or more parameter values were invalid: Both ReadCapacityUnits and \
+             WriteCapacityUnits must be specified when BillingMode is PROVISIONED"
+                .to_string(),
         )),
     }
 }
@@ -1144,8 +1204,8 @@ fn resolve_indexes(
         for index in &indexes {
             if index.provisioned_throughput.is_none() {
                 return Err(crate::state::RequestError::Validation(format!(
-                    "ProvisionedThroughput must be specified for index {} when BillingMode is \
-                     PROVISIONED",
+                    "One or more parameter values were invalid: Both ReadCapacityUnits and \
+                     WriteCapacityUnits must be specified for index: {}",
                     index.name
                 )));
             }

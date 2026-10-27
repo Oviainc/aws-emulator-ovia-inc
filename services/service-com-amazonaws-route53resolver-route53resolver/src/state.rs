@@ -19,7 +19,8 @@ use crate::ops::types::{
     FirewallConfig, FirewallDomainList, FirewallDomainListMetadata, InvalidParameterException,
     InvalidPolicyDocument, InvalidRequestException, IpAddressResponse, IpAddressUpdate,
     LimitExceededException, OutpostResolver, ResolverConfig, ResolverDnssecConfig, ResolverEndpoint,
-    ResolverQueryLogConfig, ResolverRule, ResolverRuleAssociation, ResourceExistsException,
+    ResolverQueryLogConfig, ResolverQueryLogConfigAssociation, ResolverRule, ResolverRuleAssociation,
+    ResourceExistsException,
     ResourceInUseException,
     ResourceNotFoundException, Tag, TargetAddress, UnknownResourceException, ValidationException,
 };
@@ -2234,6 +2235,40 @@ pub const QUERY_LOG_CONFIG_STATUS_CREATED: &str = "CREATED";
 /// [`RESOURCE_TYPE_RESOLVER_ENDPOINT`].
 pub const RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG: &str = "ResolverQueryLogConfig";
 
+/// `ResolverQueryLogConfigAssociationStatus` values this slice reports, out of
+/// the model's enum
+/// (`smithy_query(query="shape",shape="ResolverQueryLogConfigAssociationStatus")`,
+/// re-exported as
+/// [`crate::ops::types::RESOLVER_QUERY_LOG_CONFIG_ASSOCIATION_STATUS_VALUES`]).
+///
+/// `CREATING` is "Resolver is creating an association between an Amazon VPC and
+/// a query logging configuration", which is what an associate answers with, and
+/// `ACTIVE` is "the association ... was successfully created": the move between
+/// them is the one the clock owes, [`PROVISIONING_DELAY`] after the call that
+/// started it. `DELETING`, `ACTION_NEEDED` and `FAILED` describe an association
+/// a disassociate has been accepted for, or one Resolver could not create or
+/// delete, neither of which an associate produces.
+pub const QUERY_LOG_CONFIG_ASSOCIATION_STATUS_CREATING: &str = "CREATING";
+
+/// See [`QUERY_LOG_CONFIG_ASSOCIATION_STATUS_CREATING`].
+pub const QUERY_LOG_CONFIG_ASSOCIATION_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `ResourceNotFoundException$ResourceType` for one association between a VPC
+/// and a query logging configuration: the modelled shape name of the resource,
+/// as for [`RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG`].
+pub const RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG_ASSOCIATION: &str =
+    "ResolverQueryLogConfigAssociation";
+
+/// The most VPC associations one query logging configuration holds, for the same
+/// reason as [`MAX_STORED_QUERY_LOG_CONFIGS`]: `AssociateResolverQueryLogConfig`
+/// admits any VPC the configuration is not already associated with, so without a
+/// bound a caller looping associates would grow one emulator process without
+/// limit. An associate past this count is REFUSED by
+/// [`ResolverQueryLogConfigRecord::can_hold_another_association`] with the
+/// `LimitExceededException` the operation models, and a disassociate frees a
+/// slot.
+pub const MAX_QUERY_LOG_CONFIG_ASSOCIATIONS: usize = 1_000;
+
 /// The most query logging configurations this store holds, for the same reason
 /// as [`MAX_STORED_ENDPOINTS`]: `CreateResolverQueryLogConfig` admits any unseen
 /// `CreatorRequestId`, so without a bound a caller looping creates would grow
@@ -2350,9 +2385,77 @@ pub fn resolver_query_log_config_not_found(
     }
 }
 
+/// The `ResourceNotFoundException` the query-logging operations answer for an
+/// association id they hold no association under, built here so every operation
+/// that resolves a `ResolverQueryLogConfigAssociationId` reports the same body.
+pub fn resolver_query_log_config_association_not_found(
+    resolver_query_log_config_association_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            r#"Resolver query log config association with ID "{resolver_query_log_config_association_id}" does not exist."#
+        )),
+        resource_type: Some(RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG_ASSOCIATION.to_string()),
+    }
+}
+
+/// One association between a VPC and a Resolver query logging configuration, as
+/// stored. It lives on the configuration it belongs to, so the configuration's
+/// `AssociationCount` and the associations it holds cannot disagree.
+#[derive(Debug, Clone)]
+pub struct ResolverQueryLogConfigAssociationRecord {
+    /// Position in the store's creation order, from
+    /// [`ComAmazonawsRoute53resolverRoute53resolverState::id_seq`]. It is the
+    /// association order and the source of the minted id.
+    pub seq: u64,
+    pub id: String,
+    pub resolver_query_log_config_id: String,
+    /// The VPC "that you want this query logging configuration to log queries
+    /// for".
+    pub resource_id: String,
+    /// The transient `ResolverQueryLogConfigAssociationStatus` reported until
+    /// [`Self::active_at`] falls due.
+    pub status: String,
+    pub creation_time: String,
+    /// The instant at which the move to
+    /// [`QUERY_LOG_CONFIG_ASSOCIATION_STATUS_ACTIVE`] is owed.
+    pub active_at: Instant,
+}
+
+impl ResolverQueryLogConfigAssociationRecord {
+    /// This association's `ResolverQueryLogConfigAssociationStatus` as of `now`:
+    /// the transient status until the transition the clock owes falls due,
+    /// [`QUERY_LOG_CONFIG_ASSOCIATION_STATUS_ACTIVE`] after it. Computed, so a
+    /// read never has to write to settle one.
+    pub fn status_at(&self, now: Instant) -> &str {
+        if now < self.active_at {
+            &self.status
+        } else {
+            QUERY_LOG_CONFIG_ASSOCIATION_STATUS_ACTIVE
+        }
+    }
+
+    /// Project the record onto the modelled `ResolverQueryLogConfigAssociation`.
+    ///
+    /// `Error` is left unset, and `ErrorMessage` with it: "if the value of
+    /// `Status` is a value other than `FAILED`, `Error` is null", and this slice
+    /// produces no failed association.
+    pub fn to_association(&self, now: Instant) -> ResolverQueryLogConfigAssociation {
+        ResolverQueryLogConfigAssociation {
+            id: Some(self.id.clone()),
+            resolver_query_log_config_id: Some(self.resolver_query_log_config_id.clone()),
+            resource_id: Some(self.resource_id.clone()),
+            status: Some(self.status_at(now).to_string()),
+            error: None,
+            error_message: None,
+            creation_time: Some(self.creation_time.clone()),
+        }
+    }
+}
+
 /// A Resolver query logging configuration, as stored.
 ///
-/// `AssociationCount` is DERIVED from [`Self::associated_vpc_ids`] and never held
+/// `AssociationCount` is DERIVED from [`Self::associations`] and never held
 /// separately — the same way [`FirewallDomainListRecord::domain_count`] derives
 /// from its domains — so the count and the associations cannot disagree.
 #[derive(Debug, Clone, Default)]
@@ -2370,12 +2473,12 @@ pub struct ResolverQueryLogConfigRecord {
     /// The `ShareStatus` this configuration reports; the emulator has one
     /// account, so it is [`SHARE_STATUS_NOT_SHARED`].
     pub share_status: String,
-    /// The VPCs this configuration logs queries for, in association order —
-    /// what `AssociateResolverQueryLogConfig` adds to and
-    /// `DisassociateResolverQueryLogConfig` takes out of. A configuration is
-    /// created with none: "to specify which VPCs you want to log queries for,
+    /// The associations between this configuration and the VPCs it logs queries
+    /// for, in association order — what `AssociateResolverQueryLogConfig` adds
+    /// to and `DisassociateResolverQueryLogConfig` takes out of. A configuration
+    /// is created with none: "to specify which VPCs you want to log queries for,
     /// you use AssociateResolverQueryLogConfig".
-    pub associated_vpc_ids: Vec<String>,
+    pub associations: Vec<ResolverQueryLogConfigAssociationRecord>,
     /// The `ResolverQueryLogConfigStatus` this configuration reports, as of
     /// [`Self::settled_at`].
     pub status: String,
@@ -2394,7 +2497,33 @@ impl ResolverQueryLogConfigRecord {
     /// `AssociationCount`: "The number of VPCs that are associated with the
     /// query logging configuration."
     pub fn association_count(&self) -> i32 {
-        i32::try_from(self.associated_vpc_ids.len()).unwrap_or(i32::MAX)
+        i32::try_from(self.associations.len()).unwrap_or(i32::MAX)
+    }
+
+    /// This configuration's association with the VPC `resource_id`, if it holds
+    /// one.
+    ///
+    /// A configuration and a VPC are associated at most once — "to associate
+    /// more than one VPC with a configuration, submit one
+    /// AssociateResolverQueryLogConfig request for each VPC" — so this is what
+    /// `AssociateResolverQueryLogConfig` consults before writing a second record
+    /// for the same pair. The scan is over a list bounded by
+    /// [`MAX_QUERY_LOG_CONFIG_ASSOCIATIONS`].
+    pub fn association_for_vpc(
+        &self,
+        resource_id: &str,
+    ) -> Option<&ResolverQueryLogConfigAssociationRecord> {
+        self.associations
+            .iter()
+            .find(|record| record.resource_id == resource_id)
+    }
+
+    /// Whether one more VPC may be associated with this configuration, i.e. it
+    /// still holds fewer than [`MAX_QUERY_LOG_CONFIG_ASSOCIATIONS`]. An
+    /// associate that this refuses answers `LimitExceededException` and writes
+    /// nothing.
+    pub fn can_hold_another_association(&self) -> bool {
+        self.associations.len() < MAX_QUERY_LOG_CONFIG_ASSOCIATIONS
     }
 
     /// This configuration's `ResolverQueryLogConfigStatus` as of `now`: the
@@ -2431,6 +2560,13 @@ impl ResolverQueryLogConfigRecord {
 /// one `rqlc-<hex>`. Every result fits `ResourceId` (length 1..64).
 pub fn mint_query_log_config_id(seq: u64) -> String {
     format!("rqlc-{:016x}", scramble(seq))
+}
+
+/// Mint the `Id` of one VPC-to-configuration association from the id sequence.
+/// AWS names one `rqlca-<hex>`, the association form of the configuration's own
+/// `rqlc-` prefix. Every result fits `ResourceId` (length 1..64).
+pub fn mint_query_log_config_association_id(seq: u64) -> String {
+    format!("rqlca-{:016x}", scramble(seq))
 }
 
 /// The most tags one resource carries.
@@ -2790,6 +2926,23 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
     /// refuses answers `LimitExceededException` and writes nothing.
     pub fn can_store_another_query_log_config(&self) -> bool {
         self.resolver_query_log_configs.len() < MAX_STORED_QUERY_LOG_CONFIGS
+    }
+
+    /// The VPC-to-configuration association the store holds under
+    /// `association_id`, if any.
+    ///
+    /// An association lives on the configuration it belongs to, so resolving one
+    /// by its own id walks the configurations; both collections are bounded
+    /// ([`MAX_STORED_QUERY_LOG_CONFIGS`],
+    /// [`MAX_QUERY_LOG_CONFIG_ASSOCIATIONS`]).
+    pub fn query_log_config_association(
+        &self,
+        association_id: &str,
+    ) -> Option<&ResolverQueryLogConfigAssociationRecord> {
+        self.resolver_query_log_configs
+            .values()
+            .flat_map(|config| config.associations.iter())
+            .find(|record| record.id == association_id)
     }
 
     /// Every stored Resolver on an Outpost in creation order — the order

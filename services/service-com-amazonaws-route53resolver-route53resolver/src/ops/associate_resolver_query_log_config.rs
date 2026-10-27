@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateResolverQueryLogConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateResolverQueryLogConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateResolverQueryLogConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +159,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateResolverQueryLogConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateResolverQueryLogConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateResolverQueryLogConfig"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AssociateResolverQueryLogConfigErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // `ResolverQueryLogConfigId` is "the ID of the query logging
+        // configuration that you want to associate a VPC with": the
+        // configuration has to exist for the association to mean anything.
+        let Some(config) = store
+            .resolver_query_log_configs
+            .get(&input.resolver_query_log_config_id)
+        else {
+            return Err(
+                AssociateResolverQueryLogConfigErrorModeled::ResourceNotFoundException(
+                    crate::state::resolver_query_log_config_not_found(
+                        &input.resolver_query_log_config_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // "To associate more than one VPC with a configuration, submit one
+        // AssociateResolverQueryLogConfig request for each VPC": one VPC is
+        // associated with one configuration at most once, so associating a pair
+        // the configuration already holds is the resource that "you tried to
+        // create [and] already exists" and nothing is written.
+        if let Some(existing) = config.association_for_vpc(&input.resource_id) {
+            return Err(
+                AssociateResolverQueryLogConfigErrorModeled::ResourceExistsException(
+                    ResourceExistsException {
+                        message: Some(format!(
+                            r#"Resolver query log config "{}" is already associated with VPC "{}" by association "{}""#,
+                            input.resolver_query_log_config_id, input.resource_id, existing.id
+                        )),
+                        resource_type: Some(
+                            crate::state::RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG_ASSOCIATION
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is bounded: an association past the cap is refused with the
+        // `LimitExceededException` this operation models, BEFORE anything is
+        // written.
+        if !config.can_hold_another_association() {
+            return Err(
+                AssociateResolverQueryLogConfigErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "This emulator associates at most {} VPCs with one Resolver query logging configuration; disassociate one before associating another",
+                            crate::state::MAX_QUERY_LOG_CONFIG_ASSOCIATIONS
+                        )),
+                        resource_type: Some(
+                            crate::state::RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG_ASSOCIATION
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let seq = store.next_seq();
+        let record = crate::state::ResolverQueryLogConfigAssociationRecord {
+            seq,
+            id: crate::state::mint_query_log_config_association_id(seq),
+            resolver_query_log_config_id: input.resolver_query_log_config_id.clone(),
+            resource_id: input.resource_id.clone(),
+            // A new association reports the transient status of the model's
+            // `ResolverQueryLogConfigAssociationStatus`; the move to `ACTIVE` is
+            // owed after the provisioning span, so a caller reading straight
+            // after this call still observes `CREATING`.
+            status: crate::state::QUERY_LOG_CONFIG_ASSOCIATION_STATUS_CREATING.to_string(),
+            creation_time: crate::state::now_rfc3339(),
+            active_at: now + crate::state::PROVISIONING_DELAY,
+        };
+        let association = record.to_association(now);
+
+        // The association is kept on the configuration it belongs to, so the
+        // `AssociationCount` every read of that configuration reports counts it.
+        if let Some(config) = store
+            .resolver_query_log_configs
+            .get_mut(&input.resolver_query_log_config_id)
+        {
+            config.associations.push(record);
+        }
+
+        Ok(AssociateResolverQueryLogConfigOutput {
+            resolver_query_log_config_association: Some(association),
+        })
     }
 }

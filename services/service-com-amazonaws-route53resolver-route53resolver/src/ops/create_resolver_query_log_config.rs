@@ -274,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "To specify which VPCs you want to log queries for, you use
             // AssociateResolverQueryLogConfig": a configuration is created with
             // no VPC, so it reports an `AssociationCount` of zero.
-            associated_vpc_ids: Vec::new(),
+            associations: Vec::new(),
             status: crate::state::QUERY_LOG_CONFIG_STATUS_CREATING.to_string(),
             tags: input.tags.clone().unwrap_or_default(),
             creation_time: crate::state::now_rfc3339(),

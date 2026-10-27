@@ -335,7 +335,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Specifies the fields at the root level that you want returned in the response.
         // Fields that you do not specify are not returned" (`…Request$ObjectAttributes`),
-        // so each of the four root-level fields is reported exactly when the header named
+        // so each of the five root-level fields is reported exactly when the header named
         // it. The header's values are the `ObjectAttributes` enum's own
         // (`crate::state::OBJECT_ATTRIBUTES_*`), and the boundary has already refused a
         // value outside it.
@@ -345,6 +345,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .any(|named| named == attribute)
         };
+
+        // "Sets the maximum number of parts to return"
+        // (`GetObjectAttributesRequest$MaxParts`), bounded by what one page of parts may
+        // carry — the same 1,000 `ListParts` pages the parts of an upload in by, since this
+        // is the same collection read off the finished object. A negative value is not a
+        // count at all, which is `InvalidArgument` (400), judged by the rule its own message
+        // states.
+        let max_parts = match input.max_parts {
+            Some(requested) if requested < 0 => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "Argument max-parts must be an integer between 0 and 2147483647: \
+                         {requested}"
+                    ),
+                ))
+            }
+            Some(requested) => requested.min(MAX_PARTS_PER_PAGE),
+            None => MAX_PARTS_PER_PAGE,
+        };
+        // "The marker for the current part" (`GetObjectAttributesParts$PartNumberMarker`):
+        // the page is the object's parts above it, exactly as a page of an upload's parts is.
+        // A marker that is not a part number names no position at all.
+        let marker = match input.part_number_marker.as_deref() {
+            Some(requested) => match requested.parse::<i32>() {
+                Ok(marker) if marker >= 0 => marker,
+                _ => {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_ARGUMENT_CODE,
+                        crate::state::INVALID_ARGUMENT_STATUS,
+                        format!(
+                            "Argument part-number-marker must be an integer between 0 and \
+                             2147483647: {requested}"
+                        ),
+                    ))
+                }
+            },
+            None => 0,
+        };
+
+        // The checksum container: "contains all the possible checksum or digest values for
+        // an object" (`Checksum`), which for an object stored here is the one its write
+        // computed, under the member its algorithm names and with the `ChecksumType` that
+        // says how it was computed. An object stored under no checksum algorithm has none to
+        // report, so the container is absent even when the request asked for it.
+        let reported = crate::state::reported_checksums(
+            object
+                .checksum
+                .as_ref()
+                .filter(|_| asked(crate::state::OBJECT_ATTRIBUTE_CHECKSUM)),
+        );
+        let checksum = object
+            .checksum
+            .as_ref()
+            .filter(|_| asked(crate::state::OBJECT_ATTRIBUTE_CHECKSUM))
+            .map(|_| Checksum {
+                checksum_crc32: reported.crc32.clone(),
+                checksum_crc32_c: reported.crc32c.clone(),
+                checksum_crc64_nvme: reported.crc64nvme.clone(),
+                checksum_sha1: reported.sha1.clone(),
+                checksum_sha256: reported.sha256.clone(),
+                checksum_sha512: reported.sha512.clone(),
+                checksum_md5: reported.md5.clone(),
+                checksum_xxhash64: reported.xxhash64.clone(),
+                checksum_xxhash3: reported.xxhash3.clone(),
+                checksum_xxhash128: reported.xxhash128.clone(),
+                checksum_type: reported.checksum_type.clone(),
+            });
+
+        // "A collection of parts associated with a multipart upload"
+        // (`GetObjectAttributesParts`): the parts the completion assembled this object from,
+        // which the object remembers ([`crate::state::ObjectPartRecord`]). An object one
+        // write stored whole was assembled from no parts, so there is no collection to
+        // report for it at all — which is what AWS reports for an object a single
+        // `PutObject` wrote.
+        //
+        // "For GetObjectAttributes, if an additional checksum … isn't applied to the object
+        // specified in the request, the response doesn't return the Part element"
+        // (`GetObjectAttributesParts$Parts`) — this store holds general purpose buckets, so a
+        // multipart object stored under no checksum algorithm reports how many parts it has
+        // and none of the parts themselves.
+        let object_parts = (asked(crate::state::OBJECT_ATTRIBUTE_OBJECT_PARTS)
+            && !object.parts.is_empty())
+        .then(|| {
+            // A part is reported only for an object that carries an additional checksum, so
+            // a multipart object stored under no checksum algorithm pages no part at all and
+            // nothing about it is truncated — only how many parts it has.
+            let reports_parts = object.checksum.is_some();
+            let above_marker: Vec<&crate::state::ObjectPartRecord> = object
+                .parts
+                .iter()
+                .filter(|part| reports_parts && part.part_number > marker)
+                .collect();
+            let page = usize::try_from(max_parts).unwrap_or(0);
+            let truncated = above_marker.len() > page;
+            let parts: Vec<ObjectPart> = above_marker
+                .iter()
+                .take(page)
+                .map(|part| {
+                    // Each part's own checksum goes under the member the OBJECT's algorithm
+                    // names, through the one mapping every reader of a checksum here uses.
+                    let reported = crate::state::reported_checksums(
+                        part.checksum
+                            .as_ref()
+                            .and_then(|value| {
+                                object.checksum.as_ref().map(|checksum| {
+                                    crate::state::ObjectChecksum {
+                                        algorithm: checksum.algorithm.clone(),
+                                        value: value.clone(),
+                                        checksum_type: checksum.checksum_type.clone(),
+                                    }
+                                })
+                            })
+                            .as_ref(),
+                    );
+                    ObjectPart {
+                        part_number: Some(part.part_number),
+                        size: Some(part.size),
+                        checksum_crc32: reported.crc32,
+                        checksum_crc32_c: reported.crc32c,
+                        checksum_crc64_nvme: reported.crc64nvme,
+                        checksum_sha1: reported.sha1,
+                        checksum_sha256: reported.sha256,
+                        checksum_sha512: reported.sha512,
+                        checksum_md5: reported.md5,
+                        checksum_xxhash64: reported.xxhash64,
+                        checksum_xxhash3: reported.xxhash3,
+                        checksum_xxhash128: reported.xxhash128,
+                    }
+                })
+                .collect();
+            // "When a list is truncated, this element specifies the last part in the list,
+            // as well as the value to use for the PartNumberMarker request parameter in a
+            // subsequent request" (`…Parts$NextPartNumberMarker`), so a page that carried
+            // every part above the marker reports no next marker and is not truncated.
+            let next_marker = truncated.then(|| {
+                parts
+                    .last()
+                    .and_then(|part| part.part_number)
+                    .unwrap_or(marker)
+                    .to_string()
+            });
+            GetObjectAttributesParts {
+                // "The total number of parts" — every part the object was assembled from,
+                // not the count this page carried.
+                total_parts_count: Some(
+                    i32::try_from(object.parts.len()).unwrap_or(crate::state::MAX_PART_NUMBER),
+                ),
+                part_number_marker: input.part_number_marker.clone(),
+                next_part_number_marker: next_marker,
+                max_parts: Some(max_parts),
+                is_truncated: Some(truncated),
+                // "The response doesn't return the Part element" for an object with no
+                // additional checksum, which is an absent list rather than an empty one.
+                parts: reports_parts.then_some(parts),
+            }
+        });
 
         Ok(GetObjectAttributesOutput {
             // Bound HEADERS rather than fields of the document, so they are reported for
@@ -360,15 +518,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then(|| i64::try_from(object.body.len()).unwrap_or(i64::MAX)),
             storage_class: asked(crate::state::OBJECT_ATTRIBUTE_STORAGE_CLASS)
                 .then(|| object.storage_class.clone()),
-            // Nothing is reported for either of the two containers, whether or not the
-            // request asked for it, because this emulator holds nothing to report in
-            // them: it computes and stores no checksum for an object's bytes (see
-            // `PutObject`, which neither computes nor verifies one), and an object here is
-            // never assembled from parts — `CompleteMultipartUpload` is scaffolded, so no
-            // stored object has a part structure, which is also what AWS reports for an
-            // object a single `PutObject` wrote.
-            checksum: None,
-            object_parts: None,
+            // The checksum the object was stored with, and the parts it was assembled from
+            // — each reported exactly when the request's `x-amz-object-attributes` named it
+            // and the object really has one (see above).
+            checksum,
+            object_parts,
             // "Specifies whether the object retrieved was (true) or was not (false) a
             // delete marker" (`…Output$DeleteMarker`): a marker is refused above, so
             // every answer here is about an object that is not one, and S3 reports the
@@ -392,3 +546,10 @@ const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
 /// The status every not-found this read answers carries, the one `NoSuchKey` declares in
 /// the model.
 const NOT_FOUND_STATUS: u16 = 404;
+
+/// The most parts one page of an object's parts may carry: the same 1,000 a page of an
+/// upload's parts carries ("The ListParts request returns a maximum of 1,000 uploaded parts.
+/// The limit of 1,000 parts is also the default value" — `ListParts`'s own documentation),
+/// because it is the same collection, read off the finished object. A larger `max-parts` is
+/// answered with this many.
+const MAX_PARTS_PER_PAGE: i32 = 1000;

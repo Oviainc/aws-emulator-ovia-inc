@@ -4688,13 +4688,20 @@ pub fn is_retrieval_token_form(token: &str) -> bool {
 /// with, before any lookup: the name the operation gives the member, the value
 /// the request submitted, and why it could not be read.
 ///
-/// X-Ray words this refusal "Invalid <member> <value> passed: Invalid execution
-/// id provided: <value>" — the member the operation names, then the reason with
-/// the value it could not read — so the sentence is built here once and each
-/// reader passes the member name it uses (`retrieval token`, `execution id`).
+/// X-Ray words this refusal "Invalid <member> <value> passed: Invalid Execution
+/// Id" — the member the operation names, then the value it could not read,
+/// then a FIXED detail phrase that interpolates nothing. The rejected value is
+/// the sentence's only variable, so it is named once and the detail never grows
+/// with it; the sentence is built here once and each reader passes the member
+/// name it uses (`retrieval token`, `execution id`).
 pub fn malformed_retrieval_token_message(member: &str, token: &str) -> String {
-    format!("Invalid {member} {token} passed: Invalid execution id provided: {token}")
+    format!("Invalid {member} {token} passed: {MALFORMED_RETRIEVAL_TOKEN_DETAIL}")
 }
+
+/// The fixed detail clause that closes a malformed-`RetrievalToken` refusal
+/// ([`malformed_retrieval_token_message`]): the same capitalised phrase whatever
+/// the operation and whatever the value, carrying no part of the request.
+pub const MALFORMED_RETRIEVAL_TOKEN_DETAIL: &str = "Invalid Execution Id";
 
 // ---------------------------------------------------------------------------
 // Sampling rules

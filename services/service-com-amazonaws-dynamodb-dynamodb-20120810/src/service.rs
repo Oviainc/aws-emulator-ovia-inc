@@ -133,6 +133,36 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
     })
 }
 
+/// The input member DynamoDB's own request code validates rather than leaving to the
+/// generic request walk, named by the path that walk reports it under.
+///
+/// Its refusal is worded differently from every other enumerated member's: the clause
+/// states the requirement ALONE — neither the rejected value nor the member path — which
+/// is what a check by the service's own code looks like next to the generic validator's
+/// `Value '<v>' at '<path>' failed to satisfy constraint: …`.
+///
+/// This is ONE member, not a class, and it is here because the service's refusal of it
+/// is observed to take that shape while the refusals of the service's other enumerated
+/// members (`ReturnConsumedCapacity`, `Select`, `StreamViewType`, `ProjectionType`, …)
+/// are observed to take the generic one. Nothing about the model distinguishes them, so
+/// there is nothing to derive the difference from: a member later found to be checked
+/// the same way needs its own entry, and
+/// `tests/all/refusal_contracts_and_expression_pre_images.rs` pins both shapes side by
+/// side so the difference is visible rather than silent.
+const SERVICE_CHECKED_ENUM_MEMBER: &str = "returnValues";
+
+/// The value set that refusal states for it.
+///
+/// It is the SERVICE's own set rather than the model's `ReturnValue` enum
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ReturnValue")` gives
+/// `NONE ALL_OLD UPDATED_OLD ALL_NEW UPDATED_NEW`): the order differs and `UPDATED_NEW`
+/// is spelled `UPDATE_NEW`. Both differences are the service's and are reproduced rather
+/// than normalised, because a client matching the message has to read the same text from
+/// the emulator and from DynamoDB; deriving the set from the model would state a
+/// different sentence from the one the service sends.
+const SERVICE_CHECKED_ENUM_SET: [&str; 5] =
+    ["ALL_OLD", "UPDATED_OLD", "ALL_NEW", "UPDATE_NEW", "NONE"];
+
 /// One clause for one violated member.
 ///
 /// Which member path is stated, and whether the rejected value is echoed,
@@ -145,7 +175,8 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
 ///   caller can read out of the message which value of which member was
 ///   refused. That is exactly the framework's own rendering, so the framework
 ///   renders it (`Violation::message`) rather than this service restating the
-///   sentence;
+///   sentence. [`SERVICE_CHECKED_ENUM_MEMBER`] is the one member that is not
+///   reported that way, because the service checks it itself;
 /// * an absent member states the `null` it was, which is a fact of the
 ///   request's shape — the framework's rendering again, over the member path
 ///   spelled as the model spells it;
@@ -176,6 +207,14 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
 /// collections of the batched and transactional operations.
 fn violation_clause(violation: &Violation) -> Option<String> {
     match &violation.kind {
+        // The one member the service checks itself: the requirement with nothing
+        // echoed, over the set that check states.
+        ViolationKind::EnumValue(_) if violation.path == SERVICE_CHECKED_ENUM_MEMBER => {
+            Some(format!(
+                "Failed to satisfy constraint: {}",
+                crate::state::enum_value_requirement(&SERVICE_CHECKED_ENUM_SET)
+            ))
+        }
         ViolationKind::MissingRequiredMember
         | ViolationKind::EnumValue(_)
         | ViolationKind::MinValue(_)
