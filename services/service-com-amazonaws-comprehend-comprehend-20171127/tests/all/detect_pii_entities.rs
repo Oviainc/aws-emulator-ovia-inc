@@ -193,7 +193,7 @@ pub(crate) const DOCUMENTS: &[(&str, &str, &[(&str, &str)])] = &[
 /// The `(BeginOffset, EndOffset)` the modelled members require for `needle` inside
 /// `haystack`: zero-based CHARACTER offsets, `EndOffset` one past the entity's last
 /// character, so the characters in that range are exactly the entity.
-fn expected_offsets(case: &str, haystack: &str, needle: &str) -> (i64, i64) {
+pub(crate) fn expected_offsets(case: &str, haystack: &str, needle: &str) -> (i64, i64) {
     let byte_offset = haystack
         .find(needle)
         .unwrap_or_else(|| panic!("case {case:?}: {needle:?} is not in {haystack:?}"));

@@ -14,11 +14,14 @@
 //!   character offsets into the content block it was found in. The recognizer's
 //!   entity catalog is this service's catalog under other names for seven entities,
 //!   which [`SENSITIVE_INFORMATION_ENTITY_TYPES`] maps.
-//! * the CONTENT-FILTER check runs the English profanity/abuse engine this emulator
-//!   already analyses toxicity with (`rustrict`). Its categories cover three of the
-//!   five modelled filter categories; the other two have no detector here, so a
-//!   request naming one of them is answered about it at zero — this emulator places
-//!   nothing of those two in any message.
+//! * the CONTENT-FILTER check scores every modelled category from the text. Three
+//!   of them — the ones about language — are classified by the English
+//!   profanity/abuse engine this emulator already analyses toxicity with
+//!   (`rustrict`), and the two about CONDUCT, which that engine has no class for,
+//!   are placed by a rule recognizer over the forms each of those categories is
+//!   published as covering. No modelled category is answered by a constant: a
+//!   category comes back at zero only where both the engine and the rules placed
+//!   nothing of it in any message.
 //! * the PROMPT-ATTACK check runs a rule recognizer over the same text. A prompt
 //!   attack is an INSTRUCTION to the model, published as a small set of imperative
 //!   forms, so each modelled category is recognised by the forms it is published in,
@@ -298,8 +301,59 @@ pub fn submitted_characters(texts: &[CheckedText]) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// The category recognizers
+// ---------------------------------------------------------------------------
+
+/// One rule of a category recognizer: a pattern over one message's text, the
+/// modelled category a match places, and the severity it places it at.
+///
+/// The content filter and the prompt-attack check are both category checks over the
+/// same text, so both read this one rule type through [`placed_severity`]. What
+/// differs between them is the rule TABLE and the scale each check states its
+/// severities on, which is why the severity is a number here rather than an evidence
+/// class: each table turns its own evidence classes into its own scale as it is
+/// built.
+struct CategoryRule {
+    category: &'static str,
+    severity: f64,
+    pattern: Regex,
+}
+
+/// The strongest severity any rule of `category` placed in any of `texts`, or `None`
+/// when no rule of that category matched anywhere.
+///
+/// The request asks one question per category about the CONVERSATION, not one per
+/// message, so a category placed in any message is placed for the request.
+fn placed_severity(rules: &[CategoryRule], category: &str, texts: &[CheckedText]) -> Option<f64> {
+    rules
+        .iter()
+        .filter(|rule| rule.category == category)
+        .filter(|rule| texts.iter().any(|block| rule.pattern.is_match(&block.text)))
+        .map(|rule| rule.severity)
+        .max_by(f64::total_cmp)
+}
+
+// ---------------------------------------------------------------------------
 // The content filter
 // ---------------------------------------------------------------------------
+
+/// How much text one rule allows between two parts of the same sentence.
+///
+/// A rule reads ONE sentence, so its parts are joined by this rather than by `.*`:
+/// the span cannot cross a sentence boundary and is bounded, which keeps a rule from
+/// joining two unrelated sentences into a finding and keeps its cost linear in the
+/// text.
+const WITHIN_SENTENCE: &str = r"[^.!?\n]{0,40}?";
+
+/// The forms a speaker states an intention in.
+const STATED_INTENT: &str =
+    r"(?:will|'ll|am going to|going to|gonna|am about to|intend to|plan to|want to|would)";
+
+/// Who an act is aimed at, where a rule needs the act to have a target.
+///
+/// The speaker is deliberately not one of them: an act aimed at the speaker reads as
+/// a REPORT of someone else's conduct as often as content carrying that conduct.
+const PERSON: &str = r"(?:you|your|yourself|him|his|her|hers|them|their|themselves|everyone|anyone|someone|somebody)";
 
 /// The severity reported for a category the engine placed at each of the three
 /// severity levels it distinguishes.
@@ -316,24 +370,25 @@ const MILD_SEVERITY: f64 = 1.0 / 6.0;
 const MODERATE_SEVERITY: f64 = 0.5;
 const SEVERE_SEVERITY: f64 = 5.0 / 6.0;
 
-/// The modelled content-filter categories this emulator has a detector for, each
-/// with the engine category that detects it.
+/// The modelled content-filter categories the profanity/abuse engine classifies,
+/// each with the engine category that classifies it.
 ///
 /// The engine classifies English text as offensive (slurs and discriminatory
 /// language), mean (demeaning, insulting) and sexual, which are the modelled
-/// `HATE`, `INSULTS` and `SEXUAL` filters. The two remaining modelled categories —
-/// `VIOLENCE` and `MISCONDUCT` — have no detector in this engine and no other
-/// maintained engine here places them, so a request naming one of them is answered
-/// about it at zero severity: the check reports a verdict for every category it was
-/// asked about, and this emulator places nothing of those two in any message.
+/// `HATE`, `INSULTS` and `SEXUAL` filters — the three categories that are about the
+/// LANGUAGE a message uses. The two remaining modelled categories are about the
+/// CONDUCT a message states, asks for or endorses, which no profanity class
+/// describes, so they are placed by [`content_filter_rules`] instead; every modelled
+/// category is read by one of the two.
 const CONTENT_FILTER_DETECTORS: [(&str, Type); 3] = [
     ("HATE", Type::OFFENSIVE),
     ("INSULTS", Type::MEAN),
     ("SEXUAL", Type::SEXUAL),
 ];
 
-/// The engine category that detects `category`, or `None` for a modelled category
-/// this emulator has no detector for.
+/// The engine category that classifies `category`, or `None` for a modelled
+/// category the engine has no class for, which [`content_filter_rules`] places
+/// instead.
 fn content_filter_detector(category: &str) -> Option<Type> {
     CONTENT_FILTER_DETECTORS
         .into_iter()
@@ -355,15 +410,132 @@ fn category_severity(analysis: Type, category: Type) -> Option<f64> {
     }
 }
 
-/// The content-filter findings over `texts`, for the categories the request named.
+/// How a rule established that a message carries what its category covers, and
+/// therefore how much severity a match of it places.
 ///
-/// One finding per named category the engine placed in ANY of the messages, carrying
-/// the strongest severity it placed there — the request asks one question per
-/// category about the conversation, not one per message.
+/// The two classes are EVIDENCE classes rather than decoration: which one placed a
+/// category says what the recognizer actually read in the message, so two messages
+/// that carry a category the same way are scored the same rather than by a per-match
+/// probability. Both category checks read these classes; each states what severity
+/// each class carries on ITS own scale, because the content filter reports the three
+/// levels the profanity engine beside it reports and the prompt-attack check reports
+/// its own two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleEvidence {
+    /// The message states the thing itself: an act of the category aimed at someone,
+    /// a request for instructions in one, or the imperative an attack family is
+    /// published as.
+    Stated,
+    /// The message only alludes to it: it endorses the conduct, names its proceeds,
+    /// or uses a phrase of the attack family, with no act or imperative of its own.
+    Alluded,
+}
+
+/// Acts of physical pain, hurt or injury: what the `VIOLENCE` filter covers —
+/// threats to inflict, or glorification of, physical harm toward a person, group or
+/// thing.
+const VIOLENT_ACT: &str = r"(?:kill|murder|shoot|stab|strangle|choke|behead|lynch|assault|maim|mutilate|torture|hurt|harm|injure|beat|bash|punch|slap|attack|bomb|blow up|burn down|massacre|break)";
+
+/// The acts above whose plain reading is physical harm whatever sentence they sit
+/// in, so a rule may read one aimed at a person on its own. The ones left out —
+/// `attack`, `beat`, `break`, `hurt`, `harm` — have an everyday reading too, and are
+/// read only by a rule that also reads the stated intention or the part of the body
+/// the act is aimed at.
+const UNAMBIGUOUS_VIOLENT_ACT: &str =
+    r"(?:kill|murder|shoot|stab|strangle|choke|behead|lynch|assault|maim|mutilate|torture|beat up|punch)";
+
+/// Acts of criminal activity, or of harming, defrauding or taking advantage of a
+/// person, group or institution: what the `MISCONDUCT` filter covers.
+const ILLICIT_ACT: &str = r"(?:pick (?:a|the|his|her|their)?\s*locks?|hotwire|break into|breaking into|steal|stealing|shoplift(?:ing)?|rob|robbing|burglari[sz]e|launder (?:money|cash)|money laundering|counterfeit|forge|forging|hack into|hacking into|phish(?:ing)?|smuggle|smuggling|evade tax(?:es)?|tax evasion|buy drugs|sell drugs|cook meth|make meth|defraud|scam|embezzle|insider trading|bribe|extort|blackmail|kidnap|skim (?:credit )?cards?|clone (?:a|the) (?:credit|debit) card|disable (?:the|an|his|her|their) alarm|bypass (?:the|an) alarm|fake (?:ids?|passports?|invoices?|receipts?))";
+
+/// Every content-filter rule, compiled once.
+///
+/// The CATEGORIES are the two modelled filters the profanity engine has no class
+/// for; the FORMS are what each of them is published as covering — physical harm to
+/// a person, group or thing (`VIOLENCE`), and criminal activity or the defrauding of
+/// a person, group or institution (`MISCONDUCT`) — each stated as the forms a
+/// message carries that conduct in: a stated intention, an imperative, a request for
+/// instructions, or an endorsement of it.
+fn content_filter_rules() -> &'static [CategoryRule] {
+    static RULES: OnceLock<Vec<CategoryRule>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        let rule = |category: &'static str, evidence: RuleEvidence, pattern: String| {
+            CategoryRule {
+                category,
+                // The content filter reports on the profanity engine's three-level
+                // scale, so a stated act is the severe level and an allusion the
+                // moderate one.
+                severity: match evidence {
+                    RuleEvidence::Stated => SEVERE_SEVERITY,
+                    RuleEvidence::Alluded => MODERATE_SEVERITY,
+                },
+                pattern: Regex::new(&pattern).expect("a content-filter rule is a valid regex"),
+            }
+        };
+        vec![
+            // A stated intention to inflict harm on someone: the threat form.
+            rule(
+                "VIOLENCE",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b(?:i|we|he|she|they)\b{WITHIN_SENTENCE}\b{STATED_INTENT}\b{WITHIN_SENTENCE}\b{VIOLENT_ACT}\b{WITHIN_SENTENCE}\b{PERSON}\b"),
+            ),
+            // An imperative, or an act aimed at a person with no other framing.
+            rule(
+                "VIOLENCE",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b{UNAMBIGUOUS_VIOLENT_ACT}\s+{PERSON}\b"),
+            ),
+            // Harm aimed at a part of someone's body.
+            rule(
+                "VIOLENCE",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b(?:break|breaking|snap|smash|crush|cut off|rip off|burn)\b{WITHIN_SENTENCE}\b(?:your|his|her|their|the)\s+(?:legs?|arms?|kneecaps?|bones?|neck|jaw|face|ribs?|skull|fingers?|teeth)\b"),
+            ),
+            // Asking how to inflict harm, or how to build the means of it.
+            rule(
+                "VIOLENCE",
+                RuleEvidence::Stated,
+                format!(r"(?i)\bhow\s+(?:to|do i|can i|would i|does one)\b{WITHIN_SENTENCE}\b{VIOLENT_ACT}\b{WITHIN_SENTENCE}\b{PERSON}\b"),
+            ),
+            rule(
+                "VIOLENCE",
+                RuleEvidence::Stated,
+                format!(r"(?i)\bhow\s+(?:to|do i|can i|would i|does one)\b{WITHIN_SENTENCE}\b(?:make|build|assemble)\b{WITHIN_SENTENCE}\b(?:bombs?|explosives?|napalm|nerve agents?|silencers?)\b"),
+            ),
+            // Glorifying harm, or wishing it on someone, with no act of the
+            // speaker's own.
+            rule(
+                "VIOLENCE",
+                RuleEvidence::Alluded,
+                r"(?i)\b(?:deserve[sd]? to (?:die|be (?:killed|shot|beaten|hurt))|should (?:be (?:killed|shot|beaten|executed|lynched)|die)|hope (?:you|he|she|they) (?:dies?|gets? hurt|gets? shot)|glad (?:he|she|they) (?:died|got shot|was killed|were killed))\b".to_string(),
+            ),
+            // Seeking or giving instructions for an illicit act.
+            rule(
+                "MISCONDUCT",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b(?:how to|how do i|how can i|how would i|step by step|steps? to|teach me|show me how|explain how|walk me through|best way to|help me)\b{WITHIN_SENTENCE}\b{ILLICIT_ACT}\b"),
+            ),
+            // A stated intention to commit one.
+            rule(
+                "MISCONDUCT",
+                RuleEvidence::Stated,
+                format!(r"(?i)\b(?:i|we)\b{WITHIN_SENTENCE}\b{STATED_INTENT}\b{WITHIN_SENTENCE}\b{ILLICIT_ACT}\b"),
+            ),
+            // Naming the proceeds or the scheme, with no act of the speaker's own.
+            rule(
+                "MISCONDUCT",
+                RuleEvidence::Alluded,
+                r"(?i)\b(?:stolen (?:credit cards?|goods|cars?)|fake (?:ids?|passports?|documents?)|counterfeit (?:bills?|money|notes?|currency)|money laundering|insider trading|black market|untraceable (?:guns?|handguns?|weapons?)|burner phones?)\b".to_string(),
+            ),
+        ]
+    })
+}
+
 /// The content-filter result over `texts`: one entry per category the request
-/// named, carrying the strongest severity the analyser placed on that category in
-/// ANY of the messages — the request asks one question per category about the
-/// conversation, not one per message — and zero for a category it placed nothing of.
+/// named, carrying the strongest severity either recognizer placed on that category
+/// in ANY of the messages — the request asks one question per category about the
+/// conversation, not one per message — and zero for a category neither placed
+/// anything of.
 ///
 /// Reported in [`CONTENT_FILTER_RESULT_ORDER`], so a request naming several
 /// categories gets them back in one stable order whatever order it named them in,
@@ -381,14 +553,22 @@ fn content_filter_findings(
         .into_iter()
         .filter(|category| requested.contains(*category))
         .map(|category| {
-            let severity_score = content_filter_detector(category)
-                .and_then(|detector| {
-                    analyses
-                        .iter()
-                        .filter_map(|analysis| category_severity(*analysis, detector))
-                        .max_by(f64::total_cmp)
-                })
-                .unwrap_or(0.0);
+            let classified = content_filter_detector(category).and_then(|detector| {
+                analyses
+                    .iter()
+                    .filter_map(|analysis| category_severity(*analysis, detector))
+                    .max_by(f64::total_cmp)
+            });
+            // Whichever recognizer read the most of this category decides its
+            // severity; zero is what BOTH reading nothing of it answers.
+            let severity_score = [
+                classified,
+                placed_severity(content_filter_rules(), category, texts),
+            ]
+            .into_iter()
+            .flatten()
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0);
             CategoryFinding {
                 category,
                 severity_score,
@@ -401,43 +581,19 @@ fn content_filter_findings(
 // The prompt-attack check
 // ---------------------------------------------------------------------------
 
-/// How a rule established that a message carries a prompt attack, and therefore how
-/// much severity the finding carries.
+/// The severity a prompt-attack finding carries at each of the two evidence classes
+/// the check distinguishes ([`RuleEvidence`]).
 ///
-/// The two classes are EVIDENCE classes, not decoration: which class a finding comes
-/// back with says what the recognizer actually read in the message. A finding's
-/// severity is therefore the constant of its evidence class rather than a per-match
-/// probability, so two messages that attack the same way are scored the same.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttackEvidence {
-    /// The message states the attack itself: an imperative naming the instructions,
-    /// the guardrails or the unrestricted persona it wants.
-    Stated,
-    /// The message only alludes to it: a phrase the attack families use, with no
-    /// imperative of its own.
-    Alluded,
-}
+/// `GuardrailChecksPromptAttackResultEntry$severityScore` is modelled over 0..1 like
+/// the content filter's, but this check's verdict is not the profanity engine's
+/// three-level one, so its own two levels are stated here: a message that STATES the
+/// attack is close to certain, and one that only uses a phrase of the family is well
+/// above the middle of the range without being that.
+const STATED_ATTACK_SEVERITY: f64 = 0.9;
+const ALLUDED_ATTACK_SEVERITY: f64 = 0.6;
 
-impl AttackEvidence {
-    /// The severity a finding of this evidence class carries, in the modelled 0..1
-    /// range.
-    fn severity(self) -> f64 {
-        match self {
-            Self::Stated => 0.9,
-            Self::Alluded => 0.6,
-        }
-    }
-}
-
-/// One prompt-attack rule: a pattern over a message, the modelled category a match
-/// is, and what the match establishes.
-struct AttackRule {
-    category: &'static str,
-    evidence: AttackEvidence,
-    pattern: Regex,
-}
-
-/// Every prompt-attack rule, compiled once.
+/// Every prompt-attack rule, compiled once, as the one rule type both category
+/// checks are read through ([`CategoryRule`]).
 ///
 /// The CATEGORIES are the model's own enum
 /// (`GUARDRAIL_CHECKS_PROMPT_ATTACK_CATEGORY_VALUES`); the
@@ -446,12 +602,15 @@ struct AttackRule {
 /// (`JAILBREAK`) and a request to disclose the instructions themselves
 /// (`PROMPT_LEAKAGE`) — each stated as the imperative forms those families are
 /// published in. Every category has rules, so no modelled category is silent.
-fn attack_rules() -> &'static [AttackRule] {
-    static RULES: OnceLock<Vec<AttackRule>> = OnceLock::new();
+fn attack_rules() -> &'static [CategoryRule] {
+    static RULES: OnceLock<Vec<CategoryRule>> = OnceLock::new();
     RULES.get_or_init(|| {
-        let rule = |category: &'static str, evidence: AttackEvidence, pattern: &str| AttackRule {
+        let rule = |category: &'static str, evidence: RuleEvidence, pattern: &str| CategoryRule {
             category,
-            evidence,
+            severity: match evidence {
+                RuleEvidence::Stated => STATED_ATTACK_SEVERITY,
+                RuleEvidence::Alluded => ALLUDED_ATTACK_SEVERITY,
+            },
             pattern: Regex::new(pattern).expect("a prompt-attack rule is a valid regex"),
         };
         vec![
@@ -460,50 +619,50 @@ fn attack_rules() -> &'static [AttackRule] {
             // content.
             rule(
                 "PROMPT_INJECTION",
-                AttackEvidence::Stated,
+                RuleEvidence::Stated,
                 r"(?i)\b(?:ignore|disregard|forget|override|replace)\b[^.!?\n]{0,40}?\b(?:instructions?|rules?|directions?|guidelines?|prompt)\b",
             ),
             rule(
                 "PROMPT_INJECTION",
-                AttackEvidence::Stated,
+                RuleEvidence::Stated,
                 r"(?im)^\s*(?:system|assistant)\s*:",
             ),
             rule(
                 "PROMPT_INJECTION",
-                AttackEvidence::Alluded,
+                RuleEvidence::Alluded,
                 r"(?i)\bnew\s+(?:instructions?|rules?|directions?)\b",
             ),
             // Shedding the model's restrictions, including the named personas the
             // family is published under.
             rule(
                 "JAILBREAK",
-                AttackEvidence::Stated,
+                RuleEvidence::Stated,
                 r"(?i)\b(?:bypass|disable|turn off|get around|work around)\b[^.!?\n]{0,40}?\b(?:guardrails?|safety|safeguards?|filters?|restrictions?|limitations?|policies)\b",
             ),
             rule(
                 "JAILBREAK",
-                AttackEvidence::Stated,
+                RuleEvidence::Stated,
                 r"(?i)\b(?:pretend|act|behave|respond|answer)\b[^.!?\n]{0,40}?\b(?:no (?:rules|restrictions|limits|filters|guidelines)|without (?:any )?(?:rules|restrictions|limits|filters|guidelines)|unrestricted|uncensored|unfiltered)\b",
             ),
             rule(
                 "JAILBREAK",
-                AttackEvidence::Alluded,
+                RuleEvidence::Alluded,
                 r"(?i)\b(?:jailbreak|do anything now|dan mode|developer mode|god mode)\b",
             ),
             // Disclosing the instructions the model was given.
             rule(
                 "PROMPT_LEAKAGE",
-                AttackEvidence::Stated,
+                RuleEvidence::Stated,
                 r"(?i)\b(?:repeat|reveal|print|show|output|disclose|tell me|give me)\b[^.!?\n]{0,40}?\b(?:system prompt|system message|your instructions|your prompt|the prompt above|initial prompt|text above)\b",
             ),
             rule(
                 "PROMPT_LEAKAGE",
-                AttackEvidence::Stated,
+                RuleEvidence::Stated,
                 r"(?i)\bwhat\s+(?:are|were|is|was)\b[^.!?\n]{0,30}?\b(?:your (?:instructions|rules|guidelines)|system prompt|system message)\b",
             ),
             rule(
                 "PROMPT_LEAKAGE",
-                AttackEvidence::Alluded,
+                RuleEvidence::Alluded,
                 r"(?i)\b(?:verbatim|word for word)\b[^.!?\n]{0,30}?\b(?:prompt|instructions?)\b",
             ),
         ]
@@ -517,24 +676,14 @@ fn prompt_attack_findings(
     requested: &BTreeSet<String>,
     texts: &[CheckedText],
 ) -> Vec<CategoryFinding> {
-    let mut findings: Vec<CategoryFinding> = Vec::new();
-    for category in PROMPT_ATTACK_RESULT_ORDER {
-        if !requested.contains(category) {
-            continue;
-        }
-        let severity_score = attack_rules()
-            .iter()
-            .filter(|rule| rule.category == category)
-            .filter(|rule| texts.iter().any(|block| rule.pattern.is_match(&block.text)))
-            .map(|rule| rule.evidence.severity())
-            .max_by(f64::total_cmp)
-            .unwrap_or(0.0);
-        findings.push(CategoryFinding {
+    PROMPT_ATTACK_RESULT_ORDER
+        .into_iter()
+        .filter(|category| requested.contains(*category))
+        .map(|category| CategoryFinding {
             category,
-            severity_score,
-        });
-    }
-    findings
+            severity_score: placed_severity(attack_rules(), category, texts).unwrap_or(0.0),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
