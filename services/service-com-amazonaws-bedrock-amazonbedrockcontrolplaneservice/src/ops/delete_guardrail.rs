@@ -142,16 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let not_found = || {
             DeleteGuardrailErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(match input.guardrail_version.as_deref() {
-                    Some(version) => format!(
-                        "no guardrail {} version {version} exists in this account",
-                        input.guardrail_identifier
-                    ),
-                    None => format!(
-                        "no guardrail {} exists in this account",
-                        input.guardrail_identifier
-                    ),
-                }),
+                message: Some(crate::state::GUARDRAIL_NOT_FOUND.to_string()),
             })
         };
 

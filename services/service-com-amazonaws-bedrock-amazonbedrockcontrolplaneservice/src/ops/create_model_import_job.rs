@@ -198,18 +198,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so each list is held to it separately. The modelled `@length(0..200)` on
         // `TagList` is enforced ahead of this handler, so this is the per-resource bound
         // inside that span.
-        for (member, tags) in [
-            ("jobTags", input.job_tags.as_ref()),
-            ("importedModelTags", input.imported_model_tags.as_ref()),
-        ] {
+        for tags in [input.job_tags.as_ref(), input.imported_model_tags.as_ref()] {
             let count = tags.map_or(0, Vec::len);
             if count > crate::state::MAX_TAGS_PER_RESOURCE {
                 return Err(CreateModelImportJobErrorModeled::TooManyTagsException(
                     TooManyTagsException {
-                        message: Some(format!(
-                            "a resource may carry at most {} tags, and {member} carries {count}",
-                            crate::state::MAX_TAGS_PER_RESOURCE
-                        )),
+                        message: Some(crate::state::too_many_tags_message()),
                         resource_name: None,
                     },
                 )

@@ -202,10 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // per-resource bound inside that span.
         let tag_count = input.job_tags.as_ref().map_or(0, Vec::len);
         if tag_count > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "a resource may carry at most {} tags, and jobTags carries {tag_count}",
-                crate::state::MAX_TAGS_PER_RESOURCE
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::too_many_tags_message(),
+            ));
         }
 
         // "For model evaluation jobs, automated jobs support a single model or inference

@@ -79,7 +79,8 @@ enum Expect {
     /// refusal stands.
     ConstraintEnvelope,
     /// Every ARN in the request is one this service accepts, so the request reaches the
-    /// operation (which answers 501 while it is scaffolded) instead of being refused.
+    /// operation — which answers for the resource the ARN names (a 404 for one nothing
+    /// created, a 501 while the operation is scaffolded) instead of refusing the input.
     Accepted,
 }
 
@@ -391,13 +392,18 @@ fn cases() -> Vec<Case> {
         },
         Case {
             // `CreateModelCopyJob` copies a model to the region the request addresses,
-            // so its SOURCE model lives in another one by design.
+            // so its SOURCE model lives in another one by design. The ARN names a base
+            // model the published catalog carries, so the handler refuses it for naming
+            // no model of this account (404) rather than for its ARN.
             case: "the model-copy source ARN from another region, which is the point",
             region: HOME,
             method: "POST",
             path: "/model-copy-jobs".to_string(),
             body: Some(json!({
-                "sourceModelArn": custom_model_arn("us-east-1", "anthropic.claude/abcdef123456"),
+                "sourceModelArn": custom_model_arn(
+                    "us-east-1",
+                    "anthropic.claude-3-haiku-20240307-v1:0/abcdef123456",
+                ),
                 "targetModelName": "copied-model",
             })),
             expect: Expect::Accepted,

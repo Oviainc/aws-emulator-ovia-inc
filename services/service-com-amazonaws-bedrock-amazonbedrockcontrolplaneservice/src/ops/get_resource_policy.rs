@@ -5,7 +5,10 @@
 //! Reports the resource policy attached to one Bedrock resource of this account.
 //!
 //! A REPORTING operation (`@readonly`): it hands back the document
-//! `PutResourcePolicy` stored, byte for byte, and changes nothing a later caller sees —
+//! `PutResourcePolicy` stored, which is that document's CANONICAL form — the service holds
+//! a resource policy parsed and serializes it again on read, so the whitespace between its
+//! JSON tokens is not part of what a read reports (`ops/put_resource_policy.rs`) — and
+//! changes nothing a later caller sees:
 //! the only write on this path is the one the CLOCK already made due, the status
 //! transitions resolving the resource materialises, which a read of that resource itself
 //! would have materialised at the same instant.

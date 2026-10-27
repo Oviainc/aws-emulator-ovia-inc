@@ -4,9 +4,14 @@
 //!
 //! Attaches an IAM resource-based policy to one Bedrock resource of this account.
 //!
-//! The document is stored against the ARN the request names, VERBATIM: a policy is text
-//! the caller wrote, so `GetResourcePolicy` hands back the same bytes rather than a
-//! re-rendering of them. A resource holds at most ONE resource policy, which is what
+//! The document is stored against the ARN the request names in its CANONICAL form: Amazon
+//! Bedrock keeps a resource policy as a parsed document and re-serializes it on every
+//! read, so what `GetResourcePolicy` hands back is the same document with the whitespace
+//! between its JSON tokens dropped — the ONE minification in
+//! [`service_common::json_document`], which every service that reports a stored JSON
+//! document back uses. A caller that diffs, hashes or signs the policy it reads back
+//! therefore sees a difference only when the document itself differs. A resource holds at
+//! most ONE resource policy, which is what
 //! makes this `@idempotent` put a REPLACEMENT — the last admitted put decides the policy
 //! in force, whichever order concurrent puts arrive in.
 //!
@@ -225,7 +230,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.resource_arn
             )));
         };
-        store.attach_resource_policy(resource, input.resource_policy);
+        // Stored CANONICAL, not verbatim: the service parses the document and serializes
+        // it again on read, so the whitespace between its tokens is not part of what it
+        // holds. Only that whitespace is dropped — member order, string literals and
+        // number spellings are the document's own and survive.
+        store.attach_resource_policy(
+            resource,
+            ::service_common::json_document::minified(&input.resource_policy),
+        );
 
         // The resource the policy is now attached to, as the request spelled its ARN.
         Ok(PutResourcePolicyOutput {

@@ -138,7 +138,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetPromptRouterErrorModeled::InternalServerException(
                 InternalServerException {
@@ -151,7 +151,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let store = state.lock();
 
-        let Some(router) = store.prompt_router(&input.prompt_router_arn) else {
+        let Some(router) = store
+            .prompt_router(&input.prompt_router_arn)
+            .map(crate::state::prompt_router_summary)
+            .or_else(|| {
+                crate::state::default_prompt_router(&input.prompt_router_arn, &region)
+            })
+        else {
             return Err(GetPromptRouterErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(
@@ -164,16 +170,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetPromptRouterOutput {
-            prompt_router_name: router.name.clone(),
-            routing_criteria: router.routing_criteria.clone(),
-            description: router.description.clone(),
-            created_at: Some(crate::state::date_time(router.created_at)),
-            updated_at: Some(crate::state::date_time(router.updated_at)),
-            prompt_router_arn: router.arn.clone(),
-            models: router.models.clone(),
-            fallback_model: router.fallback_model.clone(),
-            status: router.status.to_string(),
-            r#type: router.router_type.to_string(),
+            prompt_router_name: router.prompt_router_name,
+            routing_criteria: router.routing_criteria,
+            description: router.description,
+            created_at: router.created_at,
+            updated_at: router.updated_at,
+            prompt_router_arn: router.prompt_router_arn,
+            models: router.models,
+            fallback_model: router.fallback_model,
+            status: router.status,
+            r#type: router.r#type,
         })
     }
 }

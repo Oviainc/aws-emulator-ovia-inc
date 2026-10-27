@@ -17,7 +17,14 @@ pub struct GetModelCopyJobInput {
     pub job_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#GetModelCopyJobResponse")]
+/// `GetModelCopyJobResponse`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `creationTime` carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation",operation="GetModelCopyJob")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetModelCopyJobOutput {
     pub job_arn: String,
@@ -32,4 +39,86 @@ pub struct GetModelCopyJobOutput {
     pub failure_message: Option<String>,
     pub source_model_name: Option<String>,
 }
+
+bedrock_schema_and_codec!(
+    GetModelCopyJobOutput,
+    GET_MODEL_COPY_JOB_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrock#GetModelCopyJobResponse",
+    "com.amazonaws.bedrock",
+    "GetModelCopyJobResponse",
+    (M_JOB_ARN, job_arn, "jobArn", 0, req, string),
+    (M_STATUS, status, "status", 1, req, string),
+    (
+        M_CREATION_TIME,
+        creation_time,
+        "creationTime",
+        2,
+        req,
+        date_time
+    ),
+    (
+        M_TARGET_MODEL_ARN,
+        target_model_arn,
+        "targetModelArn",
+        3,
+        req,
+        string
+    ),
+    (
+        M_TARGET_MODEL_NAME,
+        target_model_name,
+        "targetModelName",
+        4,
+        opt,
+        string
+    ),
+    (
+        M_SOURCE_ACCOUNT_ID,
+        source_account_id,
+        "sourceAccountId",
+        5,
+        req,
+        string
+    ),
+    (
+        M_SOURCE_MODEL_ARN,
+        source_model_arn,
+        "sourceModelArn",
+        6,
+        req,
+        string
+    ),
+    (
+        M_TARGET_MODEL_KMS_KEY_ARN,
+        target_model_kms_key_arn,
+        "targetModelKmsKeyArn",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_TARGET_MODEL_TAGS,
+        target_model_tags,
+        "targetModelTags",
+        8,
+        opt,
+        list_of_struct(Tag)
+    ),
+    (
+        M_FAILURE_MESSAGE,
+        failure_message,
+        "failureMessage",
+        9,
+        opt,
+        string
+    ),
+    (
+        M_SOURCE_MODEL_NAME,
+        source_model_name,
+        "sourceModelName",
+        10,
+        opt,
+        string
+    ),
+);
 

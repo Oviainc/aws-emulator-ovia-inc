@@ -134,23 +134,9 @@ impl<Eng> ListInferenceProfiles<Eng> {
 /// takes: `maxResults` is modelled `range 1..1000`, so 1000 is the whole span it admits.
 const MAX_PAGE_SIZE: usize = 1000;
 
-/// One listed profile as the `InferenceProfileSummary` the response carries.
-///
-/// Every member is read off the stored record, so the listing reports exactly what
-/// `GetInferenceProfile` answers for that same profile.
-fn summary(profile: &crate::state::InferenceProfileRecord) -> InferenceProfileSummary {
-    InferenceProfileSummary {
-        inference_profile_name: profile.name.clone(),
-        description: profile.description.clone(),
-        created_at: Some(crate::state::date_time(profile.created_at)),
-        updated_at: Some(crate::state::date_time(profile.updated_at)),
-        inference_profile_arn: profile.arn.clone(),
-        models: profile.models.clone(),
-        inference_profile_id: profile.id.clone(),
-        status: profile.status.to_string(),
-        r#type: profile.profile_type.to_string(),
-    }
-}
+// A listed profile is reported through the ONE mapping in
+// `crate::state::inference_profile_summary`, which `GetInferenceProfile` reports a profile
+// through too, so a listing and a read never disagree about a member.
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListInferenceProfiles<Eng>
@@ -217,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|profile| {
                     (
                         crate::state::listing_cursor(profile.created_at, &profile.arn),
-                        summary(profile),
+                        crate::state::inference_profile_summary(profile),
                     )
                 }),
         );
