@@ -24,8 +24,8 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    call, call_in, create_stack, member, router, wait_for_the_transition, xml_blocks, xml_text,
-    xml_texts, REGION,
+    call, call_in, create_stack, list_imports_ok, member, router, wait_for_the_transition,
+    xml_text, xml_texts, REGION,
 };
 
 /// The export names the exporting stack of these cases publishes, and the value each
@@ -141,22 +141,9 @@ async fn list_imports(
     router: &MultiServiceRouter,
     export_name: &str,
 ) -> Vec<String> {
-    let (status, body) = call(
-        router,
-        "ListImports",
-        &[member("ExportName", export_name)],
-    )
-    .await;
-    // "ListImports models NO error": an export name nothing publishes, and one nothing
-    // imports, are both a 200.
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected ListImports to succeed, got {status} {body}"
-    );
-    let Some(block) = xml_blocks(&body, "Imports").into_iter().next() else {
-        return Vec::new();
-    };
-    xml_texts(&block, "member")
+    list_imports_ok(case, router, REGION, export_name, None)
+        .await
+        .0
 }
 
 /// The `(OutputKey, OutputValue)` pairs one stack reports.
@@ -413,22 +400,7 @@ async fn the_export_index_is_scoped_to_the_region_its_stacks_live_in() {
     wait_for_the_transition().await;
 
     for (region, importer_name) in [(REGION, "home-importer"), (other_region, "away-importer")] {
-        let (status, body) = call_in(
-            &router,
-            region,
-            "ListImports",
-            &[member("ExportName", "regional-shared")],
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {region:?}: expected ListImports to succeed, got {status} {body}"
-        );
-        let block = xml_blocks(&body, "Imports")
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        let reported = xml_texts(&block, "member");
+        let (reported, _) = list_imports_ok(region, &router, region, "regional-shared", None).await;
         assert_eq!(
             reported,
             vec![importer_name.to_string()],

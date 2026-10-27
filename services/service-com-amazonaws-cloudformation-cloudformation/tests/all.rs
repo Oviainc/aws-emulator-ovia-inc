@@ -89,6 +89,8 @@ mod include_transform;
 mod list_change_sets;
 #[path = "all/list_generated_templates.rs"]
 mod list_generated_templates;
+#[path = "all/list_imports_pages.rs"]
+mod list_imports_pages;
 #[path = "all/list_stack_instances.rs"]
 mod list_stack_instances;
 #[path = "all/list_stack_resources.rs"]
