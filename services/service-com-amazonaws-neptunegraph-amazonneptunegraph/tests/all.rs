@@ -73,3 +73,5 @@ mod region_scoping;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/task_namespace_refusals.rs"]
+mod task_namespace_refusals;
