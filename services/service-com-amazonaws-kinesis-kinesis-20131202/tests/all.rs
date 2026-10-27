@@ -21,6 +21,8 @@ mod encrypted_records;
 mod manual_resharding;
 #[path = "all/max_record_size.rs"]
 mod max_record_size;
+#[path = "all/merge_adjacency.rs"]
+mod merge_adjacency;
 #[path = "all/record_flow.rs"]
 mod record_flow;
 #[path = "all/resource_tags.rs"]

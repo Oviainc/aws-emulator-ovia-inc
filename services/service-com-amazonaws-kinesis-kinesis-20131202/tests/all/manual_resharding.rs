@@ -30,12 +30,16 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    shard_not_found_message, shard_not_open_message, shards_not_adjacent_message,
+    shard_not_found_message, shard_not_open_message,
     split_hash_key_outside_the_parent_message, stream_not_found_message,
     stream_on_demand_message, STREAM_ACTIVE, STREAM_IDENTIFIER_REQUIRED_MESSAGE,
     STREAM_MODE_ON_DEMAND, STREAM_MODE_PROVISIONED, STREAM_UPDATING,
 };
 
+// The wording an ineligible pair of shards is refused with is written out in
+// `merge_adjacency`, not read from the implementation, so these rows assert the text a
+// client sees rather than whatever the handler happens to say.
+use crate::merge_adjacency::not_an_adjacent_pair;
 use crate::shard_scaling::{
     hash_key_range, is_open, parents, past_reshard, shard_id, shard_map, summary,
 };
@@ -597,7 +601,7 @@ async fn a_refused_reshard_changes_nothing() {
             },
             code: "InvalidArgumentException",
             says: |name, open| {
-                shards_not_adjacent_message(
+                not_an_adjacent_pair(
                     &shard_id(name, &open[0]),
                     &shard_id(name, &open[2]),
                     name,
@@ -617,7 +621,7 @@ async fn a_refused_reshard_changes_nothing() {
             },
             code: "InvalidArgumentException",
             says: |name, open| {
-                shards_not_adjacent_message(
+                not_an_adjacent_pair(
                     &shard_id(name, &open[0]),
                     &shard_id(name, &open[0]),
                     name,
