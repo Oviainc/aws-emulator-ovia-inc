@@ -213,6 +213,8 @@ mod load_balancer_tls_certificate_attach;
 mod load_balancer_tls_certificate_create;
 #[path = "all/load_balancer_tls_certificate_delete.rs"]
 mod load_balancer_tls_certificate_delete;
+#[path = "all/load_balancer_tls_certificate_read.rs"]
+mod load_balancer_tls_certificate_read;
 #[path = "all/load_balancer_tls_policies.rs"]
 mod load_balancer_tls_policies;
 #[path = "all/operations_for_resource.rs"]

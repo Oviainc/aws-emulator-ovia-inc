@@ -1167,6 +1167,10 @@ async fn deleting_one_named_version_keeps_the_workflow_until_no_version_is_left(
                         object_key: "dags/v2.yaml".to_string(),
                         version_id: None,
                     },
+                    // Nothing staged an object at that location, so this seeded version
+                    // froze no definition content and declares no schedule.
+                    workflow_definition: None,
+                    schedule_configuration: None,
                     code: None,
                     role_arn: role_arn(),
                     description: Some("the second version".to_string()),

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDisassociateScramSecret
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDisassociateScramSecret`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Disassociates AWS Secrets Manager secrets from the cluster an ARN names, so
+//! its SASL/SCRAM clients can no longer authenticate with them and
+//! `ListScramSecrets` stops reporting them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDisassociateScramSecret::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The inverse of `BatchAssociateScramSecret` on the one stored set
+//! ([`crate::state::Cluster::disassociate_scram_secrets`]), hence idempotent in
+//! the same way: a secret the cluster does not hold is removed from nothing, so
+//! repeating a disassociation leaves the stored set unchanged.
+//!
+//! The request-level refusals are the association's: a `ClusterArn` that is not
+//! an MSK cluster ARN and a `SecretArnList` entry that is not a Secrets Manager
+//! secret ARN are `BadRequestException`, and a well-formed cluster ARN this
+//! endpoint's region holds no cluster for is `NotFoundException`.
+//! `UnprocessedScramSecrets` is therefore empty on every accepted call.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +156,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDisassociateScramSecret` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDisassociateScramSecretErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDisassociateScramSecret"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchDisassociateScramSecretErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // The same line between the two client errors the association draws: a
+        // value that is not a cluster ARN at all is a request the service cannot
+        // act on, and `NotFoundException` is reserved for a well-formed ARN this
+        // endpoint holds no cluster for.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                BatchDisassociateScramSecretErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some("ClusterArn".to_string()),
+                        message: Some(format!(
+                            "{} is not a valid Amazon MSK cluster ARN.",
+                            input.cluster_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every entry must name a Secrets Manager secret, as it must to be
+        // associated in the first place. Checked before the lock and before
+        // anything is removed, so a batch carrying one unusable ARN
+        // disassociates none of its secrets.
+        if let Some(not_a_secret) = input
+            .secret_arn_list
+            .iter()
+            .find(|arn| !crate::state::is_secrets_manager_secret_arn(arn))
+        {
+            return Err(
+                BatchDisassociateScramSecretErrorModeled::BadRequestException(
+                    BadRequestException {
+                        invalid_parameter: Some("SecretArnList".to_string()),
+                        message: Some(format!(
+                            "{not_a_secret} is not a valid AWS Secrets Manager secret ARN."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut state = state.lock();
+        let Some(cluster) = state.settled_cluster_in_mut(
+            &region,
+            &input.cluster_arn,
+            std::time::SystemTime::now(),
+        ) else {
+            return Err(
+                BatchDisassociateScramSecretErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+
+        // Removal goes through the record's own path, which drops exactly the
+        // secrets the cluster holds and leaves the rest of the set alone.
+        cluster.disassociate_scram_secrets(&input.secret_arn_list);
+
+        Ok(BatchDisassociateScramSecretOutput {
+            // The STORED cluster's ARN, so the answer names the record the
+            // secrets were taken off rather than echoing the request.
+            cluster_arn: Some(cluster.arn.clone()),
+            // Nothing was left unprocessed: every condition that stops a secret
+            // being disassociated refuses the whole call above.
+            unprocessed_scram_secrets: Some(Vec::new()),
+        })
     }
 }

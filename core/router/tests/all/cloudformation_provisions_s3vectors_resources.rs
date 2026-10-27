@@ -48,7 +48,7 @@ const ACCOUNT: &str = "000000000000";
 /// as `core/router/src/lib.rs` mounts them. Request authentication is off, as in every
 /// other suite here; the in-process callback CloudFormation makes signs its request either
 /// way (the credential scope is what routes it).
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -74,7 +74,7 @@ fn authorization(service: &str, region: &str) -> String {
 }
 
 /// Call one CloudFormation operation over its awsQuery wire, signed for `region`.
-async fn cloudformation(
+pub(crate) async fn cloudformation(
     router: &MultiServiceRouter,
     region: &str,
     action: &str,

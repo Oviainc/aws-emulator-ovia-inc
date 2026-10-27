@@ -51,6 +51,8 @@ mod queue_lifecycle;
 mod queue_permissions;
 #[path = "all/queue_policy_authorization.rs"]
 mod queue_policy_authorization;
+#[path = "all/queue_policy_condition_keys.rs"]
+mod queue_policy_condition_keys;
 #[path = "all/queue_tags.rs"]
 mod queue_tags;
 #[path = "all/receipt_handle_lifetime.rs"]

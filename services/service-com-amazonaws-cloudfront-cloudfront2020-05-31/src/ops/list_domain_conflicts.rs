@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDomainConflicts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDomainConflicts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the domain associations this service holds that CONFLICT with a domain, read
+//! from the stored records every one of those associations was written by.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDomainConflicts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation decides
+//!
+//! * a conflict is an association of a name CloudFront cannot route separately from the
+//!   one asked about — the same name, or a wildcard alternate domain name that covers it
+//!   (or that it covers) — over the two association kinds `DistributionResourceType`
+//!   admits: a distribution's alternate domain names and a distribution tenant's domains;
+//! * `DomainControlValidationResource` is the caller's PROOF that it controls the domain it
+//!   is asking about: it names one distribution or one distribution tenant whose attached
+//!   TLS certificate covers that domain, so a resource no record answers to is
+//!   `EntityNotFound` and one that holds no such certificate — a CloudFront managed
+//!   certificate still waiting for its domains to be validated, or a distribution on
+//!   CloudFront's own default certificate — is `InvalidArgument`;
+//! * the page is cut at `MaxItems` in the ONE order the store defines, and `NextMarker` is
+//!   the resume point the next request carries, so walking the pages enumerates every
+//!   conflict exactly once.
+//!
+//! A READ: it reports what the stored associations are and writes nothing beyond the
+//! transitions the clock already owed.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +109,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -129,6 +143,65 @@ impl From<ListDomainConflictsErrorModeled> for ListDomainConflictsError {
     fn from(modeled: ListDomainConflictsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The sentence this operation refuses a `DomainControlValidationResource` that names no
+/// single resource with: `DistributionResourceId` carries one member per resource KIND, and
+/// the domain control validation is the proof of ONE resource, so a request that names
+/// neither names nothing to validate against and one that names both names two. The
+/// condition is a property of the parameter rather than of the values submitted, so neither
+/// id appears in it.
+const ONE_VALIDATION_RESOURCE_MESSAGE: &str =
+    "DomainControlValidationResource must specify either DistributionId or \
+     DistributionTenantId, but not both in the same request.";
+
+/// The sentence this operation refuses a validation resource that holds no valid
+/// certificate for the domain asked about with.
+///
+/// `DomainControlValidationResource` is "the standard distribution or distribution tenant
+/// that has a valid certificate, which covers the domain that you specify", so a resource
+/// whose attached certificate is not valid for that domain validates no control of it.
+/// CloudFront's own wording for that condition, recorded behaviour: it states what the
+/// resource has to carry and echoes no value from the request.
+const CERTIFICATE_DOES_NOT_COVER_MESSAGE: &str =
+    "There must be at least one certificate in the distribution tenant or distribution, or \
+     there must be a managed certificate request";
+
+/// The sentence this operation refuses a `Marker` that is no resume point it handed out
+/// with: the CONSTRAINT on the parameter, which carries nothing from the request, as every
+/// other invalid-marker sentence of this service states its own.
+const INVALID_MARKER_MESSAGE: &str =
+    "Marker is not a pagination token returned by ListDomainConflicts";
+
+/// This operation's modelled refusal (`InvalidArgument`, HTTP 400) carrying `message`.
+fn invalid_argument(message: &str) -> ListDomainConflictsError {
+    ListDomainConflictsErrorModeled::InvalidArgument(InvalidArgument {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The pagination token a page that left conflicts behind hands back: the conflicting
+/// domain and the id of the resource holding it, which is the pair one conflict is ordered
+/// by in the store.
+///
+/// `NextMarker` is "a token used for pagination of results" rather than an id of anything,
+/// and a domain by itself is no resume point — one domain can be associated with more than
+/// one resource — so the token names both halves of the place the page ended at. A domain
+/// name carries no `|`, so the first one separates them.
+fn resume_token(conflict: &DomainConflict) -> String {
+    format!("{}|{}", conflict.domain, conflict.resource_id)
+}
+
+/// The place a `Marker` resumes at — the conflicting domain, lowercased as the store orders
+/// it, and the resource id — or `None` when the marker is no token this operation handed
+/// out.
+fn resume_point(marker: &str) -> Option<(String, String)> {
+    let (domain, resource_id) = marker.split_once('|')?;
+    if crate::state::domain_name_refusal(domain).is_some() || resource_id.is_empty() {
+        return None;
+    }
+    Some((domain.to_lowercase(), resource_id.to_string()))
 }
 
 /// The `ListDomainConflicts` operation.
@@ -165,20 +238,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDomainConflicts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDomainConflictsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDomainConflicts"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // "The maximum number of domain conflicts to return" — a page holds at least one
+        // item, so a non-positive size names no page at all. The size served is bounded
+        // above by this emulator's own page ceiling, the same one every listing of this
+        // service is bounded by.
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListDomainConflictsErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        // "The domain to check for conflicts": the member is a plain string, so the shape
+        // of a DNS name is checked here — a value that is no domain name names no
+        // association any CloudFront resource could hold. A wildcard alternate domain name
+        // is one of the inputs this operation documents ("if you provide *.example.com as
+        // input"), and it is a domain name of the same shape.
+        if crate::state::domain_name_refusal(&input.domain).is_some() {
+            return Err(ListDomainConflictsErrorModeled::InvalidArgument(
+                crate::state::invalid_domain_name(),
+            )
+            .into());
+        }
+
+        // "The marker for the next set of domain conflicts" is the token the previous page
+        // handed back ([`resume_token`]): a value that is not one was never a resume point
+        // this service handed out.
+        let resume = match input.marker.as_deref().filter(|marker| !marker.is_empty()) {
+            Some(marker) => match resume_point(marker) {
+                Some(resume) => Some(resume),
+                None => return Err(invalid_argument(INVALID_MARKER_MESSAGE)),
+            },
+            None => None,
+        };
+
+        let mut store = state.lock();
+        // Materialise the transitions the clock already owes — a managed certificate's
+        // issuance above all, which is what decides whether it covers a domain yet — so
+        // this read answers from the records as they are at this instant.
+        store.settle(SystemTime::now());
+
+        // The domain control validation: "the ID of a standard distribution or distribution
+        // tenant in your account that has an attached TLS certificate, which covers the
+        // specified domain". The resource is resolved from the STORE, and whether its
+        // certificate covers the domain is read from that record rather than from the
+        // request. A member carrying no value names no resource.
+        let resource = &input.domain_control_validation_resource;
+        let distribution_id = resource
+            .distribution_id
+            .as_deref()
+            .filter(|id| !id.is_empty());
+        let tenant_id = resource
+            .distribution_tenant_id
+            .as_deref()
+            .filter(|id| !id.is_empty());
+        let covers_domain = match (distribution_id, tenant_id) {
+            (Some(id), None) => {
+                let Some(distribution) = store.distributions.get(id) else {
+                    return Err(ListDomainConflictsErrorModeled::EntityNotFound(
+                        crate::state::distribution_not_found(),
+                    )
+                    .into());
+                };
+                crate::state::names_custom_certificate(
+                    distribution.config.viewer_certificate.as_ref(),
+                )
+            }
+            (None, Some(id)) => {
+                let Some(tenant) = store.distribution_tenants.get(id) else {
+                    return Err(ListDomainConflictsErrorModeled::EntityNotFound(
+                        crate::state::distribution_tenant_not_found(),
+                    )
+                    .into());
+                };
+                tenant.certificate_covers_domain(&input.domain)
+            }
+            _ => return Err(invalid_argument(ONE_VALIDATION_RESOURCE_MESSAGE)),
+        };
+        if !covers_domain {
+            return Err(invalid_argument(CERTIFICATE_DOES_NOT_COVER_MESSAGE));
+        }
+
+        // Every association that conflicts with the domain, in the one order the store
+        // defines, cut to this page: `Marker` names where the previous page ENDED, so this
+        // page starts after it and walking the pages enumerates every conflict once.
+        let mut conflicts = store.domain_conflicts(&input.domain);
+        if let Some(resume) = resume {
+            conflicts.retain(|conflict| {
+                (conflict.domain.to_lowercase(), conflict.resource_id.clone()) > resume
+            });
+        }
+        let more_remain = conflicts.len() > page_size;
+        conflicts.truncate(page_size);
+
+        Ok(ListDomainConflictsOutput {
+            // The resume point the next request carries as its `Marker`: present exactly
+            // when conflicts remain, naming the place this page ended at. A page that left
+            // conflicts behind is a FULL page, so it has a last conflict to name.
+            next_marker: conflicts.last().filter(|_| more_remain).map(resume_token),
+            // "Contains details about the domain conflicts" — every one of them read from
+            // the record whose association it is.
+            domain_conflicts: Some(conflicts),
+        })
     }
 }

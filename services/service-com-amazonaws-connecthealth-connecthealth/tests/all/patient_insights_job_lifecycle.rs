@@ -17,12 +17,13 @@
 //!    under resolves it, and every other pair is the modelled
 //!    `ResourceNotFoundException`.
 //! 3. The STATUS a get reports is the one the clock has moved the job to — never zero
-//!    milliseconds after the start, and terminal once it is terminal.
+//!    milliseconds after the start, and terminal once it is terminal; a job that ran to
+//!    completion reports its output location under the path the start configured.
 //! 4. `clientToken` is an `@idempotencyToken`: a retry resolves to the job the first
 //!    call created, and the same token with different parameters is the modelled
 //!    `ConflictException`.
 //! 5. Every value of the modelled `JobStatus` enum is projected out of state, including
-//!    the ones this emulator's own lifecycle never reaches.
+//!    the ones this emulator's own lifecycle does not reach.
 //!
 //! The constraints asserted here are the model's own
 //! (`smithy_query(query="closure", operation="GetPatientInsightsJob")`), quoted beside
@@ -39,9 +40,8 @@ use service_com_amazonaws_connecthealth_connecthealth::ops::types::{
     JOB_STATUS_VALUES, PRONOUNS_VALUES,
 };
 use service_com_amazonaws_connecthealth_connecthealth::state::{
-    self, JobStatus, PatientInsightsJob, PatientInsightsJobSpec,
-    MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN, PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE,
-    PATIENT_INSIGHTS_JOB_STEP_SPAN,
+    self, patient_insights_output_uri, JobStatus, PatientInsightsJob, PatientInsightsJobSpec,
+    MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN, PATIENT_INSIGHTS_JOB_STEP_SPAN,
 };
 
 use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
@@ -109,7 +109,10 @@ fn is_job_arn(arn: &str, region: &str, domain_id: &str, job_id: &str) -> bool {
 
 /// A `StartPatientInsightsJob` body carrying only the required members, with the
 /// parameters a row wants varied folded in by the caller.
-fn minimal_body() -> Value {
+///
+/// `pub(crate)` so the sibling suites of this test target vary ONE member of the same
+/// request rather than each growing its own copy of a valid body.
+pub(crate) fn minimal_body() -> Value {
     json!({
         "patientContext": { "patientId": "patient-0001" },
         "insightsContext": { "insightsType": "PRE_VISIT" },
@@ -344,10 +347,11 @@ async fn a_started_job_is_persisted_and_read_back_member_for_member() {
 }
 
 #[tokio::test]
-async fn the_clock_moves_a_submitted_job_to_the_modelled_failure_status() {
+async fn the_clock_moves_a_submitted_job_to_the_modelled_success_status() {
     let emulator = Emulator::new("eu-west-1");
     let domain_id = domain_of(&emulator, "clinic-lifecycle").await;
-    let started = start_job(&emulator, "lifecycle", &domain_id, &minimal_body()).await;
+    let body = minimal_body();
+    let started = start_job(&emulator, "lifecycle", &domain_id, &body).await;
     let job_id = string_at(&started, "jobId");
     let creation_time = member("lifecycle", &started, "creationTime");
 
@@ -377,43 +381,39 @@ async fn the_clock_moves_a_submitted_job_to_the_modelled_failure_status() {
     );
 
     std::thread::sleep(past_a_span);
-    let failed = get_job(&emulator, "two spans in", &domain_id, &job_id).await;
+    let done = get_job(&emulator, "two spans in", &domain_id, &job_id).await;
     assert_eq!(
-        string_at(&failed, "jobStatus"),
-        "FAILED",
-        "a run this emulator cannot perform must end in the modelled failure status, \
-         got {failed}"
+        string_at(&done, "jobStatus"),
+        "SUCCEEDED",
+        "a job that ran to completion must end in the modelled success status, got {done}"
     );
+    let configured = string_at(&body["outputDataConfig"], "s3OutputPath");
     assert_eq!(
-        string_at(&failed, "statusDetails"),
-        PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE,
-        "the failure must say why nothing ran, got {failed}"
-    );
-    assert!(
-        failed.get("insightsOutput").is_none(),
-        "a job that generated nothing must carry no insightsOutput, got {failed}"
+        member("two spans in", &done, "insightsOutput"),
+        json!({ "uri": patient_insights_output_uri(&configured, &job_id) }),
+        "a completed job must report its output under the configured path, got {done}"
     );
     assert_ne!(
-        member("two spans in", &failed, "updatedTime"),
+        member("two spans in", &done, "updatedTime"),
         creation_time,
-        "a transitioned job must report when it last changed, got {failed}"
+        "a transitioned job must report when it last changed, got {done}"
     );
     assert_eq!(
-        member("two spans in", &failed, "creationTime"),
+        member("two spans in", &done, "creationTime"),
         creation_time,
-        "the creation instant must not move, got {failed}"
+        "the creation instant must not move, got {done}"
     );
 
     // Terminal means terminal: two further reads report exactly the same record, so a
     // read never advances what a later caller sees.
-    let again = get_job(&emulator, "after the failure", &domain_id, &job_id).await;
-    let and_again = get_job(&emulator, "after the failure, twice", &domain_id, &job_id).await;
+    let again = get_job(&emulator, "after the run", &domain_id, &job_id).await;
+    let and_again = get_job(&emulator, "after the run, twice", &domain_id, &job_id).await;
     assert_eq!(
-        again, failed,
+        again, done,
         "a terminal job must read the same every time, got {again}"
     );
     assert_eq!(
-        and_again, failed,
+        and_again, done,
         "a terminal job must read the same every time, got {and_again}"
     );
 }
@@ -670,19 +670,16 @@ async fn the_reader_projects_every_modelled_job_status_out_of_state() {
     let domain_id = domain_of(&emulator, "clinic-statuses").await;
 
     // The whole `JobStatus` catalog, from the modelled enum (`JOB_STATUS_VALUES`), so
-    // no status is special-cased — including `SUCCEEDED`, which carries the output of a
-    // run, and which this emulator's own lifecycle never reaches.
+    // no status is special-cased — including `FAILED`, which this emulator's own
+    // lifecycle does not reach, and `SUCCEEDED`, which carries the output of a run.
     for (index, wire_status) in JOB_STATUS_VALUES.iter().enumerate() {
         let case = format!("jobStatus {wire_status}");
         let status = JobStatus::from_wire(wire_status)
             .unwrap_or_else(|| panic!("case {case:?}: the state enum must know this wire value"));
         let job_id = format!("seeded-job-{index}");
         let (details, output) = match status {
-            JobStatus::Succeeded => (
-                Some("Insights generated."),
-                Some("s3://clinic-output/seeded/insights.json"),
-            ),
-            JobStatus::Failed => (Some(PATIENT_INSIGHTS_INFERENCE_UNAVAILABLE), None),
+            JobStatus::Succeeded => (None, Some("s3://clinic-output/seeded/insights.json")),
+            JobStatus::Failed => (Some("The job could not be completed."), None),
             _ => (None, None),
         };
         seed_job(

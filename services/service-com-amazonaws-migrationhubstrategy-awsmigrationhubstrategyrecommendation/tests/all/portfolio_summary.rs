@@ -39,10 +39,9 @@ use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommenda
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::assessment_analysis::complete_the_span;
 use crate::import_and_assess::{
-    at, call, get_assessment, minimal_assessment, register_collector_in, start_assessment, Answer,
-    TEST_REGION,
+    at, bring_every_completion_forward, call, get_assessment, minimal_assessment,
+    register_collector_in, start_assessment, Answer, TEST_REGION,
 };
 
 /// `GET /get-portfolio-summary`, from
@@ -712,7 +711,7 @@ async fn the_summary_reports_what_a_completed_assessment_recorded() {
         );
     }
 
-    complete_the_span(&engine);
+    bring_every_completion_forward(&engine);
     let assessment = get_assessment(&router, &started.string("/assessmentId")).await;
     let completed_at = at(&assessment.body, "/dataCollectionDetails/completionTime");
     assert!(
