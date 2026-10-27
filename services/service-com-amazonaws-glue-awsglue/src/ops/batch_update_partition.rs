@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchUpdatePartition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchUpdatePartition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchUpdatePartition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Writes each submitted `PartitionInput` over the stored definition of the partition its
+//! entry addresses by `PartitionValueList`, so a later partition read serves what the
+//! entry sent while the partition keeps the address and the `CreationTime` its create
+//! wrote. An absent database or table fails the whole request with
+//! `EntityNotFoundException`; a single entry that cannot be applied fails only its own
+//! entry, reported in `Errors`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +157,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchUpdatePartition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchUpdatePartitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchUpdatePartition"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(BatchUpdatePartitionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
+        // An update is a catalog WRITE, so the definitions this batch stores are encrypted
+        // under the key the catalog's setting names NOW and not under the one each
+        // partition's create used: "the specified encryption is applied to every catalog
+        // write thereafter" (`PutDataCatalogEncryptionSettings`). The entries are applied
+        // at one instant under one setting, so ONE data key is produced for the batch
+        // before anything is written, and a key KMS refuses refuses the whole batch, which
+        // leaves every stored partition where it is (`crate::state::catalog_encryption`).
+        let write_key = crate::state::catalog_encryption::write_key(&state.lock(), &catalog_id);
+        let encryption =
+            match crate::state::catalog_encryption::seal(ctx, &region, write_key.as_deref()).await {
+                Ok(encryption) => encryption,
+                Err(message) => {
+                    return Err(BatchUpdatePartitionErrorModeled::GlueEncryptionException(
+                        GlueEncryptionException {
+                            message: Some(message),
+                        },
+                    )
+                    .into())
+                }
+            };
+
+        let mut store = state.lock();
+        let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
+            return Err(BatchUpdatePartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::database_not_found(
+                        &input.database_name,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        let database_name = database.name.clone();
+        let Some(table) = database
+            .tables
+            .get_mut(&crate::state::fold_name(&input.table_name))
+        else {
+            return Err(BatchUpdatePartitionErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // Each submitted entry is applied on its own: `Errors` is "the errors encountered
+        // when trying to update the requested partitions", which is where a partial
+        // failure belongs, rather than failing the whole batch or claiming a clean update.
+        // The entries are walked in the order they were sent, so a batch that addresses
+        // the same partition twice leaves the definition the LAST of them submitted.
+        let mut errors: Vec<BatchUpdatePartitionFailureEntry> = Vec::new();
+        let mut updated = 0usize;
+        for entry in &input.entries {
+            match table.update_partition(
+                &entry.partition_value_list,
+                &entry.partition_input,
+                encryption.clone(),
+            ) {
+                Ok(_) => updated += 1,
+                Err(refusal) => errors.push(BatchUpdatePartitionFailureEntry {
+                    // `BatchUpdatePartitionFailureEntry$PartitionValueList` is "a list of
+                    // values defining the partitions": the ones this entry addressed, so a
+                    // client can tell which of its entries failed. Reported exactly as
+                    // sent.
+                    partition_value_list: Some(entry.partition_value_list.clone()),
+                    error_detail: Some(refusal.to_error_detail()),
+                }),
+            }
+        }
+        ::tracing::info!(
+            operation = "BatchUpdatePartition",
+            catalog_id = %catalog_id,
+            database = %database_name,
+            table = %table.name,
+            updated,
+            failed = errors.len(),
+            "updated Data Catalog partitions in a batch"
+        );
+
+        // The list is reported whether or not anything failed, the way the sibling batch
+        // write `BatchCreatePartition` reports its own: an empty `Errors` is the positive
+        // statement that every submitted entry was applied, which is what a client checks
+        // before treating the batch as done.
+        Ok(BatchUpdatePartitionOutput {
+            errors: Some(errors),
+        })
     }
 }
