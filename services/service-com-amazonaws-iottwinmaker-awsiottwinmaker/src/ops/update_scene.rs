@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateScene
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateScene`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates a stored scene in place: the members the request names replace what
+//! the scene held, the ones it leaves out keep their stored values, and the call
+//! answers the instant of the change — which `GetScene` then reports as the
+//! scene's `updateDateTime`, its `creationDateTime` left where the create put
+//! it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateScene::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `capabilities` and `sceneMetadata` are a LIST and a MAP, so each is a value
+//! in its own right: naming one REPLACES what the scene held, and the empty list
+//! or map clears it. Nothing here merges entry by entry — the request carries
+//! the whole collection or leaves it alone.
+//!
+//! Both labels address an EXISTING resource, so a workspace or a scene this
+//! Region's store does not hold is the `ResourceNotFoundException` the operation
+//! models, in the look-up constructions `GetScene` and `DeleteScene` report for
+//! the same misses. The update is SYNCHRONOUS: a scene has no lifecycle `state`
+//! anywhere in its API, so there is no transition for the clock to owe and the
+//! next read sees the change.
+//!
+//! Two deliberate gaps, the same ones `CreateScene` carries. `contentLocation`
+//! is stored WITHOUT checking that the S3 object it names exists, since the
+//! content definition file lives in the caller's bucket, which this emulator
+//! does not reach. Authorization is not emulated, so the modelled
+//! `AccessDeniedException` is never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +166,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateScene` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSceneErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateScene"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one mutates tenant state.
+        ::tracing::info!(
+            operation = "UpdateScene",
+            workspace_id = %input.workspace_id,
+            scene_id = %input.scene_id,
+            "serving a request"
+        );
+        // The Region this request is signed for picks the store it acts on: a
+        // scene created through another Region's endpoint is not in it, so this
+        // call cannot update it.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateSceneErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        let state = state.region_mut(&region);
+
+        // Both labels address an EXISTING resource, so neither naming something
+        // the store does not hold is anything but a 404.
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(UpdateSceneErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
+                },
+            )
+            .into());
+        };
+        let Some(scene) = workspace.scenes.get_mut(&input.scene_id) else {
+            return Err(UpdateSceneErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::scene_not_found_message(
+                        &input.workspace_id,
+                        &input.scene_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A patch: a member the request names replaces the stored value, one it
+        // leaves out keeps it. Nothing below can fail, so the record is written
+        // in place rather than on a copy. The scene's identity — its id, its
+        // workspace, its ARN and the instant it was created — is not patchable,
+        // so none of it is touched here.
+        if let Some(content_location) = input.content_location {
+            scene.content_location = content_location;
+        }
+        if let Some(description) = input.description {
+            scene.description = Some(description);
+        }
+        // A collection the request names is replaced WHOLE, the empty one
+        // included: `capabilities` keeps the order it was given, being a list,
+        // and `sceneMetadata` is the map the request carried rather than a merge
+        // of it into the stored one.
+        if let Some(capabilities) = input.capabilities {
+            scene.capabilities = capabilities;
+        }
+        if let Some(scene_metadata) = input.scene_metadata {
+            scene.scene_metadata = scene_metadata.into_iter().collect();
+        }
+        // The scene changed at this call's instant, which is what the output
+        // reports and what the next read reports as its `updateDateTime`: both
+        // come from the stored record, so they cannot disagree.
+        scene.update_date_time = ::std::time::SystemTime::now();
+
+        Ok(UpdateSceneOutput {
+            update_date_time: crate::state::timestamp(scene.update_date_time),
+        })
     }
 }
