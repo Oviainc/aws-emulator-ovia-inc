@@ -955,6 +955,34 @@ pub fn resource_not_usable_message(kind: &str, name: &str, state: &str) -> Strin
     )
 }
 
+/// Whether `state` is one a custom vocabulary's build has FINISHED in — the terminal
+/// states of the `VocabularyState` enum.
+///
+/// [`VOCABULARY_STATE_PENDING`] is the one value of that enum a build is still running
+/// in, so everything else is terminal. Single-homed here because every operation that
+/// may only act on a FINISHED vocabulary — the deletes of both vocabulary families and
+/// the updates that overwrite one — has to agree about which states those are.
+pub fn is_terminal_vocabulary_state(state: &str) -> bool {
+    state != VOCABULARY_STATE_PENDING
+}
+
+/// How this service refuses a request that would OVERWRITE a custom resource whose
+/// build has not finished: the resource of `kind` named `name` is in `state`, which is
+/// not one of the states its build has finished in
+/// ([`is_terminal_vocabulary_state`]).
+///
+/// Worded like the state refusals the deletes of every family carry ("... is in the
+/// {state} state and can't be deleted. Wait until it is no longer being processed ..."),
+/// because it is the same refusal about the same records, for the one verb this
+/// operation performs instead. The variable parts are the name the request asked for
+/// and the state this emulator holds the resource in.
+pub fn resource_not_updatable_message(kind: &str, name: &str, state: &str) -> String {
+    format!(
+        "The custom {kind} {name} is in the {state} state and can't be updated. Wait \
+         until it is no longer being processed and try your request again."
+    )
+}
+
 /// How this service words "that name is already taken", for a resource of `kind`.
 ///
 /// Same shape of text as [`not_found_message`], and the same reason for naming only

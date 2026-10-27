@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // documentation): a resource the service is still processing is not
             // deletable, exactly as the non-medical family's delete refuses it.
             Some(vocabulary_state)
-                if vocabulary_state == crate::state::VOCABULARY_STATE_PENDING =>
+                if !crate::state::is_terminal_vocabulary_state(&vocabulary_state) =>
             {
                 return Err(DeleteMedicalVocabularyErrorModeled::BadRequestException(
                     BadRequestException {

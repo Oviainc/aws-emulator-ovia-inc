@@ -163,7 +163,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_MEDICAL_VOCABULARY_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
-    /// Overwrite the stored custom medical vocabulary this request names.
+    /// Overwrite the stored custom medical vocabulary this request names, once its
+    /// build has finished.
     ///
     /// "This operation overwrites all existing information with your new values; you
     /// cannot append new terms onto an existing custom vocabulary" (the operation's
@@ -171,7 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// this request carries and the rebuild starts over: the vocabulary is `PENDING`
     /// again, with the one transition the clock owes it due from this call. Its
     /// identity — the name, the Region it lives in, its creation order and its tag
-    /// set, none of which this operation models an input for — is untouched.
+    /// set, none of which this operation models an input for — is untouched. A record
+    /// whose build has NOT finished is refused instead of overwritten, the same way
+    /// `DeleteMedicalVocabulary` refuses it.
     ///
     /// As on the create, the terms themselves can only come from the file at
     /// `VocabularyFileUri`, which this operation models `@required` with no inline
@@ -212,9 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        let Some(existing) = store
-            .medical_vocabularies
-            .get(&region, &input.vocabulary_name)
+        let Some(existing) = store.medical_vocabulary_mut(&region, &input.vocabulary_name, now)
         else {
             // A medical vocabulary this Region does not hold is this service's
             // `BadRequestException`, as it is for `GetMedicalVocabulary` and
@@ -225,6 +226,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::KIND_MEDICAL_VOCABULARY,
             )));
         };
+
+        // A build the service is still running is not overwritten: the same rule, and
+        // the same records, as `DeleteMedicalVocabulary`'s own state refusal — "Your
+        // request didn't pass one or more validation tests. This can occur when the
+        // entity you're trying to delete doesn't exist or if it's in a non-terminal
+        // state" (`BadRequestException`'s own documentation). The lookup above
+        // materialised the transition the clock already owed the record, so only a
+        // build that is genuinely still running is refused.
+        if !crate::state::is_terminal_vocabulary_state(&existing.state) {
+            let refusal = crate::state::resource_not_updatable_message(
+                crate::state::KIND_MEDICAL_VOCABULARY,
+                &existing.name,
+                &existing.state,
+            );
+            return Err(bad_request(&refusal));
+        }
 
         // The replacement record, built through the family's own `PENDING`
         // constructor so the create and this update cannot disagree about the
