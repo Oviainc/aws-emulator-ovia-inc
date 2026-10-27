@@ -188,14 +188,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `StartPrimaryEmailUpdate`: this operation acts on a member account
         // from the management or delegated administrator account, and the
         // model's own `AccountId` documentation states that the management
-        // account can't specify its own `AccountId`. `AccountId` is required
-        // here, so there is no caller's-own default to resolve.
-        if input.account_id == crate::state::default_account_id() {
-            return Err(AcceptPrimaryEmailUpdateErrorModeled::AccessDeniedException(
-                crate::state::cannot_target_own_account(),
-            )
-            .into());
-        }
+        // account can't specify its own `AccountId`. The member is required
+        // here, so it always names an account — and a named account is
+        // resolved by the one resolution every operation taking an account id
+        // goes through, which is what refuses the caller's own.
+        let account_id = match crate::state::target_account_id(Some(&input.account_id)) {
+            Ok(account_id) => account_id,
+            Err(denied) => {
+                return Err(
+                    AcceptPrimaryEmailUpdateErrorModeled::AccessDeniedException(denied).into(),
+                )
+            }
+        };
 
         // The address presented here is the one that becomes the account's root
         // user email address, so it is held to the same syntax
@@ -224,15 +228,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds, or is already owed, is taken from nobody, so re-affirming it
         // is no change and no conflict.
         let address_in_use =
-            store.primary_email_in_use_by_other(&input.primary_email, &input.account_id);
+            store.primary_email_in_use_by_other(&input.primary_email, &account_id);
 
         // This operation acts on an update that already exists, so it creates
         // no account record: an account this emulator has never been told about
         // is outside the caller's organization, which is the same refusal
         // `GetPrimaryEmailUpdateStatus` applies.
-        let Some(account) = store.existing_account_mut(&input.account_id) else {
+        let Some(account) = store.existing_account_mut(&account_id) else {
             return Err(AcceptPrimaryEmailUpdateErrorModeled::AccessDeniedException(
-                crate::state::account_not_accessible(&input.account_id),
+                crate::state::account_not_accessible(&account_id),
             )
             .into());
         };

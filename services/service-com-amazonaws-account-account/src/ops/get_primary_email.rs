@@ -175,21 +175,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // email update operations: this operation reads a member account from
         // the management or delegated administrator account, and the model's own
         // `AccountId` documentation states that the management account can't
-        // specify its own `AccountId`. `AccountId` is required here, so there is
-        // no caller's-own default to resolve — naming one's own account is the
-        // refusal.
-        if input.account_id == crate::state::default_account_id() {
-            return Err(GetPrimaryEmailErrorModeled::AccessDeniedException(
-                crate::state::cannot_target_own_account(),
-            )
-            .into());
-        }
+        // specify its own `AccountId`. The member is required here, so it
+        // always names an account — and a named account is resolved by the one
+        // resolution every operation taking an account id goes through, which
+        // is what refuses the caller's own.
+        let account_id = match crate::state::target_account_id(Some(&input.account_id)) {
+            Ok(account_id) => account_id,
+            Err(denied) => {
+                return Err(GetPrimaryEmailErrorModeled::AccessDeniedException(denied).into())
+            }
+        };
 
         let now = ::std::time::SystemTime::now();
         // A REPORTING operation: the store is read, never written, so no record
         // is created here and a later caller sees exactly what this one saw.
         let store = state.lock();
-        let Some(account) = store.account(&input.account_id) else {
+        let Some(account) = store.account(&account_id) else {
             // Naming another account requires the caller to be an identity in
             // the organization's management account, with the named account a
             // member of the same organization. An account this emulator holds no
@@ -197,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // modelled `AccessDeniedException` — the same rule
             // `GetPrimaryEmailUpdateStatus` and `GetAccountInformation` apply.
             return Err(GetPrimaryEmailErrorModeled::AccessDeniedException(
-                crate::state::account_not_accessible(&input.account_id),
+                crate::state::account_not_accessible(&account_id),
             )
             .into());
         };
