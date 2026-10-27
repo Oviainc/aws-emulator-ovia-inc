@@ -1205,10 +1205,16 @@ fn collect(definition: &str, mut found: Diagnosis) -> Diagnosis {
     }
     match serde_json::from_str::<Value>(definition) {
         Ok(document) => diagnose_machine(&document, "", JSONPATH, 1, &mut found),
+        // The diagnostic is the service's own, naming where the definition stopped
+        // parsing and what was expected there — the one construction every document
+        // this service reads is reported through.
         Err(why) => found.push(error(
             INVALID_JSON_DESCRIPTION,
             None,
-            format!("the definition is not valid JSON: {why}"),
+            format!(
+                "the definition is not valid JSON: {}",
+                crate::state::json_parse_diagnostic(definition, &why)
+            ),
         )),
     }
     found
@@ -2266,13 +2272,14 @@ fn interpret(
 ) -> (Run, bool) {
     let document: Value = match serde_json::from_str(definition) {
         Ok(document) => document,
-        Err(error) => {
+        Err(why) => {
             return (
                 failed(
                     Vec::new(),
                     Duration::ZERO,
                     runtime(format!(
-                        "the state machine definition is not valid JSON: {error}"
+                        "the state machine definition is not valid JSON: {}",
+                        crate::state::json_parse_diagnostic(definition, &why)
                     )),
                 ),
                 false,
@@ -2312,12 +2319,15 @@ fn interpret(
     }
     let input_value: Value = match serde_json::from_str(input) {
         Ok(value) => value,
-        Err(error) => {
+        Err(why) => {
             return (
                 failed(
                     Vec::new(),
                     Duration::ZERO,
-                    runtime(format!("the execution input is not valid JSON: {error}")),
+                    runtime(format!(
+                        "the execution input is not valid JSON: {}",
+                        crate::state::json_parse_diagnostic(input, &why)
+                    )),
                 ),
                 false,
             );
@@ -5746,10 +5756,13 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
     };
     let raw: Value = match serde_json::from_str(test.input) {
         Ok(value) => value,
-        Err(error) => {
+        Err(why) => {
             return Trial::failed(
                 inspection,
-                runtime(format!("the state input is not valid JSON: {error}")),
+                runtime(format!(
+                    "the state input is not valid JSON: {}",
+                    crate::state::json_parse_diagnostic(test.input, &why)
+                )),
             );
         }
     };

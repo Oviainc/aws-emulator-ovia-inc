@@ -87,6 +87,10 @@ mod cognito_vended_session_reads_sse_kms_object;
 // Declared beside the suite above, at the head, for the same reason it is here.
 #[path = "all/cognito_vended_session_is_audited.rs"]
 mod cognito_vended_session_is_audited;
+// Declared beside its two sibling cognito suites, at the head, for the same reason they are
+// here: the appended tail and the sorted `c…` span are both regions concurrent suites land in.
+#[path = "all/cognito_vended_session_is_an_assumed_role_caller.rs"]
+mod cognito_vended_session_is_an_assumed_role_caller;
 #[path = "all/pi_resource_metadata_reflects_rds_configuration.rs"]
 mod pi_resource_metadata_reflects_rds_configuration;
 // At the head for the reason the entries above record: the appended tail and the sorted
@@ -147,6 +151,9 @@ mod chime_family_signing_name_routing;
 // suite appends to.
 #[path = "all/cloudformation_provisions_acm_acme_endpoints.rs"]
 mod cloudformation_provisions_acm_acme_endpoints;
+// Declared in this same quiet span, for the reason the note above gives.
+#[path = "all/cloudformation_provisions_acm_certificates.rs"]
+mod cloudformation_provisions_acm_certificates;
 #[path = "all/cloudformation_provisions_codedeploy_resources.rs"]
 mod cloudformation_provisions_codedeploy_resources;
 // Declared in this same quiet span of the sorted list, for the reason the note above

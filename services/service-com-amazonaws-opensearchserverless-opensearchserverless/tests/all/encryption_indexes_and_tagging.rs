@@ -432,16 +432,18 @@ async fn a_constraint_clause_reports_the_pattern_without_the_model_anchors() {
     let router = emulator();
 
     // Each row's `modelled` pattern is the one the model declares for that member:
-    // `CollectionName` and `PolicyName` -> ^[a-z][a-z0-9-]+$, `CollectionId` ->
+    // `CollectionGroupName` and `PolicyName` -> ^[a-z][a-z0-9-]+$, `CollectionId` ->
     // ^[a-z0-9]{3,40}$, `PolicyVersion` ->
-    // ^([0-9a-zA-Z+/]{4})*(([0-9a-zA-Z+/]{2}==)|([0-9a-zA-Z+/]{3}=))?$.
+    // ^([0-9a-zA-Z+/]{4})*(([0-9a-zA-Z+/]{2}==)|([0-9a-zA-Z+/]{3}=))?$. A member typed
+    // `CollectionName` is NOT a row here: its clause reports the class its own validator
+    // applies rather than the trait, which `tests/all/reported_pattern.rs` owns.
     let cases = vec![
         PatternCase {
-            case: "CollectionName on CreateCollection",
+            case: "CollectionGroupName on CreateCollection",
             operation: "CreateCollection",
-            request: json!({ "name": "1-invalid-collection-name", "encryptionConfig": { "aWSOwnedKey": true } }),
-            path: "name",
-            value: "1-invalid-collection-name",
+            request: json!({ "name": "valid-collection", "collectionGroupName": "1-invalid-group", "encryptionConfig": { "aWSOwnedKey": true } }),
+            path: "collectionGroupName",
+            value: "1-invalid-group",
             modelled: "^[a-z][a-z0-9-]+$",
         },
         PatternCase {

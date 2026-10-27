@@ -36,9 +36,11 @@
 //! created with — its template, parameters, capabilities, tags, roles, permission model and
 //! deployment settings — so `DescribeStackSet` reports exactly what that call stated rather
 //! than anything recomputed from a request. Its instances and the operations performed on it
-//! are written by `CreateStackInstances` and by `DetectStackSetDrift`, which records the
-//! operation a drift detection runs as and what that detection found; the remaining writers
-//! (`UpdateStackSet`, `DeleteStackInstances`) are still scaffolds answering 501, each with
+//! are written by `CreateStackInstances`, by `DeleteStackInstances` — which takes the
+//! instances it deleted back OUT of the stack set when the DELETE operation it runs as
+//! concludes ([`StoredStackSet::settle`]) — and by `DetectStackSetDrift`, which records the
+//! operation a drift detection runs as and what that detection found; the remaining writer
+//! (`UpdateStackSet`) is still a scaffold answering 501, with
 //! its own stub issue. The ONE way a record enters this
 //! store is
 //! [`crate::state::ComAmazonawsCloudformationCloudformationState::record_stack_set`], so
@@ -275,6 +277,45 @@ pub fn preferences_view(
         max_concurrent_percentage: stored.max_concurrent_percentage,
         concurrency_mode: stored.concurrency_mode.clone(),
     }
+}
+
+/// The target accounts a stack-set deployment request names, by the member that names them.
+///
+/// "[Self-managed permissions] The account IDs of one or more Amazon Web Services accounts"
+/// / "[Service-managed permissions] The Organizations accounts": "You can specify Accounts
+/// or DeploymentTargets, but not both", and "you must specify at least one value for
+/// either". The ONE reading of those two members, so every operation that targets accounts
+/// and Regions reads a request the same way.
+pub fn target_accounts(
+    accounts: Option<&[String]>,
+    deployment_targets: Option<&crate::ops::types::DeploymentTargets>,
+) -> Result<Vec<String>, String> {
+    let named: Vec<String> = accounts.unwrap_or_default().to_vec();
+    let targeted: Vec<String> = deployment_targets
+        .map(|targets| targets.accounts.clone().unwrap_or_default())
+        .unwrap_or_default();
+    if !named.is_empty() && deployment_targets.is_some() {
+        return Err("You cannot specify both Accounts and DeploymentTargets".to_string());
+    }
+    // "The location of the accounts" an `AccountsUrl` names is an Amazon S3 object, which
+    // would have to be fetched over the network — this emulator makes no outbound
+    // connections, so a request naming one is refused rather than served with the accounts
+    // nobody read.
+    if deployment_targets.is_some_and(|targets| targets.accounts_url.is_some()) {
+        return Err(
+            "DeploymentTargets.AccountsUrl names an Amazon S3 object this emulator does not \
+             read"
+                .to_string(),
+        );
+    }
+    let selected = if named.is_empty() { targeted } else { named };
+    if selected.is_empty() {
+        return Err(
+            "You must specify at least one value for either Accounts or DeploymentTargets"
+                .to_string(),
+        );
+    }
+    Ok(selected)
 }
 
 /// One resource of one stack instance, as the drift detection that covered it found it —
@@ -590,6 +631,18 @@ impl StoredStackSet {
                 continue;
             }
             let concluded = self.operations[index].clone();
+            // "Deletes stack instances for the specified accounts, in the specified Amazon
+            // Web Services Regions": an instance the deletion carried out is no longer one
+            // of the stack set's, so it leaves the stack set when the operation that deleted
+            // it concludes. An instance the deletion FAILED on is left where it is, in the
+            // INOPERABLE state that failure put it in, so a partly failed deletion reports
+            // exactly which instances it could not remove.
+            if concluded.action == operation_action::DELETE {
+                self.instances.retain(|instance| {
+                    instance.last_operation_id != concluded.operation_id
+                        || instance.detailed_status != detailed_status::RUNNING
+                });
+            }
             if concluded.status != operation_status::SUCCEEDED {
                 continue;
             }

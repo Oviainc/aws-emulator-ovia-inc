@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeNetworkInsightsAnalyses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeNetworkInsightsAnalyses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeNetworkInsightsAnalyses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the path analyses the store holds — the ones `StartNetworkInsightsAnalysis`
+//! started — narrowed by the ids, the path, the start-time window and the filters the
+//! request names, and paged in analysis-id order. It writes nothing of its own: the only
+//! state it touches is the clock-owed end of an analysis whose due instant has already
+//! passed, which was owed at this instant whether or not anybody called.
+//!
+//! The model's `AnalysisStartTime`/`AnalysisEndTime` are the two bounds of ONE window over
+//! the only instant an analysis reports: `NetworkInsightsAnalysis` carries a `StartDate` and
+//! no end-time member at all, so there is no second instant for a bound to narrow.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +151,306 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeNetworkInsightsAnalyses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeNetworkInsightsAnalysesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+        use std::collections::HashSet;
+
+        use crate::state;
+        use crate::state::{
+            CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
+            MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS,
+        };
+
+        let service_state = state::require_service_state(&*self.engine)?;
+
+        // "The token for the next page of results" (`NextToken`) — anything else is refused
+        // rather than read as an id, and it is refused before any other member is looked at,
+        // so whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // Matching cost is filters x values x value length x stored analyses, and the model
+        // bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so every
+        // request-controlled factor is capped HERE, before any work proportional to it is
+        // done and before the store is locked — the same ceilings the crate's other filtered
+        // describes enforce, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not support is refused whether or not any
+        // analysis would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here, rather than recompiled
+        // for every candidate analysis.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !ANALYSIS_FILTERS.contains(&name) {
+                return Err(state::invalid_filter(&ANALYSIS_FILTERS));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The ID of the network insights analyses" (`NetworkInsightsAnalysisIds`) is
+        // caller-sized, and each entry is resolved against the store, so it is capped the
+        // way every other EC2 operation of this crate caps a resource-id list.
+        let requested: &[String] = input
+            .network_insights_analysis_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "NetworkInsightsAnalysisIds carries {} ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                requested.len()
+            )));
+        }
+
+        // "The maximum number of results to return with a single call" (`MaxResults`). A
+        // request that names none gets the largest page the model publishes, so the
+        // `NextToken` path below behaves the same whether or not a page size was asked for.
+        // The model's `range 1..100` has already refused anything outside it; the same bounds
+        // are applied HERE, beside the other request-size caps and before the store is
+        // locked, so a value this handler could not page by never reaches the scan — neither
+        // one that is not a positive count (zero included, which would answer an empty page
+        // with a token that never advances) nor one above the published maximum.
+        let limit = match input.max_results {
+            None => DEFAULT_MAX_RESULTS,
+            Some(max_results) => usize::try_from(max_results)
+                .ok()
+                .filter(|limit| (MIN_MAX_RESULTS..=DEFAULT_MAX_RESULTS).contains(limit))
+                .ok_or_else(|| {
+                    state::invalid_parameter_value(format!(
+                        "Value ({max_results}) for parameter maxResults is invalid. \
+                         Expecting a value between {MIN_MAX_RESULTS} and {DEFAULT_MAX_RESULTS}"
+                    ))
+                })?,
+        };
+
+        // DryRun sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused for its token,
+        // its filters or the size of a list is refused with that reason instead. "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`),
+        // and every caller of this emulator is permitted, so a well-formed dry run reports
+        // that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let mut store = service_state.lock();
+        // The clock-owed transitions this read is allowed to apply — the same call the VPC
+        // and instance describes make: an analysis `StartNetworkInsightsAnalysis` answered as
+        // `running` has ended once its due instant has passed, whether or not anybody
+        // called, so applying it here changes nothing a later caller would not have seen
+        // anyway.
+        store.materialize_due_transitions();
+
+        // An id that names no analysis of the account is an error, not an absent row. A set,
+        // so narrowing below costs one lookup per analysis rather than a scan of the
+        // asked-for list.
+        let wanted: HashSet<&str> = requested.iter().map(String::as_str).collect();
+        if let Some(unknown) = requested
+            .iter()
+            .find(|id| !store.network_insights_analyses.contains_key(id.as_str()))
+        {
+            return Err(state::invalid_network_insights_analysis_id_not_found(
+                unknown,
+            ));
+        }
+
+        // "The ID of the path" (`NetworkInsightsPathId`) selects the analyses of ONE path, so
+        // a path the account does not hold is refused for the same reason an unknown analysis
+        // id is: it names no resource of the account.
+        let path_id = input.network_insights_path_id.as_deref();
+        if let Some(path_id) = path_id {
+            if !store.network_insights_paths.contains_key(path_id) {
+                return Err(state::invalid_network_insights_path_id_not_found(path_id));
+            }
+        }
+
+        // "The time when the network insights analyses started" (`AnalysisStartTime`) and
+        // "ended" (`AnalysisEndTime`) are the two INCLUSIVE bounds of one window over the
+        // analysis's `StartDate`, the only instant the reported shape carries; an analysis
+        // with no start date at all is outside any window a request asks for.
+        let begin = input.analysis_start_time.map(state::date_time_key);
+        let end = input.analysis_end_time.map(state::date_time_key);
+
+        // With no ids the report is every analysis the account holds; the ids narrow it to
+        // the ones named, and the path, the window and every filter then have to hold too
+        // ("If you specify multiple filters, the filters are joined with an AND" — `Filter`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeNetworkInsightsAnalyses"))
+        // Every comparison is charged to ONE budget, so the product of stored analyses,
+        // filters, values and value length is bounded however the caller combines them —
+        // which is also what bounds how long this holds the store's lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&NetworkInsightsAnalysis> = Vec::new();
+        for record in store.network_insights_analyses.values() {
+            if budget.exhausted() {
+                break;
+            }
+            let analysis = &record.view;
+            if !wanted.is_empty()
+                && !wanted.contains(
+                    analysis
+                        .network_insights_analysis_id
+                        .as_deref()
+                        .unwrap_or_default(),
+                )
+            {
+                continue;
+            }
+            if path_id.is_some_and(|path_id| {
+                analysis.network_insights_path_id.as_deref() != Some(path_id)
+            }) {
+                continue;
+            }
+            let started = analysis.start_date.map(state::date_time_key);
+            let in_window = begin.is_none_or(|from| started.is_some_and(|at| at >= from))
+                && end.is_none_or(|to| started.is_some_and(|at| at <= to));
+            if !in_window {
+                continue;
+            }
+            if state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(analysis, name)
+            }) {
+                selected.push(analysis);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Page in analysis-id order, which the cursor below names a position in. The store
+        // is an ordered map, so its iteration order already satisfies this sort; doing it
+        // here establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by(|left, right| {
+            left.network_insights_analysis_id
+                .cmp(&right.network_insights_analysis_id)
+        });
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|analysis| {
+                analysis
+                    .network_insights_analysis_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "This value is null when there are no more results to return" (`NextToken`): a
+        // token only when an analysis follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|analysis| analysis.network_insights_analysis_id.as_deref())
+            .map(state::encode_page_token);
+
+        Ok(DescribeNetworkInsightsAnalysesOutput {
+            network_insights_analyses: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|analysis| (*analysis).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`NetworkInsightsMaxResults`, `range 1..100`), which is also the most EC2 returns in one
+/// page.
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The smallest page size `MaxResults` may ask for, the bottom of the same published range.
+const MIN_MAX_RESULTS: usize = 1;
+
+/// The filter names this operation supports, in the order the model enumerates them.
+///
+/// `DescribeNetworkInsightsAnalysesRequest$Filters` names them itself: "The filters. The
+/// following are the possible values: path-found - A Boolean value that indicates whether a
+/// feasible path is found. status - The status of the analysis (running | succeeded |
+/// failed)":
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeNetworkInsightsAnalysesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// Both are members of the analysis this operation reports
+/// (`NetworkInsightsAnalysis$NetworkPathFound` and `$Status`), and each must be answered by
+/// [`filter_values`]. Nothing else — no `tag:` family, no id — is in the documented set, so
+/// every other name is refused.
+const ANALYSIS_FILTERS: [&str; 2] = ["path-found", "status"];
+
+/// The values the EC2 filter `name` compares against this analysis.
+///
+/// A filter naming an attribute this analysis does not carry compares against NO values, so
+/// it selects nothing — which is the answer for `path-found` on an analysis that reports no
+/// reachability verdict, the way it is for one that is still running. `name` is one of
+/// [`ANALYSIS_FILTERS`], every other name having been refused already.
+fn filter_values<'a>(
+    analysis: &'a NetworkInsightsAnalysis,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    match name {
+        // "A Boolean value that indicates whether a feasible path is found": a boolean member
+        // is compared in the lowercase `true`/`false` form EC2 takes for one.
+        "path-found" => analysis
+            .network_path_found
+            .map(|found| Cow::Borrowed(if found { "true" } else { "false" }))
+            .into_iter()
+            .collect(),
+        "status" => analysis
+            .status
+            .as_deref()
+            .map(Cow::Borrowed)
+            .into_iter()
+            .collect(),
+        // Unreachable: the handler has already refused every other name. An undefined name
+        // compares against nothing, so it could never widen a result even if that check were
+        // bypassed.
+        _ => Vec::new(),
     }
 }

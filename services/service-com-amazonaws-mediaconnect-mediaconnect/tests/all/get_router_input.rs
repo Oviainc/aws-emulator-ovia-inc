@@ -176,7 +176,11 @@ fn defer_owed_transition(emulator: &Emulator, arn: &str) {
 /// Make the removal DeleteRouterInput accepted for `arn` come due at `due_at`, the way the
 /// delete records it (`mc::StoredRouterInput::begin_deletion`), for the same reason
 /// [`owe_transition`] writes a transition.
-fn owe_removal(emulator: &Emulator, arn: &str, due_at: SystemTime) {
+///
+/// `pub(crate)` because the source-metadata suite reaches an input the clock has already
+/// taken away the same way (see `tests/all/router_input_source_metadata.rs`), so there is one
+/// helper rather than one per suite.
+pub(crate) fn owe_removal(emulator: &Emulator, arn: &str, due_at: SystemTime) {
     let store = emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();

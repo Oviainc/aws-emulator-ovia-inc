@@ -17,6 +17,9 @@
 //!   `InvokeModel` body;
 //! * the **async-invoke** records, their idempotency index and the clock-owed
 //!   transition that moves a submitted invocation out of `InProgress`;
+//! * the **prompt-cache** entries a Converse-API `cachePoint` marker writes
+//!   (`prompt_cache`), which is what lets a later call with the same marked
+//!   prefix report it as read from the cache instead of as input tokens;
 //! * the **metric publication** ([`invocation_metrics`]) that turns a served
 //!   inference's token accounting, the request it is and the duration measured
 //!   for it into `AWS/Bedrock` metric data, so the counts and the latency a
@@ -34,11 +37,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::ops::types::{
-    AsyncInvokeOutputDataConfig, CitationGeneratedContent, CitationSourceContent, ContentBlock,
-    DocumentBlock, DocumentContentBlock, DocumentSource, GuardrailConverseContentBlock, Message,
-    ReasoningContentBlock, SearchResultBlock, SystemContentBlock, Tag, TokenUsage, Tool,
-    ToolChoice, ToolConfiguration, ToolInputSchema, ToolReference, ToolResultContentBlock,
-    ToolUseBlock,
+    AsyncInvokeOutputDataConfig, CacheDetail, CachePointBlock, CitationGeneratedContent,
+    CitationSourceContent, ContentBlock, DocumentBlock, DocumentContentBlock, DocumentSource,
+    GuardrailConverseContentBlock, Message, ReasoningContentBlock, SearchResultBlock,
+    SystemContentBlock, Tag, TokenUsage, Tool, ToolChoice, ToolConfiguration, ToolInputSchema,
+    ToolReference, ToolResultContentBlock, ToolUseBlock,
 };
 
 /// The `AWS/Bedrock` metric data a served inference publishes, beside the
@@ -74,6 +77,29 @@ pub const MAX_PAGE_SIZE: usize = 1000;
 /// deserializer's own limit.
 pub const MAX_DOCUMENT_DEPTH: usize = 64;
 
+/// The most cached prompt prefixes this emulator retains.
+///
+/// The EMULATOR's bound, so a caller marking a fresh prefix on every call
+/// cannot grow the store without limit: the entry closest to falling out of the
+/// cache is evicted once the store passes it. Each entry holds a digest and a
+/// token count, never the prompt text itself.
+pub const MAX_PROMPT_CACHE_ENTRIES: usize = 256;
+
+/// The most cache checkpoints one request can place in the cache.
+///
+/// The EMULATOR's bound, so the number of `cachePoint` markers a request
+/// carries cannot decide how many entries one call inserts into (or evicts
+/// from) the shared cache: the LONGEST prefixes a request marks are the ones
+/// honoured, which leaves the prefix the last marker delimits — the one that
+/// decides the input tokens charged — always among them.
+pub const MAX_CACHE_CHECKPOINTS: usize = 4;
+
+/// The time to live a cache checkpoint is written under when its `cachePoint`
+/// names no `ttl`: the five minutes Amazon Bedrock publishes for a prompt cache
+/// checkpoint ("Prompt caching for faster model inference" in the Amazon
+/// Bedrock User Guide), restarted on every cache hit.
+pub const DEFAULT_CACHE_TTL: &str = "5m";
+
 /// Per-service state for com-amazonaws-bedrockruntime-amazonbedrockfrontendservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
@@ -95,6 +121,10 @@ pub struct ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
     /// buffer of the most recent [`MAX_INVOCATION_LOG_ENTRIES`]: one entry per
     /// call, carrying the text units it consumed per configured check.
     pub guardrail_check_evaluations: VecDeque<guardrail_checks::EvaluationLogEntry>,
+    /// The prompt prefixes a `cachePoint` marker has had cached, keyed by
+    /// [`prompt_cache_key`]. Bounded by [`MAX_PROMPT_CACHE_ENTRIES`], and an
+    /// entry leaves it once its time to live has run out.
+    pub prompt_cache: BTreeMap<String, PromptCacheEntry>,
     /// Monotonic counter mixed into every id this service mints (an async
     /// invocation's, a tool request's).
     pub next_id: u64,
@@ -112,6 +142,7 @@ impl Default for ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
             idempotency_index: HashMap::new(),
             invocations: VecDeque::new(),
             guardrail_check_evaluations: VecDeque::new(),
+            prompt_cache: BTreeMap::new(),
             next_id: 0,
         }
     }
@@ -343,6 +374,116 @@ impl ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState {
         self.guardrail_check_evaluations.push_back(entry);
         while self.guardrail_check_evaluations.len() > MAX_INVOCATION_LOG_ENTRIES {
             self.guardrail_check_evaluations.pop_front();
+        }
+    }
+
+    /// Run the prompt-cache stage of one Converse-API turn: match the prefixes
+    /// this request's `cachePoint` markers delimit against the cache, write the
+    /// ones that are not in it yet, and report the token accounting that
+    /// follows.
+    ///
+    /// `None` when the request marks no cacheable prefix at all, which is what
+    /// makes a turn report no cache counters: there was no cache to read from or
+    /// write to.
+    ///
+    /// `plan` is [`prompt_cache_plan`]'s, computed by the caller BEFORE it takes
+    /// the state guard, so digesting a prompt never runs under the lock this
+    /// service's other requests wait on; it carries at most
+    /// [`MAX_CACHE_CHECKPOINTS`] prefixes, in increasing length, so the longest
+    /// one already cached is the one this request reads, everything from there
+    /// to the last marker is what it writes, and one request can neither insert
+    /// nor evict more than that many entries.
+    pub fn apply_prompt_cache(
+        &mut self,
+        model_id: &str,
+        plan: &PromptCachePlan,
+        now_millis: i64,
+    ) -> Option<PromptCacheOutcome> {
+        if plan.checkpoints.is_empty() {
+            return None;
+        }
+        // An entry whose time to live has run out is gone whether or not
+        // anybody called, so the clock's expiries are materialised before this
+        // request is matched against the cache.
+        self.prompt_cache
+            .retain(|_, entry| entry.expires_at > now_millis);
+
+        let mut read_tokens = 0u32;
+        for checkpoint in &plan.checkpoints {
+            let key = prompt_cache_key(model_id, &checkpoint.digest);
+            if let Some(entry) = self.prompt_cache.get_mut(&key) {
+                // Reading a cached prefix restarts its time to live.
+                entry.expires_at = now_millis.saturating_add(cache_ttl_millis(&entry.ttl));
+                read_tokens = entry.tokens;
+            }
+        }
+
+        // The prefix tokens this call puts in the cache: those between the
+        // longest prefix it read and the last marker it carries, attributed to
+        // the time to live each marker asked for.
+        let mut writes: Vec<(String, u32)> = Vec::new();
+        let mut cached_tokens = read_tokens;
+        for checkpoint in &plan.checkpoints {
+            if checkpoint.tokens <= cached_tokens {
+                continue;
+            }
+            self.prompt_cache.insert(
+                prompt_cache_key(model_id, &checkpoint.digest),
+                PromptCacheEntry {
+                    tokens: checkpoint.tokens,
+                    ttl: checkpoint.ttl.clone(),
+                    expires_at: now_millis.saturating_add(cache_ttl_millis(&checkpoint.ttl)),
+                },
+            );
+            let written = checkpoint.tokens.saturating_sub(cached_tokens);
+            match writes.iter_mut().find(|(ttl, _)| *ttl == checkpoint.ttl) {
+                Some((_, tokens)) => *tokens = tokens.saturating_add(written),
+                None => writes.push((checkpoint.ttl.clone(), written)),
+            }
+            cached_tokens = checkpoint.tokens;
+            // Trimmed on every insert, so the store never holds more than its
+            // bound even for the length of one call.
+            self.evict_prompt_cache();
+        }
+
+        // `cacheDetails` is the breakdown of what this call WROTE, longest time
+        // to live first, and is empty when it wrote nothing.
+        writes.sort_by_key(|(ttl, _)| ::std::cmp::Reverse(cache_ttl_millis(ttl)));
+        let write_tokens = writes
+            .iter()
+            .fold(0u32, |total, (_, tokens)| total.saturating_add(*tokens));
+        Some(PromptCacheOutcome {
+            read_tokens,
+            write_tokens,
+            cache_details: writes
+                .into_iter()
+                .map(|(ttl, tokens)| CacheDetail {
+                    ttl,
+                    input_tokens: token_count_i32(tokens),
+                })
+                .collect(),
+            input_tokens: plan.tail_tokens,
+        })
+    }
+
+    /// Keep the prompt cache at most [`MAX_PROMPT_CACHE_ENTRIES`] entries long,
+    /// dropping the entry closest to falling out of it first.
+    ///
+    /// Called on every insert, so it has at most one entry to drop per call and
+    /// at most [`MAX_CACHE_CHECKPOINTS`] per request: the scan for that entry is
+    /// over a store a caller cannot grow past its bound.
+    fn evict_prompt_cache(&mut self) {
+        while self.prompt_cache.len() > MAX_PROMPT_CACHE_ENTRIES {
+            let oldest = self
+                .prompt_cache
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    (left.expires_at, left_key.as_str())
+                        .cmp(&(right.expires_at, right_key.as_str()))
+                })
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else { break };
+            self.prompt_cache.remove(&oldest);
         }
     }
 }
@@ -1619,8 +1760,8 @@ pub fn truncate_to_tokens(text: &str, max_tokens: u32) -> String {
     }
 }
 
-/// Every piece of text a `Converse`-shaped input sends to the model, in request
-/// order.
+/// Every piece of text a `Converse`-shaped input sends to the model, in the
+/// order the service assembles the prompt in ([`converse_prompt_segments`]).
 ///
 /// The count an inference call reports covers the WHOLE prompt the service hands
 /// the model, not only the plain-text blocks of the conversation: `CountTokens`
@@ -1642,19 +1783,53 @@ pub fn converse_prompt_pieces(
     messages: Option<&Vec<Message>>,
     tool_config: Option<&ToolConfiguration>,
 ) -> Vec<String> {
-    let mut pieces = Vec::new();
-    for block in system.map(Vec::as_slice).unwrap_or_default() {
-        match block {
-            SystemContentBlock::Text(text) => pieces.push(text.clone()),
-            SystemContentBlock::guardContent(guard) => push_guard_text(guard, &mut pieces),
-            SystemContentBlock::cachePoint(_) => {}
-        }
+    converse_prompt_segments(system, messages, tool_config)
+        .into_iter()
+        .filter_map(|segment| match segment {
+            PromptSegment::Text(text) => Some(text),
+            PromptSegment::CachePoint(_) => None,
+        })
+        .collect()
+}
+
+/// One ordered piece of the prompt a `Converse`-shaped input assembles: a piece
+/// of prompt text, or a `cachePoint` marker.
+#[derive(Debug, Clone)]
+pub enum PromptSegment {
+    /// One piece of prompt text, as [`converse_prompt_pieces`] describes them.
+    Text(String),
+    /// A cache checkpoint, carrying the `CacheTTL` its marker asked for.
+    CachePoint(Option<String>),
+}
+
+/// The whole prompt a `Converse`-shaped input is, piece by piece and marker by
+/// marker, in the order the service assembles it: the tool configuration, then
+/// the system prompt, then the conversation.
+///
+/// The ORDER is what a `cachePoint` divides: the marker ends a prefix, and
+/// everything before it in the assembled prompt is the cacheable section it
+/// delimits, whichever of the three places the marker sits in (`toolConfig`'s
+/// tool list, `system`, or a message's content). [`converse_prompt_pieces`]
+/// drops the markers and keeps the text, so one rule describes the prompt for
+/// both the token count and the prompt cache.
+pub fn converse_prompt_segments(
+    system: Option<&Vec<SystemContentBlock>>,
+    messages: Option<&Vec<Message>>,
+    tool_config: Option<&ToolConfiguration>,
+) -> Vec<PromptSegment> {
+    // The text collected since the last marker, flushed into the segment list
+    // when a marker arrives, so every piece keeps its place in prompt order.
+    fn checkpoint(
+        point: &CachePointBlock,
+        pieces: &mut Vec<String>,
+        segments: &mut Vec<PromptSegment>,
+    ) {
+        segments.extend(pieces.drain(..).map(PromptSegment::Text));
+        segments.push(PromptSegment::CachePoint(point.ttl.clone()));
     }
-    for message in messages.map(Vec::as_slice).unwrap_or_default() {
-        for block in &message.content {
-            push_content_text(block, &mut pieces);
-        }
-    }
+
+    let mut segments: Vec<PromptSegment> = Vec::new();
+    let mut pieces: Vec<String> = Vec::new();
     if let Some(config) = tool_config {
         for tool in &config.tools {
             match tool {
@@ -1670,7 +1845,7 @@ pub fn converse_prompt_pieces(
                     }
                 }
                 Tool::systemTool(tool) => pieces.push(tool.name.clone()),
-                Tool::cachePoint(_) => {}
+                Tool::cachePoint(point) => checkpoint(point, &mut pieces, &mut segments),
             }
         }
         match &config.tool_choice {
@@ -1678,7 +1853,186 @@ pub fn converse_prompt_pieces(
             Some(ToolChoice::Auto(_) | ToolChoice::Any(_)) | None => {}
         }
     }
-    pieces
+    for block in system.map(Vec::as_slice).unwrap_or_default() {
+        match block {
+            SystemContentBlock::Text(text) => pieces.push(text.clone()),
+            SystemContentBlock::guardContent(guard) => push_guard_text(guard, &mut pieces),
+            SystemContentBlock::cachePoint(point) => {
+                checkpoint(point, &mut pieces, &mut segments)
+            }
+        }
+    }
+    for message in messages.map(Vec::as_slice).unwrap_or_default() {
+        for block in &message.content {
+            match block {
+                ContentBlock::cachePoint(point) => {
+                    checkpoint(point, &mut pieces, &mut segments)
+                }
+                block => push_content_text(block, &mut pieces),
+            }
+        }
+    }
+    segments.extend(pieces.into_iter().map(PromptSegment::Text));
+    segments
+}
+
+/// One cacheable prefix a request's `cachePoint` marker delimits.
+#[derive(Debug, Clone)]
+pub struct CacheCheckpoint {
+    /// The digest of the prompt text before the marker, in prompt order. The
+    /// cache is keyed on it, so a prefix that diverges anywhere — its first
+    /// token included — is a different prefix and cannot hit, and no prompt
+    /// text has to be held to decide that.
+    pub digest: String,
+    /// The tokens that prefix is.
+    pub tokens: u32,
+    /// The modelled `CacheTTL` the entry is written under, as [`cache_ttl`]
+    /// reads it off the marker.
+    pub ttl: String,
+}
+
+/// What the `cachePoint` markers of one request ask the prompt cache to do.
+#[derive(Debug, Clone, Default)]
+pub struct PromptCachePlan {
+    /// The cacheable prefixes the request delimits, in increasing length, at
+    /// most [`MAX_CACHE_CHECKPOINTS`] of them. A marker delimiting no text at
+    /// all contributes none.
+    pub checkpoints: Vec<CacheCheckpoint>,
+    /// The tokens of the prompt text AFTER the last marker — the input tokens a
+    /// request that marks a cacheable prefix is charged for, the prefix itself
+    /// being accounted for as a cache read or a cache write.
+    pub tail_tokens: u32,
+}
+
+/// The cacheable prefixes one `Converse`-shaped input delimits, and the tokens
+/// left after the last of them ([`PromptCachePlan`]).
+pub fn prompt_cache_plan(
+    system: Option<&Vec<SystemContentBlock>>,
+    messages: Option<&Vec<Message>>,
+    tool_config: Option<&ToolConfiguration>,
+) -> PromptCachePlan {
+    use sha2::{Digest, Sha256};
+
+    let mut checkpoints: Vec<CacheCheckpoint> = Vec::new();
+    // The prefix is digested as the prompt is walked, each piece separated from
+    // the next, so a checkpoint's digest costs one clone of the hash state
+    // rather than a copy of the prompt however many markers a request carries.
+    let mut prefix = Sha256::new();
+    let mut prefix_tokens = 0u32;
+    let mut tail_tokens = 0u32;
+    for segment in converse_prompt_segments(system, messages, tool_config) {
+        match segment {
+            PromptSegment::Text(text) => {
+                let tokens = count_text_tokens(&text);
+                prefix_tokens = prefix_tokens.saturating_add(tokens);
+                tail_tokens = tail_tokens.saturating_add(tokens);
+                prefix.update(text.as_bytes());
+                prefix.update([0u8]);
+            }
+            PromptSegment::CachePoint(ttl) => {
+                // A marker with no prompt text before it delimits nothing, so
+                // there is no prefix to cache at it.
+                if prefix_tokens > 0 {
+                    checkpoints.push(CacheCheckpoint {
+                        digest: hex::encode(prefix.clone().finalize()),
+                        tokens: prefix_tokens,
+                        ttl: cache_ttl(ttl.as_deref()),
+                    });
+                    // Only the longest prefixes a request marks are honoured,
+                    // so neither this plan nor the work it drives grows with
+                    // the number of markers the request carries.
+                    if checkpoints.len() > MAX_CACHE_CHECKPOINTS {
+                        checkpoints.remove(0);
+                    }
+                }
+                tail_tokens = 0;
+            }
+        }
+    }
+    PromptCachePlan {
+        checkpoints,
+        tail_tokens,
+    }
+}
+
+/// One prompt prefix this emulator holds in its prompt cache.
+#[derive(Debug, Clone)]
+pub struct PromptCacheEntry {
+    /// The tokens of the cached prefix: what a request that matches it reports
+    /// as read from the cache.
+    pub tokens: u32,
+    /// The modelled `CacheTTL` it was written under.
+    pub ttl: String,
+    /// When the entry leaves the cache unless it is read again before then.
+    pub expires_at: i64,
+}
+
+/// The key a cached prefix is held under: the model it was prompted to, plus the
+/// digest of the prefix text ([`CacheCheckpoint::digest`]).
+///
+/// A cached prefix belongs to the model it was prompted to, and keying on the
+/// digest is what makes only a byte-identical prefix hit while keeping the
+/// prompt text itself out of the store.
+pub fn prompt_cache_key(model_id: &str, prefix_digest: &str) -> String {
+    format!("{model_id}:{prefix_digest}")
+}
+
+/// The modelled `CacheTTL` a marker is honoured under: the one it named, or
+/// [`DEFAULT_CACHE_TTL`] when it named none.
+///
+/// A value the enum does not offer is held — and reported — under the default,
+/// so the time to live a response carries is always one the entry was actually
+/// written for and one the model declares.
+pub fn cache_ttl(ttl: Option<&str>) -> String {
+    match ttl {
+        Some("1h") => "1h".to_string(),
+        _ => DEFAULT_CACHE_TTL.to_string(),
+    }
+}
+
+/// A modelled `CacheTTL` as milliseconds.
+///
+/// The enum offers one hour and five minutes; [`cache_ttl`] is what makes every
+/// stored and reported value one of the two.
+pub fn cache_ttl_millis(ttl: &str) -> i64 {
+    match ttl {
+        "1h" => 60 * 60 * 1000,
+        _ => 5 * 60 * 1000,
+    }
+}
+
+/// The prompt-cache accounting of one served Converse-API turn.
+#[derive(Debug, Clone, Default)]
+pub struct PromptCacheOutcome {
+    /// The prefix tokens this call read from the cache.
+    pub read_tokens: u32,
+    /// The prefix tokens this call wrote to the cache.
+    pub write_tokens: u32,
+    /// What it wrote, broken down by time to live, longest first.
+    pub cache_details: Vec<CacheDetail>,
+    /// The input tokens left to charge: the prompt text after the last marker.
+    pub input_tokens: u32,
+}
+
+/// The whole prompt-cache stage of one Converse-API turn, as both Converse
+/// operations run it: digest the prompt the request assembles, then match its
+/// marked prefixes against this service's cache.
+///
+/// The digesting happens BEFORE the state guard is taken, so the only work
+/// under the lock every other request of this service waits on is the bounded
+/// match-and-write step ([`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::apply_prompt_cache`]).
+/// `Converse` and `ConverseStream` both call this, so the two cannot drift.
+pub fn serve_prompt_cache(
+    state: &::engine::ServiceState<ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState>,
+    model_id: &str,
+    system: Option<&Vec<SystemContentBlock>>,
+    messages: Option<&Vec<Message>>,
+    tool_config: Option<&ToolConfiguration>,
+) -> Option<PromptCacheOutcome> {
+    let plan = prompt_cache_plan(system, messages, tool_config);
+    state
+        .lock()
+        .apply_prompt_cache(model_id, &plan, now_millis())
 }
 
 /// The text a guarded content block carries. A guarded image carries none.
@@ -1936,8 +2290,14 @@ pub struct ConverseTurn {
     /// The tool this turn requests, when the request obliged it to request one
     /// ([`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::forced_tool_use`]).
     pub tool_use: Option<ToolUseBlock>,
+    /// The input tokens this turn is charged for. A turn whose request marks a
+    /// cacheable prefix is charged only for the prompt text after the last
+    /// marker; the prefix is in [`Self::cache`].
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// The prompt-cache accounting of this turn, when the request marked a
+    /// cacheable prefix at all.
+    pub cache: Option<PromptCacheOutcome>,
     /// Whether the generation cap cut the text short, which is what makes the
     /// turn stop on `max_tokens` instead of `end_turn`.
     pub truncated: bool,
@@ -1967,14 +2327,37 @@ impl ConverseTurn {
 
     /// The modelled `TokenUsage` for this turn: the counts actually served, with
     /// `totalTokens` their sum.
+    ///
+    /// A turn that engaged the prompt cache reports the two cache counters too,
+    /// and `totalTokens` closes over all four: the prefix tokens are billed as
+    /// a cache write on the call that cached them and as a cache read on the
+    /// call that matched them, never a second time as `inputTokens`.
     pub fn usage(&self) -> TokenUsage {
+        let cached_tokens = self
+            .cache
+            .as_ref()
+            .map(|cache| cache.read_tokens.saturating_add(cache.write_tokens))
+            .unwrap_or_default();
         TokenUsage {
             input_tokens: token_count_i32(self.input_tokens),
             output_tokens: token_count_i32(self.output_tokens),
-            total_tokens: token_count_i32(self.input_tokens.saturating_add(self.output_tokens)),
-            cache_read_input_tokens: None,
-            cache_write_input_tokens: None,
-            cache_details: None,
+            total_tokens: token_count_i32(
+                self.input_tokens
+                    .saturating_add(self.output_tokens)
+                    .saturating_add(cached_tokens),
+            ),
+            cache_read_input_tokens: self
+                .cache
+                .as_ref()
+                .map(|cache| token_count_i32(cache.read_tokens)),
+            cache_write_input_tokens: self
+                .cache
+                .as_ref()
+                .map(|cache| token_count_i32(cache.write_tokens)),
+            cache_details: self
+                .cache
+                .as_ref()
+                .map(|cache| cache.cache_details.clone()),
         }
     }
 }
@@ -1996,6 +2379,12 @@ impl ConverseTurn {
 /// caps it, and the completion is composed to FIT that budget
 /// ([`emulated_completion`]) — only a budget it cannot fit in at all cuts the
 /// turn short.
+///
+/// `cache` is the prompt-cache stage's outcome
+/// ([`ComAmazonawsBedrockruntimeAmazonbedrockfrontendserviceState::apply_prompt_cache`]):
+/// when the request marked a cacheable prefix, the tokens this turn is charged
+/// as input are only those after the last marker, the prefix itself having been
+/// accounted for as a cache read or a cache write.
 pub fn converse_turn(
     model: &ModelEntry,
     system: Option<&Vec<SystemContentBlock>>,
@@ -2003,8 +2392,12 @@ pub fn converse_turn(
     tool_config: Option<&ToolConfiguration>,
     requested_max_tokens: Option<i32>,
     tool_use: Option<ToolUseBlock>,
+    cache: Option<PromptCacheOutcome>,
 ) -> ConverseTurn {
-    let input_tokens = converse_input_tokens(system, messages, tool_config);
+    let input_tokens = match &cache {
+        Some(cache) => cache.input_tokens,
+        None => converse_input_tokens(system, messages, tool_config),
+    };
     if let Some(tool_use) = tool_use {
         let output_tokens = content_block_tokens(&ContentBlock::toolUse(tool_use.clone()));
         return ConverseTurn {
@@ -2012,6 +2405,7 @@ pub fn converse_turn(
             tool_use: Some(tool_use),
             input_tokens,
             output_tokens,
+            cache,
             truncated: false,
         };
     }
@@ -2032,6 +2426,7 @@ pub fn converse_turn(
         tool_use: None,
         input_tokens,
         output_tokens,
+        cache,
         truncated: completion.truncated,
     }
 }
@@ -2584,8 +2979,10 @@ pub fn invoke_model_response_body(
 /// The token accounting Amazon Nova reports, in the shape its response envelope
 /// and its `metadata` streaming event both carry.
 ///
-/// Nova reports its prompt-cache accounting on every invocation. This emulator
-/// caches no prompt, so no token was ever read from or written to a cache.
+/// Nova reports its prompt-cache accounting on every invocation. A cache
+/// checkpoint is marked with the Converse API's `cachePoint` block, which this
+/// body envelope does not carry, so no token of an `InvokeModel` body was read
+/// from or written to a cache.
 fn nova_usage(input_tokens: u32, output_tokens: u32) -> serde_json::Value {
     serde_json::json!({
         "inputTokens": input_tokens,

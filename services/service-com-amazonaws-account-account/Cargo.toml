@@ -24,6 +24,9 @@ http = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `PutContactInformation`: the published ISO 3166-1 country-code table, which
+# decides whether a submitted `CountryCode` is an assigned alpha-2 code.
+rust_iso3166 = "0.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

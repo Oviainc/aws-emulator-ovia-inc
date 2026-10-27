@@ -19,6 +19,25 @@
 //! The reported position is ONE-based, and a column counts BYTES from the start of its line,
 //! which is the convention the parser reports in.
 
+/// The token classes a JSON value may begin with, as a parser's diagnostic lists them.
+///
+/// A JSON value is a string, a number, an array, an object or one of the three literal
+/// tokens, and a diagnostic about a value position lists exactly those. The list is stated
+/// ONCE here because the services that quote it frame it in sentences of their own — one
+/// says `was expecting a valid value (<classes>)` where the parse stopped on a character and
+/// another `Unrecognized token '<word>': was expecting (<classes>)` where it stopped on a
+/// word — so the sentence is the caller's and the classes are not.
+pub const VALUE_CLASSES: &str = "JSON String, Number, Array, Object or token 'null', 'true' or 'false'";
+
+/// The clause a diagnostic carries where the parse stopped at a VALUE position: the classes
+/// [`VALUE_CLASSES`] lists, in the sentence this module frames them in.
+///
+/// Spelled out because the lookup below answers with one `&'static str`; the test at the foot
+/// of this module checks the clause carries [`VALUE_CLASSES`], so the two cannot drift apart.
+const VALUE_POSITION: &str =
+    "was expecting a valid value (JSON String, Number, Array, Object or token 'null', 'true' \
+     or 'false')";
+
 /// The cause of `error` without the position it renders after it.
 ///
 /// `serde_json` renders a failure as `<cause> at line <l> column <c>`; the position is
@@ -173,10 +192,7 @@ pub fn expected_where_parsing_stopped(cause: &str, offender: Option<char>) -> &s
     };
     match cause {
         "key must be a string" => "was expecting double-quote to start field name",
-        "expected value" => {
-            "was expecting a valid value (JSON String, Number, Array, Object or token \
-             'null', 'true' or 'false')"
-        }
+        "expected value" => VALUE_POSITION,
         "expected ident" => "was expecting a valid token ('null', 'true' or 'false')",
         "expected `:`" => "was expecting a colon to separate field name and value",
         "expected `,` or `}`" => "was expecting comma to separate Object entries",
@@ -329,6 +345,16 @@ mod tests {
         assert!(
             clause.ends_with("line: 2, column: 7]"),
             "the clause must name the position it was given, got {clause:?}"
+        );
+    }
+
+    /// The clause for a value position lists the classes this module states once, so the
+    /// sentence and the list cannot drift apart.
+    #[test]
+    fn the_value_position_clause_lists_the_classes_a_value_may_begin_with() {
+        assert!(
+            VALUE_POSITION.contains(VALUE_CLASSES),
+            "the clause {VALUE_POSITION:?} must list {VALUE_CLASSES:?}"
         );
     }
 }

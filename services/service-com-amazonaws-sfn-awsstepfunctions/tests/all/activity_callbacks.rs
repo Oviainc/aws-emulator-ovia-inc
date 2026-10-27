@@ -710,6 +710,17 @@ async fn a_reply_that_is_not_json_is_refused_and_changes_nothing() {
             held, 1,
             "case {case:?}: expected the task to stay outstanding, got {held} held"
         );
+        // The token the refusal was sent under still answers that task, which is
+        // what the worker holding it observes: its progress is acknowledged rather
+        // than refused for a task the reply closed.
+        let answered = emulator
+            .ok("SendTaskHeartbeat", &json!({ "taskToken": token }))
+            .await;
+        assert_eq!(
+            answered,
+            json!({}),
+            "case {case:?}: expected the token to still answer its task, got {answered:?}"
+        );
     }
 
     // The same token still answers the task once the worker sends a document.

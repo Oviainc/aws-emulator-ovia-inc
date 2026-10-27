@@ -5503,6 +5503,34 @@ pub fn filter_accepts(filter: Option<&[String]>, value: Option<&str>) -> bool {
     }
 }
 
+/// Whether a record's value for ONE member filtered by an IDENTIFIER filter is
+/// accepted by the already-resolved filter the caller sent for that member.
+///
+/// The single-valued counterpart of [`filter_accepts`], for the filters modelled as an
+/// identifier rather than as a list of values: such a filter names ONE resource, and
+/// because it arrives as `id OR ARN` it is resolved against the endpoint the request
+/// reached ([`resolve_id`]) before it selects. The selection rule is the same one —
+/// a filter the caller did not send narrows nothing, and a record matches a filter
+/// only when its value for the filtered member is the one the filter names, so a
+/// record that recorded no value there matches no filter at all. Because the value is
+/// RESOLVED, one naming a resource of another endpoint
+/// ([`ResolvedIdentifier::Elsewhere`]) names nothing of this inventory and so no
+/// record can match it: the caller is reported an empty list rather than a failure,
+/// which is what makes a filter a filter and not an identifier the request is
+/// addressed to. A handler combines one call per filter member with `&&`, exactly as
+/// it does for [`filter_accepts`].
+///
+/// Shared by the list operations that take an identifier filter so they cannot drift
+/// apart on that rule.
+pub fn identifier_filter_accepts(filter: Option<&ResolvedIdentifier>, value: Option<&str>) -> bool {
+    match filter {
+        None => true,
+        Some(filter) => filter
+            .here()
+            .is_some_and(|resource_id| value == Some(resource_id)),
+    }
+}
+
 /// Cut one page out of an already-filtered sequence of records, and issue the token
 /// that resumes after it.
 ///

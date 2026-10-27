@@ -73,10 +73,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{
-    no_such_health_check, no_such_hosted_zone, normalize_zone_id, TAG_RESOURCE_TYPE_HEALTH_CHECK,
-    TAG_RESOURCE_TYPE_HOSTED_ZONE,
-};
+use crate::state::{resource_tag_set, MissingTagResource};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,60 +155,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        match input.resource_type.as_str() {
-            TAG_RESOURCE_TYPE_HOSTED_ZONE => {
-                // The caller may pass the bare id or the `/hostedzone/`-prefixed
-                // `Id` a HostedZone handed it back; both name the same zone.
-                let id = normalize_zone_id(&input.resource_id);
-                // A pure read: nothing here writes to the store.
-                let store = state.lock();
-                let zone = store.zones.get(id).ok_or_else(|| {
-                    ListTagsForResourceErrorModeled::NoSuchHostedZone(no_such_hosted_zone(
-                        &input.resource_id,
-                    ))
-                })?;
-                Ok(ListTagsForResourceOutput {
-                    resource_tag_set: ResourceTagSet {
-                        resource_type: Some(input.resource_type.clone()),
-                        // The resource's own id, so the answer names what was
-                        // read rather than echoing however it was addressed.
-                        resource_id: Some(zone.id.clone()),
-                        // The `Tags` container is always reported, empty when
-                        // the resource carries no tags, so a client walking it
-                        // reads an empty collection rather than a missing node.
-                        tags: Some(zone.to_tag_list()),
-                    },
-                })
-            }
-            TAG_RESOURCE_TYPE_HEALTH_CHECK => {
-                // A health check is addressed by the bare id
-                // `CreateHealthCheck` assigned it, which is the id the store is
-                // keyed by. A pure read, exactly as for a zone above.
-                let store = state.lock();
-                let health_check =
-                    store.health_checks.get(&input.resource_id).ok_or_else(|| {
-                        ListTagsForResourceErrorModeled::NoSuchHealthCheck(no_such_health_check(
-                            &input.resource_id,
-                        ))
-                    })?;
-                Ok(ListTagsForResourceOutput {
-                    resource_tag_set: ResourceTagSet {
-                        resource_type: Some(input.resource_type.clone()),
-                        // The resource's own id, so the answer names what was
-                        // read rather than echoing however it was addressed.
-                        resource_id: Some(health_check.id.clone()),
-                        // The `Tags` container is always reported, empty when
-                        // the resource carries no tags.
-                        tags: Some(health_check.to_tag_list()),
-                    },
-                })
-            }
-            // Unreachable: `ResourceType` is a modelled enum, so a value outside
-            // `TagResourceType` is refused before this handler runs.
-            other => Err(ListTagsForResourceErrorModeled::InvalidInput(InvalidInput {
-                message: Some(format!("{other} is not a valid ResourceType")),
-            })
-            .into()),
-        }
+        // A pure read: the resolution below takes the store by shared
+        // reference, so nothing here writes to it.
+        let store = state.lock();
+        let tag_set = resource_tag_set(&store, &input.resource_type, &input.resource_id)
+            .map_err(|missing| match missing {
+                MissingTagResource::HostedZone(error) => {
+                    ListTagsForResourceErrorModeled::NoSuchHostedZone(error)
+                }
+                MissingTagResource::HealthCheck(error) => {
+                    ListTagsForResourceErrorModeled::NoSuchHealthCheck(error)
+                }
+                // Unreachable: `ResourceType` is a modelled enum, so a value
+                // outside `TagResourceType` is refused before this handler runs.
+                MissingTagResource::UnknownResourceType(other) => {
+                    ListTagsForResourceErrorModeled::InvalidInput(InvalidInput {
+                        message: Some(format!("{other} is not a valid ResourceType")),
+                    })
+                }
+            })?;
+
+        Ok(ListTagsForResourceOutput {
+            resource_tag_set: tag_set,
+        })
     }
 }

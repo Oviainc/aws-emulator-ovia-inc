@@ -41,7 +41,7 @@ use service_com_amazonaws_medialive_medialive::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
-use crate::support::{epoch_seconds, member, timestamp, unix_seconds};
+use crate::support::{epoch_seconds, member, resolved_network_ids, timestamp, unix_seconds};
 use crate::wire::{call, error_code, error_message, medialive, medialive_with_engine, ACCOUNT};
 
 /// The cluster collection URI
@@ -478,6 +478,10 @@ async fn a_created_cluster_round_trips_through_describe_cluster() {
 
     for (case, body) in table {
         let router = medialive();
+        // The networks the row's mappings name are put in the account first: a
+        // mapping may only name a network this account holds, and the resolved
+        // body is what the round trip is compared against.
+        let body = resolved_network_ids(&router, body).await;
         let created = create_cluster(&router, case, body.clone()).await;
 
         let id = created["id"].as_str().unwrap_or_default().to_string();

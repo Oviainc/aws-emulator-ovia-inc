@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccessPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccessPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccessPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages through the IoT SiteWise Monitor access policies this store
+//! holds — the records `CreateAccessPolicy` persisted and `UpdateAccessPolicy` last
+//! wrote — narrowed by the identity and the Monitor resource the request names, and
+//! summarised with exactly the values `DescribeAccessPolicy` reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +160,286 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccessPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccessPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccessPolicies"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        // Nothing an `AccessPolicySummary` carries is scoped to the caller's region —
+        // the summary models no ARN — so this listing reads no value off the request
+        // itself.
+        let _ = ctx;
+
+        // Each filter is stated as a PAIR of query members, and half a pair names
+        // nothing, so an incomplete one is refused before anything is read.
+        let identity_filter = identity_filter(&input)?;
+        let resource_filter = resource_filter(&input)?;
+
+        // A pure read: nothing below writes, so two callers listing in either order
+        // see the same policies.
+        let store = state.lock();
+
+        // Every stored policy the request's filters admit. Both filters NARROW this
+        // enumeration rather than scoping it to a parent resource — each is optional
+        // and this operation models no not-found error — so an identity or a Monitor
+        // resource no stored policy is about selects no policy instead of being
+        // refused.
+        let mut selected: Vec<&crate::state::AccessPolicyRecord> = store
+            .access_policies
+            .values()
+            .filter(|record| {
+                identity_filter
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.matches(&record.identity))
+                    && resource_filter
+                        .as_ref()
+                        .is_none_or(|wanted| wanted.matches(&record.resource))
+            })
+            .collect();
+
+        // A stable total order is what makes `nextToken` resumable: oldest first, ties
+        // broken by id so two policies created in the same instant still order
+        // deterministically.
+        selected.sort_by(|left, right| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the id of the first policy of
+        // the next page, hex-encoded so the token deterministically matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this enumeration is
+        // refused rather than answered with an empty page, which would report a lost
+        // resume point as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                selected
+                    .iter()
+                    .position(|record| record.id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range and
+        // nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total. The default is the one this operation's `maxResults` documents.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(selected.len());
+
+        // "The token for the next set of results, or null if there are no additional
+        // results": issued only when a policy follows this page.
+        let next_token = selected
+            .get(end)
+            .map(|record| ::hex::encode(record.id.as_bytes()));
+        let access_policy_summaries = selected[start..end].iter().copied().map(summary).collect();
+
+        Ok(ListAccessPoliciesOutput {
+            access_policy_summaries,
+            next_token,
+        })
     }
+}
+
+/// The page size this operation's `maxResults` documents when the caller sends none:
+/// "Default: 50".
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// The `IdentityType` value for an IAM Identity Center user. Source:
+/// `smithy_query(query="shape", shape="IdentityType")` — `USER | GROUP | IAM`, the
+/// same value list [`IDENTITY_TYPE_VALUES`] carries.
+const IDENTITY_TYPE_USER: &str = "USER";
+
+/// The `IdentityType` value for an IAM Identity Center group.
+const IDENTITY_TYPE_GROUP: &str = "GROUP";
+
+/// The `IdentityType` value for an IAM identity — a user or a role.
+const IDENTITY_TYPE_IAM: &str = "IAM";
+
+/// The `ResourceType` value for a portal. Source:
+/// `smithy_query(query="shape", shape="ResourceType")` — `PORTAL | PROJECT`, the same
+/// value list [`RESOURCE_TYPE_VALUES`] carries.
+const RESOURCE_TYPE_PORTAL: &str = "PORTAL";
+
+/// The `ResourceType` value for a project.
+const RESOURCE_TYPE_PROJECT: &str = "PROJECT";
+
+/// The identity a request asks this listing to narrow to, resolved to the ONE
+/// `Identity` member that `identityType` selects.
+enum IdentityFilter {
+    /// `identityType=USER`: the IAM Identity Center id the policy's `user` carries.
+    User(String),
+    /// `identityType=GROUP`: the IAM Identity Center id the policy's `group` carries.
+    Group(String),
+    /// `identityType=IAM`: the IAM ARN the policy's `iamUser` or `iamRole` carries —
+    /// the two IAM forms an `Identity` can take, either of which an `iamArn` names.
+    Iam(String),
+}
+
+impl IdentityFilter {
+    /// Whether a stored policy is about the identity this filter names.
+    fn matches(&self, identity: &Identity) -> bool {
+        match self {
+            Self::User(id) => identity.user.as_ref().is_some_and(|user| &user.id == id),
+            Self::Group(id) => identity.group.as_ref().is_some_and(|group| &group.id == id),
+            Self::Iam(arn) => {
+                identity
+                    .iam_user
+                    .as_ref()
+                    .is_some_and(|user| &user.arn == arn)
+                    || identity
+                        .iam_role
+                        .as_ref()
+                        .is_some_and(|role| &role.arn == arn)
+            }
+        }
+    }
+}
+
+/// The Monitor resource a request asks this listing to narrow to, resolved to the ONE
+/// `Resource` member that `resourceType` selects.
+enum ResourceFilter {
+    /// `resourceType=PORTAL`: the id the policy's `portal` carries.
+    Portal(String),
+    /// `resourceType=PROJECT`: the id the policy's `project` carries.
+    Project(String),
+}
+
+impl ResourceFilter {
+    /// Whether a stored policy is about the Monitor resource this filter names.
+    fn matches(&self, resource: &Resource) -> bool {
+        match self {
+            Self::Portal(id) => resource
+                .portal
+                .as_ref()
+                .is_some_and(|portal| &portal.id == id),
+            Self::Project(id) => resource
+                .project
+                .as_ref()
+                .is_some_and(|project| &project.id == id),
+        }
+    }
+}
+
+/// Read the identity filter off the request, refusing a half-stated one.
+///
+/// `identityType` is "required if you specify identityId", `identityId` is "required
+/// if you specify USER or GROUP for identityType" and `iamArn` is "required if you
+/// specify IAM for identityType": the type says WHICH member of a policy's `Identity`
+/// to compare, and the id or the ARN says WHAT to compare it to, so neither half
+/// names an identity on its own.
+fn identity_filter(
+    input: &ListAccessPoliciesInput,
+) -> Result<Option<IdentityFilter>, ListAccessPoliciesError> {
+    let identity_type = match input.identity_type.as_deref() {
+        Some(identity_type) => identity_type,
+        None => {
+            if input.identity_id.is_some() {
+                return Err(invalid_request(
+                    "identityType is required when identityId is specified.",
+                ));
+            }
+            // `iamArn` names an IAM identity on its own: there is no other
+            // `identityType` under which its value could be compared.
+            return Ok(input.iam_arn.clone().map(IdentityFilter::Iam));
+        }
+    };
+    match identity_type {
+        IDENTITY_TYPE_USER | IDENTITY_TYPE_GROUP => {
+            let identity_id = input.identity_id.clone().ok_or_else(|| {
+                invalid_request(&format!(
+                    "identityId is required when identityType is {identity_type}."
+                ))
+            })?;
+            Ok(Some(if identity_type == IDENTITY_TYPE_USER {
+                IdentityFilter::User(identity_id)
+            } else {
+                IdentityFilter::Group(identity_id)
+            }))
+        }
+        IDENTITY_TYPE_IAM => {
+            let iam_arn = input.iam_arn.clone().ok_or_else(|| {
+                invalid_request(&format!(
+                    "iamArn is required when identityType is {IDENTITY_TYPE_IAM}."
+                ))
+            })?;
+            Ok(Some(IdentityFilter::Iam(iam_arn)))
+        }
+        // Unreachable: the runtime refuses a value the enum does not declare before
+        // this handler runs. A value the model gains later names an identity form
+        // this listing cannot compare, which is the refusal here.
+        other => Err(invalid_request(&format!(
+            "identityType must be one of {}; this request named {other}.",
+            crate::state::catalog_names(IDENTITY_TYPE_VALUES.iter().copied())
+        ))),
+    }
+}
+
+/// Read the Monitor-resource filter off the request, refusing a half-stated one.
+///
+/// `resourceId` is "required if you specify resourceType" and `resourceType` is
+/// "required if you specify resourceId" — the same pairing rule the identity filter
+/// follows, for the two members a policy's `Resource` can take.
+fn resource_filter(
+    input: &ListAccessPoliciesInput,
+) -> Result<Option<ResourceFilter>, ListAccessPoliciesError> {
+    match (input.resource_type.as_deref(), input.resource_id.as_deref()) {
+        (None, None) => Ok(None),
+        (Some(RESOURCE_TYPE_PORTAL), Some(id)) => Ok(Some(ResourceFilter::Portal(id.to_string()))),
+        (Some(RESOURCE_TYPE_PROJECT), Some(id)) => {
+            Ok(Some(ResourceFilter::Project(id.to_string())))
+        }
+        (Some(_), None) => Err(invalid_request(
+            "resourceId is required when resourceType is specified.",
+        )),
+        (None, Some(_)) => Err(invalid_request(
+            "resourceType is required when resourceId is specified.",
+        )),
+        // Unreachable for the same reason the identity arm above is.
+        (Some(other), Some(_)) => Err(invalid_request(&format!(
+            "resourceType must be one of {}; this request named {other}.",
+            crate::state::catalog_names(RESOURCE_TYPE_VALUES.iter().copied())
+        ))),
+    }
+}
+
+/// One stored access policy as the summary this operation reports, read straight off
+/// the record `CreateAccessPolicy` persisted and `DescribeAccessPolicy` reads back, so
+/// a listed policy and a described one never disagree.
+fn summary(record: &crate::state::AccessPolicyRecord) -> AccessPolicySummary {
+    AccessPolicySummary {
+        id: record.id.clone(),
+        identity: record.identity.clone(),
+        resource: record.resource.clone(),
+        permission: record.permission.clone(),
+        creation_date: Some(crate::state::to_date_time(record.creation_date)),
+        last_update_date: Some(crate::state::to_date_time(record.last_update_date)),
+    }
+}
+
+/// Decode a `nextToken` back into the access-policy id it resumes from.
+fn decode_token(token: &str) -> Result<String, ListAccessPoliciesError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 500 `InternalFailureException`: the store this operation needs is not there.
+fn internal_failure() -> ListAccessPoliciesError {
+    ListAccessPoliciesErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message` — the client-input error this
+/// operation declares.
+fn invalid_request(message: &str) -> ListAccessPoliciesError {
+    ListAccessPoliciesErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: message.to_string(),
+    })
+    .into()
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListAccessPoliciesError {
+    invalid_request("The nextToken is not a token this operation issued.")
 }

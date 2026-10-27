@@ -17,9 +17,11 @@
 //! label encoder every `@httpLabel` suite shares ([`percent_encoded`]), the
 //! readers the group assertions need, the two clock readings a timestamp
 //! assertion compares ([`epoch_seconds`], [`unix_seconds`]), the one channel
-//! a signal map's discovery is entered from ([`entry_point`]) and the input
+//! a signal map's discovery is entered from ([`entry_point`]), the input
 //! setup every suite that creates an input shares ([`input_security_group`],
-//! [`sdi_source`], [`claimed_device`], [`resolved_input_body`]).
+//! [`sdi_source`], [`claimed_device`], [`resolved_input_body`]) and the network
+//! setup every suite that maps a cluster onto one shares
+//! ([`resolved_network_ids`]).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -270,6 +272,112 @@ pub async fn resolved_input_body(router: &MultiServiceRouter, body: Value) -> Va
         ]);
     }
     body
+}
+
+/// The same cluster request — or the `networkSettings` a row expects back —
+/// pointed at networks this account really holds.
+///
+/// An `InterfaceMapping`'s `NetworkId` has to name a network of this account, so
+/// a suite's row says WHICH network each interface is mapped onto by SPELLING an
+/// id, and this helper puts a network behind every spelling it finds: a spelling
+/// that already names a network this account holds is left pointing at it, and
+/// any other spelling becomes one network created under that spelling as its
+/// `Name`. Keyed by the spelling through `RequestId`, so one spelling resolves to
+/// the SAME network however often a suite asks for it — which is what lets a row
+/// resolve its request and the settings it expects back through the same call and
+/// compare them.
+///
+/// `DefaultRoute` names an interface rather than a network, so it is left exactly
+/// as the row spelled it.
+pub async fn resolved_network_ids(router: &MultiServiceRouter, value: Value) -> Value {
+    let mut spellings: Vec<String> = Vec::new();
+    collect_network_ids(&value, &mut spellings);
+    let mut resolved: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for spelling in spellings {
+        if resolved.contains_key(&spelling) {
+            continue;
+        }
+        let id = held_network(router, &spelling).await;
+        resolved.insert(spelling, id);
+    }
+    substituted_network_ids(value, &resolved)
+}
+
+/// The id of a network this account holds for the spelling `spelled`.
+async fn held_network(router: &MultiServiceRouter, spelled: &str) -> String {
+    if already_held(router, &format!("/prod/networks/{spelled}")).await {
+        return spelled.to_string();
+    }
+    let (status, network) = call(
+        router,
+        "POST",
+        "/prod/networks",
+        Some(json!({
+            "name": spelled,
+            "requestId": spelled,
+            "ipPools": [{ "cidr": "10.0.0.0/16" }],
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "setup: expected CreateNetwork for {spelled:?} to answer 201, got {status}: {network}"
+    );
+    network["id"].as_str().unwrap_or_default().to_string()
+}
+
+/// Every `networkId` spelled anywhere in `value`, in the order they appear.
+fn collect_network_ids(value: &Value, into: &mut Vec<String>) {
+    match value {
+        Value::Object(members) => {
+            for (name, member) in members {
+                match (name.as_str(), member.as_str()) {
+                    ("networkId", Some(spelled)) => into.push(spelled.to_string()),
+                    _ => collect_network_ids(member, into),
+                }
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                collect_network_ids(entry, into);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The same `value` with every `networkId` replaced by the id `resolved` holds
+/// for its spelling.
+fn substituted_network_ids(
+    value: Value,
+    resolved: &std::collections::HashMap<String, String>,
+) -> Value {
+    match value {
+        Value::Object(members) => Value::Object(
+            members
+                .into_iter()
+                .map(|(name, member)| {
+                    let member = if name == "networkId" {
+                        match member.as_str().and_then(|spelled| resolved.get(spelled)) {
+                            Some(id) => json!(id),
+                            None => member,
+                        }
+                    } else {
+                        substituted_network_ids(member, resolved)
+                    };
+                    (name, member)
+                })
+                .collect(),
+        ),
+        Value::Array(entries) => Value::Array(
+            entries
+                .into_iter()
+                .map(|entry| substituted_network_ids(entry, resolved))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// One channel named `name`, answering its ARN — the top-level resource a signal

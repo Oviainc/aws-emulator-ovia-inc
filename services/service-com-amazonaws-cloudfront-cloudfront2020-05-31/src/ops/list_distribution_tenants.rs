@@ -166,6 +166,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Filter by the associated distribution ID or connection group ID": each member the
         // filter names is a resource a tenant is associated with, and a member carrying no
         // value names no resource, so it narrows nothing.
+        //
+        // Both members are unconstrained strings the model requires nothing more of than
+        // naming "the distribution ID to filter by" and "the ID of the connection group to
+        // filter by", so each is a MATCH PREDICATE over the stored tenants and never a
+        // precondition on the resource it names: a value naming no resource this account
+        // holds matches no tenant, which is the ordinary empty page the walk below computes.
+        // Whether that resource exists is the business of the operations that associate a
+        // tenant with it, not of this listing.
         let association_filter = input.association_filter.as_ref();
         let distribution_filter = association_filter
             .and_then(|filter| filter.distribution_id.as_deref())
@@ -178,19 +186,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Materialise the propagation the clock already owes, so no summary this listing
         // reports carries a stale status.
         store.settle(SystemTime::now());
-
-        // The filter names resources of this account, so an id this service cannot resolve
-        // to one is an invalid argument rather than an empty page over a filter that matched
-        // nothing — the same answer every `AssociationFilter` of this service gives such an
-        // id. The sentence is the filter's own, so it says nothing about the value submitted.
-        let unresolvable = distribution_filter.is_some_and(|id| store.distribution(id).is_none())
-            || connection_group_filter.is_some_and(|id| !store.holds_connection_group(id));
-        if unresolvable {
-            return Err(ListDistributionTenantsErrorModeled::InvalidArgument(
-                crate::state::invalid_association_filter(),
-            )
-            .into());
-        }
 
         // "The marker for the next set of results" is the tenant id the previous page ended
         // at: a value that is not one was never a resume point this service handed out

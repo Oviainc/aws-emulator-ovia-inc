@@ -30,6 +30,7 @@ use service_com_amazonaws_medialive_medialive::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
+use crate::support::resolved_network_ids;
 use crate::wire::{call, error_code, error_message, medialive, ACCOUNT};
 
 /// The cluster collection URI `CreateCluster` is bound to
@@ -94,6 +95,10 @@ fn id_of(case: &str, cluster: &Value) -> String {
 
 /// `count` `InterfaceMapping` entries, each naming its own logical interface and
 /// network, for the rows that vary the length of the list.
+///
+/// The network each entry names is SPELLED here and turned into a network this
+/// account really holds by [`resolved_network_ids`], because a mapping may only
+/// name a network of the account.
 fn mappings(count: usize) -> Value {
     Value::Array(
         (0..count)
@@ -210,6 +215,12 @@ async fn an_update_writes_the_members_it_carries() {
         if !created_settings.is_null() {
             create_body["networkSettings"] = created_settings;
         }
+        // Every network the row spells is put in the account first, and the
+        // request, the update and the settings the row expects back are all
+        // resolved through the same call, so the three name the same networks.
+        let create_body = resolved_network_ids(&router, create_body).await;
+        let request = resolved_network_ids(&router, request).await;
+        let settings = resolved_network_ids(&router, settings).await;
         let cluster = create(&router, case, create_body).await;
         let id = id_of(case, &cluster);
         // Start from a settled cluster, so the state the update reports is the
@@ -308,9 +319,8 @@ async fn an_update_writes_the_members_it_carries() {
 async fn an_update_only_reaches_a_cluster_the_store_holds() {
     let router = medialive();
     let case = "scoping";
-    let cluster = create(
+    let body = resolved_network_ids(
         &router,
-        case,
         json!({
             "name": "the-only-cluster",
             "clusterType": ON_PREMISES,
@@ -319,6 +329,7 @@ async fn an_update_only_reaches_a_cluster_the_store_holds() {
         }),
     )
     .await;
+    let cluster = create(&router, case, body).await;
     let id = id_of(case, &cluster);
     wait_for_the_clock();
     let before = described(&router, case, &id).await;
@@ -542,9 +553,8 @@ async fn an_update_is_held_to_the_bounds_a_create_is() {
 
     for (case, count, accepted) in mapping_rows {
         let router = medialive();
-        let cluster = create(
+        let body = resolved_network_ids(
             &router,
-            case,
             json!({
                 "name": "under-test",
                 "clusterType": ON_PREMISES,
@@ -552,9 +562,10 @@ async fn an_update_is_held_to_the_bounds_a_create_is() {
             }),
         )
         .await;
+        let cluster = create(&router, case, body).await;
         let id = id_of(case, &cluster);
         let before = described(&router, case, &id).await;
-        let asked = mappings(count);
+        let asked = resolved_network_ids(&router, mappings(count)).await;
 
         let (status, body) = update(
             &router,
@@ -613,9 +624,8 @@ async fn an_update_is_held_to_the_bounds_a_create_is() {
 async fn an_update_touches_only_the_cluster_it_names() {
     let router = medialive();
     let case = "one cluster at a time";
-    let target = create(
+    let target_body = resolved_network_ids(
         &router,
-        case,
         json!({
             "name": "target",
             "clusterType": ON_PREMISES,
@@ -623,9 +633,9 @@ async fn an_update_touches_only_the_cluster_it_names() {
         }),
     )
     .await;
-    let sibling = create(
+    let target = create(&router, case, target_body).await;
+    let sibling_body = resolved_network_ids(
         &router,
-        case,
         json!({
             "name": "sibling",
             "clusterType": ON_PREMISES,
@@ -633,6 +643,7 @@ async fn an_update_touches_only_the_cluster_it_names() {
         }),
     )
     .await;
+    let sibling = create(&router, case, sibling_body).await;
     let id = id_of(case, &target);
     let sibling_id = id_of(case, &sibling);
 
@@ -660,16 +671,15 @@ async fn an_update_touches_only_the_cluster_it_names() {
     wait_for_the_clock();
     let before_sibling = described(&router, case, &sibling_id).await;
 
-    let after = updated(
+    let request = resolved_network_ids(
         &router,
-        case,
-        &id,
         json!({
             "name": "target-renamed",
             "networkSettings": { "defaultRoute": "net-2", "interfaceMappings": mappings(3) },
         }),
     )
     .await;
+    let after = updated(&router, case, &id, request).await;
     assert_eq!(
         after["channelIds"],
         json!([placed]),

@@ -78,9 +78,10 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     AccessDeniedException, FeatureConfigurations, InternalServerException, InvoiceConfiguration,
-    InvoiceProfile, InvoiceSummary, InvoiceUnit, InvoiceUnitRule, MessageKey, ProcurementPortal,
-    ProcurementPortalPreference, ProcurementPortalPreferenceSummary, ProcurementPortalSupplier,
-    ResourceNotFoundException, ResourceTag, ValidationException,
+    InvoiceProfile, InvoiceSummary, InvoiceUnit, InvoiceUnitRule, MarketplacePunchOutPreference,
+    MessageKey, ProcurementPortal, ProcurementPortalPreference,
+    ProcurementPortalPreferenceSummary, ProcurementPortalSupplier, ResourceNotFoundException,
+    ResourceTag, ValidationException,
     EINVOICE_DELIVERY_ATTACHMENT_TYPE_VALUES, EINVOICE_DELIVERY_DOCUMENT_TYPE_VALUES,
     PROCUREMENT_PORTAL_NAME_VALUES,
 };
@@ -643,11 +644,13 @@ pub const STATUS_PENDING_VERIFICATION: &str = "PENDING_VERIFICATION";
 /// refuses the same combination.
 pub const PORTAL_COUPA: &str = "COUPA";
 
-/// The 400 a write of a procurement portal preference answers when it enables
-/// Marketplace PunchOut for `procurement_portal_name` without the configuration that
-/// portal requires.
+/// The Marketplace PunchOut rule a write of a procurement portal preference applies, in
+/// one place: the `MarketplacePunchOutEnabled` the write stores, or the modelled 400 it
+/// is refused with when it enables Marketplace PunchOut for a portal whose required
+/// configuration it did not state.
 ///
-/// `MarketplacePunchOutEnabled` "defaults to false if not provided" and
+/// `MarketplacePunchOutEnabled` "defaults to false if not provided" — so an omitted
+/// member is `false` here rather than anything that was stored — and
 /// `MarketplacePunchOutPreference` is "required for Coupa when
 /// MarketplacePunchOutEnabled is true" — a combination of members the model cannot
 /// express, so the boundary validator passes it and it is refused here as the modelled
@@ -655,20 +658,37 @@ pub const PORTAL_COUPA: &str = "COUPA";
 /// it is built from what the write is acting on rather than from a constant, and it is
 /// keyed the way this plane's recorded bodies key it ([`MessageKey::Capitalised`]) —
 /// every write that reaches this rule is a write of a procurement portal preference.
-pub fn marketplace_punch_out_preference_required(
+///
+/// Both the DEFAULT and the combination that is refused live here, beside the preference
+/// registry, rather than in one operation's module, for the reason [`PORTAL_COUPA`]
+/// states: they are one rule about the RESOURCE, which every write that sets a
+/// preference's Marketplace PunchOut configuration — the create and the update — applies
+/// whole, so neither path can drift from the other. The portal is the only part a caller
+/// can reach differently: a create states it on the input, an update takes it off the
+/// stored preference, whose portal no update can change.
+pub fn resolve_marketplace_punch_out_enabled(
     procurement_portal_name: &str,
-) -> ValidationException {
-    ValidationException {
-        message: Some(format!(
-            "MarketplacePunchOutPreference is required when MarketplacePunchOutEnabled is \
-             true and ProcurementPortalName is {procurement_portal_name}"
-        )),
-        // `invalidInput` is one of the model's `ValidationExceptionReason` values
-        // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]).
-        reason: Some("invalidInput".to_string()),
-        message_key: MessageKey::Capitalised,
-        ..Default::default()
+    marketplace_punch_out_enabled: Option<bool>,
+    marketplace_punch_out_preference: Option<&MarketplacePunchOutPreference>,
+) -> Result<bool, ValidationException> {
+    let enabled = marketplace_punch_out_enabled.unwrap_or(false);
+    if enabled
+        && procurement_portal_name == PORTAL_COUPA
+        && marketplace_punch_out_preference.is_none()
+    {
+        return Err(ValidationException {
+            message: Some(format!(
+                "MarketplacePunchOutPreference is required when MarketplacePunchOutEnabled is \
+                 true and ProcurementPortalName is {procurement_portal_name}"
+            )),
+            // `invalidInput` is one of the model's `ValidationExceptionReason` values
+            // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]).
+            reason: Some("invalidInput".to_string()),
+            message_key: MessageKey::Capitalised,
+            ..Default::default()
+        });
     }
+    Ok(enabled)
 }
 
 /// The identity of a procurement portal preference: its portal, buyer domain and

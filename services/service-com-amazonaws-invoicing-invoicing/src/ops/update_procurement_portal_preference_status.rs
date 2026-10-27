@@ -24,7 +24,7 @@
 //!   plane whose status it does not state gives context for an update that is not
 //!   happening: both are refused with the modelled `ValidationException`, a combination of
 //!   members the model cannot express (every member of this input is optional on its own),
-//!   the same way `crate::state::marketplace_punch_out_preference_required` refuses the
+//!   the same way `crate::state::resolve_marketplace_punch_out_enabled` refuses the
 //!   one `PutProcurementPortalPreference` cannot express;
 //! * an ARN this service holds no preference for is the modelled
 //!   `ResourceNotFoundException`.

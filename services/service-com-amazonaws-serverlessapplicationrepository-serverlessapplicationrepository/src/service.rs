@@ -59,7 +59,9 @@
 //! - [`Service::override_routing_error`] serves it. An artifact request names no modelled
 //!   operation by construction, so the router reaches exactly this seam for it, and
 //!   reaches it BEFORE authentication — which is what lets a published artifact URL be
-//!   followed unsigned, as the real service's presigned object URL is.
+//!   followed with no `Authorization` header at all, as the real service's presigned object
+//!   URL is: the authorisation such a fetch presents is the locator's own signature, which
+//!   this seam checks.
 //!
 //! What it serves is the body the publish RETAINED (`Application::license_body` and
 //! `readme_body`, `AppVersion::template_body`), read back out of the one store the
@@ -67,8 +69,39 @@
 //! deleted, whose version was never published, or whose body the publisher named by a
 //! `*Url` instead of supplying inline, is `404` — nothing is published there, and no
 //! bytes are invented for it.
+//!
+//! A locator is PRESIGNED (`crate::state::presigned_artifact_url`), as the real service's
+//! object URL is: the signature in its query string is what makes the document fetchable
+//! by whoever holds the link and by nobody else, so this seam verifies that signature
+//! before it reads the store — a locator presented with no signature, with a rewritten
+//! one, or past the expiry it states is `403`, and only a locator this service signed is
+//! served.
+//!
+//! ## How a response with no body is framed
+//!
+//! `DeleteApplication` answers `204` with an empty (`Unit`) output
+//! (`smithy_query(query="operation", operation="DeleteApplication")`). A response with no
+//! body still has a LENGTH, and AWS states it: that answer carries `content-length: 0`.
+//! The protocol's serializer leaves the header off, which leaves the length to the
+//! transport to frame, so a client or proxy that keys on a framing header being present
+//! reads the emulator's reply differently from the service's.
+//! [`Service::override_protocol`] therefore serves a protocol that is the model's own in
+//! every respect except one: a response this service serializes with an EMPTY body says so
+//! with `content-length: 0`. A response that carries a body is left exactly as the model's
+//! protocol renders it, framed from the body it carries. This is the same seam, and the
+//! same one-header correction, that the sibling `schemas` and `mediapackage` emulators
+//! serve their own `Unit`-output operations through.
+//!
+//! That framing is what this service answers, and it is what the in-process front door
+//! delivers (the inter-service callback path and the SDK connector both serve the router's
+//! response unchanged). An answer served over HTTP/1.1 reaches a client WITHOUT it: the
+//! HTTP writer the vendored transport uses removes `content-length` from a `204`, which
+//! RFC 9110 §15.3.5 forbids there, and that writer is below anything this crate decides.
+//! `tests/all/empty_response_framing.rs` pins what this service states.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
 use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -103,6 +136,107 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 }
 
+/// How a response with no body is framed: with the `content-length: 0` that states its
+/// length, rather than with no framing header at all. See the module docs.
+///
+/// Only an EMPTY body is touched, and only that one header: a response that carries a body
+/// is framed from the body it carries, which is already right.
+fn frame_empty_body(response: &mut RtResponse) {
+    if response.body().bytes().is_some_and(<[u8]>::is_empty) {
+        response.headers_mut().insert("content-length", "0");
+    }
+}
+
+/// The protocol this service answers modelled requests in: the model's own, with the one
+/// framing correction the module docs state.
+///
+/// Implemented on the service itself because the model-derived protocol it delegates to is
+/// owned by the generated entry and reached by reference (`self.entry.protocol()`), and
+/// [`Service::override_protocol`] hands back a borrow of `&self` — so there is one protocol
+/// instance, the generated one, and no second routing table to drift from the model.
+impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
+    type Request = RtRequest;
+    type Response = RtResponse;
+
+    fn protocol_id(&self) -> &aws_smithy_schema::ShapeId {
+        self.entry.protocol().protocol_id()
+    }
+
+    fn routing_key<'a>(&self, request: &'a RtRequest) -> Result<&'a str, ProtocolError> {
+        self.entry.protocol().routing_key(request)
+    }
+
+    fn deserialize_input<'a>(
+        &self,
+        request: &'a RtRequest,
+        input_schema: &Schema,
+    ) -> Result<Box<dyn aws_smithy_schema::serde::ShapeDeserializer + 'a>, ProtocolError> {
+        self.entry.protocol().deserialize_input(request, input_schema)
+    }
+
+    fn serialize_output(
+        &self,
+        output: &dyn aws_smithy_schema::serde::SerializableStruct,
+        output_schema: &Schema,
+        operation_name: &str,
+        success_status: u16,
+    ) -> Result<RtResponse, ProtocolError> {
+        let mut response = self.entry.protocol().serialize_output(
+            output,
+            output_schema,
+            operation_name,
+            success_status,
+        )?;
+        // The status, the body and every other header are the protocol's: only the framing
+        // of an answer that has no body is added.
+        frame_empty_body(&mut response);
+        Ok(response)
+    }
+
+    fn serialize_error(
+        &self,
+        error: &dyn aws_smithy_schema::serde::SerializableStruct,
+        error_schema: &Schema,
+        error_code: &str,
+        http_status: u16,
+    ) -> Result<RtResponse, ProtocolError> {
+        let mut response = self
+            .entry
+            .protocol()
+            .serialize_error(error, error_schema, error_code, http_status)?;
+        // Every modelled failure of this service carries the `errorCode`/`message`
+        // envelope, so this body is never empty; the same framing is applied for the same
+        // reason rather than leaving one of the two paths to answer differently.
+        frame_empty_body(&mut response);
+        Ok(response)
+    }
+
+    fn serialize_event_stream_message(
+        &self,
+        event_type: &str,
+        is_exception: bool,
+        event: &dyn aws_smithy_schema::serde::SerializableStruct,
+        event_schema: &Schema,
+    ) -> Result<RtResponse, ProtocolError> {
+        self.entry.protocol().serialize_event_stream_message(
+            event_type,
+            is_exception,
+            event,
+            event_schema,
+        )
+    }
+}
+
+/// `ServerProtocol` requires `Debug`; the generated entry is not `Debug`, so this names the
+/// protocol being served rather than the service's internals.
+impl<Eng: Send + Sync + 'static> std::fmt::Debug for EmulatedService<Eng> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmulatedService")
+            .field("protocol", &self.entry.protocol().protocol_id())
+            .finish()
+    }
+}
+
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
@@ -127,7 +261,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // `http::Uri::path` already strips the scheme, the authority and the query, for
         // an origin-form request line and an absolute-form one alike.
-        if crate::state::parse_artifact_path(parts.uri.path()).is_some() {
+        if crate::state::addresses_artifact_plane(parts.uri.path()) {
             return true;
         }
         // Otherwise claim a request whose resolved route key is this service's signing
@@ -149,6 +283,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the `Action` form field on a query protocol, say — is reachable here.
         let _ = req;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // Every response a modelled operation of this service produces is serialized by the
+        // protocol returned here. See the module docs: it is the model's own protocol, with
+        // one correction — an answer with no body is framed with `content-length: 0`
+        // instead of with no framing header at all.
+        Some(self)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -197,9 +339,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // A request to an artifact URL this service published is exactly that case by
         // construction — the path is not in the model — so this is where the retained
-        // body is served. Anything else keeps the framework's default.
-        let target = crate::state::parse_artifact_path(request_path(req.uri()))?;
-        Some(self.serve_artifact(req, &target))
+        // body is served. The whole published path space is answered here, including an
+        // address in it that names no artefact this service mints: it is this service's
+        // space, so an address in it is a document that does not exist rather than an
+        // operation nothing implements. Anything else keeps the framework's default.
+        let path = request_path(req.uri());
+        if !crate::state::addresses_artifact_plane(path) {
+            return None;
+        }
+        Some(self.serve_artifact(req, path))
     }
 
     fn override_framework_error(
@@ -222,11 +370,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     ///
     /// A fetch is a pure READ of the publish: it answers the bytes the publisher supplied
     /// inline and writes nothing, so following a locator twice answers the same document
-    /// and changes nothing a later caller sees. Every segment of the locator must agree
-    /// with one stored record (`crate::state::ArtifactTarget`) — a locator whose
-    /// application has been deleted, or whose version was never published, names no
-    /// document.
-    fn serve_artifact(&self, req: &RtRequest, target: &crate::state::ArtifactTarget) -> RtResponse {
+    /// and changes nothing a later caller sees. The locator's own signature decides whether
+    /// the download is authorised at all, and then every segment of it must agree with one
+    /// stored record (`crate::state::ArtifactTarget`) — a locator whose application has
+    /// been deleted, or whose version was never published, names no document.
+    fn serve_artifact(&self, req: &RtRequest, path: &str) -> RtResponse {
         if !matches!(req.method(), "GET" | "HEAD") {
             return artifact_error(
                 405,
@@ -234,6 +382,42 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 "A published application artifact is served by GET.",
             );
         }
+        // The locator this service announced carries the signature that authorises the
+        // download, and it is checked BEFORE the store is read: a request that presents no
+        // locator this service minted learns nothing about what is published, not even
+        // whether anything is. Its scope is the region the address itself names, which is
+        // the region of the catalogue it addresses.
+        match crate::state::artifact_signature(
+            request_authority(req),
+            request_target(req.uri()),
+            crate::state::artifact_path_region(path).unwrap_or(crate::state::DEFAULT_REGION),
+            ::std::time::SystemTime::now(),
+        ) {
+            crate::state::ArtifactSignature::Honoured => {}
+            // The wording each condition answers with is the one the real object store
+            // gives for it, because this plane stands in for that store.
+            crate::state::ArtifactSignature::Absent => {
+                return artifact_error(403, "AccessDenied", "Access Denied")
+            }
+            crate::state::ArtifactSignature::Expired => {
+                return artifact_error(403, "AccessDenied", "Request has expired")
+            }
+            crate::state::ArtifactSignature::Invalid => {
+                return artifact_error(
+                    403,
+                    "SignatureDoesNotMatch",
+                    "The request signature we calculated does not match the signature you \
+                     provided. Check your key and signing method.",
+                )
+            }
+        }
+        // Which artefact the address names. A path under this space that names none — a
+        // file name no publish mints, a segment count no locator carries — addresses no
+        // document, which is the same absence as an artefact that was never published.
+        let target = match crate::state::parse_artifact_path(path) {
+            Some(target) => target,
+            None => return artifact_not_found(),
+        };
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return artifact_error(
                 500,
@@ -242,14 +426,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             );
         };
         let store = state.lock();
-        let Some(body) = store.artifact_body(target) else {
-            return artifact_error(
-                404,
-                "NoSuchKey",
-                // One sentence carrying nothing from the request, so a caller cannot
-                // probe the catalogue for artifacts it was not handed the URL of.
-                "The requested application artifact does not exist.",
-            );
+        let Some(body) = store.artifact_body(&target) else {
+            return artifact_not_found();
         };
 
         let length = body.len();
@@ -270,6 +448,18 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             .insert("content-length", length.to_string());
         resp
     }
+}
+
+/// The 404 the document plane answers for an address nothing is published at.
+///
+/// One sentence carrying nothing from the request, so a caller holding one locator cannot
+/// probe the catalogue with it for artefacts it was not handed the URL of.
+fn artifact_not_found() -> RtResponse {
+    artifact_error(
+        404,
+        "NoSuchKey",
+        "The requested application artifact does not exist.",
+    )
 }
 
 /// One refusal from the artifact document plane: the status, the condition in
@@ -294,14 +484,38 @@ fn artifact_error(status: u16, code: &str, message: &str) -> RtResponse {
 
 /// The path component of a request URI, with any scheme, authority and query removed.
 fn request_path(uri: &str) -> &str {
-    // The query is dropped FIRST: a query VALUE may carry `://`, which a scheme scan over
-    // the whole URI would mistake for the authority.
-    let without_query = uri.split('?').next().unwrap_or(uri);
-    match without_query.split_once("://") {
-        Some((_scheme, authority_and_path)) => match authority_and_path.find('/') {
-            Some(path_start) => &authority_and_path[path_start..],
-            None => "/",
-        },
-        None => without_query,
-    }
+    request_target(uri).split('?').next().unwrap_or("/")
+}
+
+/// The request TARGET of a request URI: its path and its query, with any scheme and
+/// authority removed — the two halves of the address a locator's signature covers.
+fn request_target(uri: &str) -> &str {
+    // The scheme is looked for only BEFORE the query: a query VALUE may carry `://`, which
+    // a scan over the whole URI would mistake for the authority.
+    let query_at = uri.find('?').unwrap_or(uri.len());
+    let path_at = match uri[..query_at].find("://") {
+        Some(scheme_end) => uri[scheme_end + 3..query_at]
+            .find('/')
+            .map_or(query_at, |slash| scheme_end + 3 + slash),
+        None => 0,
+    };
+    &uri[path_at..]
+}
+
+/// The endpoint a request reached this emulator on: its `Host` header, or the authority an
+/// HTTP/2 request carries on the URI instead of one. The host a locator was signed over, so
+/// a locator is verified against the endpoint it is followed through.
+fn request_authority(req: &RtRequest) -> &str {
+    req.headers()
+        .get(::http::header::HOST.as_str())
+        .or_else(|| {
+            let uri = req.uri();
+            uri.split_once("://").map(|(_scheme, rest)| {
+                match rest.find(['/', '?', '#']) {
+                    Some(end) => &rest[..end],
+                    None => rest,
+                }
+            })
+        })
+        .unwrap_or_default()
 }

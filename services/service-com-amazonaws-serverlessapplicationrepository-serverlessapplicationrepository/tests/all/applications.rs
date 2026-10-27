@@ -42,11 +42,14 @@ pub(crate) struct Repo {
     pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
-/// One HTTP answer: the status, the raw body (so an empty 204 body can be asserted) and
-/// the body parsed as JSON.
+/// One HTTP answer: the status, the raw body (so an empty 204 body can be asserted), the
+/// length the answer STATES for that body, and the body parsed as JSON.
 pub(crate) struct Answer {
     pub(crate) status: u16,
     raw: Vec<u8>,
+    /// The `content-length` the answer states, absent when it states none — the framing of
+    /// an answer with no body is a rule of its own (`tests/all/empty_response_framing.rs`).
+    pub(crate) content_length: Option<String>,
     pub(crate) body: Value,
 }
 
@@ -178,13 +181,23 @@ impl Repo {
     async fn answer(&self, request: http::Request<bytes::Bytes>) -> Answer {
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let content_length = response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let raw = response.body().to_vec();
         let body = if raw.is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(&raw).unwrap_or(Value::Null)
         };
-        Answer { status, raw, body }
+        Answer {
+            status,
+            raw,
+            content_length,
+            body,
+        }
     }
 
     pub(crate) async fn create_application(&self, body: Value) -> Answer {

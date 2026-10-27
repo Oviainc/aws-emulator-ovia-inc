@@ -17,16 +17,20 @@
 //! (`smithy_query(query="shape",shape="TagMap,TagKeyList,TagKey,TagValue",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`;
 //! the four numbers are stated once, in [`crate::state`], and read from there here).
 //!
-//! The framework's boundary walk cannot refuse either bound: a map's KEY is captured as
-//! the following value's path segment rather than checked, and a map's VALUE — like a
-//! list's scalar ELEMENT — carries the collection member's schema with its per-element
-//! check suppressed
+//! The framework's boundary walk cannot refuse a tag's KEY: for a map the codec writes
+//! the key against the map member's own schema before the value, so the walk captures it
+//! as that value's path segment rather than checking it, and a list's scalar ELEMENT
+//! carries the collection member's schema with its per-element check suppressed
 //! (`vendor/smithy-schema-server/src/constraints.rs`,
-//! `ValidatingSerializer::write_leaf`). So the handler that accepts the member is what
-//! must refuse it, and every operation of this service that names a tag — `CreateDomain`
-//! and `TagResource` through [`violation`], `UntagResource` through
-//! [`removed_key_violation`] — refuses it here, so no two can enforce different halves of
-//! one bound.
+//! `ValidatingSerializer::write_leaf`). A map's VALUE it does refuse, through the element
+//! constraints the collection member's schema carries, reported at the entry's key
+//! (`check_leaf`). So the handler that accepts the member is the only place a rule on a
+//! KEY can be applied, and the value bound is stated beside it in the same one check —
+//! both because an entry a handler is handed rather than deserialized has passed no walk,
+//! and so that one place holds the whole of what a tag has to satisfy. Every operation of
+//! this service that names a tag — `CreateDomain` and `TagResource` through
+//! [`accepted_entries`], `UntagResource` through [`removed_key_violation`] — refuses it
+//! here, so no two can enforce different halves of one bound.
 //!
 //! Beside the two modelled lengths there is one rule the model cannot state: the
 //! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace belongs to the tags the service
@@ -52,6 +56,14 @@
 //! `ServiceQuotaExceededException`, which only that operation's error channel can
 //! construct, so this module decides the condition and the handler words its own
 //! sentence.
+//!
+//! The two halves are also stated in ONE ORDER, by [`accepted_entries`]: the per-entry
+//! rule is decided from the request ALONE, which is where a modelled constraint is
+//! decided — at the request boundary, before a handler runs at all — while the count is
+//! decided from the set the addressed resource would end up holding, which is state. So
+//! a handler runs [`accepted_entries`] before it reads any state, and compares the count
+//! only afterwards; a map that breaks both rules at once is then refused for its entry,
+//! with one status and one error code, whichever operation carries it.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -268,6 +280,10 @@ pub fn removed_key_violation<'k>(keys: impl IntoIterator<Item = &'k String>) -> 
 /// empty key is refused and an empty value is not), or one whose key lies in the reserved
 /// [`RESERVED_TAG_KEY_PREFIX`] namespace — or `None` when every entry is acceptable.
 ///
+/// This is the CONTENT of the per-entry rule. A handler reaches it through
+/// [`accepted_entries`], which is where the rule's place in a handler is stated: calling
+/// this directly is what let two operations order the rule differently.
+///
 /// The caller renders the text through its own `ValidationException` channel (HTTP 400)
 /// and writes nothing.
 pub fn violation<'t>(
@@ -287,6 +303,34 @@ pub fn violation<'t>(
         violation.path = format!("{TAG_MAP_MEMBER}.{}", path::entry(key));
         envelope(&[violation])
     })
+}
+
+/// The entries a request asks for, key-ordered and every one of them acceptable, or the
+/// refusal text for the first entry this service does not accept ([`violation`]).
+///
+/// This states the per-entry rule's PLACE as well as its content, which is why both
+/// operations that accept a `TagMap` enter the rule through here. The rule is decided
+/// from the request ALONE — it is where a modelled constraint is decided, at the request
+/// boundary, before a handler runs — so a handler calls this before it reads any state,
+/// ahead of the count ([`merged_within_cap`]) and ahead of resolving the resource the
+/// request addresses. A map that breaks the entry rule and a state-dependent rule at
+/// once is therefore refused for its entry, with the one status and the one error code
+/// the entry rule carries, whichever operation the map arrived on.
+///
+/// The entries are ordered by key before the walk, so the entry a map of SEVERAL
+/// unacceptable entries is refused for is the same one however the request's map was
+/// ordered on the wire — the operations cannot word one map's refusal differently.
+///
+/// The caller renders an `Err` through its own `ValidationException` channel (HTTP 400)
+/// and hands an `Ok` on as the request's entries to merge; nothing is written here.
+pub fn accepted_entries(
+    requested: impl IntoIterator<Item = (String, String)>,
+) -> Result<BTreeMap<String, String>, String> {
+    let requested: BTreeMap<String, String> = requested.into_iter().collect();
+    match violation(requested.iter()) {
+        Some(refusal) => Err(refusal),
+        None => Ok(requested),
+    }
 }
 
 /// The tag set a request would leave a resource holding, or — when that set would be

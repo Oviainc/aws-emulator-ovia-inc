@@ -4609,6 +4609,15 @@ pub const INVALID_STATE_MACHINE_DEFINITION: &str = "Invalid State Machine Defini
 /// failure is never reported as a bare parser string.
 pub const INVALID_STATE_MACHINE_EXECUTION_INPUT: &str = "Invalid State Machine Execution Input";
 
+/// What a refusal about a document the request carried quotes: where that document
+/// stopped parsing, in the words this service states it in.
+///
+/// The sentence is framed in [`json_diagnostic`], around the tree's ONE reading of a
+/// JSON parse fault ([`::service_common::json_parse_fault`]), and re-exported here
+/// so every operation reaches it where it reaches the rest of this service's
+/// messages — and so there is one name for it rather than two.
+pub use json_diagnostic::diagnostic as json_parse_diagnostic;
+
 /// What `StateMachineTypeNotSupported` says, whatever operation raises it and
 /// whatever state machine it was raised for.
 ///
@@ -6419,6 +6428,7 @@ fn round_up_to(value: i64, increment: i64) -> i64 {
 
 pub mod asl;
 pub mod integration;
+mod json_diagnostic;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

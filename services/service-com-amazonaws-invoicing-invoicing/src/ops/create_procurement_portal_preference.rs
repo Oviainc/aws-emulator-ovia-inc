@@ -201,22 +201,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
-        // The Marketplace PunchOut combination no modelled constraint can express —
-        // enabled for Coupa without the preference that portal requires — is refused as
-        // the modelled 400, by the one rule every write of a preference applies
-        // (`crate::state::marketplace_punch_out_preference_required`).
-        let marketplace_punch_out_enabled = input.marketplace_punch_out_enabled.unwrap_or(false);
-        if marketplace_punch_out_enabled
-            && input.procurement_portal_name == crate::state::PORTAL_COUPA
-            && input.marketplace_punch_out_preference.is_none()
-        {
-            return Err(CreateProcurementPortalPreferenceErrorModeled::ValidationException(
-                crate::state::marketplace_punch_out_preference_required(
-                    &input.procurement_portal_name,
-                ),
-            )
-            .into());
-        }
+        // `MarketplacePunchOutEnabled`'s default, and the combination no modelled
+        // constraint can express — enabled for a portal without the configuration that
+        // portal requires, refused as the modelled 400 — are the one rule every write of
+        // a preference applies, which this create and the configuration update both reach
+        // at `crate::state::resolve_marketplace_punch_out_enabled`. A create states the
+        // portal on its own input.
+        let marketplace_punch_out_enabled = crate::state::resolve_marketplace_punch_out_enabled(
+            &input.procurement_portal_name,
+            input.marketplace_punch_out_enabled,
+            input.marketplace_punch_out_preference.as_ref(),
+        )
+        .map_err(CreateProcurementPortalPreferenceErrorModeled::ValidationException)?;
 
         // A resource holds at most `crate::state::MAX_RESOURCE_TAGS` tags however the
         // tags got there — the quota `TagResource` refuses a write past — so a create

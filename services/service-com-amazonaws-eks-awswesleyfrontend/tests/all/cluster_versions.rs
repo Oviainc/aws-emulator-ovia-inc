@@ -821,3 +821,148 @@ async fn an_unfiltered_listing_offers_only_versions_still_in_support() {
         );
     }
 }
+
+/// The same rule on the calendar AS SHIPPED, walked the way a client discovers
+/// versions: every page of an unfiltered listing offers only versions still inside
+/// standard or extended support, each row agrees with its own dates, and the rows
+/// the support window hides are still reachable with `includeAll`.
+///
+/// The suites above install a calendar to put the clock in every support class at
+/// once; this one leaves the shipped rows in place, so the table a caller actually
+/// reads is held to the same rule and `includeAll` is shown to change the answer
+/// against it rather than being inert.
+#[tokio::test]
+async fn the_shipped_calendar_hides_out_of_support_versions_until_asked() {
+    let (router, _engine) = emulator();
+
+    // The page size differs per case so the support window is proven to hold for
+    // the listing as a WHOLE: a filter applied per page would let an out-of-support
+    // row through on a later page.
+    for page_size in [None, Some(1), Some(3), Some(100)] {
+        let mut walked: Vec<String> = Vec::new();
+        let mut defaults: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(size) = page_size {
+                parts.push(format!("maxResults={size}"));
+            }
+            if let Some(next) = &token {
+                parts.push(format!("nextToken={next}"));
+            }
+            let answer = describe_versions(&router, &parts.join("&")).await;
+            assert_eq!(
+                answer.status, 200,
+                "case page size {page_size:?}: expected HTTP 200, got {} ({:?})",
+                answer.status, answer.body
+            );
+            let clock = now_secs();
+            for row in rows(&answer) {
+                let case = row["clusterVersion"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("expected a clusterVersion string, got {row:?}"))
+                    .to_string();
+                let end_of_standard = epoch_secs(&row["endOfStandardSupportDate"]);
+                let end_of_extended = epoch_secs(&row["endOfExtendedSupportDate"]);
+                assert!(
+                    clock < end_of_extended,
+                    "case {case}: the shipped calendar must not offer a version past extended \
+                     support, got end of extended support {end_of_extended} at now {clock}"
+                );
+                let (version_status, status) =
+                    expected_status(clock, end_of_standard, end_of_extended);
+                assert_eq!(
+                    row["versionStatus"].as_str(),
+                    Some(version_status),
+                    "case {case}: expected versionStatus {version_status:?} from its own dates, \
+                     got {:?}",
+                    row["versionStatus"]
+                );
+                assert_eq!(
+                    row["status"].as_str(),
+                    Some(status),
+                    "case {case}: expected status {status:?} from its own dates, got {:?}",
+                    row["status"]
+                );
+                assert!(
+                    row["kubernetesPatchVersion"]
+                        .as_str()
+                        .is_some_and(|patch| patch.starts_with(&format!("{case}."))),
+                    "case {case}: expected a kubernetesPatchVersion of this minor, got {:?}",
+                    row["kubernetesPatchVersion"]
+                );
+                if row["defaultVersion"].as_bool() == Some(true) {
+                    defaults.push(case.clone());
+                }
+                walked.push(case);
+            }
+            token = answer
+                .body
+                .get("nextToken")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            if token.is_none() {
+                break;
+            }
+        }
+
+        let mut distinct = walked.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            walked.len(),
+            "case page size {page_size:?}: expected every version once, got {walked:?}"
+        );
+        // Version discovery is the first call of a provisioning flow, so the
+        // default listing has to keep offering a choice of versions as the clock
+        // advances, not decay into one row or none.
+        assert!(
+            walked.len() >= 2,
+            "case page size {page_size:?}: expected at least two versions still in support, got \
+             {walked:?}"
+        );
+        assert_eq!(
+            defaults,
+            vec![DEFAULT_KUBERNETES_VERSION.to_string()],
+            "case page size {page_size:?}: expected exactly the version CreateCluster defaults \
+             to, got {defaults:?}"
+        );
+        let keys: Vec<(u32, u32)> = walked.iter().map(|version| version_key(version)).collect();
+        assert!(
+            keys.windows(2).all(|pair| pair[0] > pair[1]),
+            "case page size {page_size:?}: expected the newest Kubernetes version first, got \
+             {walked:?}"
+        );
+    }
+
+    // `includeAll` is what reaches the rows the support window hides: it is a
+    // superset of the default listing, and every row it adds is one the clock has
+    // carried past its own end of extended support.
+    let unfiltered = reported_versions(&describe_versions(&router, "maxResults=100").await);
+    let widened = describe_versions(&router, "includeAll=true&maxResults=100").await;
+    let every_version = reported_versions(&widened);
+    assert!(
+        unfiltered
+            .iter()
+            .all(|version| every_version.contains(version)),
+        "case includeAll: expected a superset of the default listing {unfiltered:?}, got \
+         {every_version:?}"
+    );
+    let clock = now_secs();
+    for row in rows(&widened) {
+        let case = row["clusterVersion"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a clusterVersion string, got {row:?}"))
+            .to_string();
+        if unfiltered.contains(&case) {
+            continue;
+        }
+        let end_of_extended = epoch_secs(&row["endOfExtendedSupportDate"]);
+        assert!(
+            clock >= end_of_extended,
+            "case {case}: includeAll must add only versions past extended support, got end of \
+             extended support {end_of_extended} at now {clock}"
+        );
+    }
+}

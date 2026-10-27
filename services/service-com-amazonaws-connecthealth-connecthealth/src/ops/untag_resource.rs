@@ -72,7 +72,9 @@
 //! tag no caller may set OR remove — is refused as a 400 `ValidationException`
 //! (`crate::scaffolded::Scaffolded::validation`), through the same per-key check
 //! `CreateDomain` and `TagResource` apply to the keys THEY name
-//! ([`crate::service::tag_bounds::removed_key_violation`]).
+//! ([`crate::service::tag_bounds::removed_key_violation`]). It is decided from the
+//! request alone, so it is decided BEFORE the ARN above is resolved — the place those two
+//! decide the same rules.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -186,6 +188,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
 
+        // A key named for REMOVAL is subject to the same per-key rules as a key named
+        // for a write: the modelled `TagKey` length, and the namespace the service
+        // reserves for the tags it sets itself — a tag no caller may set or remove. Both
+        // are decided from the request ALONE, so they are decided HERE, before any state
+        // is read: that is where the boundary decides a modelled constraint, and it is
+        // where `CreateDomain` and `TagResource` decide the same rules, so a request
+        // whose keys this service does not accept earns the one refusal that rule
+        // carries whichever member carried the key. Nothing is written: the store has not
+        // been looked at yet.
+        if let Some(violation) =
+            crate::service::tag_bounds::removed_key_violation(input.tag_keys.iter())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(violation));
+        }
+
         let mut store = state.lock();
         // Every handler materialises the deletions the CLOCK already made due first, so
         // the ARN of a resource whose deletion has fallen due no longer resolves here.
@@ -206,16 +223,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
-
-        // A key named for REMOVAL is subject to the same per-key rules as a key named
-        // for a write: the modelled `TagKey` length, and the namespace the service
-        // reserves for the tags it sets itself — a tag no caller may set or remove.
-        // Refused before anything is dropped, so a refused call writes nothing.
-        if let Some(violation) =
-            crate::service::tag_bounds::removed_key_violation(input.tag_keys.iter())
-        {
-            return Err(crate::scaffolded::Scaffolded::validation(violation));
         }
 
         // Removal is a set difference on the set the resource holds TODAY: a key the

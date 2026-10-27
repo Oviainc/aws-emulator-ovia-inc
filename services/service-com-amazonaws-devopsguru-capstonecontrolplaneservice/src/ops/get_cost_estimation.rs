@@ -184,15 +184,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // paginated read of this service does not resolve here.
         let scope = "GetCostEstimation";
         let invalid_next_token = || -> GetCostEstimationError {
-            GetCostEstimationErrorModeled::ValidationException(ValidationException {
-                message: "NextToken does not name a page of this cost estimation".to_string(),
-                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                fields: Some(vec![ValidationExceptionField {
-                    name: "NextToken".to_string(),
-                    message: "must be a token returned by an earlier GetCostEstimation"
-                        .to_string(),
-                }]),
-            })
+            GetCostEstimationErrorModeled::ValidationException(
+                // This read binds no selecting member, so its cursor is scoped to the
+                // operation alone.
+                crate::state::FilterRejection::unscoped_stale_cursor(
+                    "GetCostEstimation",
+                    "this cost estimation",
+                )
+                .validation_exception(),
+            )
             .into()
         };
 

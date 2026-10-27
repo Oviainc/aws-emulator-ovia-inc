@@ -168,7 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_server = pool
             .resource_servers
             .get(&input.identifier)
-            .ok_or_else(|| resource_server_not_found(&input.identifier))?;
+            .ok_or_else(|| {
+                resource_server_not_found(&input.identifier, &input.user_pool_id)
+            })?;
 
         // Rendered from the STORED resource server: this read changes nothing.
         Ok(DescribeResourceServerOutput {
@@ -186,10 +188,14 @@ fn user_pool_not_found(user_pool_id: &str) -> DescribeResourceServerError {
 }
 
 /// This operation's `ResourceNotFoundException` for an identifier the pool does
-/// not hold.
-fn resource_server_not_found(identifier: &str) -> DescribeResourceServerError {
+/// not hold. Worded by the same template `CreateResourceServer` uses for an
+/// identifier the pool already holds: the identifier, what is wrong with it, and
+/// the pool it was looked for in.
+fn resource_server_not_found(identifier: &str, user_pool_id: &str) -> DescribeResourceServerError {
     DescribeResourceServerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Resource server not found: {identifier}")),
+        message: Some(format!(
+            "{identifier} does not exist in user pool {user_pool_id}."
+        )),
     })
     .into()
 }

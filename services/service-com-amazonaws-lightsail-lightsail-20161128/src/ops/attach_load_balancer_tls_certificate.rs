@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachLoadBalancerTlsCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachLoadBalancerTlsCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Makes the ONE SSL/TLS certificate the request names the certificate the load balancer
+//! that holds it terminates HTTPS with, in the Region the request is made in, and answers
+//! the operation-log entry the attachment appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachLoadBalancerTlsCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A load balancer terminates HTTPS with ONE certificate, so attaching a certificate
+//! replaces whichever of that load balancer's certificates was attached before — and the
+//! attached certificate is what gives the load balancer its HTTPS listener alongside the
+//! plain `HTTP` one it always has.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +173,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachLoadBalancerTlsCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachLoadBalancerTlsCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachLoadBalancerTlsCertificate"))
+        // A load balancer is a REGIONAL resource, so the certificate it holds is
+        // addressed in the Region the request is signed for — the same Region
+        // `CreateLoadBalancer` stored the record in.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `loadBalancerName` and `certificateName` are modelled `@required`
+        // members carrying the modelled `ResourceName` pattern, so the
+        // centralized walk refused anything outside them before this body ran.
+        // What is left is what the model cannot express: the load balancer has
+        // to be one this account holds in this Region, and the certificate has
+        // to be one THAT load balancer holds. Both are checked BEFORE the write,
+        // so a refused request attaches nothing.
+        let load_balancer_name = input.load_balancer_name;
+        let certificate_name = input.certificate_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // The load balancer first: it is the resource this operation acts
+            // through, and the one tag-based access control is evaluated against
+            // ("supports tag-based access control via resource tags applied to
+            // the resource identified by load balancer name"). It is resolved
+            // ONCE, mutably, and nothing is written until every refusal below
+            // has been cleared.
+            let balancer = store
+                .load_balancer_mut(&region, &load_balancer_name)
+                .ok_or_else(|| {
+                    not_found(
+                        crate::state::RESOURCE_TYPE_LOAD_BALANCER,
+                        &load_balancer_name,
+                    )
+                })?;
+            let location = balancer.location.clone();
+
+            // The attachment itself. A load balancer terminates HTTPS with ONE
+            // certificate — "Use the AttachLoadBalancerTlsCertificate action
+            // with the non-attached certificate, and it will replace the
+            // existing one and become the attached certificate" — so the store's
+            // one owner of that rule attaches this certificate and detaches
+            // whichever of the load balancer's certificates was attached before.
+            // Attaching the one already attached asks for the state the record
+            // is already in and leaves it there. From here on the load balancer
+            // reports this certificate's summary as attached and serves the
+            // HTTPS listener the modelled `protocol` and `publicPorts` are
+            // computed from.
+            //
+            // A certificate is addressed by its own name among the ones THIS
+            // load balancer holds, so a name none of them carries names nothing
+            // to attach — on a load balancer holding no certificate at all, and
+            // on one whose certificate a `DeleteLoadBalancerTlsCertificate` call
+            // already removed. That is the same owner's answer, which writes
+            // nothing for such a name, so a refused request leaves every
+            // certificate of this load balancer exactly as it was.
+            if !balancer.attach_certificate(&certificate_name) {
+                return Err(not_found(
+                    crate::state::RESOURCE_TYPE_LOAD_BALANCER_TLS_CERTIFICATE,
+                    &certificate_name,
+                ));
+            }
+
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once; this one attaches exactly one certificate, so
+            // it answers exactly one entry, logged against the certificate it
+            // attached and located where the load balancer that holds it is —
+            // the same entry shape `CreateLoadBalancerTlsCertificate` and
+            // `DeleteLoadBalancerTlsCertificate` write for that certificate. The
+            // certificate is the attached one as this call returns, so the work
+            // the entry describes is already done and the entry is terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_ATTACH_LOAD_BALANCER_TLS_CERTIFICATE,
+                crate::state::RESOURCE_TYPE_LOAD_BALANCER_TLS_CERTIFICATE,
+                &certificate_name,
+                &location,
+                None,
+            );
+            Ok(AttachLoadBalancerTlsCertificateOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The request names a resource this account does not hold: Lightsail's
+/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
+/// `code` `DoesNotExist` and a message naming the resource type and the
+/// requested name.
+fn not_found(resource_type: &str, name: &str) -> AttachLoadBalancerTlsCertificateError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> AttachLoadBalancerTlsCertificateError {
+    AttachLoadBalancerTlsCertificateErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail load balancer store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

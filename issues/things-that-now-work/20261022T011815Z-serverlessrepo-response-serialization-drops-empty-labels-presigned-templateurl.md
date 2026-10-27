@@ -74,3 +74,22 @@ Smithy grounding: CreateApplicationResponse.Labels / GetApplicationResponse.Labe
 4. At cloudformation-template-preparation#task#1, POST /applications with templateBody; the 201 body omits "labels".
 5. At application-lifecycle#task#6, DELETE /applications/{id}; the 204 response carries no Content-Length header.
 6. At application-version-lifecycle#task#2, PUT /applications/{id}/versions/{v}; the returned templateUrl is a bare S3 URL with no X-Amz-* presigning query parameters.
+
+## Resolution
+
+Causes 1-3 (`labels`): the application projection reports the member as its value, so a
+label-less application answers `"labels": []`.
+
+Cause 5 (`templateUrl`, `licenseUrl`, `readmeUrl`): every locator this service announces
+for a body it stores is now a presigned download address — the stored document's address
+plus the SigV4 query-string fields that authorise a GET of it until a stated expiry — and
+the artifact document plane honours only a locator it signed, refusing a rewritten or
+expired one.
+
+Cause 4 (`content-length: 0` on the empty 204): the service now states that framing on
+every answer it serializes with an empty body. CAVEAT: a client reached over HTTP/1.1 still
+does not see the header, because the HTTP writer the vendored transport uses removes
+`content-length` from a `204` (RFC 9110 §15.3.5 forbids a body there) — that writer is
+under the read-only vendored tree, so the wire-level half of this cause is a platform
+limitation rather than something this service can state its way out of. The serializer seam
+is pinned by `tests/all/empty_response_framing.rs`.

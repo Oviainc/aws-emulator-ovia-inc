@@ -19,8 +19,10 @@
 //!   exactly once;
 //! * a `MaxItems` that names no page, and a `Marker` this service never handed out, are
 //!   refused; a well-formed marker naming no stored tenant is an entity that does not
-//!   exist; and an `AssociationFilter` id this service cannot resolve is an invalid
-//!   argument.
+//!   exist; and a filter member carrying no value narrows nothing.
+//!
+//! What a filter member naming a resource this account holds none of answers is the rule
+//! [`crate::distribution_tenant_filter_matches_nothing`] is about.
 //!
 //! The rows differ along what the rules generalise over: which of the two multi-tenant
 //! distributions a tenant was created under, which connection group routes it (two groups a
@@ -52,7 +54,10 @@ use crate::response_headers_policy_lifecycle::{assert_absent, text};
 // ---------------------------------------------------------------------------
 
 /// `POST /2020-05-31/distribution-tenants` with the request document `body`.
-async fn list_tenants(router: &MultiServiceRouter, body: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite asserting another of this listing's rules sends its
+/// requests down this one wire path rather than growing a copy of it.
+pub(crate) async fn list_tenants(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -80,7 +85,7 @@ async fn get_tenant(router: &MultiServiceRouter, id: &str) -> Answer {
 ///
 /// `filter` is `Some` when the request carries an `AssociationFilter` element at all — a
 /// `Some((None, None))` sends the element with neither member inside it.
-fn list_body(
+pub(crate) fn list_body(
     filter: Option<(Option<&str>, Option<&str>)>,
     marker: Option<&str>,
     max_items: Option<i32>,
@@ -120,7 +125,7 @@ fn list_body(
 /// `DistributionTenantList`'s member carries `xmlName` `DistributionTenantSummary`
 /// (`smithy_query(query="shape",shape="DistributionTenantList")`), so each entry travels in
 /// an element of that name inside the `DistributionTenantList` wrapper.
-fn summaries(answer: &Answer) -> Vec<&Node> {
+pub(crate) fn summaries(answer: &Answer) -> Vec<&Node> {
     match answer.root().at("DistributionTenantList") {
         Some(wrapper) => wrapper.children_named("DistributionTenantSummary"),
         None => Vec::new(),
@@ -128,7 +133,7 @@ fn summaries(answer: &Answer) -> Vec<&Node> {
 }
 
 /// The ids one listing reported, in the order it reported them.
-fn summary_ids(answer: &Answer) -> Vec<String> {
+pub(crate) fn summary_ids(answer: &Answer) -> Vec<String> {
     summaries(answer)
         .iter()
         .map(|summary| {
@@ -748,82 +753,16 @@ async fn the_listing_pages_and_resumes_from_the_marker() {
 }
 
 // ---------------------------------------------------------------------------
-// Refusals
+// A filter member that names nothing
 // ---------------------------------------------------------------------------
 
-/// The sentence CloudFront answers an `AssociationFilter` it cannot use with, as the
-/// recorded contract of this service's association filters pins it — written out here rather
-/// than read back off the crate's own constant, so a change to that constant fails this
-/// case.
-const RECORDED_INVALID_FILTER_MESSAGE: &str = "The association filter id is invalid.";
-
-/// An `AssociationFilter` naming a resource this service holds none of is an invalid
-/// argument, whichever member carries it and whatever else the filter names.
+/// A filter member carrying NO value names no resource, so it narrows nothing: the listing
+/// is every stored tenant, whichever member is empty and however many of them are.
 #[tokio::test]
-async fn an_association_filter_this_service_cannot_resolve_is_an_invalid_argument() {
+async fn a_filter_member_carrying_no_value_narrows_nothing() {
     let router = emulator();
     let fixture = fixture(&router).await;
 
-    // Ids in the shape CloudFront writes each one in. Nothing in these cases creates the
-    // resources they name, so this emulator holds none that either id names.
-    let absent_distribution = "E2QWRUHEXAMPLE1";
-    let absent_group = "cg_ZZZZZZZZZZZZZ";
-    assert!(
-        !fixture
-            .distributions
-            .iter()
-            .any(|id| id == absent_distribution),
-        "the fixture must not hold the distribution {absent_distribution}"
-    );
-    assert!(
-        !fixture.named_groups.iter().any(|id| id == absent_group),
-        "the fixture must not hold the connection group {absent_group}"
-    );
-
-    for (case, filter) in [
-        (
-            "a distribution this service holds none of",
-            Filter::distribution(absent_distribution),
-        ),
-        (
-            "a connection group this service holds none of",
-            Filter::connection_group(absent_group),
-        ),
-        (
-            "both members unresolvable",
-            Filter::both(absent_distribution, absent_group),
-        ),
-        (
-            "a stored distribution beside an unresolvable group",
-            Filter::both(&fixture.distributions[0], absent_group),
-        ),
-        (
-            "an unresolvable distribution beside a stored group",
-            Filter::both(absent_distribution, &fixture.group_id(Group::First)),
-        ),
-    ] {
-        let answer = list_tenants(&router, &body_for(Some(&filter), None, None)).await;
-        assert_eq!(
-            answer.status, 400,
-            "case {case}: expected HTTP 400, got {} with {}",
-            answer.status, answer.raw
-        );
-        assert_eq!(
-            answer.error_code(),
-            "InvalidArgument",
-            "case {case}: expected InvalidArgument, got {}",
-            answer.raw
-        );
-        assert_eq!(
-            answer.root().find_text("Message"),
-            Some(RECORDED_INVALID_FILTER_MESSAGE),
-            "case {case}: expected the filter's own sentence, got {}",
-            answer.raw
-        );
-    }
-
-    // A member carrying NO value names no resource, so it is no filter at all rather than a
-    // resource this service cannot resolve: the listing is every stored tenant.
     let mut all: Vec<String> = fixture
         .created
         .iter()
@@ -852,6 +791,10 @@ async fn an_association_filter_this_service_cannot_resolve_is_an_invalid_argumen
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Refusals
+// ---------------------------------------------------------------------------
 
 /// A `MaxItems` that names no page is refused, a `Marker` this service never handed out is
 /// no resume point, and a well-formed marker naming no stored tenant is an entity that does
