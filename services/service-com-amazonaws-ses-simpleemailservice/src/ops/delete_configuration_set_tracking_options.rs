@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConfigurationSetTrackingOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteConfigurationSetTrackingOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteConfigurationSetTrackingOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a configuration set's custom open-and-click redirect domain, so the
+//! next `DescribeConfigurationSet` reports no `TrackingOptions` for the set and
+//! its emails capture open and click events through the standard Amazon
+//! SES-operated domains again. The association must be there to be removed: a
+//! set the account does not hold, and a set carrying no association, are each
+//! refused with the modelled error for the resource that is missing.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +103,18 @@ impl From<DeleteConfigurationSetTrackingOptionsErrorModeled> for DeleteConfigura
     }
 }
 
+/// The sentence Amazon SES refuses a tracking-options request with when the
+/// named configuration set carries no `TrackingOptions` association: fixed text
+/// around the configuration-set name the request supplied, which is the one
+/// value this refusal is about.
+///
+/// Public so `UpdateConfigurationSetTrackingOptions` — the other operation that
+/// requires an existing association — reports the absence in the same words;
+/// the two read one sentence between them.
+pub fn no_tracking_options_message(configuration_set_name: &str) -> String {
+    format!("There are no tracking options for configuration set <{configuration_set_name}>")
+}
+
 /// The `DeleteConfigurationSetTrackingOptions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -141,18 +151,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteConfigurationSetTrackingOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteConfigurationSetTrackingOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        let name = input.configuration_set_name;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and every error this
+            // operation models is a client error, so none of them fits.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteConfigurationSetTrackingOptions",
+            ));
+        };
+        let mut state = state.lock();
+
+        // The set is looked up first: this operation supplies no tracking options
+        // of its own, so the only thing it judges about the request is which of
+        // the two resources it names is missing — the set, and then the
+        // association carried on it.
+        let Some(configuration_set) = state.configuration_sets.get_mut(&name) else {
+            // "Indicates that the configuration set does not exist", in the
+            // wording every operation of this service uses for a set that is not
+            // there.
+            return Err(
+                DeleteConfigurationSetTrackingOptionsErrorModeled::ConfigurationSetDoesNotExistException(
+                    ConfigurationSetDoesNotExistException {
+                        configuration_set_name: Some(name.clone()),
+                        message: Some(format!("Configuration set <{name}> does not exist.")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "Indicates that the TrackingOptions object you specified does not
+        // exist": the association has to be there to be removed, so a set that
+        // carries none is refused rather than answered as the delete of nothing —
+        // which is also what a second delete against one set gets. Taking the
+        // domain is the delete itself: the sub-resource exists exactly while the
+        // set holds one, and nothing else on the set changes.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteConfigurationSetTrackingOptions"))
+        // On the query wire this shape is the error code
+        // `TrackingOptionsDoesNotExist`, which the shape's `awsQueryError` code
+        // in `smithy-model/` now carries (it had been the shape name, suffix and
+        // all, which is not the code SES answers with); the same code therefore
+        // reaches a client from `UpdateConfigurationSetTrackingOptions` too.
+        if configuration_set.custom_redirect_domain.take().is_none() {
+            return Err(
+                DeleteConfigurationSetTrackingOptionsErrorModeled::TrackingOptionsDoesNotExistException(
+                    TrackingOptionsDoesNotExistException {
+                        configuration_set_name: Some(name.clone()),
+                        message: Some(no_tracking_options_message(&name)),
+                    },
+                )
+                .into(),
+            );
+        }
+        Ok(DeleteConfigurationSetTrackingOptionsOutput {})
     }
 }

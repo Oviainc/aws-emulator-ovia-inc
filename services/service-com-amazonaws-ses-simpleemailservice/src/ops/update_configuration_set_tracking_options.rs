@@ -206,11 +206,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 UpdateConfigurationSetTrackingOptionsErrorModeled::TrackingOptionsDoesNotExistException(
                     TrackingOptionsDoesNotExistException {
                         configuration_set_name: Some(name.clone()),
-                        // The sentence the model documents for this error, which
-                        // carries no value of its own; the set it is about is the
-                        // member above.
+                        // One sentence for this error class, shared with
+                        // `DeleteConfigurationSetTrackingOptions`: the same
+                        // absence, reported in the same words, naming the set it
+                        // is about.
                         message: Some(
-                            "The TrackingOptions object you specified does not exist.".to_string(),
+                            crate::ops::delete_configuration_set_tracking_options::no_tracking_options_message(
+                                &name,
+                            ),
                         ),
                     },
                 )

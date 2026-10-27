@@ -38,8 +38,8 @@ use std::collections::BTreeSet;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     KEY_GROUP_ALREADY_EXISTS_MESSAGE, KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE, MAX_KEY_GROUPS,
-    MAX_KEY_GROUP_COMMENT, MAX_PUBLIC_KEYS_IN_KEY_GROUP, TOO_MANY_KEY_GROUPS_MESSAGE,
-    TOO_MANY_PUBLIC_KEYS_IN_KEY_GROUP_MESSAGE,
+    MAX_KEY_GROUP_COMMENT, MAX_PUBLIC_KEYS_IN_KEY_GROUP, NO_SUCH_KEY_GROUP_MESSAGE,
+    TOO_MANY_KEY_GROUPS_MESSAGE, TOO_MANY_PUBLIC_KEYS_IN_KEY_GROUP_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -91,20 +91,20 @@ pub(crate) async fn get_group(router: &MultiServiceRouter, id: &str) -> Answer {
 
 /// One `KeyGroupConfig`, as a client submits it.
 #[derive(Debug, Clone)]
-struct Group {
+pub(crate) struct Group {
     /// What this row is a case of, named in every assertion it drives.
-    case: String,
-    name: String,
+    pub(crate) case: String,
+    pub(crate) name: String,
     /// `Items`, the identifiers of the public keys in the group.
-    items: Vec<String>,
+    pub(crate) items: Vec<String>,
     /// `Comment`, or `None` to leave the optional member out entirely.
-    comment: Option<String>,
+    pub(crate) comment: Option<String>,
 }
 
 impl Group {
     /// The `KeyGroupConfig` XML a client sends for this configuration, in the model's
     /// member declaration order (`Name`, `Items`, `Comment`).
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<KeyGroupConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
         );
@@ -124,7 +124,7 @@ impl Group {
 
     /// Assert that `config` — a `KeyGroupConfig` element the emulator serialised — reports
     /// exactly this configuration.
-    fn assert_matches(&self, config: &Node, context: &str, raw: &str) {
+    pub(crate) fn assert_matches(&self, config: &Node, context: &str, raw: &str) {
         let actual = config.text_at("Name").map(str::to_string);
         assert_eq!(
             actual.as_deref(),
@@ -195,7 +195,7 @@ pub(crate) async fn mint_public_keys(
 /// ids were minted by `CreatePublicKey` or are opaque strings a client submitted, and the
 /// comment forms (absent, empty, plain ASCII, XML metacharacters, and the published
 /// 128-character bound).
-async fn table(router: &MultiServiceRouter) -> Vec<Group> {
+pub(crate) async fn table(router: &MultiServiceRouter) -> Vec<Group> {
     let minted = mint_public_keys(router, "key-group-table", MAX_PUBLIC_KEYS_IN_KEY_GROUP).await;
     let comments: [Option<String>; 5] = [
         None,
@@ -600,6 +600,14 @@ async fn an_id_no_key_group_holds_is_not_found() {
             answer.error_code(),
             "NoSuchResource",
             "case {case}: expected NoSuchResource for {id}, got {}",
+            answer.raw
+        );
+        // The sentence names the resource the operation ADDRESSES: a key group.
+        let message = answer.root().find_text("Message").unwrap_or_default();
+        assert_eq!(
+            message, NO_SUCH_KEY_GROUP_MESSAGE,
+            "case {case}: expected the key group not-found message for {id}, got {message:?} \
+             in {}",
             answer.raw
         );
     }

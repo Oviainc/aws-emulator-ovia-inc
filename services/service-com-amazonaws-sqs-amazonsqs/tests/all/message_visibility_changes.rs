@@ -14,7 +14,10 @@
 //! and a value outside the member's documented range is refused before anything is changed.
 //! The batch applies that same change once per entry and reports each entry under its own
 //! outcome, while the whole batch is refused on the id and size rules every batch operation
-//! of this service shares.
+//! of this service shares. Every entry of ONE batch is judged against the message states
+//! the REQUEST arrived to, so an entry's own change cannot decide another entry's outcome:
+//! several entries naming one message are all applied, and the LAST of them is the one
+//! whose span the message keeps.
 //!
 //! The spans are documented durations measured in seconds at the shortest, so no row sleeps
 //! for one: they move the in-flight deadline a stored message carries into the past through
@@ -25,7 +28,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::state::{
-    queue_name_from_url, ComAmazonawsSqsAmazonsqsState,
+    queue_name_from_url, ComAmazonawsSqsAmazonsqsState, MAX_BATCH_ENTRIES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -483,6 +486,231 @@ async fn a_batch_that_is_not_one_is_refused_whole() {
             "case {case:?}: a refused batch must change nothing, got {held} available"
         );
     }
+}
+
+/// The ids a reply reports under `member` (`Successful` or `Failed`), in the order they are
+/// reported. A member no entry fell under is absent from the reply, which is the empty list
+/// here.
+fn reported_ids(answer: &Value, member: &str) -> Vec<String> {
+    answer
+        .get(member)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| entry["Id"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Each `Failed` entry as `(Id, Code)`, in the order the reply reports them.
+fn reported_failures(answer: &Value) -> Vec<(String, String)> {
+    answer
+        .get("Failed")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| {
+            (
+                entry["Id"].as_str().unwrap_or_default().to_string(),
+                entry["Code"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// One row of the repeated-handle table: the spans the entries of ONE request ask for the
+/// SAME message, in the order the request carries them. The LAST of them is the span the
+/// message is then held for.
+struct RepeatedRow {
+    case: &'static str,
+    spans: &'static [i64],
+}
+
+/// Every entry of one batch is judged against the message states the REQUEST arrived to, so
+/// an entry's own change cannot decide a later entry's outcome: several entries naming one
+/// in-flight message are all applied, and the message keeps the LAST entry's span.
+///
+/// The rows span what that generalises over: the order of a release and an extension, how
+/// MANY entries name the one message (up to the ten a batch takes), and the spans
+/// themselves, from the documented minimum to as much of the maximum as one receive leaves
+/// to ask for.
+#[tokio::test]
+async fn every_entry_of_one_batch_is_judged_against_the_state_the_request_arrived_to() {
+    let rows: &[RepeatedRow] = &[
+        RepeatedRow {
+            case: "a release, then an extension",
+            spans: &[MIN_TIMEOUT, 300],
+        },
+        RepeatedRow {
+            case: "an extension, then a release",
+            spans: &[300, MIN_TIMEOUT],
+        },
+        RepeatedRow {
+            case: "two releases",
+            spans: &[MIN_TIMEOUT, MIN_TIMEOUT],
+        },
+        RepeatedRow {
+            case: "two extensions, the shorter one first",
+            spans: &[30, 600],
+        },
+        RepeatedRow {
+            case: "two extensions, the longer one first",
+            spans: &[600, 30],
+        },
+        RepeatedRow {
+            case: "three entries ending in a release",
+            spans: &[120, 600, MIN_TIMEOUT],
+        },
+        RepeatedRow {
+            case: "three entries ending in an extension",
+            spans: &[MIN_TIMEOUT, MIN_TIMEOUT, 1_800],
+        },
+        RepeatedRow {
+            // A release leaves the whole span one receive may hide the message for still to
+            // be asked for, less what the consumer has already held it.
+            case: "a release, then nearly the longest span one receive may hide a message for",
+            spans: &[MIN_TIMEOUT, MAX_TIMEOUT - 60],
+        },
+        RepeatedRow {
+            // "Maximum number of entries per request are 10", all naming the one message.
+            case: "the ten entries one batch takes, ending in an extension",
+            spans: &[0, 30, 0, 30, 0, 30, 0, 30, 0, 900],
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        assert!(
+            row.spans.len() <= MAX_BATCH_ENTRIES,
+            "case {:?}: a row may not ask for more entries than one batch takes",
+            row.case
+        );
+        let (router, engine) = emulator_over_engine();
+        let url = create_ok(
+            &router,
+            &format!("visibility-batch-repeated-{index}"),
+            &json!({"VisibilityTimeout": QUEUE_TIMEOUT}),
+        )
+        .await;
+        let handle = in_flight_handle(&router, &url, row.case).await;
+
+        let ids: Vec<String> = (0..row.spans.len())
+            .map(|entry| format!("entry-{entry}"))
+            .collect();
+        let entries: Vec<Value> = ids
+            .iter()
+            .zip(row.spans)
+            .map(|(id, span)| {
+                json!({"Id": id, "ReceiptHandle": handle, "VisibilityTimeout": span})
+            })
+            .collect();
+        let answered = ok(
+            &router,
+            "ChangeMessageVisibilityBatch",
+            json!({"QueueUrl": url, "Entries": entries}),
+        )
+        .await;
+
+        assert_eq!(
+            reported_ids(&answered, "Successful"),
+            ids,
+            "case {:?}: every entry names a message that was in flight when the request \
+             arrived, so every one must be applied, got {answered}",
+            row.case
+        );
+        assert_eq!(
+            reported_failures(&answered),
+            Vec::new(),
+            "case {:?}: no entry of this batch can be refused, got {answered}",
+            row.case
+        );
+
+        // The span the message is left under is the LAST entry's: zero hands it back at
+        // once, and anything else holds it for that long from the call.
+        let kept = row.spans.last().copied().unwrap_or(MIN_TIMEOUT);
+        let expected = usize::from(kept == MIN_TIMEOUT);
+        let at_once = available_now(&router, &url).await;
+        assert_eq!(
+            at_once, expected,
+            "case {:?}: the message keeps the last entry's {kept} seconds, so {expected} \
+             message(s) are available straight after the batch, got {at_once}",
+            row.case
+        );
+        if kept == MIN_TIMEOUT {
+            continue;
+        }
+        let kept_seconds = u64::try_from(kept).unwrap_or_default();
+        age_visibility(&engine, &url, Duration::from_secs(kept_seconds / 2));
+        let halfway = available_now(&router, &url).await;
+        assert_eq!(
+            halfway, 0,
+            "case {:?}: halfway through the last entry's {kept} seconds the message is still \
+             held, got {halfway} available",
+            row.case
+        );
+        age_visibility(&engine, &url, Duration::from_secs(kept_seconds));
+        let lapsed = available_now(&router, &url).await;
+        assert_eq!(
+            lapsed, 1,
+            "case {:?}: the message comes back once the last entry's {kept} seconds have \
+             passed, got {lapsed} available",
+            row.case
+        );
+    }
+}
+
+/// The same judgment the other way round: a message that was NOT in flight when the request
+/// arrived has no timeout for any entry to change, so every entry naming it is refused —
+/// including one asking for zero — and the message is left where it was.
+#[tokio::test]
+async fn no_entry_can_change_a_message_that_was_not_in_flight_when_the_request_arrived() {
+    let (router, engine) = emulator_over_engine();
+    let url = create_ok(
+        &router,
+        "visibility-batch-lapsed-twice",
+        &json!({"VisibilityTimeout": QUEUE_TIMEOUT}),
+    )
+    .await;
+    let handle = in_flight_handle(&router, &url, "a lapsed handle named twice").await;
+    age_visibility(
+        &engine,
+        &url,
+        Duration::from_secs(QUEUE_TIMEOUT.parse().unwrap_or(600)),
+    );
+
+    let answered = ok(
+        &router,
+        "ChangeMessageVisibilityBatch",
+        json!({
+            "QueueUrl": url,
+            "Entries": [
+                {"Id": "extend", "ReceiptHandle": handle, "VisibilityTimeout": 30},
+                {"Id": "release", "ReceiptHandle": handle, "VisibilityTimeout": MIN_TIMEOUT},
+            ],
+        }),
+    )
+    .await;
+
+    let expected = vec![
+        ("extend".to_string(), "MessageNotInflight".to_string()),
+        ("release".to_string(), "MessageNotInflight".to_string()),
+    ];
+    assert_eq!(
+        reported_failures(&answered),
+        expected,
+        "case 'a lapsed handle named twice': expected {expected:?}, got {answered}"
+    );
+    assert_eq!(
+        reported_ids(&answered, "Successful"),
+        Vec::<String>::new(),
+        "case 'a lapsed handle named twice': no entry can be applied, got {answered}"
+    );
+    let available = available_now(&router, &url).await;
+    assert_eq!(
+        available, 1,
+        "case 'a lapsed handle named twice': a refused entry changes nothing, so the message \
+         is still the visible one it was, got {available} available"
+    );
 }
 
 /// The instant a change is counted from is the CALL's, not the receive's: a message changed

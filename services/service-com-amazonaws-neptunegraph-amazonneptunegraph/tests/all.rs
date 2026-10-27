@@ -23,6 +23,8 @@ mod export_task_cancellation;
 mod export_task_lifecycle;
 #[path = "all/export_task_listing.rs"]
 mod export_task_listing;
+#[path = "all/final_snapshot_rule.rs"]
+mod final_snapshot_rule;
 #[path = "all/graph_deletion.rs"]
 mod graph_deletion;
 #[path = "all/graph_lifecycle.rs"]
