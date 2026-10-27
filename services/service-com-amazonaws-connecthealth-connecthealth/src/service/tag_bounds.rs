@@ -1,38 +1,44 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a `TagMap` has to satisfy — the modelled lengths of ONE entry's key and value,
-//! the reserved key namespace the service keeps for itself, and how many entries one
-//! resource may end up holding — enforced where the request boundary cannot reach them.
+//! What a tag a request NAMES has to satisfy — the modelled lengths of one entry's key
+//! and value, the reserved key namespace the service keeps for itself, and how many
+//! entries one resource may end up holding — enforced where the request boundary cannot
+//! reach them.
 //!
-//! Both halves live here: [`violation`] is the per-ENTRY rule and [`merged_within_cap`]
-//! the per-RESOURCE count, each stated once so no two operations that accept a `TagMap`
-//! can enforce different halves — or different readings — of one bound.
+//! All three live here: [`violation`] is the per-ENTRY rule for an operation that writes
+//! a `TagMap`, [`removed_key_violation`] the per-KEY rule for the one that names keys to
+//! REMOVE, and [`merged_within_cap`] the per-RESOURCE count — each stated once, so no two
+//! operations that name a tag can enforce different halves, or different readings, of one
+//! rule.
 //!
 //! `TagMap`'s key targets `TagKey` (`@length` min 1, max 128) and its value targets
-//! `TagValue` (`@length` min 0, max 256)
-//! (`smithy_query(query="shape",shape="TagMap,TagKey,TagValue",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`;
+//! `TagValue` (`@length` min 0, max 256); `TagKeyList`, the list of keys to remove, is a
+//! list of that same `TagKey`
+//! (`smithy_query(query="shape",shape="TagMap,TagKeyList,TagKey,TagValue",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`;
 //! the four numbers are stated once, in [`crate::state`], and read from there here).
 //!
 //! The framework's boundary walk cannot refuse either bound: a map's KEY is captured as
-//! the following value's path segment rather than checked, and a map's VALUE carries the
-//! collection member's schema with its per-element check suppressed
+//! the following value's path segment rather than checked, and a map's VALUE — like a
+//! list's scalar ELEMENT — carries the collection member's schema with its per-element
+//! check suppressed
 //! (`vendor/smithy-schema-server/src/constraints.rs`,
-//! `ValidatingSerializer::write_leaf`). So the handler that accepts the map is what must
-//! refuse the entry, and every operation of this service that accepts a `TagMap` —
-//! `CreateDomain` and `TagResource` — refuses it through [`violation`] here, stated once
-//! so the two cannot enforce different halves of one bound.
+//! `ValidatingSerializer::write_leaf`). So the handler that accepts the member is what
+//! must refuse it, and every operation of this service that names a tag — `CreateDomain`
+//! and `TagResource` through [`violation`], `UntagResource` through
+//! [`removed_key_violation`] — refuses it here, so no two can enforce different halves of
+//! one bound.
 //!
 //! Beside the two modelled lengths there is one rule the model cannot state: the
 //! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace belongs to the tags the service
-//! itself sets, so a key a caller spells with that prefix (whatever its case) is refused
-//! rather than stored. `TagKey` carries no `@pattern`, so this is a service-side rule and
-//! the handler is likewise the only place that can apply it — and it is applied here, in
-//! the same one check, so the operations that accept a `TagMap` cannot disagree about it
-//! either.
+//! itself sets, so a key a caller spells with that prefix (whatever its case) is one no
+//! caller may set OR remove, and a request naming one is refused rather than served.
+//! `TagKey` carries no `@pattern`, so this is a service-side rule and the handler is
+//! likewise the only place that can apply it — and it is applied in one place here, so
+//! the operations that name a tag key cannot disagree about it either.
 //!
 //! NOTHING about constraint checking or its wording is reimplemented: the two bounds are
 //! re-declared in the framework's own form (a [`TraitMap`] carrying a [`LengthTrait`])
-//! hung on a member schema named after the member the map is bound to, the check is
+//! hung on a member schema named after the member the tag is bound to, the check is
 //! [`validate`] — the same walk the request boundary runs, so the length is counted in
 //! characters and an over-long value is elided exactly as it would be there — and the
 //! text is [`envelope`]'s. A refusal of a LENGTH made here therefore reads exactly like
@@ -68,6 +74,11 @@ const NAMESPACE: &str = "com.amazonaws.connecthealth";
 /// its entries is reported at.
 const TAG_MAP_MEMBER: &str = "tags";
 
+/// The member the one operation that NAMES tag keys rather than tag entries binds its
+/// `TagKeyList` to — `UntagResourceInput` spells it `tagKeys` — which is the path a
+/// violation of one of its elements is reported at.
+const TAG_KEY_LIST_MEMBER: &str = "tagKeys";
+
 /// `TagKey`'s modelled `@length`, in the framework's own form.
 static TAG_KEY_TRAITS: LazyLock<TraitMap> = LazyLock::new(|| {
     let mut traits = TraitMap::new();
@@ -100,6 +111,21 @@ static M_TAG_KEY: Schema = Schema::new_member(
     ShapeType::String,
     TAG_MAP_MEMBER,
     0,
+)
+.with_traits(&TAG_KEY_TRAITS);
+
+/// The schema a tag key named for REMOVAL is walked against: the same `TagKey` bound,
+/// reported at the member that carried it (`tagKeys`) rather than at `tags`, since a
+/// refusal has to name the member the caller spelled.
+static M_REMOVED_TAG_KEY: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.connecthealth#CheckedTagEntry$tagKeys",
+        NAMESPACE,
+        "tagKeys",
+    ),
+    ShapeType::String,
+    TAG_KEY_LIST_MEMBER,
+    2,
 )
 .with_traits(&TAG_KEY_TRAITS);
 
@@ -164,6 +190,79 @@ fn reserved(key: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
 }
 
+/// The refusal text for a key in the namespace the service reserves for the tags it
+/// sets itself, or `None` when `key` is outside that namespace.
+///
+/// The namespace is the service's own rule rather than a modelled constraint, so its
+/// sentence is the service's own too: it names the key the caller asked for, the member
+/// that carried it, and the prefix no caller may use. ONE sentence for every member a
+/// key can be spelled at, so naming a reserved key to SET it and naming one to REMOVE it
+/// are refused the same way.
+fn reserved_violation(member: &str, key: &str) -> Option<String> {
+    reserved(key).then(|| {
+        format!(
+            "Tag keys cannot start with '{RESERVED_TAG_KEY_PREFIX}': the tag key '{key}' \
+             at '{member}' uses the prefix reserved for tags this service sets"
+        )
+    })
+}
+
+/// The refusal text for a tag KEY this service does not accept — one outside the
+/// modelled `TagKey` length (BOTH ends, so an empty key is refused) or one in the
+/// reserved [`RESERVED_TAG_KEY_PREFIX`] namespace — or `None` when the key is
+/// acceptable.
+///
+/// The ONE place the two per-key rules and their ORDER are stated, so every member a key
+/// can be spelled at is held to the same rule in the same sequence: the length first,
+/// because a key outside its bound has no further rule to answer to.
+///
+/// `member_schema` carries `TagKey`'s bound under the name of the member that carried the
+/// key and `member` is that same name; `at` is the path a LENGTH refusal is reported at
+/// when it is not that member's own name — a list element names its 1-based position,
+/// where a map's key names the member it is bound to.
+fn key_violation(
+    member_schema: &'static Schema,
+    member: &str,
+    key: &str,
+    at: Option<String>,
+) -> Option<String> {
+    if let Some(mut violation) = checked(member_schema, key) {
+        if let Some(path) = at {
+            violation.path = path;
+        }
+        return envelope(&[violation]);
+    }
+    reserved_violation(member, key)
+}
+
+/// The refusal text for the first of `keys` this service does not accept, or `None` when
+/// every key is acceptable — the check the one operation that names tag keys for REMOVAL
+/// applies to its `tagKeys` list.
+///
+/// The per-key rules are exactly the ones [`violation`] applies to the keys of a
+/// `TagMap`, because both go through [`key_violation`]: a key outside the modelled
+/// `TagKey` length, and a key in the reserved namespace, which names a tag no caller may
+/// set OR remove. A length violation is reported at the element's own 1-based position in
+/// the list — the spelling the boundary walk itself gives a list element
+/// (`constraints::path::element`) — because a request may name up to fifty keys and the
+/// caller has to know which one was refused.
+///
+/// The caller renders the text through its own `ValidationException` channel (HTTP 400)
+/// and writes nothing.
+pub fn removed_key_violation<'k>(keys: impl IntoIterator<Item = &'k String>) -> Option<String> {
+    keys.into_iter().enumerate().find_map(|(index, key)| {
+        key_violation(
+            &M_REMOVED_TAG_KEY,
+            TAG_KEY_LIST_MEMBER,
+            key,
+            Some(format!(
+                "{TAG_KEY_LIST_MEMBER}.{}",
+                path::element(index + 1)
+            )),
+        )
+    })
+}
+
 /// The refusal text for the first entry of `tags` this service does not accept — one
 /// outside the modelled `TagKey` / `TagValue` lengths (BOTH ends of both bounds, so an
 /// empty key is refused and an empty value is not), or one whose key lies in the reserved
@@ -175,20 +274,11 @@ pub fn violation<'t>(
     tags: impl IntoIterator<Item = (&'t String, &'t String)>,
 ) -> Option<String> {
     tags.into_iter().find_map(|(key, value)| {
-        // The key first: an entry whose key is outside its bound has no position to
-        // report its value at.
-        if let Some(violation) = checked(&M_TAG_KEY, key) {
-            return envelope(&[violation]);
-        }
-        // The reserved namespace is the service's own rule rather than a modelled
-        // constraint, so its sentence is the service's own too: it names the key the
-        // caller asked for and the prefix no caller may use. Only the KEY is checked —
-        // a VALUE may say anything the length allows.
-        if reserved(key) {
-            return Some(format!(
-                "Tag keys cannot start with '{RESERVED_TAG_KEY_PREFIX}': the tag key \
-                 '{key}' at 'tags' uses the prefix reserved for tags this service sets"
-            ));
+        // The key first, by the rule every key of this service answers to: an entry
+        // whose key is refused has no position to report its value at. Only the KEY is
+        // subject to that rule — a VALUE may say anything its own length allows.
+        if let Some(reported) = key_violation(&M_TAG_KEY, TAG_MAP_MEMBER, key, None) {
+            return Some(reported);
         }
         let mut violation = checked(&M_TAG_VALUE, value)?;
         // A map value's path is `<member>.<key>.member` — the spelling the walk itself
@@ -332,6 +422,73 @@ mod tests {
                 text.contains(&key) && text.contains(RESERVED_TAG_KEY_PREFIX),
                 "case {key:?}: the refusal must name the key and the reserved prefix, \
                  got {text:?}"
+            );
+        }
+    }
+
+    /// A key named for REMOVAL answers to the same two rules as a key named for a write,
+    /// and a length refusal names the element's own 1-based position in the list — so a
+    /// caller naming many keys learns which one was refused.
+    #[test]
+    fn a_removed_key_is_held_to_the_same_rules_as_a_written_one() {
+        let acceptable: Vec<String> = vec![
+            "env".to_string(),
+            "k".to_string(),
+            "k".repeat(MAX_TAG_KEY_LEN),
+            "é".repeat(MAX_TAG_KEY_LEN),
+            "cost center".to_string(),
+            // The namespace is reserved at the START of a key only.
+            format!("team{RESERVED_TAG_KEY_PREFIX}owner"),
+            // A key the resource does not carry is still a key the rules accept.
+            "never-set".to_string(),
+        ];
+        let reported = removed_key_violation(acceptable.iter());
+        assert!(
+            reported.is_none(),
+            "every acceptable key must be accepted for removal, got {reported:?}"
+        );
+
+        // A length refusal reads like a boundary refusal of the element that carried it.
+        let over_long = "k".repeat(MAX_TAG_KEY_LEN + 1);
+        let keys = ["env".to_string(), "team".to_string(), over_long.clone()];
+        let reported = removed_key_violation(keys.iter());
+        let expected = format!(
+            "1 validation error detected: Value '{over_long}' at 'tagKeys.3.member' failed \
+             to satisfy constraint: Member must have length less than or equal to {}",
+            MAX_TAG_KEY_LEN
+        );
+        assert_eq!(
+            reported.as_deref(),
+            Some(expected.as_str()),
+            "an over-long key must be refused at its own position, got {reported:?}"
+        );
+
+        // And the reserved namespace, at the member that carried the key.
+        for spelling in ["aws:", "AWS:", "Aws:", "aWs:"] {
+            let key = format!("{spelling}cloudformation");
+            let keys = ["env".to_string(), key.clone()];
+            let reported = removed_key_violation(keys.iter());
+            let text = reported.unwrap_or_else(|| {
+                panic!("case {key:?}: a reserved key must not be removable, got nothing")
+            });
+            assert!(
+                text.contains(&key)
+                    && text.contains(RESERVED_TAG_KEY_PREFIX)
+                    && text.contains(TAG_KEY_LIST_MEMBER),
+                "case {key:?}: the refusal must name the key, the reserved prefix and the \
+                 member that carried it, got {text:?}"
+            );
+        }
+
+        // An empty key is below the modelled minimum, at either end of the list.
+        for (case, keys) in [
+            ("alone", vec![String::new()]),
+            ("after an acceptable key", vec!["env".to_string(), String::new()]),
+        ] {
+            let reported = removed_key_violation(keys.iter());
+            assert!(
+                reported.is_some_and(|text| text.starts_with("1 validation error detected: ")),
+                "case {case:?}: an empty key must be refused"
             );
         }
     }
