@@ -397,10 +397,11 @@ pub mod clusters;
 
 pub use clusters::{
     cluster_alert_output, cluster_alert_state, cluster_not_idle_message, cluster_state,
-    described_cluster_network_settings, ClusterAlertRecord, ClusterChanges, ClusterDeleteRefusal,
-    ClusterRecord, ClusterRefusal, ClusterUpdateRefusal, NewCluster, CLUSTER_ALERT_FILTERS,
-    CLUSTER_ALERT_FILTER_ALL, MAX_CLUSTERS, MAX_CLUSTER_ALERTS, MAX_CLUSTER_INTERFACE_MAPPINGS,
-    MAX_CLUSTER_TOKENS,
+    described_cluster_network_settings, mapped_network_member,
+    too_many_cluster_interface_mappings_message, ClusterAlertRecord, ClusterChanges,
+    ClusterDeleteRefusal, ClusterRecord, ClusterRefusal, ClusterUpdateRefusal, NewCluster,
+    CLUSTER_ALERT_FILTERS, CLUSTER_ALERT_FILTER_ALL, MAX_CLUSTERS, MAX_CLUSTER_ALERTS,
+    MAX_CLUSTER_INTERFACE_MAPPINGS, MAX_CLUSTER_TOKENS,
 };
 
 pub(crate) use clusters::cluster_description_output;
@@ -2666,6 +2667,25 @@ impl ComAmazonawsMedialiveMedialiveState {
                 network.name.as_deref() == Some(name) && !network.is_delete_accepted()
             })
             .map(|network| network.id.as_str())
+    }
+
+    /// The network `id` names while it is still LIVE: one no accepted delete has
+    /// taken out of the account.
+    ///
+    /// The lookup a request REFERENCING a network resolves through — an
+    /// `InterfaceMapping`'s `NetworkId`, "the ID of the network that you want to
+    /// connect to the specified logicalInterfaceName" — because a network whose
+    /// delete this service has accepted is on its way out of the account and is
+    /// not one a new resource may take a dependency on, even though its record
+    /// stays readable in that state.
+    ///
+    /// NOT the lookup a mutation OF the network goes through: those resolve the
+    /// id across the whole [`Self::networks`] store and answer a tombstone with
+    /// the already-deleted refusal of their own.
+    pub fn live_network(&self, id: &str) -> Option<&NetworkRecord> {
+        self.networks
+            .get(id)
+            .filter(|network| !network.is_delete_accepted())
     }
 
     /// Apply an `UpdateNetwork` request's changes to the network `id` names, or

@@ -161,7 +161,7 @@ fn parse_template(
 ///
 /// `schema_json` is the text the store holds (already accepted by
 /// [`parse_schema`]); `Err` carries [`Refusal::SchemaValidation`] with ONE reason
-/// per validation error the validator raised.
+/// per diagnostic the validator raised ([`validation_reasons`]).
 pub fn validate_policy_template(schema_json: &str, statement: &str) -> Result<(), Refusal> {
     let parsed = parse_schema(schema_json).map_err(|e| {
         // The store's own schema was accepted by `PutSchema`, so this is
@@ -183,28 +183,84 @@ pub fn validate_policy_template(schema_json: &str, statement: &str) -> Result<()
 
     let result = cedar_policy::Validator::new(parsed.schema)
         .validate(&set, cedar_policy::ValidationMode::Strict);
-    if result.validation_passed() {
-        return Ok(());
-    }
-    Err(Refusal::SchemaValidation(validation_reasons(&result)))
+    schema_validation(&result)
 }
 
-/// One entry per reason the Cedar validator raised, in the order it raised them
-/// and capped at [`MAX_REPORTED_EVALUATION_ERRORS`] — the output bound on a
-/// refusal, which reports one `fieldList` entry per reason.
+/// Which of the diagnostics the Cedar validator can raise as a WARNING are
+/// validation reasons this service refuses a policy for.
+///
+/// `ValidationException`'s own documentation enumerates the reasons a policy is
+/// refused for (`smithy_query(query="doc", shape="ValidationException")`), and
+/// two of them — `InvalidActionApplication` ("the policy includes an action
+/// that, according to the schema, doesn't support the specified principal and
+/// resource") and `ImpossiblePolicy` ("Cedar has determined that a policy
+/// condition always evaluates to false") — are diagnostics the `cedar-policy`
+/// crate classifies as warnings rather than as errors. They are reasons here
+/// because the service enumerates them as reasons; every other warning kind the
+/// crate can raise is a style observation that enumeration does not name (a
+/// confusable identifier, an action named in both the scope and a condition), so
+/// it is neither reported nor a refusal.
+///
+/// A policy whose SCOPE admits no request at all carries both: Cedar reports the
+/// inapplicable action AND, as a consequence of it, that the policy can never be
+/// satisfied. The consequence states nothing the first reason does not, so the
+/// impossible-policy reason is reported only when the scope is not itself what
+/// was refused — which is also the case the enumeration describes, a policy
+/// CONDITION that is always false.
+fn reported_warnings(result: &cedar_policy::ValidationResult) -> Vec<String> {
+    let inapplicable_action = result.validation_warnings().any(|warning| {
+        matches!(
+            warning,
+            cedar_policy::ValidationWarning::InvalidActionApplication(_)
+        )
+    });
+    result
+        .validation_warnings()
+        .filter(|warning| match warning {
+            cedar_policy::ValidationWarning::InvalidActionApplication(_) => true,
+            cedar_policy::ValidationWarning::ImpossiblePolicy(_) => !inapplicable_action,
+            _ => false,
+        })
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// One entry per reason the Cedar validator raised about the policy, in the
+/// order it raised them — every validation ERROR first, then every warning
+/// [`reported_warnings`] keeps — and capped at
+/// [`MAX_REPORTED_EVALUATION_ERRORS`], the output bound on a refusal that
+/// reports one `fieldList` entry per reason.
+///
+/// EMPTY when the validator raised nothing to report, which is what
+/// [`schema_validation`] reads as the policy validating.
 fn validation_reasons(result: &cedar_policy::ValidationResult) -> Vec<String> {
     let mut reasons: Vec<String> = result
         .validation_errors()
-        .take(MAX_REPORTED_EVALUATION_ERRORS)
         .map(ToString::to_string)
+        .chain(reported_warnings(result))
+        .take(MAX_REPORTED_EVALUATION_ERRORS)
         .collect();
-    if reasons.is_empty() {
-        // Defensive: `validation_passed()` is false only when there is at least
-        // one error, but a caller must still get a reason rather than an empty
-        // list.
+    if reasons.is_empty() && !result.validation_passed() {
+        // Defensive: the validator refused the policy, so a caller must still
+        // get a reason rather than an empty list.
         reasons.push("it does not validate against the schema in this policy store".to_string());
     }
     reasons
+}
+
+/// What one run of the Cedar validator means for the request that submitted the
+/// policy: `Ok` when it raised no reason at all, and otherwise the refusal
+/// carrying ONE reason per diagnostic it raised.
+///
+/// The ONE place that decides this, so every operation validating against a
+/// store's schema — a static policy, a policy template, a template-linked policy
+/// — refuses on the same diagnostics and reports all of them.
+fn schema_validation(result: &cedar_policy::ValidationResult) -> Result<(), Refusal> {
+    let reasons = validation_reasons(result);
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(Refusal::SchemaValidation(reasons))
 }
 
 /// How many authorization requests one batch call may carry, from
@@ -359,9 +415,9 @@ pub fn parse_schema(text: &str) -> Result<ParsedSchema, String> {
 ///
 /// `schema_json` is the text the store holds (already accepted by
 /// [`parse_schema`]); an `Err` carrying [`Refusal::SchemaValidation`] has ONE
-/// reason per validation error the validator raised, [`Refusal::InvalidInput`]
-/// names the statement, and [`Refusal::ServiceFault`] says the store's own
-/// schema is what could not be read.
+/// reason per diagnostic the validator raised ([`validation_reasons`]),
+/// [`Refusal::InvalidInput`] names the statement, and [`Refusal::ServiceFault`]
+/// says the store's own schema is what could not be read.
 pub fn validate_static_policy(schema_json: &str, statement: &str) -> Result<(), Refusal> {
     // The statement is bounded BEFORE the schema is parsed and before Cedar sees
     // the statement, so the cheap check dominates both parses.
@@ -388,10 +444,7 @@ pub fn validate_static_policy(schema_json: &str, statement: &str) -> Result<(), 
 
     let result = cedar_policy::Validator::new(parsed.schema)
         .validate(&set, cedar_policy::ValidationMode::Strict);
-    if result.validation_passed() {
-        return Ok(());
-    }
-    Err(Refusal::SchemaValidation(validation_reasons(&result)))
+    schema_validation(&result)
 }
 
 /// The Cedar policy id a template carries while it is linked, and the id its
@@ -491,9 +544,7 @@ pub fn link_template(
         })?;
         let result = cedar_policy::Validator::new(parsed.schema)
             .validate(&set, cedar_policy::ValidationMode::Strict);
-        if !result.validation_passed() {
-            return Err(Refusal::SchemaValidation(validation_reasons(&result)));
-        }
+        schema_validation(&result)?;
     }
 
     Ok(scope)

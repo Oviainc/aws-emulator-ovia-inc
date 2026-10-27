@@ -1683,6 +1683,28 @@ pub const PARTICIPANT_STATE_DISCONNECTED: &str = "DISCONNECTED";
 /// no S3 data plane — so a state out of that five would name work nothing ran.
 pub const NOT_RECORDED_PARTICIPANT_RECORDING_STATE: &str = "DISABLED";
 
+/// The `ParticipantRecordingState` values a recording that has ENDED carries.
+///
+/// `ParticipantRecordingState` carries six values
+/// (`smithy_query(query="shape",shape="ParticipantRecordingState")`):
+/// [`NOT_RECORDED_PARTICIPANT_RECORDING_STATE`], which is nothing recording the
+/// participant at all, and the five states a recording passes through (the values of
+/// `ParticipantRecordingFilterByRecordingState`). These two are the ones a recording
+/// comes to REST in — it stopped, or it failed — and the three that remain (`STARTING`,
+/// `ACTIVE`, `STOPPING`) are the ones media is still being written in.
+pub const FINISHED_PARTICIPANT_RECORDING_STATES: [&str; 2] = ["STOPPED", "FAILED"];
+
+/// Whether `recording_state` is a state of a recording that is RUNNING right now.
+///
+/// The one reading of "recording is active" for a participant: neither "nothing records
+/// it" ([`NOT_RECORDED_PARTICIPANT_RECORDING_STATE`]) nor a recording that has come to
+/// rest ([`FINISHED_PARTICIPANT_RECORDING_STATES`]) is a running recording; every other
+/// value of the enum is one.
+pub fn participant_recording_running(recording_state: &str) -> bool {
+    recording_state != NOT_RECORDED_PARTICIPANT_RECORDING_STATE
+        && !FINISHED_PARTICIPANT_RECORDING_STATES.contains(&recording_state)
+}
+
 /// `ReplicationType` of a participant that is neither replicated to another stage nor
 /// a replica from one.
 ///
@@ -1941,6 +1963,61 @@ pub fn participant_recording_location(
         },
         None => ParticipantRecordingLocation::not_recorded(),
     }
+}
+
+/// One participant of a stage whose individual recording is running right now: the
+/// session it is in, the participant it is, and the recording state the recorder reports
+/// for it.
+#[derive(Debug, Clone)]
+pub struct RecordingParticipant {
+    pub session_id: String,
+    pub participant_id: String,
+    /// The `ParticipantRecordingState` the recorder reports — one of the values
+    /// [`participant_recording_running`] admits.
+    pub recording_state: String,
+}
+
+/// The participants of `stage_arn` whose individual recording is running right now, in
+/// the order the sessions of the stage hold them.
+///
+/// The ONE lookup for "is a recording running in this stage", so what a read of a
+/// participant reports about its recording and what an update refuses over cannot
+/// disagree: a recording is running for a participant that is still
+/// [`PARTICIPANT_STATE_CONNECTED`], whose recorder state is a running one
+/// ([`participant_recording_running`]), and whose media has somewhere to go — the stage's
+/// `autoParticipantRecordingConfiguration` names a storage configuration this store
+/// holds, which is exactly when [`participant_recording_location`] reports a bucket for
+/// it ("Individual participant recording cannot be started unless a storage configuration
+/// is specified", as `AutoParticipantRecordingConfiguration$storageConfigurationArn`
+/// states).
+pub fn stage_recording_participants(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+) -> Vec<RecordingParticipant> {
+    let mut recording = Vec::new();
+    let Some(sessions) = state.stage_sessions.get(stage_arn) else {
+        return recording;
+    };
+    for session in sessions {
+        for participant in &session.participants {
+            if participant.state != PARTICIPANT_STATE_CONNECTED
+                || !participant_recording_running(&participant.recording_state)
+            {
+                continue;
+            }
+            let location =
+                participant_recording_location(state, stage_arn, &session.session_id, participant);
+            if location.bucket_name == NOT_RECORDED_PARTICIPANT_RECORDING_S3_LOCATION {
+                continue;
+            }
+            recording.push(RecordingParticipant {
+                session_id: session.session_id.clone(),
+                participant_id: participant.participant_id.clone(),
+                recording_state: participant.recording_state.clone(),
+            });
+        }
+    }
+    recording
 }
 
 /// The ingest configuration the participant `record` of `stage_arn` broadcasts with, or
@@ -4455,6 +4532,25 @@ pub fn resource_in_use_by_composition_message(
     composition_state: &str,
 ) -> String {
     format!("Resource: {arn} is in use: composition {composition_arn} is {composition_state}")
+}
+
+/// How this service states an update of a member that cannot be changed while a
+/// recording is running: it names the stage, the participant whose recording is running
+/// and the state that recording is in, so the caller can see what has to finish before
+/// the update can succeed.
+///
+/// AWS documents no text for `ConflictException` beyond what it means ("Updating or
+/// deleting a resource can cause an inconsistent state"), so the sentence is built from
+/// the request and the store, the way every other refusal of this service is.
+pub fn stage_recording_active_message(
+    arn: &str,
+    participant_id: &str,
+    recording_state: &str,
+) -> String {
+    format!(
+        "Resource: {arn} is in use: the recording of participant {participant_id} is \
+         {recording_state}"
+    )
 }
 
 /// How this service states a request to delete an ingest configuration a publisher is

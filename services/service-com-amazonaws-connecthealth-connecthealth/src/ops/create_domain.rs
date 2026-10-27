@@ -94,8 +94,11 @@
 //!   `TagKey`/`TagValue` lengths (key 1..128 characters, value 0..256), or one whose key
 //!   lies in the reserved `crate::state::RESERVED_TAG_KEY_PREFIX` namespace. Both are
 //!   refused through the one check every operation that accepts a `TagMap` shares
-//!   ([`crate::service::tag_bounds::violation`]), because neither a constraint on a map's
-//!   key or value nor a rule the model does not state is one the boundary walk refuses.
+//!   ([`crate::service::tag_bounds::accepted_entries`]), because neither a constraint on
+//!   a map's key or value nor a rule the model does not state is one the boundary walk
+//!   refuses. It is decided from the request alone, so it is decided BEFORE the tag count
+//!   above and before anything else this handler reads: a map that breaks both rules
+//!   earns this 400, exactly as it does on `TagResource`.
 //!
 //! ## Beside the model
 //!
@@ -265,6 +268,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let region = crate::state::region_of(ctx);
         let now = ::std::time::SystemTime::now();
+        // What an entry has to satisfy — the modelled `TagKey`/`TagValue` lengths at BOTH
+        // ends, and a key outside the reserved namespace — through the one check every
+        // operation that accepts a `TagMap` shares: neither a constraint on a map's key
+        // or value nor a rule the model does not state is one the boundary walk refuses,
+        // so the handler is what refuses it. It is decided HERE, from the request alone
+        // and before any state is read, because that is where the boundary would have
+        // decided it: so a map that is also past the count cap below earns this refusal,
+        // the same one `TagResource` answers for the same map. A refusal writes nothing —
+        // nothing has been read, let alone minted.
+        let requested_tags =
+            crate::service::tag_bounds::accepted_entries(input.tags.unwrap_or_default())
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
         // The account this create is signed for, which is the account that will own the
         // domain and the one the cap below is measured against.
         let account_id = crate::state::owning_account_id();
@@ -272,16 +287,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.purge_due_deletions(now);
 
-        // The parameters this request carried, as the store holds them: a tag set in KEY
-        // order, so the same entries in a different wire order are the same set. The
-        // digest of those parameters is the identity of the REQUEST — what tells a repeat
-        // from a different request.
-        let requested_tags: ::std::collections::BTreeMap<String, String> = input
-            .tags
-            .iter()
-            .flatten()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
+        // The digest of this request's parameters is the identity of the REQUEST — what
+        // tells a repeat from a different request. The tag set it is taken over is the one
+        // the shared entry check handed back, in KEY order, so the same entries in a
+        // different wire order are the same set and so the same request.
         let fingerprint = crate::state::domain_creation_fingerprint(
             &input.name,
             input.kms_key_arn.as_deref(),
@@ -339,7 +348,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // merge with (`crate::service::tag_bounds::merged_within_cap`), so the two cannot
         // count a different set or compare it against a different number. A domain being
         // created holds no tags yet, so the set bounded here is the entries the request
-        // carried. A refusal writes nothing: it is raised before any id is minted.
+        // carried, already known to be acceptable one by one. A refusal writes nothing:
+        // it is raised before any id is minted.
         let tags = crate::service::tag_bounds::merged_within_cap(
             ::std::collections::BTreeMap::new(),
             requested_tags,
@@ -354,15 +364,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        // What an entry has to satisfy — the modelled `TagKey`/`TagValue` lengths at
-        // BOTH ends, and a key outside the reserved namespace — through the one check
-        // every operation that accepts a `TagMap` shares: neither a constraint on a
-        // map's key or value nor a rule the model does not state is one the boundary
-        // walk refuses, so the handler is what refuses it. A refusal here writes
-        // nothing either, for the same reason.
-        if let Some(violation) = crate::service::tag_bounds::violation(tags.iter()) {
-            return Err(crate::scaffolded::Scaffolded::validation(violation));
-        }
 
         let domain_id = store.mint_domain_id();
         // The id is remembered as ALLOCATED for as long as the history holds it, past

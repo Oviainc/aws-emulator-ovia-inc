@@ -691,6 +691,11 @@ async fn an_operation_id_that_names_no_configuration_check_is_refused() {
         message(&crossed)
     );
 
+    // The start above left a change owed to the application, and no configuration check
+    // may be started against an application with work already under way on it
+    // (`tests/all/configuration_checks_in_flight.rs`), so the clock is waited out first.
+    settle().await;
+
     let check = emulator
         .start_checks(json!({
             "ApplicationId": "HDB-TEST",

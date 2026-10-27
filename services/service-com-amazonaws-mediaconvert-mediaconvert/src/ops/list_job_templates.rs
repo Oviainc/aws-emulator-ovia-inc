@@ -3,7 +3,9 @@
 //! @op ListJobTemplates
 //!
 //! Reports the account's stored job templates of the kind `listBy` selects, narrowed to
-//! `category` when the caller names one, ordered on the key `listBy` names in the
+//! `category` when the caller names one — the set
+//! [`crate::state::records_listed_by`] selects for every `listBy` listing of this service
+//! — ordered on the key `listBy` names in the
 //! direction `order` names, in pages of at most `maxResults` with an opaque `nextToken`
 //! that resumes immediately after the last template of the page just returned. Every value
 //! is projected from a record in [`crate::state`], through the one paging helper
@@ -199,29 +201,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handler takes the store to read it and writes nothing at all.
         let state = state.lock();
 
-        // `listBy` chooses BOTH which templates are listed and how they are ordered: its
-        // `SYSTEM` value selects the built-in templates, which `JobTemplate$Type`
-        // describes as the ones a user "can't modify or delete", while `NAME` and
-        // `CREATION_DATE` list the account's own templates on that key.
+        // `listBy` chooses BOTH which templates are listed and how they are ordered, and
+        // `category` narrows the set it chose: which templates that leaves is
+        // `records_listed_by`'s, the one place this service states it for a `listBy`
+        // listing, and the order and the page they come back in is
+        // `page_of_job_templates`'.
         let list_by = input.list_by.as_deref();
-        let wanted_type = if list_by == Some(crate::state::LIST_BY_SYSTEM) {
-            crate::state::TYPE_SYSTEM
-        } else {
-            crate::state::TYPE_CUSTOM
-        };
-
-        // `category`: "specify a job template category to limit responses to only job
-        // templates from that category" — so a template with no category matches no
-        // category the caller can name.
-        let category = input.category.as_deref();
         let page = crate::state::page_of_job_templates(
-            state
-                .job_templates
-                .values()
-                .filter(|record| record.template_type == wanted_type)
-                .filter(|record| {
-                    category.is_none_or(|want| record.category.as_deref() == Some(want))
-                }),
+            crate::state::records_listed_by(
+                state.job_templates.values(),
+                list_by,
+                input.category.as_deref(),
+            ),
             list_by,
             input.order.as_deref(),
             resume_from.as_ref(),

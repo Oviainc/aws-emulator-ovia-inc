@@ -91,6 +91,8 @@ mod resource_share;
 mod resource_tagging;
 #[path = "all/shared_paging.rs"]
 mod shared_paging;
+#[path = "all/shared_set_selection.rs"]
+mod shared_set_selection;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/system_job_templates.rs"]
