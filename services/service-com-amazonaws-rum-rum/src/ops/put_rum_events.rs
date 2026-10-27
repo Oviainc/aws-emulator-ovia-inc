@@ -7,7 +7,9 @@
 //! decision is made on every call from the caller's identity-based policies and the
 //! monitor's own resource policy ([`crate::state::authorization`]), so an unauthorized
 //! write is refused with the modelled `AccessDeniedException` (HTTP 403) rather than
-//! accepted.
+//! accepted. An `Id` that resolves to no stored monitor is refused the same way, because
+//! the monitor the decision is made against is what the id has to resolve to
+//! ([`crate::state::caller_lacks_permissions`]).
 //!
 //! A monitor whose `CwLogEnabled` is on also stores copies of what it collects in
 //! CloudWatch Logs, so an accepted batch is written to the vended log group the monitor
@@ -169,15 +171,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The route names the monitor by its MINTED id, so the batch is resolved through
-        // the stored id index — an id no stored monitor holds (never created, or already
-        // deleted) is not found. Resolved under a SHORT read lock, because what comes
-        // next is the authorization decision, which reads the IAM and STS stores and
-        // needs no lock of this service's.
+        // the stored id index — an id no stored monitor holds (never minted, or minted for
+        // a monitor since deleted) resolves to nothing. That is not reported as a missing
+        // resource: this write is authorized AGAINST the monitor the id names (its ARN and
+        // its resource-based policy are what the decision below is made from), so an id
+        // that resolves to nothing leaves no resource to establish the grant against and
+        // the call is refused as an authorization failure, disclosing nothing about
+        // whether such a monitor exists (`crate::state::caller_lacks_permissions`).
+        // Resolved under a SHORT read lock, because what comes next is the authorization
+        // decision, which reads the IAM and STS stores and needs no lock of this
+        // service's.
         let (resource_arn, resource_policy) = {
             let store = state.lock();
             let Some(record) = store.app_monitor_by_id(&input.id) else {
-                return Err(PutRumEventsErrorModeled::ResourceNotFoundException(
-                    crate::state::app_monitor_not_found(&input.id),
+                return Err(PutRumEventsErrorModeled::AccessDeniedException(
+                    crate::state::caller_lacks_permissions(),
                 )
                 .into());
             };
@@ -244,9 +252,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             // The monitor is resolved again under the write lock: the decision above held
             // no lock, so a concurrent `DeleteAppMonitor` may have removed it in between.
+            // An id that no longer resolves is refused the same way it is above — the
+            // monitor the grant was decided against is gone, so the write is no longer
+            // authorized.
             let Some(record) = store.app_monitor_by_id_mut(&input.id) else {
-                return Err(PutRumEventsErrorModeled::ResourceNotFoundException(
-                    crate::state::app_monitor_not_found(&input.id),
+                return Err(PutRumEventsErrorModeled::AccessDeniedException(
+                    crate::state::caller_lacks_permissions(),
                 )
                 .into());
             };
