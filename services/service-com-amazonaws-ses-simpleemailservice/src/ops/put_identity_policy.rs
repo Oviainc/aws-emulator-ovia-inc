@@ -113,6 +113,17 @@ impl From<PutIdentityPolicyErrorModeled> for PutIdentityPolicyError {
 /// words.
 const NOT_A_POLICY: &str = "Unable to parse policy.";
 
+/// What the service answers for a policy whose resource element names something that
+/// is not an ARN.
+///
+/// A sending authorization policy authorizes sending THROUGH one identity, and an
+/// identity is named by its ARN, so the service reads the element as one and reports
+/// the value it could not read as an ARN: the trailing token is that value, copied
+/// from the document that was submitted.
+fn invalid_resource_arn(value: &str) -> String {
+    format!("Invalid ARN: ARNs must start with 'arn:': {value}")
+}
+
 /// What the service answers for a document larger than the policy ceiling.
 ///
 /// Its own sentence, because the size rule is not the parse rule, and it REPORTS
@@ -217,6 +228,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policies and store them.
         if ::service_common::iam_policy::resource_policy_defect(&input.policy).is_some() {
             return Err(invalid_policy(NOT_A_POLICY));
+        }
+
+        // The resource a sending authorization policy names is the IDENTITY it
+        // authorizes sending through, and an identity is named by its ARN. The IAM
+        // grammar above admits a bare wildcard as a resource; this service does not,
+        // so a resource element that is not an ARN is refused here — before anything
+        // is written — and the refusal names the value that is not one.
+        if let Some(value) = ::service_common::iam_policy::non_arn_resource(&input.policy) {
+            return Err(invalid_policy(invalid_resource_arn(&value)));
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {

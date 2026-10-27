@@ -238,3 +238,5 @@ mod delete_base_path_mapping;
 mod update_base_path_mapping;
 #[path = "all/update_model.rs"]
 mod update_model;
+#[path = "all/model_collection.rs"]
+mod model_collection;

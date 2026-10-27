@@ -195,16 +195,36 @@ fn schema_rows() -> Vec<Row> {
             "svc.events@ScheduledEvent",
         ),
         Row::accepted("dots, hyphens, underscores and digits", "svc.9-schema_name"),
+        Row::accepted("a leading and a trailing at sign", "@svc.events@"),
+        // The two names carry DIFFERENT bounds, so a name a registry's bound would
+        // refuse is accepted here.
+        Row::accepted(
+            "longer than a registry name may be",
+            "s".repeat(REGISTRY_NAME.max_length + 1),
+        ),
         Row::accepted("the longest accepted name", "s".repeat(SCHEMA_NAME.max_length)),
         Row::refused("a space", "my%20schema", Broken::Pattern),
+        Row::refused("a number sign", "my%23schema", Broken::Pattern),
+        Row::refused("a dollar sign", "my$schema", Broken::Pattern),
+        Row::refused("an encoded slash", "my%2Fschema", Broken::Pattern),
         Row::refused("an exclamation mark", "my!schema", Broken::Pattern),
+        Row::refused("an asterisk", "my*schema", Broken::Pattern),
+        Row::refused("a plus sign", "my+schema", Broken::Pattern),
+        Row::refused("an equals sign", "my=schema", Broken::Pattern),
+        Row::refused("parentheses", "my(schema)", Broken::Pattern),
         Row::refused("a colon", "my:schema", Broken::Pattern),
         Row::refused("a tilde", "my~schema", Broken::Pattern),
         Row::refused("a comma", "my,schema", Broken::Pattern),
         Row::refused("a non-ASCII letter", "caf%C3%A9", Broken::Pattern),
+        Row::refused("a leading space", "%20leading", Broken::Pattern),
         Row::refused(
             "one character past the longest accepted name",
             "s".repeat(SCHEMA_NAME.max_length + 1),
+            Broken::Length,
+        ),
+        Row::refused(
+            "far past the longest accepted name",
+            "s".repeat(SCHEMA_NAME.max_length * 4),
             Broken::Length,
         ),
         Row::refused(
@@ -460,6 +480,83 @@ async fn a_schema_name_outside_the_constraint_is_refused_and_creates_nothing() {
             after, before,
             "case {:?}: a refused create must leave the registry's schemas as they were",
             row.case
+        );
+    }
+}
+
+/// The control schema's document, which declares the event source a search selects it
+/// by (an EventBridge document's `x-amazon-events-source` extension, which is what this
+/// service's keyword index is built from — see `tests/all/search_keyword_index.rs`).
+const CONTROL_CONTENT: &str = r#"{"openapi":"3.0.0","info":{"version":"1.0.0","title":"Control"},"paths":{},"components":{"schemas":{"AWSEvent":{"type":"object","x-amazon-events-source":"svc.control","x-amazon-events-detail-type":"Control Event","properties":{}}}}}"#;
+
+/// RULE: because a name outside the constraint is refused before anything is stored, no
+/// reader ever reports it and no ARN is ever minted for it — the refused create leaves
+/// the registry holding exactly the schemas it held, whichever reader is asked.
+#[tokio::test]
+async fn a_refused_schema_name_reaches_no_reader_and_mints_no_arn() {
+    let emulator = Emulator::new();
+    let registry = "no-reader-reports-it";
+    create_registry(&emulator, registry).await;
+
+    // A control schema, so the readers below are asserted to report the registry's real
+    // contents rather than merely to report nothing at all. Its document DECLARES an
+    // event, which is what the search below selects it by.
+    let control = "svc.events@Control";
+    let created = emulator
+        .call(
+            "POST",
+            &schema_uri(registry, control),
+            Some(json!({"Content": CONTROL_CONTENT, "Type": "OpenApi3"})),
+        )
+        .await;
+    assert_eq!(
+        created.status, 201,
+        "the control schema must be created, got {} {:?}",
+        created.status, created.body
+    );
+    let expected = vec![control.to_string()];
+    // The keyword the control schema's declared event source indexes it under, so what
+    // the search reports turns on the registry's contents rather than on how a search
+    // naming no keyword behaves.
+    let search = format!("{}/search?keywords=svc.control", listing_uri(registry));
+
+    for row in schema_rows() {
+        let Some(broken) = row.broken else { continue };
+        let case = row.case;
+        let refused = emulator
+            .call(
+                "POST",
+                &schema_uri(registry, &row.name),
+                Some(schema_body()),
+            )
+            .await;
+        assert_refused(case, &refused, &SCHEMA_NAME, broken);
+        assert!(
+            refused.body.get("SchemaArn").is_none(),
+            "case {case:?}: a refused create must mint no ARN, got {:?}",
+            refused.body
+        );
+
+        for (reader, uri) in [
+            ("ListSchemas", listing_uri(registry)),
+            ("SearchSchemas", search.clone()),
+        ] {
+            let reported = walk(&emulator, &uri, None, schema_names).await;
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: {reader} must report only the schemas the registry holds"
+            );
+        }
+
+        let read = emulator
+            .call("GET", &schema_uri(registry, &row.name), None)
+            .await;
+        assert_refused(case, &read, &SCHEMA_NAME, broken);
+        assert!(
+            read.body.get("SchemaArn").is_none(),
+            "case {case:?}: no read may answer an ARN for a name the service refuses, \
+             got {:?}",
+            read.body
         );
     }
 }

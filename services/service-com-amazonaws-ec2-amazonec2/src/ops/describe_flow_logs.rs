@@ -7,13 +7,11 @@
 //! well-formed id this account holds no flow log for selects nothing and the call succeeds
 //! with an empty list.
 //!
-//! One documented filter selects nothing whatever the store holds: `deliver-log-status`
-//! compares against `FlowLog$DeliverLogsStatus`, and no flow log of this emulator carries
-//! one — nothing here delivers a flow log RECORD, so there is no delivery outcome to report
-//! and the member is left absent rather than claiming `SUCCESS`. The filter is still
-//! accepted, because it is one the operation documents and refusing it would be a
-//! different answer from the real service's; it simply matches no stored flow log, the way
-//! any filter naming an attribute a candidate does not carry does.
+//! Every member a stored flow log carries is reported as the store holds it, and every
+//! documented filter selects on exactly those members — `deliver-log-status` compares
+//! against `FlowLog$DeliverLogsStatus`, which every stored flow log carries
+//! ([`crate::state::DELIVER_LOGS_STATUS_SUCCESS`]), so a delivery-health listing selects
+//! the flow logs that really are delivering.
 //!
 //! ## Shape of an operation
 //!
@@ -424,9 +422,9 @@ fn filter_values<'a>(flow_log: &'a FlowLog, name: &str) -> Vec<Cow<'a, str>> {
         value.map(Cow::Borrowed).into_iter().collect()
     };
     match name {
-        // "The status of the logs delivery (SUCCESS | FAILED)": nothing in this emulator
-        // delivers a flow log record, so no stored flow log carries a delivery status and
-        // this filter selects none of them.
+        // "The status of the logs delivery (SUCCESS | FAILED)"
+        // (`DescribeFlowLogsRequest$Filter`), compared against the member the stored flow
+        // log reports it under.
         "deliver-log-status" => text(flow_log.deliver_logs_status.as_deref()),
         "log-destination-type" => text(flow_log.log_destination_type.as_deref()),
         "flow-log-id" => text(flow_log.flow_log_id.as_deref()),

@@ -434,11 +434,17 @@ pub fn malformed_resource_arn_message(resource_arn: &str) -> String {
     format!("The ARN {resource_arn} is not in a valid format")
 }
 
-/// `ArnNotSupportedException` (HTTP 400): a well-formed ARN naming a resource
-/// this service's tagging operations do not act on, quoted as
-/// [`malformed_resource_arn_message`] quotes it.
+/// `ArnNotSupportedException` (HTTP 400) as the tag-WRITING operations word it:
+/// a well-formed ARN naming a resource this service's tagging operations do not
+/// act on, quoted as [`malformed_resource_arn_message`] quotes it.
 pub fn resource_arn_not_supported_message(resource_arn: &str) -> String {
-    format!("The ARN {resource_arn} is not supported")
+    format!("The ARN: {resource_arn} is not supported by CodeDeploy")
+}
+
+/// `ArnNotSupportedException` (HTTP 400) as the tag-READING operation words it:
+/// the same refusal, by the same rule, in the sentence that operation answers.
+pub fn resource_arn_not_a_codedeploy_arn_message(resource_arn: &str) -> String {
+    format!("Not a CodeDeploy ARN: {resource_arn}")
 }
 
 /// `TagRequiredException` (HTTP 400): a tagging call that named no tag at all.
@@ -1357,10 +1363,6 @@ pub struct DeploymentConfig {
     pub zonal_config: Option<ZonalConfig>,
     pub compute_platform: String,
     pub create_time_ms: i64,
-    /// The tags this configuration carries. `CreateDeploymentConfig` takes none,
-    /// so a configuration is created untagged and gains tags only through the
-    /// resource-tagging operations.
-    pub tags: Vec<Tag>,
 }
 
 /// The `RegistrationStatus` of an on-premises instance that is still
@@ -1463,8 +1465,8 @@ pub fn projected_tag_count(tags: &[Tag], added: &[(&str, &str)]) -> usize {
 /// holds so no record carries two entries for one key.
 ///
 /// The one rule every tagging operation of this service writes through, so the
-/// tags of an on-premises instance and the tags of an application, deployment
-/// group or deployment configuration are merged the same way.
+/// tags of an on-premises instance and the tags of an application or deployment
+/// group are merged the same way.
 pub fn set_tag(tags: &mut Vec<Tag>, key: &str, value: &str) {
     match tags.iter_mut().find(|tag| tag.key.as_deref() == Some(key)) {
         Some(existing) => existing.value = Some(value.to_string()),
@@ -1840,7 +1842,6 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                 zonal_config: None,
                 compute_platform: builtin.compute_platform.to_string(),
                 create_time_ms: now_ms,
-                tags: Vec::new(),
             });
         }
     }
@@ -1916,11 +1917,6 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                         MissingResource::DeploymentGroup(deployment_group_name.clone())
                     })
             }
-            TaggedResource::DeploymentConfig(name) => self
-                .deployment_configs
-                .get(name)
-                .map(|config| config.tags.as_slice())
-                .ok_or_else(|| MissingResource::DeploymentConfig(name.clone())),
         }
     }
 
@@ -1952,11 +1948,6 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                         MissingResource::DeploymentGroup(deployment_group_name.clone())
                     })
             }
-            TaggedResource::DeploymentConfig(name) => self
-                .deployment_configs
-                .get_mut(name)
-                .map(|config| &mut config.tags)
-                .ok_or_else(|| MissingResource::DeploymentConfig(name.clone())),
         }
     }
 
@@ -3257,11 +3248,9 @@ pub fn deployment_config_arn(region: &str, deployment_config_name: &str) -> Stri
 }
 
 /// A resource this service's `ResourceArn` operations act on, with the identity
-/// its ARN carries: the three CodeDeploy resource kinds that hold tags of their
-/// own, which is also what the errors those operations model name
-/// (`smithy_query(query="operation",operation="TagResource")`:
-/// `ApplicationDoesNotExistException`, `DeploymentGroupDoesNotExistException`,
-/// `DeploymentConfigDoesNotExistException`).
+/// its ARN carries: the CodeDeploy resource kinds that hold tags of their own,
+/// which an ARN naming any other kind of resource is refused against
+/// ([`ArnRefusal::Unsupported`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaggedResource {
     /// An application, by name.
@@ -3271,8 +3260,6 @@ pub enum TaggedResource {
         application_name: String,
         deployment_group_name: String,
     },
-    /// A deployment configuration, by name.
-    DeploymentConfig(String),
 }
 
 /// Why CodeDeploy will not read a `ResourceArn` as one of its taggable
@@ -3292,7 +3279,7 @@ pub enum ArnRefusal {
 /// Read `candidate` as the ARN of a resource this service tags.
 ///
 /// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>`, and for
-/// the three taggable CodeDeploy kinds the resource part is
+/// the taggable CodeDeploy kinds the resource part is
 /// `<type>:<identifier>`. The region and the account are NOT matched against
 /// this emulator's own: an ARN identifies the resource by the name it carries,
 /// which is what the lookup uses.
@@ -3339,7 +3326,10 @@ pub fn parse_tagged_resource_arn(candidate: &str) -> Result<TaggedResource, ArnR
                 deployment_group_name: named(deployment_group_name)?,
             })
         }
-        ARN_TYPE_DEPLOYMENT_CONFIG => Ok(TaggedResource::DeploymentConfig(named(identifier)?)),
+        // Every OTHER CodeDeploy resource type — a deployment configuration, a
+        // deployment, an on-premises instance — is a resource these operations
+        // do not act on, whether or not the store holds it: the resource type
+        // alone decides, so it is refused before anything is looked up.
         _ => Err(ArnRefusal::Unsupported),
     }
 }
@@ -3361,8 +3351,6 @@ pub enum MissingResource {
     Application(String),
     /// The application exists, but holds no deployment group of this name.
     DeploymentGroup(String),
-    /// No deployment configuration of this name.
-    DeploymentConfig(String),
 }
 
 /// A stored on-premises instance as the modelled `InstanceInfo`.

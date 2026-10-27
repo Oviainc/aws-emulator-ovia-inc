@@ -7385,10 +7385,11 @@ pub fn next_version_id(current: &str) -> String {
 ///
 /// This is the TOP-LEVEL error body only. A per-item failure a batch reports inside its
 /// output (`BatchDeleteTable`'s `TableError$ErrorDetail`) has its own recorded wording
-/// and is built by [`super::catalog_error_detail`]. Of the job and connection slices only
-/// `StartJobRun`'s missing-metadata refusal is here, because the corpus records it; the
-/// rest of their messages are not requirements and are left to the issues that own them
-/// rather than guessed at.
+/// and is built by [`super::catalog_error_detail`]. Of the job and connection slices the
+/// job-definition miss ([`messages::JOB_NOT_FOUND`]) and `StartJobRun`'s
+/// missing-metadata refusal are here, because the corpus records both; the rest of their
+/// messages are not requirements and are left to the issues that own them rather than
+/// guessed at.
 ///
 /// The schema-registry misses ARE here, because every operation that resolves a
 /// `RegistryId` or a `SchemaId` resolves the same two references and so has to describe
@@ -7554,12 +7555,15 @@ pub mod messages {
 
     /// Any operation whose `JobName`/`Name` names no job definition of the Region it is
     /// served in — a read or a write that addresses a job (`GetJob`, `UpdateJob`,
-    /// `GetJobRun`, `BatchStopJobRun`), and the job an action of a trigger would run. The
-    /// per-resource template this crate's job-miss refusals already carried inline, now in
-    /// one place: it names neither the Region nor the resource that referred to the job.
-    pub fn job_not_found(name: &str) -> String {
-        format!("Job {name} not found")
-    }
+    /// `GetJobRun`, `GetJobRuns`, `BatchStopJobRun`), and the job an action of a trigger
+    /// would run.
+    ///
+    /// Recorded constant: the job-definition miss is FIXED text, trailing period
+    /// included, and has no variable part — the refusal names neither the requested job,
+    /// nor the Region, nor the resource that referred to the job. One constant, shared by
+    /// every job-definition lookup, so a client matching on the sentence recognises the
+    /// miss whichever operation reported it.
+    pub const JOB_NOT_FOUND: &str = "Job not found.";
 
     /// `CreateCrawler` for an S3 target whose `EventQueueArn` (or `DlqEventQueueArn`)
     /// names a queue the crawler's `Role` cannot consume ([`super::event_queue_refusal`]).
@@ -7573,15 +7577,11 @@ pub mod messages {
         )
     }
 
-    /// `GetJobRuns` for a `JobName` the endpoint's Region holds no job definition for.
-    /// Recorded constant: the run listing's refusal names neither the job nor the Region.
-    pub const JOB_RUNS_JOB_NOT_FOUND: &str = "Job not found.";
-
     /// `StartJobRun` for a `JobName` the endpoint's Region holds no job definition for —
     /// a name nothing created, or one created through ANOTHER Region's endpoint.
     /// Recorded constant: the start's refusal names the metadata it could not read rather
-    /// than the requested name, which is why it is not [`super::messages`]'s per-resource
-    /// template.
+    /// than the miss every other job lookup reports ([`JOB_NOT_FOUND`]), which is why the
+    /// start does not share that sentence.
     pub const JOB_METADATA_MISSING: &str = "Failed to start job run due to missing metadata.";
 
     /// A tag write whose `ResourceArn` names a Region other than the one the endpoint

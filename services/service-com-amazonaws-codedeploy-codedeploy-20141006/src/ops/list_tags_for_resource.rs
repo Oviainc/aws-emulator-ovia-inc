@@ -6,8 +6,10 @@
 //! A reporting operation: it reads the tags off the resource's own record and
 //! writes nothing. The ARN is read as the resource it identifies by the same
 //! rule the tagging operations use, so a value that is not in the ARN format is
-//! the modelled `InvalidArnException` and an ARN naming something these
-//! operations do not act on is `ArnNotSupportedException`. The operation models
+//! the modelled `InvalidArnException` and an ARN naming a resource TYPE these
+//! operations do not act on — anything but an application or a deployment group
+//! — is `ArnNotSupportedException`, in this operation's own wording for that
+//! refusal. The operation models
 //! no "does not exist" error, so a well-formed ARN whose resource the store does
 //! not hold carries no tags and is reported as an empty list.
 //!
@@ -127,7 +129,7 @@ fn arn_refused(
         }
         crate::state::ArnRefusal::Unsupported => {
             ListTagsForResourceErrorModeled::ArnNotSupportedException(ArnNotSupportedException {
-                message: Some(crate::state::resource_arn_not_supported_message(
+                message: Some(crate::state::resource_arn_not_a_codedeploy_arn_message(
                     resource_arn,
                 )),
             })

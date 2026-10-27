@@ -7,7 +7,9 @@
 //! touch for this operation.
 //!
 //! A query carrying a metric math `Expression` is evaluated over the other queries of the
-//! same request: the language is parsed and computed by [`crate::state::metric_math`], whose
+//! same request: the array is resolved by [`crate::state::metric_query`] — the one resolution
+//! a metric-math ALARM is evaluated through as well — and the language itself is parsed and
+//! computed by [`crate::state::metric_math`], whose
 //! `SEARCH` discovers its series in the same store, so an expression's result is computed
 //! from the datapoints `PutMetricData` wrote and from nothing else. An expression this
 //! service cannot evaluate — one that is malformed, refers to an id the request does not
@@ -143,11 +145,11 @@
 //!
 //! * `InvalidNextToken` (HTTP 400) — The next token specified is invalid.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::metric_math::{Expression, MathSeries, MathValue};
+use crate::state::metric_math::{MathSeries, MathValue};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -339,22 +341,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         let now = crate::state::now_secs();
+        // How much work this request's queries ask for is bounded BEFORE the first series is
+        // folded: the range, the granularity and the number of queries are all the caller's,
+        // and their product is the windows the fold would materialise — so an array asking for
+        // more than one call may retrieve is refused here rather than built and then trimmed to
+        // the page the caller reads.
+        if let Some(refused) =
+            crate::state::metric_query::resolution_refusal(&input.metric_data_queries, requested_start, end)
+        {
+            return Err(refusal(refused));
+        }
 
         // Every query is resolved under its OWN short acquisition of the store, and the walk
         // yields between queries: one call can carry up to [`MAX_QUERIES`] of them, so neither
         // a critical section nor the stretch between two yield points grows with how many
         // queries the request asked for — not even when a query's expression discovers its own
         // series server-side (`SEARCH`), which is what needs the store during an evaluation.
-        let mut resolution = Resolution::default();
+        //
+        // What an array MEANS is the store's own ([`crate::state::metric_query`]), so this
+        // request and a metric-math alarm's evaluation cannot read one two ways; what this
+        // operation keeps is the walk, the locking and the refusals it answers with.
+        let mut resolution = crate::state::metric_query::Resolution::default();
         for (index, query) in input.metric_data_queries.iter().enumerate() {
             let Some(stat) = query.metric_stat.as_ref() else {
                 continue;
             };
             let series = {
                 let store = state.lock();
-                resolve_series(&store, query, stat, requested_start, end, now)
-            }?;
-            resolution.retrieve(query, series)?;
+                crate::state::metric_query::retrieved_series(
+                    &store,
+                    query,
+                    stat,
+                    requested_start,
+                    end,
+                    now,
+                )
+            }
+            .map_err(refusal)?;
+            resolution.retrieve(query, series).map_err(refusal)?;
             if index > 0 && index.is_multiple_of(QUERY_YIELD_INTERVAL) {
                 ::tokio::task::yield_now().await;
             }
@@ -363,33 +387,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every expression is parsed, and the order they are evaluated in settled, BEFORE any
         // of them is evaluated: a request carrying one malformed expression or one circular
         // reference is refused without evaluating the rest, and neither step reads the store.
-        let parsed = parse_expressions(&input)?;
-        let order = evaluation_order(&input, &parsed)?;
+        let parsed =
+            crate::state::metric_query::parse_queries(&input.metric_data_queries).map_err(refusal)?;
+        let order = crate::state::metric_query::evaluation_order(&input.metric_data_queries, &parsed)
+            .map_err(refusal)?;
         for (index, id) in order.iter().enumerate() {
-            let Some((query, tree)) = parsed.get(id.as_str()) else {
+            let Some(tree) = parsed.get(id) else {
                 continue;
             };
+            let Some(query) = input
+                .metric_data_queries
+                .iter()
+                .find(|query| query.id == *id)
+            else {
+                continue;
+            };
+            // "The granularity, in seconds, of the returned data points"
+            // (`MetricDataQuery$Period`): an expression's own period is what a constructed
+            // series is spaced at, and the default is the one minute every regular-resolution
+            // metric is stored at. It is a granularity like any other, so the one shared rule
+            // judges it.
+            if let Some(period) = query.period {
+                check_period(period)?;
+            }
+            let period = query
+                .period
+                .map_or(crate::state::metric_query::DEFAULT_EXPRESSION_PERIOD, f64::from);
             let evaluated = {
                 let store = state.lock();
                 resolution.evaluate(
-                    query,
+                    &query.id,
                     tree,
-                    &StoreSearch {
+                    &crate::state::metric_query::StoreSeriesSource {
                         store: &store,
                         requested_start,
                         end,
                         now,
                     },
                     (requested_start, end),
+                    period,
                 )
-            }?;
+            }
+            .map_err(refusal)?;
             resolution.record(&query.id, evaluated);
             if index > 0 && index.is_multiple_of(QUERY_YIELD_INTERVAL) {
                 ::tokio::task::yield_now().await;
             }
         }
 
-        let answers = resolution.answers(&input, requested_start)?;
+        let answers = answers(&resolution, &input, requested_start)?;
 
         // One datapoint budget is spent across every result, in query order, and the cursor
         // the response hands back is how many of them this and the earlier pages returned —
@@ -483,8 +529,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// "A single GetMetricData call can include up to 500 MetricDataQuery structures."
-const MAX_QUERIES: usize = 500;
+/// "A single GetMetricData call can include up to 500 MetricDataQuery structures." — the same
+/// ceiling the shared resolution bounds itself by
+/// ([`crate::state::metric_query::MAX_RESOLVED_QUERIES`]), so the refusal this operation makes
+/// and the bound the resolution keeps are one number.
+const MAX_QUERIES: usize = crate::state::metric_query::MAX_RESOLVED_QUERIES;
 
 /// "The maximum number of data points the request should return before paginating. If you
 /// omit this, the default of 100,800 is used." (`GetMetricDataInput$MaxDatapoints`)
@@ -630,354 +679,61 @@ fn check_period(period: i32) -> Result<(), GetMetricDataError> {
     }
 }
 
-/// Answer one `MetricStat` query from the store: the datapoints of the metric it names,
-/// inside `[start, end)`, folded into `Period` windows by its `Stat`.
+/// The refusal CloudWatch answers this request with for a query array that does not resolve
+/// over the store ([`crate::state::metric_query::QueryRefusal`]).
 ///
-/// A window holding no datapoint is not reported — CloudWatch returns a value only for the
-/// periods that have data — so the two lists a result carries stay in step.
-fn resolve_series(
-    store: &crate::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
-    query: &MetricDataQuery,
-    stat: &MetricStat,
-    requested_start: f64,
-    end: f64,
-    now: f64,
-) -> Result<MathSeries, GetMetricDataError> {
-    // "MetricStat" names ONE metric, and "a metric is uniquely defined by a name, a
-    // namespace, and zero or more dimensions", so both halves of that identity are required
-    // for the query to name a series at all.
-    let (Some(namespace), Some(metric_name)) =
-        (stat.metric.namespace.as_ref(), stat.metric.metric_name.as_ref())
-    else {
-        return Err(invalid_combination(format!(
-            "the query {} must name both MetricStat.Metric.Namespace and \
-             MetricStat.Metric.MetricName",
-            query.id
-        )));
-    };
+/// The one place this operation's error channel is reached from the shared resolution, so a
+/// parameter fault, an expression refusal and a Metrics Insights query are each reported the
+/// way this operation reports them and the resolution itself names no operation.
+fn refusal(refused: crate::state::metric_query::QueryRefusal) -> GetMetricDataError {
+    use crate::state::metric_query::QueryRefusal;
 
-    // "The statistic to return. It can include any CloudWatch statistic or extended
-    // statistic." (`MetricStat$Stat`) — an unconstrained string in the model, so no boundary
-    // validator refuses a name outside the statistic grammar before this handler: a name
-    // that is not a statistic at all is a bad parameter value.
-    if !crate::state::is_cloudwatch_statistic(&stat.stat) {
-        return Err(invalid_value(format!(
-            "{} is not a supported statistic",
-            stat.stat
-        )));
-    }
-
-    // "When used in GetMetricData, [Period] is the granularity, in seconds, of the returned
-    // data points": the query's own `Period` member overrides the one on its `MetricStat`.
-    let period_secs = query.period.unwrap_or(stat.period);
-    check_period(period_secs)?;
-
-    let key = crate::state::MetricKey {
-        namespace: namespace.clone(),
-        metric_name: metric_name.clone(),
-        dimensions: crate::state::dimension_set(stat.metric.dimensions.as_deref()),
-    };
-    let points = fold_series(
-        store,
-        &key,
-        &stat.stat,
-        stat.unit.as_deref(),
-        period_secs,
-        requested_start,
-        end,
-        now,
-    );
-
-    // "If Label is omitted, CloudWatch generates a default": the metric the query names,
-    // which is the label every read of one series reports it under.
-    let label = query.label.clone().unwrap_or_else(|| metric_name.clone());
-
-    // The series still IS this metric's series, which is what an anomaly detector is created
-    // for, so the identity it was retrieved under travels with it.
-    Ok(
-        MathSeries::new(label, points).of_metric(crate::state::metric_math::SeriesMetric {
-            namespace: key.namespace,
-            metric_name: key.metric_name,
-            dimensions: key.dimensions,
-            stat: stat.stat.clone(),
-        }),
-    )
-}
-
-/// One stored series folded into the `period`-wide windows of `[start, end)` by `statistic`.
-///
-/// The one place a series becomes a list of points, so a query naming a metric and a search
-/// discovering one are answered from the same fold, at the same window boundaries.
-#[allow(clippy::too_many_arguments)]
-fn fold_series(
-    store: &crate::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
-    key: &crate::state::MetricKey,
-    statistic: &str,
-    unit: Option<&str>,
-    period_secs: i32,
-    requested_start: f64,
-    end: f64,
-    now: f64,
-) -> Vec<(f64, f64)> {
-    let period = f64::from(period_secs);
-    // "If the StartTime parameter specifies a time stamp that is greater than 3 hours ago, you
-    // must specify the period as follows or no data points in that time range is returned"
-    // (`GetMetricDataInput$StartTime` / `MetricStat$Period`): the granularity a RANGE can be
-    // read at is the one the tier of its start time still holds, by the one shared rule
-    // ([`crate::state::retained_at_period`]), so a query at a finer one retrieves nothing.
-    if !crate::state::retained_at_period(requested_start, period_secs, now) {
-        return Vec::new();
-    }
-    let start = crate::state::rounded_start(requested_start, period_secs, now);
-    // `StartTime` inclusive, `EndTime` exclusive; windows are `Period` seconds wide and
-    // anchored at the rounded start time, folded by the one shared helper every reader of a
-    // series uses ([`crate::state::windows_of`]).
-    let stored = store.metrics.get(key).map_or(&[][..], Vec::as_slice);
-    let windows = crate::state::windows_of(stored, start, end, period_secs, unit, now);
-
-    let mut points: Vec<(f64, f64)> = Vec::with_capacity(windows.len());
-    for (index, data) in windows {
-        // A statistic the span does not define — a percentile over an opaque aggregate, say —
-        // reports no value for that window rather than an invented one.
-        let Some(value) = crate::state::statistic_value(&data, statistic) else {
-            continue;
-        };
-        points.push((crate::state::window_start(start, index, period), value));
-    }
-    points
-}
-
-/// What one request has resolved so far: the value of every query, the series it retrieved,
-/// and what the resolution has spent.
-///
-/// A `MetricStat` query is folded out of the store; an `Expression` query is evaluated over
-/// the values of the queries it refers to, which are resolved first. Both charge the work the
-/// request has done, so the datapoints one call can read are bounded whatever the queries and
-/// the expressions in it nest.
-#[derive(Debug, Default)]
-struct Resolution {
-    /// The value of every query resolved so far, by its `Id`.
-    values: HashMap<String, MathValue>,
-    /// The series the request RETRIEVES, in request order, each beside the metric name a
-    /// `METRICS()` filter matches against — what `METRICS()` answers with.
-    retrieved: Vec<(String, MathSeries)>,
-    /// How many points an expression's arithmetic could not produce a number for, by query.
-    dropped: HashMap<String, usize>,
-    /// How many data points the request has RETRIEVED, against [`MAX_RETRIEVED_POINTS`].
-    points: usize,
-    /// How much of the evaluation budget the request's expressions have spent, against the
-    /// evaluator's own `MAX_VISITED_POINTS`.
-    spent: usize,
-}
-
-/// How many data points one call may retrieve: "A GetMetricData operation that does not include
-/// a query can retrieve as many as 500 different metrics in a single request, with a total of as
-/// many as 100,800 data points." (`GetMetricData`)
-const MAX_RETRIEVED_POINTS: usize = 100_800;
-
-/// One expression's answer: its value and the points its arithmetic dropped.
-struct Evaluated {
-    /// The value the expression took.
-    value: MathValue,
-    /// How many points its arithmetic could not produce a number for.
-    dropped: usize,
-    /// How much of the request's evaluation budget is spent once it is evaluated.
-    spent: usize,
-}
-
-impl Resolution {
-    /// Record what one `MetricStat` query retrieved, refusing a request that retrieves more
-    /// data points than one call may.
-    fn retrieve(
-        &mut self,
-        query: &MetricDataQuery,
-        series: MathSeries,
-    ) -> Result<(), GetMetricDataError> {
-        self.points = self.points.saturating_add(series.points.len());
-        if self.points > MAX_RETRIEVED_POINTS {
-            return Err(invalid_combination(format!(
-                "the queries of this request retrieve more than the {MAX_RETRIEVED_POINTS} data \
-                 points one call can retrieve; narrow the time range or widen the Period"
-            )));
-        }
-        let metric_name = query
-            .metric_stat
-            .as_ref()
-            .and_then(|stat| stat.metric.metric_name.clone())
-            .unwrap_or_default();
-        self.retrieved.push((metric_name, series.clone()));
-        self.values
-            .insert(query.id.clone(), MathValue::Series(series));
-        Ok(())
-    }
-
-    /// Evaluate one expression query over what the request has resolved so far.
-    fn evaluate(
-        &self,
-        query: &MetricDataQuery,
-        tree: &Expression,
-        source: &dyn crate::state::metric_math::SeriesSource,
-        window: (f64, f64),
-    ) -> Result<Evaluated, GetMetricDataError> {
-        // "The granularity, in seconds, of the returned data points"
-        // (`MetricDataQuery$Period`): an expression's own period is what a constructed series
-        // is spaced at, and the default is the one minute every regular-resolution metric is
-        // stored at. It is a granularity like any other, so the one shared rule judges it.
-        if let Some(period) = query.period {
-            check_period(period)?;
-        }
-        let period = query.period.map_or(DEFAULT_EXPRESSION_PERIOD, f64::from);
-        let scope = crate::state::metric_math::MathScope {
-            resolved: &self.values,
-            retrieved: &self.retrieved,
-            source,
-            start: window.0,
-            end: window.1,
-            period,
-        };
-        // The budget carries over from the expressions already evaluated, so it bounds the
-        // REQUEST rather than each of its expressions.
-        let mut evaluation = crate::state::metric_math::Evaluation::resumed(&scope, self.spent);
-        let value = evaluation
-            .value(tree)
-            .map_err(|error| expression_refusal(&query.id, &error.message))?;
-        Ok(Evaluated {
-            value,
-            dropped: evaluation.dropped(),
-            spent: evaluation.spent(),
-        })
-    }
-
-    /// Keep what one expression evaluated to.
-    fn record(&mut self, id: &str, evaluated: Evaluated) {
-        self.values.insert(id.to_string(), evaluated.value);
-        self.dropped.insert(id.to_string(), evaluated.dropped);
-        self.spent = evaluated.spent;
-    }
-
-    /// The answer of every query of the request, in request order.
-    fn answers(
-        &self,
-        input: &GetMetricDataInput,
-        requested_start: f64,
-    ) -> Result<Vec<QueryAnswer>, GetMetricDataError> {
-        let mut answers = Vec::with_capacity(input.metric_data_queries.len());
-        for query in &input.metric_data_queries {
-            let value = self
-                .values
-                .get(&query.id)
-                .cloned()
-                .unwrap_or_else(|| MathValue::Series(MathSeries::default()));
-            let return_data = query.return_data.unwrap_or(true);
-            // A result is a time series ("The timestamps for the data points […] The number of
-            // timestamps always matches the number of values", `MetricDataResult`), so an
-            // expression whose value is one NUMBER cannot be one: it is a term another
-            // expression reads, and a request that asks for it as data is refused rather than
-            // answered with a datapoint at an instant nothing measured.
-            if return_data && matches!(value, MathValue::Scalar(_)) {
-                return Err(expression_refusal(
-                    &query.id,
-                    EXPRESSION_IS_NOT_A_SERIES_REFUSAL,
-                ));
-            }
-            answers.push(QueryAnswer {
-                id: query.id.clone(),
-                return_data,
-                dropped: self.dropped.get(&query.id).copied().unwrap_or_default(),
-                series: reported_series(value, query, requested_start),
-            });
-        }
-        Ok(answers)
-    }
-}
-
-/// Every expression query of the request, parsed, by its `Id`.
-///
-/// Parsing them all before any is evaluated is what refuses a request carrying one malformed
-/// expression without evaluating the others.
-fn parse_expressions(
-    input: &GetMetricDataInput,
-) -> Result<HashMap<&str, (&MetricDataQuery, Expression)>, GetMetricDataError> {
-    let mut parsed: HashMap<&str, (&MetricDataQuery, Expression)> = HashMap::new();
-    for query in &input.metric_data_queries {
-        let Some(expression) = query.expression.as_deref() else {
-            continue;
-        };
-        // "This field can contain either a Metrics Insights query, or a metric math
-        // expression": an Insights query is a SELECT statement in its own language, which
-        // this service does not run.
-        if crate::state::metric_math::is_metrics_insights_query(expression) {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "GetMetricData over a Metrics Insights query",
-            ));
-        }
-        let tree = crate::state::metric_math::parse(expression)
-            .map_err(|error| expression_refusal(&query.id, &error.message))?;
-        parsed.insert(query.id.as_str(), (query, tree));
-    }
-    Ok(parsed)
-}
-
-/// The order the request's expressions are evaluated in: every expression after the ones it
-/// refers to.
-///
-/// "A math expression can use the `Id` of the other metrics or queries to refer to those
-/// metrics, and can also use the `Id` of other expressions to use the result of those
-/// expressions." (`MetricDataQuery$Expression`) — so the references form a graph, and one that
-/// goes in a circle names a value nothing can compute.
-fn evaluation_order(
-    input: &GetMetricDataInput,
-    parsed: &HashMap<&str, (&MetricDataQuery, Expression)>,
-) -> Result<Vec<String>, GetMetricDataError> {
-    let mut order: Vec<String> = Vec::with_capacity(parsed.len());
-    let mut placed: HashSet<&str> = HashSet::with_capacity(parsed.len());
-    for query in &input.metric_data_queries {
-        place(query.id.as_str(), parsed, &mut order, &mut placed, &mut Vec::new())?;
-    }
-    Ok(order)
-}
-
-/// Place `id` after everything it refers to, unless it is placed already.
-fn place<'a>(
-    id: &'a str,
-    parsed: &HashMap<&'a str, (&MetricDataQuery, Expression)>,
-    order: &mut Vec<String>,
-    placed: &mut HashSet<&'a str>,
-    open: &mut Vec<&'a str>,
-) -> Result<(), GetMetricDataError> {
-    if placed.contains(id) {
-        return Ok(());
-    }
-    // An id no expression query of this request defines is either a retrieving query (already
-    // resolved) or an id nothing defines, which the evaluator refuses where the reference is
-    // read rather than here.
-    let Some((_, tree)) = parsed.get(id) else {
-        return Ok(());
-    };
-    if let Some(opened) = open.iter().position(|already| *already == id) {
-        // The cycle itself, as the refusal names it: the ids from the one that closed back on
-        // itself, in the order the expressions refer to each other, and back to it.
-        let mut cycle: Vec<&str> = open.get(opened..).unwrap_or_default().to_vec();
-        cycle.push(id);
-        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+    match refused {
+        QueryRefusal::InvalidValue(message) => invalid_value(message),
+        QueryRefusal::InvalidCombination(message) => invalid_combination(message),
+        QueryRefusal::Expression { id, detail } => expression_refusal(&id, &detail),
+        QueryRefusal::Circular(cycle) => crate::scaffolded::Scaffolded::validation_error(format!(
             "Circular dependency between expressions: {}",
             cycle.join(" -> ")
-        )));
+        )),
+        QueryRefusal::MetricsInsights => crate::scaffolded::Scaffolded::not_implemented(
+            "GetMetricData over a Metrics Insights query",
+        ),
     }
-    open.push(id);
-    for reference in crate::state::metric_math::references(tree) {
-        // The reference names one of THIS request's ids, so the borrow the walk keeps is the
-        // request's own key rather than the string the walk built.
-        if let Some((key, _)) = parsed.get_key_value(reference.as_str()) {
-            place(key, parsed, order, placed, open)?;
+}
+
+/// The answer of every query of the request, in request order.
+fn answers(
+    resolution: &crate::state::metric_query::Resolution,
+    input: &GetMetricDataInput,
+    requested_start: f64,
+) -> Result<Vec<QueryAnswer>, GetMetricDataError> {
+    let mut answers = Vec::with_capacity(input.metric_data_queries.len());
+    for query in &input.metric_data_queries {
+        let value = resolution
+            .value(&query.id)
+            .cloned()
+            .unwrap_or_else(|| MathValue::Series(MathSeries::default()));
+        let return_data = query.return_data.unwrap_or(true);
+        // A result is a time series ("The timestamps for the data points […] The number of
+        // timestamps always matches the number of values", `MetricDataResult`), so an
+        // expression whose value is one NUMBER cannot be one: it is a term another
+        // expression reads, and a request that asks for it as data is refused rather than
+        // answered with a datapoint at an instant nothing measured.
+        if return_data && matches!(value, MathValue::Scalar(_)) {
+            return Err(expression_refusal(
+                &query.id,
+                EXPRESSION_IS_NOT_A_SERIES_REFUSAL,
+            ));
         }
+        answers.push(QueryAnswer {
+            id: query.id.clone(),
+            return_data,
+            dropped: resolution.dropped(&query.id),
+            series: reported_series(value, query, requested_start),
+        });
     }
-    open.pop();
-    if let Some((key, _)) = parsed.get_key_value(id) {
-        placed.insert(key);
-    }
-    order.push(id.to_string());
-    Ok(())
+    Ok(answers)
 }
 
 /// Why an expression whose value is a single number is not a result this operation can return:
@@ -1057,121 +813,8 @@ const ARITHMETIC_ERROR_MESSAGE: &str =
     "One or more data-points have been dropped due to non-numeric values (NaN, -Infinite, \
      +Infinite)";
 
-/// The granularity an expression's constructed series takes when its query names no `Period`:
-/// one minute, the cadence a regular-resolution metric is stored at ("a period can be as
-/// short as one minute (60 seconds)", `MetricDataQuery$Period`).
-const DEFAULT_EXPRESSION_PERIOD: f64 = 60.0;
-
 /// Refuse an expression the service does not evaluate, in the words CloudWatch refuses one in:
 /// the query whose expression it is, and what is wrong with it.
 fn expression_refusal(id: &str, detail: &str) -> GetMetricDataError {
     crate::scaffolded::Scaffolded::validation_error(format!("Error in expression '{id}': {detail}"))
-}
-
-/// The store's answer to a `SEARCH`: every series it holds that the query matches, folded by
-/// the search's statistic into its period's windows.
-struct StoreSearch<'a> {
-    /// The series this request reads.
-    store: &'a crate::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State,
-    /// The `StartTime` the request asked for, before it is rounded to the period's boundary.
-    requested_start: f64,
-    /// The first instant after the requested range.
-    end: f64,
-    /// The instant the request is answered at, which is what the start-time rounding is
-    /// measured from.
-    now: f64,
-}
-
-impl crate::state::metric_math::SeriesSource for StoreSearch<'_> {
-    fn search(
-        &self,
-        query: &str,
-        stat: &str,
-        period: f64,
-    ) -> Result<crate::state::metric_math::SearchResult, crate::state::metric_math::MathError> {
-        let parsed = crate::state::metric_math::parse_search_query(query)?;
-        if !crate::state::is_cloudwatch_statistic(stat) {
-            return Err(crate::state::metric_math::MathError {
-                message: format!("{stat} is not a supported statistic"),
-            });
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        let period_secs = period.trunc() as i32;
-        if let Some(message) = crate::state::period_error(period_secs) {
-            return Err(crate::state::metric_math::MathError { message });
-        }
-
-        // The matched series are answered in a stable order — a search names no order of its
-        // own, and the store is a hash map, so the keys are sorted before anything is folded.
-        let mut matched: Vec<&crate::state::MetricKey> = self
-            .store
-            .metrics
-            .keys()
-            .filter(|key| parsed.matches(&key.namespace, &key.metric_name, &key.dimensions))
-            .collect();
-        matched.sort();
-        matched.truncate(MAX_SEARCH_SERIES);
-
-        Ok(crate::state::metric_math::SearchResult {
-            series: matched
-                .into_iter()
-                .map(|key| {
-                    MathSeries::new(
-                        search_label(key),
-                        fold_series(
-                            self.store,
-                            key,
-                            stat,
-                            None,
-                            period_secs,
-                            self.requested_start,
-                            self.end,
-                            self.now,
-                        ),
-                    )
-                    // A discovered series is still that metric's series, so a band over the
-                    // one series a search found is drawn from its detector's model.
-                    .of_metric(crate::state::metric_math::SeriesMetric {
-                        namespace: key.namespace.clone(),
-                        metric_name: key.metric_name.clone(),
-                        dimensions: key.dimensions.clone(),
-                        stat: stat.to_string(),
-                    })
-                })
-                .collect(),
-            // What the search COST its caller: every series of the store was matched against
-            // the query, whether or not it matched, and the walk charges that to the
-            // expression's budget.
-            scanned: self.store.metrics.len(),
-        })
-    }
-
-    fn anomaly_model(
-        &self,
-        series: &MathSeries,
-    ) -> Option<crate::state::metric_math::AnomalyModel> {
-        // The model is the DETECTOR's: only a detector created for this metric and statistic
-        // trained one, so the metric the series was retrieved for is what the lookup is keyed
-        // on, under the identity the write that stored the detector was keyed by. A series
-        // computed from others is no metric's series and no detector's.
-        let metric = series.metric.as_ref()?;
-        let detector_id = crate::state::AnomalyDetectorForm::of_series_metric(metric).detector_id();
-        let stored = self.store.anomaly_detectors.get(&detector_id)?;
-        crate::state::anomaly_model_of(stored, &series.points, self.now)
-    }
-}
-
-/// How many series one search answers with at most: "A GetMetricData operation that does not
-/// include a query can retrieve as many as 500 different metrics in a single request."
-const MAX_SEARCH_SERIES: usize = 500;
-
-/// The label a searched series is reported under: the metric's name and the values of its
-/// dimensions, which is what tells two series of one metric apart.
-fn search_label(key: &crate::state::MetricKey) -> String {
-    let mut label = key.metric_name.clone();
-    for value in key.dimensions.values() {
-        label.push(' ');
-        label.push_str(value);
-    }
-    label
 }

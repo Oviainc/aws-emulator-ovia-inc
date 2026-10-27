@@ -187,15 +187,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // looked at or stored: this operation updates a member account from the
         // management or delegated administrator account, and the model's
         // `AccountId` documentation states that the management account can't
-        // specify its own `AccountId`. `AccountId` is a required member here
-        // (unlike on the reporting operations), so there is no caller's-own
-        // default to resolve — naming one's own account is the refusal.
-        if input.account_id == crate::state::default_account_id() {
-            return Err(StartPrimaryEmailUpdateErrorModeled::AccessDeniedException(
-                crate::state::cannot_target_own_account(),
-            )
-            .into());
-        }
+        // specify its own `AccountId`. The member is required here (unlike on
+        // the reporting operations), so it always names an account — and a
+        // named account is resolved by the one resolution every operation
+        // taking an account id goes through, which is what refuses the caller's
+        // own.
+        let account_id = match crate::state::target_account_id(Some(&input.account_id)) {
+            Ok(account_id) => account_id,
+            Err(denied) => {
+                return Err(
+                    StartPrimaryEmailUpdateErrorModeled::AccessDeniedException(denied).into(),
+                )
+            }
+        };
 
         // `PrimaryEmail` carries `@length(min: 5, max: 64)` and no `@pattern`, and
         // `AccountId` carries `^\d{12}$`, so the boundary already refused anything
@@ -231,15 +235,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // update would have created). The target account itself is skipped on
         // both halves of the test: asking again for the address it already
         // holds, or is already owed, takes that address from nobody.
-        if store.primary_email_in_use_by_other(&input.primary_email, &input.account_id) {
+        if store.primary_email_in_use_by_other(&input.primary_email, &account_id) {
             return Err(StartPrimaryEmailUpdateErrorModeled::ConflictException(
                 crate::state::primary_email_already_in_use(),
             )
             .into());
         }
-        let Some(account) = store.account_mut(&input.account_id, now) else {
+        let Some(account) = store.account_mut(&account_id, now) else {
             return Err(StartPrimaryEmailUpdateErrorModeled::AccessDeniedException(
-                crate::state::account_store_full(&input.account_id),
+                crate::state::account_store_full(&account_id),
             )
             .into());
         };

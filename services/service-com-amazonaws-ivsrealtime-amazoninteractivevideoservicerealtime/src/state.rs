@@ -1413,6 +1413,17 @@ pub struct CompositionRecord {
     /// transition: its start plus [`COMPOSITION_ACTIVATION_SPAN`]. Stored, never
     /// slept on.
     pub active_at: SystemTime,
+    /// The instant the clock owes this composition the stop that ends it because the
+    /// stage it composites has held no participant since one
+    /// [`COMPOSITION_EMPTY_STAGE_TIMEOUT`] before it; `None` while a participant is in
+    /// that stage.
+    ///
+    /// Written only by [`Self::observe_stage_occupancy`], through the store-wide
+    /// `ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState::observe_stage_occupancy`
+    /// that every change to a stage's participants goes through, so what the timeout is
+    /// measured from is the instant the stage was actually left empty. Stored, never
+    /// slept on.
+    pub empty_stage_stop_at: Option<SystemTime>,
     /// Start order, and the stable key a listing of compositions pages over.
     pub sequence: u64,
 }
@@ -1424,12 +1435,25 @@ impl CompositionRecord {
     /// [`COMPOSITION_ACTIVATION_SPAN`] after the call that started it, and a stopping one
     /// becomes `STOPPED` [`COMPOSITION_STOP_SPAN`] after the call that stopped it,
     /// whether or not anybody calls again: this only writes down a change that was
-    /// already owed at `now`, so a reporting operation may call it. The last step a
+    /// already owed at `now`, so a reporting operation may call it. A composition whose
+    /// stage has held no participant for a whole [`COMPOSITION_EMPTY_STAGE_TIMEOUT`] is
+    /// stopped here too, by the clock rather than by a caller ([`Self::begin_stop`] at
+    /// the instant the timeout ran out), and walks the same steps from there. The last
+    /// step a
     /// stopped composition owes — the deletion of the ephemeral resource — is not a state
     /// to write but a record to drop, which is [`Self::is_reclaimed`]'s question and
     /// `ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState::materialize_due_compositions`'s
     /// to act on.
     pub fn materialize_due(&mut self, now: SystemTime) {
+        // The stop the clock owes a composition whose stage has been empty for a whole
+        // [`COMPOSITION_EMPTY_STAGE_TIMEOUT`] begins AT the instant it fell due, not at
+        // this call: everything the stop owes afterwards is owed from there, so a caller
+        // that reads late sees exactly what one reading on time saw.
+        if self.is_running() {
+            if let Some(due) = self.empty_stage_stop_at.filter(|due| now >= *due) {
+                self.begin_stop(due);
+            }
+        }
         let due = self.state_at(now);
         if due == self.state {
             return;
@@ -1455,14 +1479,28 @@ impl CompositionRecord {
     /// called since the clock made it due.
     ///
     /// A composition's position in its lifecycle is a function of the instants the start
-    /// and the stop recorded — [`Self::active_at`] for `STARTING` -> `ACTIVE`, one
-    /// [`COMPOSITION_STOP_SPAN`] after [`Self::ended_at`] for `STOPPING` -> `STOPPED` —
-    /// so this is what every reader asks, and the stored `state` is only where
+    /// and the end recorded — [`Self::active_at`] for `STARTING` -> `ACTIVE`, one
+    /// [`COMPOSITION_STOP_SPAN`] after the instant its end began ([`Self::stop_began_at`]
+    /// — a caller's stop, or the empty-stage timeout running out) for `STOPPING` ->
+    /// `STOPPED` — so this is what every reader asks, and the stored `state` is only where
     /// [`Self::materialize_due`] writes the answer down. A reader holding the store
     /// immutably therefore reaches the same answer as one that can write, instead of
     /// seeing a transition that is due but not yet recorded. A state the clock owes
     /// nothing from is reported as stored.
     pub fn state_at(&self, now: SystemTime) -> &str {
+        // A composition whose stage has been empty for a whole
+        // [`COMPOSITION_EMPTY_STAGE_TIMEOUT`] is stopped by the clock exactly as a
+        // caller's stop stops it, so both run out of the one instant the stop began
+        // ([`Self::stop_began_at`]) and reach the same two states from it.
+        if self.is_running() {
+            if let Some(began) = self.stop_began_at(now) {
+                return if now >= began + COMPOSITION_STOP_SPAN {
+                    COMPOSITION_STATE_STOPPED
+                } else {
+                    COMPOSITION_STATE_STOPPING
+                };
+            }
+        }
         match self.state.as_str() {
             COMPOSITION_STATE_STARTING if now >= self.active_at => COMPOSITION_STATE_ACTIVE,
             COMPOSITION_STATE_STOPPING
@@ -1538,14 +1576,17 @@ impl CompositionRecord {
 // ---------------------------------------------------------------------------
 // Stopping a composition
 //
-// `StopComposition` ends a composition `StartComposition` started. A composition is
+// `StopComposition` ends a composition `StartComposition` started, and so does the clock
+// when the stage a composition composites is left with nobody in it. A composition is
 // EPHEMERAL: the model's `StartComposition` doc says it "is an ephemeral resource that
 // exists after this operation returns successfully" and that the "Composition stops and
-// the resource is deleted … When StopComposition is called". So a stop is the start of
-// the composition's end — the clock owes it `STOPPED` one span later and the deletion of
-// the resource one span after that, both materialised by
-// [`CompositionRecord::materialize_due`] beside the `STARTING` -> `ACTIVE` transition a
-// start owes, and neither ever slept on.
+// the resource is deleted … When StopComposition is called", "After a 1-minute timeout,
+// when all participants are disconnected from the stage" and "After a 1-minute timeout,
+// if there are no participants in the stage when StartComposition is called". So an end
+// is the start of the composition's end, whichever of those began it — the clock owes it
+// `STOPPED` one span later and the deletion of the resource one span after that, both
+// materialised by [`CompositionRecord::materialize_due`] beside the `STARTING` ->
+// `ACTIVE` transition a start owes, and neither ever slept on.
 // ---------------------------------------------------------------------------
 
 /// `CompositionState` a composition is in from the moment `StopComposition` returns until
@@ -1574,6 +1615,19 @@ pub const DESTINATION_STATE_STOPPED: &str = "STOPPED";
 /// the composition back straight after stopping it must still observe `STOPPING`, the way
 /// it would against AWS.
 pub const COMPOSITION_STOP_SPAN: Duration = Duration::from_millis(500);
+
+/// How long a composition goes on composing while the stage it composites holds no
+/// participant, before the clock owes it the stop that ends it.
+///
+/// PUBLISHED, so it keeps the value AWS states rather than a span of this tree's
+/// choosing: `StartComposition` documents that a "Composition stops and the resource is
+/// deleted … After a 1-minute timeout, when all participants are disconnected from the
+/// stage. After a 1-minute timeout, if there are no participants in the stage when
+/// StartComposition is called." Both clauses are the same timeout on the same condition —
+/// the stage has nobody in it — so one span serves both, measured from the instant the
+/// stage was left empty or, for a composition started against an empty stage, from the
+/// start.
+pub const COMPOSITION_EMPTY_STAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl CompositionRecord {
     /// Whether this composition is still composing, so a stop is the next thing that can
@@ -1613,6 +1667,11 @@ impl CompositionRecord {
     /// Begin the stop of this composition at `now`: the composition and every destination
     /// it broadcasts to enter their stopping state and record when the broadcast ended.
     ///
+    /// The one place a composition's end begins, for both of the ways the model says it
+    /// does: a caller's `StopComposition`, and the clock running out the
+    /// [`COMPOSITION_EMPTY_STAGE_TIMEOUT`] of a composition whose stage holds nobody
+    /// ([`Self::materialize_due`], which passes the instant the timeout ran out).
+    ///
     /// Everything after that is the clock's ([`Self::materialize_due`]): `STOPPED` one
     /// [`COMPOSITION_STOP_SPAN`] later, and the deletion of the ephemeral resource one
     /// span after that.
@@ -1629,14 +1688,47 @@ impl CompositionRecord {
     /// nothing may report it any more.
     ///
     /// Due one [`COMPOSITION_STOP_SPAN`] after the stop finished, which is two spans after
-    /// the stop began — computed from the recorded end time and [`Self::state_at`] rather
-    /// than from the stored state, so a reader that holds the record immutably reaches the
-    /// same answer as one that can write ([`Self::materialize_due`] is what removes it).
+    /// the stop began — computed from the instant that end began ([`Self::stop_began_at`])
+    /// and [`Self::state_at`] rather than from the stored state, so a reader that holds the
+    /// record immutably reaches the same answer as one that can write
+    /// ([`Self::materialize_due`] is what removes it).
     pub fn is_reclaimed(&self, now: SystemTime) -> bool {
         self.state_at(now) == COMPOSITION_STATE_STOPPED
             && self
-                .ended_at
-                .is_some_and(|ended_at| now >= ended_at + COMPOSITION_STOP_SPAN * 2)
+                .stop_began_at(now)
+                .is_some_and(|began| now >= began + COMPOSITION_STOP_SPAN * 2)
+    }
+
+    /// The instant this composition's broadcast ends, as of `now`: the instant a stop
+    /// recorded ([`Self::begin_stop`]), or — for a composition no caller stopped — the
+    /// empty-stage deadline once the clock has reached it.
+    ///
+    /// `None` while the composition is still composing and the clock owes it no stop, so
+    /// this is the one question "has this composition's end begun, and when" that both
+    /// ends of the lifecycle are answered from.
+    fn stop_began_at(&self, now: SystemTime) -> Option<SystemTime> {
+        self.ended_at
+            .or_else(|| self.empty_stage_stop_at.filter(|due| now >= *due))
+    }
+
+    /// Record what the stage this composition composites holds at `now`: a participant in
+    /// it keeps the composition composing, and a stage left without one starts the
+    /// [`COMPOSITION_EMPTY_STAGE_TIMEOUT`] after which the clock owes the composition its
+    /// stop.
+    ///
+    /// Idempotent while the stage stays empty — the deadline is measured from the instant
+    /// the stage was LEFT empty, so observing the same emptiness again does not push it
+    /// back — and it says nothing about a composition that is no longer composing: one
+    /// already ending has the instant of its end recorded.
+    pub fn observe_stage_occupancy(&mut self, occupied: bool, now: SystemTime) {
+        if !self.is_running() {
+            return;
+        }
+        if occupied {
+            self.empty_stage_stop_at = None;
+        } else if self.empty_stage_stop_at.is_none() {
+            self.empty_stage_stop_at = Some(now + COMPOSITION_EMPTY_STAGE_TIMEOUT);
+        }
     }
 }
 
@@ -2665,6 +2757,9 @@ pub fn join_stage_session(
             occurrence(EVENT_PUBLISH_STARTED),
         );
     }
+    // The stage now has somebody in it, so no composition of it is counting out the
+    // empty-stage timeout the model's `StartComposition` doc ends a composition on.
+    state.observe_stage_occupancy(stage_arn, SystemTime::now());
     Some(record)
 }
 
@@ -2803,6 +2898,11 @@ pub fn leave_stage_session(
             }
         }
     }
+    // A departure can leave the stage with no participant in it at all, which is when the
+    // timeout the model's `StartComposition` doc ends a composition on starts running for
+    // every composition of that stage ("After a 1-minute timeout, when all participants
+    // are disconnected from the stage").
+    state.observe_stage_occupancy(stage_arn, SystemTime::now());
     true
 }
 
@@ -3366,19 +3466,63 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     /// Write down every composition transition the clock has already made due, and drop
     /// the compositions whose ephemeral resource it has reclaimed.
     ///
-    /// Each one was owed at [`CompositionRecord::active_at`], or one
-    /// [`COMPOSITION_STOP_SPAN`] after a stop, whether or not anybody called, so this
+    /// Each one was owed at [`CompositionRecord::active_at`], at
+    /// [`CompositionRecord::empty_stage_stop_at`], or one
+    /// [`COMPOSITION_STOP_SPAN`] after an end began, whether or not anybody called, so this
     /// changes no composition that a caller reading at the same instant would have seen
     /// differently — which is why a reporting operation may call it. A stopped
     /// composition's record goes the same way: the model says the "Composition stops and
-    /// the resource is deleted … When StopComposition is called", so the record is
-    /// reclaimed rather than kept in a terminal state forever.
+    /// the resource is deleted … When StopComposition is called", and after the same
+    /// published timeout when the stage it composites holds no participant, so the record
+    /// is reclaimed rather than kept in a terminal state forever.
     pub fn materialize_due_compositions(&mut self, now: SystemTime) {
         for composition in self.compositions.values_mut() {
             composition.materialize_due(now);
         }
         self.compositions
             .retain(|_, composition| !composition.is_reclaimed(now));
+    }
+
+    /// Whether the stage `stage_arn` holds any participant right now: a session of it
+    /// with a [`PARTICIPANT_STATE_CONNECTED`] record in it.
+    ///
+    /// The ONE answer to "are there participants in this stage", so what a composition's
+    /// empty-stage timeout turns on is exactly what `ListParticipants` reports of the same
+    /// stage. `false` for a stage this store holds no session of, and for one whose every
+    /// record has left.
+    pub fn stage_has_participants(&self, stage_arn: &str) -> bool {
+        self.stage_sessions.get(stage_arn).is_some_and(|sessions| {
+            sessions.iter().any(|session| {
+                session
+                    .participants
+                    .iter()
+                    .any(|participant| participant.state == PARTICIPANT_STATE_CONNECTED)
+            })
+        })
+    }
+
+    /// Tell every composition of `stage_arn` what that stage holds at `now`
+    /// ([`CompositionRecord::observe_stage_occupancy`]).
+    ///
+    /// Called from each of the three places that answer can change — a participant joining
+    /// ([`join_stage_session`]), one leaving ([`leave_stage_session`]) and a composition
+    /// starting against a stage — so the deadline the clock owes a composition's stop at is
+    /// decided in one place for all of them, and a composition of a stage nobody is in
+    /// cannot go on composing forever.
+    pub fn observe_stage_occupancy(&mut self, stage_arn: &str, now: SystemTime) {
+        // What the clock already owed is written down FIRST, so a participant arriving
+        // after a composition's timeout has run out cannot take back a stop that was
+        // already due: the compositions this reaches are the ones a caller reading at
+        // this instant would have seen.
+        self.materialize_due_compositions(now);
+        let occupied = self.stage_has_participants(stage_arn);
+        for composition in self
+            .compositions
+            .values_mut()
+            .filter(|composition| composition.stage_arn == stage_arn)
+        {
+            composition.observe_stage_occupancy(occupied, now);
+        }
     }
 
     /// The composition of `region` started under the `@idempotencyToken` `token`, if that

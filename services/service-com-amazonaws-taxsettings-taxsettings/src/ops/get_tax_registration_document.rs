@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTaxRegistrationDocument
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTaxRegistrationDocument`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTaxRegistrationDocument::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation answers
+//!
+//! A download location for the tax document the submitted `taxDocumentMetadata`
+//! names, resolved against the registration documents this service holds
+//! ([`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::held_tax_document`]):
+//!
+//! * `presignedS3Url` — where the document itself is
+//!   ([`crate::state::document_download_url`]), reported for every held document.
+//! * `destinationFilePath` — reported only when the request names a
+//!   `destinationS3Location`: the object key the document occupies in THAT
+//!   bucket, which is the file path the request asked it to be downloaded to. A
+//!   request that names no destination asked for no download, so there is no
+//!   destination path to report.
+//!
+//! Metadata that names no held document is refused with the modelled
+//! `ValidationException` (HTTP 400) carrying the `errorCode` the model publishes
+//! for how the token failed: `MalformedToken` for text this service never
+//! minted, `InvalidToken` for a token of its own that no longer locates a
+//! document.
+//!
+//! A pure read: resolving a token materialises nothing, so a later caller is
+//! answered exactly what this one was.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +158,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTaxRegistrationDocument` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTaxRegistrationDocumentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTaxRegistrationDocument"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTaxRegistrationDocumentErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        // The one resolution of a submitted document metadata: the token locates
+        // one document of one revision of one account's registration, and
+        // metadata that locates none is refused with the code the model
+        // publishes for how it failed. The state lock is held only for that
+        // lookup; the response is assembled after the guard is released.
+        let document = {
+            let store = state.lock();
+            store
+                .held_tax_document(&input.tax_document_metadata)
+                .map_err(GetTaxRegistrationDocumentErrorModeled::ValidationException)?
+        };
+        Ok(GetTaxRegistrationDocumentOutput {
+            destination_file_path: input
+                .destination_s3_location
+                .as_ref()
+                .map(|destination| destination_file_path(destination, &document.name)),
+            presigned_s3_url: Some(crate::state::document_download_url(&document)),
+        })
+    }
+}
+
+/// The object key the document occupies in the bucket a request named: the
+/// prefix the request asked for, then the document's own name.
+///
+/// `prefix` is documented as "the Amazon S3 object prefix that you specify for
+/// your tax document file", so it PREFIXES the key rather than replacing it, and
+/// exactly one separator joins the two however the request spelled the prefix —
+/// a request whose prefix ends in the separator names the same place in the
+/// bucket as one that leaves it off, so both get the same key.
+fn destination_file_path(destination: &DestinationS3Location, name: &str) -> String {
+    match destination
+        .prefix
+        .as_deref()
+        .map(|prefix| prefix.trim_end_matches('/'))
+        .filter(|prefix| !prefix.is_empty())
+    {
+        Some(prefix) => format!("{prefix}/{name}"),
+        None => name.to_string(),
     }
 }

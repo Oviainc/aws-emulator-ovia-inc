@@ -69,6 +69,8 @@ mod scheduling_policy_listing;
 mod scheduling_policy_refusal_messages;
 #[path = "all/scheduling_policy_teardown_and_conflicts.rs"]
 mod scheduling_policy_teardown_and_conflicts;
+#[path = "all/scheduling_policy_update_round_trip.rs"]
+mod scheduling_policy_update_round_trip;
 #[path = "all/service_environment.rs"]
 mod service_environment;
 #[path = "all/service_job_capacity_placement.rs"]

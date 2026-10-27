@@ -9332,6 +9332,15 @@ pub struct StoredDeployment {
     /// 1 for a service's first deployment, incremented per deployment after.
     pub version: i32,
     pub state: &'static str,
+    /// Whether this deployment ever BECAME ACTIVE, i.e. whether the service
+    /// launched the containers it declares.
+    ///
+    /// `INACTIVE` covers two deployments the service tells apart: one that ran
+    /// and stepped down when a later deployment replaced it, and one that was
+    /// replaced while it was still `ACTIVATING` and so never launched anything.
+    /// This is the bit that says which, so the containers that "previously ran"
+    /// are only the ones a deployment that did activate declares.
+    pub activated: bool,
     /// A `BTreeMap` so the containers are stored in one stable order, whatever
     /// order the request's map arrived in.
     pub containers: BTreeMap<String, Container>,
@@ -9582,6 +9591,11 @@ impl StoredContainerService {
                 }
             }
             self.deployments[activating].state = DEPLOYMENT_STATE_ACTIVE;
+            // This deployment is launching its containers now, so they are the
+            // ones that RAN on this service from here on — including after a
+            // later deployment supersedes it, which is what distinguishes it
+            // from a deployment that was replaced before it ever activated.
+            self.deployments[activating].activated = true;
         }
     }
 
@@ -9641,6 +9655,39 @@ impl StoredContainerService {
         self.deployments
             .iter()
             .map(StoredDeployment::view)
+            .collect()
+    }
+
+    /// Every deployment of this service that BECAME ACTIVE and the store still
+    /// holds, newest version first: the one running now and the ones it
+    /// superseded.
+    ///
+    /// A deployment still `ACTIVATING` is NOT among them, and neither is one
+    /// that was replaced before it ever activated: neither launched a container.
+    pub fn deployments_that_ran(&self) -> impl Iterator<Item = &StoredDeployment> {
+        self.deployments
+            .iter()
+            .filter(|deployment| deployment.activated)
+    }
+
+    /// Whether `container` is one that is running, or previously ran, on this
+    /// service — i.e. one that a deployment of it that became active declares.
+    pub fn has_run_container(&self, container: &str) -> bool {
+        self.deployments_that_ran()
+            .any(|deployment| deployment.containers.contains_key(container))
+    }
+
+    /// The name of every container that is running, or previously ran, on this
+    /// service, in one stable order and without repeats (a container of the same
+    /// name in two deployments is one container of this service).
+    ///
+    /// Bounded by [`MAX_CONTAINERS_PER_DEPLOYMENT`] per deployment the store
+    /// keeps, so the set is bounded however many deployments the service has had.
+    pub fn containers_that_ran(&self) -> Vec<&str> {
+        self.deployments_that_ran()
+            .flat_map(|deployment| deployment.containers.keys().map(String::as_str))
+            .collect::<BTreeSet<&str>>()
+            .into_iter()
             .collect()
     }
 }
@@ -9721,6 +9768,9 @@ pub fn deployment_from_request(
     Ok(StoredDeployment {
         version,
         state: DEPLOYMENT_STATE_ACTIVATING,
+        // A deployment the request just described has not launched anything
+        // yet: the clock activates it.
+        activated: false,
         containers,
         public_endpoint,
         created_at_ms: now_ms,
@@ -16067,6 +16117,170 @@ mod tests {
             cases.iter().map(|(_, name)| (*name).to_string()).collect::<Vec<_>>(),
             "case the whole registry: expected the images in registration order"
         );
+    }
+
+    /// RULE: a deployment that steps down when the clock activates the next one
+    /// stays one that PREVIOUSLY RAN, so the containers it declared stay ones
+    /// the service is running or previously ran, while a deployment that never
+    /// became active — one still waiting on the clock, or one replaced before it
+    /// activated — launched nothing and declares none of them. A deployment the
+    /// [`MAX_DEPLOYMENTS_PER_SERVICE`] bound dropped is forgotten with its
+    /// containers.
+    #[test]
+    fn a_superseded_deployment_is_kept_as_one_that_previously_ran() {
+        let mut service = StoredContainerService {
+            name: "svc".to_string(),
+            arn: String::new(),
+            created_at_ms: CREATED_AT_MS,
+            location: StoredLocation {
+                region_name: REGION.to_string(),
+                availability_zone: Some(format!("{REGION}a")),
+            },
+            tags: Vec::new(),
+            power: "nano".to_string(),
+            power_id: "nano-1".to_string(),
+            scale: 1,
+            state: CONTAINER_SERVICE_READY,
+            is_disabled: false,
+            domain_token: "token".to_string(),
+            principal_arn: String::new(),
+            public_domain_names: BTreeMap::new(),
+            ecr_image_puller_role_active: false,
+            deployments: VecDeque::new(),
+            next_deployment_version: 1,
+            images: Vec::new(),
+            owed: VecDeque::new(),
+        };
+
+        // Each deployment declares one container named after it, so which
+        // deployment a container came from is unambiguous.
+        let container_of = |version: i32| format!("app-{version}");
+        let deployment = |version: i32| StoredDeployment {
+            version,
+            state: DEPLOYMENT_STATE_ACTIVATING,
+            activated: false,
+            containers: BTreeMap::from([(
+                container_of(version),
+                Container {
+                    image: Some("nginx:latest".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            public_endpoint: None,
+            created_at_ms: CREATED_AT_MS,
+        };
+
+        // Three deployments past the bound, so what the bound drops is covered
+        // as well as what it keeps.
+        let total = i32::try_from(MAX_DEPLOYMENTS_PER_SERVICE + 3)
+            .expect("the case count fits a deployment version");
+        for version in 1..=total {
+            service.record_deployment(deployment(version));
+            service.owed.push_back(OwedPhase {
+                at_ms: CREATED_AT_MS,
+                state: CONTAINER_SERVICE_RUNNING,
+                activates_next_deployment: true,
+            });
+            service.advance(CREATED_AT_MS);
+
+            let ran = service.deployments_that_ran().count();
+            let want = usize::try_from(version)
+                .expect("the version fits a count")
+                .min(MAX_DEPLOYMENTS_PER_SERVICE);
+            assert_eq!(
+                ran, want,
+                "case {version} deployments activated: expected {want} of them still counted as \
+                 having run, got {ran}"
+            );
+            // Every deployment still held answers for its own container,
+            // whether it is the active one or one that ran before.
+            for held in service
+                .deployments_that_ran()
+                .map(|deployment| deployment.version)
+                .collect::<Vec<i32>>()
+            {
+                let container = container_of(held);
+                assert!(
+                    service.has_run_container(&container),
+                    "case {version} deployments activated: expected {container:?} of the \
+                     deployment {held} the store still holds to be one that ran, got the \
+                     containers {:?}",
+                    service.containers_that_ran()
+                );
+            }
+        }
+
+        assert_eq!(
+            service
+                .current_deployment()
+                .map(|active| (active.version, active.state)),
+            Some((total, DEPLOYMENT_STATE_ACTIVE)),
+            "case the newest deployment: expected it active, got {:?}",
+            service.current_deployment()
+        );
+        let not_inactive: Vec<i32> = service
+            .deployments
+            .iter()
+            .filter(|held| held.version != total && held.state != DEPLOYMENT_STATE_INACTIVE)
+            .map(|held| held.version)
+            .collect();
+        assert!(
+            not_inactive.is_empty(),
+            "case every superseded deployment: expected each marked \
+             {DEPLOYMENT_STATE_INACTIVE}, got {not_inactive:?} that are not"
+        );
+        // The oldest deployments are the ones the bound forgot, so their
+        // containers are no longer ones this service ran.
+        let bound = i32::try_from(MAX_DEPLOYMENTS_PER_SERVICE)
+            .expect("the bound fits a deployment version");
+        for forgotten in 1..=(total - bound) {
+            let container = container_of(forgotten);
+            assert!(
+                !service.has_run_container(&container),
+                "case the deployment {forgotten} the bound dropped: expected {container:?} to \
+                 be forgotten with it, got the containers {:?}",
+                service.containers_that_ran()
+            );
+        }
+        let newest = container_of(total);
+        assert!(
+            service.containers_that_ran().contains(&newest.as_str()),
+            "case the containers that ran: expected {newest:?} among them, got {:?}",
+            service.containers_that_ran()
+        );
+
+        // A deployment still WAITING on the clock, and one replaced while it was
+        // still waiting, both launched nothing — asserted here, where the clock
+        // is explicit and no activation can race the check.
+        let replaced_while_waiting = total.saturating_add(1);
+        let waiting = total.saturating_add(2);
+        service.record_deployment(deployment(replaced_while_waiting));
+        service.record_deployment(deployment(waiting));
+        for (case, version) in [
+            ("a deployment still waiting on the clock", waiting),
+            (
+                "a deployment replaced before it ever activated",
+                replaced_while_waiting,
+            ),
+        ] {
+            let container = container_of(version);
+            assert!(
+                !service.has_run_container(&container),
+                "case {case}: expected {container:?} not to be one that ran, got the containers \
+                 {:?}",
+                service.containers_that_ran()
+            );
+            assert!(
+                service
+                    .deployments_that_ran()
+                    .all(|ran| ran.version != version),
+                "case {case}: expected it outside the deployments that ran, got {:?}",
+                service
+                    .deployments_that_ran()
+                    .map(|ran| ran.version)
+                    .collect::<Vec<i32>>()
+            );
+        }
     }
 
     /// RULE: the access settings this store names are the modelled
