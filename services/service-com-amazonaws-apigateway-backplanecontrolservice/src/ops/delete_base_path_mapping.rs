@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBasePathMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBasePathMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBasePathMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored `BasePathMapping` the request's `basePath` addresses
+//! under the custom domain name record its `domainName` (with `domainNameId` for a private
+//! one) resolves to, so a later `GetBasePathMapping` of that base path no longer finds it
+//! and the base path is free to map again; answers `NotFoundException` when the
+//! identifiers resolve to no domain name record, and when that record holds no mapping at
+//! the base path.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +169,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBasePathMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBasePathMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBasePathMapping"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // A base path mapping is a record OF a custom domain name, so it is reached through
+        // that record: the domain name is resolved by the two members `GetDomainName` and
+        // `GetBasePathMapping` resolve one by (a `domainNameId` is "supported only for
+        // private custom domain names", and a private one needs it because several may
+        // carry one name). An identifier pair no stored record answers to resolves to no
+        // domain name, so there is no record to delete a mapping of: that is the domain
+        // name's own missing-resource refusal rather than the mapping's.
+        let domain_key =
+            crate::state::domain_name_key(&input.domain_name, input.domain_name_id.as_deref());
+        let domain = store.domain_names.get_mut(&domain_key).ok_or_else(|| {
+            DeleteBasePathMappingErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_DOMAIN_NAME.to_string()),
+            })
+        })?;
+
+        // The `basePath` label addresses ONE mapping of that domain name, under the
+        // spelling the record was stored with: `(none)` is the base path a caller reaches
+        // by naming the domain name and nothing after it, which is what the member
+        // documents and what `CreateBasePathMapping` stored. "Deletes the BasePathMapping
+        // resource": removing the record is what makes a later `GetBasePathMapping` stop
+        // reporting it, and leaves every other mapping of the domain name — and the domain
+        // name record itself — exactly as they were. A base path the record carries no
+        // mapping for names nothing to delete, so the call is refused with the same
+        // `NotFoundException` the read answers rather than reporting a silent success; that
+        // is also what makes a second delete of one mapping, or two concurrent ones,
+        // resolve to one success and one 404. The lookup and the removal share ONE hold of
+        // the store lock, so two concurrent deletes cannot both remove it.
+        let base_path = crate::state::base_path_key(Some(&input.base_path));
+        if domain.base_path_mappings.remove(&base_path).is_none() {
+            return Err(DeleteBasePathMappingErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::NO_SUCH_BASE_PATH_MAPPING.to_string()),
+                },
+            )
+            .into());
+        }
+        // The store lock is released before the outcome is recorded: the critical section
+        // covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome —
+        // the one record `crate::state::AUDIT_TARGET` documents, as the sibling
+        // `CreateBasePathMapping` handler emits it. Metadata only.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            domain_name = ?domain_key,
+            base_path = ?base_path,
+            outcome = "deleted",
+            "base path mapping deleted",
+        );
+        Ok(DeleteBasePathMappingOutput)
     }
 }
