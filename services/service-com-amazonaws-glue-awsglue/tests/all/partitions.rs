@@ -22,6 +22,7 @@
 //! one item can fail.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_glue_awsglue::state::messages::PARTITION_NOT_FOUND;
 use service_com_amazonaws_glue_awsglue::state::MAX_PARTITIONS_PER_TABLE;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -659,21 +660,21 @@ async fn a_read_of_an_absent_partition_is_refused() {
             "reads_db",
             "reads_table",
             vec!["2026-01-09"],
-            "Partition [2026-01-09] not found.",
+            PARTITION_NOT_FOUND,
         ),
         (
             "a value differing from a stored one only in case",
             "reads_db",
             "reads_table",
             vec!["monday"],
-            "Partition [monday] not found.",
+            PARTITION_NOT_FOUND,
         ),
         (
             "more values than the table has partition keys",
             "reads_db",
             "reads_table",
             vec!["2026-01-01", "us-east-1"],
-            "Partition [2026-01-01, us-east-1] not found.",
+            PARTITION_NOT_FOUND,
         ),
     ];
 

@@ -401,6 +401,16 @@ const UNSUPPORTED_STATISTIC_PREFIX: &str = "Unsupported statistic ";
 /// all of the statistics listed in CloudWatch statistics definitions."
 /// (`MetricStreamStatisticsConfiguration$AdditionalStatistics`)
 ///
+/// The member carries the statistics that are ADDITIONAL to the ones a stream sends anyway:
+/// "By default, a metric stream always sends the MAX, MIN, SUM, and SAMPLECOUNT statistics
+/// for each metric that is streamed. You can use this parameter to have the metric stream
+/// also send additional statistics in the stream."
+/// (`PutMetricStreamInput$StatisticsConfigurations`) — so a BASIC statistic is not
+/// admissible in any output format, json included: what json widens the member to is the
+/// statistic ABBREVIATIONS, which are exactly the extended statistics
+/// ([`crate::state::is_extended_statistic`] — percentiles and the bounded families,
+/// including the interquartile mean).
+///
 /// CloudWatch words that refusal as one fixed sentence carrying the statistic the request
 /// asked for: `Unsupported statistic <statistic> for selected OutputFormat`
 /// ([`UNSUPPORTED_STATISTIC_PREFIX`], measured against `monitoring` in us-west-2), so the
@@ -432,10 +442,13 @@ fn validate_statistics_configurations(
             )));
         }
         for statistic in &configuration.additional_statistics {
+            // Both formats admit only statistics a stream does not already send: the
+            // OpenTelemetry formats narrow that to the percentiles, while json takes every
+            // extended statistic CloudWatch abbreviates.
             let supported = if percentiles_only {
                 crate::state::parse_percentile(statistic).is_some()
             } else {
-                crate::state::is_cloudwatch_statistic(statistic)
+                crate::state::is_extended_statistic(statistic)
             };
             if !supported {
                 return Err(invalid_parameter_value(format!(
@@ -466,8 +479,8 @@ fn is_opentelemetry_format(format: &str) -> bool {
 }
 
 // The statistic grammar every operation of this service that takes a statistic NAME is
-// judged by lives in `crate::state` — `is_cloudwatch_statistic` and `parse_percentile` — so
-// a metric stream, a metric read and an alarm all admit the same set.
+// judged by lives in `crate::state` — `is_cloudwatch_statistic`, `is_extended_statistic` and
+// `parse_percentile` — so a metric stream, a metric read and an alarm all admit the same set.
 
 #[cfg(test)]
 mod tests {
