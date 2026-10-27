@@ -40,7 +40,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     build_router, call, element, emulator, error_code, grant_sns_delivery, merged, now_secs, ok,
-    rpc, sns, wait_for_evaluation,
+    rpc, sns, wait_for_evaluation, wait_for_period_room,
 };
 
 /// The customer namespace the alarm rows below watch.
@@ -67,14 +67,13 @@ const EVALUATION_RANGE_PERIODS: i32 = 3;
 ///
 /// A metric is aggregated into periods anchored at multiples of the period, so a row that
 /// needs its datapoint to stay in one period across a reading — or to leave one after a known
-/// wait — has to know where in the period it is publishing.
-fn wait_for_period_start(period: f64) {
+/// wait — has to know where in the period it is publishing: just past a boundary is where
+/// almost the whole window is still ahead ([`wait_for_period_room`]).
+async fn wait_for_period_start(period: f64) {
     /// How far into a period is close enough to its start for a reading to follow inside it.
     const CLOSE_ENOUGH_SECS: f64 = 2.0;
 
-    while now_secs().rem_euclid(period) > CLOSE_ENOUGH_SECS {
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_period_room(period, period - CLOSE_ENOUGH_SECS).await;
 }
 
 /// The alarm every row of the evaluation table starts from: one 60-second period, one
@@ -675,7 +674,7 @@ async fn an_evaluation_with_nothing_to_grade_reports_the_datapoints_it_did_not_h
     // datapoint out of the range falls at a known instant: publishing just after one boundary
     // leaves each row's datapoint inside its range for the reading below, and the wait that
     // follows crosses exactly one more boundary.
-    wait_for_period_start(f64::from(SHORTEST_PERIOD_SECS));
+    wait_for_period_start(f64::from(SHORTEST_PERIOD_SECS)).await;
     for (index, (_, periods, _)) in rows.iter().enumerate() {
         let name = format!("aged-out-{index}");
         let alarm = patched(

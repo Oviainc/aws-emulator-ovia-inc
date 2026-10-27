@@ -37,6 +37,29 @@ pub fn wait_for_evaluation() {
     std::thread::sleep(PAST_EVALUATION_DELAY);
 }
 
+/// Wait until at least `room` seconds are left of the `period`-second window the clock is in.
+///
+/// A metric is aggregated into periods ANCHORED at multiples of the period, so the window a
+/// datapoint belongs to is fixed by its own time stamp while the window an evaluation counts
+/// back FROM is the one that evaluation runs in: once the clock crosses a boundary, a datapoint
+/// published a fixed number of windows back is one window further back than it was. A suite
+/// that stamps a datapoint relative to now and then reads the state that datapoint decides asks
+/// here for as much of the window as its publish and that read need, so both land in the window
+/// it placed the datapoint relative to.
+///
+/// The wait is an await, so a test driving the service meanwhile still runs. `room` shorter
+/// than the period is the caller's part of the bargain: no instant of a window has more than
+/// the whole period left.
+pub async fn wait_for_period_room(period: f64, room: f64) {
+    debug_assert!(
+        room < period,
+        "a window of {period} seconds can never have {room} seconds left"
+    );
+    while period - now_secs().rem_euclid(period) < room {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Wall-clock now as epoch seconds, the clock the evaluation windows are measured against.
 pub fn now_secs() -> f64 {
     SystemTime::now()
