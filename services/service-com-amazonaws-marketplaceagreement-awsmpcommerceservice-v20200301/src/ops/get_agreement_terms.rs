@@ -173,10 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // The token resumes this agreement's terms and no other list's.
+        // The token resumes this agreement's terms and no other list's: the
+        // scope names the operation as well as the agreement, so a token minted
+        // for the same agreement's entitlements cannot resume these terms.
+        let scope = crate::state::listing_scope(Self::NAME, &[&input.agreement_id]);
         let offset = match input.next_token.as_deref() {
             None => 0,
-            Some(token) => match crate::state::page_offset(&input.agreement_id, token) {
+            Some(token) => match crate::state::page_offset(&scope, token) {
                 Some(offset) => offset,
                 None => {
                     return Err(GetAgreementTermsErrorModeled::ValidationException(
@@ -189,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some((accepted_terms, next_token)) = crate::state::paginate(
             &agreement.accepted_terms,
-            &input.agreement_id,
+            &scope,
             offset,
             crate::state::page_size(input.max_results),
         ) else {
