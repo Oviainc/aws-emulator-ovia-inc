@@ -371,3 +371,8 @@ mod workload_industry_type;
 // repeatedly refused to merge.
 #[path = "all/agent_recommendation_items.rs"]
 mod agent_recommendation_items;
+
+// Appended at the end of this list for the reason the notes above give: the sorted position
+// for a review-template suite falls in a crowded run of this list.
+#[path = "all/review_template_updates.rs"]
+mod review_template_updates;
