@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBulkImportJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBulkImportJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBulkImportJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +146,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBulkImportJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBulkImportJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBulkImportJobs"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            internal_failure("the IoT SiteWise store is unavailable".to_string())
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        // "Retrieves a paginated list of bulk import job requests": a report, so
+        // nothing here writes. Every value a summary carries is DERIVED from the
+        // stored job and the instant the clock has reached, which is why this
+        // listing moves no job on and cannot disagree with a read of one job.
+        let store = state.lock();
+
+        // `workspaceName` NARROWS the listing to one workspace, so that workspace
+        // has to exist: a name this service does not hold is the modelled absence
+        // every other workspace-scoped operation of this service reports, and not
+        // an empty page, which would report absence as success. Resolved BEFORE the
+        // filters are read, as every handler in this crate resolves the resource a
+        // request names first.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            if !store.workspaces.contains_key(workspace) {
+                return Err(not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_WORKSPACE,
+                    workspace,
+                )));
+            }
+        }
+
+        // "You can use a filter to select the bulk import jobs that you want to
+        // retrieve": a value of the modelled filter catalogue, which selects the
+        // jobs in the status it names, while `ALL` — the value a request that names
+        // no filter is read as — selects every job in scope. A value outside the
+        // catalogue is refused against the modelled enum BEFORE this handler runs,
+        // so reaching here means the filter names one of them.
+        let filter = input.filter.as_deref().unwrap_or(FILTER_ALL);
+        let status_wanted = (filter != FILTER_ALL).then_some(filter);
+
+        // Every job in scope that the filter keeps. The status compared against is
+        // the one the CLOCK has made due, which is the same one the summary below
+        // reports, so a filtered page can never disagree with the summaries in it.
+        let mut selected: Vec<&crate::state::BulkImportJobRecord> = store
+            .bulk_import_jobs
+            .values()
+            .filter(|record| record.in_workspace(input.workspace_name.as_deref()))
+            .filter(|record| status_wanted.is_none_or(|wanted| record.status(now) == wanted))
+            .collect();
+
+        // A stable total order is what makes `nextToken` resumable: oldest first,
+        // ties broken by id so two jobs created in the same instant still order
+        // deterministically. Oldest first, rather than the newest-first order the
+        // sibling `list_enrichment_jobs` takes, because that operation's model
+        // documents its order and this one's documents none — so this listing
+        // follows the order every other undocumented listing of this service uses.
+        selected.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+
+        // This enumeration's resume point is a job's `jobId`, and the page walk
+        // every paginated listing of this service shares takes it from there: it
+        // resumes at the token's job, refusing a token whose resume point is not in
+        // this enumeration rather than answering an empty page; it cuts the page at
+        // `maxResults`, defaulting to this service's page size; and it mints "the
+        // token for the next set of results, or null if there are no additional
+        // results" off the job that follows the page.
+        let page = crate::state::page_of(
+            &selected,
+            input.next_token.as_deref(),
+            input.max_results,
+            DEFAULT_MAX_RESULTS,
+            |record| record.job_id.as_str(),
+        )
+        .ok_or_else(invalid_token)?;
+
+        // `get` rather than a slice index: the bounds are derived from the request,
+        // so the page is taken in a form that cannot panic whatever they resolve to.
+        let jobs = selected.get(page.start..page.end).unwrap_or_default();
+
+        Ok(ListBulkImportJobsOutput {
+            job_summaries: jobs.iter().map(|record| summary(record, now)).collect(),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// The filter value that selects every job in scope, rather than the jobs of one
+/// status. Source: `smithy_query(query="shape",
+/// shape="ListBulkImportJobsFilter")`, whose values are also in
+/// [`LIST_BULK_IMPORT_JOBS_FILTER_VALUES`]; it is the only value of that
+/// catalogue that is not a `JobStatus`.
+const FILTER_ALL: &str = "ALL";
+
+/// The page size this listing answers with when the caller gives no `maxResults`.
+///
+/// CHOSEN, not documented: the member is documented only as "The maximum number
+/// of results to return for each paginated request". It is the default this
+/// service's other paginated listings already use, so a client that pages without
+/// asking for a size sees one page size across the service.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// One stored job as the summary this operation reports, read straight off the
+/// record `CreateBulkImportJob` persisted and `DescribeBulkImportJob` reads back —
+/// including the status the clock has made due at `now` — so a listed job and a
+/// described one never disagree.
+fn summary(record: &crate::state::BulkImportJobRecord, now: ::std::time::SystemTime) -> JobSummary {
+    JobSummary {
+        id: record.job_id.clone(),
+        name: record.job_name.clone(),
+        status: record.status(now).to_string(),
+    }
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued.
+fn invalid_token() -> ListBulkImportJobsError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> ListBulkImportJobsError {
+    ListBulkImportJobsErrorModeled::InvalidRequestException(InvalidRequestException { message })
+        .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> ListBulkImportJobsError {
+    ListBulkImportJobsErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+        .into()
+}
+
+/// HTTP 500 `InternalFailureException` carrying `message`.
+fn internal_failure(message: String) -> ListBulkImportJobsError {
+    ListBulkImportJobsErrorModeled::InternalFailureException(InternalFailureException { message })
+        .into()
 }

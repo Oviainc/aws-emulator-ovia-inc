@@ -239,6 +239,10 @@ mod batch_put_timestamp_and_quality;
 // one.
 #[path = "all/bulk_import_jobs.rs"]
 mod bulk_import_jobs;
+// Declared here, beside the sibling bulk-import suite, for the reason the note
+// above gives.
+#[path = "all/list_bulk_import_jobs.rs"]
+mod list_bulk_import_jobs;
 // In its alphabetical place inside the sorted list, rather than appended after
 // it: the end of this file is where every concurrent iotsitewise change appends a
 // declaration of its own, and four appends there collided in a row with this one.
