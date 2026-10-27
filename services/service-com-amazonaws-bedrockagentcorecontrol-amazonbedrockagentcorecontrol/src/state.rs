@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AgentRuntime, AgentRuntimeArtifact, AgentRuntimeVersionSummary, AuthorizerConfiguration,
-    CapacityProviderConfiguration, CertificateConfiguration, CreateGatewayOutput,
+    CapacityProviderConfiguration, CertificateConfiguration, Code, CreateGatewayOutput,
     CreateGatewayTargetOutput, CredentialProviderConfiguration, CustomTransformConfiguration,
     FilesystemConfiguration, GatewayInterceptorConfiguration, GatewayPolicyEngineConfiguration,
     GatewayProtocolConfiguration, GatewaySummary, GetGatewayOutput, GetGatewayTargetOutput,
@@ -43,7 +43,8 @@ use crate::ops::types::{
     McpTargetConfiguration, Memory, MemoryStrategy, MetadataConfiguration, NamespaceKeyEntry,
     NetworkConfiguration, PrivateEndpoint, ProtocolConfiguration, RequestHeaderConfiguration,
     ResourceNotFoundException,
-    RuntimeMetadataConfiguration, StreamDeliveryResources, TargetConfiguration, TargetSummary,
+    RuntimeMetadataConfiguration, S3Location, StreamDeliveryResources, TargetConfiguration,
+    TargetSummary,
     ToolDefinition, ToolSchema,
     UpdateGatewayOutput, ValidationException, ValidationExceptionField, WafConfiguration,
     WorkloadIdentityDetails,
@@ -2167,6 +2168,216 @@ pub async fn execution_role_is_unassumable(
     // (`service_common::iam_role::role_is_unassumable`), so this crate states
     // only WHICH principal has to be admitted and WHICH operations ask.
     ::service_common::iam_role::role_is_unassumable(ctx, region, role_arn, SERVICE_PRINCIPAL).await
+}
+
+/// The `fieldList` member path a caller names an agent runtime's code object in:
+/// the path through the `AgentRuntimeArtifact` union's `codeConfiguration`
+/// variant down to the object-storage location, so a caller sees which member of
+/// the nested union failed.
+pub const CODE_S3_MEMBER: &str = "agentRuntimeArtifact.codeConfiguration.code.s3";
+
+/// Why a code artifact whose object this account's object storage does not hold
+/// is refused — the sentence the recorded refusal carries.
+pub const CODE_OBJECT_ABSENT_MESSAGE: &str = "S3 object not found in bucket";
+
+/// The same, in the `fieldList` entry the refusal carries for
+/// [`CODE_S3_MEMBER`]: what is wrong with that member's value.
+pub const CODE_OBJECT_ABSENT: &str =
+    "names an Amazon S3 object that this account's object storage does not hold";
+
+/// The modelled validation error for a code artifact whose object is not in
+/// object storage.
+///
+/// The member that failed is reported in the `fieldList` the shape declares for
+/// exactly that; `reason` says a field failed validation. The bucket and the key
+/// are the caller's own values and the remedy does not depend on them, so the
+/// sentence does not echo them.
+pub fn code_object_not_found() -> ValidationException {
+    ValidationException {
+        message: CODE_OBJECT_ABSENT_MESSAGE.to_string(),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: CODE_S3_MEMBER.to_string(),
+            message: CODE_OBJECT_ABSENT.to_string(),
+        }]),
+    }
+}
+
+/// The HTTP status object storage answers a read of an object that IS NOT THERE
+/// with: an absent bucket, an absent key and an absent version are all a 404.
+const OBJECT_ABSENT_STATUS: u16 = 404;
+
+/// The object-storage error codes that say the object a read named is not there:
+/// the bucket does not exist, the key does not, or the named version does not.
+/// `NoSuchBucket`, `NoSuchKey` and `NoSuchVersion` are the codes object
+/// storage's own model declares for a read, and `NotFound` is what a HEAD —
+/// which carries no error document to name them in — reports instead.
+const ABSENT_OBJECT_CODES: &[&str] = &["NoSuchBucket", "NoSuchKey", "NoSuchVersion", "NotFound"];
+
+/// The character an object key's path segments are separated by, which is what
+/// makes a prefix name a set of keys rather than one key.
+const KEY_SEPARATOR: &str = "/";
+
+/// Whether object storage reports that the agent runtime code `artifact` names
+/// no object it holds.
+///
+/// An agent runtime whose artifact is a `codeConfiguration` RUNS the code at the
+/// object-storage location that configuration names, so the location is resolved
+/// when the runtime version is WRITTEN: a request naming an object that is not
+/// there is refused with the operation's modelled validation error and nothing is
+/// persisted. A `containerConfiguration` artifact names no object-storage
+/// location at all, so there is nothing to resolve for it.
+///
+/// `false` means the request may be written. That includes every case where
+/// nothing is KNOWN about the location — an emulator with no object storage to
+/// ask (a router with only this service mounted, say), or any answer that is not
+/// about the caller's object — because a refusal has to be grounded in what
+/// object storage answered, never assumed.
+pub async fn code_object_is_absent(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    artifact: &AgentRuntimeArtifact,
+) -> bool {
+    match artifact {
+        AgentRuntimeArtifact::codeConfiguration(configuration) => match &configuration.code {
+            Code::S3(location) => object_storage_holds_nothing_at(ctx, region, location).await,
+        },
+        AgentRuntimeArtifact::containerConfiguration(_) => false,
+    }
+}
+
+/// Whether object storage holds no object at `location`.
+///
+/// Two reads, both of them reads: they change nothing a later caller sees, in
+/// this service's store or in object storage.
+///
+/// The first is a `HeadObject` of the key the location names — "a HEAD request
+/// has the same options as a GET operation on an object", so it answers the same
+/// existence verdict with NO body, and nothing here interprets the artifact's
+/// contents. The second runs only when that key is not there AND the location
+/// names no version, because the member is modelled as a PREFIX ("The prefix for
+/// objects in the Amazon S3 bucket. This prefix is added to the object keys",
+/// `smithy_query shape=S3Location`): an object stored UNDER the prefix is the
+/// artifact too, and one key is enough to settle it. A location that names a
+/// version names one stored object instead, so there the first read is the whole
+/// answer.
+async fn object_storage_holds_nothing_at(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    location: &S3Location,
+) -> bool {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let client = s3_client(ctx, region);
+    let failure = match client
+        .head_object()
+        .bucket(&location.bucket)
+        .key(&location.prefix)
+        // "If not specified, the latest version of the object is used"
+        // (`S3Location$versionId`), which is what a read naming no version is.
+        .set_version_id(location.version_id.clone())
+        .send()
+        .await
+    {
+        // Object storage holds exactly this object, so the request goes ahead.
+        Ok(_) => return false,
+        Err(failure) => failure,
+    };
+    let status = failure
+        .raw_response()
+        .map(|response| response.status().as_u16());
+    let code = failure.code().unwrap_or_default().to_string();
+    if status != Some(OBJECT_ABSENT_STATUS) || !ABSENT_OBJECT_CODES.contains(&code.as_str()) {
+        // Any other answer says nothing about the caller's object — an emulator
+        // assembled without object storage answers the router's own
+        // `UnknownService`, an authentication refusal is about the signer, and a
+        // transport failure answers nothing at all — so the request is not
+        // refused for it, and it is worth a warning: a deployment with no object
+        // storage to ask is one where this resolution does not run.
+        ::tracing::warn!(
+            bucket = %location.bucket,
+            prefix = %location.prefix,
+            code = %code,
+            status = ?status,
+            detail = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+            "the read of a caller-named code object answered nothing about the object, so the \
+             request was not refused for it",
+        );
+        return false;
+    }
+    // A location that names a VERSION names ONE stored object rather than a set:
+    // the read above resolved exactly that version, so its answer is final and
+    // no other key under the prefix stands in for it.
+    if location.version_id.is_some() {
+        return true;
+    }
+    // The key itself is not there, so what is left is the prefix standing for a
+    // set of keys. It is listed at its own path separator — the prefix plus `/`
+    // unless it already ends in one — so a key that merely shares the value as a
+    // STRING (`<prefix>.bak`) is not taken for the artifact, while any key under
+    // the prefix is. One key settles it, so the listing asks for one.
+    let under_prefix = if location.prefix.ends_with(KEY_SEPARATOR) {
+        location.prefix.clone()
+    } else {
+        format!("{}{KEY_SEPARATOR}", location.prefix)
+    };
+    match client
+        .list_objects_v2()
+        .bucket(&location.bucket)
+        .prefix(&under_prefix)
+        .max_keys(1)
+        .send()
+        .await
+    {
+        Ok(listing) => listing.contents().is_empty(),
+        Err(failure) => {
+            // The read above already answered, with a code about the object,
+            // that the key itself is not there; the listing adds nothing to
+            // that, so the answer stands — and what it could not add is worth
+            // a warning.
+            ::tracing::warn!(
+                bucket = %location.bucket,
+                prefix = %under_prefix,
+                detail = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                "the keys under a caller-named code prefix could not be listed, so the \
+                 absent key stands as the answer",
+            );
+            true
+        }
+    }
+}
+
+/// The object-storage client this service resolves a caller-named code location
+/// through: the in-process callback into this same emulator, at the endpoint of
+/// the request's own Region.
+///
+/// The callback is the framework's documented seam for calling another emulated
+/// service — it routes in process — so no network client is configured here and
+/// this crate names no other service's crate.
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The in-process transport routes on the request's own path, and a
+        // virtual-host bucket name is not a host this emulator resolves, so the
+        // request addresses its bucket in the path.
+        .force_path_style(true)
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or
+        // watch for a stalled stream, and each of those would need a sleep
+        // implementation this client is not given. The same goes for caching the
+        // identity: the credentials are handed over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
 }
 
 /// The credential a gateway target reports when the caller configured none: the
