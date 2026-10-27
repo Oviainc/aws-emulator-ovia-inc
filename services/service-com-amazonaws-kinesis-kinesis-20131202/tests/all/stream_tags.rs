@@ -40,6 +40,7 @@ use service_com_amazonaws_kinesis_kinesis_20131202::state::{
     STREAM_ACTIVE, STREAM_CREATING, STREAM_DELETING, STREAM_IDENTIFIER_MISMATCH_MESSAGE,
     STREAM_IDENTIFIER_REQUIRED_MESSAGE,
 };
+use service_com_amazonaws_kinesis_kinesis_20131202::state::ComAmazonawsKinesisKinesis20131202State;
 use service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -72,6 +73,7 @@ pub(crate) fn past_activation() -> Duration {
 /// `core/router` performs, with one service mounted.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -80,8 +82,19 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         // The signature itself is not under test here, so requests are unauthenticated.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// This service's store inside the engine the router was assembled over — the very
+    /// store every handler of it reads and writes.
+    ///
+    /// A case that asserts what an operation RECORDED beside what it reports (the rolling
+    /// window a quota is counted over, say) reads it here, and one that needs a stream in a
+    /// state reaching it over the wire would cost a long wait sets it up here.
+    pub(crate) fn store(&self) -> engine::ServiceState<ComAmazonawsKinesisKinesis20131202State> {
+        self.engine
+            .state::<ComAmazonawsKinesisKinesis20131202State>()
     }
 
     /// Call `operation` with `body`, signed for `region` so the service resolves the

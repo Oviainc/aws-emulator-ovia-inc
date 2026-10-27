@@ -85,6 +85,8 @@ mod reserved_tag_prefix;
 mod resource_tags;
 #[path = "all/service_delete_drain.rs"]
 mod service_delete_drain;
+#[path = "all/service_deployment_lifecycle_hooks.rs"]
+mod service_deployment_lifecycle_hooks;
 #[path = "all/service_derived_members.rs"]
 mod service_derived_members;
 #[path = "all/service_lifecycle.rs"]

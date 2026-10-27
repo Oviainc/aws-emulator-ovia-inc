@@ -8,9 +8,17 @@
 //! and `UntagResource` all resolve a caller-supplied ARN against
 //! [`ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState::invocations`]
 //! and compute their answer from the stored record.
+//!
+//! A submission also REFERENCES resources this service does not own — the
+//! data-automation project, or the blueprints, that say what to extract. Those belong to
+//! the data-automation build-time service, which is emulated in this workspace, so
+//! [`unresolved_reference_refusal`] resolves such a reference against THAT service's
+//! store rather than recording it as opaque text.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
+
+use service_com_amazonaws_bedrockdataautomation_amazonbedrockkeystonebuildtimeservice::state as build_time;
 
 use crate::ops::types::{
     AssetProcessingConfiguration, Blueprint, DataAutomationConfiguration, EncryptionConfiguration,
@@ -259,6 +267,88 @@ pub fn extraction_target_refusal(
         (true, true) => Some(BOTH_PROJECT_AND_BLUEPRINTS),
         _ => None,
     }
+}
+
+/// The account field the modelled project and blueprint ARN patterns admit beside a
+/// 12-digit account id (`…:(aws|[0-9]{12}):…`): the literal `aws`, which marks a resource
+/// AWS ITSELF owns — the SERVICE-owned catalog of the build-time service's
+/// `ResourceOwner` enum — rather than one an account created.
+const SERVICE_OWNED_ACCOUNT: &str = "aws";
+
+/// Whether `arn` names a resource an ACCOUNT owns, which is the only kind a reference can
+/// be resolved against: the build-time store holds exactly what was created through that
+/// service, so a SERVICE-owned resource (account field [`SERVICE_OWNED_ACCOUNT`]) is a
+/// catalog entry no store here holds and nothing can be concluded from its absence —
+/// refusing it would refuse a reference AWS resolves. Read through the shared ARN parse,
+/// so this service and its siblings agree on what an ARN's account field is.
+fn names_account_owned_resource(arn: &str) -> bool {
+    ::service_common::arn::parse(arn).is_some_and(|parsed| parsed.account != SERVICE_OWNED_ACCOUNT)
+}
+
+/// Why a submission naming a data-automation project no such account holds is refused.
+///
+/// Worded as this service words the sibling refusal for the one resource it owns itself
+/// ([`INVOCATION_NOT_FOUND_MESSAGE`]): the resource kind and the member that names it,
+/// with the caller's ARN NOT echoed back.
+pub const PROJECT_NOT_FOUND_MESSAGE: &str = "Data Automation Project ARN not found.";
+
+/// Why a submission naming a blueprint no such account holds is refused — the same
+/// wording rule as [`PROJECT_NOT_FOUND_MESSAGE`], for the other referenced resource.
+pub const BLUEPRINT_NOT_FOUND_MESSAGE: &str = "Blueprint ARN not found.";
+
+/// The refusal a submission's REFERENCED resources earn, or `None` when every one of them
+/// resolves.
+///
+/// A submission names what to extract by reference: a data-automation project
+/// (`dataAutomationConfiguration.dataAutomationProjectArn`) or inline `blueprints`. Both
+/// resources belong to the data-automation build-time service, which has to be read
+/// before a job can start — the project's output configuration, or the blueprint's
+/// schema, IS the extraction the job performs — so a reference that resolves to nothing
+/// describes no job. The model gives this operation no `ResourceNotFoundException`, so
+/// the refusal is its `ValidationException` (HTTP 400), raised before anything is minted
+/// and so leaving no record behind.
+///
+/// Resolution reads the owning service's own store through its public
+/// `state::service_state`, the way a sibling crate reads another service's state
+/// elsewhere in this workspace, so the runtime and the build-time service answer about
+/// one set of projects and blueprints rather than two. It is called BEFORE this service's
+/// own store guard is taken, so only one engine lock is ever held at a time.
+///
+/// Two references are not resolved, and neither can be concluded from absence. One is an
+/// ARN whose account field is AWS's own ([`names_account_owned_resource`]). The other is a
+/// value that is not a resource ARN at all: the framework's boundary walk enforces the
+/// modelled `@pattern` on both members before a handler runs, so such a value is already
+/// refused as a constraint violation and never reaches here.
+///
+/// `None` from the owning store means this engine holds no store of that type to read at
+/// all, which is only the case for an engine kind this emulator does not mount; on the
+/// shared in-memory engine the store is always readable, and an empty one resolves
+/// nothing, so every account-owned reference is refused until something creates it.
+pub fn unresolved_reference_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    data_automation_configuration: Option<&DataAutomationConfiguration>,
+    blueprints: Option<&[Blueprint]>,
+) -> Option<&'static str> {
+    let control_plane = build_time::service_state(engine)?;
+    let store = control_plane.lock();
+
+    let unknown_project = data_automation_configuration
+        .map(|configuration| configuration.data_automation_project_arn.as_str())
+        .filter(|arn| names_account_owned_resource(arn))
+        .is_some_and(|arn| !store.projects.contains_key(arn));
+    if unknown_project {
+        return Some(PROJECT_NOT_FOUND_MESSAGE);
+    }
+
+    let unknown_blueprint = blueprints.unwrap_or_default().iter().any(|blueprint| {
+        names_account_owned_resource(&blueprint.blueprint_arn)
+            && !store.blueprints.contains_key(&blueprint.blueprint_arn)
+    });
+    if unknown_blueprint {
+        return Some(BLUEPRINT_NOT_FOUND_MESSAGE);
+    }
+
+    None
 }
 
 /// The timestamp segment a submission delimited, or `None` when it delimited no segment.

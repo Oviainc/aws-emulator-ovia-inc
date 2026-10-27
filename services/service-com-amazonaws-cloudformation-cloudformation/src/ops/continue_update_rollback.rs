@@ -202,11 +202,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::refuse_unassumable_role(&*self.engine, input.role_arn.as_deref())?;
         let now = ::std::time::SystemTime::now();
         let request_region = crate::state::request_region(ctx.parts());
+        // A rollback can be continued only from UPDATE_ROLLBACK_FAILED, so a rollback the
+        // failure of the update already made due is carried out first — including the one
+        // that LANDS the stack in that status: it was owed at the instant that update
+        // failed, whether or not anybody called (`crate::state::settle_due_rollbacks`).
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
 
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that put the resources back run after it, and each of those reaches another
         // service's own handler.
-        let (stack_id, region, declared, provenance) = {
+        let (stack_id, region, declared, against, outstanding, provenance) = {
             let mut store = state.lock();
             store.settle(now);
 
@@ -295,32 +300,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &skipped,
                 input.client_request_token.clone(),
             );
-            // What the rollback still has to put back in the owning services: the resources
-            // in force, minus the ones this request skipped — those are "left as the failed
-            // update made them rather than reverted".
-            let declared: Vec<crate::state::StoredResource> = stack
+            // What the rollback still owes the owning services, and what they are still
+            // HOLDING: both sides of the rollback that failed
+            // ([`crate::state::StoredStack::unreverted_rollback`]). The previous
+            // configuration is what this resumption declares again, and what the failed
+            // update left there is what it declares that against — the stack's own records
+            // report what those services hold, so resuming from them alone would ask for no
+            // change at all. A stack whose outstanding rollback this service does not hold
+            // is resumed over the resources in force, declared against themselves.
+            //
+            // The resources `ResourcesToSkip` names are left out of BOTH sides: they are
+            // "left exactly as the failed update made them", so they are neither reverted
+            // nor removed.
+            let outstanding = stack.unreverted_rollback.clone();
+            let in_force: Vec<crate::state::StoredResource> = stack
                 .resources
                 .iter()
                 .map(|deployed| deployed.resource.clone())
-                .filter(|resource| !skipped.contains(&resource.logical_id))
                 .collect();
+            let not_skipped = |resources: Vec<crate::state::StoredResource>| {
+                resources
+                    .into_iter()
+                    .filter(|resource| !skipped.contains(&resource.logical_id))
+                    .collect::<Vec<crate::state::StoredResource>>()
+            };
+            let declared = not_skipped(match &outstanding {
+                Some(rollback) => rollback.previous.clone(),
+                None => in_force.clone(),
+            });
+            let against = not_skipped(match &outstanding {
+                Some(rollback) => rollback.applied.clone(),
+                None => declared.clone(),
+            });
             (
                 stack.stack_id.clone(),
                 stack.region.clone(),
                 declared,
+                against,
+                outstanding,
                 stack.provenance(),
             )
         };
 
         // The rollback is re-attempted over the resources it did not skip, in the Region the
-        // stack lives in: each is declared again in the service that owns it, against the
-        // same set, so nothing the rollback is not resuming is created or deleted.
+        // stack lives in: each is declared again in the service that owns it, against what
+        // that service is still holding, so a change the failed rollback could not put back
+        // is asked for again and nothing the rollback is not resuming is created or deleted.
         let reverted = crate::state::provisioning::reconcile(
             ctx,
             &region,
             &provenance,
-            declared.clone(),
-            &declared,
+            declared,
+            &against,
         )
         .await;
 
@@ -328,15 +359,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(stack) = store.resolve_mut(&request_region, &stack_id) {
             stack.schedule_resource_events(&reverted.transitions);
             stack.record_materialised_resources(reverted.resources);
+            // What the resumed rollback left each resource in, which is what a client reads
+            // back — and what says which resource a further resumption may skip.
+            stack.record_rollback_resource_statuses(
+                &reverted.transitions,
+                ::std::time::SystemTime::now(),
+            );
             if let Some(failure) = reverted.failure {
                 // The rollback could not be carried out even now: the stack stays in
                 // UPDATE_ROLLBACK_FAILED with the owning service's own refusal as the
-                // reason, rather than reporting a rollback that did not happen.
+                // reason, rather than reporting a rollback that did not happen, and what
+                // the owning services hold is still what the failed update put there.
                 stack.fail_transition(
                     ::std::time::SystemTime::now(),
                     status::UPDATE_ROLLBACK_FAILED,
                     failure,
                 );
+                stack.unreverted_rollback = outstanding;
             }
         }
 

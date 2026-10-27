@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.datasets.remove(&input.name).is_none() {
             return Err(DeleteDatasetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    message: Some(crate::state::not_found_message("Dataset", &input.name)),
                 },
             )
             .into());

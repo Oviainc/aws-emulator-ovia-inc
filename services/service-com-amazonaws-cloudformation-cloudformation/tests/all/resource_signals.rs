@@ -490,7 +490,9 @@ async fn a_signal_something_waits_on_is_reported_on_the_resource() {
 }
 
 /// A FAILURE signal the operation in flight is waiting for fails that operation at once —
-/// and the create then unwinds the way the request that started it asked.
+/// and the operation is then rolled back the way the request that started it asked: a
+/// failed create unwinds what it had made, and a failed update goes back to the previous
+/// stack configuration.
 #[tokio::test]
 async fn a_failure_signal_fails_the_operation_that_waits_for_it() {
     struct Row {
@@ -535,12 +537,12 @@ async fn a_failure_signal_fails_the_operation_that_waits_for_it() {
             expected_verb: "create",
         },
         Row {
-            case: "an update waiting on an update policy fails",
+            case: "an update waiting on an update policy fails and is rolled back",
             stack: "failure-update-policy",
             declared: Declared::UpdatePolicy,
             updating: true,
             extra: &[],
-            expected_status: status::UPDATE_FAILED,
+            expected_status: status::UPDATE_ROLLBACK_COMPLETE,
             expected_verb: "update",
         },
     ];

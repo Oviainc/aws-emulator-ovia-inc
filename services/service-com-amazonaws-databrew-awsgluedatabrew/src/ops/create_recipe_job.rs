@@ -233,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.datasets.contains_key(dataset_name) {
                 return Err(CreateRecipeJobErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                        message: Some(crate::state::not_found_message("Dataset", dataset_name)),
                     },
                 )
                 .into());

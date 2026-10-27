@@ -218,11 +218,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // A rollback the failure of an update already made due owes work in the services
+        // that own the stack's resources, and the status this read reports is the one that
+        // rollback reaches: it is carried out here, before the store is read, since it was
+        // owed at the instant that update failed whether or not anybody called
+        // (`crate::state::settle_due_rollbacks`).
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
+
         let mut store = state.lock();
         // Reporting operation: the only write is materialising a status transition the
         // clock had already made due, which was owed whether or not anyone called.
         store.settle(::std::time::SystemTime::now());
-
         // CloudFormation is Regional: this read answers from the stacks of the Region the
         // request was signed for, and a name or id of another Region's stack names nothing
         // here.

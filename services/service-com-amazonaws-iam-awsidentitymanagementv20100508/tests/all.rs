@@ -27,12 +27,16 @@ mod account_aliases;
 mod account_authorization_details;
 #[path = "all/account_properties.rs"]
 mod account_properties;
+#[path = "all/aws_managed_policy_attachability.rs"]
+mod aws_managed_policy_attachability;
 #[path = "all/aws_managed_policy_catalog.rs"]
 mod aws_managed_policy_catalog;
 #[path = "all/custom_policy_context_keys.rs"]
 mod custom_policy_context_keys;
 #[path = "all/entities_for_policy.rs"]
 mod entities_for_policy;
+#[path = "all/enum_refusal_wording.rs"]
+mod enum_refusal_wording;
 #[path = "all/group_attached_policies.rs"]
 mod group_attached_policies;
 #[path = "all/group_attached_policy_listing.rs"]

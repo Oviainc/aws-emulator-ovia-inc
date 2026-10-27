@@ -21,14 +21,19 @@ use crate::ops::types::{
     Dataset, FormatOptions, Input, JobRun, Output, PathOptions, RecipeReference, RecipeStep,
 };
 
-/// The message DataBrew answers a `ResourceNotFoundException` with.
+/// The message DataBrew answers a `ResourceNotFoundException` with: the kind of
+/// resource the lookup addressed, the identifier the request carried for it, and the
+/// fixed `wasn't found.` tail.
 ///
-/// The model documents the error's message for this service (`smithy_query(
-/// query="shape", shape="ResourceNotFoundException")`: "One or more resources can't be
-/// found."), so that sentence IS the message, for every resource kind and every
-/// operation that answers the error. The name that was not found is the caller's own
-/// request, so the service does not append it.
-pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "One or more resources can't be found.";
+/// The sentence the model documents on the error SHAPE ("One or more resources can't
+/// be found.") describes the error class, not the message a particular lookup
+/// answers with: DataBrew builds that message from the request, so a client can tell
+/// which resource was missing, and of which kind. `kind` is the resource kind as
+/// DataBrew names it in prose, capitalised (`Dataset`, `Job`, `Recipe`, `Schedule`);
+/// `identifier` is what the request looked the resource up by.
+pub fn not_found_message(kind: &str, identifier: &str) -> String {
+    format!("{kind} {identifier} wasn't found.")
+}
 
 /// The message DataBrew answers a `ConflictException` with when a create names a
 /// resource that already exists: the resource kind, capitalised, and the name the

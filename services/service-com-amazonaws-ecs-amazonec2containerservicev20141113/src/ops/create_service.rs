@@ -863,7 +863,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // software update for the service"), recorded from the deployment id and the
         // service revision the stored service carries — and only once the create is
         // going to succeed, so a refused create records no deployment.
-        guard.start_service_deployment(&key, &region, created_at);
+        guard.start_service_deployment(&key, &region, created_at, now);
 
         let stored = guard
             .services

@@ -26,11 +26,18 @@
 //! * a NODE is a stored entity of the workspace, labelled with the `componentTypeId` of
 //!   each of its components, so `(e:com.example.type)` selects the entities carrying a
 //!   component of that type;
-//! * an EDGE is a stored relationship: a component property whose value carries a
-//!   `relationshipValue` naming a target entity of the same workspace. The edge's label
-//!   is the property's name, which is what `-[:isLocationOf]->` matches on. A
-//!   relationship pointing outside the workspace is no edge, because the node it would
-//!   end at does not exist.
+//! * an EDGE is a stored relationship between two entities of the workspace, of EITHER
+//!   kind this service stores one:
+//!   * the entity HIERARCHY, which an entity's stored parent records: an edge from the
+//!     child to its parent, labelled [`HIERARCHY_RELATIONSHIP_NAME`], so a hierarchy hop
+//!     matches without the caller having modelled the hierarchy as a property;
+//!   * a component property whose value carries a `relationshipValue` naming a target
+//!     entity of the same workspace, labelled with the property's name.
+//!
+//!   The label is what `-[:isLocationOf]->` matches on, and a relationship whose other
+//!   end is not an entity of this workspace (a target outside it, or the root sentinel a
+//!   top-level entity names as its parent) is no edge, because the node it would end at
+//!   does not exist.
 //!
 //! What the handler refuses, and with which modelled error:
 //!
@@ -1369,16 +1376,26 @@ impl Plan {
 // The graph a workspace's stored entities form
 // ---------------------------------------------------------------------------
 
-/// One relationship of the graph: a stored property value pointing at another entity of
-/// the same workspace.
+/// The name of the relationship the SERVICE itself keeps between an entity and the
+/// parent entity it was created or moved under — the label `-[:isChildOf]->` matches.
+///
+/// The hierarchy is service state in its own right: a create or an update sets the
+/// entity's parent and every read of the entity reports it, so it is a relationship the
+/// knowledge graph holds whether or not any component property models one.
+const HIERARCHY_RELATIONSHIP_NAME: &str = "isChildOf";
+
+/// One relationship of the graph: either the stored parent of an entity, or a stored
+/// property value pointing at another entity of the same workspace.
 #[derive(Debug)]
 struct GraphEdge<'a> {
     source: usize,
     target: usize,
-    /// The name of the property holding the relationship, which is the relationship's
-    /// own name and the label `-[:name]->` matches.
+    /// The relationship's own name, which is the label `-[:name]->` matches: the name of
+    /// the property holding it, or [`HIERARCHY_RELATIONSHIP_NAME`] for the hierarchy.
     relationship_name: &'a str,
-    component_name: &'a str,
+    /// The component holding the relationship, and `None` for the hierarchy, which is
+    /// held between the entities themselves rather than on a component of either.
+    component_name: Option<&'a str>,
     target_component_name: Option<&'a str>,
 }
 
@@ -1423,6 +1440,22 @@ impl<'a> Graph<'a> {
         let mut outgoing = vec![Vec::new(); entities.len()];
         let mut incoming = vec![Vec::new(); entities.len()];
         for (source, entity) in entities.iter().enumerate() {
+            // The hierarchy relationship, from the child to the parent entity it is
+            // stored under. An entity at the top of the hierarchy names the root
+            // sentinel rather than an entity, so it has no such edge — the same rule as
+            // for a property relationship pointing outside the workspace.
+            if let Some(parent) = index_of.get(entity.parent_entity_id.as_str()).copied() {
+                let index = edges.len();
+                edges.push(GraphEdge {
+                    source,
+                    target: parent,
+                    relationship_name: HIERARCHY_RELATIONSHIP_NAME,
+                    component_name: None,
+                    target_component_name: None,
+                });
+                outgoing[source].push(index);
+                incoming[parent].push(index);
+            }
             for component in entity.components.values() {
                 for (property_name, property) in &component.properties {
                     let Some(relationship) = property
@@ -1446,7 +1479,7 @@ impl<'a> Graph<'a> {
                         source,
                         target,
                         relationship_name: property_name.as_str(),
-                        component_name: component.component_name.as_str(),
+                        component_name: Some(component.component_name.as_str()),
                         target_component_name: relationship.target_component_name.as_deref(),
                     });
                     outgoing[source].push(index);
@@ -1503,7 +1536,7 @@ impl<'a> Graph<'a> {
         match field {
             "relationshipName" => Some(text(edge.relationship_name)),
             "sourceEntityId" => Some(text(&self.entities[edge.source].entity_id)),
-            "sourceComponentName" => Some(text(edge.component_name)),
+            "sourceComponentName" => edge.component_name.map(text),
             "targetEntityId" => Some(text(&self.entities[edge.target].entity_id)),
             "targetComponentName" => edge.target_component_name.map(text),
             _ => None,

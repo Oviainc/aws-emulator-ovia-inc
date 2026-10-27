@@ -167,6 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_implemented("ListStacks"));
         };
 
+        // The summary status a stack rolling back reports is the one that rollback reaches:
+        // a rollback the failure of an update already made due is carried out here, before
+        // the summaries are read, since it was owed at the instant that update failed
+        // whether or not anybody called (`crate::state::settle_due_rollbacks`).
+        crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
+
         let mut store = state.lock();
         // Reporting operation: the only write is materialising a status transition the
         // clock had already made due.

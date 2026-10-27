@@ -3,31 +3,46 @@
 //! The UPDATE path's per-resource event timeline and the recovery
 //! `ContinueUpdateRollback` drives, end to end over the awsQuery wire.
 //!
-//! Two rules are under test.
+//! Three rules are under test.
 //!
 //! * An UpdateStack records one stack event per resource per transition it puts that
 //!   resource through, beside the stack's own events, and `DescribeStackEvents` reports them
 //!   newest first — so a client can tell which resources an update had already changed
 //!   before it finished.
+//! * An update that FAILS is rolled back to the previous stack configuration — "if the
+//!   stack update fails, CloudFormation rolls back the stack to the previous stack
+//!   configuration" — in the services that own the resources it had already changed there,
+//!   whichever way it failed: including an update held at an
+//!   `AWS::CloudFormation::WaitCondition` whose wait runs out, which no call of the client's
+//!   ends. The stack reaches `UPDATE_ROLLBACK_COMPLETE`, or `UPDATE_ROLLBACK_FAILED` where
+//!   an owning service refuses to put a resource back, and a caller that asked for the
+//!   failed state to be kept (`DisableRollback`) gets it.
 //! * `ContinueUpdateRollback` resumes the rollback of an update that could not be rolled
 //!   back: it is accepted ONLY for a stack in `UPDATE_ROLLBACK_FAILED`, the resources
 //!   `ResourcesToSkip` names are left exactly as the failed update made them and take
-//!   `UPDATE_COMPLETE`, and the stack reaches `UPDATE_ROLLBACK_COMPLETE`.
+//!   `UPDATE_COMPLETE`, and the stack reaches `UPDATE_ROLLBACK_COMPLETE` — while a resumed
+//!   rollback the owning service refuses again re-enters `UPDATE_ROLLBACK_FAILED`.
 //!
 //! Every case drives the real request path (form-encoded body in, XML envelope out) through
 //! the wire harness. The table for the first rule spans the class it generalises over: a
 //! resource the update CHANGES, one it ADDS, one it REMOVES and one it leaves alone, over
-//! both template spellings. The table for the second spans the statuses a stack can be in
-//! when the call arrives, and the two spellings of what to skip.
+//! both template spellings. The table for the second spans the three directions a revert
+//! runs in (a changed resource put back, an added one removed, a removed one re-created) and
+//! the caller that declines the rollback. The table for the third spans the statuses a stack
+//! can be in when the call arrives, and the two spellings of what to skip.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
+use serde_json::{json, Map, Value};
+use service_com_amazonaws_cloudformation_cloudformation::state::wait_conditions::{
+    MAX_HELD_OPEN, MAX_TIMEOUT,
+};
 use service_com_amazonaws_cloudformation_cloudformation::state::{resource_status, status};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    call, create_stack, member, router, router_with_engine, store, wait_for_the_transition,
-    xml_text, xml_texts, REGION,
+    acknowledging_iam, call, create_stack, iam, member, router, router_with_engine, store,
+    wait_for_the_transition, xml_text, xml_texts, REGION,
 };
 
 /// Every `(LogicalResourceId, ResourceStatus)` pair one `DescribeStackEvents` response
@@ -471,5 +486,619 @@ async fn continuing_a_rollback_leaves_the_skipped_resources_as_the_failed_update
         )),
         "case {:?}: expected the stack's own rollback completion event, got {events:?}",
         "skipping the resource the rollback could not put back"
+    );
+}
+
+/// The `Timeout` the wait conditions this suite declares ask for, in seconds, and how long a
+/// case waits for one of them to run out: the declaration's own value plus the margin every
+/// other suite here allows a clock-owed transition.
+const GATE_TIMEOUT: &str = "1";
+const WAITED_OUT: Duration = Duration::from_millis(1_250);
+
+/// AWS Systems Manager's `X-Amz-Target` prefix, from its model's service shape
+/// (`com.amazonaws.ssm#AmazonSSM`), which speaks awsJson1_1.
+const SSM_TARGET_PREFIX: &str = "AmazonSSM";
+
+/// One Systems Manager call over the awsJson1_1 wire its model declares, signed for `ssm` in
+/// the Region these stacks live in — so what a case reads back is the parameter the stack's
+/// own deployment really wrote.
+async fn ssm(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/ssm/aws4_request, \
+         SignedHeaders=host, Signature=0123456789abcdef"
+    );
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://ssm.{REGION}.amazonaws.com/"))
+        .header("host", format!("ssm.{REGION}.amazonaws.com"))
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("{SSM_TARGET_PREFIX}.{operation}"))
+        .header("authorization", authorization)
+        .body(bytes::Bytes::from(body.to_string()))
+        .expect("a well-formed Systems Manager request");
+    let response = router.dispatch(request).await;
+    let status_code = response.status().as_u16();
+    let raw = response.into_body();
+    let parsed = if raw.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&raw).unwrap_or(Value::Null)
+    };
+    (status_code, parsed)
+}
+
+/// The value Parameter Store holds for `name`, or `None` when it holds no such parameter —
+/// which is what says whether a rollback put a resource back, left it as the failed update
+/// made it, or removed one the update had added.
+async fn parameter_value(router: &MultiServiceRouter, name: &str) -> Option<String> {
+    let (status_code, body) = ssm(router, "GetParameter", &json!({"Name": name})).await;
+    if status_code != 200 {
+        return None;
+    }
+    body.pointer("/Parameter/Value")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The `AWS::SSM::Parameter` declaration these cases deploy: a parameter of Parameter Store
+/// under the name the template asks for, so a case reads the deployed value back through
+/// Systems Manager's own wire.
+fn parameter(name: &str, value: &str) -> Value {
+    json!({
+        "Type": "AWS::SSM::Parameter",
+        "Properties": {"Name": name, "Type": "String", "Value": value},
+    })
+}
+
+/// The template whose `Resources` section is `resources`.
+fn template(resources: Value) -> String {
+    json!({"Resources": resources}).to_string()
+}
+
+/// `resources` plus the wait condition an update adds and nothing signals: CloudFormation
+/// "doesn't proceed with a stack creation or update until resources receive the required
+/// number of signals or the timeout period is exceeded", so this is what holds the update
+/// open and then fails it with no call of the client's.
+fn template_with_an_unsignalled_gate(resources: Value) -> String {
+    let mut declared: Map<String, Value> = match resources {
+        Value::Object(members) => members,
+        other => panic!("a Resources section must be an object, got {other:?}"),
+    };
+    declared.insert(
+        "Gate".to_string(),
+        json!({"Type": "AWS::CloudFormation::WaitConditionHandle"}),
+    );
+    declared.insert(
+        "Wait".to_string(),
+        json!({
+            "Type": "AWS::CloudFormation::WaitCondition",
+            "Properties": {
+                "Handle": {"Ref": "Gate"},
+                "Timeout": GATE_TIMEOUT,
+                "Count": "1",
+            },
+        }),
+    );
+    template(Value::Object(declared))
+}
+
+/// The `StackStatus` a stack reports right now.
+async fn status_of(router: &MultiServiceRouter, stack: &str) -> String {
+    let (http_status, body) = call(router, "DescribeStacks", &[member("StackName", stack)]).await;
+    assert_eq!(
+        http_status, 200,
+        "DescribeStacks {stack:?}: expected 200, got {http_status} {body}"
+    );
+    xml_text(&body, "StackStatus").unwrap_or_default()
+}
+
+/// The `StackStatusReason` a stack reports right now.
+async fn reason_of(router: &MultiServiceRouter, stack: &str) -> String {
+    let (_, body) = call(router, "DescribeStacks", &[member("StackName", stack)]).await;
+    xml_text(&body, "StackStatusReason").unwrap_or_default()
+}
+
+/// The `ResourceStatus` a stack reports for ONE of its resources.
+async fn resource_status_of(
+    router: &MultiServiceRouter,
+    stack: &str,
+    logical_id: &str,
+) -> String {
+    let (http_status, body) = call(
+        router,
+        "DescribeStackResources",
+        &[
+            member("StackName", stack),
+            member("LogicalResourceId", logical_id),
+        ],
+    )
+    .await;
+    assert_eq!(
+        http_status, 200,
+        "DescribeStackResources {stack:?}/{logical_id:?}: expected 200, got {http_status} {body}"
+    );
+    xml_text(&body, "ResourceStatus").unwrap_or_default()
+}
+
+/// One row of the rollback table: what the stack is created from, what the update submits,
+/// and what Parameter Store must hold before and after the rollback.
+struct RollbackCase {
+    case: &'static str,
+    stack: &'static str,
+    created: String,
+    updated: String,
+    /// `DisableRollback`, exactly as the update carries it.
+    disable_rollback: bool,
+    /// The status the stack must reach once the wait has run out.
+    settles_to: &'static str,
+    /// `(parameter name, the value Parameter Store holds)` once the update has applied its
+    /// change and before its wait runs out; `None` is a parameter it must not hold at all.
+    after_update: Vec<(String, Option<&'static str>)>,
+    /// The same, once the stack has settled.
+    after_rollback: Vec<(String, Option<&'static str>)>,
+}
+
+/// The class the rule covers: an update that fails after it has already changed the owning
+/// services, whichever direction its revert has to run in.
+fn rollback_cases() -> Vec<RollbackCase> {
+    vec![
+        RollbackCase {
+            case: "a changed resource is put back as it was",
+            stack: "roll-changed",
+            created: template(json!({"Param": parameter("/roll-changed/p", "before")})),
+            updated: template_with_an_unsignalled_gate(
+                json!({"Param": parameter("/roll-changed/p", "after")}),
+            ),
+            disable_rollback: false,
+            settles_to: status::UPDATE_ROLLBACK_COMPLETE,
+            after_update: vec![("/roll-changed/p".to_string(), Some("after"))],
+            after_rollback: vec![("/roll-changed/p".to_string(), Some("before"))],
+        },
+        RollbackCase {
+            case: "a resource the update added is removed again",
+            stack: "roll-added",
+            created: template(json!({"Param": parameter("/roll-added/p", "keep")})),
+            updated: template_with_an_unsignalled_gate(json!({
+                "Param": parameter("/roll-added/p", "keep"),
+                "Added": parameter("/roll-added/added", "added"),
+            })),
+            disable_rollback: false,
+            settles_to: status::UPDATE_ROLLBACK_COMPLETE,
+            after_update: vec![
+                ("/roll-added/p".to_string(), Some("keep")),
+                ("/roll-added/added".to_string(), Some("added")),
+            ],
+            after_rollback: vec![
+                ("/roll-added/p".to_string(), Some("keep")),
+                ("/roll-added/added".to_string(), None),
+            ],
+        },
+        RollbackCase {
+            case: "a resource the update removed is created again",
+            stack: "roll-dropped",
+            created: template(json!({
+                "Param": parameter("/roll-dropped/p", "keep"),
+                "Dropped": parameter("/roll-dropped/d", "dropped"),
+            })),
+            updated: template_with_an_unsignalled_gate(
+                json!({"Param": parameter("/roll-dropped/p", "keep")}),
+            ),
+            disable_rollback: false,
+            settles_to: status::UPDATE_ROLLBACK_COMPLETE,
+            after_update: vec![("/roll-dropped/d".to_string(), None)],
+            after_rollback: vec![
+                ("/roll-dropped/p".to_string(), Some("keep")),
+                ("/roll-dropped/d".to_string(), Some("dropped")),
+            ],
+        },
+        // "DisableRollback: Preserve the state of previously provisioned resources when an
+        // operation fails": the caller said what it wants left behind, so the failed update
+        // is not rolled back and the owning service keeps what it put there.
+        RollbackCase {
+            case: "DisableRollback keeps the failed update as it failed",
+            stack: "roll-kept",
+            created: template(json!({"Param": parameter("/roll-kept/p", "before")})),
+            updated: template_with_an_unsignalled_gate(
+                json!({"Param": parameter("/roll-kept/p", "after")}),
+            ),
+            disable_rollback: true,
+            settles_to: status::UPDATE_FAILED,
+            after_update: vec![("/roll-kept/p".to_string(), Some("after"))],
+            after_rollback: vec![("/roll-kept/p".to_string(), Some("after"))],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn an_update_whose_wait_runs_out_is_rolled_back_in_the_services_that_own_its_resources() {
+    for case in rollback_cases() {
+        let router = router();
+        let (http_status, body) = create_stack(&router, case.stack, &case.created, &[]).await;
+        assert_eq!(
+            http_status, 200,
+            "case {:?}: expected CreateStack to succeed, got {http_status} {body}",
+            case.case
+        );
+        wait_for_the_transition().await;
+        let created = status_of(&router, case.stack).await;
+        assert_eq!(
+            created,
+            status::CREATE_COMPLETE,
+            "case {:?}: expected the create to complete before the update, got {created:?}",
+            case.case
+        );
+
+        let mut members = vec![
+            member("StackName", case.stack),
+            member("TemplateBody", &case.updated),
+        ];
+        if case.disable_rollback {
+            members.push(member("DisableRollback", "true"));
+        }
+        let (http_status, body) = call(&router, "UpdateStack", &members).await;
+        assert_eq!(
+            http_status, 200,
+            "case {:?}: expected UpdateStack to succeed, got {http_status} {body}",
+            case.case
+        );
+
+        // The update has made its changes in the owning services and is HELD at the wait
+        // condition: the clock alone does not complete it.
+        wait_for_the_transition().await;
+        let in_flight = status_of(&router, case.stack).await;
+        assert_eq!(
+            in_flight,
+            status::UPDATE_IN_PROGRESS,
+            "case {:?}: expected the update to be held at its wait condition, got \
+             {in_flight:?}",
+            case.case
+        );
+        for (name, expected) in &case.after_update {
+            let held = parameter_value(&router, name).await;
+            assert_eq!(
+                held.as_deref(),
+                *expected,
+                "case {:?}: expected Parameter Store to hold {expected:?} for {name:?} once \
+                 the update had applied its change, got {held:?}",
+                case.case
+            );
+        }
+
+        // The wait runs out, which fails the update with no call of the client's: the
+        // rollback that failure owes is what the next call materialises.
+        tokio::time::sleep(WAITED_OUT).await;
+        let settling = status_of(&router, case.stack).await;
+        assert!(
+            settling == case.settles_to || settling == status::UPDATE_ROLLBACK_IN_PROGRESS,
+            "case {:?}: expected the stack to be rolling back or settled at {}, got \
+             {settling:?}",
+            case.case,
+            case.settles_to
+        );
+        wait_for_the_transition().await;
+        let settled = status_of(&router, case.stack).await;
+        assert_eq!(
+            settled, case.settles_to,
+            "case {:?}: expected the stack to settle at {}, got {settled:?}",
+            case.case, case.settles_to
+        );
+        // The reason is the wait condition's own diagnosis, which is what failed the update.
+        let reason = reason_of(&router, case.stack).await;
+        assert!(
+            reason.contains("WaitCondition timed out"),
+            "case {:?}: expected the reason to carry the wait condition's diagnosis, got \
+             {reason:?}",
+            case.case
+        );
+        for (name, expected) in &case.after_rollback {
+            let held = parameter_value(&router, name).await;
+            assert_eq!(
+                held.as_deref(),
+                *expected,
+                "case {:?}: expected Parameter Store to hold {expected:?} for {name:?} once \
+                 the stack had settled, got {held:?}",
+                case.case
+            );
+        }
+        // The stack's own events say what it did, in order.
+        let events = stack_events(case.case, &router, case.stack).await;
+        let rolled_back = events.contains(&(
+            case.stack.to_string(),
+            status::UPDATE_ROLLBACK_IN_PROGRESS.to_string(),
+        ));
+        assert_eq!(
+            rolled_back,
+            !case.disable_rollback,
+            "case {:?}: expected the rollback to be reported only where one was owed, got \
+             {events:?}",
+            case.case
+        );
+        assert!(
+            events.contains(&(case.stack.to_string(), status::UPDATE_FAILED.to_string())),
+            "case {:?}: expected the update's own failure event, got {events:?}",
+            case.case
+        );
+    }
+}
+
+/// One row of the hold table: the `Timeout` the declaration states and how long the wait is
+/// held for it.
+struct HoldCase {
+    case: &'static str,
+    stack: &'static str,
+    /// `Timeout` as the declaration spells it, or `None` for a declaration that states none.
+    declared: Option<&'static str>,
+    held: Duration,
+}
+
+/// The class the bound covers: every `Timeout` a declaration can state.
+///
+/// The published bound is the type's own: "the maximum time that can be specified for this
+/// property is 12 hours (43200 seconds)" (`AWS::CloudFormation::WaitCondition`'s `Timeout`),
+/// so the rows include it, one second past it, and the degenerate zero — plus the instants
+/// either side of what this emulator holds an operation open for.
+fn hold_cases() -> Vec<HoldCase> {
+    vec![
+        HoldCase {
+            case: "a wait that is over the moment it starts",
+            stack: "hold-zero",
+            declared: Some("0"),
+            held: Duration::ZERO,
+        },
+        HoldCase {
+            case: "a wait of one second",
+            stack: "hold-one",
+            declared: Some("1"),
+            held: Duration::from_secs(1),
+        },
+        HoldCase {
+            case: "a wait just inside what this emulator holds open",
+            stack: "hold-just-inside",
+            declared: Some("14"),
+            held: MAX_HELD_OPEN - Duration::from_secs(1),
+        },
+        HoldCase {
+            case: "a wait of exactly what this emulator holds open",
+            stack: "hold-exactly",
+            declared: Some("15"),
+            held: MAX_HELD_OPEN,
+        },
+        HoldCase {
+            case: "a wait one second past what this emulator holds open",
+            stack: "hold-just-past",
+            declared: Some("16"),
+            held: MAX_HELD_OPEN,
+        },
+        HoldCase {
+            case: "a wait of a minute and a half",
+            stack: "hold-ninety",
+            declared: Some("90"),
+            held: MAX_HELD_OPEN,
+        },
+        HoldCase {
+            case: "a wait of the documented maximum",
+            stack: "hold-maximum",
+            declared: Some("43200"),
+            held: MAX_HELD_OPEN,
+        },
+        HoldCase {
+            case: "a wait past the documented maximum",
+            stack: "hold-past-maximum",
+            declared: Some("43201"),
+            held: MAX_HELD_OPEN,
+        },
+        HoldCase {
+            case: "a declaration that states no wait at all",
+            stack: "hold-unstated",
+            declared: None,
+            held: MAX_HELD_OPEN,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_wait_is_held_for_what_it_asked_bounded_by_what_this_emulator_holds_open() {
+    // The emulator's own bound is shorter than the type's documented maximum, which is what
+    // makes a stack held at an unsignalled wait condition settle inside a client's poll
+    // loop.
+    assert!(
+        MAX_HELD_OPEN < MAX_TIMEOUT,
+        "the hold bound must be shorter than the documented Timeout maximum, got \
+         {MAX_HELD_OPEN:?} against {MAX_TIMEOUT:?}"
+    );
+
+    let (router, engine) = router_with_engine();
+    for case in hold_cases() {
+        let properties = match case.declared {
+            Some(timeout) => json!({"Handle": {"Ref": "Gate"}, "Timeout": timeout, "Count": "1"}),
+            None => json!({"Handle": {"Ref": "Gate"}, "Count": "1"}),
+        };
+        let body = template(json!({
+            "Gate": {"Type": "AWS::CloudFormation::WaitConditionHandle"},
+            "Wait": {"Type": "AWS::CloudFormation::WaitCondition", "Properties": properties},
+        }));
+        let (http_status, created) = create_stack(&router, case.stack, &body, &[]).await;
+        assert_eq!(
+            http_status, 200,
+            "case {:?}: expected CreateStack to succeed, got {http_status} {created}",
+            case.case
+        );
+
+        let held = store(&engine);
+        let locked = held.lock();
+        let stack = locked
+            .resolve(REGION, case.stack)
+            .unwrap_or_else(|| panic!("case {:?}: the stack just created", case.case));
+        let barrier = stack
+            .wait_conditions
+            .first()
+            .unwrap_or_else(|| panic!("case {:?}: the wait condition's own barrier", case.case));
+        let held_for = barrier
+            .deadline()
+            .duration_since(barrier.opened_at)
+            .unwrap_or(Duration::ZERO);
+        assert_eq!(
+            held_for, case.held,
+            "case {:?}: expected a declaration of {:?} to be held for {:?}, got {held_for:?}",
+            case.case, case.declared, case.held
+        );
+    }
+}
+
+/// The trust policy the role these cases deploy carries: IAM's own `CreateRole` requires
+/// the document, and the principal is immaterial to the rule under test.
+fn trust_policy() -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "ec2.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }],
+    })
+}
+
+/// The documented cause of `UPDATE_ROLLBACK_FAILED`, driven end to end: an update fails, and
+/// the rollback cannot put a resource back because that resource was changed outside
+/// CloudFormation — "this might occur when a stack attempts to roll back to an old database
+/// that was deleted outside of CloudFormation" — so `ContinueUpdateRollback` is what gets
+/// the stack out of it.
+#[tokio::test]
+async fn a_rollback_the_owning_service_refuses_is_resumed_by_skipping_that_resource() {
+    let router = router();
+    let stack = "stuck-rollback";
+    let role_name = "stuck-rollback-role";
+    let parameter_name = "/stuck-rollback/p";
+    let role = |description: &str| {
+        json!({
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "RoleName": role_name,
+                "AssumeRolePolicyDocument": trust_policy(),
+                "Description": description,
+            },
+        })
+    };
+
+    let created = template(json!({
+        "TheRole": role("before"),
+        "TheParam": parameter(parameter_name, "before"),
+    }));
+    let (http_status, body) =
+        create_stack(&router, stack, &created, &acknowledging_iam(&[])).await;
+    assert_eq!(
+        http_status, 200,
+        "expected CreateStack to succeed, got {http_status} {body}"
+    );
+    wait_for_the_transition().await;
+    let (http_status, body) = iam(&router, "GetRole", &[("RoleName", role_name)]).await;
+    assert_eq!(
+        http_status, 200,
+        "expected the stack to have created the role in IAM, got {http_status} {body}"
+    );
+
+    // The update changes both resources and is then held at a wait condition nothing
+    // signals.
+    let updated = template_with_an_unsignalled_gate(json!({
+        "TheRole": role("after"),
+        "TheParam": parameter(parameter_name, "after"),
+    }));
+    let mut members = vec![
+        member("StackName", stack),
+        member("TemplateBody", &updated),
+    ];
+    members.extend(acknowledging_iam(&[]));
+    let (http_status, body) = call(&router, "UpdateStack", &members).await;
+    assert_eq!(
+        http_status, 200,
+        "expected UpdateStack to succeed, got {http_status} {body}"
+    );
+
+    // The role is deleted OUTSIDE CloudFormation, so the rollback cannot put it back.
+    let (http_status, body) = iam(&router, "DeleteRole", &[("RoleName", role_name)]).await;
+    assert_eq!(
+        http_status, 200,
+        "expected the role to be deleted outside CloudFormation, got {http_status} {body}"
+    );
+
+    tokio::time::sleep(WAITED_OUT).await;
+    let failed = status_of(&router, stack).await;
+    assert_eq!(
+        failed,
+        status::UPDATE_ROLLBACK_FAILED,
+        "expected a rollback the owning service refused to leave the stack in \
+         UPDATE_ROLLBACK_FAILED, got {failed:?}"
+    );
+    let refused = resource_status_of(&router, stack, "TheRole").await;
+    assert_eq!(
+        refused,
+        resource_status::UPDATE_FAILED,
+        "expected the resource the rollback could not put back to be reported UPDATE_FAILED, \
+         got {refused:?}"
+    );
+
+    // Resumed with nothing skipped, the rollback is attempted again and the same refusal
+    // stands: the stack re-enters UPDATE_ROLLBACK_FAILED rather than reporting a rollback
+    // that did not happen.
+    let (http_status, body) = call(
+        &router,
+        "ContinueUpdateRollback",
+        &[member("StackName", stack)],
+    )
+    .await;
+    assert_eq!(
+        http_status, 200,
+        "expected ContinueUpdateRollback to be accepted, got {http_status} {body}"
+    );
+    wait_for_the_transition().await;
+    let again = status_of(&router, stack).await;
+    assert_eq!(
+        again,
+        status::UPDATE_ROLLBACK_FAILED,
+        "expected a resumed rollback the owning service refuses again to re-enter \
+         UPDATE_ROLLBACK_FAILED, got {again:?}"
+    );
+
+    // Resumed with that resource SKIPPED, the rollback completes: the skipped resource is
+    // left exactly as the failed update made it — nothing re-creates the role — and
+    // everything else goes back to the configuration in force before the update.
+    let (http_status, body) = call(
+        &router,
+        "ContinueUpdateRollback",
+        &[
+            member("StackName", stack),
+            member("ResourcesToSkip.member.1", "TheRole"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        http_status, 200,
+        "expected the skipping ContinueUpdateRollback to be accepted, got {http_status} {body}"
+    );
+    wait_for_the_transition().await;
+    let completed = status_of(&router, stack).await;
+    assert_eq!(
+        completed,
+        status::UPDATE_ROLLBACK_COMPLETE,
+        "expected the skipping rollback to complete, got {completed:?}"
+    );
+    let skipped = resource_status_of(&router, stack, "TheRole").await;
+    assert_eq!(
+        skipped,
+        resource_status::UPDATE_COMPLETE,
+        "expected the skipped resource to be reported UPDATE_COMPLETE, got {skipped:?}"
+    );
+    let (http_status, body) = iam(&router, "GetRole", &[("RoleName", role_name)]).await;
+    assert_eq!(
+        http_status, 404,
+        "expected the skipped resource to be left exactly as the failed update made it, got \
+         {http_status} {body}"
+    );
+    let put_back = parameter_value(&router, parameter_name).await;
+    assert_eq!(
+        put_back.as_deref(),
+        Some("before"),
+        "expected the resource the rollback did not skip to be put back as it was, got \
+         {put_back:?}"
     );
 }
