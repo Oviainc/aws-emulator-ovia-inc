@@ -85,23 +85,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// Encode the resume point of a page as the opaque `nextToken` the caller hands back.
-///
-/// The token names the LAST tag key on the page just returned, qualified by the resource
-/// it was issued for, and is hex-encoded so no caller can read a key out of it or build
-/// one by hand. The ARN half is hex-encoded too, so it cannot contain the `#` separator
-/// whatever the ARN or the tag key carries.
-fn encode_page_token(resource_arn: &str, tag_key: &str) -> String {
-    ::hex::encode(format!("{}#{tag_key}", ::hex::encode(resource_arn)))
-}
-
-/// The tag key a `nextToken` resumes after, or `None` when the token is not one this
-/// service issued for `resource_arn` — a token minted for a different resource resumes
-/// nothing here and is refused rather than silently ignored.
-fn decode_page_token(token: &str, resource_arn: &str) -> Option<String> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    let (arn, key) = decoded.split_once('#')?;
-    (arn == ::hex::encode(resource_arn) && !key.is_empty()).then(|| key.to_string())
+/// The scope a `ListTagsForResource` resume point is qualified by: the resource the page's
+/// tags are held on, hex-encoded so the scope half cannot contain the codec's separator
+/// whatever the ARN carries, and so no other listing's scope collides with it. A token this
+/// listing issued therefore resumes only a listing of the SAME resource, and
+/// [`crate::state::decode_page_token`] refuses one minted for another.
+fn page_token_scope(resource_arn: &str) -> String {
+    ::hex::encode(resource_arn)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -188,7 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resume_after = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                decode_page_token(token, &input.resource_arn).ok_or_else(|| {
+                crate::state::decode_page_token(token, &page_token_scope(&input.resource_arn))
+                    .ok_or_else(|| {
                     ListTagsForResourceErrorModeled::ValidationException(ValidationException {
                         message: Some(format!(
                             "nextToken is not a pagination token this service issued for resource '{}'.",
@@ -232,9 +223,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.max_results,
         );
         let next_token = match truncated {
-            true => page
-                .last()
-                .map(|(key, _)| encode_page_token(&input.resource_arn, key)),
+            true => page.last().map(|(key, _)| {
+                crate::state::encode_page_token(&page_token_scope(&input.resource_arn), key)
+            }),
             false => None,
         };
 

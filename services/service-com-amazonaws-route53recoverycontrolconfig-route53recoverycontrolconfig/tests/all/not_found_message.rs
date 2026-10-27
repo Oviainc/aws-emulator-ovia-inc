@@ -11,8 +11,11 @@
 //! The tables span what that rule generalises over: every implemented operation that
 //! ADDRESSES a resource by ARN (read, delete, update, list), all three resource levels
 //! (cluster, control panel, routing control) and several fillings of the ARN's own
-//! variable parts — account id, a lowercase UUID, an upper-case-hex UUID and a non-UUID
-//! tail.
+//! variable parts — a lowercase UUID, an upper-case-hex UUID and a non-UUID tail.
+//!
+//! Every ARN here names the CALLER's account, because that is the only kind of ARN this
+//! sentence answers: one naming another account is refused by the authorization check
+//! ahead of the lookup, which `tests/all/cross_account_authorization.rs` pins.
 //!
 //! A create that merely REFERENCES a parent by ARN is NOT in this table: it resolves no
 //! resource of its own, so it is refused on its input instead — see
@@ -52,9 +55,9 @@ const RESOURCE_IDS: &[&str] = &[
     "named_cluster-1",
 ];
 
-/// Account ids the ARNs are built for, so the sentence is not tested against a single
-/// account.
-const ACCOUNTS: &[&str] = &["000000000000", "123456789012"];
+/// The account the ARNs are built for: the caller's own, which is the only account whose
+/// ARNs reach a lookup at all.
+const ACCOUNT: &str = "000000000000";
 
 /// One request to make, with the resource kind and ARN its refusal must name.
 struct Case {
@@ -167,15 +170,13 @@ async fn an_unresolvable_arn_is_refused_with_the_no_record_sentence() {
     create_cluster(&router, json!({ "ClusterName": "present" })).await;
 
     let mut cases: Vec<Case> = Vec::new();
-    for account in ACCOUNTS {
-        for id in RESOURCE_IDS {
-            let cluster_arn = arn(account, &format!("cluster/{id}"));
-            let panel_arn = arn(account, &format!("controlpanel/{id}"));
-            let control_arn = format!("{panel_arn}/routingcontrol/{id}");
-            cases.extend(cluster_cases(&cluster_arn));
-            cases.extend(control_panel_cases(&panel_arn));
-            cases.extend(routing_control_cases(&control_arn));
-        }
+    for id in RESOURCE_IDS {
+        let cluster_arn = arn(ACCOUNT, &format!("cluster/{id}"));
+        let panel_arn = arn(ACCOUNT, &format!("controlpanel/{id}"));
+        let control_arn = format!("{panel_arn}/routingcontrol/{id}");
+        cases.extend(cluster_cases(&cluster_arn));
+        cases.extend(control_panel_cases(&panel_arn));
+        cases.extend(routing_control_cases(&control_arn));
     }
 
     for case in cases {

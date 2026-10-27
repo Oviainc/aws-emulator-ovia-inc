@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddDirectQueryDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddDirectQueryDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddDirectQueryDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds one direct query data source to this account and persists it as a
+//! [`crate::state::DirectQueryDataSourceRecord`] — the same record
+//! `GetDirectQueryDataSource` reports and the tagging operations attach tags to.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +89,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::btree_map::Entry;
+
+use crate::state::{
+    direct_query_data_source_arn, direct_query_data_source_exists,
+    direct_query_data_source_quota_exceeded, direct_query_data_source_type_name, is_arn,
+    malformed_arn, open_search_arns_required, request_region, requires_open_search_arns,
+    service_state, state_unavailable, stored_policy_document, tag_quota_exceeded, tag_set,
+    DirectQueryDataSourceRecord, DIRECT_QUERY_DATA_SOURCE_QUOTA, TAG_QUOTA,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -167,18 +172,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddDirectQueryDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddDirectQueryDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddDirectQueryDataSource"))
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let region = request_region(ctx.parts());
+
+        // `OpenSearchArns` "is required for CloudWatchLogs and SecurityLake datasource
+        // types" and optional for the remaining member of the union, so a request of one
+        // of those types that names no collection asks for a data source the service
+        // does not define, and is refused rather than stored half-formed. A member that
+        // is present but empty names no collection either.
+        let open_search_arns = input.open_search_arns.unwrap_or_default();
+        if open_search_arns.is_empty() && requires_open_search_arns(&input.data_source_type) {
+            return Err(AddDirectQueryDataSourceErrorModeled::ValidationException(
+                open_search_arns_required(direct_query_data_source_type_name(
+                    &input.data_source_type,
+                )),
+            )
+            .into());
+        }
+
+        // Each element of `OpenSearchArns` is an `ARN`, `@length(min: 20, max: 2048)`
+        // with pattern `.*`: the request boundary enforces only the length, so a value
+        // that is not an ARN at all is a malformed request rather than an ARN naming
+        // nothing.
+        for arn in &open_search_arns {
+            if !is_arn(arn) {
+                return Err(AddDirectQueryDataSourceErrorModeled::ValidationException(
+                    malformed_arn("OpenSearchArns", arn),
+                )
+                .into());
+            }
+        }
+
+        // The data source is addressed by its name across the account, so its ARN is
+        // built from that name and the Region the request was signed for: the identifier
+        // the add answers with is the one every later read of the record reports.
+        let arn = direct_query_data_source_arn(&input.data_source_name, &region);
+
+        // The access policy "must be in valid JSON format and follow IAM policy
+        // syntax", so the document is read as JSON before it is stored and held as the
+        // document it denotes rather than as the text that denoted it.
+        let data_source_access_policy =
+            stored_policy_document("DataSourceAccessPolicy", input.data_source_access_policy)
+                .map_err(AddDirectQueryDataSourceErrorModeled::ValidationException)?;
+
+        // A data source is added carrying the tags the request named, and the same bound
+        // holds on them as on a later `AddTags`: a resource carries at most `TAG_QUOTA`
+        // tags, so an add naming more is refused rather than storing a set no `AddTags`
+        // could have built. The set is keyed by tag key, so a key the request names
+        // twice carries one value and counts once.
+        let tags = tag_set(input.tag_list.unwrap_or_default());
+        if tags.len() > TAG_QUOTA {
+            return Err(AddDirectQueryDataSourceErrorModeled::LimitExceededException(
+                tag_quota_exceeded(&arn, tags.len()),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // The store is BOUNDED: past its quota an add is refused rather than adding
+        // another record, so a caller looping with fresh names cannot grow the state
+        // without end.
+        if store.direct_query_data_sources.len() >= DIRECT_QUERY_DATA_SOURCE_QUOTA {
+            return Err(AddDirectQueryDataSourceErrorModeled::LimitExceededException(
+                direct_query_data_source_quota_exceeded(),
+            )
+            .into());
+        }
+
+        // The name is "a unique, user-defined label to identify the data source within
+        // your OpenSearch Service environment", so a second add of a name the account
+        // already holds is refused: the existing record stays exactly as it is rather
+        // than becoming a second data source a caller could not tell apart by name. The
+        // model declares no "already exists" error for this operation, so the refusal is
+        // its `ValidationException`. The refusal comes off the OCCUPIED entry and the
+        // record is stored into the VACANT one, so there is one lookup rather than two
+        // that could disagree.
+        let Entry::Vacant(slot) = store
+            .direct_query_data_sources
+            .entry(input.data_source_name.clone())
+        else {
+            return Err(AddDirectQueryDataSourceErrorModeled::ValidationException(
+                direct_query_data_source_exists(&input.data_source_name),
+            )
+            .into());
+        };
+
+        let stored = slot.insert(DirectQueryDataSourceRecord {
+            data_source_name: input.data_source_name,
+            data_source_type: input.data_source_type,
+            description: input.description,
+            open_search_arns,
+            data_source_access_policy,
+            arn,
+            tags,
+        });
+
+        // Answered from the STORED record, so the identifier the caller is handed is the
+        // one every later read of that record reports.
+        Ok(AddDirectQueryDataSourceOutput {
+            data_source_arn: Some(stored.arn.clone()),
+        })
     }
 }

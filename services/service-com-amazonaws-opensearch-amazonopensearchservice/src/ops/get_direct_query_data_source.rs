@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDirectQueryDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDirectQueryDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDirectQueryDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one direct query data source of this account from the
+//! [`crate::state::DirectQueryDataSourceRecord`] `AddDirectQueryDataSource`
+//! persisted — a pure read: nothing about the record changes, so the next caller
+//! sees what this one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +88,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{direct_query_data_source_absent, service_state, state_unavailable};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +162,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDirectQueryDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDirectQueryDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDirectQueryDataSource"))
+        let _ = ctx;
+        let state = service_state(&*self.engine).ok_or_else(state_unavailable)?;
+
+        // A pure read: the stored record is projected onto the response and nothing
+        // about it changes, so the next caller sees what this one saw.
+        let store = state.lock();
+        let data_source = store
+            .direct_query_data_sources
+            .get(&input.data_source_name)
+            .ok_or_else(|| {
+                GetDirectQueryDataSourceErrorModeled::ValidationException(
+                    direct_query_data_source_absent(),
+                )
+            })?;
+
+        Ok(GetDirectQueryDataSourceOutput {
+            data_source_name: Some(data_source.data_source_name.clone()),
+            data_source_type: Some(data_source.data_source_type.clone()),
+            description: data_source.description.clone(),
+            // The stored list is empty exactly where the data source is associated with
+            // no OpenSearch collection, which the response reports by carrying no
+            // `OpenSearchArns` at all rather than an empty list.
+            open_search_arns: (!data_source.open_search_arns.is_empty())
+                .then(|| data_source.open_search_arns.clone()),
+            // "Returns the current policy configuration in JSON format, or null if no
+            // custom policy is configured": the document is reported as the service
+            // holds it, and absent where the data source carries none.
+            data_source_access_policy: data_source.data_source_access_policy.clone(),
+            data_source_arn: Some(data_source.arn.clone()),
+        })
     }
 }

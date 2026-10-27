@@ -17,7 +17,8 @@
 //! * a value that breaks the `@pattern` or `@length` declared on a BODY member never
 //!   reaches the operation: the request-body validator refuses it with
 //!   `BadRequestException` (400), stating the declared regex or bound and the value that
-//!   failed it.
+//!   failed it. The same layer's clause for a value outside an enumerated SET is pinned by
+//!   `tests/all/body_enum_refusals.rs`.
 
 use std::time::Duration;
 
@@ -855,9 +856,9 @@ async fn a_body_value_outside_a_declared_string_constraint_is_a_bad_request() {
 /// nothing else, so a request it cannot word whole is left to the service's own refusal
 /// rather than reported half in one voice and half in another.
 ///
-/// Rows span the body classes with no clause — a value outside an enumerated set, an
-/// absent `@required` member — and the MIXED request, where a member outside its pattern
-/// (which the door does state) arrives together with one of them.
+/// Rows span the body class with no clause — an absent `@required` member — and the MIXED
+/// request, where a member outside its pattern (which the door does state) arrives
+/// together with one of them.
 #[tokio::test]
 async fn a_body_class_the_front_door_has_no_clause_for_keeps_the_modelled_error() {
     let router = router();
@@ -866,12 +867,6 @@ async fn a_body_class_the_front_door_has_no_clause_for_keeps_the_modelled_error(
     let cluster_arn = cluster["ClusterArn"].as_str().unwrap_or_default().to_string();
 
     let cases: Vec<(&str, &str, &str, Value)> = vec![
-        (
-            "a NetworkType outside the modelled values",
-            "PUT",
-            "/cluster",
-            json!({ "ClusterArn": cluster_arn, "NetworkType": "IPV6" }),
-        ),
         (
             "an absent required body member",
             "POST",

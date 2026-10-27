@@ -153,7 +153,7 @@ pub(crate) fn tag(key: &str, value: &str) -> (String, String) {
 const UNRESOLVABLE_ARN: &str = "Invalid ARN. Domain not found.";
 
 /// The `message` an error answer carries, under either casing a wire path may use.
-fn error_message(answer: &Answer) -> String {
+pub(crate) fn error_message(answer: &Answer) -> String {
     answer.body["message"]
         .as_str()
         .or_else(|| answer.body["Message"].as_str())
