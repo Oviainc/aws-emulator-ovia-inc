@@ -708,6 +708,8 @@ pub const OPERATION_TYPE_TEST_ALARM: &str = "TestAlarm";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_CERTIFICATE: &str = "CreateCertificate";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DELETE_CERTIFICATE: &str = "DeleteCertificate";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_ATTACH_CERTIFICATE_TO_DISTRIBUTION: &str =
     "AttachCertificateToDistribution";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -13279,6 +13281,25 @@ impl ComAmazonawsLightsailLightsail20161128State {
     pub fn insert_certificate(&mut self, certificate: StoredCertificate) {
         self.certificates
             .insert(certificate.name.clone(), certificate);
+    }
+
+    /// Remove the SSL/TLS certificate `name` names, answering the record that
+    /// was stored under it, or `None` when this account holds no certificate of
+    /// that name.
+    ///
+    /// Everything a certificate carries lives ON this record — the domains it
+    /// covers and their validation, its tags, its serial number and the window
+    /// it is valid for — so removing the record is what removes them all, and
+    /// no later read, listing or tag change can reach a certificate this
+    /// account no longer holds. Nothing else in the store is rewritten: a
+    /// distribution is a resource of its own, and whether any distribution
+    /// still serves this certificate is what the caller asks
+    /// [`Self::certificate_in_use_resource_count`] BEFORE removing it, so no
+    /// distribution is ever left naming a certificate that secures nothing.
+    /// The operation log is append-only, so the entries this certificate's
+    /// earlier calls wrote stay readable.
+    pub fn remove_certificate(&mut self, name: &str) -> Option<StoredCertificate> {
+        self.certificates.remove(name)
     }
 
     /// How many resources of this account the certificate `name` is attached to,

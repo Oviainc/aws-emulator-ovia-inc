@@ -341,7 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &mut references,
             settings.and_then(|settings| settings.language_id_settings.as_ref()),
         );
-        if let Some(message) = store.unheld_reference_error(&region, &references) {
+        if let Some(message) = store.unheld_reference_error(&region, now, &references) {
             return Err(bad_request(&message));
         }
 

@@ -348,6 +348,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same name is a different resource.
         if let Some(message) = store.unheld_reference_error(
             &region,
+            now,
             &[(
                 crate::state::ResourceFamily::MedicalVocabulary,
                 input
