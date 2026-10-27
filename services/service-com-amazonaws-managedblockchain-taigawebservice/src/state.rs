@@ -1568,6 +1568,46 @@ impl StoredInvitation {
     }
 }
 
+/// The ONE walk of the store that resolves a `ResourceArn` to the record it names, written
+/// out here once and expanded once per kind of borrow.
+///
+/// `$records` is the method that iterates a map's values (`values` for the reading
+/// resolution, `values_mut` for the writing one) and `$record` the enum those borrows are
+/// resolved into ([`TaggedRecord`] and [`TaggedRecordMut`]). Which record kinds carry a tag
+/// set, the precedence they are matched in, and the stored-ARN equality each is matched by
+/// therefore exist ONCE: a kind added here is added to both resolutions, so the status a
+/// refusal keys on and the tag set a write lands in can never come from different records.
+///
+/// Expands to the whole body of a resolver returning `Option<$record<'_>>`: it `return`s the
+/// first record whose stored ARN is `$arn` and evaluates to `None` when no record carries it.
+macro_rules! resolve_tagged_record {
+    ($state:expr, $arn:expr, $records:ident, $record:ident) => {{
+        let arn: &str = $arn;
+        if let Some(accessor) = $state.accessors.$records().find(|accessor| accessor.arn == arn) {
+            return Some($record::Accessor(accessor));
+        }
+        for network in $state.networks.$records() {
+            if network.arn == arn {
+                return Some($record::Network(network));
+            }
+            if let Some(member) = network.members.$records().find(|member| member.arn == arn) {
+                return Some($record::Member(member));
+            }
+            if let Some(node) = network.nodes.$records().find(|node| node.arn == arn) {
+                return Some($record::Node(node));
+            }
+            if let Some(proposal) = network
+                .proposals
+                .$records()
+                .find(|proposal| proposal.arn == arn)
+            {
+                return Some($record::Proposal(proposal));
+            }
+        }
+        None
+    }};
+}
+
 /// One stored record that carries a tag set, as a lookup by ARN resolves it.
 ///
 /// The five record types here are exactly the shapes whose model declares a `Tags` member
@@ -1619,6 +1659,33 @@ impl<'a> TaggedRecord<'a> {
             Self::Member(member) => transient_status(&member.status),
             Self::Node(node) => transient_status(&node.status),
             Self::Proposal(_) => None,
+        }
+    }
+}
+
+/// The same stored record, as a lookup by ARN resolves it TO WRITE.
+///
+/// The write counterpart of [`TaggedRecord`]: the same five record kinds, resolved by the
+/// same `resolve_tagged_record!` walk, so the record a tagging write lands in is the record
+/// the read resolution reports and keys its refusals on.
+#[derive(Debug)]
+pub enum TaggedRecordMut<'a> {
+    Accessor(&'a mut StoredAccessor),
+    Network(&'a mut StoredNetwork),
+    Member(&'a mut StoredMember),
+    Node(&'a mut StoredNode),
+    Proposal(&'a mut StoredProposal),
+}
+
+impl<'a> TaggedRecordMut<'a> {
+    /// The tag set this record holds, to write — the one [`TaggedRecord::tags`] reads.
+    pub fn tags_mut(self) -> &'a mut BTreeMap<String, String> {
+        match self {
+            Self::Accessor(accessor) => &mut accessor.tags,
+            Self::Network(network) => &mut network.tags,
+            Self::Member(member) => &mut member.tags,
+            Self::Node(node) => &mut node.tags,
+            Self::Proposal(proposal) => &mut proposal.tags,
         }
     }
 }
@@ -1875,68 +1942,27 @@ impl ComAmazonawsManagedblockchainTaigawebserviceState {
     }
 
     /// The record the resource `arn` names, resolved by the ARN each record was minted
-    /// with and STORED — the one walk of the store [`Self::tags_for_resource`] and
-    /// [`Self::status_not_ready`] both read through, so the status a refusal keys on and
-    /// the tag set a reply reports always come from the same record.
+    /// with and STORED — the one walk of the store (`resolve_tagged_record!`)
+    /// [`Self::tags_for_resource`] and [`Self::status_not_ready`] both read through, so the
+    /// status a refusal keys on and the tag set a reply reports always come from the same
+    /// record.
     pub fn tagged_record(&self, arn: &str) -> Option<TaggedRecord<'_>> {
-        if let Some(accessor) = self.accessors.values().find(|accessor| accessor.arn == arn) {
-            return Some(TaggedRecord::Accessor(accessor));
-        }
-        for network in self.networks.values() {
-            if network.arn == arn {
-                return Some(TaggedRecord::Network(network));
-            }
-            if let Some(member) = network.members.values().find(|member| member.arn == arn) {
-                return Some(TaggedRecord::Member(member));
-            }
-            if let Some(node) = network.nodes.values().find(|node| node.arn == arn) {
-                return Some(TaggedRecord::Node(node));
-            }
-            if let Some(proposal) = network
-                .proposals
-                .values()
-                .find(|proposal| proposal.arn == arn)
-            {
-                return Some(TaggedRecord::Proposal(proposal));
-            }
-        }
-        None
+        resolve_tagged_record!(self, arn, values, TaggedRecord)
+    }
+
+    /// The record the resource `arn` names, to write: the same `resolve_tagged_record!`
+    /// walk [`Self::tagged_record`] reads through, so a write lands in the record the read
+    /// resolution resolved — the tagging operations get their tag set from
+    /// [`Self::tags_for_resource_mut`] below.
+    pub fn tagged_record_mut(&mut self, arn: &str) -> Option<TaggedRecordMut<'_>> {
+        resolve_tagged_record!(self, arn, values_mut, TaggedRecordMut)
     }
 
     /// The tag set of the resource `arn` names, to write: the same resolution
     /// [`Self::tags_for_resource`] reads through, so a tag written here is the one a read
     /// of that resource reports.
     pub fn tags_for_resource_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
-        if let Some(accessor) = self
-            .accessors
-            .values_mut()
-            .find(|accessor| accessor.arn == arn)
-        {
-            return Some(&mut accessor.tags);
-        }
-        for network in self.networks.values_mut() {
-            if network.arn == arn {
-                return Some(&mut network.tags);
-            }
-            if let Some(member) = network
-                .members
-                .values_mut()
-                .find(|member| member.arn == arn)
-            {
-                return Some(&mut member.tags);
-            }
-            if let Some(node) = network.nodes.values_mut().find(|node| node.arn == arn) {
-                return Some(&mut node.tags);
-            }
-            if let Some(proposal) = network
-                .proposals
-                .values_mut()
-                .find(|proposal| proposal.arn == arn)
-            {
-                return Some(&mut proposal.tags);
-            }
-        }
-        None
+        self.tagged_record_mut(arn).map(TaggedRecordMut::tags_mut)
     }
 
     /// What the create under this idempotency key already minted, if the ledger still
