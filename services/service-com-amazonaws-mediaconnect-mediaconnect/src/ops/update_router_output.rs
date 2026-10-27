@@ -336,7 +336,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored pair it did not introduce.
         if input.tier.is_some() || input.maximum_bitrate.is_some() {
             if let Some(rejection) =
-                crate::state::router_output_bitrate_rejection(&tier, maximum_bitrate)
+                crate::state::ROUTER_OUTPUT_TIERS.bitrate_rejection(&tier, maximum_bitrate)
             {
                 return Err(bad_request(rejection));
             }
