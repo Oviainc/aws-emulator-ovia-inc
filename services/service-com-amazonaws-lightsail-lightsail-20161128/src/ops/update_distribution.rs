@@ -457,8 +457,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // certificate of its own, and with it the domains that
                 // certificate published.
                 _ if input.use_default_certificate == Some(true) => {
-                    distribution.certificate_name = None;
-                    distribution.alternative_domain_names = Vec::new();
+                    distribution.detach_certificate();
                 }
                 // A request that names no certificate and does not ask for the
                 // default one says nothing about the certificate, so the

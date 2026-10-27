@@ -389,6 +389,21 @@ pub fn check_capacity_units(member: &str, value: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse a DB shard group capacity range that is not a range: `MinACU` is "the minimum
+/// capacity of the DB shard group in Aurora capacity units (ACUs)" and `MaxACU` the
+/// maximum, so a minimum above the maximum names no range at all. A shard group created or
+/// modified without a minimum has none to compare, which is why the minimum is optional
+/// here, and the pair is checked as it WOULD stand rather than one member at a time.
+pub fn check_capacity_range(min_acu: Option<f64>, max_acu: f64) -> Result<(), String> {
+    match min_acu {
+        Some(min_acu) if min_acu > max_acu => Err(format!(
+            "MinACU ({min_acu}) must not exceed MaxACU ({max_acu}): the minimum capacity of \
+             a DB shard group cannot be above its maximum"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// How many DB clusters one region may hold: Amazon RDS's published default quota ("DB
 /// clusters": 40 per Region). Reaching it is the modelled `DBClusterQuotaExceededFault` —
 /// "The user attempted to create a new DB cluster and the user has already reached the

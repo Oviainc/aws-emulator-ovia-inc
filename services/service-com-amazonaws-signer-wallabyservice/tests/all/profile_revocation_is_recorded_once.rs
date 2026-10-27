@@ -27,12 +27,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region every request here is signed for; a profile is a resource of it.
 const REGION: &str = "eu-west-1";
 
-/// The access key id the FIRST revoke of each case is signed with — the identity
-/// the one recorded revocation is attributed to.
+/// The access key id the FIRST revoke of each case is signed with.
 const FIRST_REVOKER_KEY: &str = "AKIDFIRSTREVOKER";
 
-/// A second, different access key id, so a repeat can be signed by another
-/// identity than the one that revoked.
+/// A second, different access key id, so a repeat can be signed with another
+/// credential than the one that revoked.
 const OTHER_REVOKER_KEY: &str = "AKIDOTHERREVOKER";
 
 /// The account id every generated emulator presents, spelled out so a wrong
@@ -319,8 +318,9 @@ async fn a_repeated_revoke_leaves_the_first_record_standing() {
         );
         assert_eq!(
             record["revokedBy"],
-            json!(format!("arn:aws:iam::{ACCOUNT_ID}:user/{FIRST_REVOKER_KEY}")),
-            "case {}: expected revokedBy to name the first caller, got {:?}",
+            json!(format!("arn:aws:iam::{ACCOUNT_ID}:user/emulator")),
+            "case {}: expected revokedBy to name the principal the revoking credentials \
+             resolve to, got {:?}",
             case.name,
             record["revokedBy"]
         );

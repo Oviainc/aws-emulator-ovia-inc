@@ -48,7 +48,7 @@ const ACCOUNT_ID: &str = "000000000000";
 const PLATFORM_ID: &str = "AWSLambda-SHA384-ECDSA";
 
 /// A second such platform, so a per-region row can differ in its platform.
-const OTHER_PLATFORM_ID: &str = "AWSIoTDeviceManagement-SHA256-ECDSA";
+const OTHER_PLATFORM_ID: &str = "Notation-OCI-SHA384-ECDSA";
 
 /// The profile name every region in this suite uses — one name, so a leak across
 /// regions shows up as the WRONG profile rather than as no profile.
