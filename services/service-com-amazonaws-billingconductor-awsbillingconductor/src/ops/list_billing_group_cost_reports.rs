@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBillingGroupCostReports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBillingGroupCostReports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBillingGroupCostReports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the margin summary of EVERY billing group the
+//! store holds for one billing period — the actual Amazon Web Services charges of the
+//! group, the pro forma charges computed from the custom line items in effect for it in
+//! that period, and the margin between them — narrowed to the groups the request's
+//! filter names and cut into pages. It writes nothing. This file is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +156,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBillingGroupCostReports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBillingGroupCostReportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBillingGroupCostReports"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListBillingGroupCostReportsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // "The preferred billing period for your report": the summary is of ONE month, and
+        // a request that names none is asking about the month the call is made in. The
+        // modelled pattern is enforced before this handler runs, and the two spellings it
+        // admits (`2026-1` / `2026-01`) name the same period
+        // (`crate::state::billing_period_key`).
+        let billing_period = input
+            .billing_period
+            .unwrap_or_else(crate::state::current_billing_period);
+
+        // "A `ListBillingGroupCostReportsFilter` to specify billing groups to retrieve
+        // reports from": its one member NARROWS the listing to the groups it names, in
+        // either spelling the `BillingGroupArn` pattern admits, so it is normalised to the
+        // identity the store keys by. An absent filter narrows nothing, and a filter is a
+        // predicate rather than a resource lookup: an ARN that names no stored group
+        // selects none, exactly as the `Arns` filter of `ListBillingGroups` does.
+        let wanted_arns: Option<Vec<String>> = input
+            .filters
+            .and_then(|filters| filters.billing_group_arns)
+            .map(|arns| {
+                arns.iter()
+                    .map(|arn| crate::state::normalize_billing_group_arn(arn))
+                    .collect()
+            });
+
+        // One row per billing group that existed in that period, keyed by its ARN: the
+        // map is ordered by ARN and an ARN carries the monotonic id this service mints, so
+        // the sequence is creation order and a `NextToken` names the same cut point on the
+        // next call.
+        let mut selected: Vec<(String, &crate::state::BillingGroupRecord)> = Vec::new();
+        for (arn, group) in &state.billing_groups {
+            if wanted_arns
+                .as_ref()
+                .is_some_and(|wanted| !wanted.contains(arn))
+            {
+                continue;
+            }
+            if group.exists_in(&billing_period) {
+                selected.push((arn.clone(), group));
+            }
+        }
+
+        // The page is cut FIRST — at the request's `MaxResults`, or at this service's
+        // default page when it names none, the modelled `MaxBillingGroupResults` range
+        // (1..100) being the very bound `crate::state::paginate` clamps to — so the
+        // charges are computed for at most one page of groups rather than for every group
+        // the store holds.
+        let (page, next_token) =
+            crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+
+        // "A summary report of actual Amazon Web Services charges and calculated Amazon
+        // Web Services charges, based on the associated pricing plan of a billing group":
+        // the pro forma charges of the whole group in that period are the signed charges of
+        // its custom line items, whatever product each is presented under — this listing
+        // reports no breakdown, so they are summed.
+        let billing_group_cost_reports: Vec<BillingGroupCostReportElement> = page
+            .into_iter()
+            .map(|group| {
+                let proforma_cost: f64 = state
+                    .proforma_custom_line_item_charges(&group.arn, &billing_period)
+                    .values()
+                    .sum();
+                let summary = crate::state::MarginSummary::of_proforma(proforma_cost);
+                BillingGroupCostReportElement {
+                    arn: Some(group.arn.clone()),
+                    aws_cost: Some(crate::state::reported_amount(summary.aws_cost)),
+                    proforma_cost: Some(crate::state::reported_amount(summary.proforma_cost)),
+                    margin: Some(crate::state::reported_amount(summary.margin)),
+                    margin_percentage: Some(crate::state::reported_amount(
+                        summary.margin_percentage,
+                    )),
+                    currency: Some(crate::state::partition_currency_code(&group.arn).to_string()),
+                }
+            })
+            .collect();
+
+        Ok(ListBillingGroupCostReportsOutput {
+            billing_group_cost_reports: Some(billing_group_cost_reports),
+            next_token,
+        })
     }
 }
