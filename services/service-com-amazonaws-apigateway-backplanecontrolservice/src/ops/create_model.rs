@@ -122,7 +122,14 @@ fn is_json_media_type(media_type: &::mime::Mime) -> bool {
 /// else keeps its own body, whose syntax this sentence says nothing about.
 ///
 /// `Err` carries WHY the schema could not be read, for the modelled `BadRequestException`.
-fn validated_schema(schema: Option<String>, content_type: &::mime::Mime) -> Result<Option<String>, String> {
+///
+/// Shared with `UpdateModel`, which stores a schema for the same records this operation
+/// creates: one copy of the rule, so the schema a patch leaves on a model is one a read
+/// can report as a schema exactly as a created one is.
+pub(crate) fn validated_schema(
+    schema: Option<String>,
+    content_type: &::mime::Mime,
+) -> Result<Option<String>, String> {
     let Some(schema) = schema else {
         return Ok(None);
     };
@@ -133,13 +140,14 @@ fn validated_schema(schema: Option<String>, content_type: &::mime::Mime) -> Resu
         return Ok(None);
     }
     if is_json_media_type(content_type) {
-        let read = ::serde_json::from_str::<::serde_json::Value>(&schema).map_err(|_| {
-            crate::state::invalid_model_schema("the schema is not a JSON document")
-        })?;
+        // Every way the document fails to be a JSON Schema — unparseable JSON, or a JSON
+        // value that is not an object — is the one condition API Gateway answers with the
+        // one fixed sentence, so neither the reader's diagnostic nor the rejected text
+        // reaches the caller.
+        let read = ::serde_json::from_str::<::serde_json::Value>(&schema)
+            .map_err(|_| crate::state::INVALID_MODEL_SCHEMA.to_string())?;
         if !read.is_object() {
-            return Err(crate::state::invalid_model_schema(
-                "the schema is not a JSON Schema document",
-            ));
+            return Err(crate::state::INVALID_MODEL_SCHEMA.to_string());
         }
     }
     Ok(Some(schema))
