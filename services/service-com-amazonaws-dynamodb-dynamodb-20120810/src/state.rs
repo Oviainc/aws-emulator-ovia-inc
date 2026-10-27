@@ -3415,6 +3415,25 @@ impl Table {
         self.removed_at.is_some_and(|due| now >= due)
     }
 
+    /// How long the clock still owes this table its `CREATING` -> `ACTIVE` transition at
+    /// `now`, or `None` for a table whose creation has already fallen due.
+    ///
+    /// The creation is the transition that makes a table usable at all — "You can perform
+    /// read and write operations only on an ACTIVE table" (the `CreateTable` doc) — so it
+    /// is the one a client blocks on before it does anything else, with a poller whose
+    /// interval is far longer than the span this emulator compresses the creation into
+    /// ([`STATUS_TRANSITION`]). [`crate::ops::describe_table`] reports the table once this
+    /// is no longer owed, so the first poll a client sends observes the settled table
+    /// instead of waiting out its whole polling interval for a transition that was already
+    /// a fraction of a second away. A table being deleted or updated is reported as it
+    /// stands: it already serves (or has served) requests, so nothing is gated on it.
+    pub fn creation_settles_in(&self, now: SystemTime) -> Option<Duration> {
+        self.active_at
+            .duration_since(now)
+            .ok()
+            .filter(|left| !left.is_zero())
+    }
+
     /// The read and write capacity units this table has PROVISIONED: its own, plus that
     /// of every global secondary index on it.
     ///

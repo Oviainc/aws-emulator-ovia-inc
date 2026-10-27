@@ -45,25 +45,33 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// The first URI path segment this service's model binds to a DIFFERENT endpoint host
-/// than its own: `GetRevocationStatus` (`GET /revocations`) carries
-/// `@endpoint(hostPrefix: "data-")`
-/// (`smithy_query(query="operation",operation="GetRevocationStatus")`), so an SDK sends
-/// it to `data-signer.<region>.amazonaws.com` — the Signer DATA PLANE, emulated by
-/// `services/service-com-amazonaws-signerdata-signerdataplane`, which signs with the
-/// same `signer` signing name. Declining it here leaves exactly one claimant for that
-/// path instead of the `500 AmbiguousService` two claimants produce.
-const DATA_PLANE_PATH_SEGMENT: &str = "revocations";
+/// The operation `GET /revocations` addresses, as the generated routing table keys
+/// it (the operation's own name).
+const GET_REVOCATION_STATUS: &str = "GetRevocationStatus";
 
-/// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
-/// first segment (`"/"`, `""`).
+/// The method that route is bound to.
+const REVOCATIONS_METHOD: &str = "GET";
+
+/// Its path, as the single path segment it consists of. Compared the way the router
+/// compares it: `route_lookup` trims the path's leading and trailing `/` and splits
+/// the rest into segments, so `/revocations`, `/revocations/` and `//revocations//`
+/// are all that one segment and anything else is another route.
+const REVOCATIONS_PATH_SEGMENT: &str = "revocations";
+
+/// Whether `req` addresses the `GET /revocations` route, whatever query parameters
+/// it carries.
 ///
-/// Mirrors the framework's own `first_path_segment`, which is private to
-/// `emulator_server` and reads a whole buffered request; the `Service::can_handle` seam
-/// receives only `Parts`, so the identical rule is applied here.
-fn first_path_segment(path: &str) -> Option<&str> {
-    let segment = path.trim_start_matches('/').split('/').next()?;
-    (!segment.is_empty()).then_some(segment)
+/// Parsed with `http::Uri` rather than by hand, so an absolute-form URI, an
+/// origin-form one, and the userinfo/port/fragment variants all yield the same path
+/// the router reads. A URI that does not parse addresses no route.
+fn addresses_revocation_status(req: &aws_smithy_runtime_api::http::Request) -> bool {
+    if req.method() != REVOCATIONS_METHOD {
+        return false;
+    }
+    let Ok(uri) = req.uri().parse::<http::Uri>() else {
+        return false;
+    };
+    uri.path().trim_matches('/') == REVOCATIONS_PATH_SEGMENT
 }
 
 /// The `com-amazonaws-signer-wallabyservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -96,21 +104,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
         // AWS Signer and the Signer data plane are two emulated services behind ONE
-        // SigV4 signing name (`signer`) — the router resolves a request's routing key
-        // from the credential scope first, so both see the key `signer` — which the
-        // model cannot express. Claiming on the signing name ALONE therefore makes both
-        // services claim every `signer`-signed request and the router answers `500
-        // AmbiguousService` for ALL of it, this service's own operations included.
+        // SigV4 signing name (`signer`), which the model cannot express. The router
+        // resolves a request's routing key from the credential scope FIRST and falls
+        // back to the `Host` label, so the key names an ENDPOINT: `signer` for this
+        // service (whose endpoint prefix IS the shared signing name, and which every
+        // signed request to either endpoint therefore resolves to) and `data-signer`
+        // for the peer's own endpoint, which only a request addressed at that host
+        // without a credential scope resolves to.
         //
-        // This is the service whose endpoint prefix IS the shared signing name, so it
-        // serves that name's traffic — except the one path space the model itself
-        // addresses at the data-plane endpoint (`DATA_PLANE_PATH_SEGMENT`), which the
-        // peer crate emulates and which is declined here.
+        // So this service claims the signing name's traffic WHOLE, its own
+        // `GetRevocationStatus` (`GET /revocations`) included: it holds the records
+        // that answer it — `RevokeSigningProfile` and `RevokeSignature` write them —
+        // and a request signed for `signer` is one this service serves whichever of
+        // the two endpoint hosts it was sent to. The peer
+        // (`services/service-com-amazonaws-signerdata-signerdataplane`) claims the key
+        // of its OWN endpoint and no longer the shared signing name, so the two claims
+        // are disjoint by key and no request has the two claimants the router answers
+        // `500 AmbiguousService` for.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) if key == self.entry.identity().signing_name() => {
-                first_path_segment(parts.uri.path()) != Some(DATA_PLANE_PATH_SEGMENT)
-            }
-            _ => false,
+            Some(key) => key == self.entry.identity().signing_name(),
+            None => false,
         }
     }
 
@@ -118,12 +131,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // `GetRevocationStatus` binds `GET /revocations` with ALL FIVE of its input
+        // members `@required` + `@httpQuery`
+        // (`smithy_query(query="operation",operation="GetRevocationStatus")`), so the
+        // REST router's required-binding check matches that route only for a request
+        // that carries every one of those query parameters. A request leaving one out
+        // resolves to NO operation, and the protocol default for that is 501
+        // `NotImplemented` — which says nobody implemented the operation, when what
+        // actually happened is that the request left a required parameter out.
+        //
+        // Naming the operation here hands such a request to the operation it
+        // addressed, so the centralized walk's own boundary validator refuses it with
+        // the modelled 400 naming each absent member. A request that carries them all
+        // resolves to this same operation through the routing table, so nothing else
+        // changes.
+        if !addresses_revocation_status(req) {
+            return None;
+        }
+        self.entry.routing_table().get(GET_REVOCATION_STATUS)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

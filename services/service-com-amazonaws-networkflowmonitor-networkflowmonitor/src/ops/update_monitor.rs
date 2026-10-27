@@ -216,11 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource, so the request is refused whole rather than resolved in favour
         // of one of the two lists. Refused before the monitor is read, so a
         // contradictory update leaves the record — and `modifiedAt` — as it was.
-        if let Some((member, reason)) = contradiction(&input) {
-            return Err(UpdateMonitorErrorModeled::ValidationException(
-                crate::state::field_validation(member, reason),
-            )
-            .into());
+        if contradiction(&input) {
+            return Err(
+                UpdateMonitorErrorModeled::ValidationException(crate::state::add_remove_overlap())
+                    .into(),
+            );
         }
 
         let mut state = state.lock();
@@ -287,14 +287,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Which member of this request contradicts another, and why — or `None` when no
-/// resource is named in both an *ToAdd list and its *ToRemove list.
+/// Whether this request names one resource BOTH in an *ToAdd list and in its
+/// matching *ToRemove list.
 ///
-/// The two pairs are checked in the order the model declares them, so a request
-/// contradicting both is refused naming the local pair; the reason names the
-/// resource the caller put in both lists, so the request can be fixed from the
-/// message alone.
-fn contradiction(input: &UpdateMonitorInput) -> Option<(&'static str, String)> {
+/// Both pairs are checked — the local lists and the remote lists — because either
+/// contradiction refuses the request whole.
+fn contradiction(input: &UpdateMonitorInput) -> bool {
     let local = crate::state::overlapping_resources(
         input.local_resources_to_add.as_deref().unwrap_or_default(),
         input
@@ -302,41 +300,16 @@ fn contradiction(input: &UpdateMonitorInput) -> Option<(&'static str, String)> {
             .as_deref()
             .unwrap_or_default(),
     )
-    .map(|entry| {
-        (
-            "localResourcesToAdd",
-            contradiction_reason(
-                "localResourcesToRemove",
-                entry.r#type.as_str(),
-                entry.identifier.as_str(),
-            ),
-        )
-    });
-    local.or_else(|| {
-        crate::state::overlapping_resources(
+    .is_some();
+    local
+        || crate::state::overlapping_resources(
             input.remote_resources_to_add.as_deref().unwrap_or_default(),
             input
                 .remote_resources_to_remove
                 .as_deref()
                 .unwrap_or_default(),
         )
-        .map(|entry| {
-            (
-                "remoteResourcesToAdd",
-                contradiction_reason(
-                    "remoteResourcesToRemove",
-                    entry.r#type.as_str(),
-                    entry.identifier.as_str(),
-                ),
-            )
-        })
-    })
-}
-
-/// The reason text of the contradiction refusal, built from the request: the
-/// resource it named twice, and the other member it named it in.
-fn contradiction_reason(other_member: &str, resource_type: &str, identifier: &str) -> String {
-    format!("{resource_type} {identifier} is also in {other_member}")
+        .is_some()
 }
 
 /// This operation's output for a stored monitor — every member read off the

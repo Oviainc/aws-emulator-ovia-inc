@@ -186,16 +186,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Dropping an address block changes the directory's own networking, exactly as
         // adding one does, so it needs a directory that is in service: one still being
         // built by the transition its create owes is unavailable, which is the modelled
-        // refusal for exactly that.
+        // refusal for exactly that. The diagnostic is this service's shared one for a
+        // directory a call cannot reach: the requested id and nothing about the stage it
+        // is in.
         if directory.stage != crate::state::STAGE_ACTIVE {
             return Err(
                 RemoveIpRoutesErrorModeled::DirectoryUnavailableException(crate::state::refusal(
-                    format!(
-                        "Directory {id} is in stage {stage} and is not available for \
-                         IP route changes",
-                        id = directory.directory_id,
-                        stage = directory.stage
-                    ),
+                    crate::state::directory_unavailable(&input.directory_id),
                 ))
                 .into(),
             );

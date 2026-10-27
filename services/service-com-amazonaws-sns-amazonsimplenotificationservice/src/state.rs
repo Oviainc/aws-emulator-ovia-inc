@@ -1854,14 +1854,27 @@ fn ordering_id_is_valid(value: &str) -> bool {
 /// characters" has to name them beside the control category.
 const LINE_SEPARATORS: [char; 2] = ['\u{2028}', '\u{2029}'];
 
-/// Whether `subject` satisfies the rule SNS documents for it: at most
-/// [`MAX_SUBJECT_CHARS`] characters (CHARACTERS, not UTF-8 bytes — any script is
-/// accepted), none of them a line break or a control character.
+/// The one control character a `Subject` may carry: the HORIZONTAL TAB, which the
+/// recorded service accepts in a subject where it refuses every other control
+/// character — a tab is text a subject line can carry, not a break in it.
+const SUBJECT_TAB: char = '\t';
+
+/// Whether `subject` satisfies the rule SNS documents for it: it is "UTF-8 text" —
+/// so it carries at least one character that is not blank space — of at most
+/// [`MAX_SUBJECT_CHARS`] characters (CHARACTERS, not UTF-8 bytes, so any script is
+/// accepted), with "no line breaks or control characters" other than
+/// [`SUBJECT_TAB`].
+///
+/// A subject that is accepted is carried as it was sent: the blank space AROUND the
+/// text is part of the subject, so nothing here trims it.
 fn subject_is_valid(subject: &str) -> bool {
     subject.chars().count() <= MAX_SUBJECT_CHARS
+        // Text, rather than blank space: a subject of none — the empty one, and the
+        // one that is only spaces — is no subject line at all.
+        && subject.chars().any(|c| !c.is_whitespace())
         && !subject
             .chars()
-            .any(|c| c.is_control() || LINE_SEPARATORS.contains(&c))
+            .any(|c| (c.is_control() && c != SUBJECT_TAB) || LINE_SEPARATORS.contains(&c))
 }
 
 /// The sentence SNS refuses a publish that names no destination with: the members one
@@ -1903,8 +1916,8 @@ pub const NO_DEFAULT_ENTRY_REFUSAL: &str =
 pub const MESSAGE_TOO_LONG_REFUSAL: &str = "Invalid parameter: Message too long";
 
 /// The sentence SNS refuses an unacceptable `Subject` with: `Invalid parameter:` and
-/// the parameter, whichever of the member's rules the value broke (its length or a
-/// character it may not carry).
+/// the parameter, whichever of the member's rules the value broke (its length, a
+/// character it may not carry, or carrying no text at all).
 pub const INVALID_SUBJECT_REFUSAL: &str = "Invalid parameter: Subject";
 
 /// The sentence SNS refuses a `MessageDeduplicationId` on a STANDARD topic with:
@@ -3755,11 +3768,44 @@ pub const PLATFORM_APPLICATION_DOES_NOT_EXIST: &str = "PlatformApplication does 
 pub const RESOURCE_DOES_NOT_EXIST: &str = "Resource does not exist";
 
 /// The sentence SNS refuses an attribute name it does not write with: `Invalid
-/// parameter:` and the parameter, whether the name is none SNS defines for that
-/// resource, one only the create call sets, or one the service computes. Shared by
-/// every operation that writes an attribute by name, so the sentence does not depend
-/// on which call carried it.
+/// parameter:` and the member the name was carried in, whether the name is none SNS
+/// defines for that resource, one only the create call sets, or one the service
+/// computes. Shared by the operations that write ONE attribute by name — whose input
+/// member IS `AttributeName` — so the sentence does not depend on which of them
+/// carried it; a call carrying an attribute MAP names its own member and the key it
+/// did not recognise instead (see [`unknown_attribute_refusal`]).
 pub const INVALID_ATTRIBUTE_NAME_REFUSAL: &str = "Invalid parameter: AttributeName";
+
+/// The input member an attribute MAP reaches SNS in — the member `CreateTopic` and
+/// `Subscribe` carry their attributes in, as against the `AttributeName` member of the
+/// calls that write ONE attribute by name.
+pub const ATTRIBUTES_MEMBER: &str = "Attributes";
+
+/// The unrecognised key `attributes` carries, or `None` when every one of them is a
+/// name `is_defined` admits.
+///
+/// A map has no order of its own, so the key reported is the first of the unrecognised
+/// ones in the order a reader of the refusal can predict — ascending by name — and one
+/// request therefore always names the same offending key.
+pub fn unknown_attribute_name(
+    attributes: &HashMap<String, String>,
+    is_defined: impl Fn(&str) -> bool,
+) -> Option<&str> {
+    attributes
+        .keys()
+        .map(String::as_str)
+        .filter(|name| !is_defined(name))
+        .min()
+}
+
+/// The sentence SNS refuses an attribute MAP carrying a name it does not define with:
+/// the input member the map arrived in, and the key that was not recognised.
+///
+/// Built from the REQUEST, so a caller reading it can find the typo it made: the
+/// member names where to look and the echoed key names which entry of it.
+pub fn unknown_attribute_refusal(member: &str, name: &str) -> String {
+    format!("Invalid parameter: {member} Reason: Unknown attribute {name}")
+}
 
 /// The sentence SNS refuses a `NextToken` that is not one it minted with.
 ///

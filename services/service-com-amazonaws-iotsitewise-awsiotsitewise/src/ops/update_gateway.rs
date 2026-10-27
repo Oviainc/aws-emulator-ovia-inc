@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: renames the stored gateway the request addresses, keeping the name
+//! unique across this service's gateways and moving the gateway's `lastUpdateDate`;
+//! `DescribeGateway` and `ListGateways` read the new name back.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +168,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGateway"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateGatewayError::Modeled(UpdateGatewayErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // The gateway the path addresses has to exist before anything about the
+        // request's content is judged: an update of a gateway this service does not
+        // hold is the not-found refusal, whatever name it asks for.
+        if !store.gateways.contains_key(&input.gateway_id) {
+            return Err(not_found(&input.gateway_id));
+        }
+
+        // `gatewayName` is "A unique name for the gateway", so a rename may not take a
+        // name another gateway already holds — the same one-name-one-gateway rule
+        // `CreateGateway` enforces, applied here to the gateway this request renames.
+        // Asking for the name this gateway already carries asks for the state it is
+        // already in, so it is accepted rather than refused against itself.
+        if let Some(holder) = store
+            .gateways
+            .values()
+            .find(|record| record.name == input.gateway_name && record.id != input.gateway_id)
+        {
+            let (holder_id, holder_arn) = (holder.id.clone(), holder.arn.clone());
+            return Err(name_in_use(&holder_id, &holder_arn));
+        }
+
+        let gateway = store
+            .gateways
+            .get_mut(&input.gateway_id)
+            .ok_or_else(|| not_found(&input.gateway_id))?;
+
+        // The name is REPLACED by the one this request carries, and the gateway was
+        // just updated, so its `lastUpdateDate` moves with the write while its
+        // `creationDate` stays where the create put it. Nothing else about the
+        // gateway — its platform, its version, its capability configurations or its
+        // tags — is in this request, so nothing else changes.
+        gateway.name = input.gateway_name.clone();
+        gateway.last_update_date = now;
+
+        Ok(UpdateGatewayOutput)
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the id the request supplied, worded
+/// by this service's one not-found rule rather than by a template of this handler's
+/// own.
+fn not_found(gateway_id: &str) -> UpdateGatewayError {
+    UpdateGatewayError::Modeled(UpdateGatewayErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_GATEWAY, gateway_id),
+        },
+    ))
+}
+
+/// HTTP 409 `ConflictingOperationException` for a `gatewayName` another gateway
+/// already holds: the message names the DIMENSION of the request that collided, as
+/// this service's uniqueness rule words it, and the error's members name "the
+/// resource that conflicts with this operation" — the gateway holding that name, by
+/// its own stored id and the ARN it was minted with, never one rebuilt from this
+/// request.
+///
+/// This is the 409 the operation models for a conflict: it declares no
+/// `ResourceAlreadyExistsException`, which this service keeps for a resource that a
+/// CREATE would mint and that is itself already there. Its own summary speaks of
+/// more than one operation on the same resource at once, but its REQUIRED
+/// `resourceId`/`resourceArn` members exist to point at "the resource that
+/// conflicts with this operation", and a gateway holding the requested name is
+/// exactly such a resource — a conflict this rename cannot resolve, rather than a
+/// malformed request — so this is the modelled error whose shape carries it.
+fn name_in_use(holder_id: &str, holder_arn: &str) -> UpdateGatewayError {
+    UpdateGatewayError::Modeled(UpdateGatewayErrorModeled::ConflictingOperationException(
+        ConflictingOperationException {
+            message: crate::state::already_using_message("gateway", "name"),
+            resource_id: holder_id.to_string(),
+            resource_arn: holder_arn.to_string(),
+        },
+    ))
 }
