@@ -67,6 +67,10 @@ pub mod alarm_evaluation;
 /// evaluated over the series this store holds.
 pub mod metric_math;
 
+/// A `MetricDataQuery` array — what `GetMetricData` answers from and what a metric-math
+/// alarm's configuration is — resolved over the series this store holds.
+pub mod metric_query;
+
 /// A dimension set, normalised: dimension name to value, ordered by name, so the same set
 /// keys the same time series whatever order a request listed it in.
 pub type DimensionSet = BTreeMap<String, String>;
@@ -2419,6 +2423,13 @@ pub const ALARM_STATE_ALARM: &str = "ALARM";
 /// (`STATE_VALUE_VALUES`).
 pub const ALARM_STATE_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
 
+/// The `StateReason` an alarm NOTHING has evaluated yet reports: "When this operation creates
+/// an alarm, the alarm state is immediately set to INSUFFICIENT_DATA. The alarm is then
+/// evaluated and its state is set appropriately." (`PutMetricAlarm`) — the service's own
+/// constant for that un-evaluated seed state, recorded verbatim, so every alarm writer of
+/// every kind seeds the state the same way and no evaluation has to word it.
+pub const INITIAL_STATE_REASON: &str = "Unchecked: Initial alarm creation";
+
 /// `MetricAlarm`, one of the modelled `AlarmType` values (`ALARM_TYPE_VALUES`): the kind of
 /// alarm `PutMetricAlarm` creates, which is also the kind `DescribeAlarms` and
 /// `DescribeAlarmHistory` report when a request names no `AlarmTypes`.
@@ -2635,22 +2646,25 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// arrives with it.
     ///
     /// An alarm is matched on the datapoints it would GRADE: the series it names — namespace,
-    /// metric name and dimension set, the identity its own evaluation reads — and the unit it
-    /// selects ("If you specify a unit, the operation returns only data that was collected with
-    /// that unit specified"), so a datapoint of another series, or of a unit this alarm does not
-    /// grade, makes it no more due than one nobody published.
+    /// metric name and dimension set, the identity its own evaluation reads, or the identities
+    /// its `Metrics` queries name — and the unit each of them selects ("If you specify a unit,
+    /// the operation returns only data that was collected with that unit specified"), so a
+    /// datapoint of another series, or of a unit this alarm does not grade, makes it no more
+    /// due than one nobody published.
     pub fn make_alarms_due(&mut self, written: &[WrittenSeries], now_secs: f64) {
         if written.is_empty() {
             return;
         }
         let due = now_secs + alarm_evaluation::EVALUATION_DELAY_SECS;
         for stored in self.alarms.values_mut() {
-            let watched = alarm_evaluation::watched_series(&stored.alarm);
+            let watched = alarm_evaluation::watched_series_set(&stored.alarm);
             let grades = written.iter().any(|series| {
-                series.key == watched
-                    && series.units.iter().any(|unit| {
-                        alarm_evaluation::alarm_grades_unit(&stored.alarm, unit.as_deref())
-                    })
+                watched.iter().any(|(key, selector)| {
+                    series.key == *key
+                        && series.units.iter().any(|unit| {
+                            alarm_evaluation::grades_unit(selector.as_deref(), unit.as_deref())
+                        })
+                })
             });
             if grades {
                 stored.evaluation_due_secs = stored.evaluation_due_secs.min(due);

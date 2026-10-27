@@ -480,6 +480,29 @@ fn projected(
                 });
             }
         }
+        // A run-a-job task's own submission: "the response from a resource when a task
+        // has started", which is the document the call that started the job answered.
+        crate::state::EVENT_TASK_SUBMITTED => {
+            if let Some((resource_type, resource)) = named_work(stored) {
+                event.task_submitted_event_details = Some(TaskSubmittedEventDetails {
+                    resource_type,
+                    resource,
+                    output: data(stored.details.output.clone()),
+                    output_details: included
+                        .filter(|_| with_data && stored.details.output.is_some()),
+                });
+            }
+        }
+        crate::state::EVENT_TASK_SUBMIT_FAILED => {
+            if let Some((resource_type, resource)) = named_work(stored) {
+                event.task_submit_failed_event_details = Some(TaskSubmitFailedEventDetails {
+                    resource_type,
+                    resource,
+                    error: stored.details.error.clone(),
+                    cause: stored.details.cause.clone(),
+                });
+            }
+        }
         crate::state::EVENT_TASK_FAILED => {
             if let Some((resource_type, resource)) = named_work(stored) {
                 event.task_failed_event_details = Some(TaskFailedEventDetails {

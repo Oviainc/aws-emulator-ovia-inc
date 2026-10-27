@@ -81,6 +81,20 @@ const AWS_DEFAULT_FLOW_LOG_FORMAT: &str = "${version} ${account-id} ${interface-
                                            ${protocol} ${packets} ${bytes} ${start} \
                                            ${end} ${action} ${log-status}";
 
+/// The flow log status AWS documents: "The status of the flow log (`ACTIVE`)"
+/// (`FlowLog$FlowLogStatus` —
+/// `smithy_query(query="shape",shape="FlowLog")`). Written out here rather than read from
+/// the crate for the reason [`AWS_DEFAULT_FLOW_LOG_FORMAT`] is.
+const AWS_FLOW_LOG_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// A delivering flow log's outcome, one of the two values AWS documents: "The status of the
+/// logs delivery (`SUCCESS` | `FAILED`)" (`FlowLog$DeliverLogsStatus`, and the values the
+/// `deliver-log-status` filter selects on — `DescribeFlowLogsRequest$Filter`).
+const AWS_DELIVER_LOGS_STATUS_SUCCESS: &str = "SUCCESS";
+
+/// The other documented outcome of the same member — a flow log whose delivery failed.
+const AWS_DELIVER_LOGS_STATUS_FAILED: &str = "FAILED";
+
 /// One form field.
 fn param(name: &str, value: &str) -> (String, String) {
     (name.to_string(), value.to_string())
@@ -694,8 +708,13 @@ async fn describe_flow_logs_filters_the_store_rather_than_looking_one_up() {
             Vec::new(),
         ),
         narrowing(
-            "the deliver-log-status filter, which no stored flow log answers",
-            filters(&[("deliver-log-status", &["SUCCESS"])]),
+            "the deliver-log-status filter on the delivering flow logs",
+            filters(&[("deliver-log-status", &[AWS_DELIVER_LOGS_STATUS_SUCCESS])]),
+            vec![on_first.clone(), on_second.clone()],
+        ),
+        narrowing(
+            "the deliver-log-status filter on a delivery outcome nothing is in",
+            filters(&[("deliver-log-status", &[AWS_DELIVER_LOGS_STATUS_FAILED])]),
             Vec::new(),
         ),
     ];
@@ -1380,6 +1399,171 @@ async fn an_s3_flow_log_keeps_its_destination_arn_and_options() {
     assert!(
         !reported.contains("<logGroupName>"),
         "an S3 destination: expected no logGroupName, got {reported}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Delivery health: the outcome is reported beside the flow log's own status
+// ---------------------------------------------------------------------------
+
+/// Every flow log the store holds reports its LOG DELIVERY OUTCOME beside its own status:
+/// `flowLogStatus` and `deliverLogsStatus` are reported together, the delivery of a flow log
+/// whose destination the create resolved is `SUCCESS`, a successful delivery carries no error
+/// message, and the documented `deliver-log-status` filter selects on exactly that member —
+/// so a client can tell a delivering flow log from a broken one, and list the account's
+/// flow logs by delivery health.
+///
+/// The rows differ in the destination TYPE (the three the model admits, including the one
+/// left to its default), in WHICH member named the destination (a log group name, a log
+/// group ARN, a bucket ARN, a delivery stream ARN), in the monitored resource KIND (a VPC,
+/// a subnet, a network interface), in the traffic type, and in whether a cross-account
+/// delivery role or destination options were asked for.
+#[tokio::test]
+async fn every_flow_log_reports_its_delivery_outcome_beside_its_flow_log_status() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let vpc_id = create_vpc(&router, "10.227.0.0/16").await;
+    let subnet_id = create_subnet(&router, &vpc_id, "10.227.1.0/24").await;
+    let network_interface_id = create_network_interface(&router, &subnet_id).await;
+
+    // The destination forms `CreateFlowLogsRequest$LogDestination` documents, in Regions and
+    // accounts that are deliberately not the emulator's own.
+    const GROUP_ARN: &str = "arn:aws:logs:eu-west-1:111122223333:log-group:delivery-group";
+    const BUCKET_ARN: &str = "arn:aws:s3:::flow-log-delivery-bucket/vpc/";
+    const STREAM_ARN: &str = "arn:aws:firehose:eu-central-1:111122223333:deliverystream:delivered";
+    const CROSS_ACCOUNT_ROLE_ARN: &str = "arn:aws:iam::111122223333:role/flow-logs-cross-account";
+
+    let mut cross_account = cloud_watch_logs_params("VPC", &vpc_id, "cross-account-group");
+    cross_account.push(param("DeliverCrossAccountRole", CROSS_ACCOUNT_ROLE_ARN));
+
+    let cases: Vec<RequestCase> = vec![
+        RequestCase {
+            name: "cloud-watch-logs on a VPC, named by LogGroupName",
+            params: cloud_watch_logs_params("VPC", &vpc_id, "/aws/vpc/flow-logs"),
+        },
+        RequestCase {
+            name: "the default destination type on a subnet, rejected traffic",
+            params: vec![
+                param("ResourceType", "Subnet"),
+                param("ResourceId.1", &subnet_id),
+                param("TrafficType", "REJECT"),
+                param("LogGroupName", "subnet-delivery-group"),
+                param("DeliverLogsPermissionArn", DELIVER_LOGS_ROLE_ARN),
+            ],
+        },
+        RequestCase {
+            name: "cloud-watch-logs on a network interface, named by a log group ARN",
+            params: vec![
+                param("ResourceType", "NetworkInterface"),
+                param("ResourceId.1", &network_interface_id),
+                param("TrafficType", "ACCEPT"),
+                param("LogDestinationType", LOG_DESTINATION_TYPE_CLOUD_WATCH_LOGS),
+                param("LogDestination", GROUP_ARN),
+                param("DeliverLogsPermissionArn", DELIVER_LOGS_ROLE_ARN),
+            ],
+        },
+        RequestCase {
+            name: "cloud-watch-logs with a cross-account delivery role",
+            params: cross_account,
+        },
+        RequestCase {
+            name: "s3 on a VPC, named by a bucket ARN",
+            params: vec![
+                param("ResourceType", "VPC"),
+                param("ResourceId.1", &vpc_id),
+                param("TrafficType", "ALL"),
+                param("LogDestinationType", "s3"),
+                param("LogDestination", BUCKET_ARN),
+            ],
+        },
+        RequestCase {
+            name: "s3 with hive-compatible partitions and a parquet file format",
+            params: vec![
+                param("ResourceType", "VPC"),
+                param("ResourceId.1", &vpc_id),
+                param("TrafficType", "REJECT"),
+                param("LogDestinationType", "s3"),
+                param("LogDestination", BUCKET_ARN),
+                param("DestinationOptions.FileFormat", "parquet"),
+                param("DestinationOptions.HiveCompatiblePartitions", "true"),
+            ],
+        },
+        RequestCase {
+            name: "kinesis-data-firehose on a VPC, named by a delivery stream ARN",
+            params: vec![
+                param("ResourceType", "VPC"),
+                param("ResourceId.1", &vpc_id),
+                param("TrafficType", "ACCEPT"),
+                param("LogDestinationType", "kinesis-data-firehose"),
+                param("LogDestination", STREAM_ARN),
+            ],
+        },
+    ];
+
+    let mut minted: Vec<String> = Vec::new();
+    for case in &cases {
+        let (status, body) = create_flow_logs(&router, &case.params).await;
+        let flow_log_id = created_id(case.name, status, &body);
+        let reported = describe_one(&router, case.name, &flow_log_id).await;
+
+        let statuses = (
+            element(&reported, "flowLogStatus"),
+            element(&reported, "deliverLogsStatus"),
+        );
+        assert_eq!(
+            (
+                statuses.0.as_deref(),
+                statuses.1.as_deref()
+            ),
+            (
+                Some(AWS_FLOW_LOG_STATUS_ACTIVE),
+                Some(AWS_DELIVER_LOGS_STATUS_SUCCESS)
+            ),
+            "case {case:?}: expected (flowLogStatus, deliverLogsStatus) \
+             ({AWS_FLOW_LOG_STATUS_ACTIVE:?}, {AWS_DELIVER_LOGS_STATUS_SUCCESS:?}), got \
+             {statuses:?} in {reported}",
+            case = case.name,
+        );
+        // "Information about the error that occurred" (`FlowLog$DeliverLogsErrorMessage`) —
+        // a delivery that succeeded has no error to report.
+        assert!(
+            !reported.contains("<deliverLogsErrorMessage>"),
+            "case {case:?}: expected no deliverLogsErrorMessage, got {reported}",
+            case = case.name,
+        );
+
+        // The documented filter selects on exactly that member: this flow log is found
+        // under the outcome it reports, and under no other one.
+        for (outcome, expected) in [
+            (AWS_DELIVER_LOGS_STATUS_SUCCESS, vec![flow_log_id.clone()]),
+            (AWS_DELIVER_LOGS_STATUS_FAILED, Vec::new()),
+        ] {
+            let params = filters(&[
+                ("deliver-log-status", &[outcome][..]),
+                ("flow-log-id", &[flow_log_id.as_str()][..]),
+            ]);
+            let selected = described_ids(&router, case.name, &params).await;
+            assert_eq!(
+                selected, expected,
+                "case {case:?}: expected the deliver-log-status {outcome} filter to select \
+                 {expected:?}, got {selected:?}",
+                case = case.name,
+            );
+        }
+        minted.push(flow_log_id);
+    }
+
+    // Every flow log this account holds is delivering, so the delivery-health listing a
+    // client polls reports all of them rather than an empty set.
+    minted.sort();
+    let selected = described_ids(
+        &router,
+        "every delivering flow log",
+        &filters(&[("deliver-log-status", &[AWS_DELIVER_LOGS_STATUS_SUCCESS])]),
+    )
+    .await;
+    assert_eq!(
+        selected, minted,
+        "every delivering flow log: expected {minted:?}, got {selected:?}"
     );
 }
 

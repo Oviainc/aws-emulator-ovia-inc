@@ -20,6 +20,9 @@
 //! * a document that is not an IAM resource-based policy, or one past the
 //!   service's size ceiling, is refused with the modeled `InvalidPolicy` error
 //!   and nothing is stored, and a size refusal reports the size submitted;
+//! * the resource element of a sending-authorization policy names an identity by
+//!   its ARN, so a value that is not an ARN is refused and the refusal names that
+//!   value;
 //! * an identity this account has not verified is refused by every one of these
 //!   operations ("this operation is for the identity owner only").
 
@@ -424,6 +427,125 @@ async fn a_document_that_is_not_a_policy_is_refused_and_nothing_is_stored() {
         assert!(
             listed.is_empty(),
             "case {case:?}: a refused put must store nothing, got {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_policy_whose_resource_is_not_an_arn_is_refused_and_nothing_is_stored() {
+    // A sending authorization policy authorizes sending THROUGH an identity, and an
+    // identity is named by its ARN, so the resource element has to name one. The rows
+    // differ along what the rule generalises over: which element carries the value,
+    // the form it is written in (one string or a list), and the kind of value that is
+    // not an ARN — the wildcard the IAM language itself admits, a bare identity name,
+    // a glob over a resource path, and a prefix that only looks like an ARN's.
+    let own_arn = "arn:aws:ses:us-east-1:000000000000:identity/sender@example.com";
+    struct Row<'a> {
+        case: &'a str,
+        /// The `Resource` (or `NotResource`) element, as JSON.
+        element: String,
+        /// The value the refusal must name, or `None` for a policy that is accepted.
+        offending: Option<&'a str>,
+    }
+    let rows = [
+        Row {
+            case: "the identity's own ARN",
+            element: format!("\"Resource\":\"{own_arn}\""),
+            offending: None,
+        },
+        Row {
+            case: "a list of identity ARNs",
+            element: format!("\"Resource\":[\"{own_arn}\",\"{own_arn}\"]"),
+            offending: None,
+        },
+        Row {
+            case: "an ARN whose resource path ends in a wildcard",
+            element: "\"Resource\":\"arn:aws:ses:us-east-1:000000000000:identity/*\"".to_string(),
+            offending: None,
+        },
+        Row {
+            case: "a bare wildcard",
+            element: "\"Resource\":\"*\"".to_string(),
+            offending: Some("*"),
+        },
+        Row {
+            case: "the identity's name rather than its ARN",
+            element: "\"Resource\":\"sender@example.com\"".to_string(),
+            offending: Some("sender@example.com"),
+        },
+        Row {
+            case: "a glob over a resource path",
+            element: "\"Resource\":\"identity/*\"".to_string(),
+            offending: Some("identity/*"),
+        },
+        Row {
+            case: "a prefix that only looks like an ARN's",
+            element: "\"Resource\":\"ARN:aws:ses:us-east-1:000000000000:identity/x\"".to_string(),
+            offending: Some("ARN:aws:ses:us-east-1:000000000000:identity/x"),
+        },
+        Row {
+            case: "the wildcard second in a list of resources",
+            element: format!("\"Resource\":[\"{own_arn}\",\"*\"]"),
+            offending: Some("*"),
+        },
+        Row {
+            case: "a NotResource that is not an ARN",
+            element: "\"NotResource\":\"*\"".to_string(),
+            offending: Some("*"),
+        },
+    ];
+
+    for row in rows {
+        let router = emulator();
+        verify_email(&router, "sender@example.com").await;
+        let document = format!(
+            "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Sid\":\"Authorize\",\
+             \"Effect\":\"Allow\",\"Principal\":{{\"AWS\":\"*\"}},\
+             \"Action\":\"ses:SendEmail\",{}}}]}}",
+            row.element
+        );
+        let (status, body) = put_policy(&router, "sender@example.com", "Authorize", &document).await;
+        let listed = policy_names(&router, "sender@example.com").await;
+
+        let Some(offending) = row.offending else {
+            assert_eq!(
+                status, 200,
+                "case {:?}: a policy naming its resource by ARN is accepted, got {status} with \
+                 {body}",
+                row.case
+            );
+            assert_eq!(
+                listed,
+                vec!["Authorize".to_string()],
+                "case {:?}: an accepted policy is stored, got {listed:?}",
+                row.case
+            );
+            continue;
+        };
+
+        assert_eq!(
+            status, 400,
+            "case {:?}: a resource that is not an ARN is refused, got {status} with {body}",
+            row.case
+        );
+        assert_eq!(
+            element(&body, "Code").as_deref(),
+            Some("InvalidPolicy"),
+            "case {:?}: expected the modeled InvalidPolicy code, got {body}",
+            row.case
+        );
+        let expected = format!("Invalid ARN: ARNs must start with 'arn:': {offending}");
+        let reported = element(&body, "Message").map(|text| xml_text(&text));
+        assert_eq!(
+            reported.as_deref(),
+            Some(expected.as_str()),
+            "case {:?}: expected the message {expected:?}, got {reported:?} in {body}",
+            row.case
+        );
+        assert!(
+            listed.is_empty(),
+            "case {:?}: a refused put must store nothing, got {listed:?}",
+            row.case
         );
     }
 }

@@ -56,10 +56,11 @@ struct InstanceGatedRoute {
     /// The path the operation's `@http` `uri` binds it to, matched before the framework has
     /// resolved a routing key.
     uri: &'static str,
-    /// The refusal this route serves, carrying the operation name a gated request is
-    /// recorded under: the one the model names for that route, so a refusal lands in the
-    /// same telemetry series as the requests that reach the handler.
-    fail_closed: FailClosed,
+    /// The operation the model names for that route. It is both the routing key the
+    /// modelled operation is wired under — so an authorized request is served by running
+    /// it — and the operation name a gated request is recorded under, so a refusal lands in
+    /// the same telemetry series as the requests that reach the handler.
+    operation: &'static str,
 }
 
 /// Every route the authorization gate covers.
@@ -81,15 +82,11 @@ struct InstanceGatedRoute {
 static INSTANCE_GATED_ROUTES: &[InstanceGatedRoute] = &[
     InstanceGatedRoute {
         uri: "/user/AssociateUser",
-        fail_closed: FailClosed {
-            operation: "AssociateUser",
-        },
+        operation: "AssociateUser",
     },
     InstanceGatedRoute {
         uri: "/user/ListUserAssociations",
-        fail_closed: FailClosed {
-            operation: "ListUserAssociations",
-        },
+        operation: "ListUserAssociations",
     },
 ];
 
@@ -110,12 +107,16 @@ const RESOURCE_ARN_MEMBER: &str = "resourceArn";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// The same shared engine the entry constructed each operation from, so the
-    /// authorization gate in [`Self::override_operation`] can read this service's store
-    /// before any handler runs. The gate must decide BEFORE the framework deserializes and
-    /// constraint-checks the request, which is the one decision that cannot be made from
-    /// inside a handler.
-    engine: Arc<Eng>,
+    /// The authorization gate for each route in [`INSTANCE_GATED_ROUTES`], each holding the
+    /// same shared engine the entry constructed every operation from.
+    ///
+    /// The gate has to decide BEFORE the framework deserializes and constraint-checks the
+    /// request, which is the one decision that cannot be made from inside a handler — and
+    /// deciding it means resolving an EC2 instance against the service that owns instances,
+    /// which is an await. So the gate is an operation ([`InstanceGate`]): the sync
+    /// [`Service::override_operation`] seam only picks it, and the gate itself resolves the
+    /// instance and then either refuses or runs the modelled operation the route names.
+    gates: Vec<InstanceGate<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -125,32 +126,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
-            engine,
+            gates: INSTANCE_GATED_ROUTES
+                .iter()
+                .map(|route| InstanceGate {
+                    route,
+                    engine: Arc::clone(&engine),
+                })
+                .collect(),
         }
-    }
-
-    /// Whether this service will authorize a request that acts on the EC2 instance it names,
-    /// read off the RAW request body.
-    ///
-    /// The predicate is the handler's own
-    /// ([`crate::state::ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::authorizes_instance`]):
-    /// the caller's ownership of the EC2 instance the request names. Asking the same
-    /// question in the same place is what keeps the two gates from ever disagreeing — this
-    /// one only answers it EARLIER, before the boundary validator runs.
-    ///
-    /// `None` means "the gate does not apply": the body is not readable as JSON, or it
-    /// names no `InstanceId` at all, so there is nothing to authorize and the framework's
-    /// own refusal stands. `Some(false)` is a request this service refuses before it looks
-    /// at the request's shape.
-    fn authorizes_named_instance(
-        &self,
-        req: &aws_smithy_runtime_api::http::Request,
-    ) -> Option<bool> {
-        let body: serde_json::Value = serde_json::from_slice(req.body().bytes()?).ok()?;
-        let instance_id = body.get("InstanceId")?.as_str()?;
-        let state = crate::state::service_state(&*self.engine)?;
-        let authorized = state.lock().authorizes_instance(instance_id);
-        Some(authorized)
     }
 }
 
@@ -191,17 +174,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // not depend on which one the caller reached for; each handler asks the same
         // predicate again, so the two gates cannot disagree about a request that gets this
         // far.
+        //
+        // What is picked here is the GATE, not the refusal: resolving the instance reaches
+        // the service that owns instances, which cannot be awaited in this sync seam, so the
+        // gate makes that decision in its own `run` and hands an authorized request on to
+        // the modelled operation the route names.
         if req.method() != GATED_METHOD {
             return None;
         }
         let path = request_path(req.uri());
-        let route = INSTANCE_GATED_ROUTES
-            .iter()
-            .find(|route| route.uri == path)?;
-        if self.authorizes_named_instance(req) == Some(false) {
-            return Some(&route.fail_closed);
-        }
-        None
+        let gate = self.gates.iter().find(|gate| gate.route.uri == path)?;
+        Some(gate as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -285,36 +268,80 @@ fn request_path(uri: &str) -> &str {
     }
 }
 
-/// The refusal this service fails closed with, as an operation the dispatch path can run.
+/// The authorization gate for one [`INSTANCE_GATED_ROUTES`] entry, as an operation the
+/// dispatch path can run.
 ///
-/// It answers one thing: the non-modelled `UnauthorizedException` and its fixed sentence,
-/// with the SAME code, sentence and status the handler's own gate answers
+/// It is an operation rather than a predicate because the decision needs an await: the
+/// account's EC2 instances are EC2's, so resolving the one a request names asks the service
+/// that owns them over the in-process callback
+/// ([`crate::state::ec2_fleet::authorizes_instance`]), the same resolution each handler
+/// makes. Running here is what puts that decision AHEAD of the boundary validator.
+///
+/// An authorized request is handed to the modelled operation the route names, read off this
+/// service's own routing table, so it is served by exactly the centralized
+/// deserialize -> validate -> handle walk every other request takes — the gate changes WHICH
+/// refusal comes first, not whether the modelled constraints are enforced. Its handler then
+/// resolves the instance AGAIN, which is deliberate: each layer asks the question itself, so
+/// the hoisted gate and the handler cannot disagree about a request, and a handler stays
+/// correct for a caller that reaches it without this seam. The cost is one extra
+/// `DescribeInstances` for one id, in process, on an authorized gated request.
+///
+/// A request it refuses answers one thing: the non-modelled `UnauthorizedException` and its
+/// fixed sentence, with the SAME code, sentence and status the handler's own gate answers
 /// ([`crate::scaffolded::Scaffolded::unauthorized`]), so a caller cannot tell which gate
-/// refused the request — only that it was refused. It is rendered through the service's
-/// own protocol envelope (`refusal_response`), so a fail-closed refusal is shaped exactly
-/// like every other refusal this service sends, and it reads neither the request nor any
-/// state: the decision was already made by
-/// [`EmulatedService::authorizes_user_association`]; this only states it.
+/// refused the request — only that it was refused. It is rendered through the service's own
+/// protocol envelope (`refusal_response`), so a fail-closed refusal is shaped exactly like
+/// every other refusal this service sends.
 ///
 /// The refusal travels as an `Invalid` protocol error with no violations, which is what
 /// gives it the 400 this service reports a refusal with
 /// ([`crate::scaffolded::SERVICE_REFUSAL_STATUS`]); the chosen code and message replace
 /// the wording that error would otherwise carry.
-struct FailClosed {
-    /// The operation the gated request named, for the telemetry row below.
-    operation: &'static str,
+struct InstanceGate<Eng> {
+    /// The route this gate covers: the path it is picked for and the modelled operation it
+    /// hands an authorized request to.
+    route: &'static InstanceGatedRoute,
+    /// The same shared engine the entry constructed each operation from, so the gate reads
+    /// this service's own fleet seam before asking EC2.
+    engine: Arc<Eng>,
 }
 
-impl ErasedOperation for FailClosed {
+impl<Eng: Send + Sync + 'static> ErasedOperation for InstanceGate<Eng> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
         req: &'r aws_smithy_runtime_api::http::Request,
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
-        let _ = req;
         let started = std::time::Instant::now();
         Box::pin(async move {
+            // A body that is not readable as JSON, or that names no `InstanceId` at all,
+            // gives the gate nothing to authorize: there is no instance to resolve, so the
+            // request goes on to the modelled operation and the framework's own refusal
+            // stands.
+            let authorized = match named_instance(req) {
+                None => true,
+                Some(instance_id) => {
+                    crate::state::ec2_fleet::authorizes_instance(
+                        &*self.engine,
+                        ctx,
+                        &instance_id,
+                    )
+                    .await
+                }
+            };
+            if authorized {
+                // The modelled operation this route names, from this service's own
+                // model-derived routing table (keyed by operation name).
+                if let Some(operation) = svc.definition().routing_table().get(self.route.operation)
+                {
+                    return operation.run(svc, req, ctx).await;
+                }
+                // Unreachable while the model binds the route: the table is built from the
+                // same model the route's path and operation come from. Answered as the
+                // request naming no modelled operation, which is what it would be.
+                return svc.definition().routing_error_response(req);
+            }
             let response = svc.definition().refusal_response(
                 aws_smithy_schema_server::ProtocolError::Invalid(Vec::new()),
                 Some(Refused {
@@ -324,7 +351,7 @@ impl ErasedOperation for FailClosed {
             );
             record_refusal(
                 ctx,
-                self.operation,
+                self.route.operation,
                 response.status().as_u16(),
                 started.elapsed(),
             );
@@ -337,6 +364,17 @@ impl ErasedOperation for FailClosed {
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
         None
     }
+}
+
+/// The EC2 instance a gated request names, read off the RAW request body — before the
+/// framework has deserialized or constraint-checked anything, which is the whole point of
+/// deciding here.
+///
+/// `None` means the gate does not apply: the body is not readable as JSON, or it names no
+/// `InstanceId` at all, so there is nothing to authorize.
+fn named_instance(req: &aws_smithy_runtime_api::http::Request) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_slice(req.body().bytes()?).ok()?;
+    Some(body.get("InstanceId")?.as_str()?.to_string())
 }
 
 /// Record the refusal above as the operation row the framework's dispatch sequence would

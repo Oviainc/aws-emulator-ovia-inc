@@ -7,7 +7,8 @@
 //!
 //! The INSTANCE-AUTHORIZATION gate below is also run BEFORE the request's shape is
 //! validated, by `crate::service::EmulatedService::override_operation` over the same
-//! `authorizes_instance` predicate: this service refuses a call it will not authorize
+//! `crate::state::ec2_fleet::authorizes_instance` predicate: this service refuses a call it
+//! will not authorize
 //! identically whether the request's `Tags` map is within the modelled `@length(max: 50)`
 //! or past it, and a handler cannot do that — the framework's centralized walk is
 //! deserialize -> validate -> handle, so by the time this function runs an over-length map
@@ -25,9 +26,11 @@
 //! The order the refusals come in is the behaviour, not an implementation detail:
 //!
 //! 1. the INSTANCE-AUTHORIZATION gate runs first and fails CLOSED — the caller's
-//!    ownership of an EC2 instance is a fact about the account's fleet
-//!    ([`crate::state::ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::authorizes_instance`]),
-//!    and an instance the fleet does not hold cannot be shown to be the caller's, so the
+//!    ownership of an EC2 instance is a fact about the account's instances, which EC2 owns
+//!    and this service therefore ASKS it about
+//!    ([`crate::state::ec2_fleet::authorizes_instance`]),
+//!    and an instance neither EC2 nor this service's own fleet seam reports cannot be
+//!    shown to be the caller's, so the
 //!    request is refused with the non-modelled `UnauthorizedException`
 //!    ([`crate::scaffolded::Scaffolded::unauthorized`]) and its fixed sentence, which
 //!    discloses nothing about this service's own resources;
@@ -185,15 +188,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(&ctx.parts().headers);
         let signing_name = ctx.identity().signing_name().to_string();
 
-        let mut state = state.lock();
-        state.materialise_due(now);
-
         // The authorization gate, BEFORE any existence lookup of this service's own
-        // resources: an instance the account's fleet does not hold cannot be shown to be
-        // the caller's, so the request fails closed.
-        if !state.authorizes_instance(&input.instance_id) {
+        // resources: an instance neither this service's fleet seam nor the service that
+        // OWNS instances reports cannot be shown to be the caller's, so the request fails
+        // closed. Asked before the store is locked, because resolving it reaches another
+        // service over the in-process callback.
+        if !crate::state::ec2_fleet::authorizes_instance(&*self.engine, ctx, &input.instance_id)
+            .await
+        {
             return Err(crate::scaffolded::Scaffolded::unauthorized());
         }
+
+        let mut state = state.lock();
+        state.materialise_due(now);
 
         let key = crate::state::provider_key(&input.identity_provider).map_err(into_error)?;
         if !state.provider_key_is_registered(&key) {

@@ -14,7 +14,7 @@
 //! the rule generalises over (four, in three partitions, including the one an unsigned
 //! request defaults to) and every resource kind this service holds — an import file
 //! task, an assessment and its latest-id singleton, the preferences singleton, a
-//! recommendation report generation task and its one-at-a-time coalescing, and the
+//! recommendation report generation task and its one-at-a-time rule, and the
 //! server inventory an import ingests. Each resource is created through ONE Region's
 //! endpoint and then looked for through every Region's, so a read that answers from
 //! another Region's portfolio fails here.
@@ -487,7 +487,9 @@ async fn a_region_nothing_was_created_in_reads_as_an_empty_account() {
 }
 
 /// The one-report-at-a-time rule is per Region: a start call made in another Region while
-/// a task is running does NOT coalesce onto it, it mints that Region's own task.
+/// a task is running is NOT refused for it, it mints that Region's own task — while a
+/// second start in the Region the task is running in is refused with the modelled 409
+/// `ConflictException` naming that Region's task.
 #[tokio::test]
 async fn the_running_report_task_is_per_region() {
     let router = emulator();
@@ -510,7 +512,8 @@ async fn the_running_report_task_is_per_region() {
     }
 
     for (region, id) in &ids {
-        // Inside the same Region a second start coalesces onto the running task.
+        // Inside the same Region a second start is refused for the task already running
+        // there, and the refusal names THAT Region's task.
         let again = call_in(
             &router,
             region,
@@ -520,10 +523,18 @@ async fn the_running_report_task_is_per_region() {
         )
         .await;
         assert_eq!(
-            again.string("/id"),
-            *id,
-            "case {region:?}: a start inside one Region's running task coalesces onto it, got {:?}",
+            (again.status, again.error_code()),
+            (409, "ConflictException"),
+            "case {region:?}: a start inside one Region's running task is refused with 409 \
+             ConflictException, got {} with {:?}",
+            again.status,
             again.body
+        );
+        assert!(
+            again.string("/message").contains(id),
+            "case {region:?}: the refusal must name that Region's own running task {id:?}, got \
+             {:?}",
+            again.string("/message")
         );
         // Across Regions the tasks are distinct records.
         for (other, other_id) in ids.iter().filter(|(other, _)| other != region) {

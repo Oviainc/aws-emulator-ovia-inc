@@ -19,7 +19,8 @@
 //! called), which is what every reporting operation of this service materialises.
 //!
 //! The request is authorized before anything else about it is examined — an `InstanceId`
-//! the account's EC2 fleet does not hold fails closed with this service's
+//! the account does not have, as the service that owns instances reports it
+//! ([`crate::state::ec2_fleet`]), fails closed with this service's
 //! `UnauthorizedException` whatever else the request says, the same gate and the same
 //! predicate `AssociateUser` runs — and a directory no LIVE registration of this account is
 //! for has no associations to report, which is the modelled `ResourceNotFoundException`.
@@ -153,28 +154,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListUserAssociationsErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the service state is unavailable".to_string()),
             })
         })?;
 
+        // THE AUTHORIZATION GATE, asked before anything else about the request is examined,
+        // with the same predicate `AssociateUser` and the pre-handler gate in
+        // `crate::service` ask: an instance neither this service's fleet seam nor the
+        // service that OWNS instances reports cannot be shown to be the caller's, so the
+        // request fails closed whatever else it says — exactly as `AssociateUser` is
+        // refused identically however else the request is wrong. Asked before the store is
+        // locked, because resolving it reaches another service over the in-process
+        // callback.
+        if !crate::state::ec2_fleet::authorizes_instance(&*self.engine, ctx, &input.instance_id)
+            .await
+        {
+            return Err(crate::scaffolded::Scaffolded::unauthorized());
+        }
+
         let mut state = state.lock();
         // The only write a read may make: the transition the clock already owed — an
         // association whose `ASSOCIATING` span has elapsed is `ASSOCIATED` whether or not
         // anybody called, so this reports the status the clock reached.
         state.materialise_due(std::time::SystemTime::now());
-
-        // THE AUTHORIZATION GATE, asked before anything else about the request is examined,
-        // with the same predicate `AssociateUser` and the pre-handler gate in
-        // `crate::service` ask: an instance the account's EC2 fleet does not hold cannot be
-        // shown to be the caller's, so the request fails closed whatever else it says —
-        // exactly as `AssociateUser` is refused identically however else the request is
-        // wrong.
-        if !state.authorizes_instance(&input.instance_id) {
-            return Err(crate::scaffolded::Scaffolded::unauthorized());
-        }
 
         // Which directory the request names is a fact about the request, asked once the
         // instance it acts on is authorized; it is also what an association is keyed by —
