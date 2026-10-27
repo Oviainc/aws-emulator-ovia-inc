@@ -1008,6 +1008,25 @@ pub fn hop_wait_problem(hops: &[HopDestination]) -> Option<String> {
     None
 }
 
+/// Why a hop destination cannot name the queue it states, or `None` when every entry that
+/// states a `Queue` carries at least one character.
+///
+/// `HopDestination$Queue` is a reference to a queue resource exactly as `CreateJob$Queue`
+/// and `CreateJobTemplate$Queue` are ([`hop_destination_queue_name`]), so it takes the same
+/// test every resource-naming member in this service takes ([`carries_no_characters`]): a
+/// hop that states a queue carrying no characters names neither a queue this account holds
+/// nor the member left out — which is "the job will move to the default queue" — so it is
+/// the bad request [`blank_member_message`] words rather than a lookup of a name nothing
+/// could hold. The member is named by its path from the request, as the service's other
+/// nested-member refusals are, because the request also carries a top-level `Queue`. One
+/// function for the three operations that accept hop destinations, exactly as
+/// [`hop_wait_problem`] is, so what they accept cannot drift apart.
+pub fn hop_destination_blank_queue_problem(hops: &[HopDestination]) -> Option<String> {
+    hop_destination_queues(hops)
+        .any(carries_no_characters)
+        .then(|| blank_member_message("HopDestinations.Queue"))
+}
+
 /// How this service refuses a hop destination that would move a job to the very queue it
 /// was submitted to.
 ///

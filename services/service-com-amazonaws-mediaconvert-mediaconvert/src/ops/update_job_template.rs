@@ -215,6 +215,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::hop_destination_queues(hops)
                 .any(|reference| !state.holds_queue(reference))
         });
+        // And a hop destination that states a `Queue` carrying no characters is the same
+        // problem in the request the member above is: the modelled 400 naming the member,
+        // not a lookup of a name nothing could hold.
+        let hop_blank_queue_problem = input
+            .hop_destinations
+            .as_deref()
+            .and_then(crate::state::hop_destination_blank_queue_problem);
         // And every entry of a new hop list has to state a wait inside the range the
         // member publishes, or it sets up no hop at all — the same test `CreateJob` and
         // `CreateJobTemplate` take.
@@ -253,6 +260,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateJobTemplateErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::not_found_message("queue")),
             })
+            .into());
+        }
+        if let Some(problem) = hop_blank_queue_problem {
+            return Err(UpdateJobTemplateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(problem),
+                },
+            )
             .into());
         }
         if hop_queue_missing {
