@@ -20,9 +20,9 @@ use crate::harness::{now_ms, Logs, REGION};
 /// another service, so the emulator never mints these ARNs itself.
 const ACCOUNT: &str = "123456789012";
 
-/// AWS's documented quota, from `PutSubscriptionFilter`: "Each log group can have up to
-/// two subscription filters associated with it."
-const MAX_FILTERS_PER_GROUP: usize = 2;
+/// The subscription filters one log group can hold ATTACHED at a time: the service accepts
+/// five on one log group and refuses the next put.
+const MAX_FILTERS_PER_GROUP: usize = 5;
 
 /// The published bounds of `DescribeSubscriptionFilters$limit`. Source: the
 /// `DescribeLimit` shape, `range 1..50`.
@@ -400,8 +400,11 @@ async fn filters_are_sorted_prefix_filtered_and_paged() {
     let logs = Logs::new();
     // Rows differ in the order the names are put in and in where they diverge, so the
     // reported order cannot be the insertion order.
-    let cases: [[&str; MAX_FILTERS_PER_GROUP]; 3] =
-        [["b", "a"], ["alpha-2", "alpha-1"], ["Z", "a"]];
+    let cases: [[&str; MAX_FILTERS_PER_GROUP]; 3] = [
+        ["b", "a", "d", "c", "e"],
+        ["alpha-2", "alpha-1", "alpha-10", "beta-1", "alpha-3"],
+        ["Z", "a", "A", "z", "M"],
+    ];
 
     for (index, names) in cases.iter().enumerate() {
         let group = format!("sorted-group-{index}");
@@ -516,11 +519,11 @@ async fn filters_are_sorted_prefix_filtered_and_paged() {
     }
 }
 
-/// The per-group quota: two filters associated with one log group, a third refused, and
-/// a put over a name already stored still accepted because it is an update. The quota is
-/// per log group, so another group takes its own two.
+/// The per-group quota: the filters one log group holds, the next put refused, and a put
+/// over a name already stored still accepted because it is an update. The quota is per log
+/// group, so another group takes its own.
 #[tokio::test]
-async fn quota_is_two_filters_per_log_group() {
+async fn the_quota_is_counted_per_log_group() {
     let logs = Logs::new();
     let destination = arn("kinesis", "stream/quota-target");
     let role = role_arn("CWLtoKinesisRole");
@@ -983,11 +986,11 @@ async fn a_member_that_is_not_an_arn_reports_a_parse_failure() {
     );
 }
 
-/// Delivery to any destination but a Lambda function goes through a role CloudWatch Logs
-/// assumes, so a put that names no `roleArn` is refused and the refusal names the vendor
-/// it was asked to deliver to. A Lambda function is invoked directly, and a logical
-/// destination owned by another account authorises the delivery with its own policy, so
-/// neither needs a role.
+/// Delivery to a stream of one of the two streaming services named as a DIRECT destination
+/// goes through a role CloudWatch Logs assumes, so a put that names no `roleArn` is refused
+/// and the refusal names the vendor it was asked to deliver to. A Lambda function is invoked
+/// directly, and a logical destination carries the role it was created with, so neither
+/// needs a role.
 #[tokio::test]
 async fn a_destination_that_needs_a_role_is_refused_without_one() {
     let logs = Logs::new();
@@ -1007,15 +1010,11 @@ async fn a_destination_that_needs_a_role_is_refused_without_one() {
         body
     };
 
-    // One row per vendor that needs a role: each streaming destination, and a logical
-    // destination owned by this same account.
+    // One row per vendor that needs a role: the streaming destinations CloudWatch Logs
+    // delivers to by assuming the role the put names.
     for (vendor, destination) in [
         ("kinesis", arn("kinesis", "stream/role-target")),
         ("firehose", arn("firehose", "deliverystream/role-target")),
-        (
-            "logs",
-            own_account_arn("logs", "destination:same-account-destination"),
-        ),
     ] {
         let (code, message) = logs
             .refusal("PutSubscriptionFilter", &put(&destination, None))
@@ -1058,10 +1057,13 @@ async fn a_destination_that_needs_a_role_is_refused_without_one() {
         .await;
     }
 
-    // What needs no role at all.
+    // What needs no role at all: a Lambda function, which is invoked directly, and a
+    // logical destination, which was given its own role by `PutDestination` — whichever
+    // account holds it.
     for destination in [
         arn("lambda", "function:log-consumer"),
         arn("logs", "destination:cross-account-destination"),
+        own_account_arn("logs", "destination:same-account-destination"),
     ] {
         logs.ok("PutSubscriptionFilter", &put(&destination, None))
             .await;
@@ -1116,8 +1118,8 @@ async fn delete_removes_only_the_subscription_filter_it_names() {
         })
     };
 
-    // The quota is two filters per group, so the group holds both, and another group
-    // holds a filter under one of the same names.
+    // Both filters are within the per-group quota, so the group holds both, and another
+    // group holds a filter under one of the same names.
     let names = ["keep", "remove"];
     for name in names {
         logs.ok("PutSubscriptionFilter", &put(group, name)).await;

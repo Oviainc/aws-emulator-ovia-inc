@@ -169,6 +169,8 @@ mod scratch_queries;
 mod state_roundtrip;
 #[path = "all/storage_tier_policy.rs"]
 mod storage_tier_policy;
+#[path = "all/subscription_destination_plumbing.rs"]
+mod subscription_destination_plumbing;
 #[path = "all/subscription_filters.rs"]
 mod subscription_filters;
 #[path = "all/syslog_configurations.rs"]

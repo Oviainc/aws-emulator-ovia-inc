@@ -216,20 +216,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::next_token_conflict_message("ExclusiveStartStreamName"),
                     ));
                 }
-                let resume = crate::state::StreamPageToken::decode(token)
-                    .filter(|resume| !resume.is_expired(now) && resume.region == region)
-                    .ok_or_else(|| {
-                        ListStreamsError::from(
-                            ListStreamsErrorModeled::ExpiredNextTokenException(
-                                ExpiredNextTokenException {
-                                    message: Some(crate::state::next_token_expired_message()),
-                                },
-                            ),
-                        )
-                    })?;
+                let resume = crate::state::RegionalPageToken::decode(
+                    crate::state::RegionalListing::Streams,
+                    token,
+                )
+                .filter(|resume| !resume.is_expired(now) && resume.region == region)
+                .ok_or_else(|| {
+                    ListStreamsError::from(ListStreamsErrorModeled::ExpiredNextTokenException(
+                        ExpiredNextTokenException {
+                            message: Some(crate::state::next_token_expired_message()),
+                        },
+                    ))
+                })?;
                 // The token names the first stream the earlier page did NOT return, so the
                 // page that resumes it starts AT that stream rather than after it.
-                Some(resume.next_stream_name)
+                Some(resume.next_name)
             }
         };
         let resumes_at_token = input.next_token.is_some();
@@ -263,7 +264,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // back.
             has_more_streams: next.is_some(),
             next_token: next.map(|stream| {
-                crate::state::StreamPageToken::new(&region, &stream.name, now).encode()
+                crate::state::RegionalPageToken::new(
+                    crate::state::RegionalListing::Streams,
+                    &region,
+                    &stream.name,
+                    now,
+                )
+                .encode()
             }),
         })
     }

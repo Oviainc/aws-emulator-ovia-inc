@@ -241,13 +241,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A code is a message, so it needs an address to be sent to: only an attribute
         // that IS such an address can carry one, and which attribute it is decides the
         // medium the message travels over (`crate::state::delivery_medium`, the same
-        // rule `UpdateUserAttributes` reports a pending value's delivery by).
+        // rule `UpdateUserAttributes` reports a pending value's delivery by). The
+        // refusal states the permitted set and quotes nothing the request asked for.
         let attribute_name = input.attribute_name.clone();
         let Some(medium) = crate::state::delivery_medium(&attribute_name) else {
-            return Err(invalid_parameter(format!(
-                "Invalid AttributeName: {attribute_name} is not an attribute a verification \
-                 code can be sent for"
-            )));
+            return Err(invalid_parameter(
+                crate::state::UNVERIFIABLE_ATTRIBUTE_MESSAGE.to_string(),
+            ));
         };
         // The destination is the attribute's STORED value, so a user holding no value
         // for it has nowhere for a code to be sent — the same refusal, in the one
