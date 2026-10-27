@@ -199,6 +199,8 @@ mod type_testing;
 mod unprovisioned_resources;
 #[path = "all/unrecognized_resource_types.rs"]
 mod unrecognized_resource_types;
+#[path = "all/update_after_a_refused_delete.rs"]
+mod update_after_a_refused_delete;
 #[path = "all/update_rollback_recovery.rs"]
 mod update_rollback_recovery;
 #[path = "all/validate_template.rs"]
