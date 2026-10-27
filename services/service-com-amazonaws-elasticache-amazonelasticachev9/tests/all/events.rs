@@ -5,10 +5,15 @@
 //! The rule under test: every change this service makes to one of its resources
 //! records an event under that resource, and `DescribeEvents` reports the
 //! recorded log over the time interval the request bounds, filtered by source,
-//! oldest first and paginated. Nothing here reaches into the service's state
+//! NEWEST FIRST and paginated. Nothing here reaches into the service's state
 //! struct — every event is written by a real `awsQuery` call through the
 //! production router and read back through another one, so a response that is
 //! not computed from the persisted log cannot pass.
+//!
+//! Every table below lists the events a scenario records in the order the CALLS
+//! made them — oldest first, which is how the scenario reads — and the
+//! comparison puts them into the order the service answers in
+//! ([`newest_first`]).
 //!
 //! The tests are tables: each row is one input along the axis the rule
 //! generalises over (which operation made the change, how the window is
@@ -38,7 +43,9 @@ struct WireEvent {
 /// What a row expects of one event: `(SourceType, SourceIdentifier, Message)`.
 type Expected = (&'static str, &'static str, &'static str);
 
-/// `rows` as the events a reply must report.
+/// `rows`, which every table lists oldest first, as [`WireEvent`]s in that same
+/// chronological order; [`newest_first`] is what turns them into the order a
+/// reply reports.
 fn expect(rows: &[Expected]) -> Vec<WireEvent> {
     rows.iter()
         .map(|(source_type, source_identifier, message)| WireEvent {
@@ -47,6 +54,12 @@ fn expect(rows: &[Expected]) -> Vec<WireEvent> {
             message: (*message).to_string(),
         })
         .collect()
+}
+
+/// `events`, listed oldest first, in the order `DescribeEvents` reports them:
+/// strictly reverse-chronological, most recent first.
+fn newest_first(events: &[WireEvent]) -> Vec<WireEvent> {
+    events.iter().rev().cloned().collect()
 }
 
 /// Every `Event` a reply reports, in document order.
@@ -481,7 +494,7 @@ async fn every_change_this_service_makes_is_reported_as_an_event() {
         );
         assert_eq!(
             wire_events(case, &reply),
-            expect(scenario.expected),
+            newest_first(&expect(scenario.expected)),
             "case {case}: the reported log must be the one these calls wrote, got {}",
             reply.body
         );
@@ -496,14 +509,14 @@ async fn every_change_this_service_makes_is_reported_as_an_event() {
             );
         }
         assert!(
-            dates.windows(2).all(|pair| pair[0] <= pair[1]),
-            "case {case}: events are reported oldest first, got {dates:?}"
+            dates.windows(2).all(|pair| pair[0] >= pair[1]),
+            "case {case}: events are reported newest first, got {dates:?}"
         );
         // A read reports; it does not change what a later caller sees. Asking
         // again must answer exactly the same log.
         assert_eq!(
             events_of(&emulator, case, &[]).await,
-            expect(scenario.expected),
+            newest_first(&expect(scenario.expected)),
             "case {case}: a second read must report the same log"
         );
     }
@@ -545,7 +558,7 @@ async fn a_replication_group_records_its_own_events() {
     .await;
     assert_eq!(
         reported,
-        expect(&[
+        newest_first(&expect(&[
             (
                 "replication-group",
                 "events-group-1",
@@ -556,7 +569,7 @@ async fn a_replication_group_records_its_own_events() {
                 "events-group-1",
                 "Replication group status changed from creating to available",
             ),
-        ]),
+        ])),
         "the replication group's own events must be the ones it recorded, got {reported:?}"
     );
     // Its member clusters are a different source, and the filter above excluded
@@ -654,7 +667,7 @@ async fn the_reported_window_follows_start_time_end_time_and_duration() {
         );
         assert_eq!(
             &wire_events(case, &reply),
-            expected,
+            &newest_first(expected),
             "case {case}: the window must select exactly these events, got {}",
             reply.body
         );
@@ -764,7 +777,8 @@ async fn source_identifier_and_source_type_filter_the_log() {
     for ((case, pairs), expected) in &cases {
         let reported = events_of(&emulator, case, pairs).await;
         assert_eq!(
-            &reported, *expected,
+            reported,
+            newest_first(expected),
             "case {case}: the filter must select exactly these events, got {reported:?}"
         );
     }

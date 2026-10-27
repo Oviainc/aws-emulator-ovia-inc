@@ -29,14 +29,18 @@ use std::time::{Duration, SystemTime};
 
 /// The instant a seeded configuration was last modified: a fixed past one, so a call
 /// that writes the record is visible as a `modifiedAt` that MOVED.
-fn seeded_at() -> SystemTime {
+///
+/// `pub(crate)` with the four builders below, because `scraper_logging_configuration`
+/// seeds the same stored record through the same engine: a second copy of them is a
+/// second set of rules about what a stored scraper logging configuration looks like.
+pub(crate) fn seeded_at() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
 }
 
 /// A CloudWatch Logs destination holding `log_group` — the one variant
 /// `ScraperLoggingDestination` models. The ARN satisfies `LogGroupArn`'s published
 /// pattern (`^arn:aws[a-z0-9-]*:logs:[a-z0-9-]+:[0-9]{12}:log-group:...\:\*$`).
-fn cloud_watch_logs(log_group: &str) -> ScraperLoggingDestination {
+pub(crate) fn cloud_watch_logs(log_group: &str) -> ScraperLoggingDestination {
     ScraperLoggingDestination::cloudWatchLogs(CloudWatchLogDestination {
         log_group_arn: format!(
             "arn:aws:logs:us-west-2:{}:log-group:{log_group}:*",
@@ -48,7 +52,7 @@ fn cloud_watch_logs(log_group: &str) -> ScraperLoggingDestination {
 /// One scraper component of each `type` named, every one carrying the options map
 /// `ComponentConfig` models. The catalog of types is the model's own value list
 /// (`crate::ops::types::SCRAPER_COMPONENT_TYPE_VALUES`).
-fn components(types: &[&str]) -> Vec<ScraperComponent> {
+pub(crate) fn components(types: &[&str]) -> Vec<ScraperComponent> {
     types
         .iter()
         .map(|component_type| ScraperComponent {
@@ -65,7 +69,7 @@ fn components(types: &[&str]) -> Vec<ScraperComponent> {
 
 /// One seeded scraper logging configuration, in `status_code`, with nothing owed by the
 /// clock yet.
-fn logging_configuration(
+pub(crate) fn logging_configuration(
     scraper_id: &str,
     status_code: &str,
     destination: ScraperLoggingDestination,
@@ -85,7 +89,7 @@ fn logging_configuration(
 
 /// Seed one logging configuration into the store the mounted service reads — the SAME
 /// record the handler reads, not a second copy of it.
-fn seed_logging(amp: &Amp, record: &ScraperLoggingConfiguration) {
+pub(crate) fn seed_logging(amp: &Amp, record: &ScraperLoggingConfiguration) {
     amp.store()
         .lock()
         .scraper_logging
@@ -115,7 +119,11 @@ fn stored(amp: &Amp, scraper_id: &str) -> Option<ScraperLoggingConfiguration> {
 }
 
 /// An `ACTIVE` scraper holding a logging configuration, seeded together.
-fn seed_pair(amp: &Amp, record: &ScraperLoggingConfiguration, destination_workspace: &str) -> Scraper {
+pub(crate) fn seed_pair(
+    amp: &Amp,
+    record: &ScraperLoggingConfiguration,
+    destination_workspace: &str,
+) -> Scraper {
     let host = scraper(
         &record.scraper_id,
         Some("logging"),

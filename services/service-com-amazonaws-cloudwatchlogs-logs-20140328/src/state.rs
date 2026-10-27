@@ -631,6 +631,11 @@ pub const EXPORT_TASK_STATUS_COMPLETED: &str = "COMPLETED";
 /// An export task a caller cancelled, from the model's `ExportTaskStatusCode` enum.
 pub const EXPORT_TASK_STATUS_CANCELLED: &str = "CANCELLED";
 
+/// An export task whose export stopped on an error, from the model's `ExportTaskStatusCode`
+/// enum. Terminal like [`EXPORT_TASK_STATUS_COMPLETED`]: the task has finished, so nothing
+/// moves it on and a cancel of it has no execution left to stop.
+pub const EXPORT_TASK_STATUS_FAILED: &str = "FAILED";
+
 /// How long after it is created an export task moves `PENDING` -> `RUNNING`, and how long
 /// after that it reaches `COMPLETED`.
 ///
@@ -1796,6 +1801,18 @@ impl ExportTaskRecord {
     pub fn is_active(&self) -> bool {
         self.status_code == EXPORT_TASK_STATUS_PENDING
             || self.status_code == EXPORT_TASK_STATUS_RUNNING
+    }
+
+    /// Cancel this export task: it reaches [`EXPORT_TASK_STATUS_CANCELLED`] at `now_ms` and
+    /// owes the clock no further transition, so the start and the completion it was armed for
+    /// are DISCARDED rather than materialised later over the cancellation. Only a task that
+    /// [`Self::is_active`] has an export left to cancel — "The task must be in the PENDING or
+    /// RUNNING state."
+    pub fn cancel(&mut self, now_ms: i64) {
+        self.status_code = EXPORT_TASK_STATUS_CANCELLED.to_string();
+        self.completion_time_ms = Some(now_ms);
+        self.running_due_ms = None;
+        self.completion_due_ms = None;
     }
 
     /// Materialise the status changes the clock owes this task: a pending export whose start
@@ -6448,6 +6465,12 @@ pub fn export_time_range_message(from: i64, to: i64) -> String {
          value"
     )
 }
+
+/// The refusal `CancelExportTask` answers when the task the request names is not in one of
+/// the two statuses a cancel applies to: "The task must be in the PENDING or RUNNING state."
+/// The text is fixed for the condition — it interpolates neither the task id, nor the log
+/// group, nor the bucket the export was going to — and the task keeps the status it reached.
+pub const EXPORT_TASK_FINISHED_MESSAGE: &str = "The specified export task has already finished";
 
 /// The revision id a resource-scoped policy carries, minted from the monotonic policy
 /// revision counter so it is unique and derived from stored state. AWS documents no

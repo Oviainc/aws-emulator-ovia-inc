@@ -167,15 +167,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `InvalidCacheClusterStateFault` is "the requested cluster is not in
-        // the available state": a cluster still `creating`, `modifying` from an
-        // immediate change, or already rebooting from an earlier call is refused
-        // rather than rebooted twice.
-        if cluster.status != crate::state::STATUS_AVAILABLE {
+        // the available state". A reboot is not gated on `available` alone: the
+        // states it IS accepted in are the ones the refusal names
+        // (`crate::state::REBOOTABLE_CLUSTER_STATES`), so a cluster still
+        // `creating`, `modifying` from an immediate change, or already rebooting
+        // from an earlier call is refused rather than rebooted twice, while one
+        // being snapshotted or holding parameters its engine rejected can still
+        // be rebooted — which is how a client recovers it.
+        if !crate::state::REBOOTABLE_CLUSTER_STATES.contains(&cluster.status.as_str()) {
             return Err(RebootCacheClusterErrorModeled::InvalidCacheClusterStateFault(
                 InvalidCacheClusterStateFault {
-                    message: Some(format!(
-                        "Cache cluster {cache_cluster_id} is in {} state, not available.",
-                        cluster.status
+                    message: Some(crate::state::reboot_state_refusal(
+                        &cache_cluster_id,
+                        &cluster.status,
                     )),
                 },
             )

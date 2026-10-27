@@ -96,6 +96,12 @@ async fn catalog(emulator: &Emulator, case: &str) -> Vec<WireVersion> {
 }
 
 /// One filter row: which of the three filters carry a value.
+///
+/// Every row's `Engine` names an engine the catalog publishes, because an
+/// `Engine` it does not publish is REFUSED rather than filtered — see
+/// `describe_cache_engine_versions_refuses_an_engine_it_does_not_publish` in the
+/// `read_validate_fidelity` suite, and the engine rows of
+/// [`a_value_the_describe_cannot_serve_is_refused_with_invalid_parameter_value`].
 #[derive(Debug, Clone, Copy)]
 struct FilterCase {
     name: &'static str,
@@ -150,7 +156,7 @@ fn selects(case: &FilterCase, row: &WireVersion) -> bool {
 }
 
 /// The filter table every filter test walks.
-const FILTER_CASES: [FilterCase; 14] = [
+const FILTER_CASES: [FilterCase; 12] = [
     FilterCase {
         name: "no filter",
         engine: None,
@@ -191,22 +197,6 @@ const FILTER_CASES: [FilterCase; 14] = [
         engine_version: None,
         must_report: &["7.1"],
         must_be_empty: false,
-    },
-    FilterCase {
-        name: "engine nothing runs",
-        engine: Some("sqlite"),
-        family: None,
-        engine_version: None,
-        must_report: &[],
-        must_be_empty: true,
-    },
-    FilterCase {
-        name: "empty engine",
-        engine: Some(""),
-        family: None,
-        engine_version: None,
-        must_report: &[],
-        must_be_empty: true,
     },
     FilterCase {
         // A family the issue cites nowhere, and the one whose name the
@@ -744,6 +734,54 @@ async fn a_value_the_describe_cannot_serve_is_refused_with_invalid_parameter_val
             reply.error_code(),
             reply.body
         );
+    }
+
+    // `Engine` names an engine of the published catalog, so a value that names
+    // none is refused rather than answered with an empty page: a client could
+    // not otherwise tell a typo from an engine with no versions.
+    let engines = [
+        ("engine nothing runs", "sqlite"),
+        ("engine misspelled", "readis"),
+        ("empty engine", ""),
+    ];
+    for (case, engine) in engines {
+        let reply = emulator
+            .call(
+                "DescribeCacheEngineVersions",
+                &params(&[("Engine", engine)]),
+            )
+            .await;
+        assert_eq!(
+            reply.status, 400,
+            "case {case}: must be refused with HTTP 400, got {}: {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_code(),
+            "InvalidParameterValue",
+            "case {case}: must be refused with InvalidParameterValue, got {:?}: {}",
+            reply.error_code(),
+            reply.body
+        );
+        // The template too, so the suite that owns the engine filter pins the
+        // words the refusal is made of. An engine sent EMPTY leaves the message
+        // ending in a space, which the XML reader trims away, so that row is
+        // asserted on the raw element.
+        let expected = state::invalid_engine_name_message(engine);
+        if engine.is_empty() {
+            assert!(
+                reply.body.contains(&format!("<Message>{expected}</Message>")),
+                "case {case}: expected the message {expected:?}, got {}",
+                reply.body
+            );
+        } else {
+            assert_eq!(
+                reply.error_message(),
+                expected,
+                "case {case}: expected the message {expected:?}, got {:?}",
+                reply.error_message()
+            );
+        }
     }
 }
 

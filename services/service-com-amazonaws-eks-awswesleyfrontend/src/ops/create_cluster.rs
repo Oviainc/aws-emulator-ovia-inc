@@ -600,6 +600,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // No on-demand insights refresh has been started for a cluster that
             // has just been created; `StartInsightsRefresh` writes this slot.
             insights_refresh: None,
+            // The analysis Amazon EKS ran when it created the cluster is the
+            // cluster's own creation, which is what every insight of a cluster
+            // nobody has refreshed reports: no later analysis has completed yet.
+            insights_analyzed_at: None,
         };
 
         let key = (region.clone(), input.name.clone());

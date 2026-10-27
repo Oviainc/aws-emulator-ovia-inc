@@ -262,12 +262,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // naming no size — or the range's lower bound `0`, which the service documents no
         // meaning for — gets `DEFAULT_PAGE_SIZE` plus a `nextToken` to walk the rest, the
         // same rule this service's other 0..1000-paged readers follow.
-        let page_size = input
-            .max_results
-            .and_then(|requested| usize::try_from(requested).ok())
-            .filter(|requested| *requested > 0)
-            .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
-            .min(crate::state::MAX_PAGE_SIZE);
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::DEFAULT_PAGE_SIZE,
+            crate::state::MAX_PAGE_SIZE,
+        );
 
         let guard = state.lock();
         // "The account is not opted in to Compute Optimizer": the service analyses an
@@ -354,19 +353,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One page of the selected sequence. A next token is handed out only when the
         // sequence continues past this page, and it resumes exactly where this page stopped.
-        let page: Vec<LicenseRecommendation> = selected
-            .into_iter()
-            .skip(offset)
-            .take(page_size.saturating_add(1))
-            .collect();
-        let has_more = page.len() > page_size;
-        let page: Vec<LicenseRecommendation> = page.into_iter().take(page_size).collect();
-        let next_token = has_more.then(|| {
-            crate::state::encode_offset_page_token(&crate::state::PageCursor {
-                offset: offset.saturating_add(page.len()),
-                selection_fingerprint,
-            })
-        });
+        let (page, next_token) =
+            crate::state::offset_page(selected, offset, page_size, selection_fingerprint);
 
         Ok(GetLicenseRecommendationsOutput {
             next_token,

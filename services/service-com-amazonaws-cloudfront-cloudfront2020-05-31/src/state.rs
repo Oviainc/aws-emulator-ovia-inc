@@ -4531,6 +4531,30 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
     }
 
+    /// The distribution that attaches the origin request policy `id` to one of its cache
+    /// behaviours, or `None` when no stored distribution does.
+    ///
+    /// `OriginRequestPolicyInUse` is documented as "Cannot delete the origin request policy
+    /// because it is attached to one or more cache behaviors", and a behaviour attaches a
+    /// policy through its `OriginRequestPolicyId` — so what makes a policy in use is a stored
+    /// behaviour naming it, which is the rule [`references_origin_request_policy`] states for
+    /// the whole configuration. The SAME rule
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_cache_policy`]
+    /// states for the other policy a cache behaviour attaches. The scan reads the STORED
+    /// configurations rather than a second index beside them, so it cannot drift out of step
+    /// with what a read of those distributions reports; both collections are bounded
+    /// ([`MAX_DISTRIBUTIONS`] distributions, each with a bounded behaviour list). A behaviour
+    /// that attaches no policy carries no `OriginRequestPolicyId` at all rather than an empty
+    /// one, so an id matches only a behaviour that really names it.
+    pub fn distribution_using_origin_request_policy(
+        &self,
+        id: &str,
+    ) -> Option<&StoredDistribution> {
+        self.distributions
+            .values()
+            .find(|distribution| references_origin_request_policy(&distribution.config, id))
+    }
+
     /// The cache policy `id` names, or `None` when the store holds none.
     ///
     /// The ACCOUNT's own policies only — what a mutation addresses, since nothing in this
@@ -9053,17 +9077,22 @@ pub fn response_headers_policy_already_exists(name: &str) -> ResponseHeadersPoli
 /// The modelled `NoSuchOriginRequestPolicy` (HTTP 404) for an origin request policy id the
 /// store does not hold.
 ///
-/// The sentence is the one the model states on the shape itself — "The origin request
-/// policy does not exist." — a property of the store rather than of the request, so
-/// nothing from the request belongs in the text.
+/// The sentence states a property of the store rather than of the request, so nothing from
+/// the request belongs in the text.
 pub fn no_such_origin_request_policy() -> NoSuchOriginRequestPolicy {
     NoSuchOriginRequestPolicy {
         message: Some(NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE.to_string()),
     }
 }
 
-/// `NoSuchOriginRequestPolicy`'s message, as the model documents the shape.
-pub const NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE: &str = "The origin request policy does not exist.";
+/// `NoSuchOriginRequestPolicy`'s message, in the form CloudFront answers a `NoSuch…` with for
+/// a named resource — "The specified <resource> does not exist.", as
+/// [`NO_SUCH_CACHE_POLICY_MESSAGE`] and [`NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE`] carry it.
+/// The recorded service answers this code with that sentence — which is what a replay of the
+/// origin request policy surface holds it to — and the shape's own documentation states it in
+/// its shorter form.
+pub const NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE: &str =
+    "The specified origin request policy does not exist.";
 
 /// The modelled `OriginRequestPolicyAlreadyExists` (HTTP 409) for a policy name that is
 /// already taken — "An origin request policy with this name already exists. You must
@@ -9143,6 +9172,27 @@ pub fn cache_policy_in_use() -> crate::ops::types::CachePolicyInUse {
 pub const CACHE_POLICY_IN_USE_MESSAGE: &str =
     "The specified cache policy is currently associated with a cache behavior. Please \
      disassociate the policy before deleting.";
+
+/// The modelled `OriginRequestPolicyInUse` (HTTP 409) for a delete of a policy a cache
+/// behaviour still attaches.
+///
+/// The SAME rule [`cache_policy_in_use`] states for the other policy a cache behaviour
+/// attaches: the sentence is a property of the CONDITION rather than of the request — the
+/// policy is associated with a cache behaviour, and the caller is told to disassociate it
+/// first — so nothing from the request or from the store belongs in it, and every refusal of
+/// this condition reads the same.
+pub fn origin_request_policy_in_use() -> crate::ops::types::OriginRequestPolicyInUse {
+    crate::ops::types::OriginRequestPolicyInUse {
+        message: Some(ORIGIN_REQUEST_POLICY_IN_USE_MESSAGE.to_string()),
+    }
+}
+
+/// `OriginRequestPolicyInUse`'s message: what CloudFront answers a delete of an origin
+/// request policy that a cache behaviour still associates, worded as
+/// [`CACHE_POLICY_IN_USE_MESSAGE`] words the same condition for the other policy.
+pub const ORIGIN_REQUEST_POLICY_IN_USE_MESSAGE: &str =
+    "The specified origin request policy is currently associated with a cache behavior. \
+     Please disassociate the policy before deleting.";
 
 /// The modelled `IllegalDelete` (HTTP 400) for a delete whose target is a policy AWS
 /// published rather than one this account created.

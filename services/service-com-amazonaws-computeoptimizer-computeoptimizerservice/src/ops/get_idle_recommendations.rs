@@ -266,12 +266,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a request naming no size — or the range's lower bound `0`, which the service
         // documents no meaning for — gets that same bound, the largest page the model
         // allows, plus a `nextToken` to walk the rest.
-        let page_size = input
-            .max_results
-            .and_then(|requested| usize::try_from(requested).ok())
-            .filter(|requested| *requested > 0)
-            .unwrap_or(crate::state::IDLE_MAX_PAGE_SIZE)
-            .min(crate::state::IDLE_MAX_PAGE_SIZE);
+        let page_size = crate::state::page_size(
+            input.max_results,
+            crate::state::IDLE_MAX_PAGE_SIZE,
+            crate::state::IDLE_MAX_PAGE_SIZE,
+        );
 
         let guard = state.lock();
         if !guard.enrollment.is_opted_in() {
@@ -402,19 +401,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One page of the selected sequence. A next token is handed out only when the
         // sequence continues past this page, and it resumes exactly where this page stopped.
-        let page: Vec<IdleRecommendation> = selected
-            .into_iter()
-            .skip(offset)
-            .take(page_size.saturating_add(1))
-            .collect();
-        let has_more = page.len() > page_size;
-        let page: Vec<IdleRecommendation> = page.into_iter().take(page_size).collect();
-        let next_token = has_more.then(|| {
-            crate::state::encode_offset_page_token(&crate::state::PageCursor {
-                offset: offset.saturating_add(page.len()),
-                selection_fingerprint,
-            })
-        });
+        let (page, next_token) =
+            crate::state::offset_page(selected, offset, page_size, selection_fingerprint);
 
         Ok(GetIdleRecommendationsOutput {
             next_token,

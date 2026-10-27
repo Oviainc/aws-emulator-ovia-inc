@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFormType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFormType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFormType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the metadata form type the request's `Identifier` names from this account's
+//! form type namespace ([`crate::state::ComAmazonawsGlueAwsglueState::form_types`]), so a
+//! later `GetFormType` of that identifier misses. The identifier is resolved the way every
+//! operation that addresses a form type resolves one
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::form_type_by_reference`]): a form
+//! type's identifier is its name ([`crate::state::FormTypeEntry::id`]).
+//!
+//! Two things this delete does NOT do:
+//!
+//! * It does not refuse a form type an ASSET TYPE still references, and does not rewrite
+//!   that reference. The behaviour recorded for a form type an asset type refers to is a
+//!   served delete that leaves the asset type's `Forms` entry naming the identifier its own
+//!   put sent, so a read of the asset type still reports that entry while the form type it
+//!   names is gone. Only the form type record is removed, and the asset type surface is
+//!   left exactly as its own puts wrote it.
+//! * It reports no miss. `GetFormType` models `EntityNotFoundException` and this operation
+//!   does not model it at all, so an identifier this account holds no form type under is
+//!   answered as the delete of something already absent: the caller asked for the state the
+//!   store is already in, and a repeated delete of one identifier answers the same way as
+//!   the first.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +156,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFormType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFormTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFormType"))
+        // Form types live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(DeleteFormTypeErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue form type store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The record is removed under the name it is keyed by, which is the identifier a
+        // client addresses it by. An identifier that resolves to nothing removes nothing
+        // and is still served: this operation models no miss.
+        match store.remove_form_type_by_reference(&input.identifier) {
+            Some(removed) => ::tracing::info!(
+                operation = "DeleteFormType",
+                form_type = %removed.name,
+                "deleted a Glue form type"
+            ),
+            None => ::tracing::info!(
+                operation = "DeleteFormType",
+                "no Glue form type to delete for the requested identifier"
+            ),
+        }
+
+        // `DeleteFormTypeResponse` models no members: the delete reports only that it
+        // happened.
+        Ok(DeleteFormTypeOutput {})
     }
 }

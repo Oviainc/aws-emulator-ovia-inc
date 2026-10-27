@@ -68,7 +68,7 @@ async fn remove_tags(emulator: &Emulator, arn: &str, tag_keys: &[&str]) -> Answe
 
 /// Create a domain and hand back the ARN its `DomainStatus` reports, so no test
 /// composes an ARN by hand.
-async fn domain_arn(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn domain_arn(emulator: &Emulator, name: &str) -> String {
     let created = emulator.create(json!({ "DomainName": name })).await;
     assert_eq!(
         created.status, 200,
@@ -104,7 +104,11 @@ pub(crate) fn reported_tags(answer: &Answer, case: &str) -> Vec<(String, String)
 }
 
 /// The tags `arn` carries, read through `ListTags`.
-async fn stored_tags(emulator: &Emulator, arn: &str, case: &str) -> Vec<(String, String)> {
+pub(crate) async fn stored_tags(
+    emulator: &Emulator,
+    arn: &str,
+    case: &str,
+) -> Vec<(String, String)> {
     let read = list_tags(emulator, arn).await;
     assert_eq!(
         read.status, 200,
@@ -115,7 +119,7 @@ async fn stored_tags(emulator: &Emulator, arn: &str, case: &str) -> Vec<(String,
 }
 
 /// A tag list as the wire carries it.
-fn wire_tags(tags: &[(String, String)]) -> Value {
+pub(crate) fn wire_tags(tags: &[(String, String)]) -> Value {
     Value::Array(
         tags.iter()
             .map(|(key, value)| json!({ "Key": key, "Value": value }))
@@ -124,7 +128,7 @@ fn wire_tags(tags: &[(String, String)]) -> Value {
 }
 
 /// The same pairs sorted by key: what [`reported_tags`] compares against.
-fn as_set(tags: &[(String, String)]) -> Vec<(String, String)> {
+pub(crate) fn as_set(tags: &[(String, String)]) -> Vec<(String, String)> {
     let mut set = tags.to_vec();
     set.sort();
     set
@@ -139,7 +143,7 @@ fn label(tags: &[(String, String)]) -> String {
     format!("[{}]", keys.join(","))
 }
 
-fn tag(key: &str, value: &str) -> (String, String) {
+pub(crate) fn tag(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 

@@ -1917,11 +1917,35 @@ pub fn instant_key(at: DateTime) -> (i64, u32) {
 /// shape="com.amazonaws.codeguruprofiler#GetRecommendationsRequest", member="startTime")`),
 /// so a refusal naming a bound states it the way the request carried it.
 ///
+/// The fractional-second field of that form is the MILLISECOND field the documented
+/// example spells out: three digits, zero-padded, present on every instant — so a whole
+/// second is named `...:02.000Z`, half a second `...:02.500Z` and 660 ms `...:02.660Z`.
+/// The library's RFC-3339 writer emits the SHORTEST fraction that names the instant
+/// instead (nothing at all for a whole second, `.5` for half of one, `.66` for 660 ms), so
+/// the field is written here: the whole second goes through the library, which owns the
+/// calendar, and the fixed-width field is appended to it. `subsec_nanos` counts forward
+/// from `secs` on either side of the epoch, so that split holds before 1970 too.
+///
+/// An instant carrying a finer fraction than the field holds is named at the field's own
+/// resolution — the millisecond it falls in — because the form carries no digit for a
+/// fraction of a millisecond. The interval rule itself still COMPARES bounds at the full
+/// nanosecond resolution they were sent in ([`instant_key`]); only the rendering is at the
+/// documented width.
+///
 /// Falls back to epoch seconds if the instant cannot be rendered, so a refusal is never
 /// lost to a formatting failure.
 pub fn iso8601(at: DateTime) -> String {
-    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_else(|_| format!("{} (epoch seconds)", at.as_secs_f64()))
+    const NANOS_PER_MILLISECOND: u32 = 1_000_000;
+    match DateTime::from_secs(at.secs()).fmt(::aws_smithy_types::date_time::Format::DateTime) {
+        // The whole-second instant carries no fraction of its own, so its trailing zone
+        // designator is exactly where the millisecond field goes.
+        Ok(whole_second) => format!(
+            "{}.{:03}Z",
+            whole_second.strip_suffix('Z').unwrap_or(&whole_second),
+            at.subsec_nanos() / NANOS_PER_MILLISECOND
+        ),
+        Err(_) => format!("{} (epoch seconds)", at.as_secs_f64()),
+    }
 }
 
 /// This service's INTERVAL rule, in one place for every operation that takes a time

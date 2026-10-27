@@ -20,7 +20,7 @@
 //!   record holds there is refused `LoadBalancerNotFound`.
 //! * a request the model cannot constrain — a policy name outside "alphanumeric
 //!   characters and dashes (-)", a negative cookie expiration period — is refused
-//!   `ValidationException` and writes nothing.
+//!   `ValidationError` and writes nothing.
 //!
 //! Every create is asserted on what a LATER describe reports, never on what the create
 //! answered alone.
@@ -397,7 +397,7 @@ async fn a_create_past_the_policy_bound_is_refused_too_many_policies() {
     );
 }
 
-/// A request outside a rule the model cannot express is refused 400 `ValidationException`
+/// A request outside a rule the model cannot express is refused 400 `ValidationError`
 /// and writes nothing.
 #[tokio::test]
 async fn a_request_outside_a_documented_rule_is_refused() {
@@ -427,8 +427,8 @@ async fn a_request_outside_a_documented_rule_is_refused() {
         let refused = create_policy(&router, REGION, "refusal-lb", policy_name, period).await;
         assert_eq!(
             (refused.status, refused.error_code().as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: the create must be refused 400 ValidationException, got {} \
+            (400, "ValidationError"),
+            "case {case:?}: the create must be refused 400 ValidationError, got {} \
              with {}",
             refused.status,
             refused.body

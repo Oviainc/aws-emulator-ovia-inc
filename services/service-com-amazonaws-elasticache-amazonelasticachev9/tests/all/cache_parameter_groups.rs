@@ -159,16 +159,25 @@ fn reported_names(reply: &Reply) -> Vec<&str> {
 
 /// Assert that `reply` reports `expected` for the element at `path`.
 ///
-/// An empty expected value is its own case: the awsQuery serializer renders
-/// `Some("")` as an EMPTY ELEMENT, which carries no text node, so "the member is
-/// present and empty" is asserted on the element rather than on its text.
+/// Two expected values are their own case, because the XML reader reports text
+/// nodes trimmed and drops empty ones: the awsQuery serializer renders `Some("")`
+/// as an EMPTY ELEMENT, and a value that is only whitespace (the single space a
+/// blank description normalises to) carries no text node either — so both are
+/// asserted on the ELEMENT in the raw body rather than on its text.
 fn assert_member(reply: &Reply, case: &str, path: &str, expected: &str) {
-    if expected.is_empty() {
+    if expected.trim().is_empty() {
         let element = path.rsplit('/').next().unwrap_or(path);
+        let rendered = if expected.is_empty() {
+            vec![
+                format!("<{element}></{element}>"),
+                format!("<{element}/>"),
+            ]
+        } else {
+            vec![format!("<{element}>{expected}</{element}>")]
+        };
         assert!(
-            reply.body.contains(&format!("<{element}></{element}>"))
-                || reply.body.contains(&format!("<{element}/>")),
-            "case {case}: {path} must be reported as an empty element, got {}",
+            rendered.iter().any(|form| reply.body.contains(form)),
+            "case {case}: {path} must be reported as one of {rendered:?}, got {}",
             reply.body
         );
         return;
@@ -500,7 +509,12 @@ struct GroupCase {
     /// `CacheParameterGroupName` "is stored as a lowercase string".
     stored_name: &'static str,
     family: &'static str,
+    /// `Description` as the request sends it.
     description: &'static str,
+    /// What the group REPORTS for it: the value as sent, byte for byte, except
+    /// that a blank description is normalised to a single space
+    /// (`state::BLANK_DESCRIPTION`).
+    reported_description: &'static str,
     tags: &'static [(&'static str, &'static str)],
 }
 
@@ -515,6 +529,7 @@ async fn a_created_parameter_group_is_read_back_from_persisted_state() {
             stored_name: "my-group",
             family: "redis7",
             description: "A Redis OSS 7 group",
+            reported_description: "A Redis OSS 7 group",
             tags: &[("env", "prod")],
         },
         GroupCase {
@@ -522,15 +537,27 @@ async fn a_created_parameter_group_is_read_back_from_persisted_state() {
             stored_name: "mixed-case-group",
             family: "memcached1.4",
             description: "The oldest published Memcached line",
+            reported_description: "The oldest published Memcached line",
             tags: &[],
         },
         GroupCase {
             sent_name: "empty-description",
             stored_name: "empty-description",
             family: "redis6.x",
-            // An empty description is a value, not an absent member: it has to
-            // come back as the empty string it was stored as.
+            // An explicit empty description is a value, not an absent member,
+            // and the service normalises a blank one to a single space — which
+            // is what every later read reports.
             description: "",
+            reported_description: state::BLANK_DESCRIPTION,
+            tags: &[],
+        },
+        GroupCase {
+            sent_name: "blank-description",
+            stored_name: "blank-description",
+            family: "redis7",
+            // Whitespace is blank too, and normalises to the same single space.
+            description: "   ",
+            reported_description: state::BLANK_DESCRIPTION,
             tags: &[],
         },
         GroupCase {
@@ -538,6 +565,7 @@ async fn a_created_parameter_group_is_read_back_from_persisted_state() {
             stored_name: "unicode-description",
             family: "valkey8",
             description: "キャッシュ · grupo de parámetros · 🧊",
+            reported_description: "キャッシュ · grupo de parámetros · 🧊",
             tags: &[("ключ", "значение")],
         },
         GroupCase {
@@ -547,6 +575,7 @@ async fn a_created_parameter_group_is_read_back_from_persisted_state() {
             // A tag with an empty value is accepted ("although null is
             // accepted"), and neither tag changes what the group reports.
             description: "Two tags, one of them valueless",
+            reported_description: "Two tags, one of them valueless",
             tags: &[("a", "1"), ("b", "")],
         },
     ];
@@ -599,7 +628,7 @@ async fn a_created_parameter_group_is_read_back_from_persisted_state() {
                 reply,
                 &case_label,
                 "CacheParameterGroup/Description",
-                case.description,
+                case.reported_description,
             );
             // "Indicates whether the parameter group is associated with a
             // Global datastore": nothing here associates one.

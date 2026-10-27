@@ -566,10 +566,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ReplicasPerNodeGroup instead" — so the two members set the same count
         // and cannot both be given.
         if input.num_cache_clusters.is_some() && num_node_groups > 1 {
-            return Err(invalid_combination(format!(
-                "NumCacheClusters cannot be combined with NumNodeGroups ({num_node_groups}); use \
-                 ReplicasPerNodeGroup instead."
-            )));
+            return Err(invalid_combination(
+                crate::state::NUM_CACHE_CLUSTERS_ONE_SHARD_MESSAGE.to_string(),
+            ));
         }
         if input.num_cache_clusters.is_some() && input.replicas_per_node_group.is_some() {
             return Err(invalid_combination(
@@ -750,6 +749,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+        // `KmsKeyId` is "the ID of the KMS key used to encrypt the disk in the
+        // cluster" and the group REPORTS it for the rest of its life, so the
+        // identifier the request named is resolved to the key's own ARN before it
+        // is stored; see `crate::state::kms_key`. Resolved before the store is
+        // locked, because resolving it is a call into KMS.
+        let kms_key_id =
+            crate::state::kms_key::stored_key_id(ctx, &region, input.kms_key_id).await;
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // Whether the primary cluster below is `available` depends on the status
@@ -760,9 +766,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateReplicationGroupErrorModeled::ReplicationGroupAlreadyExistsFault(
                     ReplicationGroupAlreadyExistsFault {
-                        message: Some(format!(
-                            "Replication group {replication_group_id} already exists."
-                        )),
+                        message: Some(
+                            crate::state::REPLICATION_GROUP_ALREADY_EXISTS_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -784,7 +790,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     CreateReplicationGroupErrorModeled::GlobalReplicationGroupNotFoundFault(
                         GlobalReplicationGroupNotFoundFault {
-                            message: Some(format!("Global datastore {global} not found.")),
+                            message: Some(
+                                crate::state::GLOBAL_REPLICATION_GROUP_NOT_FOUND_MESSAGE
+                                    .to_string(),
+                            ),
                         },
                     )
                     .into(),
@@ -1164,7 +1173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .and_then(|cluster| cluster.notification_topic_arn.clone())
             }),
             replication_group_id: replication_group_id.clone(),
-            description: input.replication_group_description,
+            description: crate::state::stored_description(&input.replication_group_description),
             region,
             engine,
             engine_version,
@@ -1179,7 +1188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             transit_encryption_enabled,
             transit_encryption_mode: input.transit_encryption_mode,
             at_rest_encryption_enabled,
-            kms_key_id: input.kms_key_id,
+            kms_key_id,
             data_tiering,
             network_type: input.network_type,
             ip_discovery: input.ip_discovery,

@@ -173,7 +173,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This operation MUTATES: it mints a snapshot of a stored cluster, and
         // puts that cluster in `snapshotting` until the clock owes it
         // `available` again.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::STORE_UNAVAILABLE,
@@ -238,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (None, Some(group)) => {
                 return Err(CreateSnapshotErrorModeled::ReplicationGroupNotFoundFault(
                     ReplicationGroupNotFoundFault {
-                        message: Some(format!("Replication group {group} not found.")),
+                        message: Some(crate::state::replication_group_not_found_message(group)),
                     },
                 )
                 .into())
@@ -271,6 +270,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // `KmsKeyId` is "the ID of the KMS key used to encrypt the snapshot",
+        // which the snapshot reports for the rest of its life, so the identifier
+        // the request named is resolved to the key's own ARN before it is stored
+        // (`crate::state::kms_key`) — before the store is locked, because
+        // resolving it is a call into KMS.
+        let kms_key_id = crate::state::kms_key::stored_key_id(
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            input.kms_key_id,
+        )
+        .await;
         let mut store = state.lock();
         // A snapshot whose removal a `DeleteSnapshot` made due is gone, so the
         // name it held is free again and it does not count against the quota:
@@ -281,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.snapshots.contains_key(&snapshot_name) {
             return Err(CreateSnapshotErrorModeled::SnapshotAlreadyExistsFault(
                 SnapshotAlreadyExistsFault {
-                    message: Some(format!("Snapshot {snapshot_name} already exists.")),
+                    message: Some(crate::state::SNAPSHOT_ALREADY_EXISTS_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -369,7 +379,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::NewSnapshot {
                 snapshot_name,
                 source: crate::state::SNAPSHOT_SOURCE_MANUAL.to_string(),
-                kms_key_id: input.kms_key_id,
+                kms_key_id,
                 // Resolved below: the VPC is the source cluster's subnet
                 // group's, which is another record of this store.
                 vpc_id: None,

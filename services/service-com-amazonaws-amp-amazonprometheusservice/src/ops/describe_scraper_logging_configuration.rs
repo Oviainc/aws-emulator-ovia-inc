@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeScraperLoggingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeScraperLoggingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeScraperLoggingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the logging configuration the store holds for one scraper, computed from that
+//! stored record. A scraper this account does not hold, and a scraper that holds no
+//! logging configuration, are each the modelled `ResourceNotFoundException` naming the
+//! resource that is missing.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeScraperLoggingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeScraperLoggingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeScraperLoggingConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeScraperLoggingConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the scraper store is unavailable".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // Every lifecycle transition the clock already owed at this instant was owed
+        // whether or not anybody called, so a read reports the record as of now rather
+        // than as of the last write.
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // The configuration is a child of the scraper, so a scraper this account does
+        // not hold has no configuration to report and is itself the missing resource —
+        // a different resource from a configuration that was never written, which is
+        // why the two refusals name different ones.
+        if !store.scrapers.contains_key(&input.scraper_id) {
+            return Err(
+                DescribeScraperLoggingConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::SCRAPER_NOT_FOUND_MESSAGE.to_string(),
+                        resource_id: input.scraper_id.clone(),
+                        resource_type: crate::state::SCRAPER_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(configuration) = store.scraper_logging.get(&input.scraper_id) else {
+            return Err(
+                DescribeScraperLoggingConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::SCRAPER_LOGGING_NOT_FOUND_MESSAGE.to_string(),
+                        resource_id: input.scraper_id.clone(),
+                        resource_type: crate::state::SCRAPER_LOGGING_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeScraperLoggingConfigurationOutput {
+            status: crate::state::scraper_logging_status(configuration),
+            // Every member is read back off the STORED record — `scraperId` included, so
+            // it names the scraper the configuration belongs to rather than echoing the
+            // request's label.
+            scraper_id: configuration.scraper_id.clone(),
+            logging_destination: configuration.logging_destination.clone(),
+            scraper_components: configuration.scraper_components.clone(),
+            modified_at: ::aws_smithy_types::DateTime::from(configuration.modified_at),
+        })
     }
 }

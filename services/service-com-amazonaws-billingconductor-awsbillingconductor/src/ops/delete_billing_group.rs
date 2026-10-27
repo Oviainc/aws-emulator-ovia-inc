@@ -13,6 +13,12 @@
 //! ([`crate::state::billing_group_already_exists_in_current_billing_period`]), and
 //! only from the next billing period on is the name free.
 //!
+//! A group that automatically associates newly added accounts is not deletable while
+//! it does: that is the consolidated billing family's election of one group, so the
+//! caller turns `AccountGrouping.AutoAssociate` off (`UpdateBillingGroup`) and then
+//! deletes, and until then the call is refused with the reason the model enumerates
+//! for it ([`crate::state::cannot_delete_auto_associate_billing_group`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -162,15 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         let group_arn = crate::state::normalize_billing_group_arn(&input.arn);
-        // One state method removes the group and everything that only existed
-        // because of it: its name-index entry, its account associations (whose
-        // accounts become UNMONITORED — they are still linked accounts of the payer
-        // account) and the idempotency entries that named it.
-        //
         // This operation models no `ResourceNotFoundException`, so an `Arn` that
         // names no stored group is refused with the modelled `ValidationException`
         // and the reason the model enumerates for it.
-        if state.remove_billing_group(&group_arn).is_none() {
+        let Some(group) = state.billing_groups.get(&group_arn) else {
             return Err(DeleteBillingGroupErrorModeled::ValidationException(
                 crate::state::validation_exception(
                     "INVALID_BILLING_GROUP",
@@ -179,7 +180,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
             .into());
+        };
+
+        // A group that automatically associates the accounts newly joining the
+        // consolidated billing family is the family's election, not just this group's
+        // setting, so it is not deletable while it holds that election: the caller
+        // turns `AccountGrouping.AutoAssociate` off through `UpdateBillingGroup` and
+        // then deletes. Refused BEFORE anything is removed, so a request the service
+        // does not serve leaves the group, its custom line items and its account
+        // associations exactly as they were.
+        if group.auto_associates() {
+            return Err(DeleteBillingGroupErrorModeled::ValidationException(
+                crate::state::cannot_delete_auto_associate_billing_group("Arn", &group_arn),
+            )
+            .into());
         }
+
+        // One state method removes the group and everything that only existed
+        // because of it: its name-index entry, its account associations (whose
+        // accounts become UNMONITORED — they are still linked accounts of the payer
+        // account) and the idempotency entries that named it.
+        //
+        // The lookup above already proved the group is stored, so the removal cannot
+        // miss; the record it hands back is the group as it stood, which this
+        // operation's output does not report.
+        let removed = state.remove_billing_group(&group_arn);
+        debug_assert!(
+            removed.is_some(),
+            "the group was read from the same guarded state this removal writes to"
+        );
 
         Ok(DeleteBillingGroupOutput {
             arn: Some(group_arn),

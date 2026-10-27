@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names one unusable instance registers none of them. The batch is bounded
         // first, so neither the work nor the allocation below is caller-driven.
         if input.instances.len() > crate::state::MAX_INSTANCES_PER_REQUEST {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "Instances must carry at most {} instances; got {}",
                 crate::state::MAX_INSTANCES_PER_REQUEST,
                 input.instances.len()
@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller cannot grow it without limit by repeating the call.
         let would_add = record.new_instance_count(&requested);
         if record.instances.len() + would_add > crate::state::MAX_INSTANCES_PER_LOAD_BALANCER {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "Quota of {} registered instances per load balancer reached",
                 crate::state::MAX_INSTANCES_PER_LOAD_BALANCER
             )));
