@@ -990,6 +990,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-kinesis"
+version = "1.128.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0aaf48a12dd06bdef35da83c407bf1052ffdeb6cd482c57d9695169930df0d6"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-eventstream 0.61.6",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.0",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-kms"
 version = "1.126.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9116,6 +9142,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-kinesis",
  "aws-sdk-lambda",
  "aws-sdk-sfn",
  "aws-sdk-sns",
@@ -9129,6 +9156,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
+ "service-com-amazonaws-kinesis-kinesis-20131202",
  "service-com-amazonaws-sfn-awsstepfunctions",
  "service-com-amazonaws-sns-amazonsimplenotificationservice",
  "service-com-amazonaws-sqs-amazonsqs",
@@ -15803,6 +15831,7 @@ dependencies = [
  "http",
  "iso8601-duration",
  "serde_json",
+ "serde_json_path",
  "sha2 0.10.9",
  "uuid",
 ]

@@ -12,7 +12,8 @@
 //! discarded side effect — and then DELIVERED to each of those targets:
 //! EventBridge makes the API call that target's service is invoked by
 //! (`sqs:SendMessage` for a queue, `lambda:InvokeFunction` for a function,
-//! `sns:Publish` for a topic, `states:StartExecution` for a state machine),
+//! `sns:Publish` for a topic, `states:StartExecution` for a state machine,
+//! `kinesis:PutRecord` for a data stream),
 //! carrying the whole event envelope. For the kinds AWS invokes under the
 //! target's `RoleArn` it acts as that role, so a role it cannot assume or whose
 //! policies withhold the call is a delivery that fails: the event is sent to the
@@ -943,6 +944,12 @@ pub(crate) struct CompiledTarget {
     /// rule was compiled — `None` for a target that is not one, and for an ARN
     /// naming a destination this account does not hold.
     api_destination: Option<ApiDestination>,
+    /// `KinesisParameters$PartitionKeyPath`: "the JSON path to be extracted from
+    /// the event and used as the partition key" of the record a Kinesis data
+    /// stream target is written as — `None` for a target carrying no
+    /// `KinesisParameters`, for which "the default is to use the `eventId` as
+    /// the partition key" (see [`kinesis_partition_key`]).
+    partition_key_path: Option<String>,
 }
 
 /// What an API-destination target's invocation is made of: the endpoint and
@@ -1007,6 +1014,11 @@ impl CompiledRule {
                         .as_ref()
                         .and_then(|policy| policy.maximum_retry_attempts),
                     api_destination: api_destination(store, &target.arn),
+                    partition_key_path: target
+                        .raw
+                        .kinesis_parameters
+                        .as_ref()
+                        .map(|parameters| parameters.partition_key_path.clone()),
                 })
                 .collect(),
         })
@@ -1216,7 +1228,7 @@ pub(crate) async fn deliver(
     let outcome = match role_refusal(iam, role_arn, &attempt) {
         Some((code, message)) => crate::state::InvocationOutcome::Failed { code, message },
         None => {
-            kind.invoke(ctx, clients, region, target, body, &mut retries, budget)
+            kind.invoke(ctx, clients, region, handover, body, &mut retries, budget)
                 .await
         }
     };
@@ -1290,6 +1302,9 @@ enum TargetKind {
     /// A Step Functions state machine: `states:StartExecution` with the event as
     /// the execution input.
     StateMachine,
+    /// A Kinesis data stream: `kinesis:PutRecord` with the event as the record's
+    /// data, keyed as [`kinesis_partition_key`] decides.
+    Stream,
     /// One of this service's own API destinations: an HTTP request to the
     /// endpoint the destination holds, carrying the event as the body (see
     /// [`invoke_api_destination`]).
@@ -1304,6 +1319,8 @@ const LAMBDA_ARN_NAMESPACE: &str = "lambda";
 const SNS_ARN_NAMESPACE: &str = "sns";
 /// The ARN namespace of AWS Step Functions, whose state machines a rule starts.
 const STATES_ARN_NAMESPACE: &str = "states";
+/// The ARN namespace of Amazon Kinesis, whose data streams a rule writes to.
+const KINESIS_ARN_NAMESPACE: &str = "kinesis";
 
 /// The resource type a Lambda function ARN names.
 const FUNCTION_RESOURCE_TYPE: &str = "function";
@@ -1311,6 +1328,8 @@ const FUNCTION_RESOURCE_TYPE: &str = "function";
 const STATE_MACHINE_RESOURCE_TYPE: &str = "stateMachine";
 /// The resource type one of this service's own API destination ARNs names.
 const API_DESTINATION_RESOURCE_TYPE: &str = "api-destination";
+/// The resource type a Kinesis data stream ARN names.
+const STREAM_RESOURCE_TYPE: &str = "stream";
 
 impl TargetKind {
     /// The kind `arn` names, or `None` when this emulator has no invocation for
@@ -1338,6 +1357,16 @@ impl TargetKind {
             STATES_ARN_NAMESPACE if parsed.resource_type() == STATE_MACHINE_RESOURCE_TYPE => {
                 Some(Self::StateMachine)
             }
+            // A data stream's ARN names the stream directly (`stream/<name>`): a
+            // resource carrying a further segment addresses something within a
+            // stream (a consumer) rather than the stream, so no record is written
+            // for it.
+            KINESIS_ARN_NAMESPACE
+                if ::service_common::arn::resource_id_of_type(arn, STREAM_RESOURCE_TYPE)
+                    .is_some_and(|name| !name.is_empty() && !name.contains(['/', ':'])) =>
+            {
+                Some(Self::Stream)
+            }
             // This service's own resource: an API destination, whose ARN carries
             // the destination's name and its unique id
             // (`crate::state::api_destination_arn`).
@@ -1358,6 +1387,7 @@ impl TargetKind {
             Self::Function => "lambda:InvokeFunction",
             Self::Topic => "sns:Publish",
             Self::StateMachine => "states:StartExecution",
+            Self::Stream => "kinesis:PutRecord",
             Self::ApiDestination => "events:InvokeApiDestination",
         }
     }
@@ -1375,11 +1405,12 @@ impl TargetKind {
         ctx: &smithy_server_runtime::OperationContext<'_>,
         clients: &mut Clients,
         region: &str,
-        target: &CompiledTarget,
+        handover: &Handover<'_>,
         body: &str,
         retries: &mut Option<Retries>,
         budget: &mut DeliveryBudget,
     ) -> crate::state::InvocationOutcome {
+        let target = handover.target;
         let arn = target.arn.as_str();
         // The target's OWN Region — the ARN's — which is not necessarily the one
         // this request was signed for, falling back to it when the ARN names no
@@ -1436,6 +1467,31 @@ impl TargetKind {
                     .send()
                     .await,
             ),
+            Self::Stream => {
+                // Resolving the key reads the delivered text back as a document
+                // and names a place in it, which is CPU work on this worker:
+                // yielding first gives a cancellation or shutdown signal
+                // somewhere to land before it starts.
+                ::tokio::task::yield_now().await;
+                let partition_key = kinesis_partition_key(
+                    target.partition_key_path.as_deref(),
+                    handover.event_id,
+                    body,
+                );
+                outcome(
+                    clients
+                        .kinesis(ctx, region)
+                        .put_record()
+                        .stream_arn(arn)
+                        // The record's data is the whole event envelope, and its
+                        // partition key is what decides the shard the event goes
+                        // to.
+                        .data(::aws_sdk_kinesis::primitives::Blob::new(body.as_bytes()))
+                        .partition_key(partition_key)
+                        .send()
+                        .await,
+                )
+            }
             Self::ApiDestination => {
                 invoke_api_destination(ctx, target, body, retries, budget).await
             }
@@ -1449,6 +1505,7 @@ impl TargetKind {
             Self::Function => LAMBDA_ARN_NAMESPACE,
             Self::Topic => SNS_ARN_NAMESPACE,
             Self::StateMachine => STATES_ARN_NAMESPACE,
+            Self::Stream => KINESIS_ARN_NAMESPACE,
             Self::ApiDestination => crate::state::ARN_NAMESPACE,
         }
     }
@@ -1470,11 +1527,70 @@ impl TargetKind {
             // EventBridge needs `events:InvokeApiDestination` on the
             // destination, and the `RoleArn` the target names is what carries
             // it.
-            Self::StateMachine | Self::ApiDestination => true,
+            Self::StateMachine | Self::ApiDestination | Self::Stream => true,
             Self::Queue | Self::Function | Self::Topic => false,
         }
     }
 }
+
+/// The partition key the record that carries `delivered` to a Kinesis data
+/// stream target is written under.
+///
+/// `KinesisParameters` "enables you to specify a JSON path to extract from the
+/// event and use as the partition key for the Amazon Kinesis data stream, so
+/// that you can control the shard to which the event goes. If you do not include
+/// this parameter, the default is to use the `eventId` as the partition key" — so
+/// the key is a property of the EVENT being delivered and is resolved per event,
+/// never once per target.
+///
+/// A partition key is a string and the selected value is any JSON value, so what
+/// the key carries is that value's JSON TEXT: a string arrives quoted, a number
+/// as its digits, a container as its compact JSON text. A path that selects
+/// nothing is not a failed delivery — EventBridge writes the record all the same,
+/// keyed on the empty JSON object ([`NO_SELECTION_PARTITION_KEY`]) — and so is a
+/// path that selects more than one value, or a delivered body no path can be
+/// evaluated against.
+fn kinesis_partition_key(
+    partition_key_path: Option<&str>,
+    event_id: &str,
+    delivered: &str,
+) -> String {
+    let Some(path) = partition_key_path else {
+        return event_id.to_string();
+    };
+    selected_partition_key(path, delivered)
+        .unwrap_or_else(|| NO_SELECTION_PARTITION_KEY.to_string())
+}
+
+/// What `path` selects out of `delivered`, as the JSON text a partition key
+/// carries; `None` when it selects no single value.
+///
+/// The path is a CALLER's (`PartitionKeyPath`), so it is read through the ONE
+/// bounded evaluation of such a path (`service_common::json_reference_path`):
+/// the path has to NAME a place — a partition key is one value — and what that
+/// costs is its segment count rather than the size of the delivered event, so a
+/// path asking for a walk of the whole document is refused before anything
+/// evaluates it instead of multiplying this delivery's work.
+///
+/// Four situations answer `None`, and the caller keys the record the same way
+/// for each: the path selects nothing, it is not a path that names one place, it
+/// is past the bounds of one, and the delivered text is not one JSON document.
+/// The first is what EventBridge is observed to do; the others are the same
+/// condition stated of a path a record still has to be keyed under — there is no
+/// single value to key it on either way — so none of them stops the delivery.
+fn selected_partition_key(path: &str, delivered: &str) -> Option<String> {
+    // The path is judged BEFORE the delivered text is read back as a document,
+    // so a path this service does not evaluate costs nothing but its own length.
+    let named = ::service_common::json_reference_path::segments(path)?;
+    let document = crate::state::parse_delivered_event(delivered)?;
+    ::service_common::json_reference_path::select_segments(&named, &document)
+        .map(::serde_json::Value::to_string)
+}
+
+/// The partition key a record is written under when its target's
+/// `PartitionKeyPath` selects no single value out of the delivered event: the
+/// empty JSON object, which is what EventBridge keys such a record on.
+const NO_SELECTION_PARTITION_KEY: &str = "{}";
 
 /// The wire error code an emulated service answers with for an operation nobody
 /// has implemented yet (`crate::scaffolded`).
@@ -1902,9 +2018,10 @@ pub(crate) struct Clients {
     lambda: Option<(String, ::aws_sdk_lambda::Client)>,
     sns: Option<(String, ::aws_sdk_sns::Client)>,
     sfn: Option<(String, ::aws_sdk_sfn::Client)>,
+    kinesis: Option<(String, ::aws_sdk_kinesis::Client)>,
 }
 
-/// Build the four clients the same way: over the in-process callback into this
+/// Build the five clients the same way: over the in-process callback into this
 /// same emulator, against the target service's endpoint in `region`.
 ///
 /// The transport is in-process, so each client disables what a network client
@@ -1953,6 +2070,7 @@ impl Clients {
     callback_client!(sns, aws_sdk_sns, "sns");
     // Step Functions publishes its endpoint and signs under `states`.
     callback_client!(sfn, aws_sdk_sfn, "states");
+    callback_client!(kinesis, aws_sdk_kinesis, "kinesis");
 }
 
 #[cfg(test)]
@@ -1972,11 +2090,11 @@ mod tests {
     ///
     /// The four kinds, and the action each needs, are the ones the EventBridge
     /// targets reference states for them: `sqs:SendMessage` for a queue,
-    /// `lambda:InvokeFunction` for a function, `sns:Publish` for a topic and
-    /// `states:StartExecution` for a state machine. Which of them is invoked
-    /// under the target's role is that reference's other sentence: a role for a
-    /// state machine, a resource-based policy for a queue, a topic and a
-    /// function.
+    /// `lambda:InvokeFunction` for a function, `sns:Publish` for a topic,
+    /// `states:StartExecution` for a state machine and `kinesis:PutRecord` for a
+    /// data stream. Which of them is invoked under the target's role is that
+    /// reference's other sentence: a role for a state machine and a Kinesis data
+    /// stream, a resource-based policy for a queue, a topic and a function.
     #[test]
     fn a_target_arn_names_the_invocation_its_service_is_reached_by() {
         let account = ::engine::emulator_account_id();
@@ -2024,6 +2142,22 @@ mod tests {
                 Some(TargetKind::StateMachine),
                 Some("states:StartExecution"),
                 true,
+            ),
+            (
+                "a Kinesis data stream",
+                format!("arn:aws:kinesis:eu-west-2:{account}:stream/telemetry"),
+                Some(TargetKind::Stream),
+                Some("kinesis:PutRecord"),
+                true,
+            ),
+            // A resource WITHIN a stream rather than the stream: a consumer is
+            // not something a record is written to.
+            (
+                "a Kinesis stream consumer",
+                format!("arn:aws:kinesis:eu-west-2:{account}:stream/telemetry/consumer/reader"),
+                None,
+                None,
+                false,
             ),
             // A resource of a service this invokes, but not one it can invoke.
             (
