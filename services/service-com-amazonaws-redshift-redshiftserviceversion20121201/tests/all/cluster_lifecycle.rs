@@ -70,6 +70,29 @@ impl Emulator {
         Self::build(true)
     }
 
+    /// An emulator with the SNS service mounted beside Redshift on the SAME
+    /// engine, exactly as the assembled emulator mounts them.
+    ///
+    /// A control-plane write publishes the Redshift event it raises onto the
+    /// topic each subscription scoped to that event names, by calling Amazon SNS
+    /// in process, so a suite that is about those notifications needs an SNS to
+    /// reach.
+    pub(crate) fn with_sns() -> Self {
+        let mut emulator = Self::build(false);
+        emulator.router.register_service(
+            service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
+                Arc::clone(&emulator.engine),
+            ),
+        );
+        emulator
+    }
+
+    /// A handle to this emulator for driving it through an AWS SDK client: the
+    /// same in-process seam a handler reaches another mounted service through.
+    pub(crate) fn callback(&self) -> smithy_server_runtime::EmbeddedEmulator {
+        smithy_server_runtime::EmbeddedEmulator::from_router(self.router.clone())
+    }
+
     fn build(with_kms: bool) -> Self {
         // The one shared engine, exactly as `router/src/lib.rs` builds it: every
         // request in this suite observes the same store.
