@@ -54,7 +54,7 @@ use crate::function_lifecycle::{
 /// From `smithy_query(query="operation", operation="UpdateFunction")`: this one operation
 /// binds its version token to `ETtag`, where the rest of the function surface binds `ETag`.
 /// Header names are compared case-insensitively, so the case here is immaterial.
-const UPDATE_ETAG_HEADER: &str = "ETtag";
+pub(crate) const UPDATE_ETAG_HEADER: &str = "ETtag";
 
 /// A version token that is well formed — `E` + 13 characters, the shape this service mints
 /// — but that no function in a fresh emulator holds, so a precondition carrying it is STALE

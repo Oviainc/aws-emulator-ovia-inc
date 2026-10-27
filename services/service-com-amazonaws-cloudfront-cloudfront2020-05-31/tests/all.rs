@@ -103,6 +103,8 @@ mod function_update;
 mod invalidation_list;
 #[path = "all/key_group_lifecycle.rs"]
 mod key_group_lifecycle;
+#[path = "all/key_value_store_delete.rs"]
+mod key_value_store_delete;
 #[path = "all/key_value_store_lifecycle.rs"]
 mod key_value_store_lifecycle;
 #[path = "all/key_value_store_list.rs"]
