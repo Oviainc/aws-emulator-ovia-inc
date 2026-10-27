@@ -2,10 +2,11 @@
 
 //! @op DisableBaseline
 //!
-//! Removes an `EnabledBaseline` from [`crate::state`] and starts the asynchronous
-//! `DISABLE_BASELINE` operation `GetBaselineOperation` reports. Implemented alongside
-//! `EnableBaseline` so the baseline operation log holds more than one operation type; the
-//! remaining baseline operations keep their own stub issues.
+//! Starts the asynchronous `DISABLE_BASELINE` operation `GetBaselineOperation` reports and
+//! parks the removal of the `EnabledBaseline` it tears down on that resource, for
+//! [`crate::state`]'s settle pass to apply once the clock makes it due. Implemented
+//! alongside `EnableBaseline` so the baseline operation log holds more than one operation
+//! type; the remaining baseline operations keep their own stub issues.
 //!
 //! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
 //! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
@@ -190,22 +191,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `@idempotent`: a disable already in flight against this resource IS this
-        // request's work, so repeating the call reports that same operation rather than
-        // starting a second teardown or refusing.
-        if let Some(in_flight) = store.baseline_operation_in_flight(&arn) {
-            let operation_type = store
-                .baseline_operations
-                .get(&in_flight)
-                .map(|operation| operation.operation_type);
-            if operation_type == Some(crate::state::BaselineOperationType::DisableBaseline) {
-                return Ok(DisableBaselineOutput {
-                    operation_identifier: in_flight,
-                });
-            }
-            // Any OTHER operation still changing this enablement would be left half
-            // applied by a teardown starting now, which is what `ConflictException`
-            // reports.
+        // `@idempotent`: a teardown already parked on this enablement IS this request's
+        // work, so repeating the call reports that same operation rather than starting a
+        // second teardown or refusing.
+        if let Some(in_flight) = store.baseline_deletion_in_flight_on(&arn) {
+            return Ok(DisableBaselineOutput {
+                operation_identifier: in_flight,
+            });
+        }
+        // Any OTHER operation still changing this enablement would be left half applied
+        // by a teardown starting now, which is what `ConflictException` reports.
+        if let Some(in_flight) = store.baseline_change_in_flight_on(&arn) {
             return Err(DisableBaselineErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
@@ -218,17 +214,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let operation_identifier = store.record_baseline_operation(
-            crate::state::BaselineOperationType::DisableBaseline,
-            &arn,
-            now,
-        );
-        // The resource stays until the teardown is due — `settle` removes it then — so a
-        // caller polling straight after this call still sees it UNDER_CHANGE.
-        if let Some(enabled_baseline) = store.enabled_baselines.get_mut(&arn) {
-            enabled_baseline.status = crate::state::EnablementStatus::UnderChange;
-            enabled_baseline.last_operation_identifier = operation_identifier.clone();
-        }
+        // The teardown starts an asynchronous operation, as every call acting on an
+        // enablement does, so the identifier it returns names a record in the baseline
+        // operation log; the enablement stays in the store, `UNDER_CHANGE`, until the clock
+        // makes the removal parked on it due and `settle` removes it. A caller polling
+        // straight after this call therefore still sees it UNDER_CHANGE.
+        let Some(operation_identifier) = store.record_enabled_baseline_disable(&arn, now) else {
+            // The ARN was read out of this same locked store above, so nothing can have
+            // removed the enablement in between; the modelled 404 is the answer if it ever
+            // did.
+            return Err(DisableBaselineErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no enabled baseline matches enabledBaselineIdentifier {arn}"),
+                },
+            )
+            .into());
+        };
 
         Ok(DisableBaselineOutput {
             operation_identifier,
