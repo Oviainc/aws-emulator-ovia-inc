@@ -4306,6 +4306,24 @@ pub struct AlarmRuleError {
     pub message: String,
 }
 
+/// The tokens a rule may carry where a TERM is expected, as CloudWatch lists them in the
+/// diagnosis of a rule it could not parse: the open parenthesis and `NOT` that start a
+/// grouped or negated term, the `AT_LEAST` quantifier, the two boolean literals, and the
+/// three state functions. The list is the service's own, reproduced as it words it.
+const RULE_TERM_TOKENS: &str =
+    "'(', 'NOT', AT_LEAST, TRUE or FALSE, ALARM, OK, or INSUFFICIENT_DATA";
+
+/// What this parser states it expected where a rule ends before the term it owes: the refusal
+/// class the diagnosis above has no recorded wording for.
+const TERM_EXPECTED: &str = "expected ALARM, OK, INSUFFICIENT_DATA, TRUE, FALSE, NOT or `(`";
+
+/// One diagnosis in the envelope CloudWatch carries an `AlarmRule` refusal in, so a client
+/// that classifies a refusal by its message can tell a rule it could not parse from the two
+/// other refusals the same operation answers with the same error code.
+fn alarm_rule_diagnosis(diagnosis: &str) -> String {
+    format!("Error in AlarmRule [{diagnosis}]")
+}
+
 impl std::fmt::Display for AlarmRuleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
@@ -4395,6 +4413,54 @@ impl<'a> RuleParser<'a> {
         }
     }
 
+    /// The refusal for a token sitting where the rule can only carry a TERM, or `None` where
+    /// the rule carries no token at that position at all — it simply STOPS before the term it
+    /// owes, which is a different class, and one no recording words for this service.
+    ///
+    /// CloudWatch diagnoses a rule that carries such a token by naming the OFFENDING TOKEN and
+    /// WHERE in the rule it sits, together with the tokens that position admits
+    /// ([`RULE_TERM_TOKENS`]) — which is what tells a client it mistyped the expression rather
+    /// than referenced an alarm that does not exist. Both variable parts are read off the rule
+    /// the caller submitted: the token as it appears in it ([`Self::token_here`]) and its offset
+    /// in CHARACTERS from the start of the rule, which is the position a client counts to in the
+    /// string it sent.
+    fn unsupported_token(&self) -> Option<AlarmRuleError> {
+        let token = self.token_here();
+        if token.is_empty() {
+            return None;
+        }
+        let at_char = self
+            .text
+            .get(..self.at)
+            .unwrap_or_default()
+            .chars()
+            .count();
+        Some(AlarmRuleError {
+            message: alarm_rule_diagnosis(&format!(
+                "Unsupported token '{token}' at char {at_char}, must be: {RULE_TERM_TOKENS}"
+            )),
+        })
+    }
+
+    /// The token the rule carries at the position this parse reached: the whole WORD where the
+    /// text continues with one (`AND`, a misspelled function), otherwise the single character
+    /// there (a stray operator or bracket), and nothing at all at the end of the rule — where
+    /// the rule simply stops before the term it owes.
+    fn token_here(&self) -> &'a str {
+        let rest = self.rest();
+        let Some(first) = rest.chars().next() else {
+            return "";
+        };
+        if first.is_alphanumeric() || first == '_' {
+            let end = rest
+                .find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                .unwrap_or(rest.len());
+            &rest[..end]
+        } else {
+            &rest[..first.len_utf8()]
+        }
+    }
+
     /// Enter one more level of nesting, refusing a rule that nests past
     /// [`MAX_RULE_NESTING_DEPTH`]. Called at the only two sites the parse recurses from, so
     /// the recursion can never grow with the request past the bound.
@@ -4479,7 +4545,14 @@ impl<'a> RuleParser<'a> {
                 });
             }
         }
-        Err(self.error("expected ALARM, OK, INSUFFICIENT_DATA, TRUE, FALSE, NOT or `(`"))
+        // Nothing here starts a term. A rule that carries a TOKEN at this position is refused
+        // with CloudWatch's own diagnosis of it — the one parse failure a recording words. A
+        // rule that simply ENDS here carries no token to name, and nothing records how the
+        // service words that, so it keeps this parser's own wording rather than the recorded
+        // template with an empty slot in it.
+        Err(self
+            .unsupported_token()
+            .unwrap_or_else(|| self.error(TERM_EXPECTED)))
     }
 
     /// The alarm a state function names: `("x")` or `(x)`, since a name "can be surrounded
