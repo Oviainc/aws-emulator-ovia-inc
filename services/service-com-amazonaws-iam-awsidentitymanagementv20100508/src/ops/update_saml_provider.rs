@@ -200,11 +200,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let replacement = match input.saml_metadata_document.as_deref() {
             None => None,
             Some(document) => match crate::state::parse_saml_metadata(document) {
-                Ok(metadata) => Some(metadata),
-                Err(reason) => {
+                Some(metadata) => Some(metadata),
+                None => {
                     return Err(UpdateSAMLProviderErrorModeled::InvalidInputException(
                         InvalidInputException {
-                            message: Some(format!("Invalid SAMLMetadataDocument: {reason}")),
+                            message: Some(
+                                crate::state::INVALID_SAML_METADATA_DOCUMENT.to_string(),
+                            ),
                         },
                     )
                     .into())
