@@ -75,6 +75,8 @@ mod status_timestamp_wire_form;
 mod table_catalog;
 #[path = "all/table_listing.rs"]
 mod table_listing;
+#[path = "all/table_property_refusal_field.rs"]
+mod table_property_refusal_field;
 #[path = "all/tagging.rs"]
 mod tagging;
 #[path = "all/tagging_arn_validation.rs"]
