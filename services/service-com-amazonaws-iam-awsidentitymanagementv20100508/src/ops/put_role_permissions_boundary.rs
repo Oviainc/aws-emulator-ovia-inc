@@ -256,19 +256,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of AWS's managed policies, and an entry invented for one would not be
         // knowledge it has. A customer-managed policy exists exactly when this account
         // holds it, which is what `CreatePolicy` records. The same rule
-        // `AttachRolePolicy` applies to the policy it attaches. The sentence below is
-        // written out here rather than taken from `crate::state::policy_not_attachable`
-        // (the policy-ATTACHMENT family's wording, shared by the attach calls and by
-        // `ListEntitiesForPolicy`): what a boundary call names is a SCOPE rather than an
-        // attachment, so its wording is settled per operation and not by sharing that
-        // helper into this family.
+        // `AttachRolePolicy` applies to the policy it attaches. The sentence is the
+        // boundary family's own (`crate::state::boundary_scope_not_attachable`): what a
+        // boundary call names is a SCOPE rather than an attachment, which IAM words
+        // `Scope ARN: <arn> …` where the attachment family words it `Policy <arn> …`.
         let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;
         if !aws_managed && store.policy_by_arn(&input.permissions_boundary).is_none() {
             return Err(PutRolePermissionsBoundaryErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!(
-                        "Policy {} does not exist or is not attachable.",
-                        input.permissions_boundary
+                    message: Some(crate::state::boundary_scope_not_attachable(
+                        &input.permissions_boundary,
                     )),
                 },
             )

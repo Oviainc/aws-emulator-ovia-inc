@@ -217,15 +217,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // non-empty string, which is all `policyDocumentType`'s own pattern asks for.
         // The rule, and its wording, are the shared ones every operation taking a policy
         // document applies.
-        if !crate::state::is_policy_document(&input.policy_document) {
+        if let Some(defect) = crate::state::policy_document_defect(&input.policy_document) {
             return Err(
                 CreatePolicyVersionErrorModeled::MalformedPolicyDocumentException(
                     MalformedPolicyDocumentException {
-                        message: Some(
-                            "Syntax errors in policy: PolicyDocument must be a JSON object \
-                             carrying a Statement element"
-                                .to_string(),
-                        ),
+                        message: Some(defect.message().to_string()),
                     },
                 )
                 .into(),
@@ -240,10 +236,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if characters > crate::state::MAX_MANAGED_POLICY_CHARACTERS {
             return Err(CreatePolicyVersionErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "Maximum policy size of {} characters exceeded for policy {}",
+                    message: Some(crate::state::policy_size_quota_exceeded(
                         crate::state::MAX_MANAGED_POLICY_CHARACTERS,
-                        input.policy_arn
                     )),
                 },
             )

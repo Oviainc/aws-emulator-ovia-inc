@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveUserFromGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveUserFromGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveUserFromGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the membership that makes the named user a member of the named group, so
+//! `GetGroup` stops reporting the user and `ListGroupsForUser` stops reporting the group.
+//! A group name and a user name the account does not hold are each a `NoSuchEntityException`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveUserFromGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveUserFromGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveUserFromGroup"))
+        // `ctx` carries request metadata only; nothing about a membership depends on it —
+        // IAM is global, and both entities are named by the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RemoveUserFromGroupErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // IAM entity names "are not distinguished by case", so both entities are found
+        // under their case-folded names; a name the account holds no group or no user
+        // under "referenced a resource entity that does not exist", the same two lookups
+        // and the same two sentences `AddUserToGroup` makes.
+        let group_key = crate::state::name_key(&input.group_name);
+        if !store.groups.contains_key(&group_key) {
+            return Err(RemoveUserFromGroupErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The group with name {} cannot be found.",
+                        input.group_name
+                    )),
+                },
+            )
+            .into());
+        }
+        let user_key = crate::state::name_key(&input.user_name);
+        if !store.users.contains_key(&user_key) {
+            return Err(RemoveUserFromGroupErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Removes the specified user from the specified group": what goes is the
+        // MEMBERSHIP, held in the one set `AddUserToGroup` fills and `GetGroup` reports.
+        // A user the group does not hold leaves the account exactly as it is — the
+        // membership the request asks for is already absent — and a group left holding
+        // nobody holds no membership set either, so no bookkeeping for a membership that
+        // no longer exists is left behind.
+        if let Some(members) = store.group_members.get_mut(&group_key) {
+            members.remove(&user_key);
+            if members.is_empty() {
+                store.group_members.remove(&group_key);
+            }
+        }
+
+        // Audit record for the change: the operation and what it changed, so a
+        // state-changing call leaves a local record. The acting principal is deliberately
+        // NOT part of it: the only thing that names the caller is its request's
+        // `Authorization` header, and nothing of that header belongs in a log line.
+        ::tracing::info!(
+            audit = true,
+            operation = "RemoveUserFromGroup",
+            outcome = "removed",
+            group_name = %input.group_name,
+            user_name = %input.user_name,
+            "a user was removed from a group"
+        );
+        Ok(RemoveUserFromGroupOutput)
     }
 }

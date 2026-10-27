@@ -4149,6 +4149,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// the record name", which is the `Name` its own declaration states.)
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == APIGATEWAYV2_API
+        // An IAM managed policy is one more: "Ref returns the ARN of the managed policy",
+        // the handle every IAM operation on one takes (`GetPolicy$PolicyArn`,
+        // `AttachRolePolicy$PolicyArn`), and `CreatePolicy` is what answers it — built from
+        // the account and the path IAM created the policy under rather than from the name
+        // the template declared.
+        || resource_type == "AWS::IAM::ManagedPolicy"
         || resource_type == APIGATEWAYV2_API_MAPPING
         || resource_type == APIGATEWAYV2_INTEGRATION
         || resource_type == APIGATEWAYV2_ROUTE
