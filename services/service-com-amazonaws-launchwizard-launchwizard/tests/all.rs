@@ -49,6 +49,8 @@ mod tag_key_rule_single_source;
 mod update_deployment_dry_run_response;
 #[path = "all/validation_messages.rs"]
 mod validation_messages;
+#[path = "all/validation_report_single_source.rs"]
+mod validation_report_single_source;
 #[path = "all/workload_catalogue.rs"]
 mod workload_catalogue;
 #[path = "all/workload_deployment_patterns.rs"]
