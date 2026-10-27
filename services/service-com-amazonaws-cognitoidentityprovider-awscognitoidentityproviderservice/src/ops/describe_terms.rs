@@ -167,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let terms = pool
             .terms
             .get(&input.terms_id)
-            .ok_or_else(|| terms_not_found(&input.terms_id))?;
+            .ok_or_else(terms_not_found)?;
 
         // Rendered from the STORED terms documents: this read changes nothing.
         Ok(DescribeTermsOutput {
@@ -185,10 +185,12 @@ fn user_pool_not_found(user_pool_id: &str) -> DescribeTermsError {
 }
 
 /// This operation's `ResourceNotFoundException` for a `TermsId` the pool does not
-/// hold.
-fn terms_not_found(terms_id: &str) -> DescribeTermsError {
+/// hold, worded as [`crate::state::TERMS_NOT_FOUND_MESSAGE`] — the one sentence
+/// every terms-document lookup that resolves nothing answers, whatever it looked
+/// the documents up by.
+fn terms_not_found() -> DescribeTermsError {
     DescribeTermsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Terms documents {terms_id} do not exist.")),
+        message: Some(crate::state::TERMS_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }
