@@ -27,7 +27,9 @@ use service_com_amazonaws_polly_parrot_v1::service::errors;
 use service_com_amazonaws_polly_parrot_v1::state::mint_task_id;
 
 use crate::lexicons_and_speech::{error_code, json, Polly};
-use crate::support::{fixture_task_id, get_task, message_slot, seed_task, stored_task};
+use crate::support::{
+    fixture_task_id, get_task, message_slot, pls_with_replacement, seed_task, stored_task,
+};
 
 /// Assert one error document: the status and code it carries, that its `message`
 /// member is PRESENT, and that the member is exactly what this service words that code
@@ -70,17 +72,6 @@ fn assert_message_member(
             "case {case:?}: expected the message {sentence:?}, got {slot:?}"
         ),
     }
-}
-
-/// A PLS lexicon with one lexeme whose `element` replacement is `length` characters.
-fn pls_with_replacement(element: &str, length: usize) -> String {
-    format!(
-        "<lexicon version=\"1.0\" \
-         xmlns=\"http://www.w3.org/2005/01/pronunciation-lexicon\" \
-         alphabet=\"ipa\" xml:lang=\"en-US\">\
-         <lexeme><grapheme>G</grapheme><{element}>{}</{element}></lexeme></lexicon>",
-        "x".repeat(length)
-    )
 }
 
 /// RULE: the error document of the code Amazon Polly answers with NO message carries
