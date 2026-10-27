@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `OutpostIdentifier`, so it accepts the bare id or the full Outpost ARN; an
         // ARN carries a partition, a Region and an account of its own, and one that is
         // not this endpoint's names no Outpost of this inventory — so nothing can
-        // match it ([`matches_outpost`]).
+        // match it ([`crate::state::identifier_filter_accepts`]).
         let outpost_filter = match input
             .outpost_identifier_filter
             .as_deref()
@@ -200,7 +200,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::ORDER_PAGE,
             store
                 .orders_in(&region)
-                .filter(|record| matches_outpost(record, outpost_filter.as_ref()))
+                // The filter selects on the order's own `OutpostId` — the Outpost the
+                // order was placed against — by the rule every identifier filter of
+                // this service selects by.
+                .filter(|record| {
+                    crate::state::identifier_filter_accepts(
+                        outpost_filter.as_ref(),
+                        record.order.outpost_id.as_deref(),
+                    )
+                })
                 .map(|record| (record.sequence, order_summary(&record.order))),
             after,
             size,
@@ -212,27 +220,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             orders: Some(orders),
             next_token,
         })
-    }
-}
-
-/// Whether a stored order satisfies the Outpost filter the caller sent.
-///
-/// The filter selects on the order's own `OutpostId` — the Outpost the order was
-/// placed against — and a filter the caller did not send narrows nothing. It is a
-/// filter and not an identifier the request is addressed to: it narrows the list the
-/// caller is reported, so one naming an Outpost that holds no order — including one
-/// this endpoint does not hold at all, which is what an ARN of another partition,
-/// Region or account names — reports no order rather than failing, the rule every
-/// filtered list of this service selects by.
-fn matches_outpost(
-    record: &crate::state::OrderRecord,
-    outpost_filter: Option<&crate::state::ResolvedIdentifier>,
-) -> bool {
-    match outpost_filter {
-        None => true,
-        Some(filter) => filter
-            .here()
-            .is_some_and(|outpost_id| record.order.outpost_id.as_deref() == Some(outpost_id)),
     }
 }
 
