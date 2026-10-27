@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateLanguageModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateLanguageModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateLanguageModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Re-encrypts the artifacts of a stored custom language model in place, with the
+//! encryption configuration and data access role a request names (see
+//! [`UpdateLanguageModel::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -167,23 +161,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_LANGUAGE_MODEL_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Change the encryption configuration of the stored custom language model this
+    /// request names, once the service has finished working on it.
+    ///
+    /// "Updates the encryption configuration for an existing custom language model.
+    /// ... The model artifacts are re-encrypted in place. No model training is
+    /// required" (the operation's own doc), so this is the ONE change it makes to the
+    /// record: everything the training established — the language, the base model, the
+    /// training data it was given and the terminal status that data decided — is
+    /// untouched, as is the record's identity, which this operation models no input
+    /// for. The new configuration is what a later reader sees at once, while the
+    /// re-encryption the service still owes shows as the model's status: "You cannot
+    /// submit another update while a previous update is in progress. Use [the describe
+    /// operation] to check the current state of your model", so the record is
+    /// `IN_PROGRESS` with its one clock-owed transition due from this call and settles
+    /// back in the status its training data already decided (see
+    /// [`crate::state::LanguageModelRecord::re_encrypt`]). A model the service has NOT
+    /// finished with is refused rather than updated — the same rule, and the same
+    /// records, as `DeleteLanguageModel`'s own state refusal.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateLanguageModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateLanguageModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateLanguageModel"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateLanguageModelErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The Region this request is served in: only the models created through this
+        // Region's endpoint are this call's to update, and the Region is half of a
+        // record's key, so an update reaches only its own Region's model.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The lookup materialises the transition the clock already owed the record, so
+        // a model whose training was due by now is updated rather than refused for a
+        // status it had already left.
+        let Some(record) = store.language_model_mut(&region, &input.model_name, now) else {
+            // A custom language model this Region does not hold is this service's
+            // `BadRequestException`, as it is for `DescribeLanguageModel` and
+            // `DeleteLanguageModel`: the shape whose own documentation covers an entity
+            // that "doesn't exist", and the one this service's recorded not-found
+            // responses carry — not the modelled `NotFoundException`.
+            return Err(bad_request(&crate::state::not_found_message(
+                crate::state::KIND_LANGUAGE_MODEL,
+            )));
+        };
+
+        // "Your custom language model must not be in the IN_PROGRESS state when you
+        // call this operation. You cannot submit another update while a previous update
+        // is in progress" (the operation's own doc) — the refusal
+        // `BadRequestException`'s own documentation covers ("if it's in a non-terminal
+        // state (such as IN PROGRESS)"), over the one non-terminal value of
+        // `ModelStatus` (see [`crate::state::is_terminal_model_status`]).
+        if !crate::state::is_terminal_model_status(&record.status) {
+            let refusal = crate::state::resource_not_updatable_message(
+                crate::state::KIND_LANGUAGE_MODEL,
+                &record.name,
+                &record.status,
+            );
+            return Err(bad_request(&refusal));
+        }
+
+        record.re_encrypt(
+            input.data_access_role_arn,
+            input.encryption_configuration,
+            now,
+        );
+
+        // The response is the record just written, never the request echoed back.
+        let output = UpdateLanguageModelOutput {
+            model_name: Some(record.name.clone()),
+            model_status: Some(record.status.clone()),
+            last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
+        };
+        ::tracing::info!(
+            operation = "UpdateLanguageModel",
+            model = %record.name,
+            status = %record.status,
+            "custom language model artifacts re-encrypted in place; no training runs again"
+        );
+
+        Ok(output)
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express.
+fn bad_request(message: &str) -> UpdateLanguageModelError {
+    UpdateLanguageModelErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

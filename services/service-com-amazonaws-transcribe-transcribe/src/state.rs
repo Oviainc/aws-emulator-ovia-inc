@@ -1025,7 +1025,8 @@ pub fn is_terminal_vocabulary_state(state: &str) -> bool {
 /// How this service refuses a request that would OVERWRITE a custom resource whose
 /// build has not finished: the resource of `kind` named `name` is in `state`, which is
 /// not one of the states its build has finished in
-/// ([`is_terminal_vocabulary_state`]).
+/// ([`is_terminal_vocabulary_state`] for a custom vocabulary,
+/// [`is_terminal_model_status`] for a custom language model).
 ///
 /// Worded like the state refusals the deletes of every family carry ("... is in the
 /// {state} state and can't be deleted. Wait until it is no longer being processed ..."),
@@ -2357,6 +2358,47 @@ impl LanguageModelRecord {
             self.last_modified_time = due;
             self.settles_due = None;
         }
+    }
+
+    /// Re-encrypt this model's artifacts in place, the one change
+    /// `UpdateLanguageModel` makes to a stored model.
+    ///
+    /// "The model artifacts are re-encrypted in place using the specified KMS key or
+    /// with an AWS-owned key if a key is not supplied" (the model's doc for
+    /// `UpdateLanguageModelRequest$EncryptionConfiguration`), so the configuration the
+    /// request carries REPLACES the stored one and a request that carries none leaves
+    /// the artifacts under the AWS-owned key — which this record spells as no
+    /// configuration of its own, exactly as a create that named none does.
+    /// `DataAccessRoleArn` is optional on that request, so a request naming no role
+    /// keeps the one the model already reads its data with.
+    ///
+    /// The re-encryption is work the service performs AFTER answering — "You cannot
+    /// submit another update while a previous update is in progress. Use [the
+    /// describe operation] to check the current state of your model" (the operation's
+    /// own doc) — so the record goes back to [`MODEL_STATUS_IN_PROGRESS`] carrying the
+    /// instant its one clock-owed transition falls due, the same invariant
+    /// [`Self::in_progress`] establishes for a create. "No model training is
+    /// required" (same doc): nothing resolves the training data again, so the status
+    /// this record settles back in is the one that data already decided
+    /// ([`TrainingDataVerdict`]) and an update cannot change which terminal status a
+    /// model ends in.
+    pub fn re_encrypt(
+        &mut self,
+        data_access_role_arn: Option<String>,
+        encryption_configuration: Option<EncryptionConfiguration>,
+        now: SystemTime,
+    ) {
+        self.encryption_configuration = encryption_configuration;
+        if let Some(role) = data_access_role_arn {
+            self.input_data_config.data_access_role_arn = role;
+        }
+        self.status = MODEL_STATUS_IN_PROGRESS.to_string();
+        // A model the service is working on reports no failure yet; the one its
+        // training data grounds is set again when the transition falls due
+        // ([`Self::advance_clock`]).
+        self.failure_reason = None;
+        self.settles_due = Some(now + MODEL_TRANSITION_DELAY);
+        self.last_modified_time = now;
     }
 
     /// This record as the modelled `LanguageModel` shape, which
