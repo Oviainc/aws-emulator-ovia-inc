@@ -22,7 +22,7 @@
 //! ([`crate::state::messages::partition_values_do_not_match_keys`]) because a create has to
 //! say what it would not store; a read of such a list has no partition to report either
 //! way, and the single-partition read answers it as the same miss
-//! (`Partition [..] not found.`), so the two reads agree.
+//! ([`crate::state::messages::PARTITION_NOT_FOUND`]), so the two reads agree.
 //!
 //! ## Shape of an operation
 //!

@@ -178,7 +178,9 @@ async fn get_enrollment(router: &MultiServiceRouter) -> Value {
 /// if your account is an organization management account": every read of it — filtered, paged
 /// or bare — is refused with the operation's modelled 400 rather than answered with an empty
 /// sequence, while `GetEnrollmentStatus`, the action that reports a standalone account's own
-/// enrollment, still answers. Enrolling that organization still creates no member account.
+/// enrollment, still answers. Enrolling the account itself still creates no member account —
+/// and asking that enrollment to include member accounts is refused for the same reason this
+/// read is (`include_member_accounts.rs` pins that refusal across every operation taking it).
 #[tokio::test]
 async fn a_standalone_account_is_refused_the_organization_s_statuses() {
     let router = emulator();
@@ -226,7 +228,7 @@ async fn a_standalone_account_is_refused_the_organization_s_statuses() {
         "a standalone account has no member account opted in, got {enrollment}"
     );
 
-    update_enrollment(&router, "Active", true).await;
+    update_enrollment(&router, "Active", false).await;
     settle().await;
     let enrollment = get_enrollment(&router).await;
     assert_eq!(
@@ -237,7 +239,7 @@ async fn a_standalone_account_is_refused_the_organization_s_statuses() {
     assert_eq!(
         enrollment["numberOfMemberAccountsOptedIn"],
         json!(0),
-        "enrolling member accounts creates none, got {enrollment}"
+        "enrolling a standalone account creates no member account, got {enrollment}"
     );
 }
 
