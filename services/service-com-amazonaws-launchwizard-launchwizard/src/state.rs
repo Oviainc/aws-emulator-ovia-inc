@@ -311,8 +311,8 @@ impl SpecificationField {
 /// One VERSION of a deployment pattern, in the seeded, read-only catalogue.
 ///
 /// This is the single record every deployment-pattern-version view reports from
-/// (`GetDeploymentPatternVersion` today), so a version's name and description cannot
-/// differ between two readers. The workload and pattern a version belongs to are NOT
+/// (`GetDeploymentPatternVersion` and `ListDeploymentPatternVersions`), so a version's
+/// name and description cannot differ between two readers. The workload and pattern a version belongs to are NOT
 /// stored here: they are read off the [`DeploymentPattern`] that holds it (see
 /// [`DeploymentPattern::version_summary`]), so a version can never name a pattern it is
 /// not part of.
@@ -388,23 +388,56 @@ impl DeploymentPattern {
     /// One of this pattern's versions as the `DeploymentPatternVersionDataSummary`
     /// `GetDeploymentPatternVersion` returns, or `None` when the catalogue publishes no
     /// version of this pattern under that name.
+    pub fn version_summary(
+        &self,
+        version_name: &str,
+    ) -> Option<DeploymentPatternVersionDataSummary> {
+        Some(self.summary_of(self.version(version_name)?))
+    }
+
+    /// EVERY version this pattern publishes as the summaries
+    /// `ListDeploymentPatternVersions` pages, OLDEST FIRST — the order
+    /// [`CATALOGUE_PATTERN_VERSIONS`] publishes them in, so a page resumes in a stable
+    /// order.
+    ///
+    /// Built from the same projection the single-version read reports
+    /// ([`DeploymentPattern::summary_of`]), so the list view and the version view cannot
+    /// disagree about one version.
+    pub fn version_summaries(&self) -> Vec<DeploymentPatternVersionDataSummary> {
+        self.versions
+            .iter()
+            .map(|version| self.summary_of(version))
+            .collect()
+    }
+
+    /// One of this pattern's versions as the summary every version view reports.
     ///
     /// `workloadName` and `deploymentPatternName` are read off THIS record rather than
     /// off the request, so the reported version is always stated as a version of the
     /// pattern it was found in, and `documentationUrl` is the document the catalogue
     /// publishes for it, read off the same record.
-    pub fn version_summary(
-        &self,
-        version_name: &str,
-    ) -> Option<DeploymentPatternVersionDataSummary> {
-        let version = self.version(version_name)?;
-        Some(DeploymentPatternVersionDataSummary {
+    fn summary_of(&self, version: &PatternVersion) -> DeploymentPatternVersionDataSummary {
+        DeploymentPatternVersionDataSummary {
             deployment_pattern_version_name: Some(version.version_name.clone()),
             description: Some(version.description.clone()),
             documentation_url: Some(self.documentation_url.clone()),
             workload_name: Some(self.workload_name.clone()),
             deployment_pattern_name: Some(self.pattern_name.clone()),
-        })
+        }
+    }
+
+    /// Whether an update of a deployment that currently deploys `from_version` of this
+    /// pattern can move it onto `version` of it.
+    ///
+    /// An update names a version of the pattern it deploys and this catalogue publishes
+    /// several per pattern, so ANY published version is one a deployment can be moved
+    /// onto (`UpdateDeployment`) — except the one it already deploys, which moves no
+    /// version at all. A starting version this pattern does not publish names no
+    /// deployment of this pattern, so nothing is an update away from it.
+    pub fn is_update_target(&self, from_version: &str, version: &str) -> bool {
+        from_version != version
+            && self.version(from_version).is_some()
+            && self.version(version).is_some()
     }
 
     /// This pattern as the `WorkloadDeploymentPatternDataSummary`

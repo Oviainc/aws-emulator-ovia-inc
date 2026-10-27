@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBasePathMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBasePathMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBasePathMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the request's `patchOperations` to the stored `BasePathMapping`
+//! the `domainName` + `basePath` pair resolves to, in request order, and reports the
+//! patched record — the same one a later `GetBasePathMapping` reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +81,80 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    base_path_key, bound_chars, patch_optional_string, patch_required_string, BasePathMappingEntry,
+    Patch, PatchFailure, PatchOpKind, MAX_PATH_CHARS, MAX_STAGE_NAME_CHARS, MAX_STRING_CHARS,
+};
+
+impl From<&BasePathMappingEntry> for UpdateBasePathMappingOutput {
+    /// The patched record as THIS operation's output shape.
+    ///
+    /// Both shapes are the model's `BasePathMapping` (`smithy_query(query="operation",
+    /// operation="CreateBasePathMapping,UpdateBasePathMapping")`: one output shape,
+    /// generated once per operation), so the record is rendered by the one
+    /// `BasePathMapping` renderer this crate has and the update cannot report a stored
+    /// mapping differently from the create or the read.
+    fn from(entry: &BasePathMappingEntry) -> Self {
+        let body = CreateBasePathMappingOutput::from(entry);
+        Self {
+            base_path: body.base_path,
+            rest_api_id: body.rest_api_id,
+            stage: body.stage,
+        }
+    }
+}
+
+// The `path` values `UpdateBasePathMapping` accepts are the ones `apply_patch` below has
+// an arm for: one per member of the `BasePathMapping` shape — the base path the mapping
+// answers to, the API a call on it is served by, and the stage of that API. The shape
+// models nothing else, so there is no fourth path.
+//
+// `restapiId` is the spelling API Gateway documents for this resource's pointer (its CLI
+// reference spells the remap `op=replace,path=/restapiId,value=<api-id>`), which is the
+// member `BasePathMapping$restApiId` reports.
+
+/// Apply one patch to a COPY of a stored mapping.
+fn apply_patch(entry: &mut BasePathMappingEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    match patch.member() {
+        // The base path is the mapping's own address, and it always has one: an EMPTY
+        // base path is not an absent member but the base path spelled `(none)` — "the
+        // base path name that callers of the API must provide as part of the URL after
+        // the domain name" (`BasePathMapping$basePath`) — so a value is stored under the
+        // same spelling `CreateBasePathMapping` stores it, and a `remove` is refused
+        // because there is no state in which the member has no value.
+        "basePath" => {
+            patch.require_single_valued()?;
+            match patch.op {
+                PatchOpKind::Add | PatchOpKind::Replace => {
+                    let value = patch.require_value()?;
+                    bound_chars(&patch.path, value, MAX_PATH_CHARS)
+                        .map_err(PatchFailure::BadRequest)?;
+                    entry.base_path = base_path_key(Some(value));
+                    Ok(())
+                }
+                _ => Err(patch.unsupported_op()),
+            }
+        }
+        // "The string identifier of the associated RestApi": a mapping always names the
+        // API it sends calls to, so the member can be replaced but neither removed nor
+        // emptied. Whether the new identifier resolves to a stored API is checked by the
+        // handler, which is what holds the records.
+        "restapiId" => patch_required_string(&mut entry.rest_api_id, patch, MAX_STRING_CHARS),
+        // "The name of the associated stage" is optional — a mapping created without one
+        // names no stage, and `(none)` is the spelling for a mapping whose callers name
+        // the stage themselves — so a `remove`, like an empty value, clears it back to
+        // naming no stage at all.
+        "stage" => {
+            patch_optional_string(&mut entry.stage, patch, MAX_STAGE_NAME_CHARS)?;
+            if entry.stage.as_deref().is_some_and(str::is_empty) {
+                entry.stage = None;
+            }
+            Ok(())
+        }
+        _ => Err(patch.unsupported_path()),
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +228,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBasePathMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBasePathMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBasePathMapping"))
+        let bad_request = |message: String| -> Self::Error {
+            UpdateBasePathMappingErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The list is read BEFORE the store lock is taken, so a malformed patch never
+        // reaches the records at all.
+        let patches =
+            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+
+        // The mapping is a record OF a custom domain name, resolved by the two members
+        // `GetDomainName` resolves one by, and addressed within it by the base path under
+        // the spelling the record was stored with — the same two lookups
+        // `GetBasePathMapping` makes, so the request that reads a mapping is the request
+        // that patches it.
+        let domain_key =
+            crate::state::domain_name_key(&input.domain_name, input.domain_name_id.as_deref());
+        let base_path = base_path_key(Some(&input.base_path));
+
+        let mut store = state.lock();
+        let stored = store
+            .domain_names
+            .get(&domain_key)
+            .ok_or_else(|| {
+                UpdateBasePathMappingErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_DOMAIN_NAME.to_string()),
+                })
+            })?
+            .base_path_mappings
+            .get(&base_path)
+            .ok_or_else(|| {
+                UpdateBasePathMappingErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::NO_SUCH_BASE_PATH_MAPPING.to_string()),
+                })
+            })?
+            .clone();
+
+        // Patched on a COPY: a list whose later op is refused leaves the stored record
+        // untouched, rather than keeping the ops before it.
+        let mut updated = stored.clone();
+        for patch in &patches {
+            apply_patch(&mut updated, patch).map_err(patch_failure)?;
+        }
+
+        // A patch that moved WHERE the mapping sends calls must leave it pointing at
+        // records that exist, which is the rule `CreateBasePathMapping` applies to the
+        // same two members: the API identifier must resolve to a stored API, and a named
+        // stage must be a stage of THAT API. Checked only when the patch actually moved
+        // the reference, so a patch of the base path alone neither re-resolves nor
+        // re-refuses what the create already accepted.
+        if updated.rest_api_id != stored.rest_api_id || updated.stage != stored.stage {
+            let api = store
+                .rest_apis
+                .get(&updated.rest_api_id)
+                .ok_or_else(|| bad_request(crate::state::INVALID_REST_API_IDENTIFIER.to_string()))?;
+            // A `stage` of `(none)` names NO stage — the mapping's callers name the stage
+            // themselves — so it is not resolved against the API's stages.
+            let named_stage = updated
+                .stage
+                .as_deref()
+                .filter(|stage| *stage != crate::state::NONE_BASE_PATH);
+            if let Some(stage) = named_stage {
+                if !api.stages.contains_key(stage) {
+                    return Err(bad_request(crate::state::NO_SUCH_STAGE.to_string()));
+                }
+            }
+        }
+
+        let domain = store
+            .domain_names
+            .get_mut(&domain_key)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // A patched base path is the address the mapping answers to from now on, and the
+        // base path "must be unique for all of the mappings" of the domain name, so one
+        // that another mapping already answers to is the modelled conflict rather than a
+        // silent replacement of that mapping: the lookup and the move share ONE hold of
+        // the store lock.
+        if updated.base_path != base_path
+            && domain.base_path_mappings.contains_key(&updated.base_path)
+        {
+            return Err(UpdateBasePathMappingErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::BASE_PATH_MAPPING_ALREADY_EXISTS.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The record MOVES to its new address rather than being copied to it: the mapping
+        // the request named is gone from the base path it used to answer to, so the domain
+        // name carries one mapping and not two.
+        domain.base_path_mappings.remove(&base_path);
+        let moved_to = updated.base_path.clone();
+        domain.base_path_mappings.insert(moved_to.clone(), updated);
+        // Reading the record back means what the caller is told is what a later
+        // `GetBasePathMapping` will report.
+        let output = Self::Output::from(
+            domain
+                .base_path_mappings
+                .get(&moved_to)
+                .ok_or_else(crate::state::state_unavailable)?,
+        );
+        // Everything below is owned, so the store lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — never a patch value.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            domain_name = ?domain_key,
+            base_path = ?base_path,
+            patch_operations = patches.len(),
+            outcome = "updated",
+            "base path mapping updated",
+        );
+        Ok(output)
     }
+}
+
+/// The modelled failure for a patch this operation cannot apply.
+fn patch_failure(failure: PatchFailure) -> UpdateBasePathMappingError {
+    match failure {
+        PatchFailure::BadRequest(message) => {
+            UpdateBasePathMappingErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::NotFound(message) => {
+            UpdateBasePathMappingErrorModeled::NotFoundException(NotFoundException {
+                message: Some(message),
+            })
+        }
+        PatchFailure::Conflict(message) => {
+            UpdateBasePathMappingErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

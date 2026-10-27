@@ -70,6 +70,20 @@
 //! runs first — is what closes it once it comes due, back to `UP_TO_DATE`. The
 //! instant is stored and never slept on.
 //!
+//! A device's REBOOT is the third thing the clock owes it:
+//! `RebootInputDevice` "[s]end[s] a reboot command to the specified input
+//! device", and the record keeps the instant that reboot completes beside
+//! whether the device resumes producing video when it does
+//! ([`InputDeviceRecord::begin_reboot`]). A rebooting device is producing
+//! nothing, so a reboot puts its `InputDeviceState` in `IDLE` for as long as it
+//! lasts, and a reboot the request FORCED is the one that resumes the stream it
+//! interrupted once it completes ("[i]f the device was streaming prior to the
+//! reboot, the device will resume streaming when the reboot completes"); a
+//! start or a stop issued in the meantime is the device's run state from then
+//! on and cancels that resumption. A reboot does NOT move the device's
+//! `InputDeviceConnectionState`: no Link unit is connected to this emulator, so
+//! a completed reboot has nothing to reconnect.
+//!
 //! A pending transfer waits on the RECIPIENT's decision rather than on the
 //! clock, so `settle` never touches it: `AcceptInputDeviceTransfer` is what ends
 //! one ([`InputDeviceRecord::accept_transfer`]), and only for the transfer the
@@ -164,6 +178,16 @@ pub mod device_settings_sync_state {
 pub mod input_device_state {
     pub const IDLE: &str = "IDLE";
     pub const STREAMING: &str = "STREAMING";
+}
+
+/// The `RebootInputDeviceForce` values, spelled exactly as the model declares
+/// them (`smithy_query(query="shape", shape="RebootInputDeviceForce")`: NO |
+/// YES). `YES` is the one a reboot reads: forcing a reboot is what makes the
+/// device "resume streaming when the reboot completes", and `NO` — like the
+/// request that leaves the optional member out — asks for no such resumption,
+/// so it is the absence of the force rather than a value of its own.
+pub mod reboot_input_device_force {
+    pub const YES: &str = "YES";
 }
 
 /// The `InputDeviceType` values, spelled exactly as the model declares them
@@ -631,10 +655,24 @@ pub struct InputDeviceRecord {
     /// `InputDeviceState` reports.
     ///
     /// PRIVATE, so the only way in is
-    /// [`InputDeviceRecord::start_streaming`] and
-    /// [`InputDeviceRecord::stop_streaming`], and the only way to read it is
+    /// [`InputDeviceRecord::start_streaming`],
+    /// [`InputDeviceRecord::stop_streaming`] and
+    /// [`InputDeviceRecord::begin_reboot`], and the only way to read it is
     /// [`InputDeviceRecord::device_state`].
     streaming: bool,
+    /// The instant the reboot this device is going through completes, or `None`
+    /// while no reboot is pending on it. Stored, never slept on.
+    ///
+    /// PRIVATE, so the only way in is [`InputDeviceRecord::begin_reboot`] and
+    /// [`InputDeviceRecord::settle`], and the only way to read it is
+    /// [`InputDeviceRecord::is_rebooting`].
+    reboot_complete: Option<SystemTime>,
+    /// Whether the device resumes producing video when that reboot completes,
+    /// which a FORCED reboot of a streaming device is what sets.
+    ///
+    /// PRIVATE, for the same reason, and cleared by a start or a stop: an
+    /// explicit command is the device's run state from then on.
+    resumes_streaming_after_reboot: bool,
     /// The latest thumbnail this device has sent, or `None` while it has sent
     /// none.
     ///
@@ -750,10 +788,11 @@ impl InputDeviceRecord {
         self.maintenance_window_close = Some(now + TRANSIENT_STATE_SPAN);
     }
 
-    /// Close the maintenance window, and complete the configuration
-    /// synchronisation, the clock has already made due. Both are owed at their
-    /// stored instant whether or not anybody called, so applying them in a
-    /// reporting operation changes nothing a later caller would have seen.
+    /// Close the maintenance window, complete the configuration
+    /// synchronisation, and finish the reboot, the clock has already made due.
+    /// Each is owed at its stored instant whether or not anybody called, so
+    /// applying them in a reporting operation changes nothing a later caller
+    /// would have seen.
     fn settle(&mut self, now: SystemTime) {
         if self
             .maintenance_window_close
@@ -763,6 +802,16 @@ impl InputDeviceRecord {
         }
         if self.settings_sync_due.is_some_and(|due| now >= due) {
             self.settings_sync_due = None;
+        }
+        if self.reboot_complete.is_some_and(|complete| now >= complete) {
+            self.reboot_complete = None;
+            // A reboot that interrupted a stream it was forced to interrupt is
+            // the one that resumes it: "the device will resume streaming when
+            // the reboot completes". Taken rather than read, so the resumption
+            // is owed once, by the reboot that recorded it.
+            if ::std::mem::take(&mut self.resumes_streaming_after_reboot) {
+                self.streaming = true;
+            }
         }
     }
 
@@ -790,16 +839,54 @@ impl InputDeviceRecord {
     /// start asks for exactly the state it is already in. There is no transient
     /// state between the two: `InputDeviceState` declares only `IDLE` and
     /// `STREAMING`, so the clock owes this device nothing.
+    ///
+    /// It cancels the resumption a pending reboot owed the device: an explicit
+    /// command is the device's run state from then on, so the reboot does not
+    /// move it again when it completes.
     pub fn start_streaming(&mut self) {
         self.streaming = true;
+        self.resumes_streaming_after_reboot = false;
     }
 
     /// Put the device in `IDLE`: it is no longer producing video.
     ///
-    /// IDEMPOTENT, for the same reason [`InputDeviceRecord::start_streaming`]
-    /// is.
+    /// IDEMPOTENT, and cancelling a pending reboot's resumption, for the same
+    /// reasons [`InputDeviceRecord::start_streaming`] is and does.
     pub fn stop_streaming(&mut self) {
         self.streaming = false;
+        self.resumes_streaming_after_reboot = false;
+    }
+
+    /// Whether a reboot is pending on this device right now.
+    pub fn is_rebooting(&self) -> bool {
+        self.reboot_complete.is_some()
+    }
+
+    /// Send the device a reboot command, which the clock completes once
+    /// [`TRANSIENT_STATE_SPAN`] has passed.
+    ///
+    /// A rebooting unit is running no video, so the reboot stops the device
+    /// producing it — "[i]f the device is streaming, it will stop streaming and
+    /// begin rebooting" — and `force` is what decides where it comes back: a
+    /// forced reboot of a streaming device resumes that stream when it
+    /// completes ("[i]f the device was streaming prior to the reboot, the device
+    /// will resume streaming when the reboot completes"), while a reboot nobody
+    /// forced leaves the device idle for a start to move again.
+    ///
+    /// The span is the emulator's own, as it is for every other transient state
+    /// here: AWS documents only that "[t]he device will begin rebooting within a
+    /// few seconds of sending the command", never how long a reboot takes. It is
+    /// deliberately non-zero, so a caller that reads the device straight after
+    /// the call still observes the device the reboot took off the air.
+    ///
+    /// A reboot while one is pending is the LATEST command: it restarts the
+    /// span, and resumes the stream afterwards only if the device was producing
+    /// video when it arrived — which a device the earlier reboot already took
+    /// off the air was not.
+    pub fn begin_reboot(&mut self, force: bool, now: SystemTime) {
+        self.resumes_streaming_after_reboot = force && self.is_streaming();
+        self.streaming = false;
+        self.reboot_complete = Some(now + TRANSIENT_STATE_SPAN);
     }
 
     /// The transfer pending on this device, or `None` while none is.
@@ -936,8 +1023,11 @@ pub fn new_input_device(id: String, arn: String, device_type: &str) -> InputDevi
         tags: HashMap::new(),
         maintenance_window_close: None,
         transfer: None,
-        // A claimed device is producing nothing until a start says so.
+        // A claimed device is producing nothing until a start says so, and
+        // nothing has told it to reboot.
         streaming: false,
+        reboot_complete: None,
+        resumes_streaming_after_reboot: false,
         // And it has sent no image until it sends one.
         thumbnail: None,
     }
@@ -1057,7 +1147,9 @@ fn transfer_has_direction(transfer: &InputDeviceTransferRecord, transfer_type: &
 }
 
 impl ComAmazonawsMedialiveMedialiveState {
-    /// Materialise every maintenance window the clock has already closed.
+    /// Materialise every device transition the clock has already made due: the
+    /// maintenance windows it has closed, the configuration changes it has
+    /// synchronised and the reboots it has completed.
     pub(super) fn settle_input_devices(&mut self, now: SystemTime) {
         for device in self.input_devices.values_mut() {
             device.settle(now);
