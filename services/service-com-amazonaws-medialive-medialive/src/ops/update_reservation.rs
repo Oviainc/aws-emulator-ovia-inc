@@ -185,23 +185,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Update reservation": the settings the request CARRIES replace the
         // stored ones and the settings it omits are left as they were, so an
         // update changes only what it named. An id naming no reservation this
-        // account holds leaves nothing to change, which is this operation's
-        // modelled 404 — and the store is left untouched.
-        let reservation = state
-            .update_reservation(
-                &input.reservation_id,
-                crate::state::ReservationUpdate {
-                    name: input.name,
-                    renewal_settings: input.renewal_settings,
-                },
-                now,
-            )
-            .ok_or_else(|| {
-                not_found(crate::state::not_found_message(
-                    "Reservation",
-                    &input.reservation_id,
-                ))
-            })?;
+        // account may still change leaves nothing to change, which is this
+        // operation's modelled 404 — and the store is left untouched. A
+        // reservation this account has DELETED is such an id: its record stays
+        // readable, but it is a tombstone rather than a resource, so only the
+        // message tells the two apart.
+        let reservation = match state.update_reservation(
+            &input.reservation_id,
+            crate::state::ReservationUpdate {
+                name: input.name,
+                renewal_settings: input.renewal_settings,
+            },
+            now,
+        ) {
+            Some(reservation) => reservation,
+            None => {
+                let message = if state.reservations.contains_key(&input.reservation_id) {
+                    crate::state::already_deleted_message(&format!(
+                        "Reservation {}",
+                        input.reservation_id
+                    ))
+                } else {
+                    crate::state::not_found_message("Reservation", &input.reservation_id)
+                };
+                return Err(not_found(message));
+            }
+        };
 
         // Read back out of the STORED reservation through the one projection
         // every reader of this service answers from, so what this update reports
