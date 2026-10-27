@@ -8,6 +8,13 @@
 //! it. A listing is a REPORTING call — it selects, orders and pages what is stored and
 //! changes nothing a later caller sees.
 //!
+//! A requirement ends when the job does: a job in a terminal `JobStatus` can never
+//! consume the resource again, so it is no longer one of the jobs that require it and this
+//! listing stops reporting it under EVERY filter, the status filters included
+//! ([`crate::state::requires_consumable_resources`]). The job itself is untouched — it
+//! keeps the `consumableResourceProperties` it was submitted with, which `DescribeJobs`
+//! still replays.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -138,6 +145,10 @@ impl From<ListJobsByConsumableResourceErrorModeled> for ListJobsByConsumableReso
 
 /// How much of the consumable resource stored under `name` the job `job` requires, or
 /// `None` for a job that requires none of it (and so is not listed at all).
+///
+/// Asked only of a job that still requires its resources at all
+/// ([`crate::state::requires_consumable_resources`]); this is how much of THIS resource
+/// such a job asks for.
 ///
 /// A requirement names its resource the way every `consumableResource` member documents
 /// it — "The name or ARN of the consumable resource" — so each reference is put through
@@ -297,6 +308,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let selected: Vec<(batch::Job, i64)> = state
                 .jobs
                 .values()
+                // A terminal job released what it required, so it is not among the jobs
+                // that require the resource any more — under no filter, including a
+                // `JOB_STATUS` naming its own terminal status.
+                .filter(|job| batch::requires_consumable_resources(job))
                 .filter_map(|job| {
                     required_quantity(&state, job, &name).map(|quantity| (job.clone(), quantity))
                 })
