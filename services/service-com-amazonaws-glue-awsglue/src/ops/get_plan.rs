@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Generates the ETL code that performs a mapping: a linear pipeline per target table,
+//! reading the source table out of the Data Catalog, applying the requested mapping to it,
+//! selecting the mapped fields and writing them to the target. The nodes are the ones Glue
+//! codegen emits — `DataSource`, `ApplyMapping`, `SelectFields`, `ResolveChoice`,
+//! `DataSink` — each annotated with its type, its arguments, the name it binds and the
+//! frame it reads, and named `<kind><position>` in one counter across the whole script.
+//!
+//! The plan is computed from the STORED table definitions: every table the request names
+//! is resolved in the Data Catalog, the script names the catalog's own spelling of its
+//! database and table, and a mapping entry that leaves a field's type unstated takes the
+//! type the stored column declares. A request naming a database or table the catalog does
+//! not hold is refused with `InvalidInputException` — there is no code to generate for a
+//! table nothing can read, and this operation models no entity-miss error of its own.
+//!
+//! A `Mapping` entry that names a target table belongs to that target's pipeline alone, and
+//! one that names none belongs to every pipeline. `Location` is where the mapped data goes
+//! when no target TABLE says so, so it is the sink of a request that names no `Sinks` and is
+//! not read by one that does.
+//!
+//! `Language` picks which member carries it: `SCALA` answers `ScalaCode`, and `PYTHON` or
+//! no language at all answers `PythonScript`. Nothing is persisted — two identical calls
+//! answer the same script and the tables they read are unchanged.
+//!
+//! A request naming more targets than [`crate::ops::get_mapping::MAX_MAPPING_SINKS`], or
+//! one whose pipelines would carry more than
+//! [`crate::ops::get_mapping::MAX_MAPPING_ENTRIES`] mapped fields, is refused with
+//! `InvalidInputException`: this emulator's own request-size bounds, shared with the
+//! mapping proposal this plan is usually built from, because the model bounds neither the
+//! `Sinks` list nor the `Mapping` list.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +103,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::std::collections::{BTreeMap, HashMap};
+
+use super::get_mapping::{MAX_MAPPING_ENTRIES, MAX_MAPPING_SINKS};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -112,6 +139,681 @@ impl From<GetPlanErrorModeled> for GetPlanError {
     fn from(modeled: GetPlanErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The value of `Language` the generated code is Scala for; any other admitted value, and
+/// an absent `Language`, is the Python one. The member is an enum of exactly `PYTHON` and
+/// `SCALA` (`smithy_query shape=Language`), and the enum's value set is enforced before
+/// this handler runs, so these two are all that reach it.
+const SCALA_LANGUAGE: &str = "SCALA";
+
+/// The type a mapped field carries when neither the request's mapping entry nor the stored
+/// column it names declares one: `Column$Type` is not required, and a DynamicFrame field of
+/// unstated type is read as a string.
+const UNTYPED_FIELD_TYPE: &str = "string";
+
+/// The `ResolveChoice` choice a catalog target is written through: the generated pipeline
+/// resolves each field's type against the target table the catalog holds, which is what
+/// makes the written frame match the target's stored schema.
+const MATCH_CATALOG_CHOICE: &str = "MATCH_CATALOG";
+
+/// Which language's member of the answer carries the generated code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanLanguage {
+    Python,
+    Scala,
+}
+
+/// The language a request asks the plan in.
+fn requested_language(language: Option<&String>) -> PlanLanguage {
+    if language.is_some_and(|asked| asked == SCALA_LANGUAGE) {
+        PlanLanguage::Scala
+    } else {
+        PlanLanguage::Python
+    }
+}
+
+/// A table of the plan as the Data Catalog holds it: the catalog's own spelling of the
+/// database and table, and the type each of its columns declares, keyed by the folded name
+/// a column is matched by ([`crate::state::fold_name`]).
+struct Resolved {
+    database: String,
+    table: String,
+    columns: HashMap<String, String>,
+}
+
+impl Resolved {
+    /// The type the stored table declares for the field at `path`, if it declares a column
+    /// of that name at all. A nested path names no column of the table and so takes no
+    /// declared type.
+    fn declared_type(&self, path: &str) -> Option<String> {
+        self.columns.get(&crate::state::fold_name(path)).cloned()
+    }
+}
+
+/// This operation's modelled client refusal, carrying `message`.
+fn invalid_input(message: String) -> GetPlanError {
+    GetPlanErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// The type each column of a stored table's DATA declares: its storage-descriptor columns
+/// ("a column in a Table", `StorageDescriptor$Columns`) and then its partition keys ("a
+/// list of columns by which the table is partitioned", `Table$PartitionKeys`), which a
+/// reader of the table reads as columns of every record. The FIRST column of a name in
+/// that order is the one the table declares, and a column stating no type contributes none.
+fn declared_types(table: &crate::state::TableEntry) -> HashMap<String, String> {
+    let mut declared: HashMap<String, String> = HashMap::new();
+    let columns = table
+        .storage_descriptor
+        .as_ref()
+        .and_then(|descriptor| descriptor.columns.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .chain(table.partition_keys.as_deref().unwrap_or_default().iter());
+    for column in columns {
+        if let Some(declared_type) = &column.r#type {
+            declared
+                .entry(crate::state::fold_name(&column.name))
+                .or_insert_with(|| declared_type.clone());
+        }
+    }
+    declared
+}
+
+/// The stored table a [`CatalogEntry`] addresses, or this operation's refusal for a
+/// database or table the catalog does not hold. A catalog entry "specifies a table
+/// definition in the Glue Data Catalog" by database and table name and carries no
+/// `CatalogId`, so it is resolved in the catalog of the account this endpoint serves, by
+/// the Hive-folded name every other read of one table resolves by.
+fn resolve(
+    store: &crate::state::ComAmazonawsGlueAwsglueState,
+    catalog_id: &str,
+    entry: &CatalogEntry,
+) -> Result<Resolved, GetPlanError> {
+    let Some(database) = store.database(catalog_id, &entry.database_name) else {
+        return Err(invalid_input(crate::state::messages::database_not_found(
+            &entry.database_name,
+        )));
+    };
+    let Some(table) = database
+        .tables
+        .get(&crate::state::fold_name(&entry.table_name))
+    else {
+        return Err(invalid_input(crate::state::messages::table_not_found(
+            &entry.table_name,
+        )));
+    };
+    Ok(Resolved {
+        database: table.database_name.clone(),
+        table: table.name.clone(),
+        columns: declared_types(table),
+    })
+}
+
+/// One mapped field of an `ApplyMapping` node: the field read from the source frame and the
+/// field written to the target, each with its type.
+struct Field {
+    source_path: String,
+    source_type: String,
+    target_path: String,
+    target_type: String,
+}
+
+/// Whether a mapping entry belongs to the pipeline of `target`: an entry that names a
+/// target table belongs to THAT target's pipeline alone, and one that names none belongs to
+/// every pipeline. A plan with no target table at all applies every entry.
+fn applies_to(entry: &MappingEntry, target: Option<&Resolved>) -> bool {
+    match (&entry.target_table, target) {
+        (Some(named), Some(target)) => {
+            crate::state::fold_name(named) == crate::state::fold_name(&target.table)
+        }
+        _ => true,
+    }
+}
+
+/// The field one mapping entry maps, with every type it leaves unstated taken from the
+/// stored tables: the source table's declared type for the field it reads, the target
+/// table's for the field it writes. An entry stating no `SourcePath` names no field to
+/// read, so it maps nothing; one stating no `TargetPath` writes the field under the name it
+/// was read by.
+fn field(source: &Resolved, target: Option<&Resolved>, entry: &MappingEntry) -> Option<Field> {
+    let source_path = entry.source_path.clone()?;
+    let source_type = entry
+        .source_type
+        .clone()
+        .or_else(|| source.declared_type(&source_path))
+        .unwrap_or_else(|| UNTYPED_FIELD_TYPE.to_string());
+    let target_path = entry
+        .target_path
+        .clone()
+        .unwrap_or_else(|| source_path.clone());
+    let target_type = entry
+        .target_type
+        .clone()
+        .or_else(|| target.and_then(|held| held.declared_type(&target_path)))
+        .unwrap_or_else(|| source_type.clone());
+    Some(Field {
+        source_path,
+        source_type,
+        target_path,
+        target_type,
+    })
+}
+
+/// The fields one target's pipeline maps.
+fn fields_of(source: &Resolved, target: Option<&Resolved>, mapping: &[MappingEntry]) -> Vec<Field> {
+    mapping
+        .iter()
+        .filter(|entry| applies_to(entry, target))
+        .filter_map(|entry| field(source, target, entry))
+        .collect()
+}
+
+/// A node of the generated pipeline.
+enum NodeKind {
+    /// Reads one Data Catalog table.
+    DataSource {
+        database: String,
+        table: String,
+        /// The request's additional plan options, carried into the read's options so the
+        /// generated script reads the source the way those options ask for ("additional
+        /// optional key-value parameters … for the default script generated",
+        /// `GetPlanRequest$AdditionalPlanOptionsMap`). Ordered by key, so one request
+        /// always generates one script.
+        options: BTreeMap<String, String>,
+    },
+    /// Maps the fields of the frame it reads.
+    ApplyMapping { fields: Vec<Field> },
+    /// Keeps the mapped fields alone.
+    SelectFields { paths: Vec<String> },
+    /// Resolves each field's type against the target table's stored schema.
+    ResolveChoice { database: String, table: String },
+    /// Writes the frame to a Data Catalog table.
+    CatalogSink { database: String, table: String },
+    /// Writes the frame to the location the request named instead of to a catalog table.
+    LocationSink {
+        connection_type: &'static str,
+        options: Vec<(String, String)>,
+    },
+}
+
+impl NodeKind {
+    /// The `@type` the node is annotated with. Both sinks are `DataSink`: the annotation
+    /// names what the node does, not how it was addressed.
+    fn type_name(&self) -> &'static str {
+        match self {
+            NodeKind::DataSource { .. } => "DataSource",
+            NodeKind::ApplyMapping { .. } => "ApplyMapping",
+            NodeKind::SelectFields { .. } => "SelectFields",
+            NodeKind::ResolveChoice { .. } => "ResolveChoice",
+            NodeKind::CatalogSink { .. } | NodeKind::LocationSink { .. } => "DataSink",
+        }
+    }
+
+    /// The stem of the name the node binds, which its position in the script completes.
+    fn prefix(&self) -> &'static str {
+        match self {
+            NodeKind::DataSource { .. } => "datasource",
+            NodeKind::ApplyMapping { .. } => "applymapping",
+            NodeKind::SelectFields { .. } => "selectfields",
+            NodeKind::ResolveChoice { .. } => "resolvechoice",
+            NodeKind::CatalogSink { .. } | NodeKind::LocationSink { .. } => "datasink",
+        }
+    }
+}
+
+/// One node of the plan: what it does, and which node's frame it reads (none for the
+/// source, which reads the catalog).
+struct Node {
+    kind: NodeKind,
+    input: Option<usize>,
+}
+
+/// Append one node to the plan and answer its position, which is also what names it.
+fn push(nodes: &mut Vec<Node>, kind: NodeKind, input: Option<usize>) -> usize {
+    nodes.push(Node { kind, input });
+    nodes.len() - 1
+}
+
+/// The name the node at `index` binds: its kind's stem and its position in the script, so
+/// every node of a plan is named once however many pipelines it has.
+fn node_name(kind: &NodeKind, index: usize) -> String {
+    format!("{prefix}{index}", prefix = kind.prefix())
+}
+
+/// The location a plan with no catalog target writes to, and the connection type that
+/// location's member names. `Location` is "the parameters for the mapping" — where the
+/// mapped data goes when no target TABLE says so — so it is read only when the request
+/// names no sink. The members are tried in the order the structure declares them (S3,
+/// JDBC, DynamoDB) and the first one carrying arguments is the sink; each argument is a
+/// name and the value it takes (`CodeGenNodeArg`), in the order the request listed them.
+fn location_sink(location: Option<&Location>) -> Option<NodeKind> {
+    let location = location?;
+    let members: [(&'static str, Option<&[CodeGenNodeArg]>); 3] = [
+        ("s3", location.s3.as_deref()),
+        ("jdbc", location.jdbc.as_deref()),
+        ("dynamodb", location.dynamo_db.as_deref()),
+    ];
+    for (connection_type, args) in members {
+        let Some(args) = args else { continue };
+        if args.is_empty() {
+            continue;
+        }
+        return Some(NodeKind::LocationSink {
+            connection_type,
+            options: args
+                .iter()
+                .map(|arg| (arg.name.clone(), arg.value.clone()))
+                .collect(),
+        });
+    }
+    None
+}
+
+/// The whole plan: the source node, then one pipeline per target — map, select, and either
+/// resolve-and-write to the target table or write to the location the request named.
+fn plan(
+    source: &Resolved,
+    sinks: &[Resolved],
+    mapping: &[MappingEntry],
+    location: Option<&Location>,
+    options: BTreeMap<String, String>,
+) -> Vec<Node> {
+    let mut nodes = vec![Node {
+        kind: NodeKind::DataSource {
+            database: source.database.clone(),
+            table: source.table.clone(),
+            options,
+        },
+        input: None,
+    }];
+    const SOURCE: usize = 0;
+
+    if sinks.is_empty() {
+        // No target table: the pipeline still maps and selects the fields the request
+        // asked for, and writes them only if the request named a location to write to.
+        let fields = fields_of(source, None, mapping);
+        let paths = fields.iter().map(|held| held.target_path.clone()).collect();
+        let mapped = push(&mut nodes, NodeKind::ApplyMapping { fields }, Some(SOURCE));
+        let selected = push(&mut nodes, NodeKind::SelectFields { paths }, Some(mapped));
+        if let Some(sink) = location_sink(location) {
+            push(&mut nodes, sink, Some(selected));
+        }
+        return nodes;
+    }
+
+    // One pipeline per target table, in the order the request named the sinks; each reads
+    // the one source node.
+    for sink in sinks {
+        let fields = fields_of(source, Some(sink), mapping);
+        let paths = fields.iter().map(|held| held.target_path.clone()).collect();
+        let mapped = push(&mut nodes, NodeKind::ApplyMapping { fields }, Some(SOURCE));
+        let selected = push(&mut nodes, NodeKind::SelectFields { paths }, Some(mapped));
+        let resolved = push(
+            &mut nodes,
+            NodeKind::ResolveChoice {
+                database: sink.database.clone(),
+                table: sink.table.clone(),
+            },
+            Some(selected),
+        );
+        push(
+            &mut nodes,
+            NodeKind::CatalogSink {
+                database: sink.database.clone(),
+                table: sink.table.clone(),
+            },
+            Some(resolved),
+        );
+    }
+    nodes
+}
+
+/// One string as the generated code spells it: double-quoted, with a quote or a backslash
+/// in the value escaped, so a catalog name carrying either still generates code that parses.
+fn quoted(value: &str) -> String {
+    let escaped: String = value
+        .chars()
+        .flat_map(|character| match character {
+            '\\' => vec!['\\', '\\'],
+            '"' => vec!['\\', '"'],
+            other => vec![other],
+        })
+        .collect();
+    format!("\"{escaped}\"")
+}
+
+/// A key-value option set, as both a Python dict literal and the JSON a Scala
+/// `JsonOptions` takes: `{"name": "value", …}`.
+fn option_object<'pairs, Pairs>(pairs: Pairs) -> String
+where
+    Pairs: IntoIterator<Item = (&'pairs str, &'pairs str)>,
+{
+    let rendered: Vec<String> = pairs
+        .into_iter()
+        .map(|(name, value)| format!("{}: {}", quoted(name), quoted(value)))
+        .collect();
+    format!("{{{}}}", rendered.join(", "))
+}
+
+/// The mapped fields as the four-element tuples `ApplyMapping` takes, which is also how the
+/// node's `@args` annotation spells them in either language.
+fn field_tuples(fields: &[Field]) -> String {
+    let rendered: Vec<String> = fields
+        .iter()
+        .map(|held| {
+            format!(
+                "({source_path}, {source_type}, {target_path}, {target_type})",
+                source_path = quoted(&held.source_path),
+                source_type = quoted(&held.source_type),
+                target_path = quoted(&held.target_path),
+                target_type = quoted(&held.target_type),
+            )
+        })
+        .collect();
+    rendered.join(", ")
+}
+
+/// The selected paths, as a comma-separated list of quoted names.
+fn path_list(paths: &[String]) -> String {
+    let rendered: Vec<String> = paths.iter().map(|path| quoted(path)).collect();
+    rendered.join(", ")
+}
+
+/// The arguments a node is annotated with, in the generated script's own spelling of them.
+/// One text for both languages: the annotation names the plan's arguments, which do not
+/// depend on the language the plan is generated in.
+fn annotated_args(kind: &NodeKind, name: &str) -> String {
+    let context = format!("transformation_ctx = {}", quoted(name));
+    match kind {
+        NodeKind::DataSource {
+            database,
+            table,
+            options,
+        } => {
+            let mut args = format!(
+                "database = {database}, table_name = {table}, {context}",
+                database = quoted(database),
+                table = quoted(table),
+            );
+            if !options.is_empty() {
+                args.push_str(&format!(
+                    ", additional_options = {}",
+                    option_object(
+                        options
+                            .iter()
+                            .map(|(name, value)| (name.as_str(), value.as_str()))
+                    )
+                ));
+            }
+            args
+        }
+        NodeKind::ApplyMapping { fields } => {
+            format!("mapping = [{}], {context}", field_tuples(fields))
+        }
+        NodeKind::SelectFields { paths } => format!("paths = [{}], {context}", path_list(paths)),
+        NodeKind::ResolveChoice { database, table } => format!(
+            "choice = {choice}, database = {database}, table_name = {table}, {context}",
+            choice = quoted(MATCH_CATALOG_CHOICE),
+            database = quoted(database),
+            table = quoted(table),
+        ),
+        NodeKind::CatalogSink { database, table } => format!(
+            "database = {database}, table_name = {table}, {context}",
+            database = quoted(database),
+            table = quoted(table),
+        ),
+        NodeKind::LocationSink {
+            connection_type,
+            options,
+        } => format!(
+            "connection_type = {connection_type}, connection_options = {options}, {context}",
+            connection_type = quoted(connection_type),
+            options = option_object(
+                options
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+            ),
+        ),
+    }
+}
+
+/// The Python expression a node binds its name to.
+fn python_call(kind: &NodeKind, name: &str, input: &str) -> String {
+    let context = format!("transformation_ctx = {}", quoted(name));
+    match kind {
+        NodeKind::DataSource {
+            database,
+            table,
+            options,
+        } => {
+            let additional = if options.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", additional_options = {}",
+                    option_object(
+                        options
+                            .iter()
+                            .map(|(name, value)| (name.as_str(), value.as_str()))
+                    )
+                )
+            };
+            format!(
+                "glueContext.create_dynamic_frame.from_catalog(database = {database}, \
+                 table_name = {table}, {context}{additional})",
+                database = quoted(database),
+                table = quoted(table),
+            )
+        }
+        NodeKind::ApplyMapping { fields } => format!(
+            "ApplyMapping.apply(frame = {input}, mappings = [{fields}], {context})",
+            fields = field_tuples(fields),
+        ),
+        NodeKind::SelectFields { paths } => format!(
+            "SelectFields.apply(frame = {input}, paths = [{paths}], {context})",
+            paths = path_list(paths),
+        ),
+        NodeKind::ResolveChoice { database, table } => format!(
+            "ResolveChoice.apply(frame = {input}, choice = {choice}, database = {database}, \
+             table_name = {table}, {context})",
+            choice = quoted(MATCH_CATALOG_CHOICE),
+            database = quoted(database),
+            table = quoted(table),
+        ),
+        NodeKind::CatalogSink { database, table } => format!(
+            "glueContext.write_dynamic_frame.from_catalog(frame = {input}, database = \
+             {database}, table_name = {table}, {context})",
+            database = quoted(database),
+            table = quoted(table),
+        ),
+        NodeKind::LocationSink {
+            connection_type,
+            options,
+        } => format!(
+            "glueContext.write_dynamic_frame.from_options(frame = {input}, connection_type = \
+             {connection_type}, connection_options = {options}, {context})",
+            connection_type = quoted(connection_type),
+            options = option_object(
+                options
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+            ),
+        ),
+    }
+}
+
+/// The Scala expression a node binds its name to.
+fn scala_call(kind: &NodeKind, name: &str, input: &str) -> String {
+    let context = format!("transformationContext = {}", quoted(name));
+    match kind {
+        NodeKind::DataSource {
+            database,
+            table,
+            options,
+        } => {
+            let additional = if options.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", additionalOptions = JsonOptions(\"\"\"{}\"\"\")",
+                    option_object(
+                        options
+                            .iter()
+                            .map(|(name, value)| (name.as_str(), value.as_str()))
+                    )
+                )
+            };
+            format!(
+                "glueContext.getCatalogSource(database = {database}, tableName = {table}, \
+                 redshiftTmpDir = \"\", {context}{additional}).getDynamicFrame()",
+                database = quoted(database),
+                table = quoted(table),
+            )
+        }
+        NodeKind::ApplyMapping { fields } => format!(
+            "{input}.applyMapping(mappings = Seq({fields}), caseSensitive = false, {context})",
+            fields = field_tuples(fields),
+        ),
+        NodeKind::SelectFields { paths } => format!(
+            "{input}.selectFields(paths = Seq({paths}), {context})",
+            paths = path_list(paths),
+        ),
+        NodeKind::ResolveChoice { database, table } => format!(
+            "{input}.resolveChoice(choiceOption = Some(ChoiceOption({choice})), database = \
+             Some({database}), tableName = Some({table}), {context})",
+            choice = quoted(MATCH_CATALOG_CHOICE),
+            database = quoted(database),
+            table = quoted(table),
+        ),
+        NodeKind::CatalogSink { database, table } => format!(
+            "glueContext.getCatalogSink(database = {database}, tableName = {table}, \
+             redshiftTmpDir = \"\", {context}).writeDynamicFrame({input})",
+            database = quoted(database),
+            table = quoted(table),
+        ),
+        NodeKind::LocationSink {
+            connection_type,
+            options,
+        } => format!(
+            "glueContext.getSinkWithFormat(connectionType = {connection_type}, options = \
+             JsonOptions(\"\"\"{options}\"\"\"), {context}).writeDynamicFrame({input})",
+            connection_type = quoted(connection_type),
+            options = option_object(
+                options
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+            ),
+        ),
+    }
+}
+
+/// What every generated Python script opens with: the Glue job's context and the job the
+/// script's nodes run in.
+const PYTHON_PREAMBLE: &str = "\
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+";
+
+/// What it closes with: the job commit that ends a Glue script.
+const PYTHON_EPILOGUE: &str = "job.commit()\n";
+
+/// The same for Scala: the object and `main` the nodes run in.
+const SCALA_PREAMBLE: &str = "\
+import com.amazonaws.services.glue.ChoiceOption
+import com.amazonaws.services.glue.GlueContext
+import com.amazonaws.services.glue.util.GlueArgParser
+import com.amazonaws.services.glue.util.Job
+import com.amazonaws.services.glue.util.JsonOptions
+import org.apache.spark.SparkContext
+import scala.collection.JavaConverters._
+
+object GlueApp {
+  def main(sysArgs: Array[String]) {
+    val spark: SparkContext = new SparkContext()
+    val glueContext: GlueContext = new GlueContext(spark)
+    // @params: [JOB_NAME]
+    val args = GlueArgParser.getResolvedOptions(sysArgs, Seq(\"JOB_NAME\").toArray)
+    Job.init(args(\"JOB_NAME\"), glueContext, args.asJava)
+";
+
+/// And its close.
+const SCALA_EPILOGUE: &str = "    Job.commit()\n  }\n}\n";
+
+/// The script the plan generates, in one language: the language's preamble, then each node
+/// annotated with its type, arguments, the name it binds and the frame it reads, and then
+/// the language's close.
+fn script(nodes: &[Node], language: PlanLanguage) -> String {
+    let (comment, indent) = match language {
+        PlanLanguage::Python => ("##", ""),
+        PlanLanguage::Scala => ("//", "    "),
+    };
+    let mut script = String::from(match language {
+        PlanLanguage::Python => PYTHON_PREAMBLE,
+        PlanLanguage::Scala => SCALA_PREAMBLE,
+    });
+    for (index, node) in nodes.iter().enumerate() {
+        let name = node_name(&node.kind, index);
+        let input = node
+            .input
+            .map(|at| node_name(&nodes[at].kind, at))
+            .unwrap_or_default();
+        let inputs = if input.is_empty() {
+            String::new()
+        } else {
+            format!("frame = {input}")
+        };
+        script.push_str(&format!(
+            "{indent}{comment} @type: {type_name}\n{indent}{comment} @args: [{args}]\n\
+             {indent}{comment} @return: {name}\n{indent}{comment} @inputs: [{inputs}]\n",
+            type_name = node.kind.type_name(),
+            args = annotated_args(&node.kind, &name),
+        ));
+        let statement = match language {
+            PlanLanguage::Python => {
+                format!("{name} = {}", python_call(&node.kind, &name, &input))
+            }
+            PlanLanguage::Scala => {
+                format!("val {name} = {}", scala_call(&node.kind, &name, &input))
+            }
+        };
+        script.push_str(&format!("{indent}{statement}\n"));
+    }
+    script.push_str(match language {
+        PlanLanguage::Python => PYTHON_EPILOGUE,
+        PlanLanguage::Scala => SCALA_EPILOGUE,
+    });
+    script
+}
+
+/// The message the target-count refusal carries, built from the bound it enforces.
+fn sinks_limit_message() -> String {
+    format!("Sinks may name at most {MAX_MAPPING_SINKS} tables")
+}
+
+/// The message the plan-size refusal carries: built from the bound and from the two factors
+/// of THIS request, so a caller can see which of them to cut.
+fn fields_limit_message(entries: usize, sinks: usize) -> String {
+    format!(
+        "a plan of {entries} mapping entries onto {sinks} target tables carries more than the \
+         {MAX_MAPPING_ENTRIES} mapped fields one plan may carry"
+    )
 }
 
 /// The `GetPlan` operation.
@@ -150,18 +852,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPlan"))
+        // Every table the plan names is addressed by a `CatalogEntry`, which carries no
+        // `CatalogId`, so all of them are read out of the catalog of the account this
+        // endpoint serves — the default the member catalog operations document. Nothing in
+        // `ctx` is therefore read.
+        let _ = ctx;
+        let sinks = input.sinks.as_deref().unwrap_or_default();
+        // The request-size bounds are properties of the REQUEST, so they are answered
+        // before any table is looked up and before the script allocates anything.
+        if sinks.len() > MAX_MAPPING_SINKS {
+            return Err(invalid_input(sinks_limit_message()));
+        }
+        if input.mapping.len().saturating_mul(sinks.len().max(1)) > MAX_MAPPING_ENTRIES {
+            return Err(invalid_input(fields_limit_message(
+                input.mapping.len(),
+                sinks.len(),
+            )));
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPlanErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+        let catalog_id = crate::state::resolve_catalog_id(None);
+
+        // Everything the plan is computed FROM is read in one critical section, and the
+        // guard is dropped before the script is generated.
+        let (source, resolved_sinks) = {
+            let store = state.lock();
+            let source = resolve(&store, &catalog_id, &input.source)?;
+            let mut resolved_sinks: Vec<Resolved> = Vec::with_capacity(sinks.len());
+            for sink in sinks {
+                resolved_sinks.push(resolve(&store, &catalog_id, sink)?);
+            }
+            (source, resolved_sinks)
+        };
+
+        let options: BTreeMap<String, String> = input
+            .additional_plan_options_map
+            .as_ref()
+            .map(|asked| {
+                asked
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let nodes = plan(
+            &source,
+            &resolved_sinks,
+            &input.mapping,
+            input.location.as_ref(),
+            options,
+        );
+
+        // The answer carries the code in the language the request asked for, and only that
+        // one: the other member states no code the caller asked for.
+        match requested_language(input.language.as_ref()) {
+            PlanLanguage::Python => Ok(GetPlanOutput {
+                python_script: Some(script(&nodes, PlanLanguage::Python)),
+                scala_code: None,
+            }),
+            PlanLanguage::Scala => Ok(GetPlanOutput {
+                python_script: None,
+                scala_code: Some(script(&nodes, PlanLanguage::Scala)),
+            }),
+        }
     }
 }
