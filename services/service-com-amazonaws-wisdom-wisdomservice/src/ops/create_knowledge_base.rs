@@ -178,21 +178,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(&ctx.parts().headers);
         let mut state = state.lock();
 
-        // A retried create carrying the same `clientToken` answers with the
-        // resource the first call created, rather than minting a second one.
-        if let Some(token) = input.client_token.as_deref() {
-            let replayed = state
-                .replayed_resource_id(Self::NAME, "", token)
-                .cloned()
-                .and_then(|id| state.knowledge_bases.get(&id))
-                .map(crate::state::KnowledgeBase::to_data);
-            if let Some(knowledge_base) = replayed {
-                return Ok(CreateKnowledgeBaseOutput {
-                    knowledge_base: Some(knowledge_base),
-                });
-            }
-        }
-
         // The model puts no bound on the `tags` map, so the store does: AWS's
         // tagging restrictions allow at most 50 tags on a resource, and a request
         // past that is outside what the service accepts. The count is taken from
@@ -212,6 +197,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let tags: ::std::collections::BTreeMap<String, String> =
             requested_tags.into_iter().collect();
+
+        // What this create's `clientToken` identifies: every member the record below is
+        // built from. The configuration members carry no map, so their `Debug` rendering
+        // is stable for one request, while the tag map is fingerprinted in key order
+        // (`crate::state::tags_fingerprint`).
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.name.clone(),
+            input.knowledge_base_type.clone(),
+            input.description.clone().unwrap_or_default(),
+            format!("{:?}", input.source_configuration),
+            format!("{:?}", input.rendering_configuration),
+            format!("{:?}", input.server_side_encryption_configuration),
+            crate::state::tags_fingerprint(&tags),
+        ]);
+
+        // A retried create carrying the same `clientToken` answers with the
+        // resource the first call created, rather than minting a second one — while the
+        // same token carrying a DIFFERENT request is the modelled idempotency conflict
+        // rather than a record the caller did not ask for. A knowledge base is an
+        // account-level resource, so the token's scope is the account the whole store
+        // represents.
+        match state.replayed_create(Self::NAME, "", input.client_token.as_deref(), &fingerprint) {
+            crate::state::Replay::Conflict => {
+                return Err(CreateKnowledgeBaseErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(crate::state::MESSAGE_IDEMPOTENCY_CONFLICT.to_string()),
+                    },
+                )
+                .into())
+            }
+            crate::state::Replay::Retry(created) => {
+                if let Some(knowledge_base) = state
+                    .knowledge_bases
+                    .get(&created)
+                    .map(crate::state::KnowledgeBase::to_data)
+                {
+                    return Ok(CreateKnowledgeBaseOutput {
+                        knowledge_base: Some(knowledge_base),
+                    });
+                }
+            }
+            crate::state::Replay::Fresh => {}
+        }
 
         // `name` identifies a knowledge base within the account, so a second one
         // claiming a live name conflicts with the first.
@@ -260,11 +288,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if let Some(token) = input.client_token.as_deref() {
-            // A knowledge base is an account-level resource, so the token's scope is
-            // the account the whole store represents.
-            state.remember_client_token(Self::NAME, "", token, &knowledge_base_id);
-        }
+        state.remember_client_token(
+            Self::NAME,
+            "",
+            input.client_token.as_deref(),
+            &fingerprint,
+            &knowledge_base_id,
+        );
 
         // Answer from what was just persisted, so this response and a later
         // `GetKnowledgeBase` cannot disagree.

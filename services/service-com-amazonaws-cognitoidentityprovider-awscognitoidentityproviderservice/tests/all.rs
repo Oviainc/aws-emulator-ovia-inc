@@ -31,6 +31,8 @@ mod admin_user_enabled_state;
 mod admin_user_global_sign_out;
 #[path = "all/admin_user_pool_lifecycle.rs"]
 mod admin_user_pool_lifecycle;
+#[path = "all/auth_flow_not_enabled.rs"]
+mod auth_flow_not_enabled;
 #[path = "all/clock_dependent_state.rs"]
 mod clock_dependent_state;
 #[path = "all/delete_group.rs"]

@@ -19,11 +19,10 @@
 //! many users the group holds, the page size (both published bounds included) and the
 //! form of a `Marker` that names no position in this group's membership.
 //!
-//! `AddUserToGroup` and `RemoveUserFromGroup` — the operations that write a membership —
-//! are still scaffolded 501s with their own stub issues, so the memberships these tests
-//! read back are written into the service's OWN store (`state::group_members`) rather
-//! than into a second copy, the way `tests/all/policy_version_listing.rs` seeds the
-//! versions `CreatePolicyVersion` will write.
+//! The memberships these tests read back are seeded into the service's OWN store
+//! (`state::group_members`) rather than into a second copy, so what they assert is the
+//! READ and nothing else; `tests/all/group_membership_writes.rs` is the suite that
+//! drives `AddUserToGroup`, the operation that writes one.
 
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
 use smithy_server_runtime::MultiServiceRouter;
@@ -97,9 +96,8 @@ async fn with_fixture_users() -> (MultiServiceRouter, std::sync::Arc<engine::InM
 /// user name, which is the key the store is ordered on.
 ///
 /// This is the state an `AddUserToGroup` ("adds the specified user to the specified
-/// group") will write once that operation is implemented — it is still a scaffolded 501
-/// with its own stub issue — so the membership is written into the service's own store
-/// here rather than into a second copy.
+/// group") writes, seeded into the service's own store here rather than into a second
+/// copy, so these cases exercise the READ alone.
 fn seed_members(
     engine: &engine::InMemoryEngine,
     group_name: &str,

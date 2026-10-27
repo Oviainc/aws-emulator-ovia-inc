@@ -23,6 +23,8 @@ mod authorization_precedence;
 mod content_upload;
 #[path = "all/enum_value_refusal.rs"]
 mod enum_value_refusal;
+#[path = "all/idempotency_contents_and_refusal_fidelity.rs"]
+mod idempotency_contents_and_refusal_fidelity;
 #[path = "all/knowledge_base_lifecycle.rs"]
 mod knowledge_base_lifecycle;
 #[path = "all/knowledge_base_listing_and_queries.rs"]

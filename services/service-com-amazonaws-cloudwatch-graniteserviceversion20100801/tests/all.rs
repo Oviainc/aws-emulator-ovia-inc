@@ -77,6 +77,8 @@ mod otel_enrichment;
 mod put_metric_data_validation;
 #[path = "all/query_form_metrics.rs"]
 mod query_form_metrics;
+#[path = "all/rds_alarm_action_delivery.rs"]
+mod rds_alarm_action_delivery;
 #[path = "all/replay_probe.rs"]
 mod replay_probe;
 #[path = "all/resource_tags.rs"]

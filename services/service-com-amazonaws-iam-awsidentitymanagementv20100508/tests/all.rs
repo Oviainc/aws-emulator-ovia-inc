@@ -41,6 +41,8 @@ mod group_inline_policies;
 mod group_listing;
 #[path = "all/group_membership.rs"]
 mod group_membership;
+#[path = "all/group_membership_writes.rs"]
+mod group_membership_writes;
 #[path = "all/group_policy_listing.rs"]
 mod group_policy_listing;
 #[path = "all/human_readable_summaries.rs"]
@@ -71,6 +73,8 @@ mod managed_policies;
 mod open_id_connect_client_ids;
 #[path = "all/open_id_connect_provider_listing.rs"]
 mod open_id_connect_provider_listing;
+#[path = "all/open_id_connect_provider_tag_updates.rs"]
+mod open_id_connect_provider_tag_updates;
 #[path = "all/open_id_connect_providers.rs"]
 mod open_id_connect_providers;
 #[path = "all/policies_granting_service_access.rs"]

@@ -154,20 +154,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // placed by this account, so that inventory is exactly the account's orders.
         let region = crate::state::request_region(ctx.parts());
         // The Outpost the caller narrowed to, if any. The filter is modelled as an
-        // `OutpostIdentifier`, so it accepts the bare id or the full Outpost ARN and
-        // both name the same stored Outpost.
+        // `OutpostIdentifier`, so it accepts the bare id or the full Outpost ARN; an
+        // ARN carries a partition, a Region and an account of its own, and one that is
+        // not this endpoint's names no Outpost of this inventory — so nothing can
+        // match it ([`matches_outpost`]).
         let outpost_filter = match input
             .outpost_identifier_filter
             .as_deref()
             .filter(|identifier| !identifier.is_empty())
         {
-            Some(identifier) => Some(crate::state::resolve_outpost_id(identifier).ok_or_else(
-                || {
+            Some(identifier) => Some(
+                crate::state::resolve_outpost_id(identifier, &region).ok_or_else(|| {
                     ListOrdersErrorModeled::ValidationException(ValidationException {
                         message: Some(crate::state::outpost_identifier_filter_pattern_report()),
                     })
-                },
-            )?),
+                })?,
+            ),
             None => None,
         };
         // The resume point the caller's token names. A token this service did not
@@ -198,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::ORDER_PAGE,
             store
                 .orders_in(&region)
-                .filter(|record| matches_outpost(record, outpost_filter.as_deref()))
+                .filter(|record| matches_outpost(record, outpost_filter.as_ref()))
                 .map(|record| (record.sequence, order_summary(&record.order))),
             after,
             size,
@@ -219,10 +221,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// placed against — and a filter the caller did not send narrows nothing. It is a
 /// filter and not an identifier the request is addressed to: it narrows the list the
 /// caller is reported, so one naming an Outpost that holds no order — including one
-/// this region does not hold at all — reports no order rather than failing, the rule
-/// every filtered list of this service selects by.
-fn matches_outpost(record: &crate::state::OrderRecord, outpost_filter: Option<&str>) -> bool {
-    outpost_filter.is_none_or(|outpost_id| record.order.outpost_id.as_deref() == Some(outpost_id))
+/// this endpoint does not hold at all, which is what an ARN of another partition,
+/// Region or account names — reports no order rather than failing, the rule every
+/// filtered list of this service selects by.
+fn matches_outpost(
+    record: &crate::state::OrderRecord,
+    outpost_filter: Option<&crate::state::ResolvedIdentifier>,
+) -> bool {
+    match outpost_filter {
+        None => true,
+        Some(filter) => filter
+            .here()
+            .is_some_and(|outpost_id| record.order.outpost_id.as_deref() == Some(outpost_id)),
+    }
 }
 
 /// The `OrderSummary` a stored order is reported as.

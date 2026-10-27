@@ -169,6 +169,8 @@ fn judge_against_store(
     // but only when it is the SAME request. A token reused with different
     // parameters names a different connection than the one it created, so it is
     // refused, naming the token, rather than answered with an unrelated record.
+    // "The same" is judged on EVERY member of the create the caller owns, absence
+    // included, so no member of a retried request can be swapped silently.
     //
     // The token is held under the Region the request addressed: the connection it
     // created belongs to that Region, so the same token sent to another Region's
@@ -178,13 +180,7 @@ fn judge_against_store(
             .idempotency_tokens
             .get(&crate::state::idempotency_key(region, token))
         {
-            if !created.matches(
-                &input.environment_id,
-                &input.bandwidth,
-                &input.attach_point,
-                input.description.as_ref(),
-                input.tags.as_ref(),
-            ) {
+            if !created.matches(input) {
                 return Err(CreateConnectionErrorModeled::InterconnectValidationException(
                     InterconnectValidationException {
                         message: format!(
@@ -513,14 +509,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.clone() {
             store.idempotency_tokens.insert(
                 crate::state::idempotency_key(&region, &token),
-                crate::state::IdempotentCreate {
-                    connection_id: id,
-                    environment_id: input.environment_id.clone(),
-                    bandwidth: input.bandwidth.clone(),
-                    attach_point: input.attach_point.clone(),
-                    description: input.description.clone(),
-                    tags: input.tags.clone(),
-                },
+                crate::state::IdempotentCreate::of(id, &input),
             );
         }
         // Both indexes hold only entries that name a stored connection, so they are

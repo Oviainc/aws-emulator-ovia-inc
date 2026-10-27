@@ -3081,6 +3081,91 @@ impl ReviewTemplateRecord {
             share_invitation_id: None,
         }
     }
+
+    /// Carry the review content this template holds for each lens it applies onto
+    /// `carried`, keyed by lens ALIAS: the answers it records for that lens's questions
+    /// and the notes written against that lens review and its pillars.
+    ///
+    /// A review template is applied to a workload to PRE-POPULATE that workload's review:
+    /// "for a review template, these are the notes that will be associated with the
+    /// workload when the template is applied" (`smithy_query(query="doc", shape="Notes")`
+    /// and `smithy_query(query="doc", shape="PillarNotes")`), and the recorded answers are
+    /// what creating a workload from a template needs
+    /// `wellarchitected:GetReviewTemplateAnswer` and
+    /// `wellarchitected:ListReviewTemplateAnswers` for
+    /// (`smithy_query(query="operation", operation="CreateWorkload")`). Every half of that
+    /// content is projected from this one place, so an applier cannot carry one half and
+    /// drop the other.
+    ///
+    /// Content already in `carried` is LEFT as it stands, so where two applied templates
+    /// speak about the same lens, question or pillar, the first one applied is what the
+    /// workload is created with.
+    pub fn carry_review_content_into(
+        &self,
+        carried: &mut BTreeMap<String, CarriedLensReviewContent>,
+    ) {
+        for (alias, review) in &self.lens_reviews {
+            let lens = carried.entry(alias.clone()).or_default();
+            if lens.notes.is_none() {
+                lens.notes = review.notes.clone();
+            }
+            for (pillar_id, notes) in &review.pillar_notes {
+                lens.pillar_notes
+                    .entry(pillar_id.clone())
+                    .or_insert_with(|| notes.clone());
+            }
+        }
+        for (alias, answers) in &self.answers {
+            let lens = carried.entry(alias.clone()).or_default();
+            for (question_id, answer) in answers {
+                lens.answers
+                    .entry(question_id.clone())
+                    .or_insert_with(|| answer.clone());
+            }
+        }
+    }
+}
+
+/// The review content ONE lens review of an applied review template contributes to the
+/// workload it is applied to ([`ReviewTemplateRecord::carry_review_content_into`]): what
+/// the template recorded about that lens, in the form the workload's own review holds it.
+#[derive(Debug, Clone, Default)]
+pub struct CarriedLensReviewContent {
+    /// The answers the template records for this lens's questions, by `QuestionId`.
+    pub answers: BTreeMap<String, AnswerRecord>,
+    /// The notes written against the template's review of this lens.
+    pub notes: Option<String>,
+    /// The notes written against the pillars of that review, by `PillarId`.
+    pub pillar_notes: BTreeMap<String, String>,
+}
+
+/// Write the review content of the applied review templates (`carried`) onto the lens
+/// reviews of the workload being created, and answer the workload's `answers` map.
+///
+/// Only a lens the workload actually reviews takes content: every lens an applied
+/// template applies is associated with the workload, so this drops nothing in practice —
+/// it is what keeps the store from holding a review or an answer for a lens the workload
+/// has no review of.
+///
+/// A workload being created has nothing of its own in either place — no operation writes a
+/// per-lens note or an answer before the workload exists — so the carried content is
+/// written as it stands rather than merged.
+pub fn apply_carried_review_content(
+    carried: BTreeMap<String, CarriedLensReviewContent>,
+    lens_reviews: &mut BTreeMap<String, LensReviewRecord>,
+) -> BTreeMap<String, BTreeMap<String, AnswerRecord>> {
+    let mut answers: BTreeMap<String, BTreeMap<String, AnswerRecord>> = BTreeMap::new();
+    for (alias, content) in carried {
+        let Some(review) = lens_reviews.get_mut(&alias) else {
+            continue;
+        };
+        review.notes = content.notes;
+        review.pillar_notes = content.pillar_notes;
+        if !content.answers.is_empty() {
+            answers.insert(alias, content.answers);
+        }
+    }
+    answers
 }
 
 /// The `ReviewTemplateAnswer` shape `UpdateReviewTemplateAnswer` and
