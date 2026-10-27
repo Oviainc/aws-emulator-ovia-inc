@@ -49,6 +49,8 @@ mod custom_line_item_billing_group_scope;
 mod custom_line_item_tag_lifecycle;
 #[path = "all/custom_line_item_versions_by_billing_period.rs"]
 mod custom_line_item_versions_by_billing_period;
+#[path = "all/delete_auto_associate_billing_group.rs"]
+mod delete_auto_associate_billing_group;
 #[path = "all/delete_custom_line_item.rs"]
 mod delete_custom_line_item;
 #[path = "all/disassociate_accounts.rs"]
