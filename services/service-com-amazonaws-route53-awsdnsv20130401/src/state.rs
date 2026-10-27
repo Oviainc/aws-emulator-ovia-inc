@@ -179,6 +179,17 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 10;
 /// the model declares `TooManyHealthChecks` for the refusal that enforces it.
 pub const MAX_HEALTH_CHECKS: usize = 200;
 
+/// The most deleted health checks' `CallerReference`s the store keeps holding.
+///
+/// A reference outlives the health check that used it (see
+/// [`ComAmazonawsRoute53Awsdnsv20130401State::retain_deleted_health_check_reference`]),
+/// and a caller chooses the reference freely, so without a cap a create/delete
+/// loop would grow the index for the life of the process. Past this many the
+/// oldest reference is released, which is the eviction policy the live
+/// population already gets from [`MAX_HEALTH_CHECKS`]; the cap is far above the
+/// number of health checks any one client session creates and deletes.
+const MAX_RETAINED_HEALTH_CHECK_REFERENCES: usize = 10_000;
+
 /// The `HealthCheckType` values that check an endpoint of the caller's, rather
 /// than reading a CloudWatch alarm, combining other health checks or following a
 /// routing control (`HealthCheckType` enum).
@@ -1526,8 +1537,13 @@ pub struct ComAmazonawsRoute53Awsdnsv20130401State {
     /// [`MAX_HEALTH_CHECKS`].
     pub health_checks: BTreeMap<String, StoredHealthCheck>,
     /// `CallerReference` -> health-check id, the index `CreateHealthCheck`
-    /// recognises a repeated request by.
+    /// recognises a repeated request by. An entry OUTLIVES the health check it
+    /// names, because the reference of a deleted health check stays held; those
+    /// entries are bounded by [`MAX_RETAINED_HEALTH_CHECK_REFERENCES`].
     pub health_check_by_caller_reference: HashMap<String, String>,
+    /// The references of deleted health checks in deletion order, so the oldest
+    /// can be released first.
+    deleted_health_check_references: VecDeque<String>,
     /// Every reusable delegation set of the account's, keyed by its bare id. A
     /// `BTreeMap` so a listing pages over a stable total order of set ids.
     /// Bounded by [`MAX_REUSABLE_DELEGATION_SETS`].
@@ -1568,6 +1584,7 @@ impl Default for ComAmazonawsRoute53Awsdnsv20130401State {
             traffic_policy_instances: BTreeMap::new(),
             health_checks: BTreeMap::new(),
             health_check_by_caller_reference: HashMap::new(),
+            deleted_health_check_references: VecDeque::new(),
             delegation_sets: BTreeMap::new(),
             delegation_set_by_caller_reference: HashMap::new(),
             ids: IdMinter::default(),
@@ -1622,6 +1639,23 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
             let id = self.ids.mint_uuid();
             if !self.health_checks.contains_key(&id) {
                 return id;
+            }
+        }
+    }
+
+    /// Record that the health check holding `caller_reference` was deleted, so
+    /// `CreateHealthCheck` still recognises that reference: a reference stays
+    /// held after the health check that used it is gone.
+    ///
+    /// The index entry is left in place and the reference is remembered in
+    /// deletion order; past [`MAX_RETAINED_HEALTH_CHECK_REFERENCES`] the oldest
+    /// one is released, so the index cannot grow without end.
+    pub fn retain_deleted_health_check_reference(&mut self, caller_reference: String) {
+        self.deleted_health_check_references
+            .push_back(caller_reference);
+        while self.deleted_health_check_references.len() > MAX_RETAINED_HEALTH_CHECK_REFERENCES {
+            if let Some(released) = self.deleted_health_check_references.pop_front() {
+                self.health_check_by_caller_reference.remove(&released);
             }
         }
     }

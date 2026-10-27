@@ -36,14 +36,17 @@ use crate::hosted_zone_records::{router, Reply};
 /// with: `HealthCheckVersionMismatch`, HTTP 409.
 const VERSION_MISMATCH: &str = "HealthCheckVersionMismatch";
 
-/// The refusal message that error carries, which is the shape's own
-/// documentation sentence ("The value of HealthCheckVersion in the request
-/// doesn't match the value of HealthCheckVersion in the health check."), named
-/// here so the wording a loser is refused with is asserted and not merely its
-/// code.
-const VERSION_MISMATCH_MESSAGE: &str =
-    "The value of HealthCheckVersion in the request doesn't match the value of \
-     HealthCheckVersion in the health check.";
+/// The refusal message a loser carries: the sentence names the health check and
+/// BOTH versions — the one the health check holds by the time the loser is
+/// judged (the winner's, one on from the version every writer presented) and the
+/// one the loser presented — so a loser learns the current version from its own
+/// refusal.
+fn version_mismatch_message(health_check_id: &str, held: i64, presented: i64) -> String {
+    format!(
+        "Health check with id {health_check_id} has version {held}, but expected to have \
+         version {presented}. Could not proceed with update."
+    )
+}
 
 /// The `HealthCheckConfig` the health check every suite here contends over is
 /// created with: an endpoint check whose `Port` and `ResourcePath` an update can
@@ -111,7 +114,7 @@ fn updates_in_flight_together(
 
 /// The index of the single reply that was applied, asserting that there is
 /// exactly one and that every other reply is the documented refusal.
-fn the_one_winner(replies: &[Reply], case: &str) -> usize {
+fn the_one_winner(replies: &[Reply], case: &str, id: &str, presented: i64) -> usize {
     let statuses: Vec<u16> = replies.iter().map(|reply| reply.status).collect();
     let winners: Vec<usize> = replies
         .iter()
@@ -141,11 +144,14 @@ fn the_one_winner(replies: &[Reply], case: &str) -> usize {
             reply.error_code(),
             reply.body
         );
+        // Exactly one update was applied, so the version the health check holds
+        // when a loser is judged is the presented one plus that single step.
+        let expected_message = version_mismatch_message(id, presented + 1, presented);
         let message = reply.first("Error/Message").unwrap_or("");
         assert_eq!(
-            message, VERSION_MISMATCH_MESSAGE,
+            message, expected_message,
             "case {case:?}: writer {index} expected the refusal message \
-             {VERSION_MISMATCH_MESSAGE:?}, got {message:?}; body {}",
+             {expected_message:?}, got {message:?}; body {}",
             reply.body
         );
     }
@@ -188,7 +194,7 @@ async fn exactly_one_update_presenting_the_current_version_is_applied() {
             .collect();
         let replies = updates_in_flight_together(&router, &id, &bodies);
 
-        let winner = the_one_winner(&replies, &case);
+        let winner = the_one_winner(&replies, &case, &id, base);
         let applied = reported_version(&replies[winner], &case);
         assert_eq!(
             applied,
@@ -253,7 +259,7 @@ async fn each_round_of_contention_moves_the_version_on_by_exactly_one() {
             })
             .collect();
         let replies = updates_in_flight_together(&router, &id, &bodies);
-        let winner = the_one_winner(&replies, &round_case);
+        let winner = the_one_winner(&replies, &round_case, &id, held);
 
         let after = get_health_check(&router, &id).await;
         let moved = reported_version(&after, &round_case);
