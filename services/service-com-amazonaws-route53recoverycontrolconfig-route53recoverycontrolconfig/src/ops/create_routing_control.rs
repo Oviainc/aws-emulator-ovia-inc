@@ -169,6 +169,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The same authorization check the ARN-addressed operations run, for both parents
+        // this create would attach to: decided from the request alone, so it runs before
+        // either ARN is looked up and before the request's idempotency token is honoured.
+        crate::state::authorize_resource_arn(Self::NAME, &input.cluster_arn)
+            .map_err(CreateRoutingControlErrorModeled::AccessDeniedException)?;
+        if let Some(control_panel_arn) = input.control_panel_arn.as_deref() {
+            crate::state::authorize_resource_arn(Self::NAME, control_panel_arn)
+                .map_err(CreateRoutingControlErrorModeled::AccessDeniedException)?;
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateRoutingControlErrorModeled::InternalServerException(
                 InternalServerException {

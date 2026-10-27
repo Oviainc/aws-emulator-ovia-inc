@@ -15,7 +15,8 @@
 //!
 //! This module also holds what more than one operation needs — ARN construction,
 //! the request's region, the modelled defaults, the [page window][page_window] every
-//! `@paginated` listing reports through, the [service-managed
+//! `@paginated` listing reports through with the [token codec][encode_page_token] the
+//! scope-qualified ones resume through, the [service-managed
 //! catalog][SERVICE_MANAGED_KEYSPACES] every Region already holds (derived per request by
 //! [`keyspace`][ComAmazonawsKeyspacesKeyspacesserviceState::keyspace]),
 //! and [`settle`][ComAmazonawsKeyspacesKeyspacesserviceState::settle],
@@ -407,8 +408,8 @@ pub const MAX_PAGE_SIZE: i32 = 1000;
 /// Takes ONE item more than the page fits, so the returned flag is true exactly when an
 /// item follows the last one on the page — which is when the listing owes the caller a
 /// `nextToken`, leaving the final page without one. The resume point is the last item of
-/// the returned page; what a token for it looks like is each listing's own, so the
-/// encoding stays with the operation.
+/// the returned page; a scope-qualified listing turns it into a token through
+/// [`encode_page_token`], so only the scope expression stays with the operation.
 pub fn page_window<Item>(
     items: impl Iterator<Item = Item>,
     max_results: Option<i32>,
@@ -419,6 +420,38 @@ pub fn page_window<Item>(
     let truncated = page.len() > page_size;
     page.truncate(page_size);
     (page, truncated)
+}
+
+/// The separator between the scope half and the item half of a scope-qualified resume
+/// point, inside the token body [`encode_page_token`] hex-encodes.
+const PAGE_TOKEN_SEPARATOR: char = '#';
+
+/// Encode the resume point of a page as the opaque `nextToken` a scope-qualified listing
+/// hands its caller — the ONE token codec every such listing of this service reports
+/// through, so the scope expression is the only part that is a listing's own.
+///
+/// The token names the LAST item of the page just returned, qualified by the `scope` that
+/// item was listed within, and is hex-encoded so no caller can read a resource name out of
+/// it or build one by hand. Splitting at the FIRST [`PAGE_TOKEN_SEPARATOR`] separates the
+/// two halves unambiguously as long as the `scope` carries none, which is each listing's
+/// own obligation: a scope that could contain one hex-encodes itself first.
+///
+/// The `scope` is also what keeps the listings apart. Two listings of this service page
+/// collections whose item names have the same shape, so a token one issued must not resume
+/// the other: a listing whose scope expression could collide with another's qualifies it
+/// further (a prefix no other scope can carry), and [`decode_page_token`] then refuses a
+/// foreign token rather than resuming at a point that would silently skip items.
+pub fn encode_page_token(scope: &str, item: &str) -> String {
+    ::hex::encode(format!("{scope}{PAGE_TOKEN_SEPARATOR}{item}"))
+}
+
+/// The item a `nextToken` resumes after, or `None` when the token is not one
+/// [`encode_page_token`] issued for `scope` — a token minted for a different scope, or by a
+/// different listing, resumes nothing and is refused rather than silently ignored.
+pub fn decode_page_token(token: &str, scope: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let (token_scope, item) = decoded.split_once(PAGE_TOKEN_SEPARATOR)?;
+    (token_scope == scope && !item.is_empty()).then(|| item.to_string())
 }
 
 /// The most keyspaces this emulator holds in one Amazon Web Services Region, and — with
