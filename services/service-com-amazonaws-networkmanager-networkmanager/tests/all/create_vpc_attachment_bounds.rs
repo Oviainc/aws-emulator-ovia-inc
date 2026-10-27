@@ -36,15 +36,13 @@ use crate::attachment_lifecycle::{
 };
 use crate::global_network_lifecycle::{error_code, expected_arn, ids_of, Emulator};
 use crate::resource_tagging::{list_tags, tag, MAX_KEY_CHARS, MAX_TAGS, MAX_VALUE_CHARS};
+// The bound on how many subnets one attachment holds and the `SubnetArns` accessor, both
+// owned by `crate::vpc_attachment_lifecycle`, so no suite carries its own copy of either.
+use crate::vpc_attachment_lifecycle::{subnets_of, MAX_SUBNETS};
 
 /// The one Region every core network here configures an edge location in, and so the Region
 /// of every VPC and subnet these cases name.
 const REGION: &str = "us-west-2";
-
-/// How many subnets one VPC attachment may hold: the bound
-/// `state::MAX_SUBNETS_PER_VPC_ATTACHMENT` fixes, the same number
-/// `crate::vpc_attachment_lifecycle` holds an update to.
-const MAX_SUBNETS: usize = 50;
 
 /// The `Reason` a `ValidationException` of this service carries when an input member is at
 /// fault, and the one it carries when none is — the request is invalid against a count or
@@ -84,18 +82,6 @@ fn descending_block(base: usize, count: usize) -> Vec<String> {
         .rev()
         .map(|index| subnet_arn(REGION, base + index))
         .collect()
-}
-
-/// The subnet ARNs a `VpcAttachment` wrapper reports, in the order it reports them.
-fn subnets_of(wrapper: &Value) -> Vec<String> {
-    wrapper["SubnetArns"]
-        .as_array()
-        .map_or_else(Vec::new, |listed| {
-            listed
-                .iter()
-                .map(|arn| arn.as_str().unwrap_or_default().to_string())
-                .collect()
-        })
 }
 
 /// A create that must be accepted, answering the minted attachment id.

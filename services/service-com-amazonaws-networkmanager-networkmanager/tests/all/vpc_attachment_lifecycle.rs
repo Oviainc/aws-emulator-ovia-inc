@@ -38,8 +38,9 @@ const OPTION_MEMBERS: [&str; 4] = [
 
 /// How many subnets one VPC attachment may hold: the bound
 /// `state::MAX_SUBNETS_PER_VPC_ATTACHMENT` fixes, which is what keeps repeated updates from
-/// growing one attachment's subnet list without end.
-const MAX_SUBNETS: usize = 50;
+/// growing one attachment's subnet list without end. Shared with the suites that drive that
+/// bound, so the one copy of it cannot drift.
+pub(crate) const MAX_SUBNETS: usize = 50;
 
 /// An EC2 subnet ARN of [`REGION`]; see `crate::attachment_lifecycle::subnet_arn`.
 fn subnet(index: usize) -> String {
@@ -54,12 +55,14 @@ fn block(base: usize, indices: &[usize]) -> Vec<String> {
 
 /// The four `VpcOptions` flags an attachment reports. An absent member, like an absent
 /// `Options`, is the modelled default (`false`), so both spellings of "off" read alike.
-fn options_of(attachment: &Value) -> [bool; 4] {
+/// Shared with the suites that read a VPC attachment back.
+pub(crate) fn options_of(attachment: &Value) -> [bool; 4] {
     OPTION_MEMBERS.map(|member| attachment["Options"][member].as_bool().unwrap_or(false))
 }
 
 /// The `Options` body for the four flags, in the order [`OPTION_MEMBERS`] names them.
-fn options_body(flags: [bool; 4]) -> Value {
+/// Shared with the suites that create a VPC attachment carrying options.
+pub(crate) fn options_body(flags: [bool; 4]) -> Value {
     let mut body = json!({});
     for (member, flag) in OPTION_MEMBERS.iter().zip(flags) {
         body[*member] = json!(flag);
@@ -67,8 +70,9 @@ fn options_body(flags: [bool; 4]) -> Value {
     body
 }
 
-/// The subnet ARNs an attachment reports, in the order it reports them.
-fn subnets_of(attachment: &Value) -> Vec<String> {
+/// The subnet ARNs an attachment reports, in the order it reports them. Shared with the
+/// suites that read a VPC attachment back.
+pub(crate) fn subnets_of(attachment: &Value) -> Vec<String> {
     attachment["SubnetArns"]
         .as_array()
         .map_or_else(Vec::new, |listed| {
