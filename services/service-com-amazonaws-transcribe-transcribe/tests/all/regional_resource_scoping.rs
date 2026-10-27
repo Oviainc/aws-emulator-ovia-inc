@@ -631,6 +631,8 @@ async fn a_job_references_only_a_custom_resource_of_its_own_region() {
         )
         .await
         .ok("create the referenced vocabulary");
+    // A start may apply it only once its build has finished.
+    transcribe.vocabulary_ready(vocabulary, Some(HOME)).await;
 
     let refused = transcribe
         .call_in_region(
@@ -678,6 +680,9 @@ async fn a_job_references_only_a_custom_resource_of_its_own_region() {
         )
         .await
         .ok(&format!("create the same vocabulary name in {elsewhere}"));
+    transcribe
+        .vocabulary_ready(vocabulary, Some(elsewhere))
+        .await;
     transcribe
         .call_in_region(
             "StartTranscriptionJob",

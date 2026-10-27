@@ -82,7 +82,8 @@ async fn get(transcribe: &Transcribe, name: &str) -> Reply {
 }
 
 /// `CreateVocabulary` for `name`, so this account holds a custom vocabulary of that
-/// name.
+/// name — and holds it in the state a start may apply it in, `READY`, which a create
+/// reaches only once its build falls due.
 async fn create_vocabulary(transcribe: &Transcribe, name: &str) {
     transcribe
         .call(
@@ -95,6 +96,7 @@ async fn create_vocabulary(transcribe: &Transcribe, name: &str) {
         )
         .await
         .ok(&format!("CreateVocabulary {name:?}"));
+    transcribe.vocabulary_ready(name, None).await;
 }
 
 /// `CreateVocabularyFilter` for `name`.
@@ -621,6 +623,11 @@ async fn a_start_naming_a_custom_resource_this_account_lacks_is_refused() {
                 .call(operation, input)
                 .await
                 .ok(&format!("{operation} {resource:?}"));
+            // A held custom vocabulary is applicable only once its build has finished:
+            // READY is what makes one usable.
+            if operation == "CreateVocabulary" {
+                transcribe.vocabulary_ready(resource, None).await;
+            }
             let members = (reference.members)(resource);
             transcribe
                 .call("StartTranscriptionJob", start_request(&held, &members))
@@ -797,6 +804,11 @@ async fn every_job_family_refuses_a_start_naming_a_vocabulary_it_lacks() {
             .call(family.create, create)
             .await
             .ok(&format!("{} {vocabulary:?}", family.create));
+        // A held custom vocabulary is applicable only once its build has finished:
+        // READY is what makes one usable.
+        if family.create == "CreateVocabulary" {
+            transcribe.vocabulary_ready(&vocabulary, None).await;
+        }
         transcribe
             .call(family.start, (family.request)("held-job", &vocabulary))
             .await

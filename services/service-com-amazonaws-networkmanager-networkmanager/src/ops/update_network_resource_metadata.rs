@@ -1,22 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNetworkResourceMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNetworkResourceMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNetworkResourceMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `UpdateNetworkResourceMetadata::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! Stores the resource metadata of one network resource of a global network: the map the
+//! request carries becomes the WHOLE metadata of the resource its ARN names inside the
+//! global network the path addresses, and the answer reports that ARN with the map the
+//! store then holds for it — the same map `GetNetworkResources` reports in
+//! `NetworkResource$Metadata` from then on. A map carrying more entries than one resource's
+//! metadata may hold is refused on the member, so one request cannot grow the store without
+//! end. This is the ONLY file to touch for this operation.
 //!
 //! ## Reaching this service's state
 //!
@@ -152,17 +143,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNetworkResourceMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNetworkResourceMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNetworkResourceMetadata"))
+        // request metadata.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateNetworkResourceMetadataErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The global network the path addresses is checked first: one the store does not
+        // hold owns no network resource at all, whatever ARN the rest of the path names.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(
+                UpdateNetworkResourceMetadataErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::GLOBAL_NETWORK_KIND,
+                        &input.global_network_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // A string that is not an ARN of this service names no resource of this
+        // inventory at all, which is a bad request rather than a missing resource — the
+        // same answer every other operation of this service gives for that input class.
+        let parts = crate::state::parse_resource_arn(&input.resource_arn).ok_or_else(|| {
+            UpdateNetworkResourceMetadataErrorModeled::ValidationException(
+                crate::state::malformed_resource_arn(crate::state::FIELD_RESOURCE_ARN),
+            )
+        })?;
+
+        // The request carries the resource metadata in full, so the map is stored whole:
+        // the resource ends up with exactly the keys the request named and none it left
+        // out. The answer is read back out of the store rather than echoed from the input.
+        // How many entries one resource may carry is bounded, so a single request cannot
+        // grow the store without end; the modelled constraints already bound each key and
+        // value.
+        crate::state::check_metadata_entries(input.metadata.len())
+            .map_err(UpdateNetworkResourceMetadataErrorModeled::ValidationException)?;
+        let requested: ::std::collections::BTreeMap<String, String> = input
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let stored = store
+            .put_network_resource_metadata(
+                &input.global_network_id,
+                &input.resource_arn,
+                requested,
+                now,
+            )
+            .ok_or_else(|| {
+                UpdateNetworkResourceMetadataErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(parts.kind, parts.id),
+                )
+            })?;
+        drop(store);
+
+        Ok(UpdateNetworkResourceMetadataOutput {
+            resource_arn: Some(input.resource_arn),
+            metadata: Some(crate::state::metadata_shape(&stored)),
+        })
     }
 }

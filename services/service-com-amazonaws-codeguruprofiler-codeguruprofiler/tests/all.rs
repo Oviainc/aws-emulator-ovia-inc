@@ -27,6 +27,8 @@ mod interval_resolution;
 mod interval_validation;
 #[path = "all/list_pagination.rs"]
 mod list_pagination;
+#[path = "all/message_timestamp_rendering.rs"]
+mod message_timestamp_rendering;
 #[path = "all/not_found_surfaces.rs"]
 mod not_found_surfaces;
 #[path = "all/notification_channels.rs"]

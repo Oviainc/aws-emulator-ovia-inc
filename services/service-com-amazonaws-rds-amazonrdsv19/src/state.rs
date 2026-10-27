@@ -3724,6 +3724,23 @@ pub fn db_security_group_not_found_message(name: &str) -> String {
     format!("DBSecurityGroup not found: {name}")
 }
 
+/// The refusal this API version answers a request that would MODIFY the ingress rules of a
+/// VPC DB security group with.
+///
+/// Every DB security group of this account is VPC-backed: the ingress operations' own
+/// documentation records that "EC2-Classic was retired on August 15, 2022", so there is no
+/// other network a group could belong to, and the two ingress APIs this service publishes
+/// are the EC2-Classic-era ones — they cannot modify a VPC group, and say which API
+/// versions can. Fixed text: it names neither the group nor the rule, so there is nothing
+/// of the request in it.
+///
+/// It lives here rather than in one handler because `AuthorizeDBSecurityGroupIngress` and
+/// `RevokeDBSecurityGroupIngress` are the same refusal — both modify a group's rules — and
+/// a caller branching on one must read the same answer from the other.
+pub const VPC_DB_SECURITY_GROUP_NOT_MODIFIABLE: &str =
+    "VPC DB Security Groups cannot be modified with this API version.  Please use an API \
+     version between 2012-01-15 and 2012-10-31 to modify this group.";
+
 /// A stored DB security group: the name and description a create gave it, and the ingress
 /// rules authorized on it.
 ///

@@ -12,6 +12,9 @@
 //! * `PipelineNameInUseException` and `PipelineNotFoundException` carry the text their
 //!   rule builds from the REQUEST and the caller's account, so the account the name was
 //!   looked up in is reported;
+//! * a declaration whose first stage is not made up exclusively of `Source` actions is
+//!   refused with the FIXED sentence that defect class carries, with nothing of the
+//!   request interpolated into it, by every operation that takes a declaration;
 //! * a constraint-violation message names the member path and the constraint and
 //!   NOTHING of the rejected value, states a `@pattern` without the `^`/`$` anchors the
 //!   model spells it with, and reports a constraint of a map's ENTRY shape against the
@@ -744,4 +747,177 @@ async fn a_map_entrys_constraint_is_reported_against_the_map_member() {
             "case {case:?}: the entry's own key is not the path AWS names, got {message:?}"
         );
     }
+}
+
+/// The FIXED sentence a declaration whose first stage is not made up exclusively of
+/// source actions is refused with. A constant for this defect class: no stage name,
+/// action name, category, count or index is interpolated into it.
+const FIRST_STAGE_MESSAGE: &str = "Pipeline should start with a stage that only contains source actions";
+
+/// One action with no artifact members: the category and provider are what the
+/// first-stage law looks at.
+fn categorised_action(name: &str, category: &str, provider: &str, run_order: i32) -> Value {
+    json!({
+        "name": name,
+        "actionTypeId": {
+            "category": category, "owner": "AWS", "provider": provider, "version": "1",
+        },
+        "runOrder": run_order,
+    })
+}
+
+/// A source action with no artifact members, for a first stage under test.
+fn bare_source_action(name: &str, run_order: i32) -> Value {
+    json!({
+        "name": name,
+        "actionTypeId": {
+            "category": "Source", "owner": "AWS", "provider": "S3", "version": "1",
+        },
+        "configuration": {"S3Bucket": "bucket", "S3ObjectKey": "source.zip"},
+        "runOrder": run_order,
+    })
+}
+
+/// A first stage that is not the pipeline's source stage is refused with the fixed
+/// sentence of that defect class, whatever the declaration that violates the law looks
+/// like — and nothing of the request is interpolated into it.
+#[tokio::test]
+async fn a_first_stage_that_is_not_the_source_stage_carries_the_fixed_message() {
+    let emulator = Emulator::new();
+    emulator.role().await;
+
+    // The law generalises over the COMPOSITION of the first stage, so the rows differ in
+    // how it is composed: no source action at all, a source action mixed with a
+    // non-source one (in either order of `runOrder`), several non-source actions, and a
+    // pipeline whose single stage carries no source action. `tokens` is the text each row
+    // puts in the request that an interpolating message would leak.
+    let rows: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "an approval stage first, the source stage second",
+            json!([
+                {"name": "Gate", "actions": [
+                    categorised_action("Approve", "Approval", "Manual", 1),
+                ]},
+                source_stage("SourceArtifact"),
+            ]),
+            vec!["Gate", "Approve", "Approval", "Manual"],
+        ),
+        (
+            "a build stage first, the source stage second",
+            json!([
+                {"name": "Prebuild", "actions": [
+                    categorised_action("Compile", "Build", "CodeBuild", 1),
+                ]},
+                source_stage("SourceArtifact"),
+            ]),
+            vec!["Prebuild", "Compile", "Build", "CodeBuild"],
+        ),
+        (
+            "a source action and a non-source action in the first stage",
+            json!([{"name": "Ingest", "actions": [
+                bare_source_action("Src", 1),
+                categorised_action("Hold", "Approval", "Manual", 2),
+            ]}]),
+            vec!["Ingest", "Hold", "Approval", "Manual"],
+        ),
+        (
+            "a non-source action before the source action in the first stage",
+            json!([{"name": "Ingest", "actions": [
+                categorised_action("Hold", "Invoke", "Lambda", 1),
+                bare_source_action("Src", 2),
+            ]}]),
+            vec!["Ingest", "Hold", "Invoke", "Lambda"],
+        ),
+        (
+            "two non-source actions in the first stage",
+            json!([
+                {"name": "Zulu", "actions": [
+                    categorised_action("Hold", "Approval", "Manual", 1),
+                    categorised_action("Probe", "Test", "CodeBuild", 2),
+                ]},
+                source_stage("SourceArtifact"),
+            ]),
+            vec!["Zulu", "Hold", "Probe", "Test", "CodeBuild"],
+        ),
+        (
+            "a single stage carrying no source action",
+            json!([{"name": "Verify", "actions": [
+                categorised_action("Probe", "Test", "CodeBuild", 1),
+            ]}]),
+            vec!["Verify", "Probe", "Test", "CodeBuild"],
+        ),
+    ];
+
+    for (index, (case, stages, tokens)) in rows.into_iter().enumerate() {
+        let name = format!("first-stage-{index}");
+        let body = declaration(&name, stages);
+        let (status, code, message) = emulator.refusal("CreatePipeline", &body).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "InvalidStructureException"),
+            "case {case:?}: expected the modelled structure refusal, got {status} {code} \
+             {message:?}"
+        );
+        assert_eq!(
+            message, FIRST_STAGE_MESSAGE,
+            "case {case:?}: expected the fixed first-stage sentence, got {message:?}"
+        );
+        for token in tokens {
+            assert!(
+                !message.contains(token),
+                "case {case:?}: nothing of the request is interpolated, but {token:?} \
+                 appears in {message:?}"
+            );
+        }
+        // A refused declaration is not stored.
+        let (status, listed) = emulator.cp("ListPipelines", &json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: ListPipelines must answer, got {status} with {listed}"
+        );
+        assert!(
+            !listed["pipelines"].as_array().is_some_and(|summaries| {
+                summaries
+                    .iter()
+                    .any(|summary| summary["name"] == json!(name))
+            }),
+            "case {case:?}: the refused pipeline must be absent from ListPipelines, got \
+             {listed}"
+        );
+    }
+
+    // The control: the SAME two stages with the source stage first are accepted, so what
+    // the refusal turns on is the first stage's composition and not the stages
+    // themselves.
+    let accepted = declaration(
+        "first-stage-control",
+        json!([
+            source_stage("SourceArtifact"),
+            {"name": "Gate", "actions": [
+                categorised_action("Approve", "Approval", "Manual", 1),
+            ]},
+        ]),
+    );
+    let (status, answer) = emulator.cp("CreatePipeline", &accepted).await;
+    assert_eq!(
+        status, 200,
+        "a declaration whose first stage is the source stage is accepted, got {status} \
+         with {answer}"
+    );
+
+    // `UpdatePipeline` takes the same declaration, so it words the same law the same way.
+    let mut update = accepted.clone();
+    update["pipeline"]["stages"] = json!([
+        {"name": "Gate", "actions": [
+            categorised_action("Approve", "Approval", "Manual", 1),
+        ]},
+        source_stage("SourceArtifact"),
+    ]);
+    let (status, code, message) = emulator.refusal("UpdatePipeline", &update).await;
+    assert_eq!(
+        (status, code.as_str(), message.as_str()),
+        (400, "InvalidStructureException", FIRST_STAGE_MESSAGE),
+        "UpdatePipeline refuses the same law with the same fixed sentence, got {status} \
+         {code} {message:?}"
+    );
 }

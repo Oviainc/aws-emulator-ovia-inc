@@ -41,6 +41,8 @@ mod detect_resource_drift;
 mod drift_and_resource_reads;
 #[path = "all/dynamic_references.rs"]
 mod dynamic_references;
+#[path = "all/ec2_network_identifiers_feed_rds.rs"]
+mod ec2_network_identifiers_feed_rds;
 #[path = "all/ecs_elbv2_stack_identifiers.rs"]
 mod ecs_elbv2_stack_identifiers;
 // An EMPTY, moved-out suite: its rows now live in `all/nested_resource_outputs.rs` and

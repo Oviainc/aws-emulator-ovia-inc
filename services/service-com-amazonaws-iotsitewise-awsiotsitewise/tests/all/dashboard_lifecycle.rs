@@ -91,14 +91,14 @@ fn stored_dashboards(engine: &std::sync::Arc<engine::InMemoryEngine>) -> usize {
 /// A modelled `ID` built from `seed`: a lowercase hyphenated UUID that is not the
 /// all-zero one the pattern refuses. Used for the ids expected to resolve to
 /// nothing — a dashboard no create minted and a project no create minted.
-fn modelled_id(seed: u32) -> String {
+pub(crate) fn modelled_id(seed: u32) -> String {
     format!("{seed:08x}-1c2d-4e5f-8a9b-0c1d2e3f4a5b")
 }
 
 /// A dashboard definition literal of `length` characters: a JSON object whose one
 /// property is padded out, so the row spans a size without leaving the form a
 /// definition takes.
-fn definition_of(length: usize) -> String {
+pub(crate) fn definition_of(length: usize) -> String {
     let envelope = r#"{"widgets":[{"title":""}]}"#;
     let padding = length.saturating_sub(envelope.len());
     format!(

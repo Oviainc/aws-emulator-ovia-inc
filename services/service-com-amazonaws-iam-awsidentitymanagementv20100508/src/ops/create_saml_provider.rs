@@ -197,19 +197,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You upload a SAML metadata document that you get from your IdP. That document
         // includes the issuer's name, expiration information, and keys" — so the document
         // is READ here, not just stored: a value that describes no SAML 2.0 identity
-        // provider is "an invalid … value … supplied for an input parameter", and the
-        // refusal names the member and what was wrong with it. `SAMLMetadataDocumentType`'s
-        // own length bound (1000..10000000) was already enforced before this handler ran.
-        let metadata = match crate::state::parse_saml_metadata(&input.saml_metadata_document) {
-            Ok(metadata) => metadata,
-            Err(reason) => {
-                return Err(CreateSAMLProviderErrorModeled::InvalidInputException(
-                    InvalidInputException {
-                        message: Some(format!("Invalid SAMLMetadataDocument: {reason}")),
-                    },
-                )
-                .into())
-            }
+        // provider is "an invalid … value … supplied for an input parameter", refused with
+        // the one fixed sentence IAM words that refusal with.
+        // `SAMLMetadataDocumentType`'s own length bound (1000..10000000) was already
+        // enforced before this handler ran.
+        let Some(metadata) = crate::state::parse_saml_metadata(&input.saml_metadata_document)
+        else {
+            return Err(CreateSAMLProviderErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INVALID_SAML_METADATA_DOCUMENT.to_string()),
+                },
+            )
+            .into());
         };
 
         // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
