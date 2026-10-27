@@ -194,13 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An account has exactly one API endpoint per region, so a response never fills
         // `nextToken` and there is no page after the first: any token handed back is not
-        // one this service issued.
+        // one this service issued. The sentence is the state module's, as it is for every
+        // other reader of a `nextToken` here; this one names the token, because what is
+        // wrong is that a token arrived at all.
         if let Some(token) = input.next_token.as_deref() {
             return Err(DescribeEndpointsErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(format!(
-                        "nextToken is not a token this service issued: {token:?}."
-                    )),
+                    message: Some(crate::state::unissued_next_token_named_message(token)),
                 },
             )
             .into());

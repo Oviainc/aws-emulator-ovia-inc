@@ -167,23 +167,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A `nextToken` is decoded BEFORE the store is touched: a token this service never
-        // issued is a bad request, as it is for every other paged listing in this crate.
-        let resume_from = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => {
-                let Some(cursor) = crate::state::decode_cursor(token) else {
-                    return Err(ListVersionsErrorModeled::BadRequestException(
-                        BadRequestException {
-                            message: Some(
-                                "nextToken is not a token this service issued.".to_string(),
-                            ),
-                        },
-                    )
-                    .into());
-                };
-                Some(cursor)
-            }
-        };
+        // issued is a bad request, as it is for every other paged listing in this crate —
+        // the rule and its sentence live in the state module, and only the modelled error
+        // it is answered as is this operation's.
+        let resume_from = crate::state::resume_from_token(input.next_token.as_deref()).map_err(
+            |message| {
+                ListVersionsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            },
+        )?;
 
         let now = ::std::time::SystemTime::now();
         // Reporting only, and not even the one write the job readers make: the catalogue is

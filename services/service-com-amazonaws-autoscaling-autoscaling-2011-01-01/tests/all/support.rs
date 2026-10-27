@@ -21,13 +21,13 @@ pub const REGION: &str = "us-west-2";
 /// `application/x-www-form-urlencoded` body.
 ///
 /// THE ONE COPY in this crate's tests: every suite posts through [`query`] below,
-/// so the encoder is defined here and nowhere else. Written out rather than taken
-/// from `percent_encoding` for one reason — a dev-dependency rewrites
-/// `Cargo.lock`, the file nearly every other change in this repository also
-/// rewrites, and that lock conflict is what repeatedly blocked this fix from
-/// being merged. It is RFC 3986's unreserved set, exercised by every request
-/// these suites make.
-fn form_encode(value: &str) -> String {
+/// or builds its own request on this encoder, so it is defined here and nowhere
+/// else. Written out rather than taken from `percent_encoding` for one reason — a
+/// dev-dependency rewrites `Cargo.lock`, the file nearly every other change in this
+/// repository also rewrites, and that lock conflict is what repeatedly blocked this
+/// fix from being merged. It is RFC 3986's unreserved set, exercised by every
+/// request these suites make.
+pub fn form_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {

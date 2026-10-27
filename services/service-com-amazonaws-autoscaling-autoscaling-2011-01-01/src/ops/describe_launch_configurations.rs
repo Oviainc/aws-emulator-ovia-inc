@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         let mut state = state.lock();
-        state.materialize_due(::std::time::SystemTime::now());
+        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
 
         // This operation's `NextToken` is the launch configuration name the next
         // page resumes AFTER: the store is name-ordered, so every value names a
