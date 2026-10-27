@@ -105,6 +105,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The event types this projection matches on, named where every other operation of
+// this service names them: the store that writes them.
+use crate::state::{
+    EVENT_EXECUTION_ABORTED, EVENT_EXECUTION_SUCCEEDED, EVENT_EXECUTION_TIMED_OUT,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -276,6 +282,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// One stored event as this API reports it: the event's own identity, and the detail
 /// member its type names where the execution's record carries what that detail holds.
 ///
+/// Every value that MOVES — the output, the error, the cause and the redrive count —
+/// is read off the EVENT, because the execution's own are those of its latest attempt
+/// and the event an earlier attempt ended on stays in the history. Only what an
+/// execution carries for its whole life (the input it was started with, and the alias
+/// or version it was started through) is read off the record.
+///
 /// A detail this emulator does not record is left unset rather than filled with a
 /// stand-in: `stateEnteredEventDetails`/`stateExitedEventDetails` name the state the
 /// event was written for, and the four execution-level details carry the input, the
@@ -405,31 +417,32 @@ fn projected(
         }
         EVENT_EXECUTION_SUCCEEDED => {
             event.execution_succeeded_event_details = Some(ExecutionSucceededEventDetails {
-                output: data(execution.output.clone()),
-                output_details: included.filter(|_| with_data && execution.output.is_some()),
+                output: data(stored.details.output.clone()),
+                output_details: included
+                    .filter(|_| with_data && stored.details.output.is_some()),
             });
         }
         crate::state::EVENT_EXECUTION_FAILED => {
             event.execution_failed_event_details = Some(ExecutionFailedEventDetails {
-                error: execution.error.clone(),
-                cause: execution.cause.clone(),
+                error: stored.details.error.clone(),
+                cause: stored.details.cause.clone(),
             });
         }
         EVENT_EXECUTION_ABORTED => {
             event.execution_aborted_event_details = Some(ExecutionAbortedEventDetails {
-                error: execution.error.clone(),
-                cause: execution.cause.clone(),
+                error: stored.details.error.clone(),
+                cause: stored.details.cause.clone(),
             });
         }
         EVENT_EXECUTION_TIMED_OUT => {
             event.execution_timed_out_event_details = Some(ExecutionTimedOutEventDetails {
-                error: execution.error.clone(),
-                cause: execution.cause.clone(),
+                error: stored.details.error.clone(),
+                cause: stored.details.cause.clone(),
             });
         }
         crate::state::EVENT_EXECUTION_REDRIVEN => {
             event.execution_redriven_event_details = Some(ExecutionRedrivenEventDetails {
-                redrive_count: Some(execution.redrive_count),
+                redrive_count: stored.details.redrive_count,
             });
         }
         _ => {}
@@ -449,13 +462,3 @@ fn seconds(bound: Option<u64>) -> Option<i64> {
 
 /// The same for `<Type>StateExited`.
 const STATE_EXITED_SUFFIX: &str = "StateExited";
-
-/// The history event an execution that reached its `Succeed` end writes.
-const EVENT_EXECUTION_SUCCEEDED: &str = "ExecutionSucceeded";
-
-/// The history event a STOPPED execution writes.
-const EVENT_EXECUTION_ABORTED: &str = "ExecutionAborted";
-
-/// The history event an execution that ran past its definition's `TimeoutSeconds`
-/// writes.
-const EVENT_EXECUTION_TIMED_OUT: &str = "ExecutionTimedOut";

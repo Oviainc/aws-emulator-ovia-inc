@@ -566,8 +566,9 @@ async fn every_sync_run_is_persisted_under_its_own_execution_arn() {
     }
 
     // An Express execution is not readable through this API — `DescribeExecution` and
-    // `ListExecutions` each refuse one, and `GetExecutionHistory` is still scaffolded —
-    // so what was persisted is asserted against the store the service answers from.
+    // `ListExecutions` each refuse one, and `GetExecutionHistory` is "not supported by
+    // EXPRESS state machines" — so what was persisted is asserted against the store
+    // the service answers from.
     // The guard is scoped to this block, so it is released before the call below.
     {
         let store = emulator.store();
