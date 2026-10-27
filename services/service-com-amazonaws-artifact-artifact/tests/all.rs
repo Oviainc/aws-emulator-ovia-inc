@@ -45,6 +45,8 @@ mod harness;
 mod inquiry_query_identifier_rules;
 #[path = "all/inquiry_tags_reporting.rs"]
 mod inquiry_tags_reporting;
+#[path = "all/minted_store_ids.rs"]
+mod minted_store_ids;
 #[path = "all/pagination_page_walk.rs"]
 mod pagination_page_walk;
 #[path = "all/pagination_token_opacity.rs"]
