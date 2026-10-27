@@ -355,3 +355,8 @@ mod workload_share_deletion;
 // a new suite does not collide with another insertion.
 #[path = "all/lens_review_pinned_version_content.rs"]
 mod lens_review_pinned_version_content;
+
+// Declared last for the same reason as the declaration above: the sorted position for a
+// profile suite falls in a crowded run of this list.
+#[path = "all/profile_share_quota.rs"]
+mod profile_share_quota;

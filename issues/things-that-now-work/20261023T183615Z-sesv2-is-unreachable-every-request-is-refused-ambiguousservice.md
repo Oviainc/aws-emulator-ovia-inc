@@ -64,3 +64,28 @@ Cause 2 — expected: an awsQuery XML ErrorResponse the SDK can parse into a Cod
 ## Steps to Reproduce
 Cause 1: with any SESv2 client against the emulator, call sesv2.create_email_identity(EmailIdentity=<domain>) (or create_configuration_set / create_contact_list / create_tenant / create_dedicated_ip_pool / create_multi_region_endpoint / get_account / list_suppressed_destinations). Expect 200 + the modeled output; the emulator answers a 5xx with code AmbiguousService and botocore retries it 3 times. Then call a not-found path, e.g. sesv2.get_tenant(TenantName='does-not-exist') or sesv2.get_dedicated_ip(Ip='203.0.113.42'), and expect NotFoundException (404) — the same AmbiguousService arrives instead. Replay the 89 cause-1 check ids in trace_ids.
 Cause 2: call the SES v1 (awsQuery) ListTemplates against the same endpoint — ses.list_templates() — and observe botocore raising ResponseParserError on a JSON '__type' body instead of a ClientError with a Code. Replay sesv2.v1-template-token-continues-the-v2-list.
+
+## Resolution
+Both causes are fixed, and pinned by tests: each of the four crates that sign as `ses`
+claims only the requests addressing its own endpoint and wire form (`can_handle` in each
+crate's `src/service.rs`), so no request to this family has more than one claimant, and
+every refusal rendered after a service is claimed and before its handler runs is framed
+by that service's own protocol. The tests are
+`services/service-com-amazonaws-sesv2-simpleemailservice-v2/tests/all/request_claim.rs`
+(which requests this service claims) and
+`core/router/tests/all/ses_family_pre_dispatch_refusals.rs` (the operations named above
+reaching SESv2, and the per-protocol framing of a pre-dispatch refusal), beside
+`core/router/tests/all/ses_family_signing_name_routing.rs`.
+
+Handover: the per-check replay keys above that assert a specific modelled refusal
+(`sesv2.get-import-job-unknown-rejected`, `sesv2.import-job-invalid-data-source-rejected`,
+`sesv2.send-bulk-email-missing-default-template-data-rejected`,
+`sesv2.delete-suppressed-destination-unknown-rejected`,
+`sesv2.get-dedicated-ip-unknown-rejected`,
+`sesv2.put-dedicated-ip-warmup-attributes-unknown-rejected`,
+`sesv2.put-account-dedicated-ip-warmup-attributes-out-of-range-percentage-rejected`,
+`sesv2.put-configuration-set-archiving-options-unknown-cs-rejected`,
+`sesv2.list-recommendations-unknown-resource-not-found`) now reach the operations
+themselves, several of which are still `SCAFFOLDED, NOT IMPLEMENTED` and are owned by
+their own stub reports under `issues/things-that-do-not-work/`. Those keys stay failing
+until those reports are fixed; they are not regressions of the routing fix recorded here.

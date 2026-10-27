@@ -27,7 +27,7 @@
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dataset_data_segments`], keyed
 //! by the dataset, each record naming the dataset the data came from, the time
 //! series it covers and the half-open span it covers of it, which is what a
-//! deletion addresses one by. A workspace's searches live in
+//! listing reports and a deletion addresses one by. A workspace's searches live in
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::searches`], keyed by the
 //! workspace and the search id, each record carrying the request the search was
 //! started from and the instants its lifecycle transitions fall due, so the
@@ -4238,6 +4238,30 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             SeriesKey::Disassociated(alias) => self
                 .disassociated_stream_type(alias)
                 .map(|(data_type, _)| data_type),
+        }
+    }
+
+    /// The `PropertyAlias` the stream `key` names answers to: the alias carried by
+    /// the asset property that owns it, or the alias a disassociated stream is
+    /// itself keyed by. `None` when the store holds no such stream, and for a
+    /// stream whose owning asset property carries no alias at all.
+    ///
+    /// The counterpart of [`Self::series_data_type`] for a reader that needs the
+    /// stream's ALIAS: one data stream answers to one alias whether an asset
+    /// property is associated with it or not, so every reader takes it from here
+    /// rather than reaching into [`Self::assets`] or
+    /// [`Self::disassociated_time_series`] on its own.
+    pub fn series_alias(&self, key: &SeriesKey) -> Option<&str> {
+        match key {
+            SeriesKey::Property(asset_id, property_id) => self
+                .assets
+                .get(asset_id)
+                .and_then(|asset| asset.property(property_id))
+                .and_then(|property| property.alias.as_deref()),
+            SeriesKey::Disassociated(alias) => self
+                .disassociated_time_series
+                .get(alias)
+                .map(|series| series.alias.as_str()),
         }
     }
 
