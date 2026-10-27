@@ -37,7 +37,7 @@ use crate::ecs_wire::{
 /// One listed attribute, reduced to what a client keys on: the full ARN of the resource
 /// it is on, its name and its value (the empty string for an attribute stored without
 /// one).
-type Listed = (String, String, String);
+pub(crate) type Listed = (String, String, String);
 
 /// One row of the registration table: the case name, the EC2 instance id the identity
 /// document names and the `attributes` the agent reports for it.
@@ -48,7 +48,7 @@ type RegistrationRow = (&'static str, &'static str, Value);
 type FilterRow = (&'static str, Option<&'static str>, Option<&'static str>, Vec<usize>);
 
 /// Register one container instance carrying `attributes` and return its ARN.
-async fn register_with_attributes(
+pub(crate) async fn register_with_attributes(
     router: &MultiServiceRouter,
     cluster: &str,
     instance_id: &str,
@@ -75,7 +75,7 @@ async fn register_with_attributes(
 ///
 /// Each entry is checked to carry no `targetType`: the listing reports the full ARN of
 /// the target, which is the form `Attribute$targetType` is NOT required for.
-async fn list_attributes(
+pub(crate) async fn list_attributes(
     router: &MultiServiceRouter,
     request: Value,
     case: &str,

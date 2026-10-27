@@ -57,6 +57,8 @@ mod distribution_lifecycle;
 mod distribution_tags;
 #[path = "all/distribution_tenant_lifecycle.rs"]
 mod distribution_tenant_lifecycle;
+#[path = "all/distribution_tenant_update.rs"]
+mod distribution_tenant_update;
 #[path = "all/distribution_tenants_by_customization.rs"]
 mod distribution_tenants_by_customization;
 #[path = "all/distribution_web_acl_association.rs"]

@@ -8,10 +8,12 @@
 //!
 //! * a sandbox that leaves the queue is provisioned and becomes a live session — it
 //!   reports `RUNNING` with `currentSession.currentPhase` `RUN_SANDBOX` and STAYS there
-//!   for as long as its own `timeoutInMinutes` has not elapsed;
-//! * once that documented wait ("How long, in minutes, from 5 to 2160 (36 hours), for
-//!   CodeBuild to wait before timing out this sandbox if it does not get marked as
-//!   completed") has elapsed, the sandbox is `TIMED_OUT` and has ended;
+//!   for as long as the wait it carries has not run out;
+//! * once that wait ("How long, in minutes, from 5 to 2160 (36 hours), for CodeBuild to
+//!   wait before timing out this sandbox if it does not get marked as completed",
+//!   emulated on the compressed sandbox clock) has run out, the clock reaps the sandbox
+//!   and it has ended `STOPPED` — the one terminal status a sandbox that stops running
+//!   reaches, whoever ended it;
 //! * `StopSandbox` ends a sandbox that has not ended on its own, from whichever phase
 //!   it is in, and leaves one that already ended as it was.
 //!
@@ -42,6 +44,22 @@ const PAST_THE_SETTLE_SPAN: Duration =
 /// Milliseconds in a minute — a `timeoutInMinutes` is measured in minutes and the
 /// store in epoch millis.
 const MILLIS_PER_MINUTE: i64 = 60_000;
+
+/// How far either side of the reap a case is placed, so the wall clock moving on
+/// between seeding a record and reading it back cannot decide a boundary row.
+const CLEAR_OF_THE_REAP: i64 = 2_000;
+
+/// How long a sandbox carrying `timeout_minutes` stays live: the wait AWS documents in
+/// minutes, on the compressed clock this emulator reaps a sandbox on and inside the
+/// bounds that clock publishes. A record carrying no member falls back to the project
+/// build-timeout default AWS documents.
+fn live_span_millis(timeout_minutes: Option<i32>) -> i64 {
+    let minutes = i64::from(timeout_minutes.unwrap_or(state::DEFAULT_BUILD_TIMEOUT_MINUTES));
+    (minutes * MILLIS_PER_MINUTE / state::SANDBOX_IDLE_CLOCK_SCALE).clamp(
+        state::MIN_SANDBOX_IDLE_SPAN_MILLIS,
+        state::MAX_SANDBOX_IDLE_SPAN_MILLIS,
+    )
+}
 
 /// One router carrying only this service, over the engine the caller holds.
 fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
@@ -147,17 +165,17 @@ fn phase_pairs(session: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Persist a sandbox whose session went live `age_minutes` ago, carrying
+/// Persist a sandbox whose session went live `age_millis` ago, carrying
 /// `timeout_minutes` — the way `StartSandbox` persists one, but with the instants
-/// placed in the past so a wait AWS measures in minutes is observable in a test.
+/// placed in the past, so a test reads a sandbox of any age without waiting for one.
 fn seed_live_sandbox(
     engine: &engine::InMemoryEngine,
     project: &str,
     id: &str,
     timeout_minutes: Option<i32>,
-    age_minutes: i64,
+    age_millis: i64,
 ) {
-    let started = state::now_millis() - age_minutes * MILLIS_PER_MINUTE;
+    let started = state::now_millis() - age_millis;
     let requested = started - state::SANDBOX_SETTLE_MILLIS;
     engine.state::<CodeBuildState>().lock().insert_sandbox(
         id.to_string(),
@@ -181,146 +199,152 @@ fn seed_live_sandbox(
 }
 
 /// RULE: a sandbox is a live session, not a job with an outcome — it reports `RUNNING`
-/// in the `RUN_SANDBOX` phase from the instant it is provisioned until the
-/// `timeoutInMinutes` it carries has elapsed, and only then is it `TIMED_OUT` and
-/// ended.
+/// in the `RUN_SANDBOX` phase from the instant it is provisioned until the wait it
+/// carries runs out, and the clock then reaps it with nobody having called: it ends
+/// `STOPPED`, the one terminal status a sandbox that stops running reaches, at the
+/// instant the wait ran out rather than at the instant it was read.
 ///
-/// The table spans that documented wait: the published bounds of
-/// `Sandbox$timeoutInMinutes` ("from 5 to 2160 (36 hours)"), a value between them, and
-/// the project default a sandbox carries when the member was never set — each just
-/// inside the wait, exactly at it, and past it.
+/// The table spans that wait: the published bounds of `Sandbox$timeoutInMinutes` ("from
+/// 5 to 2160 (36 hours)"), values between them, and the project default a sandbox
+/// carries when the member was never set — each read inside the wait, at it, and past
+/// it. The emulator serves the wait on its compressed sandbox clock, so what the rows
+/// pin is that the configured wait decides when the reap falls due, monotonically and
+/// inside the bounds that clock publishes.
 #[tokio::test]
-async fn a_live_sandbox_runs_until_its_documented_timeout_elapses() {
+async fn a_live_sandbox_runs_until_its_wait_runs_out_and_is_then_reaped_stopped() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(Arc::clone(&engine));
     create_project(&router, "timeout-proj", json!({})).await;
 
-    // (case, the sandbox's timeoutInMinutes, minutes since it went live, expected status)
-    let cases: Vec<(&str, Option<i32>, i64, &str)> = vec![
-        ("the documented minimum, a minute in", Some(5), 1, "RUNNING"),
-        ("the documented minimum, at the wait", Some(5), 5, "TIMED_OUT"),
-        (
-            "the documented minimum, a minute past it",
-            Some(5),
-            6,
-            "TIMED_OUT",
-        ),
-        ("a value between the bounds, inside", Some(480), 479, "RUNNING"),
-        (
-            "a value between the bounds, past it",
-            Some(480),
-            481,
-            "TIMED_OUT",
-        ),
-        (
-            "the documented maximum, a minute short of 36 hours",
-            Some(2160),
-            2159,
-            "RUNNING",
-        ),
-        (
-            "the documented maximum, at 36 hours",
-            Some(2160),
-            2160,
-            "TIMED_OUT",
-        ),
-        (
-            "the documented maximum, a day past it",
-            Some(2160),
-            2160 + 24 * 60,
-            "TIMED_OUT",
-        ),
+    // (case, the sandbox's timeoutInMinutes), ascending in the wait they configure.
+    let cases: Vec<(&str, Option<i32>)> = vec![
+        ("the documented minimum", Some(5)),
+        ("a quarter of an hour", Some(15)),
+        ("the project default, set explicitly", Some(60)),
+        ("a value between the bounds", Some(480)),
+        ("the documented maximum", Some(2160)),
         // No member at all: the record falls back to the 60 minutes AWS documents as
         // the project build-timeout default, which `CreateProject` stores.
-        ("no timeout member, inside the default", None, 59, "RUNNING"),
-        ("no timeout member, past the default", None, 61, "TIMED_OUT"),
+        ("no timeout member at all", None),
     ];
 
-    for (index, (case, timeout_minutes, age_minutes, expected)) in cases.iter().enumerate() {
-        let id = format!("timeout-proj:case-{index:02}");
-        seed_live_sandbox(
-            &engine,
-            "timeout-proj",
-            &id,
-            *timeout_minutes,
-            *age_minutes,
-        );
+    let mut spans: Vec<(&str, i64)> = Vec::new();
 
-        let record = read_sandbox(&router, &id).await;
-        let actual = text(&record, "status");
-        assert_eq!(
-            &actual, expected,
-            "case {case:?}: expected status {expected}, got {actual:?} in {record}"
+    for (index, (case, timeout_minutes)) in cases.iter().enumerate() {
+        let span = live_span_millis(*timeout_minutes);
+        assert!(
+            (state::MIN_SANDBOX_IDLE_SPAN_MILLIS..=state::MAX_SANDBOX_IDLE_SPAN_MILLIS)
+                .contains(&span),
+            "case {case:?}: expected a live span inside the bounds the sandbox clock \
+             publishes, got {span}"
         );
+        spans.push((case, span));
 
-        let session = record["currentSession"].clone();
-        assert_eq!(
-            text(&session, "status"),
-            *expected,
-            "case {case:?}: the session must report the sandbox's status, got {session}"
-        );
+        // (moment, how long ago this sandbox's session went live, the status then)
+        let moments: [(&str, i64, &str); 3] = [
+            ("read inside the wait", span - CLEAR_OF_THE_REAP, "RUNNING"),
+            ("read as the wait runs out", span, "STOPPED"),
+            ("read well past the wait", span + CLEAR_OF_THE_REAP, "STOPPED"),
+        ];
 
-        if *expected == "RUNNING" {
+        for (moment_index, (moment, age_millis, expected)) in moments.iter().enumerate() {
+            let case = format!("{case}, {moment}");
+            let id = format!("timeout-proj:case-{index:02}-{moment_index}");
+            seed_live_sandbox(&engine, "timeout-proj", &id, *timeout_minutes, *age_millis);
+
+            let record = read_sandbox(&router, &id).await;
+            let actual = text(&record, "status");
             assert_eq!(
-                text(&session, "currentPhase"),
-                "RUN_SANDBOX",
-                "case {case:?}: a live session sits in RUN_SANDBOX, got {session}"
+                &actual, expected,
+                "case {case:?}: expected status {expected}, got {actual:?} in {record}"
             );
-            assert!(
-                record["endTime"].is_null(),
-                "case {case:?}: a live sandbox has not ended, got {record}"
-            );
-            assert!(
-                record["startTime"].is_number(),
-                "case {case:?}: a live sandbox reports when it started, got {record}"
-            );
+
+            let session = record["currentSession"].clone();
             assert_eq!(
-                phase_pairs(&session),
-                vec![
-                    ("SUBMITTED".to_string(), "SUCCEEDED".to_string()),
-                    ("QUEUED".to_string(), "SUCCEEDED".to_string()),
-                    ("PROVISIONING".to_string(), "SUCCEEDED".to_string()),
-                    ("RUN_SANDBOX".to_string(), String::new()),
-                ],
-                "case {case:?}: provisioning must have succeeded and the run be open, \
-                 got {session}"
+                text(&session, "status"),
+                *expected,
+                "case {case:?}: the session must report the sandbox's status, got {session}"
             );
-        } else {
+
+            if *expected == "RUNNING" {
+                assert_eq!(
+                    text(&session, "currentPhase"),
+                    "RUN_SANDBOX",
+                    "case {case:?}: a live session sits in RUN_SANDBOX, got {session}"
+                );
+                assert!(
+                    record["endTime"].is_null(),
+                    "case {case:?}: a live sandbox has not ended, got {record}"
+                );
+                assert!(
+                    record["startTime"].is_number(),
+                    "case {case:?}: a live sandbox reports when it started, got {record}"
+                );
+                assert_eq!(
+                    phase_pairs(&session),
+                    vec![
+                        ("SUBMITTED".to_string(), "SUCCEEDED".to_string()),
+                        ("QUEUED".to_string(), "SUCCEEDED".to_string()),
+                        ("PROVISIONING".to_string(), "SUCCEEDED".to_string()),
+                        ("RUN_SANDBOX".to_string(), String::new()),
+                    ],
+                    "case {case:?}: provisioning must have succeeded and the run be open, \
+                     got {session}"
+                );
+            } else {
+                assert_eq!(
+                    text(&session, "currentPhase"),
+                    "COMPLETED",
+                    "case {case:?}: an ended session sits in COMPLETED, got {session}"
+                );
+                let started = record["startTime"].as_f64().unwrap_or_default();
+                let ended = record["endTime"].as_f64().unwrap_or_default();
+                // awsJson timestamps are epoch SECONDS; the store keeps millis.
+                let waited_millis = ((ended - started) * 1000.0).round() as i64;
+                assert_eq!(
+                    waited_millis, span,
+                    "case {case:?}: the reap must be recorded {span} ms after the session \
+                     went live, whenever it was read, got {waited_millis} in {record}"
+                );
+                assert_eq!(
+                    phase_pairs(&session),
+                    vec![
+                        ("SUBMITTED".to_string(), "SUCCEEDED".to_string()),
+                        ("QUEUED".to_string(), "SUCCEEDED".to_string()),
+                        ("PROVISIONING".to_string(), "SUCCEEDED".to_string()),
+                        ("RUN_SANDBOX".to_string(), "STOPPED".to_string()),
+                        ("COMPLETED".to_string(), String::new()),
+                    ],
+                    "case {case:?}: the run phase must close with the status the reap \
+                     gave the session, got {session}"
+                );
+            }
+
+            // Computed from the stored instants, so a second read reports the same record.
+            let reread = read_sandbox(&router, &id).await;
             assert_eq!(
-                text(&session, "currentPhase"),
-                "COMPLETED",
-                "case {case:?}: an ended session sits in COMPLETED, got {session}"
-            );
-            let started = record["startTime"].as_f64().unwrap_or_default();
-            let ended = record["endTime"].as_f64().unwrap_or_default();
-            // awsJson timestamps are epoch SECONDS, so the wait is seconds / 60.
-            let waited_minutes = ((ended - started) / 60.0).round() as i64;
-            let documented = i64::from(timeout_minutes.unwrap_or(60));
-            assert_eq!(
-                waited_minutes, documented,
-                "case {case:?}: must time out exactly {documented} minutes after it \
-                 went live, got {waited_minutes} in {record}"
-            );
-            assert_eq!(
-                phase_pairs(&session),
-                vec![
-                    ("SUBMITTED".to_string(), "SUCCEEDED".to_string()),
-                    ("QUEUED".to_string(), "SUCCEEDED".to_string()),
-                    ("PROVISIONING".to_string(), "SUCCEEDED".to_string()),
-                    ("RUN_SANDBOX".to_string(), "TIMED_OUT".to_string()),
-                    ("COMPLETED".to_string(), String::new()),
-                ],
-                "case {case:?}: the run phase must carry the timeout, got {session}"
+                reread, record,
+                "case {case:?}: a sandbox must not be re-fabricated per call, got {reread}"
             );
         }
+    }
 
-        // Computed from the stored instants, so a second read reports the same record.
-        let reread = read_sandbox(&router, &id).await;
-        assert_eq!(
-            reread, record,
-            "case {case:?}: a sandbox must not be re-fabricated per call, got {reread}"
+    // A longer configured wait is never the shorter emulated one, and a sandbox that
+    // names no wait is reaped exactly like one that names the project default.
+    for pair in spans.windows(2) {
+        let [(shorter, short_span), (longer, long_span)] = [&pair[0], &pair[1]];
+        assert!(
+            short_span <= long_span,
+            "case {longer:?}: a longer configured wait must not be reaped sooner than \
+             {shorter:?}, got {long_span} against {short_span}"
         );
     }
+    assert_eq!(
+        live_span_millis(None),
+        live_span_millis(Some(state::DEFAULT_BUILD_TIMEOUT_MINUTES)),
+        "a sandbox carrying no timeoutInMinutes must wait exactly as long as one \
+         carrying the project build-timeout default"
+    );
 }
 
 /// RULE: `StopSandbox` ends a sandbox that has not ended on its own — whichever phase
@@ -413,22 +437,29 @@ async fn stop_sandbox_ends_a_sandbox_from_whichever_phase_it_is_in() {
         "stopping it twice must report the same record, got {body}"
     );
 
-    // A sandbox the clock already timed out keeps that outcome.
-    seed_live_sandbox(&engine, "stop-proj", "stop-proj:timed-out", Some(5), 9);
-    let (status, body) = call(
-        &router,
-        "StopSandbox",
-        json!({"id": "stop-proj:timed-out"}),
-    )
-    .await;
+    // A sandbox the clock already reaped keeps that outcome — the same token a stop
+    // produces, so stopping it is indistinguishable from not having to.
+    seed_live_sandbox(
+        &engine,
+        "stop-proj",
+        "stop-proj:reaped",
+        Some(5),
+        live_span_millis(Some(5)) + CLEAR_OF_THE_REAP,
+    );
+    let reaped = read_sandbox(&router, "stop-proj:reaped").await;
+    assert_eq!(
+        text(&reaped, "status"),
+        "STOPPED",
+        "a sandbox the clock reaped reports the terminal status a stop does, got {reaped}"
+    );
+    let (status, body) = call(&router, "StopSandbox", json!({"id": "stop-proj:reaped"})).await;
     assert_eq!(
         status, 200,
-        "stopping a timed-out sandbox: expected 200, got {status} with {body}"
+        "stopping a reaped sandbox: expected 200, got {status} with {body}"
     );
     assert_eq!(
-        text(&body["sandbox"], "status"),
-        "TIMED_OUT",
-        "a sandbox the clock already ended keeps its outcome, got {body}"
+        body["sandbox"], reaped,
+        "a sandbox the clock already ended keeps the record it ended with, got {body}"
     );
 
     // (case, the id asked for)

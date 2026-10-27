@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the metadata of an identity this service holds: the pool's own record of when
+//! the identity was minted, when it last changed, and the login providers it is linked to.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORTING call — "Returns metadata related to the given identity" — so it reads the
+//! stored identity and writes nothing: what a later caller sees is what the calls that
+//! minted or linked the identity left. "You must use Amazon Web Services developer
+//! credentials to call this operation", so the call is authorized against the calling
+//! principal's identity-based policies, on the pool the identity belongs to, BEFORE the
+//! identity is read.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +152,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeIdentity"))
+        // The call AWS audits is this one, whatever it answers: the record is written from
+        // the outcome, so a refused read is recorded with the error code its caller was
+        // answered with. The identity itself is untouched by its own record.
+        let request_parameters = ::service_common::management_events::recorded_members([(
+            "identityId",
+            ::serde_json::json!(input.identity_id),
+        )]);
+        let region = crate::state::request_region(ctx.parts());
+        // The resource the call acted on is the pool the identity belongs to.
+        let identity_pool_id = crate::state::identity_pool_of(&*self.engine, &input.identity_id);
+        let outcome = self.describe(input, ctx).await;
+        crate::state::record_served_call(
+            &*self.engine,
+            ctx.parts(),
+            &crate::state::ServedCall {
+                operation: Self::NAME,
+                region: &region,
+                // A describe reports the stored identity and changes nothing.
+                read_only: true,
+                identity_pool_id,
+                request_parameters,
+                // The metadata this call answers is read from the identity itself rather
+                // than from the record of the call.
+                response_elements: None,
+            },
+            &outcome,
+        );
+        outcome
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DescribeIdentity<Eng> {
+    /// The describe itself: authorize, then report the stored identity.
+    async fn describe(
+        &self,
+        input: DescribeIdentityInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<DescribeIdentityOutput, DescribeIdentityError> {
+        // Authorization comes first, before the identity is read: this is a
+        // developer-credentials operation, so it is served only to a caller whose
+        // identity-based IAM policies allow its own action on the pool the identity named
+        // belongs to. A request naming an identity this service does not hold addresses no
+        // one pool, so it is decided against the account's pools — which is what keeps an
+        // unauthorized caller from learning whether the identity exists.
+        let resource = crate::state::identity_pool_of(&*self.engine, &input.identity_id)
+            .map(|identity_pool_id| crate::state::identity_pool_arn(&identity_pool_id));
+        if let Some(denied) = crate::state::authorization::denied(
+            &*self.engine,
+            ctx,
+            <Self as smithy_server_runtime::Operation>::NAME,
+            resource.as_deref(),
+        ) {
+            return Err(denied);
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeIdentityErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the identity-pool store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(identity) = store.identities.get(&input.identity_id) else {
+            return Err(DescribeIdentityErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Identity '{}' not found.", input.identity_id)),
+                },
+            )
+            .into());
+        };
+
+        // The same metadata a listing of the pool's identities reports for it, read from
+        // the one stored record both answer from.
+        Ok(DescribeIdentityOutput {
+            identity_id: Some(identity.identity_id.clone()),
+            logins: Some(identity.logins.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(identity.creation_date)),
+            last_modified_date: Some(::aws_smithy_types::DateTime::from(
+                identity.last_modified_date,
+            )),
+        })
     }
 }

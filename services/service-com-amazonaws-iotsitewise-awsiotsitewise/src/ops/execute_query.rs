@@ -7,9 +7,10 @@
 //!
 //! The engine itself — [`run_statement`] and the helpers below it — is this
 //! service's ONE query path: `StartQuery` runs the statements of a workspace's
-//! asynchronous queries through the same entry point, so the two operations cannot
-//! drift about which statements they admit or which rows they read. Changing this
-//! operation's own wire behaviour stays here; changing the engine changes both.
+//! asynchronous queries through the same entry point, and `GetQueryResults` answers
+//! the rows of such a query through it too, so none of them can drift about which
+//! statements they admit or which rows they read. Changing this operation's own wire
+//! behaviour stays here; changing the engine changes all of them.
 //!
 //! ## Shape of an operation
 //!
@@ -196,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .clamp(1, MAX_ROWS_PER_PAGE) as usize;
         let end = start.saturating_add(max_results).min(result.rows.len());
-        let next_token = (end < result.rows.len()).then(|| ::hex::encode(end.to_string()));
+        let next_token = (end < result.rows.len()).then(|| encode_row_offset(end));
 
         Ok(ExecuteQueryOutput {
             columns: Some(
@@ -227,11 +228,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Parse `statement`, plan it and run it over the store, answering the rows it
 /// computes and what the run COST.
 ///
-/// This is this service's query engine, entered here by both operations that run a
-/// caller's SQL: `ExecuteQuery`, which answers the rows synchronously, and
-/// `StartQuery`, which runs the statement of a workspace's asynchronous query. One
-/// entry point rather than two, so both admit the same statements, over the same
-/// views, under the same budget.
+/// This is this service's query engine, entered here by every operation that runs a
+/// caller's SQL: `ExecuteQuery`, which answers the rows synchronously, `StartQuery`,
+/// which runs the statement of a workspace's asynchronous query, and
+/// `GetQueryResults`, which answers the rows of one such query. One entry point
+/// rather than three, so each admits the same statements, over the same views, under
+/// the same budget.
 ///
 /// The statement is SQL, so it goes through a real SQL parser (the `sqlparser`
 /// crate) rather than being matched on as text: a statement the parser cannot read
@@ -393,6 +395,14 @@ impl QueryRun {
         u64::try_from(self.rows.len()).unwrap_or(u64::MAX)
     }
 
+    /// How many rows this result HOLDS, in the type a slice index takes: the same
+    /// number [`Self::row_count`] reports as the `Long` a statistic carries, so a
+    /// caller's paging arithmetic is exact against the rows the result holds
+    /// instead of against a conversion of that figure.
+    pub(crate) fn rows_held(&self) -> usize {
+        self.rows.len()
+    }
+
     /// How many bytes of stored cells the run read off the store.
     pub(crate) fn bytes_scanned(&self) -> u64 {
         self.bytes_scanned
@@ -401,6 +411,32 @@ impl QueryRun {
     /// How long the run took, from the first read of the store to the answer.
     pub(crate) fn elapsed(&self) -> ::std::time::Duration {
         self.elapsed
+    }
+
+    /// The columns the statement projects: each the name the result reports it
+    /// under and the `ScalarType` value of the type its cells carry.
+    ///
+    /// The engine names a column's type in ONE vocabulary (`ScalarType`); an
+    /// operation whose own result member names it in another translates it where
+    /// it serialises, so this answers what the engine computed and nothing else.
+    pub(crate) fn columns(&self) -> &[(String, &'static str)] {
+        &self.columns
+    }
+
+    /// The rows of this result inside `page`, each cell rendered as the text the
+    /// wire carries for it and `None` for an absent value — which is what a null
+    /// cell is.
+    ///
+    /// A range reaching past the end answers nothing, so a caller's own paging
+    /// arithmetic cannot make this panic, and only the page asked for is
+    /// rendered: the rest of the result is never copied.
+    pub(crate) fn text_rows(&self, page: ::std::ops::Range<usize>) -> Vec<Vec<Option<String>>> {
+        self.rows
+            .get(page)
+            .unwrap_or_default()
+            .iter()
+            .map(|row| row.iter().map(Cell::as_text).collect())
+            .collect()
     }
 }
 
@@ -463,15 +499,22 @@ pub(crate) fn classify(error: &ExecuteQueryError) -> QueryFailure<'_> {
     }
 }
 
-/// How many rows one page carries when the caller gives no `maxResults`, and the
-/// ceiling on how many it may ask for.
+/// How many rows one page of a query's results carries when the caller gives no
+/// `maxResults`, and the ceiling on how many THIS operation lets one ask for.
 ///
-/// The emulator's own bound, not a published AWS default: `maxResults` is modelled
-/// with a minimum of 1 and no maximum, so a response needs a cap of its own for one
-/// call not to be able to serialise an unbounded result set. Everything past a page
-/// is reachable through `nextToken`.
-const DEFAULT_MAX_RESULTS: i32 = 250;
-/// See [`DEFAULT_MAX_RESULTS`].
+/// The emulator's own bound, not a published AWS default: this operation's
+/// `maxResults` is modelled with a minimum of 1 and no maximum, so a response needs
+/// a cap of its own for one call not to be able to serialise an unbounded result
+/// set. Everything past a page is reachable through `nextToken`.
+///
+/// The DEFAULT is shared with the other operation that pages a query's rows
+/// (`GetQueryResults`), so a client sees one page size whichever path it read the
+/// rows of a query through, and the two cannot drift apart.
+pub(crate) const DEFAULT_MAX_RESULTS: i32 = 250;
+/// See [`DEFAULT_MAX_RESULTS`]. The ceiling is this operation's own, because the
+/// member it bounds is the one modelled without a maximum of its own: the other
+/// operation that pages a query's rows carries the model's `maxResults` range, which
+/// the runtime enforces for it before its handler runs.
 const MAX_ROWS_PER_PAGE: i32 = 1_000;
 
 /// How many source rows' worth of WORK one query may do — the step budget this
@@ -1987,13 +2030,33 @@ fn unsupported(construct: &str) -> ExecuteQueryError {
     })
 }
 
-/// Decode a `nextToken` back into the row offset it resumes from.
-fn decode_token(token: &str) -> Result<usize, ExecuteQueryError> {
+/// The `nextToken` that resumes a query's rows at `offset`.
+///
+/// The token FORM belongs to this engine — the index of the first row of the next
+/// page, hex-encoded so it stays opaque to the caller — and every operation that
+/// pages a query's rows issues that same form, so it is built here once, beside the
+/// decoder that reads it back.
+pub(crate) fn encode_row_offset(offset: usize) -> String {
+    ::hex::encode(offset.to_string())
+}
+
+/// The row offset a `nextToken` over a query's rows resumes from, or `None` for
+/// text this service never issued as one.
+///
+/// Reads back what [`encode_row_offset`] writes. WHICH offsets an operation then
+/// accepts is that operation's own question — each knows how many rows the result it
+/// is paging holds — so this answers only what the token says, and the operation
+/// lifts a `None`, or an offset outside its result, into its own modelled refusal.
+pub(crate) fn decode_row_offset(token: &str) -> Option<usize> {
     ::hex::decode(token)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|text| text.parse().ok())
-        .ok_or_else(|| {
-            invalid_request("The nextToken is not a token this operation issued.".to_string())
-        })
+}
+
+/// Decode a `nextToken` back into the row offset it resumes from.
+fn decode_token(token: &str) -> Result<usize, ExecuteQueryError> {
+    decode_row_offset(token).ok_or_else(|| {
+        invalid_request("The nextToken is not a token this operation issued.".to_string())
+    })
 }
