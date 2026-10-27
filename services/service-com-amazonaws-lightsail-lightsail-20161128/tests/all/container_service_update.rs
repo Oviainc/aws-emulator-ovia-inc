@@ -155,6 +155,63 @@ async fn wait_for_state(emulator: &Emulator, region: &str, name: &str, want: &st
     }
 }
 
+/// The one Region the certificate API is served in (the modelled
+/// `InvalidInputException` documentation: "Domain and distribution APIs are only
+/// available in the N. Virginia (us-east-1) Amazon Web Services Region"), which
+/// is where this suite's harness sends a call the shared stand-up makes with no
+/// credential scope of its own, whichever region the container service of a row
+/// lives in.
+const CERTIFICATE_REGION: &str = "us-east-1";
+
+/// One signed call to this service, which is all the shared certificate stand-up
+/// needs of this suite's harness. Every call of this suite carries a credential
+/// scope, so one the stand-up leaves open is made in the certificate API's own
+/// Region.
+impl crate::distribution_certificate_attachment::SignedCall for Emulator {
+    async fn call_signed(
+        &self,
+        region: Option<&str>,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        self.call(region.unwrap_or(CERTIFICATE_REGION), operation, body)
+            .await
+    }
+}
+
+/// Stand up every certificate the `publicDomainNames` of `body` are keyed by,
+/// issued, so a request carrying them is one the account can be served.
+///
+/// A container service's `publicDomainNames` is keyed by the name of the SSL/TLS
+/// certificate that secures the domains listed under it, and "You must create and
+/// validate an SSL/TLS certificate before you can use public domain names with
+/// your container service" — so an update naming one has to hold an issued
+/// certificate of that name first. The stand-up and the issuance wait are the ONE
+/// pair this test target holds (`distribution_certificate_attachment`), and the
+/// certificate it requests covers exactly the domains the request keys by it.
+async fn issue_certificates_of(emulator: &Emulator, body: &Value) {
+    let Some(names) = body["publicDomainNames"].as_object() else {
+        return;
+    };
+    for (certificate, domains) in names {
+        let domains: Vec<&str> = domains
+            .as_array()
+            .map(|domains| {
+                domains
+                    .iter()
+                    .map(|domain| domain.as_str().unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::distribution_certificate_attachment::issue_certificate(
+            emulator,
+            certificate,
+            &domains,
+        )
+        .await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The update table
 // ---------------------------------------------------------------------------
@@ -572,6 +629,12 @@ fn assert_configuration(case: &str, region: &str, name: &str, expected: &Expecte
 async fn an_update_applies_only_the_members_it_names() {
     let emulator = Emulator::new();
     for row in rows() {
+        // Every certificate the row's requests key public domain names by, held
+        // and issued before the first of them is made.
+        issue_certificates_of(&emulator, &row.create).await;
+        for step in &row.steps {
+            issue_certificates_of(&emulator, &step.request).await;
+        }
         let created = emulator.create(row.region, create_body(&row)).await;
         // The identity the update must not touch: nothing here is an update's
         // business, whatever it changes.
@@ -864,17 +927,14 @@ async fn an_unservable_update_is_refused_and_changes_nothing() {
         let emulator = Emulator::new();
         let region = "us-east-1";
         let name = "unchanged";
-        let created = emulator
-            .create(
-                region,
-                json!({
-                    "serviceName": name,
-                    "power": "micro",
-                    "scale": 2,
-                    "publicDomainNames": {"kept-cert": ["kept.example.com"]},
-                }),
-            )
-            .await;
+        let create = json!({
+            "serviceName": name,
+            "power": "micro",
+            "scale": 2,
+            "publicDomainNames": {"kept-cert": ["kept.example.com"]},
+        });
+        issue_certificates_of(&emulator, &create).await;
+        let created = emulator.create(region, create).await;
 
         let mut body = asked.clone();
         body["serviceName"] = json!(name);

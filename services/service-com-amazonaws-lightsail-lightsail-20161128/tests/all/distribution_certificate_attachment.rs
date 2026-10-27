@@ -72,6 +72,33 @@ const ISSUER_CA: &str = "Amazon";
 // Driving the service
 // ---------------------------------------------------------------------------
 
+/// What standing up a certificate needs of a suite's harness: ONE call to this
+/// service, in `region` when the suite names one, answering the HTTP status and
+/// the parsed body.
+///
+/// `pub(crate)` with one implementation per harness, so the ONE certificate
+/// stand-up and the ONE issuance wait below serve every suite whose cases need an
+/// issued certificate — whatever its own `Emulator` looks like — rather than each
+/// carrying its own copy of the call and the poll.
+pub(crate) trait SignedCall {
+    /// Call `operation` with `body`, in `region` when one is given, and `None` to
+    /// carry no credential scope at all (which this service serves in its default
+    /// region).
+    async fn call_signed(&self, region: Option<&str>, operation: &str, body: Value)
+        -> (u16, Value);
+}
+
+impl SignedCall for Emulator {
+    async fn call_signed(
+        &self,
+        region: Option<&str>,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        self.call_in(region, operation, body).await
+    }
+}
+
 /// Request the certificate `name` for `domain`, with `alternatives` as its
 /// alternate domains, answering the `certificate` the create reports.
 ///
@@ -90,21 +117,39 @@ pub(crate) async fn create_certificate(
     emulator.ok("CreateCertificate", body).await["certificate"].clone()
 }
 
-/// The stored certificate `name`, in full, as `GetCertificates` reports it.
+/// The HTTP status `GetCertificates` answers for the certificate `name`, and the
+/// record it reports — `Value::Null` when this account holds no certificate of
+/// that name.
 ///
-/// `pub(crate)` for the same reason as [`create_certificate`].
-pub(crate) async fn certificate(emulator: &Emulator, name: &str) -> Value {
-    let body = emulator
-        .ok(
+/// The certificate API is served by one Region alone, so the call carries no
+/// credential scope: it is served in the default region, which IS that one,
+/// whichever region the resource keyed by the certificate lives in.
+pub(crate) async fn certificate_entry<E: SignedCall>(emulator: &E, name: &str) -> (u16, Value) {
+    let (status, body) = emulator
+        .call_signed(
+            None,
             "GetCertificates",
             json!({"certificateName": name, "includeCertificateDetails": true}),
         )
         .await;
-    body["certificates"]
+    let record = body["certificates"]
         .as_array()
         .and_then(|certificates| certificates.first())
         .cloned()
-        .unwrap_or(Value::Null)
+        .unwrap_or(Value::Null);
+    (status, record)
+}
+
+/// The stored certificate `name`, in full, as `GetCertificates` reports it.
+///
+/// `pub(crate)` for the same reason as [`create_certificate`].
+pub(crate) async fn certificate(emulator: &Emulator, name: &str) -> Value {
+    let (status, record) = certificate_entry(emulator, name).await;
+    assert_eq!(
+        status, 200,
+        "case reading the certificate {name}: expected HTTP 200, got {status} {record:?}"
+    );
+    record
 }
 
 /// Poll `GetCertificates` until the certificate `name` reports `ISSUED`,
@@ -115,10 +160,10 @@ pub(crate) async fn certificate(emulator: &Emulator, name: &str) -> Value {
 ///
 /// `pub(crate)` so the ONE issuance wait of this test target serves every suite
 /// whose case needs an issued certificate.
-pub(crate) async fn wait_for_issued_certificate(emulator: &Emulator, name: &str) -> Value {
+pub(crate) async fn wait_for_issued_certificate<E: SignedCall>(emulator: &E, name: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let reported = certificate(emulator, name).await;
+        let (_, reported) = certificate_entry(emulator, name).await;
         if reported["certificateDetail"]["status"].as_str() == Some(ISSUED) {
             return reported;
         }
@@ -128,6 +173,40 @@ pub(crate) async fn wait_for_issued_certificate(emulator: &Emulator, name: &str)
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// Request the certificate `name` covering `domains`, unless this account holds
+/// one of that name already, and wait until the certificate authority has issued
+/// it.
+///
+/// The first domain is the certificate's `domainName` and the rest its alternate
+/// domains, so the certificate really covers the domains the resource keyed by it
+/// then serves.
+///
+/// `pub(crate)` so every suite whose cases need an ISSUED certificate of the
+/// account — a distribution's, or the one a container service's public domain
+/// names are keyed by — stands one up through this one helper.
+pub(crate) async fn issue_certificate<E: SignedCall>(emulator: &E, name: &str, domains: &[&str]) {
+    // Whether the account holds it is read off the RECORD, not off the status: a
+    // name nothing was created under answers the `DoesNotExist` envelope with no
+    // certificate in it, and any other answer leaves the record null too, which
+    // the create's own assertion below then reports.
+    let (_, held) = certificate_entry(emulator, name).await;
+    if held.is_null() {
+        let (domain, alternatives) = domains
+            .split_first()
+            .expect("a certificate secures at least one domain");
+        let mut body = json!({"certificateName": name, "domainName": domain});
+        if !alternatives.is_empty() {
+            body["subjectAlternativeNames"] = json!(alternatives);
+        }
+        let (status, created) = emulator.call_signed(None, "CreateCertificate", body).await;
+        assert_eq!(
+            status, 200,
+            "case requesting the certificate {name}: expected HTTP 200, got {status} {created:?}"
+        );
+    }
+    wait_for_issued_certificate(emulator, name).await;
 }
 
 /// The stored distribution `name`, as `GetDistributions` reports it.
