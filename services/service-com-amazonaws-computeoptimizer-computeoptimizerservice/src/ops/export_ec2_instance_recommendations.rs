@@ -228,6 +228,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 exportable_fields: EXPORTABLE_INSTANCE_FIELD_VALUES,
                 file_format: input.file_format,
                 one_job_in_progress: ONE_JOB_IN_PROGRESS,
+                // "When you specify AWS_ARM64 with an ExportEC2InstanceRecommendations
+                // request, Compute Optimizer exports recommendations that consist of Graviton
+                // instance types only": the preference selects which recommendation options
+                // the exported rows are of, by the same rule `GetEC2InstanceRecommendations`
+                // reports them under.
+                recommendation_preferences: input.recommendation_preferences,
             },
         )
         .map_err(refuse)?;
