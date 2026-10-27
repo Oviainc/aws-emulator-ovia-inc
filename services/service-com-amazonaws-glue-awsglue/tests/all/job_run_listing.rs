@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_glue_awsglue::state::messages::JOB_RUNS_JOB_NOT_FOUND;
+use service_com_amazonaws_glue_awsglue::state::messages::JOB_NOT_FOUND;
 use service_com_amazonaws_glue_awsglue::state::{
     ComAmazonawsGlueAwsglueState, JOB_RUN_NOT_EXECUTED_MESSAGE, JOB_RUN_STATE_FAILED,
     JOB_RUN_STATE_STARTING,
@@ -411,7 +411,7 @@ async fn a_job_the_store_does_not_hold_is_not_found() {
         );
         assert_eq!(
             error_message(&body),
-            JOB_RUNS_JOB_NOT_FOUND,
+            JOB_NOT_FOUND,
             "case {case:?}: expected the wording the corpus records for this listing's job \
              miss, got {body}"
         );
