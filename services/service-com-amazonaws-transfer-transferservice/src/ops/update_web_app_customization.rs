@@ -14,6 +14,12 @@
 //! app's customization is what `DeleteWebAppCustomization` is for; an omitted member is
 //! "not modified", never "removed".
 //!
+//! An update of a web app that HOLDS no customization — one none was ever assigned to,
+//! or one whose customization that delete removed — is what brings the object into
+//! existence, so the members this request carries are assigned to a fresh one and the
+//! ones it omits stay unset. That is the counterpart of the delete: afterwards the web
+//! app has a customization again, and its readers project it rather than refusing.
+//!
 //! A `WebAppId` the store does not hold is answered with the modelled
 //! `ResourceNotFoundException`. The model carries no version, ETag or client token for
 //! this operation, so there is no documented condition under which it conflicts: two
@@ -188,9 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The partial-update rule, applied through the one function that holds it:
         // every member the request carries is assigned, every member it omits is left
-        // as it stands.
+        // as it stands. An update of a web app that holds no customization object
+        // creates it, which is what makes the update the counterpart of the delete.
         stored
             .customization
+            .get_or_insert_with(st::WebAppCustomization::default)
             .assign(input.title, input.logo_file, input.favicon_file);
         let web_app_id = stored.web_app_id.clone();
         drop(guard);

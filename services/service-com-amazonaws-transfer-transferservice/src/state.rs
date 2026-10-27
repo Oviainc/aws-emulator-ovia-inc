@@ -46,7 +46,11 @@
 //! built here, as a FIXED text per condition that carries no request data: the
 //! identifier a caller needs to see travels in the error's own `Resource`/
 //! `ResourceType` members, so an id can never reach a message a client logs or asserts
-//! on, and a text can never be derived from an internal name. A handler still words
+//! on, and a text can never be derived from an internal name. The ONE exception is a
+//! condition whose recorded wording itself names the resource in the text
+//! ([`no_web_app_customization`]): the service's own words are the requirement, so that
+//! text is reproduced as a template whose variable part is read off the REQUEST, never
+//! off an internal name. A handler still words
 //! its own refusals for conditions this module holds no text for (a store-capacity
 //! refusal, say); the one message built from the request is the framework's
 //! `ValidationException`, whose template (member path + modelled constraint, no value)
@@ -828,6 +832,22 @@ pub fn accesses_require_directory_provider(
 /// already deleted.
 pub fn unknown_web_app(web_app_id: &str) -> ResourceNotFoundException {
     resource_not_found(&NOT_FOUND_WEB_APP, web_app_id)
+}
+
+/// The not-found payload for a web app that HOLDS no customization — none was ever
+/// assigned to it, or `DeleteWebAppCustomization` removed the one that was.
+///
+/// The web app itself resolved, so this reports the missing sub-resource rather than a
+/// bad `WebAppId`: it is the one condition in this service whose recorded wording names
+/// the resource inside the text, so the text is a template over the `WebAppId` the
+/// REQUEST carried (see this module's header) while `Resource`/`ResourceType` stay what
+/// every other web-app refusal carries.
+pub fn no_web_app_customization(web_app_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("The WebApp {web_app_id} doesn't have customization"),
+        resource: web_app_id.to_string(),
+        resource_type: RESOURCE_TYPE_WEB_APP.to_string(),
+    }
 }
 
 /// The not-found payload for a `ProfileId` the store does not hold — never created,
@@ -2855,9 +2875,16 @@ pub struct WebApp {
     /// the web app rather than in a map of its own because a customization has no
     /// identifier of its own: it is addressed by `WebAppId`, and
     /// `DescribedWebAppCustomization.Arn` is documented as "the ARN for the web app",
-    /// i.e. [`Self::arn`]. A web app no customization was assigned to carries the
-    /// default (every member unset), which no `CreateWebApp` member can set.
-    pub customization: WebAppCustomization,
+    /// i.e. [`Self::arn`].
+    ///
+    /// `None` is the web app HAVING no customization: a customization is a sub-resource
+    /// that comes into existence when an update assigns it ("deletes the
+    /// WebAppCustomization object that corresponds to the web app ID specified" is what
+    /// `DeleteWebAppCustomization` does to it) and ceases to exist when that delete
+    /// removes it, so a reader of a web app that holds none has no object to project —
+    /// see [`no_web_app_customization`]. No `CreateWebApp` member can set one, so a new
+    /// web app starts with `None`.
+    pub customization: Option<WebAppCustomization>,
     /// When the update this web app is CURRENTLY applying completes, or `None` when it
     /// is applying none — see [`WEB_APP_UPDATE_SPAN`].
     pub update_due: Option<Instant>,
@@ -2927,7 +2954,9 @@ pub fn web_app_has_no_vpc_endpoint() -> InvalidRequestException {
 /// of those three members OPTIONAL beside the `@required` `WebAppId` — so an update
 /// assigns the members it carries and leaves the others as they stand
 /// ([`Self::assign`]); removing a customization is what the service's own
-/// `DeleteWebAppCustomization` is for, not an omitted member. Each member is `None`
+/// `DeleteWebAppCustomization` is for, not an omitted member — and that delete removes
+/// the WHOLE object ([`WebApp::customization`] goes back to `None`), which is what an
+/// omitted member never does. Each member is `None`
 /// until an update assigns it, and `DescribeWebAppCustomization` reports exactly the
 /// ones that were: `Title` is modelled `len 0..100`, so `Some(String::new())` is a
 /// title a caller really did assign (the empty one) and is distinct from never having

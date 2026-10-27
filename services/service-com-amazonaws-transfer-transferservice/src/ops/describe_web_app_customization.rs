@@ -8,10 +8,13 @@
 //!
 //! `Arn` is documented as "the ARN for the web app", so the customization is reported
 //! under the web app's own ARN — a customization has no identifier of its own and is
-//! addressed only by `WebAppId`. A web app no update has customized yet reports that
-//! ARN and id with none of `Title`, `LogoFile` or `FaviconFile`, since nothing has
-//! assigned them; a `WebAppId` the store does not hold is answered with the modelled
-//! `ResourceNotFoundException`.
+//! addressed only by `WebAppId`. The output's `WebAppCustomization` is `@required`, and
+//! a customization is an OBJECT that exists only once an update assigned it and ceases
+//! to exist when `DeleteWebAppCustomization` removes it — so a web app that holds none
+//! has nothing to project and is answered with the modelled
+//! `ResourceNotFoundException` naming it, exactly as a `WebAppId` the store does not
+//! hold is. A web app that has one reports the members some update assigned and no
+//! others, since nothing has assigned them.
 //!
 //! ## Shape of an operation
 //!
@@ -171,6 +174,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // The web app resolved, but a customization is an object of its own: a web app
+        // none was assigned to — or whose customization `DeleteWebAppCustomization`
+        // removed — holds nothing this `@required` output could project.
+        let Some(customization) = stored.customization.as_ref() else {
+            return Err(st::not_found(
+                DescribeWebAppCustomizationErrorModeled::ResourceNotFoundException(
+                    st::no_web_app_customization(&input.web_app_id),
+                ),
+            ));
+        };
+
         let web_app_customization = DescribedWebAppCustomization {
             // The web app's own ARN: `Arn` is documented as "the ARN for the web app".
             arn: stored.arn.clone(),
@@ -178,9 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Each member is reported only when an update assigned it; an unassigned
             // one is absent rather than defaulted, because the model documents no
             // default title, logo or icon.
-            title: stored.customization.title.clone(),
-            logo_file: stored.customization.logo_file.clone(),
-            favicon_file: stored.customization.favicon_file.clone(),
+            title: customization.title.clone(),
+            logo_file: customization.logo_file.clone(),
+            favicon_file: customization.favicon_file.clone(),
         };
 
         Ok(DescribeWebAppCustomizationOutput {
