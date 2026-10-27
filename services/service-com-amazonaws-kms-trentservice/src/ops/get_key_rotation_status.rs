@@ -257,11 +257,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|schedule| crate::state::date_time(schedule.next_rotation_date())),
             // "Identifies the date and time that an IN PROGRESS on-demand rotation
             // was initiated ... once the on-demand rotation is complete, KMS removes
-            // this field from the response": `RotateKeyOnDemand` here completes the
-            // rotation it performs before it answers, so no key ever has one in
-            // progress and no start date is manufactured for a completed one. The
-            // dates of completed rotations are what `ListKeyRotations` reports.
-            on_demand_rotation_start_date: None,
+            // this field from the response": an on-demand rotation is in progress for
+            // the span after the call that started it
+            // (`crate::state::ON_DEMAND_ROTATION_SPAN`), which is read off the rotation
+            // the key recorded rather than written by this read. The dates of completed
+            // rotations are what `ListKeyRotations` reports.
+            on_demand_rotation_start_date: key
+                .on_demand_rotation_in_progress()
+                .map(crate::state::date_time),
         })
     }
 }

@@ -2484,10 +2484,17 @@ fn ordering_requirement(check: &str, status: &str, status_message: String) -> Or
 ///
 /// "The payment options to include in the quote pricing. If not specified, all
 /// available payment options are returned", and the same sentence for the payment
-/// terms — and a list the modelled `length(min: 0)` let arrive empty names no more
-/// than an absent member does. A value named twice is one request for it, so the
+/// terms — and a list the modelled `length(min: 0, max: 3)` let arrive empty names no
+/// more than an absent member does. A value named twice is one request for it, so the
 /// quote is priced under each distinct value once, in the order the request named
 /// them in.
+///
+/// What is kept is what the MODEL declares: a value outside `modelled` names none of
+/// the payment values this service prices, so it is dropped here rather than carried
+/// into the combinations a quote is priced under — which is what keeps the number of
+/// those combinations a figure of the model (`modelled.len()` per set) however long a
+/// list arrives, and the membership test a set lookup rather than a walk of
+/// everything kept so far.
 fn requested_or_modelled<'a>(
     requested: Option<&'a [String]>,
     modelled: &'static [&'static str],
@@ -2495,8 +2502,9 @@ fn requested_or_modelled<'a>(
     match requested {
         Some(values) if !values.is_empty() => {
             let mut named: Vec<&str> = Vec::new();
+            let mut already: BTreeSet<&str> = BTreeSet::new();
             for value in values.iter().map(String::as_str) {
-                if !named.contains(&value) {
+                if modelled.contains(&value) && already.insert(value) {
                     named.push(value);
                 }
             }
@@ -3496,12 +3504,21 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             .find(|task| task.outpost_id == outpost_id && task.is_active())
     }
 
-    /// The capacity task that is still ACTIVE on `order_id`, if any. See
+    /// The capacity task of `region` that is still ACTIVE on `order_id`, if any. See
     /// [`Self::active_capacity_task_on_outpost`] — the same rule, stated for the
     /// other resource a task is one-at-a-time per.
-    pub fn active_capacity_task_on_order(&self, order_id: &str) -> Option<&CapacityTaskRecord> {
-        self.capacity_tasks
-            .values()
+    ///
+    /// Scoped to `region` for the reason [`RegionalRecord`] gives: an order belongs
+    /// to the region it was placed in, so only that region's tasks can be running on
+    /// it, and a conflict is never reported about a task of an inventory the caller's
+    /// endpoint does not serve. A task takes its region from its Outpost, which is
+    /// what [`Self::capacity_tasks_in`] scopes by.
+    pub fn active_capacity_task_on_order(
+        &self,
+        region: &str,
+        order_id: &str,
+    ) -> Option<&CapacityTaskRecord> {
+        self.capacity_tasks_in(region)
             .find(|task| task.order_id.as_deref() == Some(order_id) && task.is_active())
     }
 
@@ -3927,18 +3944,6 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             .assets
             .iter()
             .find(|asset| asset.asset_id.as_deref() == Some(asset_id))
-    }
-
-    /// Whether this store holds the Amazon Web Services Outposts order `order_id`.
-    ///
-    /// An order is a TOP-LEVEL resource of the account (`CreateOrder` persists one
-    /// and `GetOrder` reads it back at `/orders/{OrderId}`), so this asks only
-    /// whether the account placed it. An operation that scopes its answer to the
-    /// hardware an order is FOR needs the narrower question — whether the order was
-    /// placed against the Outpost in hand — and asks it of
-    /// [`OrderRecord::order`]'s own `OutpostId`.
-    pub fn holds_order(&self, order_id: &str) -> bool {
-        self.orders.contains_key(order_id)
     }
 
     /// Mint a fresh 32-byte digest for a resource of kind `kind`, with the creation

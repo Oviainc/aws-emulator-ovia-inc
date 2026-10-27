@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSpotDatafeedSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSpotDatafeedSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Drops the account's ONE Spot Instance data feed from
+//! [`crate::state::ComAmazonawsEc2Amazonec2State`], giving back the bytes
+//! `CreateSpotDatafeedSubscription` charged for it, so a
+//! `DescribeSpotDatafeedSubscription` afterwards reports that the account has no feed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSpotDatafeedSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The delete is IDEMPOTENT: the feed is an account-level singleton with no id, so a caller
+//! names no resource that could be absent, and the recorded service answers a delete made
+//! by an account holding no feed with the same success envelope as one that holds one —
+//! HTTP 200 whose body is the `<return>true</return>` flag the ec2Query envelope writes for
+//! a Unit output (see `crate::service`). The model declares no errors for this operation, so
+//! this handler invents none: `InvalidSpotDatafeed.NotFound` belongs to the REPORT, which
+//! has nothing to answer with when there is no feed, while a delete's postcondition — the
+//! account holds no feed — already holds.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +153,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSpotDatafeedSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSpotDatafeedSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSpotDatafeedSubscription"))
+        use crate::state;
+
+        // "Deletes the data feed for Spot Instances": the feed is one account-level resource,
+        // and this store is per account (`crate::state`'s module docs), so nothing of the
+        // request beyond `DryRun` is read and `ctx` carries nothing this operation needs.
+        let _ = ctx;
+
+        let store = state::require_service_state(&*self.engine)?;
+
+        // DryRun is answered BEFORE the removal, the way every other mutation on this
+        // surface orders it: the flag asks whether the request WOULD have succeeded "without
+        // actually making the request" (`DryRun`), so a dry run leaves the stored feed
+        // exactly where it was.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The removal goes through the store, which gives the record's byte charge back in
+        // the one place that charge is computed. Whether a feed was there is deliberately
+        // discarded: the flag the envelope writes says the request was performed, and after
+        // it the account holds no feed either way.
+        let _had_a_feed = store.lock().remove_spot_datafeed_subscription();
+
+        Ok(DeleteSpotDatafeedSubscriptionOutput)
     }
 }
