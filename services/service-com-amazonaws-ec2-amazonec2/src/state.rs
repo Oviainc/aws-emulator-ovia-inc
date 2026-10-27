@@ -290,6 +290,15 @@
 //! at. The shape carries no status member: AWS hands a trust provider back ready, so the
 //! clock owes it no transition and there is nothing to derive on read.
 //!
+//! [`ComAmazonawsEc2Amazonec2State::remove_verified_access_trust_provider`] is the one way
+//! a trust provider leaves that store: it takes the create token that minted it along with
+//! it, gives the record's caller-chosen bytes back to the byte budget, and — when the
+//! delete named an idempotency token — keeps the removed record under that token
+//! ([`ComAmazonawsEc2Amazonec2State::verified_access_trust_provider_deletion`]) so a
+//! retried delete answers with what the first one answered. That history is bounded by
+//! entry count and drops its oldest entry to make room, because a delete frees the live
+//! record's slot and so leaves no ceiling that would bound it.
+//!
 //! ## Verified Access instances, groups and endpoints
 //!
 //! [`ComAmazonawsEc2Amazonec2State::verified_access_instances`] holds the account's Verified
@@ -1246,7 +1255,7 @@
 //! store holds no request text.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::Ipv6Addr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2649,6 +2658,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// minted, so a repeat of the same request answers with that trust provider instead
     /// of creating a second one.
     pub verified_access_trust_provider_client_tokens: HashMap<String, String>,
+    /// A `DeleteVerifiedAccessTrustProvider` `ClientToken` and the trust provider that
+    /// call removed, newest LAST, so a retry of the same delete answers what the first one
+    /// answered instead of an id that names nothing. The record itself is kept, because the
+    /// trust provider is gone from [`Self::verified_access_trust_providers`] and the answer
+    /// reports it; the history holds at most
+    /// [`MAX_REMEMBERED_VERIFIED_ACCESS_TRUST_PROVIDER_DELETIONS`] of them.
+    pub verified_access_trust_provider_deletions:
+        VecDeque<(String, crate::ops::types::VerifiedAccessTrustProvider)>,
     /// Every Verified Access instance the account holds, by `VerifiedAccessInstanceId`, as
     /// the modelled [`crate::ops::types::VerifiedAccessInstance`] shape itself — see the
     /// module docs. Ordered by id, the order a describe of the instances reports and pages
@@ -3432,6 +3449,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             flow_log_client_tokens: HashMap::new(),
             verified_access_trust_providers: BTreeMap::new(),
             verified_access_trust_provider_client_tokens: HashMap::new(),
+            verified_access_trust_provider_deletions: VecDeque::new(),
             // A fresh account has created no Verified Access instance, no group on one and
             // no endpoint on a group.
             verified_access_instances: BTreeMap::new(),
@@ -13165,6 +13183,29 @@ pub const TRUST_PROVIDER_TYPE_DEVICE: &str = "device";
 /// kind that is OpenID Connect, so the one `OidcOptions` describe.
 pub const USER_TRUST_PROVIDER_TYPE_OIDC: &str = "oidc";
 
+/// What a reported `OidcOptions$ClientSecret` reads as.
+///
+/// The OIDC client secret is WRITE-ONLY: it is the one member of that shape the model
+/// marks sensitive (`smithy_query(query="shape",shape="OidcOptions")`), and a report of a
+/// trust provider answers this fixed mask in its place rather than the value the request
+/// configured — the same arrangement every other AWS API that takes a secret and reports
+/// the resource back uses (CodePipeline's webhook `SecretToken`, which reads as `****`).
+/// So the secret a caller configures is never stored and no read can report it; a trust
+/// provider configured without one reports no secret at all.
+pub const REDACTED_CLIENT_SECRET: &str = "REDACTED";
+
+/// How many answered deletes this store remembers for their idempotency tokens.
+///
+/// A delete FREES a live record's slot, so [`MAX_VERIFIED_ACCESS_TRUST_PROVIDERS`] does not
+/// bound a history that outlives the resource, and neither does [`MAX_STORED_BYTES`]: that
+/// budget charges the text a caller chose the length of, not a record's fixed fields or a
+/// map entry's own footprint, so a create-and-delete loop would grow this history without
+/// end. It therefore keeps the most recent deletes and drops the oldest, the way every
+/// other post-delete history of this emulator is bounded — a retry arrives right after the
+/// call it repeats, so the entries a retry can still reach are the newest ones, and a
+/// delete is never refused because the history is full.
+pub const MAX_REMEMBERED_VERIFIED_ACCESS_TRUST_PROVIDER_DELETIONS: usize = 200;
+
 /// How many Verified Access trust providers this emulator stores before
 /// `CreateVerifiedAccessTrustProvider` is refused.
 ///
@@ -13319,6 +13360,97 @@ impl ComAmazonawsEc2Amazonec2State {
         self.verified_access_trust_providers
             .insert(trust_provider_id.clone(), provider);
         trust_provider_id
+    }
+
+    /// Remove the Verified Access trust provider `trust_provider_id` and answer it as it
+    /// was last reported, or `None` when the store holds no such trust provider.
+    ///
+    /// The `CreateVerifiedAccessTrustProvider` token that minted it goes with it — a token
+    /// must never answer with a trust provider that is no longer stored — and the bytes the
+    /// record held go back to the store's budget on the terms
+    /// [`verified_access_trust_provider_payload_bytes`] took them on.
+    ///
+    /// `client_token` is the DELETE's own token: when the caller gave one, the removed
+    /// record is kept under it ([`Self::verified_access_trust_provider_deletions`]) so a
+    /// retry of that delete answers what the first one answered, and the bytes it keeps are
+    /// charged again under that token. That history is bounded by
+    /// [`MAX_REMEMBERED_VERIFIED_ACCESS_TRUST_PROVIDER_DELETIONS`] entries, the oldest
+    /// dropped (and its bytes given back) to make room, so a create-and-delete loop cannot
+    /// grow it; a delete that names no token frees the record outright.
+    pub fn remove_verified_access_trust_provider(
+        &mut self,
+        trust_provider_id: &str,
+        client_token: Option<&str>,
+    ) -> Option<crate::ops::types::VerifiedAccessTrustProvider> {
+        let provider = self
+            .verified_access_trust_providers
+            .remove(trust_provider_id)?;
+        let minting_token = self
+            .verified_access_trust_provider_client_tokens
+            .iter()
+            .find(|(_, minted)| minted.as_str() == trust_provider_id)
+            .map(|(token, _)| token.clone());
+        if let Some(token) = &minting_token {
+            self.verified_access_trust_provider_client_tokens.remove(token);
+        }
+        self.release_stored_bytes(verified_access_trust_provider_payload_bytes(
+            &provider,
+            minting_token.as_deref(),
+        ));
+        if let Some(token) = client_token {
+            // One token names ONE delete, so a token used again replaces what it named
+            // rather than leaving the history two entries to answer with.
+            if let Some(position) = self
+                .verified_access_trust_provider_deletions
+                .iter()
+                .position(|(remembered, _)| remembered == token)
+            {
+                self.forget_verified_access_trust_provider_deletion(position);
+            }
+            self.add_stored_bytes(verified_access_trust_provider_payload_bytes(
+                &provider,
+                Some(token),
+            ));
+            self.verified_access_trust_provider_deletions
+                .push_back((token.to_string(), provider.clone()));
+            while self.verified_access_trust_provider_deletions.len()
+                > MAX_REMEMBERED_VERIFIED_ACCESS_TRUST_PROVIDER_DELETIONS
+            {
+                self.forget_verified_access_trust_provider_deletion(0);
+            }
+        }
+        Some(provider)
+    }
+
+    /// The trust provider the delete that carried `client_token` removed, while this store
+    /// still remembers that delete.
+    ///
+    /// The history is bounded
+    /// ([`MAX_REMEMBERED_VERIFIED_ACCESS_TRUST_PROVIDER_DELETIONS`]), so a token whose
+    /// delete has been dropped answers `None` — the same answer as a token no delete of this
+    /// store ever carried.
+    pub fn verified_access_trust_provider_deletion(
+        &self,
+        client_token: &str,
+    ) -> Option<&crate::ops::types::VerifiedAccessTrustProvider> {
+        self.verified_access_trust_provider_deletions
+            .iter()
+            .find(|(remembered, _)| remembered == client_token)
+            .map(|(_, provider)| provider)
+    }
+
+    /// Drop the remembered deletion at `position`, giving the bytes it held back to the
+    /// store's budget: the record leaves the history on the same terms it entered it on.
+    fn forget_verified_access_trust_provider_deletion(&mut self, position: usize) {
+        if let Some((token, provider)) = self
+            .verified_access_trust_provider_deletions
+            .remove(position)
+        {
+            self.release_stored_bytes(verified_access_trust_provider_payload_bytes(
+                &provider,
+                Some(&token),
+            ));
+        }
     }
 }
 

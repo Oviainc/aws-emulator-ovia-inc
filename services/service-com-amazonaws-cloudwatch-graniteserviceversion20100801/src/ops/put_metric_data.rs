@@ -498,8 +498,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // notifications it owes are delivered with it released.
         {
             let mut store = state.lock();
-            let mut written: Vec<crate::state::MetricKey> = Vec::with_capacity(ingest.len());
+            let mut written: Vec<crate::state::WrittenSeries> = Vec::with_capacity(ingest.len());
             for (key, observations) in ingest {
+                // The units these datapoints carry, which is what decides whether an alarm
+                // over this series would grade any of them.
+                let units: Vec<Option<String>> = observations
+                    .iter()
+                    .map(|datum| datum.unit.clone())
+                    .collect();
                 let watched = key.clone();
                 if store.append_datapoints(key, observations).is_err() {
                     return Err(PutMetricDataErrorModeled::LimitExceededFault(
@@ -512,7 +518,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
-                written.push(watched);
+                written.push(crate::state::WrittenSeries {
+                    key: watched,
+                    units,
+                });
             }
             // An alarm is evaluated FROM these datapoints, so storing one of the series it
             // watches is what makes its evaluation due.

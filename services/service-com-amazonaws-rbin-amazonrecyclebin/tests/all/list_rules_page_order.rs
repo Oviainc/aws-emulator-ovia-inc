@@ -20,7 +20,9 @@
 
 use serde_json::{json, Value};
 
-use crate::retention_rule_lifecycle::{create_rule, list_of, list_rules, retention, router};
+use crate::retention_rule_lifecycle::{
+    create_rule, list_of, list_rules, retention, router, supported_retention,
+};
 use service_com_amazonaws_rbin_amazonrecyclebin::state::{decode_page_token, is_rule_identifier};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -54,7 +56,7 @@ async fn create_rules(
             router,
             json!({
                 "ResourceType": resource_type,
-                "RetentionPeriod": retention(1 + (nth as i64 % 3650)),
+                "RetentionPeriod": retention(supported_retention(resource_type, nth)),
             }),
         )
         .await;

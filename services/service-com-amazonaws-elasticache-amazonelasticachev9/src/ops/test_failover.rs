@@ -215,9 +215,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = store.settled_replication_group_mut(&key, now) else {
             return Err(TestFailoverErrorModeled::ReplicationGroupNotFoundFault(
                 ReplicationGroupNotFoundFault {
-                    message: Some(format!(
-                        "Replication group {} not found.",
-                        input.replication_group_id
+                    message: Some(crate::state::replication_group_not_found_message(
+                        &input.replication_group_id,
                     )),
                 },
             )

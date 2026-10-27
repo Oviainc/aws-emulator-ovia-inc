@@ -37,6 +37,8 @@ mod scaling_instruction_validation;
 mod scaling_mode_conditional_members;
 #[path = "all/scaling_plan_lifecycle.rs"]
 mod scaling_plan_lifecycle;
+#[path = "all/scaling_plan_resource_policies.rs"]
+mod scaling_plan_resource_policies;
 #[path = "all/stack_arn_predicate_consistency.rs"]
 mod stack_arn_predicate_consistency;
 #[path = "all/state_roundtrip.rs"]

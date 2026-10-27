@@ -612,8 +612,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         ListAllowedNodeTypeModificationsErrorModeled::ReplicationGroupNotFoundFault(
                             ReplicationGroupNotFoundFault {
-                                message: Some(format!(
-                                    "Replication group {replication_group_id} not found."
+                                message: Some(crate::state::replication_group_not_found_message(
+                                    replication_group_id,
                                 )),
                             },
                         )

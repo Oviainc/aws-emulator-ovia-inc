@@ -496,6 +496,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // one Lightsail creates an instance with, exactly as a
                     // directly created one's is.
                     metadata_options: crate::state::StoredMetadataOptions::default(),
+                    // Nothing has authenticated this instance yet, so the
+                    // service holds no recorded host key for it: a host key is
+                    // recorded when the browser-based access path witnesses it
+                    // (`HostKeyAttributes$witnessedAt`), and a snapshot reports
+                    // none to carry over.
+                    known_host_keys: Vec::new(),
                 });
                 // Each mapped disk is restored as a block storage disk of its
                 // own and attached to the new instance at the device path it was

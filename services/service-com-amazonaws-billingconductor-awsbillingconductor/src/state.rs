@@ -1318,6 +1318,15 @@ impl BillingGroupRecord {
         self.status_reason_of(&self.current_version())
     }
 
+    /// True when this group automatically associates the accounts newly joining the
+    /// consolidated billing family — `AccountGrouping.AutoAssociate`, where an absent
+    /// flag is the default `false`. One reading of the flag, so every rule that turns
+    /// on it (the state-wide cap on holders, the refusal to delete a holder) decides
+    /// from the same answer.
+    pub fn auto_associates(&self) -> bool {
+        self.auto_associate.unwrap_or(false)
+    }
+
     /// `BillingGroupType`: a group that bills through a transfer relationship is
     /// `TRANSFER_BILLING`, every other group is `STANDARD`.
     pub fn billing_group_type(&self) -> &'static str {
@@ -3028,9 +3037,7 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     pub fn other_auto_associate_billing_groups(&self, group_arn: &str) -> Vec<String> {
         self.billing_groups
             .iter()
-            .filter(|(arn, group)| {
-                group.auto_associate.unwrap_or(false) && arn.as_str() != group_arn
-            })
+            .filter(|(arn, group)| group.auto_associates() && arn.as_str() != group_arn)
             .map(|(arn, _)| arn.clone())
             .collect()
     }
@@ -3922,6 +3929,31 @@ pub fn too_many_auto_associate_billing_groups(
              billing family may automatically associate newly added accounts; it is already \
              enabled on {}",
             holders.join(", ")
+        ),
+    )
+}
+
+/// The modelled refusal a request earns when it asks to delete a billing group that
+/// still has automatic account association enabled.
+///
+/// A group with `AccountGrouping.AutoAssociate` on is the one the consolidated billing
+/// family hands its newly added accounts to, so it is not deletable while it holds that
+/// election: the caller turns the flag off (`UpdateBillingGroup`) and then deletes.
+/// `ValidationExceptionReason` enumerates
+/// `CANNOT_DELETE_AUTO_ASSOCIATE_BILLING_GROUP` for exactly this
+/// (`smithy_query(query="shape",shape="ValidationExceptionReason")`), so the answer is
+/// the 400 `ValidationException` with that reason. `field` names the input member that
+/// carried the group's ARN.
+pub fn cannot_delete_auto_associate_billing_group(
+    field: &str,
+    group_arn: &str,
+) -> crate::ops::types::ValidationException {
+    validation_exception(
+        "CANNOT_DELETE_AUTO_ASSOCIATE_BILLING_GROUP",
+        field,
+        format!(
+            "the billing group {group_arn} automatically associates newly added accounts and \
+             cannot be deleted; turn AccountGrouping.AutoAssociate off before deleting it"
         ),
     )
 }

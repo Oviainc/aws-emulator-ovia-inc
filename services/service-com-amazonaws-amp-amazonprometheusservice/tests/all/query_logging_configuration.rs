@@ -566,6 +566,243 @@ async fn replaying_a_client_token_creates_no_second_configuration() {
     );
 }
 
+/// Which earlier call recorded the token the update under test carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recorded {
+    /// No call has used this token yet.
+    Nobody,
+    /// `CreateQueryLoggingConfiguration` carried it.
+    Create,
+    /// An earlier `UpdateQueryLoggingConfiguration` carried it.
+    Update,
+    /// `DeleteQueryLoggingConfiguration` carried it.
+    Delete,
+}
+
+/// What the update under test must do with the token it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expected {
+    /// A request this operation has not carried out: the destinations it names become
+    /// the stored ones.
+    Applies,
+    /// The same update again: 202 from the stored record, which stands unchanged.
+    Replays,
+    /// Refused with the modelled `ConflictException` (409); nothing changes.
+    Conflicts,
+}
+
+/// One row of the replay table: who used the token before, what the update carries, and
+/// what it must then do.
+struct Replay {
+    name: &'static str,
+    recorded: Recorded,
+    /// Spans the `IdempotencyToken` shape (`len 1..64`, pattern `^[!-~]+$`): a plain
+    /// name, a UUID, punctuation, the 64-character bound — and no token at all.
+    token: Option<&'static str>,
+    expected: Expected,
+}
+
+/// `UpdateQueryLoggingConfiguration`'s `clientToken` is an `@idempotencyToken`, so a
+/// replay is recognised against the token THIS operation's own last call recorded: a
+/// token some other operation recorded names a request this one never carried out, so
+/// the update applies (or is refused on the state that other call left) rather than
+/// being answered from the stored record. One row per operation that can have recorded
+/// the token.
+#[tokio::test]
+async fn an_update_replays_only_the_token_its_own_last_call_recorded() {
+    let rows = [
+        Replay {
+            name: "a token nothing has used",
+            recorded: Recorded::Nobody,
+            token: Some("fresh-token"),
+            expected: Expected::Applies,
+        },
+        Replay {
+            name: "no token at all",
+            recorded: Recorded::Nobody,
+            token: None,
+            expected: Expected::Applies,
+        },
+        Replay {
+            name: "the token the create carried",
+            recorded: Recorded::Create,
+            token: Some("7f1c9a60-2b4e-4a51-9f2f-8c7d6e5b4a30"),
+            expected: Expected::Applies,
+        },
+        Replay {
+            name: "the punctuated token the create carried",
+            recorded: Recorded::Create,
+            token: Some("!~#$%&*+/=?^_`{|}"),
+            expected: Expected::Applies,
+        },
+        Replay {
+            name: "the token this operation's own last call carried",
+            recorded: Recorded::Update,
+            token: Some("update-token"),
+            expected: Expected::Replays,
+        },
+        Replay {
+            name: "a 64-character token this operation's own last call carried",
+            recorded: Recorded::Update,
+            token: Some("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+            expected: Expected::Replays,
+        },
+        Replay {
+            name: "the token the delete carried",
+            recorded: Recorded::Delete,
+            token: Some("delete-token"),
+            expected: Expected::Conflicts,
+        },
+    ];
+
+    let region = "us-west-2";
+    for row in rows {
+        let amp = Amp::new();
+        let workspace_id = amp.active_workspace(region, "query-logging").await;
+        let stored = log_group_arn(region, "stored-logs");
+        let target = log_group_arn(region, "target-logs");
+
+        // The create: it carries the row's token only where the row says the CREATE is
+        // what recorded it.
+        let mut create_body = serde_json::json!({ "destinations": destinations_json(&stored, 100) });
+        if row.recorded == Recorded::Create {
+            create_body["clientToken"] = serde_json::json!(row.token);
+        }
+        let created = create_configuration(&amp, region, &workspace_id, &create_body).await;
+        assert_eq!(
+            created.status, 202,
+            "case {:?}: create must succeed, got {created:?}",
+            row.name
+        );
+        wait_for_due_transition();
+
+        // The earlier call that records the token, where the row names one. An earlier
+        // update leaves the SAME destinations the create stored, so only the update
+        // under test can change them.
+        if row.recorded == Recorded::Update {
+            let earlier = update_configuration(
+                &amp,
+                region,
+                &workspace_id,
+                &serde_json::json!({
+                    "destinations": destinations_json(&stored, 100),
+                    "clientToken": row.token,
+                }),
+            )
+            .await;
+            assert_eq!(
+                earlier.status, 202,
+                "case {:?}: the earlier update must succeed, got {earlier:?}",
+                row.name
+            );
+        }
+        if row.recorded == Recorded::Delete {
+            let deleted = delete_configuration(&amp, region, &workspace_id, row.token).await;
+            assert_eq!(
+                deleted.status, 202,
+                "case {:?}: the delete must be accepted, got {deleted:?}",
+                row.name
+            );
+        }
+
+        let before = describe_configuration(&amp, region, &workspace_id).await;
+        let mut update_body = serde_json::json!({ "destinations": destinations_json(&target, 7) });
+        if let Some(token) = row.token {
+            update_body["clientToken"] = serde_json::json!(token);
+        }
+        let updated = update_configuration(&amp, region, &workspace_id, &update_body).await;
+
+        match row.expected {
+            Expected::Conflicts => {
+                assert_eq!(
+                    updated.status, 409,
+                    "case {:?}: the update must answer the modelled 409, got {updated:?}",
+                    row.name
+                );
+                assert_eq!(
+                    updated.error_code(),
+                    "ConflictException",
+                    "case {:?}: unexpected error code, got {updated:?}",
+                    row.name
+                );
+            }
+            Expected::Applies | Expected::Replays => {
+                assert_eq!(
+                    updated.status, 202,
+                    "case {:?}: the update must answer the modelled 202, got {updated:?}",
+                    row.name
+                );
+                assert_eq!(
+                    text(&updated.body["status"]["statusCode"]),
+                    QUERY_LOGGING_STATUS_UPDATING,
+                    "case {:?}: the reported status must be the stored one, got {updated:?}",
+                    row.name
+                );
+            }
+        }
+
+        let described = describe_configuration(&amp, region, &workspace_id).await;
+        let metadata = &described.body["queryLoggingConfiguration"];
+        let expected_destinations = match row.expected {
+            Expected::Applies => vec![(target.clone(), 7)],
+            Expected::Replays | Expected::Conflicts => vec![(stored.clone(), 100)],
+        };
+        assert_eq!(
+            destinations_of(&metadata["destinations"]),
+            expected_destinations,
+            "case {:?}: expected the stored destinations to be {expected_destinations:?}, \
+             got {described:?}",
+            row.name
+        );
+        let expected_status = match row.expected {
+            Expected::Applies | Expected::Replays => QUERY_LOGGING_STATUS_UPDATING,
+            Expected::Conflicts => QUERY_LOGGING_STATUS_DELETING,
+        };
+        assert_eq!(
+            text(&metadata["status"]["statusCode"]),
+            expected_status,
+            "case {:?}: expected the stored status to be {expected_status}, got {described:?}",
+            row.name
+        );
+        if row.expected == Expected::Applies {
+            assert!(
+                epoch_seconds(&metadata["modifiedAt"])
+                    >= epoch_seconds(&before.body["queryLoggingConfiguration"]["modifiedAt"]),
+                "case {:?}: an applied update must move modifiedAt to the time of the \
+                 change, got {described:?}",
+                row.name
+            );
+        } else {
+            assert_eq!(
+                metadata["modifiedAt"], before.body["queryLoggingConfiguration"]["modifiedAt"],
+                "case {:?}: a call that changed nothing must leave modifiedAt standing, \
+                 got {described:?}",
+                row.name
+            );
+        }
+
+        // The create's own token still answers as a replay of that create, whatever the
+        // update did with a token of its own.
+        if row.recorded == Recorded::Create {
+            let replayed_create =
+                create_configuration(&amp, region, &workspace_id, &create_body).await;
+            assert_eq!(
+                replayed_create.status, 202,
+                "case {:?}: replaying the create must still be accepted, \
+                 got {replayed_create:?}",
+                row.name
+            );
+            let after = describe_configuration(&amp, region, &workspace_id).await;
+            assert_eq!(
+                destinations_of(&after.body["queryLoggingConfiguration"]["destinations"]),
+                vec![(target.clone(), 7)],
+                "case {:?}: the replayed create must store nothing, got {after:?}",
+                row.name
+            );
+        }
+    }
+}
+
 /// Every one of the four operations answers `ResourceNotFoundException` for a workspace
 /// that holds no such resource — an unknown workspace, and a known workspace with no
 /// configuration.

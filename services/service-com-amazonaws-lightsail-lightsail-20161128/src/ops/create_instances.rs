@@ -348,6 +348,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // way Lightsail creates one;
                     // `UpdateInstanceMetadataOptions` is what changes it.
                     metadata_options: crate::state::StoredMetadataOptions::default(),
+                    // Nothing has authenticated this instance yet, so the
+                    // service holds no recorded host key for it: a host key is
+                    // recorded when the browser-based access path witnesses it
+                    // (`HostKeyAttributes$witnessedAt`).
+                    known_host_keys: Vec::new(),
                 });
                 operations.push(
                     store

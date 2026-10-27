@@ -244,8 +244,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             modified_at: now,
             transition_due: Some(now + crate::state::TRANSITION_DELAY),
-            create_token: input.client_token.clone(),
-            client_token: input.client_token,
+            create_token: input.client_token,
+            // Nothing has updated it yet, so no token stands for an update of this
+            // configuration: the create's own token is remembered in `create_token`
+            // alone, where only a replayed create is matched against it.
+            update_token: None,
         };
 
         let response = CreateQueryLoggingConfigurationOutput {

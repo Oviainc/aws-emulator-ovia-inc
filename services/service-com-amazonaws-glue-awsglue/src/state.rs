@@ -1971,6 +1971,15 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// The stored databases ordered by folded name — the deterministic order
+    /// `GetDatabases` pages over, the same order [`DatabaseEntry::tables_ordered`] gives
+    /// the tables of one database.
+    pub fn databases_ordered(&self) -> Vec<&DatabaseEntry> {
+        let mut databases: Vec<&DatabaseEntry> = self.databases.values().collect();
+        databases.sort_by(|left, right| left.name.cmp(&right.name));
+        databases
+    }
+
     /// Whether this catalog can hold another database, i.e. is below
     /// [`MAX_DATABASES_PER_CATALOG`].
     pub fn can_store_database(&self) -> bool {

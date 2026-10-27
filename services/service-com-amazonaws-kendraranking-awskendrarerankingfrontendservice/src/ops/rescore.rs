@@ -6,17 +6,26 @@
 //! execution plan, which must exist in this service's store and must have reached
 //! `ACTIVE` — a plan still `CREATING` is refused with the modelled `ValidationException`
 //! ("When the value is ACTIVE, the rescore execution plan is ready for use."). Every result item names a
-//! document the request carried, with a score computed from that document's own text
-//! and original score, and the list is ordered by descending score.
+//! document the request carried, and the list is ordered by descending score.
+//!
+//! A score belongs to a SCORING UNIT, not to a submitted document: submitted documents
+//! that carry the same `GroupId` are "grouped together and processed as one document
+//! within the service" (`Document$GroupId`), so their text is pooled into one unit,
+//! scored once, and every member of the group carries that one score and sits in the
+//! group's single position in the ordering. A document with no `GroupId` is a unit of
+//! its own. See [`scoring_units`].
 //!
 //! WHAT IS AND IS NOT FAITHFUL HERE: the real service scores with a semantic model
 //! this emulator does not have, so the MAGNITUDE of a `Score` is an emulator-chosen
 //! lexical heuristic (query-term overlap blended with `OriginalScore`, see
-//! [`rescored_score`]) and no caller should depend on the numbers. What is faithful is
+//! [`unit_score`]) and no caller should depend on the numbers — and that includes which
+//! `OriginalScore` stands for a GROUP, which this emulator takes to be the highest its
+//! members carry. What is faithful is
 //! everything around it, and that is what the tests pin: one result item per submitted
-//! document, every `DocumentId` drawn from the request, a descending order, scores
-//! inside the range the model gives `Score`, a deterministic answer for one input, and
-//! a plan that must exist.
+//! document, every `DocumentId` drawn from the request, a descending order with a group
+//! occupying one position, one score shared by a group's members, scores inside the
+//! range the model gives `Score`, a deterministic answer for one input, and a plan that
+//! must exist.
 //!
 //! ## Shape of an operation
 //!
@@ -101,7 +110,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -300,22 +309,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let query_terms = distinct_query_terms(&input.search_query);
-        let mut ranked: Vec<(String, f32)> = input
-            .documents
-            .iter()
-            .map(|document| {
-                (
-                    document.id.clone(),
-                    rescored_score(&query_terms, document),
-                )
+        // One score per scoring unit, so a group of documents is ranked as the one
+        // document it is processed as, and each of its members reports that score.
+        let mut ranked: Vec<(f32, Vec<String>)> = scoring_units(&input.documents)
+            .into_iter()
+            .map(|mut unit| {
+                let score = unit_score(&query_terms, &unit);
+                // Inside one unit the members are listed by document id, the same
+                // tie-break the ordering below applies between units.
+                unit.member_ids.sort();
+                (score, unit.member_ids)
             })
             .collect();
-        // "The results are in descending order." Ties fall back to the document id, so
-        // one request's ranking is one total order rather than an input-order accident.
-        ranked.sort_by(|(left_id, left_score), (right_id, right_score)| {
+        // "The results are in descending order." Ties fall back to the unit's lowest
+        // document id, so one request's ranking is one total order rather than an
+        // input-order accident, and a unit of one document keeps ordering by its id.
+        ranked.sort_by(|(left_score, left_ids), (right_score, right_ids)| {
             right_score
                 .total_cmp(left_score)
-                .then_with(|| left_id.cmp(right_id))
+                .then_with(|| left_ids.first().cmp(&right_ids.first()))
         });
 
         Ok(RescoreOutput {
@@ -325,9 +337,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             result_items: Some(
                 ranked
                     .into_iter()
-                    .map(|(document_id, score)| RescoreResultItem {
-                        document_id: Some(document_id),
-                        score: Some(score),
+                    // A unit's members stay together: the group holds ONE position in
+                    // the ordering, with one result item naming each document the
+                    // request submitted under it.
+                    .flat_map(|(score, member_ids)| {
+                        member_ids
+                            .into_iter()
+                            .map(move |document_id| RescoreResultItem {
+                                document_id: Some(document_id),
+                                score: Some(score),
+                            })
                     })
                     .collect(),
             ),
@@ -367,26 +386,91 @@ const SCORE_MIN: f32 = -100_000.0;
 /// See [`SCORE_MIN`].
 const SCORE_MAX: f32 = 100_000.0;
 
-/// The score this service gives `document` for a query carrying `query_terms`.
+/// What this operation scores: one submitted document, or every submitted document that
+/// carries the same `GroupId` pooled into the single document the service processes them
+/// as.
+#[derive(Debug)]
+struct ScoringUnit {
+    /// The ids of the documents this unit was built from, in the order they joined it;
+    /// the ranking re-orders them by id before they reach the answer. Never empty: a
+    /// unit exists because a document joined it.
+    member_ids: Vec<String>,
+    /// The unit's title terms: the union of its members' title terms.
+    title_terms: BTreeSet<String>,
+    /// The unit's body terms: the union of its members' body terms.
+    body_terms: BTreeSet<String>,
+    /// The original score the unit is blended with: the highest its members carry.
+    /// Which member's score stands for a group is EMULATOR-chosen, like the weights in
+    /// [`unit_score`]; taking the highest keeps a unit of one document scored exactly as
+    /// that document's own `OriginalScore` and keeps the unit inside the range the model
+    /// gives `OriginalScore`.
+    original_score: f32,
+}
+
+/// The scoring units of one request's documents, in the order each unit's FIRST member
+/// was submitted.
 ///
-/// It blends the document's own `OriginalScore` with the share of the query's distinct
-/// terms the document's text carries, weighting the title above the body, and stays
-/// inside the range the model gives `Score`.
+/// `Document$GroupId` is "the optional group identifier of the document from the search
+/// service. Documents with the same group identifier are grouped together and processed
+/// as one document within the service", so documents sharing a group identifier pool
+/// into one unit — their title and body text joins one unit's text — while a document
+/// that carries no group identifier is a unit holding only itself. Grouping is by the
+/// identifier's exact value and spans only the documents of this one request.
+fn scoring_units(documents: &[Document]) -> Vec<ScoringUnit> {
+    let mut units: Vec<ScoringUnit> = Vec::new();
+    let mut unit_of_group: BTreeMap<&str, usize> = BTreeMap::new();
+    for document in documents {
+        let title_terms = field_terms(
+            document.title.as_deref(),
+            document.tokenized_title.as_deref(),
+        );
+        let body_terms = field_terms(document.body.as_deref(), document.tokenized_body.as_deref());
+        // The unit this document joins: the one its group already opened, or a new one
+        // (which a later document carrying the same group identifier then joins).
+        let joined = match document.group_id.as_deref() {
+            Some(group_id) => match unit_of_group.entry(group_id) {
+                std::collections::btree_map::Entry::Occupied(opened) => Some(*opened.get()),
+                std::collections::btree_map::Entry::Vacant(unopened) => {
+                    unopened.insert(units.len());
+                    None
+                }
+            },
+            None => None,
+        };
+        match joined {
+            Some(index) => {
+                let unit = &mut units[index];
+                unit.member_ids.push(document.id.clone());
+                unit.title_terms.extend(title_terms);
+                unit.body_terms.extend(body_terms);
+                unit.original_score = unit.original_score.max(document.original_score);
+            }
+            None => units.push(ScoringUnit {
+                member_ids: vec![document.id.clone()],
+                title_terms,
+                body_terms,
+                original_score: document.original_score,
+            }),
+        }
+    }
+    units
+}
+
+/// The score this service gives one scoring unit for a query carrying `query_terms`.
+///
+/// It blends the unit's `OriginalScore` with the share of the query's distinct terms the
+/// unit's text carries, weighting the title above the body, and stays inside the range
+/// the model gives `Score`.
 ///
 /// The weights are the EMULATOR's, not the service's: Amazon Kendra Intelligent Ranking
 /// re-ranks with a semantic model, which this emulator cannot run, so this is a
-/// deterministic lexical stand-in. Its guarantees are ordinal, not absolute — a document
+/// deterministic lexical stand-in. Its guarantees are ordinal, not absolute — a unit
 /// whose text carries more of the query outranks one that carries less at the same
 /// original score, and the same input always yields the same ranking.
-fn rescored_score(query_terms: &[String], document: &Document) -> f32 {
-    let title_terms = field_terms(
-        document.title.as_deref(),
-        document.tokenized_title.as_deref(),
-    );
-    let body_terms = field_terms(document.body.as_deref(), document.tokenized_body.as_deref());
-    let relevance = TITLE_WEIGHT * coverage(query_terms, &title_terms)
-        + BODY_WEIGHT * coverage(query_terms, &body_terms);
-    (ORIGINAL_SCORE_WEIGHT * document.original_score + RELEVANCE_WEIGHT * relevance)
+fn unit_score(query_terms: &[String], unit: &ScoringUnit) -> f32 {
+    let relevance = TITLE_WEIGHT * coverage(query_terms, &unit.title_terms)
+        + BODY_WEIGHT * coverage(query_terms, &unit.body_terms);
+    (ORIGINAL_SCORE_WEIGHT * unit.original_score + RELEVANCE_WEIGHT * relevance)
         .clamp(SCORE_MIN, SCORE_MAX)
 }
 
