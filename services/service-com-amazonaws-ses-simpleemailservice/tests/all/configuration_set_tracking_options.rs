@@ -18,6 +18,9 @@
 //!   before the set is looked up at all, and changes nothing;
 //! * the association must exist before an update modifies it, and a second
 //!   create does not replace it;
+//! * a delete removes the association the set carries — whatever form the
+//!   stored domain took — leaves everything else on the set alone, and is
+//!   refused when there is no association, or no set, to delete;
 //! * a configuration set name is admitted exactly when it meets the documented
 //!   naming rule.
 
@@ -78,6 +81,16 @@ async fn update_tracking_options(
     .await
 }
 
+/// `DeleteConfigurationSetTrackingOptions`.
+async fn delete_tracking_options(router: &MultiServiceRouter, name: &str) -> (u16, String) {
+    call(
+        router,
+        "DeleteConfigurationSetTrackingOptions",
+        &[field("ConfigurationSetName", name)],
+    )
+    .await
+}
+
 /// `DescribeConfigurationSet`, asking for the attribute groups in `attributes`.
 async fn describe_configuration_set(
     router: &MultiServiceRouter,
@@ -121,6 +134,20 @@ fn refusal(body: &str) -> (Option<String>, Option<String>) {
 /// not a domain name, one for a domain no verified identity covers.
 const NOT_A_DOMAIN: &str = "The tracking domain you specified is not a valid domain or subdomain.";
 const NOT_VERIFIED: &str = "The tracking domain you specified is not verified in Amazon SES.";
+
+/// The refusal a tracking-options operation that needs an existing association
+/// answers for a set carrying none: the modelled
+/// `TrackingOptionsDoesNotExistException`, which SES renders on the query wire
+/// as `<Code>TrackingOptionsDoesNotExist</Code>`, and the one sentence it
+/// reports that absence with, naming the set the request supplied.
+fn no_such_association(name: &str) -> (Option<String>, Option<String>) {
+    (
+        Some("TrackingOptionsDoesNotExist".to_string()),
+        Some(format!(
+            "There are no tracking options for configuration set <{name}>"
+        )),
+    )
+}
 
 /// A set with an existing tracking-options association, over an engine that
 /// already holds a verified domain identity: the fixture every case about
@@ -334,10 +361,7 @@ async fn an_association_must_exist_before_an_update_modifies_it() {
         );
         assert_eq!(
             refusal(&body),
-            (
-                Some("TrackingOptionsDoesNotExistException".to_string()),
-                Some("The TrackingOptions object you specified does not exist.".to_string())
-            ),
+            no_such_association("fresh-set"),
             "case update fresh-set to {domain:?}: expected the no-such-association refusal, \
              got {body}"
         );
@@ -445,5 +469,202 @@ async fn a_configuration_set_name_is_admitted_exactly_when_the_rule_admits_it() 
             Some("Configuration set <cs> already exists.".to_string())
         ),
         "case create cs twice: expected the already-exists refusal, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_removes_the_association_whatever_form_the_stored_domain_took() {
+    let router = emulator();
+    verify_domain(&router, "example.com").await;
+    // Every form the write rule admits, so the delete is exercised over the
+    // whole class of stored domains rather than one of them: one label under the
+    // verified apex, several labels, a label carrying digits and dashes, the apex
+    // itself, and a fully qualified (trailing-dot) name, which is stored without
+    // its root label.
+    let cases = [
+        ("set-1", "click.example.com"),
+        ("set-2", "deep.nested.track.example.com"),
+        ("set-3", "a-1.example.com"),
+        ("set-4", "example.com"),
+        ("set-5", "click.example.com."),
+    ];
+    for (name, domain) in cases {
+        let (status, body) = create_configuration_set(&router, name).await;
+        assert_eq!(
+            status, 200,
+            "case create {name}: expected 200, got {status} with {body}"
+        );
+        let (status, body) = create_tracking_options(&router, name, domain).await;
+        assert_eq!(
+            status, 200,
+            "case create tracking options {name} -> {domain:?}: expected 200, got {status} \
+             with {body}"
+        );
+
+        let (status, body) = delete_tracking_options(&router, name).await;
+        assert_eq!(
+            status, 200,
+            "case delete {name} holding {domain:?}: expected 200, got {status} with {body}"
+        );
+        // The association is gone: the set is still there and reports no
+        // tracking options at all.
+        let reported = described_tracking_domain(&router, name).await;
+        assert_eq!(
+            reported, None,
+            "case delete {name} holding {domain:?}: expected no tracking options, got {reported:?}"
+        );
+
+        // A second delete has nothing left to remove, and says so instead of
+        // answering the delete of nothing.
+        let (status, body) = delete_tracking_options(&router, name).await;
+        assert_eq!(
+            status, 400,
+            "case delete {name} twice: expected 400, got {status} with {body}"
+        );
+        assert_eq!(
+            refusal(&body),
+            no_such_association(name),
+            "case delete {name} twice: expected the no-such-association refusal, got {body}"
+        );
+
+        // And the set is back where a freshly created one starts: a create adds
+        // the association again, which it would refuse if one were still stored.
+        let (status, body) = create_tracking_options(&router, name, "click.example.com").await;
+        assert_eq!(
+            status, 200,
+            "case re-create tracking options on {name}: expected 200, got {status} with {body}"
+        );
+        let reported = described_tracking_domain(&router, name).await;
+        assert_eq!(
+            reported.as_deref(),
+            Some("click.example.com"),
+            "case re-create tracking options on {name}: expected the stored domain, \
+             got {reported:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delete_on_a_set_carrying_no_association_is_refused() {
+    let router = emulator();
+    verify_domain(&router, "example.com").await;
+    // The names vary along everything the naming rule admits — length, case,
+    // separators — and each of these sets was created WITHOUT tracking options.
+    let cases = [
+        "fresh-set".to_string(),
+        "Fresh_Set_2".to_string(),
+        "z".to_string(),
+        "a".repeat(64),
+    ];
+    for name in cases {
+        let (status, body) = create_configuration_set(&router, &name).await;
+        assert_eq!(
+            status, 200,
+            "case create {name:?}: expected 200, got {status} with {body}"
+        );
+        let (status, body) = delete_tracking_options(&router, &name).await;
+        assert_eq!(
+            status, 400,
+            "case delete {name:?} with no association: expected 400, got {status} with {body}"
+        );
+        assert_eq!(
+            refusal(&body),
+            no_such_association(&name),
+            "case delete {name:?} with no association: expected the no-such-association refusal, \
+             got {body}"
+        );
+        // The refused delete left the set itself alone: it still describes, and
+        // still carries no association.
+        let reported = described_tracking_domain(&router, &name).await;
+        assert_eq!(
+            reported, None,
+            "case delete {name:?} with no association: expected no tracking options, \
+             got {reported:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delete_naming_a_set_the_account_does_not_hold_is_refused() {
+    let router = emulator();
+    // None of these sets was ever created, and the names again span the rule.
+    let cases = [
+        "absent-set".to_string(),
+        "Absent_Set_2".to_string(),
+        "z".to_string(),
+        "a".repeat(64),
+    ];
+    for name in cases {
+        let (status, body) = delete_tracking_options(&router, &name).await;
+        assert_eq!(
+            status, 400,
+            "case delete absent {name:?}: expected 400, got {status} with {body}"
+        );
+        assert_eq!(
+            refusal(&body),
+            (
+                Some("ConfigurationSetDoesNotExist".to_string()),
+                Some(format!("Configuration set <{name}> does not exist."))
+            ),
+            "case delete absent {name:?}: expected the not-found refusal, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delete_touches_only_the_named_sets_association() {
+    let router = router_with_tracked_set("tracked-set").await;
+    let (status, body) = create_configuration_set(&router, "other-set").await;
+    assert_eq!(
+        status, 200,
+        "case create other-set: expected 200, got {status} with {body}"
+    );
+    let (status, body) = create_tracking_options(&router, "other-set", "track.example.com").await;
+    assert_eq!(
+        status, 200,
+        "case create tracking options on other-set: expected 200, got {status} with {body}"
+    );
+    // Something else on the deleted set, so the delete can be seen to remove
+    // the association and nothing more.
+    let (status, body) = call(
+        &router,
+        "UpdateConfigurationSetReputationMetricsEnabled",
+        &[
+            field("ConfigurationSetName", "tracked-set"),
+            field("Enabled", "true"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case enable reputation metrics: expected 200, got {status} with {body}"
+    );
+
+    let (status, body) = delete_tracking_options(&router, "tracked-set").await;
+    assert_eq!(
+        status, 200,
+        "case delete tracked-set: expected 200, got {status} with {body}"
+    );
+
+    let reported = described_tracking_domain(&router, "other-set").await;
+    assert_eq!(
+        reported.as_deref(),
+        Some("track.example.com"),
+        "case delete tracked-set: other-set keeps its own association, got {reported:?}"
+    );
+    let (status, body) =
+        describe_configuration_set(&router, "tracked-set", &["reputationOptions"]).await;
+    assert_eq!(
+        status, 200,
+        "case describe tracked-set: expected 200, got {status} with {body}"
+    );
+    let reputation = element(&body, "ReputationOptions").unwrap_or_default();
+    assert_eq!(
+        (
+            element(&reputation, "SendingEnabled"),
+            element(&reputation, "ReputationMetricsEnabled")
+        ),
+        (Some("true".to_string()), Some("true".to_string())),
+        "case delete tracked-set: the set's other attributes are untouched, got {body}"
     );
 }

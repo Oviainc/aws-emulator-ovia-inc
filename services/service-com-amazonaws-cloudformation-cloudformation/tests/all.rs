@@ -35,6 +35,8 @@ mod cognito_resource_types;
 mod content_delivery_stack_outputs;
 #[path = "all/cross_stack_imports.rs"]
 mod cross_stack_imports;
+#[path = "all/delete_canceled_export_in_use.rs"]
+mod delete_canceled_export_in_use;
 #[path = "all/detect_resource_drift.rs"]
 mod detect_resource_drift;
 #[path = "all/drift_and_resource_reads.rs"]

@@ -55,7 +55,8 @@
 //! * `tags` is keyed by the ARNs of the stores above, and an entry is dropped with the
 //!   resource it tags, so it is bounded by them; one resource's tag map holds at most
 //!   [`MAX_TAGS_PER_RESOURCE`] entries and `TagResource` is REFUSED past that count (see
-//!   [`merge_tags`]), so repeating it with fresh keys cannot grow the store either.
+//!   [`merge_tags`]), so repeating it with fresh keys cannot grow the store either, and
+//!   [`remove_tags`] only ever shrinks it.
 //!
 //! The LIST operations over these stores all narrow their listing the same way, so the
 //! rule lives here once rather than in each handler: [`Filter`] is one `filter` member as
@@ -65,6 +66,7 @@
 //! member cannot drift between them.
 //!
 //! [`merge_tags`]: ComAmazonawsControltowerAwscontroltowerapisState::merge_tags
+//! [`remove_tags`]: ComAmazonawsControltowerAwscontroltowerapisState::remove_tags
 //!
 //! [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
 //! [`record_enablement`]: ComAmazonawsControltowerAwscontroltowerapisState::record_enablement
@@ -206,8 +208,9 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 /// caller's to create: the AWS tag restrictions reserve the prefix for Amazon Web
 /// Services' own use in ANY letter case, which is why [`is_reserved_tag_key`] compares it
 /// case-insensitively. The modelled `TagKey` (len 1..128) can express nothing of this, so
-/// it is the handler's rule: every request that WRITES tags refuses a map carrying such a
-/// key with the `ValidationException` the model declares for it, and writes nothing.
+/// it is the handler's rule: every request that WRITES tags refuses one naming such a key
+/// with the `ValidationException` the model declares for it, and writes nothing — a key
+/// Amazon Web Services reserves can be neither created nor deleted by a caller.
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
 /// Whether `key` names a tag in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
@@ -224,12 +227,12 @@ pub fn is_reserved_tag_key(key: &str) -> bool {
 /// is reserved.
 ///
 /// The ONE place this refusal is decided and worded, reached by every operation of this
-/// service that writes tags (`TagResource` and the `tags` member of `CreateLandingZone`,
-/// `EnableControl` and `EnableBaseline`), so the rule cannot drift between them. The
-/// message names the member it is stated against and the offending key; the SMALLEST
-/// offending key is the one named, so a map carrying several reserved keys is refused in
-/// the same words on every call rather than naming whichever one a hash map happened to
-/// yield first.
+/// service that writes tags (`TagResource`, `UntagResource` and the `tags` member of
+/// `CreateLandingZone`, `EnableControl` and `EnableBaseline`), so the rule cannot drift
+/// between them. The message names the member it is stated against and the offending key;
+/// the SMALLEST offending key is the one named, so a request carrying several reserved keys
+/// is refused in the same words on every call rather than naming whichever one a hash map
+/// happened to yield first.
 pub fn reserved_tag_key_message<'a, I>(member: &str, keys: I) -> Option<String>
 where
     I: IntoIterator<Item = &'a str>,
@@ -238,7 +241,7 @@ where
     Some(format!(
         "{member} carries tag key {offending:?}, which opens with the reserved \
          {RESERVED_TAG_KEY_PREFIX} prefix; keys under that prefix name tags Amazon Web \
-         Services applies itself and cannot be created or modified"
+         Services applies itself and cannot be created, modified or removed"
     ))
 }
 
@@ -1092,7 +1095,8 @@ pub struct ComAmazonawsControltowerAwscontroltowerapisState {
     pub baseline_operations: HashMap<String, BaselineOperationRecord>,
     /// Tags keyed by the tagged resource's ARN — the single home for this service's
     /// tags, written by `CreateLandingZone`'s, `EnableControl`'s and `EnableBaseline`'s
-    /// `tags` members and by `TagResource`, and read by `ListTagsForResource`.
+    /// `tags` members and by `TagResource`, removed from by `UntagResource`, and read by
+    /// `ListTagsForResource`.
     pub tags: HashMap<String, BTreeMap<String, String>>,
 }
 
@@ -1913,6 +1917,35 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
         let count = merged.len();
         self.tags.insert(arn.to_string(), merged);
         Some(count)
+    }
+
+    /// Remove the tags `keys` names from the tags attached to `arn`.
+    ///
+    /// A key the resource does not carry is removed by having nothing to remove: untagging
+    /// states the tag set a caller no longer wants, so repeating it is the same call, and
+    /// every key not named is left exactly as it was. The single site that SHRINKS a
+    /// resource's tag set, and the counterpart of [`merge_tags`]; it can only lower the
+    /// store's size, so no cap applies and nothing here can refuse the request — which is
+    /// why it reports no count where [`merge_tags`] reports one. A resource left with no
+    /// tags loses its entry rather than keeping an empty map, which is the same thing a
+    /// read reports ([`tags_of`] has no entry and no tags alike) and keeps the store no
+    /// larger than the resources that have tags.
+    ///
+    /// [`merge_tags`]: Self::merge_tags
+    /// [`tags_of`]: Self::tags_of
+    pub fn remove_tags<'a, I>(&mut self, arn: &str, keys: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let Some(attached) = self.tags.get_mut(arn) else {
+            return;
+        };
+        for key in keys {
+            attached.remove(key);
+        }
+        if attached.is_empty() {
+            self.tags.remove(arn);
+        }
     }
 
     /// Start an `UPDATE_ENABLED_BASELINE` against the enablement `arn` names, parking the

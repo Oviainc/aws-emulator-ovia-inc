@@ -145,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries names no key group, whatever shape it has.
         let Some(stored) = store.key_group(&input.id) else {
             return Err(
-                GetKeyGroupErrorModeled::NoSuchResource(crate::state::no_such_resource()).into(),
+                GetKeyGroupErrorModeled::NoSuchResource(crate::state::no_such_key_group()).into(),
             );
         };
 
