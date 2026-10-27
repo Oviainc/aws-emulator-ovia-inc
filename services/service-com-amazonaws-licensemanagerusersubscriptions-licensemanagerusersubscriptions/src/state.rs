@@ -2044,25 +2044,21 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     }
 
     /// Remove every product user subscribed through the registration `provider_arn`
-    /// names, in ONE pass over each list that reaches them: a registration with many
-    /// subscribers must not cost a scan of the order list and of the index per subscriber.
+    /// names.
+    ///
+    /// Selects the subscriptions of the one registration and hands them to
+    /// [`drop_product_users`](Self::drop_product_users), the one writer of a product
+    /// user's removal, so this path cannot disagree with the other drop paths about what
+    /// a removal takes away; the batched drop keeps the single pass over the subscription
+    /// order and over the triple index that a registration with many subscribers needs.
     fn remove_product_users_of(&mut self, provider_arn: &str) {
-        let orphaned: HashSet<String> = self
+        let orphaned: Vec<String> = self
             .product_users
             .values()
             .filter(|user| user.identity_provider_arn == provider_arn)
             .map(|user| user.arn.clone())
             .collect();
-        if orphaned.is_empty() {
-            return;
-        }
-        for arn in &orphaned {
-            self.product_users.remove(arn);
-            self.tags.remove(arn);
-        }
-        self.product_user_order.retain(|arn| !orphaned.contains(arn));
-        self.product_user_index
-            .retain(|_, indexed| !orphaned.contains(indexed));
+        self.drop_product_users(&orphaned);
     }
 
     /// Remove one product user from the store and from every index that reaches it.
@@ -2081,6 +2077,11 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
 
     /// Drop the product users `arns` names from the store and from every index that reaches
     /// them.
+    ///
+    /// The ONE remover of a product user — every path that stops reporting a subscription
+    /// (one user's final drop, the clock-owed sweep, the removal of the registration the
+    /// user is subscribed through) comes through here, so no path can leave the three
+    /// stores disagreeing about what is subscribed.
     ///
     /// Batched on purpose: the subscription ORDER and the triple index are each rebuilt in
     /// ONE pass however many subscriptions are dropped together, so a request that finds
