@@ -5725,6 +5725,12 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateWorkloadShare`'s `ClientRequestToken` -> what the original request created.
     /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_workload_share_tokens: TokenLedger<CreateWorkloadShareToken>,
+    /// `DeleteWorkloadShare`'s `ClientRequestToken` -> the delete the original request
+    /// completed ([`delete_replay`]), held exactly as [`Self::delete_profile_share_tokens`]
+    /// is and for the same reason: the revoked share cannot serve the replay, so the
+    /// completed delete does, and a retry carrying the token answers that success rather
+    /// than the not-found the original request's own work produced.
+    pub delete_workload_share_tokens: TokenLedger<CompletedDeleteToken>,
     /// Every share recorded against a custom lens, keyed by the lens id then by
     /// `ShareId`. A `BTreeMap` because `ShareId` order is the stable order a listing of
     /// a lens's shares pages over, exactly as [`Self::workload_shares`] is ordered.
@@ -7509,6 +7515,24 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .get(template_arn)?
             .values()
             .find(|share| share.shared_with == shared_with)
+    }
+
+    /// Drop one share of a workload and everything keyed to it — the workload counterpart
+    /// of [`Self::remove_lens_share`], sharing its removal through [`take_share`]: the
+    /// create token that resolved to the share goes with it, so the next request carrying
+    /// that token shares afresh rather than replaying a share that is gone.
+    ///
+    /// `None` when the workload holds no such share, which is what tells a delete that the
+    /// share it was asked to remove does not exist.
+    pub fn remove_workload_share(
+        &mut self,
+        workload_id: &str,
+        share_id: &str,
+    ) -> Option<WorkloadShareRecord> {
+        let record = take_share(&mut self.workload_shares, workload_id, share_id)?;
+        self.create_workload_share_tokens
+            .retain(|token| !(token.workload_id == workload_id && token.share_id == share_id));
+        Some(record)
     }
 
     /// Drop one share of a lens and everything keyed to it: the create token that

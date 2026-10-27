@@ -468,8 +468,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             warm_throughput_mi_bps: input.warm_throughput_mi_bps,
             max_record_size_in_ki_b: input.max_record_size_in_ki_b,
             record_distribution_strategy: input.record_distribution_strategy,
-            // Nothing has deleted the stream, so no removal is owed for it.
+            // Nothing has deleted the stream, so no removal is owed for it, and nothing
+            // has rescaled it, so no re-tiling is owed either.
             deleted_at: None,
+            updating_until: None,
+            reshards: Vec::new(),
             tags: input.tags.unwrap_or_default(),
         };
 

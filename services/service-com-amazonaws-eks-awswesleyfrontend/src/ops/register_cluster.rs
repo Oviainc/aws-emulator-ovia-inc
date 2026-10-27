@@ -407,6 +407,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is not one `StartInsightsRefresh` acts on: it never reaches `ACTIVE`
             // in this emulator.
             insights_refresh: None,
+            // Cluster insights are an analysis of a control plane Amazon EKS
+            // manages, and a connected cluster has none, so no analysis of one
+            // ever completes.
+            insights_analyzed_at: None,
         };
 
         let cluster = record.to_cluster();
