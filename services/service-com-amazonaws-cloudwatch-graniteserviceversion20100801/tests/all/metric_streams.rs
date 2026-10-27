@@ -12,7 +12,10 @@ use crate::harness::{build_router, call, error_code, ok};
 use serde_json::{json, Value};
 
 /// A `PutMetricStream` request with only the members the model makes required.
-fn put_request(name: &str, output_format: &str) -> Value {
+///
+/// `pub(crate)` so every metric-stream suite in this target writes the required members once
+/// — the statistics suite builds its configurations on top of this request.
+pub fn put_request(name: &str, output_format: &str) -> Value {
     json!({
         "Name": name,
         "FirehoseArn": "arn:aws:firehose:us-east-1:000000000000:deliverystream/metrics",
@@ -111,7 +114,7 @@ async fn every_configuration_form_round_trips_through_get_metric_stream() {
                 "StatisticsConfigurations": [
                     {
                         "IncludeMetrics": [{"Namespace": "MyApp", "MetricName": "Latency"}],
-                        "AdditionalStatistics": ["Average", "tm98", "PR(:300)"],
+                        "AdditionalStatistics": ["wm90", "tm98", "PR(:300)"],
                     },
                     {
                         "IncludeMetrics": [{"Namespace": "MyApp", "MetricName": "Size"}],
@@ -292,27 +295,35 @@ async fn an_update_overwrites_the_configuration_and_keeps_the_identity() {
 
 #[tokio::test]
 async fn an_additional_statistic_is_accepted_only_where_the_output_format_carries_it() {
-    // The rule: an OpenTelemetry stream carries percentile statistics only, while a json
-    // stream carries every statistic CloudWatch supports. Rows span the statistic forms the
-    // "CloudWatch statistics definitions" page lists — basic statistics, percentiles, the
-    // trimmed/Winsorized families in both their bare and spanned forms, the percentile rank
-    // family, the interquartile mean — plus values no family produces.
+    // The rule: AdditionalStatistics names statistics a stream does not send anyway, so a
+    // basic statistic is admissible in no format; an OpenTelemetry stream narrows the member
+    // to the percentiles, while a json stream takes every statistic abbreviation CloudWatch
+    // defines. Rows span the statistic forms the "CloudWatch statistics definitions" page
+    // lists — basic statistics (in more than one letter case, since nothing of the member is
+    // normalised), percentiles, the trimmed/Winsorized families in both their bare and
+    // spanned forms, the percentile rank family, the interquartile mean — plus values no
+    // family produces.
     let statistics: Vec<(&str, bool, bool)> = vec![
         // (statistic, valid for json, valid for an OpenTelemetry format)
         ("p99", true, true),
         ("p0", true, true),
         ("p100", true, true),
         ("p99.9", true, true),
+        ("p0.5", true, true),
         ("p101", false, false),
-        ("Average", true, false),
-        ("SampleCount", true, false),
-        ("Minimum", true, false),
-        ("Maximum", true, false),
-        ("Sum", true, false),
+        ("Average", false, false),
+        ("average", false, false),
+        ("SampleCount", false, false),
+        ("Minimum", false, false),
+        ("Maximum", false, false),
+        ("MAXIMUM", false, false),
+        ("Sum", false, false),
         ("IQM", true, false),
         ("tm98", true, false),
         ("wm90", true, false),
         ("TM(10%:90%)", true, false),
+        ("wm(10%:90%)", true, false),
+        ("TC(0.5:2.5)", true, false),
         ("ts(100:)", true, false),
         ("PR(:300)", true, false),
         ("Median", false, false),
