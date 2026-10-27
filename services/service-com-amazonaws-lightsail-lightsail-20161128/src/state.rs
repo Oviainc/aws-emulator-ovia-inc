@@ -679,6 +679,8 @@ pub const OPERATION_TYPE_DELETE_LOAD_BALANCER: &str = "DeleteLoadBalancer";
 pub const OPERATION_TYPE_ATTACH_INSTANCES_TO_LOAD_BALANCER: &str =
     "AttachInstancesToLoadBalancer";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_UPDATE_LOAD_BALANCER_ATTRIBUTE: &str = "UpdateLoadBalancerAttribute";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_LOAD_BALANCER_TLS_CERTIFICATE: &str =
     "CreateLoadBalancerTlsCertificate";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -10510,6 +10512,58 @@ pub const LOAD_BALANCER_ATTRIBUTE_TLS_POLICY_NAME: &str = "TlsPolicyName";
 /// as `SessionStickiness_LB_CookieDurationSeconds`.
 pub const DEFAULT_SESSION_STICKINESS_COOKIE_DURATION_SECONDS: i64 = 86_400;
 
+/// The shortest session-stickiness cookie lifetime that attribute admits, in
+/// seconds.
+///
+/// Exactly the source [`DEFAULT_SESSION_STICKINESS_COOKIE_DURATION_SECONDS`]
+/// comes from: the Elastic Load Balancing load balancer attribute
+/// `stickiness.lb_cookie.duration_seconds`, which Lightsail surfaces as
+/// `SessionStickiness_LB_CookieDurationSeconds`, is documented as "The range is
+/// 1 second to 1 week (604800 seconds)". Lightsail's own model states only that
+/// the value "must be an integer that represents the cookie duration in
+/// seconds", so the attribute's published range is what bounds it.
+pub const MIN_SESSION_STICKINESS_COOKIE_DURATION_SECONDS: i64 = 1;
+
+/// The longest session-stickiness cookie lifetime that attribute admits, in
+/// seconds — the one week of the same published range. See
+/// [`MIN_SESSION_STICKINESS_COOKIE_DURATION_SECONDS`].
+pub const MAX_SESSION_STICKINESS_COOKIE_DURATION_SECONDS: i64 = 604_800;
+
+/// The health check path `path` describes, or `None` when it describes none.
+///
+/// `LoadBalancer$healthCheckPath` is a `NonEmptyString` (pattern `\S`), so a
+/// path that carries nothing but whitespace is not one any read of this resource
+/// could ever answer; and the member is "the path to ping on the target", which
+/// the whitespace around it is no part of, so what is stored is the path
+/// itself. The one owner of that rule, shared by every operation that takes a
+/// health check path from a request.
+pub fn health_check_path_value(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Whether this service publishes a TLS security policy named `name`.
+///
+/// Both `CreateLoadBalancer$tlsPolicyName` and the `TlsPolicyName` attribute of
+/// `UpdateLoadBalancerAttribute` document the same rule — "Use the
+/// GetLoadBalancerTlsPolicies action to get a list of TLS policy names that you
+/// can specify" — so a name that catalog does not report names no policy a load
+/// balancer can be given.
+pub fn publishes_load_balancer_tls_policy(name: &str) -> bool {
+    load_balancer_tls_policy_spec(name).is_some()
+}
+
+/// The refusal message for a TLS security policy name this service does not
+/// publish, naming the request member that carried it and the names that are
+/// available instead.
+pub fn unpublished_tls_policy_message(member: &str, name: &str) -> String {
+    format!(
+        "{member} '{name}' is not a TLS security policy this service publishes: \
+         GetLoadBalancerTlsPolicies reports {}",
+        reported_load_balancer_tls_policy_names(&load_balancer_tls_policies())
+    )
+}
+
 /// The DNS suffix a load balancer's `dnsName` is published under.
 ///
 /// AWS publishes it under its own `elb.amazonaws.com` zone. That HOSTNAME is
@@ -10732,6 +10786,29 @@ pub struct StoredLoadBalancer {
     pub https_redirection_enabled: bool,
 }
 
+/// ONE of a load balancer's configuration options, with the value already
+/// resolved out of the `attributeValue` string the request carried.
+///
+/// The modelled `attributeValue` is a string whatever the attribute is, and each
+/// `LoadBalancerAttributeName` documents its own value domain — a ping path, a
+/// boolean, a number of seconds, a published TLS policy name. This is what a
+/// value of one of those domains looks like once it has been read out of that
+/// string, so the store never holds a value the attribute does not admit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadBalancerAttribute {
+    /// `HealthCheckPath` — "the path to ping on the target".
+    HealthCheckPath(String),
+    /// `SessionStickinessEnabled` — whether session stickiness is active.
+    SessionStickinessEnabled(bool),
+    /// `SessionStickiness_LB_CookieDurationSeconds` — "the cookie duration in
+    /// seconds".
+    SessionStickinessCookieDurationSeconds(i64),
+    /// `HttpsRedirectionEnabled` — whether HTTP to HTTPS redirection is active.
+    HttpsRedirectionEnabled(bool),
+    /// `TlsPolicyName` — "the name of the TLS policy".
+    TlsPolicyName(String),
+}
+
 impl StoredLoadBalancer {
     /// Whether an SSL/TLS certificate is ATTACHED to this load balancer, which
     /// is what decides its protocol and its public ports.
@@ -10796,6 +10873,29 @@ impl StoredLoadBalancer {
         self.certificates
             .iter()
             .position(|certificate| certificate.name == name)
+    }
+
+    /// Set ONE of this load balancer's configuration options to `attribute`.
+    ///
+    /// The counterpart of [`Self::configuration_options`]: every
+    /// `LoadBalancerAttributeName` this record reports a value for is written
+    /// here and read there, so the option a caller sets is the one the next read
+    /// answers. "You can only update one attribute at a time", which is why this
+    /// takes exactly one.
+    pub fn set_attribute(&mut self, attribute: LoadBalancerAttribute) {
+        match attribute {
+            LoadBalancerAttribute::HealthCheckPath(path) => self.health_check_path = path,
+            LoadBalancerAttribute::SessionStickinessEnabled(enabled) => {
+                self.session_stickiness_enabled = enabled;
+            }
+            LoadBalancerAttribute::SessionStickinessCookieDurationSeconds(seconds) => {
+                self.session_stickiness_cookie_duration_seconds = seconds;
+            }
+            LoadBalancerAttribute::HttpsRedirectionEnabled(enabled) => {
+                self.https_redirection_enabled = enabled;
+            }
+            LoadBalancerAttribute::TlsPolicyName(name) => self.tls_policy_name = Some(name),
+        }
     }
 
     /// Make the certificate `name` the one this load balancer terminates HTTPS
