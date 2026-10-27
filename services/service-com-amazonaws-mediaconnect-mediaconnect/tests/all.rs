@@ -169,3 +169,5 @@ mod router_input_listing;
 mod create_router_output_request_bounds;
 #[path = "all/get_router_output.rs"]
 mod get_router_output;
+#[path = "all/router_input_source_metadata.rs"]
+mod router_input_source_metadata;
