@@ -85,6 +85,8 @@ mod policies_granting_service_access;
 mod policy_deletion;
 #[path = "all/policy_listing.rs"]
 mod policy_listing;
+#[path = "all/policy_refusal_wording.rs"]
+mod policy_refusal_wording;
 #[path = "all/policy_simulation.rs"]
 mod policy_simulation;
 #[path = "all/policy_tag_listing.rs"]
