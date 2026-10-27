@@ -170,6 +170,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due(::std::time::Instant::now());
 
+        // The AUTHORIZATION verdict, decided BEFORE the own-account lookup: an
+        // identifier in the AWS-OWNED namespace names a resource of AWS's own
+        // catalogue, which this account may discover through the managed operations but
+        // not read through the customer API — so it is DENIED rather than reported
+        // missing. Deciding it first is the point: a 404 would tell a caller with no
+        // permission on the identifier whether it exists, and would tell it the base
+        // image the service itself advertises does not.
+        if crate::state::is_managed_microvm_image_arn(&input.image_identifier) {
+            return Err(GetMicrovmImageErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // `MicrovmImageIdentifier` is "The ARN or ID of the MicroVmImage", so the
         // identifier is resolved as an id this account holds and, failing that, read as
         // an ARN. The three outcomes mean different things to a caller, and a client
