@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports one `ExportSummary` per export record this store holds that the
+//! request selects — the region it reached, the table its `TableArn` names, and the
+//! documented window "within the past 90 days" ([`crate::state::EXPORT_HISTORY_WINDOW`])
+//! — each read from [`crate::state::Export`], so every member reported is what the
+//! export wrote and nothing is canned.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The page is taken in DESCENDING `ExportArn` order — "in reverse alphanumeric order of
+//! ExportArn" (this operation's own doc), which the store walks back over the keys it
+//! holds exports by ([`crate::state::new_export_arn`]) — `MaxResults` entries at a time,
+//! and `NextToken` is reported exactly when more remain, so the next call resumes
+//! strictly after the entry this page stopped on in that same order. The token is that
+//! cursor in an opaque form (`ExportNextToken` publishes no pattern of its own), so a
+//! token this operation mints is one a client may send straight back and one it did not
+//! mint stands for no page.
+//!
+//! A record that has not finished is still reported: "Export can be in one of the
+//! following states: IN_PROGRESS, COMPLETED, or FAILED" (`ExportSummary$ExportStatus`),
+//! so the status a summary carries is the one the record holds rather than a filter on
+//! which records exist.
+//!
+//! An account that has run no export is answered an empty list and no token: the records
+//! are written by the EXPORT surface (`ExportTableToPointInTime`), which is still a
+//! scaffold tracked by its own stub issue, so a store driven through this slice's own API
+//! holds none.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +171,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExports"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // "The Amazon Resource Name (ARN) associated with the exported table"
+        // (`ListExports$TableArn`): the member narrows the listing to one table's exports,
+        // and a request that names none is answered over every table's.
+        let table = input
+            .table_arn
+            .as_deref()
+            .map(|arn| crate::state::check_table_arn(arn, &region))
+            .transpose()
+            .map_err(lift)?;
+        // "must be copied from the output of a previous call to ListExports"
+        // (`ListExports$NextToken`), so a token this operation did not mint stands for no
+        // page and is refused rather than quietly taken for the first one.
+        let cursor = input.next_token.as_deref().map(decode_token).transpose()?;
+
+        let store = state.lock();
+        // A reporting operation, and one that reports nothing a transition could change:
+        // an export record is fixed once written, and whether it still falls inside the
+        // documented window is derived from the clock on each read. So this reads only.
+        let mut summaries: Vec<ExportSummary> = store
+            // Exports are recorded per region, so a listing answers with the ones this
+            // request's own region holds, in the reverse ARN order the operation reports.
+            .exports_in(&region)
+            .filter(|export| {
+                table
+                    .as_deref()
+                    .is_none_or(|named| export.table_name == named)
+                    // "Lists completed exports within the past 90 days" (the operation's
+                    // own doc): a record older than that window is no longer reported.
+                    && export.within_history_window(now)
+            })
+            // The cursor: this page starts strictly after the entry the previous one
+            // stopped on in the order this listing reports — so, that order being the
+            // reverse of the ARN's, strictly BELOW it.
+            .filter(|export| {
+                cursor
+                    .as_deref()
+                    .is_none_or(|start| export.arn.as_str() < start)
+            })
+            .map(crate::state::Export::summary)
+            .collect();
+        drop(store);
+
+        // "Maximum number of results to return per page" (`ListExports$MaxResults`),
+        // which the model bounds at 25 — the page size this reports when the request
+        // names none.
+        let limit = usize::try_from(input.max_results.unwrap_or(DEFAULT_MAX_RESULTS)).unwrap_or(0);
+        let truncated = summaries.len() > limit;
+        summaries.truncate(limit);
+        // "If this value is returned, there are additional results to be displayed"
+        // (`ListExportsOutput$NextToken`): reported only where entries remain beyond this
+        // page, and standing for the entry the page stopped on.
+        let next_token = truncated
+            .then(|| {
+                summaries
+                    .last()
+                    .and_then(|summary| summary.export_arn.as_deref())
+                    .map(encode_token)
+            })
+            .flatten();
+
+        Ok(ListExportsOutput {
+            export_summaries: Some(summaries),
+            next_token,
+        })
     }
+}
+
+/// The page size this operation reports when the request names no `MaxResults`: the
+/// ceiling the model declares for the member (`ListExportsMaxLimit`, range 1..=25), so a
+/// request that asks for no bound is answered with as many exports as one page may carry.
+const DEFAULT_MAX_RESULTS: i32 = 25;
+
+/// The cursor a truncated page reports: the cursor's bytes in hex.
+///
+/// `ExportNextToken` publishes no pattern or length of its own, so the token carries
+/// nothing but the entry the page stopped on, in a form that is opaque to a client and
+/// that this operation can tell apart from a value it never minted.
+fn encode_token(cursor: &str) -> String {
+    ::hex::encode(cursor.as_bytes())
+}
+
+/// The cursor a `NextToken` stands for, or the refusal for a token this operation did
+/// not mint.
+fn decode_token(token: &str) -> Result<String, ListExportsError> {
+    let bytes = ::hex::decode(token).map_err(|_| invalid_next_token())?;
+    let cursor = String::from_utf8(bytes).map_err(|_| invalid_next_token())?;
+    if cursor.is_empty() {
+        return Err(invalid_next_token());
+    }
+    Ok(cursor)
+}
+
+/// How a `NextToken` that is not one of this operation's is refused: the wording this
+/// service states for that case wherever a reader pages by a token.
+fn invalid_next_token() -> ListExportsError {
+    crate::scaffolded::Scaffolded::validation("Invalid NextToken")
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> ListExportsError {
+    ListExportsErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+///
+/// The only one this operation can meet is a `TableArn` that addresses no table of this
+/// endpoint — it looks up no table, because a listing is answered over whatever records
+/// the store holds — so a refusal here is about the request's own member and is reported
+/// as the `ValidationException` such a value is.
+fn lift(error: crate::state::RequestError) -> ListExportsError {
+    crate::scaffolded::Scaffolded::validation(error.message().to_string())
 }

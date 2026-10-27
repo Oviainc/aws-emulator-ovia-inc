@@ -17,9 +17,7 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_glue_awsglue::state::messages::{
-    JOB_METADATA_MISSING, JOB_RUNS_JOB_NOT_FOUND,
-};
+use service_com_amazonaws_glue_awsglue::state::messages::{JOB_METADATA_MISSING, JOB_NOT_FOUND};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{call, call_in_region, emulator, error_code, error_message, ok, REGION};
@@ -479,7 +477,7 @@ async fn the_run_history_is_listed_newest_first_for_the_region_that_holds_the_jo
     );
     assert_eq!(
         error_message(&answer),
-        JOB_RUNS_JOB_NOT_FOUND,
+        JOB_NOT_FOUND,
         "expected the service's wording for a run listing of an unknown job, got {}",
         error_message(&answer)
     );

@@ -390,9 +390,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The store grows only here, and a record is reclaimed only by an explicit stop
-        // or by the stage going away, so the bound is checked before anything is minted
-        // or persisted.
+        // The store grows only here, and a record is reclaimed only by an end the clock
+        // has finished running out or by the stage going away, so the bound is checked
+        // before anything is minted or persisted.
         if store.compositions.len() >= crate::state::MAX_COMPOSITIONS {
             return Err(crate::state::quota_exceeded(
                 StartCompositionErrorModeled::ServiceQuotaExceededException,
@@ -442,7 +442,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::CompositionRecord {
             arn: arn.clone(),
             composition_id,
-            stage_arn: input.stage_arn,
+            stage_arn: input.stage_arn.clone(),
             // "A Composition is an ephemeral resource that exists after this operation
             // returns successfully": it exists, and it is not running yet — the clock
             // owes it `ACTIVE` at `active_at`.
@@ -455,11 +455,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             started_at: now,
             ended_at: None,
             active_at: now + crate::state::COMPOSITION_ACTIVATION_SPAN,
+            // Decided below, through the one place this service writes the deadline the
+            // clock owes a composition's stop at.
+            empty_stage_stop_at: None,
             sequence,
         };
 
         let composition = record.to_composition();
         store.compositions.insert(arn, record);
+        // "After a 1-minute timeout, if there are no participants in the stage when
+        // StartComposition is called": a stage nobody is in gives this composition the
+        // same deadline a stage emptied under a running composition gives it, so the
+        // timeout is written down here the way a departure writes it down
+        // (`crate::state::leave_stage_session`) and is cleared the moment somebody joins.
+        store.observe_stage_occupancy(&input.stage_arn, now);
 
         Ok(StartCompositionOutput {
             composition: Some(composition),

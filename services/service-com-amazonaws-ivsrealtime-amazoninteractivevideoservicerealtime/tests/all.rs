@@ -15,6 +15,8 @@
 mod attributes_size_limit;
 #[path = "all/composition_destination_kinds.rs"]
 mod composition_destination_kinds;
+#[path = "all/composition_empty_stage_timeout.rs"]
+mod composition_empty_stage_timeout;
 #[path = "all/composition_layout_default_lifetime.rs"]
 mod composition_layout_default_lifetime;
 #[path = "all/composition_stop.rs"]
