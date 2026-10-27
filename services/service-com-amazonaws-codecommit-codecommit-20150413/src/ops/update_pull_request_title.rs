@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePullRequestTitle
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePullRequestTitle`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePullRequestTitle::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +146,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePullRequestTitle` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePullRequestTitleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePullRequestTitle"))
+        // This operation's answer is a projection of stored state and nothing from
+        // the request metadata, so `ctx` carries nothing it reads.
+        let _ = ctx;
+        // Which ids address a pull request is `crate::state`'s rule, so every
+        // operation taking a `pullRequestId` agrees about it; this only maps each
+        // outcome onto the error THIS operation models for it.
+        let pull_request_id = crate::state::normalize_pull_request_id(&input.pull_request_id)
+            .map_err(|problem| match problem {
+                crate::state::PullRequestIdProblem::Missing => {
+                    UpdatePullRequestTitleErrorModeled::PullRequestIdRequiredException(
+                        PullRequestIdRequiredException {
+                            message: Some(
+                                crate::state::PULL_REQUEST_ID_REQUIRED_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+                crate::state::PullRequestIdProblem::Invalid => {
+                    UpdatePullRequestTitleErrorModeled::InvalidPullRequestIdException(
+                        InvalidPullRequestIdException {
+                            message: Some(
+                                crate::state::INVALID_PULL_REQUEST_ID_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                }
+            })?;
+
+        // "A pull request title is required. It cannot be empty or null." `Title`'s
+        // modelled length is 0..150, so an empty title reaches here rather than being
+        // refused at the boundary, while one longer than the member admits never
+        // does. A title of nothing but whitespace titles the pull request with
+        // nothing, so it is the same failure as naming no title at all — the rule
+        // `CreatePullRequest` already reads a `title` by.
+        if input.title.trim().is_empty() {
+            return Err(UpdatePullRequestTitleErrorModeled::TitleRequiredException(
+                TitleRequiredException {
+                    message: Some(crate::state::TITLE_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let pull_request = store.pull_request_mut(pull_request_id).ok_or_else(|| {
+            UpdatePullRequestTitleErrorModeled::PullRequestDoesNotExistException(
+                PullRequestDoesNotExistException {
+                    message: Some(crate::state::pull_request_does_not_exist_message(
+                        &pull_request_id.to_string(),
+                    )),
+                },
+            )
+        })?;
+
+        // A pull request takes a change to its text only while it is open: one that
+        // is no longer open is the record of what was reviewed, so its title is
+        // settled. The refusal names the state the pull request is IN, read from the
+        // stored record.
+        if pull_request.status != crate::state::PULL_REQUEST_STATUS_OPEN {
+            return Err(
+                UpdatePullRequestTitleErrorModeled::PullRequestAlreadyClosedException(
+                    PullRequestAlreadyClosedException {
+                        message: Some(
+                            crate::state::pull_request_text_cannot_be_changed_message(
+                                &pull_request.status,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "This replaces the existing title": the stored title becomes exactly what
+        // the request names, whitespace and all. A request naming the title already
+        // held asks for the state already held, so it changes NOTHING — and moves no
+        // activity instant either, the same way an accepted no-op status update does.
+        if pull_request.title != input.title {
+            pull_request.title = input.title.clone();
+            // "The day and time of the last user or system activity on the pull
+            // request": retitling one IS activity on it. The reviewable state has
+            // NOT moved — a title is not among the tips a revision is between — so
+            // the `revisionId` is untouched, and `PullRequestEventType` names no
+            // kind of event for a title change, so the event log is untouched too.
+            pull_request.last_activity_date = ::std::time::SystemTime::now();
+        }
+
+        Ok(UpdatePullRequestTitleOutput {
+            pull_request: pull_request.to_modeled(),
+        })
     }
 }
