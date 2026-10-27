@@ -619,6 +619,10 @@ pub const TRANSIENT_STATE_SETTLES_AFTER: Duration = ENDPOINT_IN_SERVICE_AFTER;
 pub const NODE_STATUS_PENDING: &str = "Pending";
 /// See [`NODE_STATUS_PENDING`].
 pub const NODE_STATUS_RUNNING: &str = "Running";
+/// `ClusterInstanceStatus`'s member a node carries while the instance it runs on is
+/// being terminated, which is what a node replacement starts with. See
+/// [`ClusterNode::begin_replacement`].
+pub const NODE_STATUS_SHUTTING_DOWN: &str = "ShuttingDown";
 
 /// `VolumeAttachmentStatus`'s two members this emulator moves an attachment through.
 pub const VOLUME_STATUS_ATTACHING: &str = "attaching";
@@ -2305,20 +2309,71 @@ pub struct ClusterNode {
     pub threads_per_core: Option<i32>,
     pub launch_time: SystemTime,
     pub running_at: SystemTime,
+    /// The instant the clock owes this node its REPLACEMENT hardware, set by
+    /// [`ClusterNode::begin_replacement`]; `None` while no replacement is in flight.
+    /// Until then the node reports `ShuttingDown` on the instance being terminated, and
+    /// past it it reports `Running` on a freshly minted instance id.
+    pub replacement_due_at: Option<SystemTime>,
     /// The volumes attached to this node, keyed by `VolumeId`.
     pub volume_attachments: BTreeMap<String, VolumeAttachment>,
 }
 
 impl ClusterNode {
-    /// Materialise the `Pending` -> `Running` transition the clock already owes, and with
-    /// it the node's instance id. Answers whether this call made the transition.
+    /// Materialise the transition the clock already owes this node — the
+    /// `Pending` -> `Running` one of a node that is coming up, or the
+    /// `ShuttingDown` -> `Running` one of a node whose replacement hardware is due — and
+    /// with it the node's instance id. Answers whether this call made a transition.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
         if self.status == NODE_STATUS_PENDING && now >= self.running_at {
             self.status = NODE_STATUS_RUNNING.to_string();
             self.instance_id = Some(mint_instance_id());
             return true;
         }
+        // The replacement instance is a DIFFERENT instance of the same node: it carries a
+        // newly minted instance id and its own launch time, while the `NodeLogicalId` —
+        // the identifier that "persists throughout the node's lifecycle" — is untouched.
+        if let Some(due) = self.replacement_due_at.filter(|due| now >= *due) {
+            self.status = NODE_STATUS_RUNNING.to_string();
+            self.instance_id = Some(mint_instance_id());
+            self.launch_time = due;
+            self.running_at = due;
+            self.replacement_due_at = None;
+            return true;
+        }
         false
+    }
+
+    /// Whether this node's hardware may be replaced right now: its status is a settled
+    /// one, so nothing the service is already doing to the node is interrupted.
+    ///
+    /// `Running` is the one settled status this emulator moves a node to; a node that is
+    /// still coming up, shutting down, updating or being health-checked is mid-change,
+    /// which is the condition the per-node `InvalidInstanceStatus` describes.
+    pub fn accepts_replacement(&self) -> bool {
+        self.status == NODE_STATUS_RUNNING && self.replacement_due_at.is_none()
+    }
+
+    /// Whether a replacement is already in flight on this node, i.e. another operation is
+    /// in progress for it.
+    pub fn is_replacing(&self) -> bool {
+        self.replacement_due_at.is_some()
+    }
+
+    /// Start the replacement `BatchReplaceClusterNodes` asked for: the instance the node
+    /// runs on is terminated — so the node reports `ShuttingDown` and every volume it
+    /// held is gone — and the clock owes it fresh hardware
+    /// [`TRANSIENT_STATE_SETTLES_AFTER`] later, materialised by
+    /// [`ClusterNode::settle_status`].
+    ///
+    /// The node's `NodeLogicalId` and its instance group, type, zone and threads-per-core
+    /// are kept: the replacement runs "the same configuration but fresh hardware". The old
+    /// instance id stays until the new instance comes up, because that instance is what
+    /// the node is still running on while it shuts down. Replacing a node destroys all its
+    /// instance volumes, root and secondary, so none survives the call.
+    pub fn begin_replacement(&mut self, now: SystemTime) {
+        self.status = NODE_STATUS_SHUTTING_DOWN.to_string();
+        self.replacement_due_at = Some(now + TRANSIENT_STATE_SETTLES_AFTER);
+        self.volume_attachments.clear();
     }
 
     /// Materialise every `attaching` -> `attached` transition this node's volumes are
@@ -5375,6 +5430,8 @@ impl Cluster {
                         threads_per_core,
                         launch_time: now,
                         running_at: now,
+                        // Nothing has asked for this node's hardware to be replaced.
+                        replacement_due_at: None,
                         volume_attachments: BTreeMap::new(),
                     },
                 );
