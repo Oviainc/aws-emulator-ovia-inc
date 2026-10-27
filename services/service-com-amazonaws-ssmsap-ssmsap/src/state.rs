@@ -928,6 +928,30 @@ impl StoredApplication {
         }
     }
 
+    /// The ARNs of every resource this registration gives rise to: the application's own
+    /// ARN, the ARNs of the SAP HANA databases derived from it ([`Self::databases`]) and
+    /// the ARNs of its components ([`component_arn`]) — each one a resource this service
+    /// reports an ARN for and keeps tags and resource permissions under, keyed by exactly
+    /// that spelling.
+    ///
+    /// This is the ONE enumeration of a registration's resources, so the resolver that
+    /// decides whether an ARN names something ([`RegionState::holds_resource`]) and the
+    /// cleanup that drops what was held per resource when the registration goes
+    /// ([`RegionState::settle`]) cannot disagree about which resources a registration has.
+    ///
+    /// `region` is the Region the application is registered in, which is the Region the
+    /// ARNs listed here carry.
+    pub fn resource_arns(&self, region: &str) -> Vec<String> {
+        let mut arns = ::std::vec![self.arn.clone()];
+        arns.extend(self.databases(region).into_iter().map(|db| db.arn));
+        arns.extend(
+            self.components
+                .iter()
+                .map(|component| component_arn(region, &self.id, &component.id)),
+        );
+        arns
+    }
+
     /// Project `database` of this application onto the modelled `Database`.
     ///
     /// The stored half is the same [`ApplicationDatabase`] `ListDatabases` projects onto
@@ -2502,24 +2526,20 @@ impl RegionState {
         // what bounds them.
         //
         // What is held PER RESOURCE goes with it for every resource of that
-        // registration — the application's own ARN and the ARNs of the databases
-        // DERIVED from it ([`StoredApplication::databases`]), since a database cannot
-        // outlive the registration it came from and neither can what was tagged on it
-        // or granted on it.
+        // registration — the application's own ARN and the ARNs of the resources
+        // DERIVED from it ([`StoredApplication::resource_arns`]), since a database or a
+        // component cannot outlive the registration it came from and neither can what
+        // was tagged on it or granted on it.
         let completed: Vec<(String, Vec<String>)> = self
             .applications
             .values()
             .filter(|application| application.removal_due(now))
             .map(|application| {
                 let region = arn_region(&application.arn);
-                let mut arns = vec![application.arn.clone()];
-                arns.extend(
-                    application
-                        .databases(region)
-                        .into_iter()
-                        .map(|database| database.arn),
-                );
-                (application.id.clone(), arns)
+                (
+                    application.id.clone(),
+                    application.resource_arns(region),
+                )
             })
             .collect();
         for (id, arns) in completed {
@@ -2689,12 +2709,14 @@ impl RegionState {
 
     /// Whether `arn` names a resource THIS Region holds.
     ///
-    /// The resources AWS Systems Manager for SAP holds are the registered SAP
-    /// application and the SAP HANA databases of that application, so an ARN resolves
-    /// here when it is a registered application's own ARN
-    /// ([`StoredApplication::arn`]) or the ARN of one of the databases derived from
-    /// that registration ([`StoredApplication::databases`]) — and nothing else, since
-    /// the registration is the only thing this store holds.
+    /// The resources AWS Systems Manager for SAP holds are the registered SAP application
+    /// and the resources derived from that registration, so an ARN resolves here when it
+    /// is a registered application's own ARN ([`StoredApplication::arn`]) or the ARN of
+    /// one of the resources derived from it ([`StoredApplication::resource_arns`]: the SAP
+    /// HANA databases and the components of the registration) — and nothing else, since
+    /// the registration is the only thing this store holds. Every resource this service
+    /// reports an ARN for therefore resolves here, which is what makes the ARN a response
+    /// hands a caller usable in the calls that take one.
     ///
     /// `region` is the Region this partition holds, which is the Region those ARNs
     /// embed: an ARN of another Region therefore resolves to nothing here, exactly as
@@ -2702,16 +2724,16 @@ impl RegionState {
     pub fn holds_resource(&self, region: &str, arn: &str) -> bool {
         // An application is resolved from its ARN the ONE way this store resolves one,
         // and that pass costs a string comparison per application; only when it finds
-        // nothing is the database set DERIVED, which is the one place that derivation
-        // lives ([`StoredApplication::databases`]).
+        // nothing are the derived resources ENUMERATED, which is the one place that
+        // enumeration lives ([`StoredApplication::resource_arns`]).
         if self.resolve_application_id(None, Some(arn), None).is_some() {
             return true;
         }
         self.applications.values().any(|application| {
             application
-                .databases(region)
+                .resource_arns(region)
                 .iter()
-                .any(|database| database.arn == arn)
+                .any(|held| held == arn)
         })
     }
 

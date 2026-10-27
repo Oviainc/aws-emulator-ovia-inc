@@ -54,14 +54,29 @@ const FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
 /// resolution.
 const SLACK: Duration = Duration::from_millis(250);
 
-/// The volume `id` as the service's own store holds it — the engine the router was
-/// built from, read the one legal way.
-fn stored_volume(engine: &engine::InMemoryEngine, id: &str) -> wsinst::state::VolumeRecord {
+/// The volume `id` as Region `region`'s store holds it, or `None` for a volume that
+/// Region does not hold — the engine the router was built from, read the one legal way.
+///
+/// `pub(crate)` with the wire helpers of the other suites: the sibling
+/// `volume_attachment` suite reads the stored record through this one rather than
+/// opening the store a second way, and needs the `None` (a record a delete removed) and
+/// the Region (its rows run in more than one).
+pub(crate) fn stored_volume_in(
+    engine: &engine::InMemoryEngine,
+    region: &str,
+    id: &str,
+) -> Option<wsinst::state::VolumeRecord> {
     wsinst::state::service_state(engine)
         .expect("the service's store is reachable from the engine the router was built from")
         .lock()
-        .volume(DEFAULT_TEST_REGION, id)
+        .volume(region, id)
         .cloned()
+}
+
+/// [`stored_volume_in`] for this suite's own Region, where every row expects the record
+/// to be there.
+fn stored_volume(engine: &engine::InMemoryEngine, id: &str) -> wsinst::state::VolumeRecord {
+    stored_volume_in(engine, DEFAULT_TEST_REGION, id)
         .unwrap_or_else(|| panic!("the store holds no volume {id:?} in {DEFAULT_TEST_REGION}"))
 }
 

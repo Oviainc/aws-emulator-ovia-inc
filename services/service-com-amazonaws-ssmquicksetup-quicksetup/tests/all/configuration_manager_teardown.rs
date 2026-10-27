@@ -128,9 +128,19 @@ fn label(value: &str) -> String {
         .collect()
 }
 
-/// The minimum a create needs: one definition whose `Type` the service publishes.
+/// The minimum a create needs: one definition whose `Type` the service publishes and
+/// whose `Parameters` name somewhere to deploy to.
+///
+/// A definition that names neither the accounts nor the organizational units to deploy
+/// to is refused, and no case here is about that rule, so the organizational unit is
+/// added wherever the row's own `parameters` leave it out — which leaves the accounts
+/// the definition fans out to exactly what those parameters name.
 fn definition(type_: &str, parameters: Value) -> Value {
-    json!({ "Type": type_, "Parameters": parameters })
+    let mut parameters = parameters.as_object().cloned().unwrap_or_default();
+    parameters
+        .entry("TargetOrganizationalUnits".to_string())
+        .or_insert_with(|| json!("ou-1"));
+    json!({ "Type": type_, "Parameters": Value::Object(parameters) })
 }
 
 /// Create a manager that must succeed, answering its ARN.
@@ -311,7 +321,7 @@ struct Case {
 fn cases() -> Vec<Case> {
     vec![
         Case {
-            name: "one definition, no target parameters at all",
+            name: "one definition, no target Region at all",
             body: json!({
                 "Name": "single",
                 "ConfigurationDefinitions": [definition(
@@ -650,7 +660,10 @@ fn mutations() -> Vec<Mutation> {
                     label(definition_id)
                 )
             },
-            body: Some(json!({ "Parameters": { "TargetRegions": "eu-west-1" } })),
+            body: Some(json!({ "Parameters": {
+                "TargetOrganizationalUnits": "ou-1",
+                "TargetRegions": "eu-west-1",
+            } })),
         },
         Mutation {
             operation: "TagResource",

@@ -32,8 +32,11 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    acknowledging_iam, call, create_stack, describe_stack, member, router,
-    wait_for_the_transition, xml_text, xml_texts, ACCOUNT_ID, REGION,
+    acknowledging_iam, call, create_stack, describe_stack, member, resource_event_reason,
+    router, wait_for_the_transition, xml_text, xml_texts, ACCOUNT_ID, REGION,
+};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary, resource_status,
 };
 
 /// The `X-Amz-Target` prefix CodePipeline's OPERATIONS.md records.
@@ -573,8 +576,9 @@ async fn a_declared_pipeline_exists_in_codepipeline_wired_to_the_stacks_resource
 }
 
 /// A resource the owning service REFUSES is not created, so the deployment FAILS: the
-/// stack reports a failed status naming the resource and carrying that service's own
-/// refusal, and the resource is absent from the owning service.
+/// stack reports a failed status whose reason summarises which resource failed, that
+/// service's own refusal is reported on the resource's own event, and the resource is
+/// absent from the owning service.
 #[tokio::test]
 async fn a_refused_resource_fails_the_deployment() {
     let router = router();
@@ -588,13 +592,26 @@ async fn a_refused_resource_fails_the_deployment() {
         "expected the failed create to be rolled back, got {status:?} ({reason:?})"
     );
     let reason = reason.unwrap_or_default();
-    assert!(
-        reason.contains("Flow"),
-        "expected the reason to name the refused resource, got {reason:?}"
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::CREATE, ["Flow"]),
+        "expected the stack reason to be the summary naming the refused resource, got \
+         {reason:?}"
     );
+    // The owning service's own refusal is the failing RESOURCE's diagnosis, reported on
+    // that resource's event rather than folded into the stack's summary.
+    let on_the_resource = resource_event_reason(
+        &router,
+        "refused-stack",
+        "Flow",
+        resource_status::CREATE_FAILED,
+    )
+    .await;
     assert!(
-        reason.contains("InvalidStructureException"),
-        "expected the reason to carry the owning service's refusal, got {reason:?}"
+        on_the_resource.contains("which no earlier action outputs")
+            && on_the_resource.contains("HandlerErrorCode: InvalidRequest"),
+        "expected the owning service's refusal on the failed resource's event, got \
+         {on_the_resource:?}"
     );
 
     // Nothing was created for it: the pipeline is absent from CodePipeline.
@@ -690,9 +707,25 @@ async fn a_declaration_missing_a_required_property_fails_the_deployment() {
         "expected the failed create to be rolled back, got {status:?} ({reason:?})"
     );
     let reason = reason.unwrap_or_default();
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::CREATE, ["Role"]),
+        "expected the stack reason to be the summary naming the resource that failed, got \
+         {reason:?}"
+    );
+    // WHICH property is missing is the resource's own diagnosis: it is reported on that
+    // resource's event.
+    let on_the_resource = resource_event_reason(
+        &router,
+        "trustless-stack",
+        "Role",
+        resource_status::CREATE_FAILED,
+    )
+    .await;
     assert!(
-        reason.contains("Role") && reason.contains("AssumeRolePolicyDocument"),
-        "expected the reason to name the resource and the missing property, got {reason:?}"
+        on_the_resource.contains("AssumeRolePolicyDocument"),
+        "expected the missing property on the failed resource's event, got \
+         {on_the_resource:?}"
     );
 
     // Nothing was created for it: IAM holds no such role.

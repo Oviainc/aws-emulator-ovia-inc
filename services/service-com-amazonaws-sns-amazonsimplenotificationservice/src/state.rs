@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{MessageAttributeValue, Subscription};
 
 pub mod filter_policy;
+/// The address-matching condition of a filter policy (`cidr`), which
+/// [`filter_policy`] reads beside the conditions that compare values.
+pub mod message_filter;
 
 /// The region an ARN carries when the request names none.
 ///
@@ -1899,6 +1902,19 @@ pub const DESTINATIONS_NOT_EXCLUSIVE_REFUSAL: &str =
 /// answers `400 InvalidParameter` with exactly this.
 pub const EMPTY_MESSAGE_REFUSAL: &str = "Invalid parameter: Empty message";
 
+/// The sentence SNS refuses a `MessageStructure: json` body it cannot READ as a structured
+/// message with: the condition is about the message STRUCTURE rather than the body's bytes,
+/// and the structure is a JSON document of per-protocol bodies — so a body that is not one
+/// did not parse as the structure the publish declared.
+///
+/// It answers both ways a declared structure fails to parse: a body that is not JSON at all,
+/// and one that is JSON but not the object of protocol branches the structure names ("use a
+/// JSON object for the Message parameter", `PublishInput$Message` doc). Recorded evidence: a
+/// publish declaring the json structure over a body that is not a JSON object is refused with
+/// exactly this.
+pub const JSON_MESSAGE_PARSE_REFUSAL: &str =
+    "Invalid parameter: Message Structure - JSON message body failed to parse";
+
 /// The sentence SNS refuses a `MessageStructure: json` body that names no default
 /// message with: the condition is about the message STRUCTURE rather than the body's
 /// bytes, and the member the structure is missing is the default entry.
@@ -1938,21 +1954,17 @@ pub fn ordering_id_refusal(member: &str) -> String {
     )
 }
 
-/// Check a `MessageStructure: json` body: a JSON object. Returns the reason it is not
-/// one.
+/// Whether a `MessageStructure: json` body is one SNS can READ: a JSON object, which is
+/// the document the structure declares ("use a JSON object for the Message parameter",
+/// `PublishInput$Message` doc).
 ///
 /// The other rule the member documents — "contain at least a top-level JSON key of
 /// \"default\"" (`PublishInput$MessageStructure` doc) — is judged by
 /// [`default_branch_body`], because a `default` member and a `default` member that names
 /// a message are the same requirement: see [`NO_DEFAULT_ENTRY_REFUSAL`].
-fn json_message_error(message: &str) -> Option<&'static str> {
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(message) else {
-        return Some("message must be a syntactically valid JSON object");
-    };
-    if !parsed.is_object() {
-        return Some("message must be a syntactically valid JSON object");
-    }
-    None
+fn is_json_message_document(message: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(message)
+        .is_ok_and(|parsed| parsed.is_object())
 }
 
 /// The body a PROTOCOL-keyed branch of a structured message names, or `None` when it
@@ -2060,8 +2072,8 @@ pub fn message_refusal(request: MessageRequest<'_>) -> Option<String> {
         .message_structure
         .is_some_and(is_json_message_structure)
     {
-        if let Some(reason) = json_message_error(request.message) {
-            return Some(format!("Invalid parameter: Message - {reason}"));
+        if !is_json_message_document(request.message) {
+            return Some(JSON_MESSAGE_PARSE_REFUSAL.to_string());
         }
         // "contain at least a top-level JSON key of "default"" that names a message:
         // the body every protocol no other member names receives. A document without

@@ -40,6 +40,9 @@ use bytes::Bytes;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::query_wire::{elements, form_encode, opt_element};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 
 /// The region every request here is signed for, and so the region the stack's configuration
 /// sets belong to. Deliberately NOT the emulator's default region: the call that creates the
@@ -525,11 +528,23 @@ async fn a_configuration_set_ses_refuses_to_create_fails_the_stack() {
         "case {case:?}: expected the failed create to be rolled back rather than publish a \
          configuration set name nothing answers to, got {body}"
     );
+    // The STACK's reason summarises which resource failed; the owning service's own
+    // refusal is reported on that resource's event.
     let reason = opt_element(&body, "StackStatusReason").unwrap_or_default();
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::CREATE, ["Bad"]),
+        "case {case:?}: expected the stack reason to summarise what failed, got {reason:?}"
+    );
+    let (_, events) =
+        cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
     assert!(
-        reason.contains("Bad") && reason.contains("InvalidConfigurationSet"),
-        "case {case:?}: expected the reason to name the resource and the owning service's own \
-         refusal, got {reason:?}"
+        elements(&events, "ResourceStatusReason")
+            .iter()
+            .any(|reported| reported
+                .contains("The configuration set name must contain only letters")),
+        "case {case:?}: expected the failing resource's event to carry the owning service's \
+         own refusal, got {events}"
     );
 
     let (status, answer) = describe_configuration_set(&router, "refused.stack.set").await;
@@ -558,11 +573,22 @@ async fn a_property_no_ses_call_takes_fails_the_stack_and_leaves_no_set() {
         "case {case:?}: expected the stack to report the property it could not apply rather \
          than a set created without it, got {body}"
     );
+    // The STACK's reason summarises which resource failed; WHICH property could not be
+    // applied is that resource's own diagnosis, on its event.
     let reason = opt_element(&body, "StackStatusReason").unwrap_or_default();
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::CREATE, ["Paused"]),
+        "case {case:?}: expected the stack reason to summarise what failed, got {reason:?}"
+    );
+    let (_, events) =
+        cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
     assert!(
-        reason.contains("Paused") && reason.contains("SendingOptions"),
-        "case {case:?}: expected the reason to name the resource and the property, got \
-         {reason:?}"
+        elements(&events, "ResourceStatusReason")
+            .iter()
+            .any(|reported| reported.contains("SendingOptions")),
+        "case {case:?}: expected the failing resource's event to name the property, got \
+         {events}"
     );
 
     let (status, answer) = describe_configuration_set(&router, "unmapped-stack-set").await;

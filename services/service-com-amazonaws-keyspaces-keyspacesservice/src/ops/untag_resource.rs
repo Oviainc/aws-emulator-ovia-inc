@@ -163,22 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exactly as it was: a reserved key could never have been assigned by a caller
         // ("Amazon Web Services-assigned tag names ... the user cannot assign", `Tag`), so
         // refusing it says the key is one the caller does not own, rather than reporting a
-        // removal that cannot have happened.
-        if let Some(reserved) = input
-            .tags
-            .iter()
-            .find(|tag| tag.key.starts_with(crate::state::RESERVED_TAG_KEY_PREFIX))
-        {
-            return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
-                message: Some(
-                    crate::state::TagRejection::ReservedKeyPrefix {
-                        key: reserved.key.clone(),
-                    }
-                    .message(),
-                ),
+        // removal that cannot have happened. Decided on the request alone, above the
+        // Region, `settle` and the ARN lookup — the same stage `TagResource` decides it at.
+        crate::state::reject_reserved_tag_keys(&input.tags).map_err(|rejection| {
+            UntagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(rejection.message()),
             })
-            .into());
-        }
+        })?;
 
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();

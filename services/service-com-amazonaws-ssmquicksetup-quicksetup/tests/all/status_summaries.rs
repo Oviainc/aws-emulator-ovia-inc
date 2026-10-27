@@ -107,9 +107,19 @@ fn label(value: &str) -> String {
         .collect()
 }
 
-/// The minimum a create needs: one definition whose `Type` the service publishes.
+/// The minimum a create needs: one definition whose `Type` the service publishes and
+/// whose `Parameters` name somewhere to deploy to.
+///
+/// A definition that names neither the accounts nor the organizational units to deploy
+/// to is refused, and no case here is about that rule, so the organizational unit is
+/// added wherever the row's own `parameters` leave it out — which leaves the accounts
+/// the definition fans out to exactly what those parameters name.
 fn definition(type_: &str, parameters: Value) -> Value {
-    json!({ "Type": type_, "Parameters": parameters })
+    let mut parameters = parameters.as_object().cloned().unwrap_or_default();
+    parameters
+        .entry("TargetOrganizationalUnits".to_string())
+        .or_insert_with(|| json!("ou-1"));
+    json!({ "Type": type_, "Parameters": Value::Object(parameters) })
 }
 
 /// Create a manager that must succeed, answering its ARN.
@@ -390,7 +400,7 @@ async fn every_reported_record_carries_one_summary_per_modelled_status_type() {
     // published catalog (`crate::state::QUICK_SETUP_TYPE_CATALOG`).
     let cases: Vec<(&str, Value)> = vec![
         (
-            "one definition naming no deployment target at all",
+            "one definition naming no target Region at all",
             json!({
                 "Name": "no-targets",
                 "ConfigurationDefinitions": [definition("AWSQuickSetupType-SSM", json!({}))],
@@ -588,7 +598,10 @@ async fn each_summary_carries_the_message_its_status_and_type_call_for() {
         case,
         &manager_arn,
         &definition_id,
-        &json!({ "Parameters": { "TargetRegions": "us-east-1,us-west-2" } }),
+        &json!({ "Parameters": {
+            "TargetOrganizationalUnits": "ou-1",
+            "TargetRegions": "us-east-1,us-west-2",
+        } }),
     )
     .await;
     assert_stage(
@@ -698,7 +711,10 @@ async fn submitting_a_deployment_again_restarts_every_kind_of_work() {
         case,
         &manager_arn,
         &definition_id,
-        &json!({ "Parameters": { "TargetRegions": "us-east-1" } }),
+        &json!({ "Parameters": {
+            "TargetOrganizationalUnits": "ou-1",
+            "TargetRegions": "us-east-1",
+        } }),
     )
     .await;
 

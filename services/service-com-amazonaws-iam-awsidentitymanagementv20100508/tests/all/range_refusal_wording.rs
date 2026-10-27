@@ -3,112 +3,253 @@
 //! How this service words a request the framework refused at the boundary, end to end
 //! over the awsQuery wire.
 //!
-//! The rule under test: a PAGE SIZE outside the `@range` its member declares is refused
-//! with HTTP 400 `ValidationError` whose message names the member and the bound it broke
-//! and nothing of the number itself — `N validation error(s) detected: Value at
-//! 'maxItems' failed to satisfy constraint: Member must have value {greater,less} than or
-//! equal to <bound>` — while every other class of boundary refusal, another numeric
-//! member outside its own range included, keeps the sentence the framework states with
-//! the rejected value in it.
+//! The rule under test: a value outside a BOUND its member declares — a number outside
+//! its `@range`, or a string or a collection outside its `@length` — is refused with HTTP
+//! 400 `ValidationError` whose message names the member and the bound it broke and
+//! nothing of the value itself (`N validation error(s) detected: Value at '<member>'
+//! failed to satisfy constraint: Member must have {value,length} {greater,less} than or
+//! equal to <bound>`), while the other classes of boundary refusal — a string outside its
+//! `@pattern`, an absent required member — keep the sentence the framework states with the
+//! rejected value in it.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
-//! operation carries the page size, which bound is broken and by how much, which other
-//! members the same request carries, how many violations one request carries, and which
-//! other constraint class it breaks. No single request is the specification.
+//! member carries the bound and which operation takes it, whether the bound is a `@range`
+//! on a number or a `@length` on a string or a list, which end of the bound is broken and
+//! by how much, which other members the same request carries, how many violations one
+//! request carries, and which other constraint class it breaks. No single request is the
+//! specification.
 //!
 //! The awsQuery harness is the one `tests/all/user_lifecycle.rs` owns and the other
 //! suites in this crate share.
 
+use crate::role_lifecycle::{borrowed, param};
 use crate::user_lifecycle::{call, element, error_code, router};
 
 /// A trust policy with a single statement, so the `CreateRole` rows are refused for the
 /// member under test and nothing else.
 const TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
 
-/// One row: the call to make, the member path the clause must name, and the requirement
-/// it must state.
-struct PageSizeCase {
-    case: &'static str,
+/// One row: the call to make, the member path the clause must name, the requirement it
+/// must state, and the value the request carried, which the clause must NOT echo.
+struct BoundCase {
+    case: String,
     action: &'static str,
-    params: Vec<(&'static str, &'static str)>,
-    requirement: &'static str,
+    params: Vec<(String, String)>,
+    member: &'static str,
+    requirement: String,
+    echoed: Vec<String>,
 }
 
-/// The rows: the page size broken below its minimum and above its maximum, across the
-/// listings this service's model binds it to.
+/// The requirement clause the framework states for a bound, built from the model's own
+/// bound (`vendor/smithy-schema-server/src/constraints.rs::Violation::requirement`).
+fn below_value(min: i64) -> String {
+    format!("Member must have value greater than or equal to {min}")
+}
+
+fn above_value(max: i64) -> String {
+    format!("Member must have value less than or equal to {max}")
+}
+
+fn above_length(max: i64) -> String {
+    format!("Member must have length less than or equal to {max}")
+}
+
+/// The rows: every bound this service's role and listing surface declares, broken at each
+/// end.
 ///
-/// `MaxItems` targets `maxItemsType` (range 1..1000) on every one of them
+/// Bounds come from the model: `MaxItems` targets `maxItemsType` (range 1..1000) on every
+/// paginated listing, `MaxSessionDuration` targets `roleMaxSessionDurationType` (range
+/// 3600..43200), `Description` targets `roleDescriptionType` (length 0..1000), `RoleName`
+/// targets `roleNameType` (length 1..64) and `Tags` targets `tagListType` (length 0..50)
 /// (`smithy_query(query="operation",
-/// operation="ListInstanceProfiles,ListRoles,ListUsers,ListGroups,ListPolicies")`).
-fn page_size_cases() -> Vec<PageSizeCase> {
-    let below = "Member must have value greater than or equal to 1";
-    let above = "Member must have value less than or equal to 1000";
-    vec![
-        PageSizeCase {
-            case: "one below the minimum",
-            action: "ListInstanceProfiles",
-            params: vec![("MaxItems", "0")],
-            requirement: below,
-        },
-        PageSizeCase {
-            case: "far below the minimum",
-            action: "ListInstanceProfiles",
-            params: vec![("MaxItems", "-1")],
-            requirement: below,
-        },
-        PageSizeCase {
-            case: "one above the maximum",
-            action: "ListInstanceProfiles",
-            params: vec![("MaxItems", "1001")],
-            requirement: above,
-        },
-        PageSizeCase {
-            case: "far above the maximum, beside another member",
-            action: "ListInstanceProfiles",
-            params: vec![("PathPrefix", "/eng/"), ("MaxItems", "99999")],
-            requirement: above,
-        },
-        PageSizeCase {
-            case: "the same member on the role listing",
-            action: "ListRoles",
-            params: vec![("MaxItems", "0")],
-            requirement: below,
-        },
-        PageSizeCase {
-            case: "the same member on the user listing",
-            action: "ListUsers",
-            params: vec![("MaxItems", "1001")],
-            requirement: above,
-        },
-        PageSizeCase {
-            case: "the same member on the group listing",
-            action: "ListGroups",
-            params: vec![("MaxItems", "-100")],
-            requirement: below,
-        },
-        PageSizeCase {
-            case: "the same member on the policy listing",
-            action: "ListPolicies",
-            params: vec![("Scope", "Local"), ("MaxItems", "100000")],
-            requirement: above,
-        },
-    ]
+/// operation="ListInstanceProfiles,ListRoles,ListUsers,ListGroups,ListPolicies,CreateRole,UpdateRole,UpdateRoleDescription")`).
+fn bound_cases() -> Vec<BoundCase> {
+    let listing_floor = below_value(1);
+    let listing_ceiling = above_value(1000);
+    let session_floor = below_value(3600);
+    let session_ceiling = above_value(43200);
+    let description_ceiling = above_length(1000);
+
+    let page_size_rows = [
+        ("one below the minimum", "ListInstanceProfiles", "0"),
+        ("far below the minimum", "ListInstanceProfiles", "-1"),
+        ("the same member on the role listing", "ListRoles", "0"),
+        ("the same member on the group listing", "ListGroups", "-100"),
+    ];
+    let mut rows: Vec<BoundCase> = Vec::new();
+    for (case, action, value) in page_size_rows {
+        rows.push(BoundCase {
+            case: case.to_string(),
+            action,
+            params: vec![param("MaxItems", value)],
+            member: "maxItems",
+            requirement: listing_floor.clone(),
+            echoed: vec![value.to_string()],
+        });
+    }
+    for (case, action, value) in [
+        ("one above the maximum", "ListInstanceProfiles", "1001"),
+        ("the same member on the user listing", "ListUsers", "1001"),
+    ] {
+        rows.push(BoundCase {
+            case: case.to_string(),
+            action,
+            params: vec![param("MaxItems", value)],
+            member: "maxItems",
+            requirement: listing_ceiling.clone(),
+            echoed: vec![value.to_string()],
+        });
+    }
+    rows.push(BoundCase {
+        case: "far above the maximum, beside another member".to_string(),
+        action: "ListInstanceProfiles",
+        params: vec![param("PathPrefix", "/eng/"), param("MaxItems", "99999")],
+        member: "maxItems",
+        requirement: listing_ceiling.clone(),
+        echoed: vec!["99999".to_string()],
+    });
+    rows.push(BoundCase {
+        case: "the same member on the policy listing".to_string(),
+        action: "ListPolicies",
+        params: vec![param("Scope", "Local"), param("MaxItems", "100000")],
+        member: "maxItems",
+        requirement: listing_ceiling.clone(),
+        echoed: vec!["100000".to_string()],
+    });
+
+    // A session duration below its minimum, including zero, and above its maximum, on
+    // both operations that take it.
+    for (case, action, value) in [
+        ("a session duration one below its minimum", "CreateRole", "3599"),
+        ("a session duration of zero", "CreateRole", "0"),
+        ("a session duration on the update half", "UpdateRole", "3599"),
+    ] {
+        rows.push(BoundCase {
+            case: case.to_string(),
+            action,
+            params: session_params(action, value),
+            member: "maxSessionDuration",
+            requirement: session_floor.clone(),
+            echoed: vec![value.to_string()],
+        });
+    }
+    for (case, action, value) in [
+        ("a session duration one above its maximum", "CreateRole", "43201"),
+        (
+            "a session duration far above its maximum on the update half",
+            "UpdateRole",
+            "432000",
+        ),
+    ] {
+        rows.push(BoundCase {
+            case: case.to_string(),
+            action,
+            params: session_params(action, value),
+            member: "maxSessionDuration",
+            requirement: session_ceiling.clone(),
+            echoed: vec![value.to_string()],
+        });
+    }
+
+    // A STRING above its `@length` maximum, on each operation that takes a description:
+    // one character over, and far over.
+    let one_over = "d".repeat(1001);
+    let far_over = "d".repeat(5000);
+    for (case, action, value) in [
+        ("a description one character over its maximum", "UpdateRole", &one_over),
+        ("a description far over its maximum", "UpdateRole", &far_over),
+        (
+            "a description over its maximum on the create half",
+            "CreateRole",
+            &one_over,
+        ),
+        (
+            "a description over its maximum on the description-only half",
+            "UpdateRoleDescription",
+            &one_over,
+        ),
+    ] {
+        let mut params = vec![param("RoleName", "bounded-role"), param("Description", value)];
+        if action == "CreateRole" {
+            params.push(param("AssumeRolePolicyDocument", TRUST_POLICY));
+        }
+        rows.push(BoundCase {
+            case: case.to_string(),
+            action,
+            params,
+            member: "description",
+            requirement: description_ceiling.clone(),
+            echoed: vec![value.clone()],
+        });
+    }
+
+    // A role name above the `@length` maximum its own member declares — the same class on
+    // a different member, with a name the member's pattern admits so the length is the
+    // only bound broken.
+    let long_name = "p".repeat(65);
+    rows.push(BoundCase {
+        case: "a role name one character over its maximum".to_string(),
+        action: "CreateRole",
+        params: vec![
+            param("RoleName", &long_name),
+            param("AssumeRolePolicyDocument", TRUST_POLICY),
+        ],
+        member: "roleName",
+        requirement: above_length(64),
+        echoed: vec![long_name],
+    });
+
+    // A COLLECTION above its `@length` maximum: the walk renders its SIZE where a scalar
+    // renders its value, and neither is echoed.
+    let mut tag_params = vec![
+        param("RoleName", "tagged-role"),
+        param("AssumeRolePolicyDocument", TRUST_POLICY),
+    ];
+    for position in 1..=51 {
+        tag_params.push(param(&format!("Tags.member.{position}.Key"), &format!("k{position}")));
+        tag_params.push(param(&format!("Tags.member.{position}.Value"), "v"));
+    }
+    rows.push(BoundCase {
+        case: "one tag over the list's maximum".to_string(),
+        action: "CreateRole",
+        params: tag_params,
+        member: "tags",
+        requirement: above_length(50),
+        echoed: vec!["51 items".to_string()],
+    });
+
+    rows
 }
 
-/// RULE: a page size outside its declared range is refused 400 `ValidationError`, and the
-/// clause names the member and the bound it broke WITHOUT echoing the number.
+/// The parameters a session-duration row carries: the duration under test, plus whatever
+/// else `action` requires.
+fn session_params(action: &str, value: &str) -> Vec<(String, String)> {
+    let mut params = vec![
+        param("RoleName", "ranged-role"),
+        param("MaxSessionDuration", value),
+    ];
+    if action == "CreateRole" {
+        params.push(param("AssumeRolePolicyDocument", TRUST_POLICY));
+    }
+    params
+}
+
+/// RULE: a value outside a bound its member declares is refused 400 `ValidationError`, and
+/// the clause names the member and the bound it broke WITHOUT echoing the value.
 #[tokio::test]
-async fn a_page_size_outside_its_declared_range_is_refused_without_echoing_it() {
+async fn a_value_outside_a_declared_bound_is_refused_without_echoing_it() {
     let router = router();
 
-    for PageSizeCase {
+    for BoundCase {
         case,
         action,
         params,
+        member,
         requirement,
-    } in page_size_cases()
+        echoed,
+    } in bound_cases()
     {
-        let (status, body) = call(&router, action, &params).await;
+        let (status, body) = call(&router, action, &borrowed(&params)).await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected HTTP 400, got {status}: {body}"
@@ -119,24 +260,21 @@ async fn a_page_size_outside_its_declared_range_is_refused_without_echoing_it() 
             "case {case:?}: expected the query protocol's bound refusal code, got {body}"
         );
         let expected = format!(
-            "1 validation error detected: Value at 'maxItems' failed to satisfy constraint: \
+            "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
              {requirement}"
         );
+        let message = element(&body, "Message");
         assert_eq!(
-            element(&body, "Message"),
-            expected,
-            "case {case:?}: expected {expected:?}, got {:?}",
-            element(&body, "Message")
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
-        // The rejected number is nowhere in the document.
-        for (name, value) in &params {
-            if *name == "MaxItems" {
-                assert!(
-                    !body.contains(&format!("Value &apos;{value}&apos;"))
-                        && !body.contains(&format!("Value '{value}'")),
-                    "case {case:?}: the clause must not echo {value:?}, got {body}"
-                );
-            }
+        // The rejected value is nowhere in the document.
+        for value in &echoed {
+            assert!(
+                !body.contains(&format!("Value &apos;{value}&apos;"))
+                    && !body.contains(&format!("Value '{value}'")),
+                "case {case:?}: the clause must not echo {value:?}, got {body}"
+            );
         }
     }
 }
@@ -147,39 +285,82 @@ async fn a_page_size_outside_its_declared_range_is_refused_without_echoing_it() 
 async fn each_published_bound_itself_is_accepted() {
     let router = router();
 
-    // Rows: both bounds of the page size, and both bounds of the other range member this
-    // suite exercises, on an operation that carries each.
-    for (case, action, params) in [
+    // A role to drive the update rows against, so what they answer is about the bound and
+    // not about a role that does not exist.
+    let created = vec![
+        param("RoleName", "bound-role"),
+        param("AssumeRolePolicyDocument", TRUST_POLICY),
+    ];
+    let (status, body) = call(&router, "CreateRole", &borrowed(&created)).await;
+    assert_eq!(
+        status, 200,
+        "the fixture CreateRole must succeed, got {status}: {body}"
+    );
+
+    // Rows: both bounds of the page size, both bounds of the session duration, and both
+    // bounds of a description's length — each on an operation that carries it.
+    let longest_description = "d".repeat(1000);
+    let rows = vec![
         (
-            "the page-size minimum",
+            "the page-size minimum".to_string(),
             "ListInstanceProfiles",
-            vec![("MaxItems", "1")],
+            vec![param("MaxItems", "1")],
         ),
         (
-            "the page-size maximum",
+            "the page-size maximum".to_string(),
             "ListInstanceProfiles",
-            vec![("MaxItems", "1000")],
+            vec![param("MaxItems", "1000")],
         ),
         (
-            "the session minimum",
+            "the session minimum".to_string(),
             "CreateRole",
             vec![
-                ("RoleName", "min-session-role"),
-                ("AssumeRolePolicyDocument", TRUST_POLICY),
-                ("MaxSessionDuration", "3600"),
+                param("RoleName", "min-session-role"),
+                param("AssumeRolePolicyDocument", TRUST_POLICY),
+                param("MaxSessionDuration", "3600"),
             ],
         ),
         (
-            "the session maximum",
+            "the session maximum".to_string(),
             "CreateRole",
             vec![
-                ("RoleName", "max-session-role"),
-                ("AssumeRolePolicyDocument", TRUST_POLICY),
-                ("MaxSessionDuration", "43200"),
+                param("RoleName", "max-session-role"),
+                param("AssumeRolePolicyDocument", TRUST_POLICY),
+                param("MaxSessionDuration", "43200"),
             ],
         ),
-    ] {
-        let (status, body) = call(&router, action, &params).await;
+        (
+            "the session maximum on the update half".to_string(),
+            "UpdateRole",
+            vec![
+                param("RoleName", "bound-role"),
+                param("MaxSessionDuration", "43200"),
+            ],
+        ),
+        (
+            "the description length floor".to_string(),
+            "UpdateRole",
+            vec![param("RoleName", "bound-role"), param("Description", "")],
+        ),
+        (
+            "the description length ceiling".to_string(),
+            "UpdateRole",
+            vec![
+                param("RoleName", "bound-role"),
+                param("Description", &longest_description),
+            ],
+        ),
+        (
+            "the description length ceiling on the description-only half".to_string(),
+            "UpdateRoleDescription",
+            vec![
+                param("RoleName", "bound-role"),
+                param("Description", &longest_description),
+            ],
+        ),
+    ];
+    for (case, action, params) in rows {
+        let (status, body) = call(&router, action, &borrowed(&params)).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected HTTP 200, got {status}: {body}"
@@ -197,18 +378,14 @@ struct EchoedCase<'a> {
     value: &'a str,
 }
 
-/// RULE: only the page size is stated value-free — every other class of boundary refusal
-/// keeps the sentence the framework states, the rejected value included, including
-/// another numeric member outside its own `@range` (`roleMaxSessionDurationType`, range
-/// 3600..43200), for which this service has no recorded value-free answer.
+/// RULE: only a DECLARED BOUND is stated value-free — a string outside its `@pattern` is
+/// another class and keeps the sentence the framework states, the rejected value included.
 #[tokio::test]
 async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
     let router = router();
 
-    // Rows: a string outside its `@pattern` on two different members, one outside its
-    // `@length` maximum, and the other range member below its minimum and above its
-    // maximum on both operations that take it.
-    let long_name = "p".repeat(65);
+    // Rows: a string outside its `@pattern` on three different members, across three
+    // operations.
     let cases = vec![
         EchoedCase {
             case: "a profile name outside its pattern",
@@ -225,46 +402,11 @@ async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
             value: "has/slash",
         },
         EchoedCase {
-            case: "a role name above its length maximum",
-            action: "CreateRole",
-            params: vec![
-                ("RoleName", long_name.as_str()),
-                ("AssumeRolePolicyDocument", TRUST_POLICY),
-            ],
-            member: "roleName",
-            value: long_name.as_str(),
-        },
-        EchoedCase {
-            case: "a session duration below its minimum",
-            action: "CreateRole",
-            params: vec![
-                ("RoleName", "ranged-role"),
-                ("AssumeRolePolicyDocument", TRUST_POLICY),
-                ("MaxSessionDuration", "3599"),
-            ],
-            member: "maxSessionDuration",
-            value: "3599",
-        },
-        EchoedCase {
-            case: "a session duration above its maximum",
-            action: "CreateRole",
-            params: vec![
-                ("RoleName", "ranged-role"),
-                ("AssumeRolePolicyDocument", TRUST_POLICY),
-                ("MaxSessionDuration", "43201"),
-            ],
-            member: "maxSessionDuration",
-            value: "43201",
-        },
-        EchoedCase {
-            case: "that member on the update half",
-            action: "UpdateRole",
-            params: vec![
-                ("RoleName", "ranged-role"),
-                ("MaxSessionDuration", "43201"),
-            ],
-            member: "maxSessionDuration",
-            value: "43201",
+            case: "a path prefix outside its pattern",
+            action: "ListRoles",
+            params: vec![("PathPrefix", "eng")],
+            member: "pathPrefix",
+            value: "eng",
         },
     ];
 
@@ -282,7 +424,7 @@ async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
             "case {case:?}: expected HTTP 400, got {status}: {body}"
         );
         // The code is the framework's own for a boundary refusal on this protocol, and
-        // these rows go nowhere near the page-size rewording — so this pins the code
+        // these rows go nowhere near the bound rewording — so this pins the code
         // independently of it.
         assert_eq!(
             error_code(&body),
@@ -298,8 +440,8 @@ async fn another_constraint_class_keeps_the_frameworks_own_sentence() {
     }
 }
 
-/// RULE: a request that breaks the page-size bound AND another constraint is stated as
-/// both clauses — the page size value-free, the other as the framework states it.
+/// RULE: a request that breaks a declared bound AND another constraint is stated as both
+/// clauses — the bound value-free, the other as the framework states it.
 #[tokio::test]
 async fn a_mixed_refusal_states_each_class_its_own_way() {
     let router = router();

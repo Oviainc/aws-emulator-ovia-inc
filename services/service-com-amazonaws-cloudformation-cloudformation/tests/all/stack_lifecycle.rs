@@ -222,6 +222,40 @@ pub(crate) fn xml_blocks(xml: &str, tag: &str) -> Vec<String> {
     found
 }
 
+/// The `ResourceStatusReason` a stack's event stream carries for the event in which
+/// `logical_id` reached `resource_status`, or the empty string when it recorded none.
+///
+/// `StackEvent$ResourceStatusReason` is the "success/failure message associated with the
+/// resource", so this is the PER-RESOURCE field a failing resource's own diagnosis — the
+/// refusal the service that owns it answered — is reported on, beside the stack-level
+/// summary of which logical resources failed. Shared so every suite that reads one asks
+/// for it the same way.
+pub(crate) async fn resource_event_reason(
+    router: &MultiServiceRouter,
+    stack: &str,
+    logical_id: &str,
+    resource_status: &str,
+) -> String {
+    let (code, body) = call(
+        router,
+        "DescribeStackEvents",
+        &[member("StackName", stack)],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "DescribeStackEvents({stack}) must answer 200, got {code} {body}"
+    );
+    xml_blocks(&body, "member")
+        .iter()
+        .find(|entry| {
+            xml_text(entry, "LogicalResourceId").as_deref() == Some(logical_id)
+                && xml_text(entry, "ResourceStatus").as_deref() == Some(resource_status)
+        })
+        .and_then(|entry| xml_text(entry, "ResourceStatusReason"))
+        .unwrap_or_default()
+}
+
 /// Wait past the instant a drift detection's own result becomes due.
 ///
 /// The drift clock's counterpart to [`wait_for_the_transition`], shared by every suite that

@@ -41,6 +41,9 @@ use smithy_server_runtime::MultiServiceRouter;
 // expected ARNs name, and a divergence would fail these cases rather than pass quietly.
 use crate::query_wire::{elements, form_encode, opt_element};
 use crate::rds_docdb_neptune_signing_name_routing::authorization;
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    failed_action, resource_failure_summary,
+};
 
 /// The region every request here is signed for, and so the region the stack's resources and
 /// their ARNs belong to.
@@ -732,11 +735,22 @@ async fn a_metric_stream_cloudwatch_refuses_fails_the_stack() {
         "case {case:?}: expected the failed create to be rolled back rather than publish a \
          stream nothing holds, got {body}"
     );
+    // The STACK's reason is the summary naming the resource that failed; CloudWatch's own
+    // refusal is that resource's diagnosis, reported on its event.
     let reason = opt_element(&body, "StackStatusReason").unwrap_or_default();
+    assert_eq!(
+        reason,
+        resource_failure_summary(failed_action::CREATE, ["MetricStream"]),
+        "case {case:?}: expected the stack reason to summarise what failed, got {reason:?}"
+    );
+    let (_, events) =
+        cloudformation(&router, "DescribeStackEvents", &[("StackName", stack_name)]).await;
     assert!(
-        reason.contains("MetricStream") && reason.contains("InvalidParameterValueException"),
-        "case {case:?}: expected the reason to name the resource and CloudWatch's own \
-         refusal, got {reason:?}"
+        elements(&events, "ResourceStatusReason")
+            .iter()
+            .any(|reported| reported.contains("Unsupported statistic")),
+        "case {case:?}: expected the failing resource's event to carry CloudWatch's own \
+         refusal, got {events}"
     );
 
     let (status, gone) = cloudwatch(

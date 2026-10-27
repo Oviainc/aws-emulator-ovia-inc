@@ -77,7 +77,7 @@ fn unheld_id() -> String {
 
 /// `POST /datastore/{datastoreId}/imageSet/{imageSetId}/getImageSetMetadata` —
 /// `GetImageSetMetadata`, optionally for one version (`version` is an `@httpQuery`).
-async fn get_image_set_metadata(
+pub(crate) async fn get_image_set_metadata(
     emulator: &Emulator,
     datastore_id: &str,
     image_set_id: &str,
@@ -92,7 +92,7 @@ async fn get_image_set_metadata(
 
 /// The document one successful answer carries: the blob read as the JSON document
 /// `contentType` says it is, after asserting what the answer says the blob holds.
-fn document(answer: &Answer, case: &str) -> Value {
+pub(crate) fn document(answer: &Answer, case: &str) -> Value {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected HTTP 200 from GetImageSetMetadata, got {answer:?}"

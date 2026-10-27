@@ -31,6 +31,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// below is refused only for the reason under test.
 const TYPE: &str = "AWSQuickSetupType-SSMHostMgmt";
 
+/// The organizational unit every definition below deploys to. A definition's parameters
+/// must name somewhere to deploy to, and no case here is about which accounts that is,
+/// so every create names this one and differs only in the Regions it targets.
+const TARGET_OU: &str = "ou-1";
+
 /// The tag key every fixture manager carries, so an `UntagResource` has a key to remove
 /// and a cross-Region attempt has something it could have destroyed. Alphanumeric, so
 /// it travels through a query string unchanged.
@@ -158,6 +163,8 @@ async fn create_ok(
     name: &str,
     parameters: &Value,
 ) -> String {
+    // Every accepted definition's parameters name somewhere to deploy to, so each
+    // caller's `parameters` carry [`TARGET_OU`] beside whatever the case is about.
     let body = json!({
         "Name": name,
         "Tags": { TAG_KEY: TAG_VALUE },
@@ -312,8 +319,11 @@ async fn a_listing_reports_only_what_the_signed_region_holds() {
         let mut configurations = 0_usize;
         for (name, targets) in managers {
             let parameters = match targets {
-                Some(target_regions) => json!({ "TargetRegions": target_regions }),
-                None => json!({}),
+                Some(target_regions) => json!({
+                    "TargetOrganizationalUnits": TARGET_OU,
+                    "TargetRegions": target_regions,
+                }),
+                None => json!({ "TargetOrganizationalUnits": TARGET_OU }),
             };
             let arn = create_ok(&router, case, region, name, &parameters).await;
             configurations += targets.map_or(1, |target_regions| target_regions.split(',').count());
@@ -403,8 +413,11 @@ async fn a_configuration_is_served_by_the_region_that_created_its_manager() {
         // mean that endpoint serves none of this row's resources.
         let router = emulator();
         let parameters = match targets {
-            Some(target_regions) => json!({ "TargetRegions": target_regions }),
-            None => json!({}),
+            Some(target_regions) => json!({
+                "TargetOrganizationalUnits": TARGET_OU,
+                "TargetRegions": target_regions,
+            }),
+            None => json!({ "TargetOrganizationalUnits": TARGET_OU }),
         };
         let manager_arn = create_ok(&router, case, home, "deployed-elsewhere", &parameters).await;
 
@@ -496,7 +509,9 @@ struct Fixture {
 
 /// One manager in `region` with one definition and one deployed configuration.
 async fn fixture(router: &MultiServiceRouter, region: &'static str, name: &'static str) -> Fixture {
-    let manager_arn = create_ok(router, region, region, name, &json!({})).await;
+    let manager_arn =
+        create_ok(router, region, region, name, &json!({ "TargetOrganizationalUnits": TARGET_OU }))
+            .await;
     let (status, manager) = get_manager(router, region, &manager_arn).await;
     assert_eq!(
         status, 200,
@@ -608,7 +623,10 @@ async fn per_resource_call(
                     label(&fixture.definition_id)
                 ),
                 region,
-                Some(&json!({ "Parameters": { "TargetRegions": "us-east-1" } })),
+                Some(&json!({ "Parameters": {
+                    "TargetOrganizationalUnits": TARGET_OU,
+                    "TargetRegions": "us-east-1",
+                } })),
             )
             .await
         }

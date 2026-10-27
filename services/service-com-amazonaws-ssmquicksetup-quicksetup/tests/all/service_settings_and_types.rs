@@ -135,7 +135,11 @@ async fn create_manager(router: &MultiServiceRouter, region: &str, type_: &str) 
         region,
         Some(&json!({
             "Name": "catalog-probe",
-            "ConfigurationDefinitions": [{ "Type": type_, "Parameters": {} }],
+            "ConfigurationDefinitions": [{
+                "Type": type_,
+                // Every accepted definition's parameters name somewhere to deploy to.
+                "Parameters": { "TargetOrganizationalUnits": "ou-1" },
+            }],
         })),
     )
     .await;
@@ -326,7 +330,11 @@ async fn a_published_catalog_entry_is_accepted_as_a_configuration_definition_typ
             "ConfigurationDefinitions": [{
                 "Type": entry.type_,
                 "TypeVersion": entry.latest_version(),
-                "Parameters": { "DelegatedAccountId": "000000000000" },
+                "Parameters": {
+                    "DelegatedAccountId": "000000000000",
+                    // Every accepted definition's parameters name somewhere to deploy to.
+                    "TargetOrganizationalUnits": "ou-1",
+                },
             }],
         })),
     )

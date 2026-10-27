@@ -148,3 +148,5 @@ mod conformance_pack_compliance;
 mod remediation_runs_its_runbook;
 #[path = "all/batch_get_resource_config.rs"]
 mod batch_get_resource_config;
+#[path = "all/conformance_pack_compliance_details.rs"]
+mod conformance_pack_compliance_details;

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAgentRecommendationFeedback
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAgentRecommendationFeedback`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAgentRecommendationFeedback::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Submits user feedback on a recommendation to help improve future optimization
+//! suggestions and track implementation outcomes": the feedback the request carries is
+//! recorded as the feedback sub-resource of the recommendation its `recommendationArn`
+//! names, which is why the operation is a PUT of `…/{recommendationArn}/feedback` and is
+//! `@idempotent` — a recommendation holds the feedback last submitted for it, so
+//! resubmitting the same feedback leaves it where it already was and submitting different
+//! feedback replaces what stood.
 //!
 //! ## Shape of an operation
 //!
@@ -148,20 +147,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAgentRecommendationFeedback` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAgentRecommendationFeedbackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutAgentRecommendationFeedbackErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Well-Architected Tool agent profile store is unavailable"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        // Defence in depth for a caller that builds the input directly: `type` is a
+        // `RecommendationFeedbackType` and `feedbackCategory` a `FeedbackCategory`, so the
+        // boundary walk in `crate::service` already refuses a value outside either
+        // published set with this same 400 before the handler runs. Both are kept so no
+        // feedback is ever STORED naming a value its enum does not publish.
+        for (member, value, published) in [
+            (
+                TYPE_MEMBER,
+                Some(input.r#type.as_str()),
+                RECOMMENDATION_FEEDBACK_TYPE_VALUES,
+            ),
+            (
+                FEEDBACK_CATEGORY_MEMBER,
+                input.feedback_category.as_deref(),
+                FEEDBACK_CATEGORY_VALUES,
+            ),
+        ] {
+            let Some(value) = value else { continue };
+            if !published.contains(&value) {
+                return Err(
+                    PutAgentRecommendationFeedbackErrorModeled::ValidationException(
+                        crate::state::member_constraint_exception(
+                            member,
+                            &format!(
+                                "Member must satisfy enum value set: [{}], got {value}",
+                                published.join(", ")
+                            ),
+                        ),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The recommendations of a generation whose analysis the clock has finished exist
+        // from that instant, so they are recorded before this ARN is resolved: a caller may
+        // judge one as soon as the generation that produced it completed, whether or not
+        // anybody polled that generation in between.
+        store.materialise_due_agent_recommendations(now);
+
+        // "The Amazon Resource Name (ARN) of the recommendation to provide feedback for":
+        // an ARN that names no recommendation this account holds has nothing to judge,
+        // which is the 404 this operation models.
+        let Some(record) = store.agent_recommendation_mut(&input.recommendation_arn) else {
+            return Err(
+                PutAgentRecommendationFeedbackErrorModeled::ResourceNotFoundException(
+                    crate::state::agent_recommendation_not_found(&input.recommendation_arn),
+                )
+                .into(),
+            );
+        };
+
+        // The whole submission, PUT as one sub-resource: a member the request omits is
+        // absent in what is recorded rather than inherited from an earlier submission, so
+        // what is held is exactly the feedback last given. The recommendation's own
+        // published content and its `status` / `updateReason` / `lastModified*` lifecycle
+        // are untouched — feedback judges the finding rather than modifying it, so every
+        // operation that reports the recommendation answers as it did before.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAgentRecommendationFeedback"))
+        // `@idempotent`: a resubmission of the feedback this recommendation already holds
+        // leaves it exactly as it stood, the instant it was accepted at included, so a
+        // retried request is indistinguishable from the one it retries. Only feedback that
+        // differs in a member the caller submitted is a new submission.
+        let already_held = record.feedback.as_ref().is_some_and(|held| {
+            held.feedback_type == input.r#type
+                && held.category == input.feedback_category
+                && held.comments == input.comments
+        });
+        if !already_held {
+            record.feedback = Some(crate::state::AgentRecommendationFeedback {
+                feedback_type: input.r#type,
+                category: input.feedback_category,
+                comments: input.comments,
+                // The identity a write is attributed to: every request this emulator
+                // serves is its one account's, exactly as the generation that produced the
+                // recommendation is.
+                submitted_by: ::engine::emulator_account_id().to_string(),
+                submitted_at: now,
+            });
+        }
+
+        // The response carries no members (`PutAgentRecommendationFeedbackResponse` is an
+        // empty structure): the submission is accepted, and no operation of this service
+        // reports feedback back.
+        Ok(PutAgentRecommendationFeedbackOutput {})
     }
 }
+
+/// The modelled input member a feedback-type finding names
+/// (`PutAgentRecommendationFeedbackRequest$type`), as `ValidationExceptionField$Name`
+/// reports it.
+const TYPE_MEMBER: &str = "type";
+
+/// The modelled input member a feedback-category finding names
+/// (`PutAgentRecommendationFeedbackRequest$feedbackCategory`).
+const FEEDBACK_CATEGORY_MEMBER: &str = "feedbackCategory";
