@@ -44,7 +44,7 @@
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
@@ -52,7 +52,9 @@ use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
     PUBLISH_STATUS_PUBLISHED, PUBLISH_STATUS_PUBLISH_IN_PROGRESS,
 };
 
-use crate::api_lifecycle::{as_str, call, call_in_region, emulator, error_code, instant};
+use crate::api_lifecycle::{
+    as_str, call, call_in_region, emulator, error_code, instant, strip_nulls,
+};
 use crate::portal_lifecycle::{custom_colors, portal_content};
 
 /// The portals collection URI (`CreatePortal`'s modelled `POST /v2/portals`); one portal
@@ -363,26 +365,10 @@ fn long_logo_uri() -> String {
 }
 
 /// One member of a document, with an absent member read as `null` — so "absent" and
-/// "reported as null" are not asserted as two different things.
+/// "reported as null" are not asserted as two different things. The normalizer is the
+/// crate-wide one in `api_lifecycle`, shared with every other suite.
 fn member(document: &Value, name: &str) -> Value {
     strip_nulls(document.get(name).unwrap_or(&Value::Null))
-}
-
-/// `value` with every null object entry dropped, recursively: the request and the two
-/// readers are compared through this ONE normalizer, so a structure member a reader omits
-/// and one it reports as null compare equal.
-fn strip_nulls(value: &Value) -> Value {
-    match value {
-        Value::Object(entries) => Value::Object(
-            entries
-                .iter()
-                .filter(|(_, entry)| !entry.is_null())
-                .map(|(key, entry)| (key.clone(), strip_nulls(entry)))
-                .collect::<Map<String, Value>>(),
-        ),
-        Value::Array(entries) => Value::Array(entries.iter().map(strip_nulls).collect()),
-        other => other.clone(),
-    }
 }
 
 /// `document`'s `portalContent` without the theme's `LogoLastUploaded`: that member is
