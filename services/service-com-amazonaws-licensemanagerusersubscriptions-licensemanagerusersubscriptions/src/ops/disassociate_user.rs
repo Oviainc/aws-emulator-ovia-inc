@@ -10,12 +10,27 @@
 //! (`smithy_query(query="operation", operation="DisassociateUser")`), so the service
 //! itself owns the identifier rules, in this order:
 //!
-//! 1. the request must address an association — by `InstanceUserArn`, or by the full
+//! 1. an EC2 instance the request names is AUTHORIZED first, over the same
+//!    `crate::state::ec2_fleet::authorizes_instance` predicate `AssociateUser` and
+//!    `ListUserAssociations` ask — an instance the account does not have cannot be shown
+//!    to be the caller's, so the request fails closed before anything else about it is
+//!    read. That decision is ALSO taken ahead of the boundary validator, by
+//!    `crate::service::EmulatedService::override_operation`, because this service refuses
+//!    a call it will not authorize identically whatever else the request gets wrong —
+//!    whether its `InstanceUserArn` is inside the modelled `Arn` `@pattern` or outside it
+//!    — and a handler cannot do that: the framework's centralized walk is
+//!    deserialize -> validate -> handle, so by the time this function runs a malformed ARN
+//!    has already been refused as a `ValidationException`. The gate here is what a request
+//!    that reached the handler is judged by; the one in `service.rs` only hoists the SAME
+//!    decision, so the two cannot disagree. `InstanceId` is optional on this operation, so
+//!    the question arises only for a request that names an instance — one addressed by
+//!    `InstanceUserArn` alone names none and authorizes nothing;
+//! 2. then the request must address an association — by `InstanceUserArn`, or by the full
 //!    `IdentityProvider`/`InstanceId`/`Username` triple. A request naming neither is an
 //!    argument error the caller must fix, refused with the modelled
 //!    `ValidationException` naming the members it requires, BEFORE anything is looked
 //!    up;
-//! 2. then the association is resolved, and the refusal fails CLOSED: an identifier
+//! 3. then the association is resolved, and the refusal fails CLOSED: an identifier
 //!    state holds no association for cannot be shown to be the caller's, so it is the
 //!    non-modelled `UnauthorizedException`
 //!    ([`crate::scaffolded::Scaffolded::unauthorized`]) with its fixed sentence, never a
@@ -155,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DisassociateUserErrorModeled::InternalServerException(InternalServerException {
@@ -163,7 +178,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The identifier rules come first, independently of what state holds: a request
+        // The authorization gate, BEFORE any rule about the rest of the request and before
+        // any existence lookup of this service's own resources: an instance neither this
+        // service's fleet seam nor the service that OWNS instances reports cannot be shown
+        // to be the caller's, so a request that names one fails closed. The member is
+        // optional here, so an association addressed by its ARN alone names no instance and
+        // there is nothing to authorize. Asked before the store is locked, because resolving
+        // it reaches another service over the in-process callback.
+        if let Some(instance_id) = input.instance_id.as_deref() {
+            if !crate::state::ec2_fleet::authorizes_instance(&*self.engine, ctx, instance_id).await
+            {
+                return Err(crate::scaffolded::Scaffolded::unauthorized());
+            }
+        }
+
+        // The identifier rules come next, independently of what state holds: a request
         // addressing no association at all is an argument error, not a missing resource.
         if input.instance_user_arn.is_none()
             && !(input.identity_provider.is_some()

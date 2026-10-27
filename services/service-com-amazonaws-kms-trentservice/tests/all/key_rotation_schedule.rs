@@ -29,7 +29,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use super::harness::{
-    assert_empty, call, create_alias, create_key, describe, error_code, ok, router, text, REGION,
+    assert_empty, call, create_alias, create_key, describe, error_code, ok, replicate_into, router,
+    text, REGION,
 };
 
 /// Seconds in a day: the unit `RotationPeriodInDays` counts in
@@ -666,7 +667,7 @@ async fn configuring_rotation_is_refused_outside_an_enabled_symmetric_kms_key() 
         &create_key(&router, &json!({"MultiRegion": true})).await,
         "KeyId",
     );
-    replicate_into(&router, &replica, "eu-west-2").await;
+    replicate_into(&router, "setup", &replica, &["eu-west-2"]).await;
     ok(
         &router,
         "UpdatePrimaryRegion",
@@ -689,18 +690,3 @@ async fn configuring_rotation_is_refused_outside_an_enabled_symmetric_kms_key() 
     }
 }
 
-/// Replicate the multi-Region key `key_id` into `region`, which is what leaves a
-/// replica key of the set at that Region's endpoint — the same seam
-/// `multi_region_primary` drives.
-async fn replicate_into(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    key_id: &str,
-    region: &str,
-) {
-    ok(
-        router,
-        "ReplicateKey",
-        &json!({"KeyId": key_id, "ReplicaRegion": region}),
-    )
-    .await;
-}

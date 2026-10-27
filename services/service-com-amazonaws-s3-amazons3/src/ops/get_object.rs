@@ -345,25 +345,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Members whose answer is a response this operation cannot render. Each of them
-        // changes the status or the body of a successful GET, and an operation here
-        // renders one success status (200) over the whole stored object, so serving them
-        // as a plain 200 full-body read would answer something the request did not ask:
+        // changes the status or the body of a successful GET in a way an operation that
+        // renders ONE success status cannot express:
         //
-        // * `Range` and `partNumber` ask for part of the object, which S3 answers with
-        //   HTTP 206 and a `Content-Range`.
-        // * the conditional members are answered with HTTP 304 (`If-None-Match`,
-        //   `If-Modified-Since`) or 412 (`If-Match`, `If-Unmodified-Since`) when the
-        //   condition fails; `PreconditionFailed` is not a shape in this model either.
+        // * `If-None-Match` and `If-Modified-Since` are answered with HTTP 304 and NO body
+        //   when the condition fails, which is not a response this operation can serialize
+        //   (its one success status is 200, and a 304 carries no document at all).
+        // * `Range`, `partNumber`, `If-Match` and `If-Unmodified-Since` are SERVED below: a
+        //   partial read answers 206 with a `Content-Range` (the status follows from that
+        //   header — see `crate::service::wire`), and a precondition that does not hold is a
+        //   refusal with the documented code and status.
         // * `versionId` is SERVED (below): it names one stored version of the key.
         // * the SSE-C members are the key an encrypted object would be decrypted with;
         //   `PutObject` refuses to store one, so no object here was encrypted with it.
         for (member, present) in [
-            ("Range", input.range.is_some()),
-            ("partNumber", input.part_number.is_some()),
-            ("If-Match", input.if_match.is_some()),
             ("If-None-Match", input.if_none_match.is_some()),
             ("If-Modified-Since", input.if_modified_since.is_some()),
-            ("If-Unmodified-Since", input.if_unmodified_since.is_some()),
             (
                 "x-amz-server-side-encryption-customer-algorithm",
                 input.sse_customer_algorithm.is_some(),
@@ -432,6 +429,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(GetObjectErrorModeled::NoSuchKey(NoSuchKey {}).into());
         };
 
+        let now = ::std::time::SystemTime::now();
+
+        // The preconditions this read is subject to, judged against the version it
+        // resolved: a read whose `If-Match` or `If-Unmodified-Since` does not hold is
+        // refused with 412 and the documented sentence
+        // ([`crate::state::read_precondition_fails`] carries the rule and the precedence
+        // between the two), and nothing about the object is reported.
+        if crate::state::read_precondition_fails(
+            &object.etag,
+            object.last_modified,
+            input.if_match.as_deref(),
+            input.if_unmodified_since.as_ref().and_then(crate::state::instant_of),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::PRECONDITION_FAILED_CODE,
+                crate::state::PRECONDITION_FAILED_STATUS,
+                crate::state::PRECONDITION_FAILED_MESSAGE,
+            ));
+        }
+
+        // "Before you can retrieve the object you must first restore a copy using
+        // RestoreObject. Otherwise, this operation returns an InvalidObjectState error"
+        // (`GetObject`'s documentation of that error): an object whose bytes are archived
+        // has no copy a read can serve ([`crate::state::Object::archived_at`] decides it
+        // from the storage class and the state of the restore), so the read is refused
+        // rather than answered with the bytes the store happens to hold. The code is
+        // modelled but the `<Message>` depends on which state barred the call, so it goes
+        // out through the unmodelled channel with the sentence S3 words for this one.
+        if object.archived_at(now) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_OBJECT_STATE_CODE,
+                crate::state::INVALID_OBJECT_STATE_STATUS,
+                crate::state::INVALID_OBJECT_STATE_READ_MESSAGE,
+            ));
+        }
+
+        // WHICH BYTES this read answers with, and what it reports about them.
+        //
+        // A `partNumber` "effectively performs a 'ranged' GET request for the part
+        // specified" (`GetObjectRequest$PartNumber`) and a `Range` "downloads the specified
+        // byte range of an object" (`$Range`) — so each selects a span of the object, and a
+        // response carrying a span reports it in `Content-Range` (which is what makes the
+        // answer a 206; see `crate::service::wire`). A read naming neither is of the whole
+        // object and reports no range at all.
+        //
+        // `partNumber` is judged first: a number the object has no part for is
+        // `InvalidPartNumber` (416), and a `Range` asking for bytes outside the object is
+        // `InvalidRange` (416) — the two refusals HTTP has for a span that cannot be served.
+        //
+        // A request naming BOTH is answered with the part: "effectively performs a 'ranged'
+        // GET request for the part specified" (`GetObjectRequest$PartNumber`) — the part
+        // number IS the range it asks for, so it decides the span and the `Range` beside it
+        // names a second one the answer cannot also be.
+        let total = object.body.len();
+        let span = match (input.part_number, input.range.as_deref()) {
+            (Some(part_number), _) => match object.part_span(part_number) {
+                Some(span) => Some(span),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_PART_NUMBER_CODE,
+                        crate::state::INVALID_PART_NUMBER_STATUS,
+                        crate::state::INVALID_PART_NUMBER_MESSAGE,
+                    ))
+                }
+            },
+            (None, Some(header)) => match crate::state::requested_range(header, total) {
+                crate::state::RangeRequest::Span(span) => Some(span),
+                crate::state::RangeRequest::Unsatisfiable => {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_RANGE_CODE,
+                        crate::state::INVALID_RANGE_STATUS,
+                        crate::state::INVALID_RANGE_MESSAGE,
+                    ))
+                }
+                // A header this emulator serves no single span for is ignored, which RFC
+                // 9110 allows and S3 does: the whole object is served with 200.
+                crate::state::RangeRequest::Ignored => None,
+            },
+            (None, None) => None,
+        };
+        let body = match span {
+            Some(span) => span.slice(&object.body),
+            None => object.body.clone(),
+        };
+
         // The `response-*` query parameters override the matching response headers
         // ("Sets the Content-Type header of the response", and so on for each), so the
         // request's value wins over the stored one when it carries any.
@@ -458,11 +540,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         Ok(GetObjectOutput {
-            body: object.body.clone(),
-            // `Content-Length` is the length of the body actually being returned.
-            content_length: Some(object.body.len() as i64),
+            // `Content-Length` is the length of the body actually being returned, which for
+            // a part- or range-scoped read is the span's own length rather than the object's.
+            content_length: Some(i64::try_from(body.len()).unwrap_or(i64::MAX)),
+            body,
             e_tag: Some(object.etag.clone()),
             last_modified: Some(::aws_smithy_types::DateTime::from(object.last_modified)),
+            // "Indicates that a range of bytes was specified in the request"
+            // (`GetObjectOutput$AcceptRanges`) — S3 advertises that an object read supports
+            // byte ranges whether or not this read asked for one, which is what the one
+            // value this header carries says ([`ACCEPT_RANGES_BYTES`]).
+            accept_ranges: Some(crate::state::ACCEPT_RANGES_BYTES.to_string()),
+            // "The portion of the object returned in the response"
+            // (`GetObjectOutput$ContentRange`), for a read that asked for one — and nothing
+            // at all for a whole-object read, which returns no portion.
+            content_range: span.map(|span| span.content_range(total)),
+            // "The count of parts this object has. This value is only returned if you
+            // specify `partNumber` in your request and the object was uploaded as a
+            // multipart upload" (`GetObjectOutput$PartsCount`) — so both conditions hold or
+            // no count is reported.
+            parts_count: input.part_number.and(object.parts_count()),
             // "Amazon S3 returns this header for all objects except for S3 Standard
             // storage class objects" (`GetObjectOutput$StorageClass`).
             storage_class: Some(object.storage_class.clone())
@@ -523,14 +620,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             restore: object
                 .restore
                 .as_ref()
-                .and_then(|restore| restore.header_value(::std::time::SystemTime::now())),
+                .and_then(|restore| restore.header_value(now)),
             // Everything else describes a feature no stored object here has, so none of
-            // it is reported rather than being invented: `AcceptRanges` would advertise
-            // the ranged reads refused above, `DeleteMarker` needs a delete marker (a
-            // delete records none, so no read can be of one), `ArchiveStatus` needs an
-            // S3 Intelligent-Tiering archive tier,
-            // the SSE-C members are refused at write time, `PartsCount` needs
-            // a multipart upload, `ContentRange` belongs to a ranged read, `MissingMeta`
+            // it is reported rather than being invented: `DeleteMarker` needs a delete
+            // marker (a delete records none, so no read can be of one), `ArchiveStatus`
+            // needs an S3 Intelligent-Tiering archive tier,
+            // the SSE-C members are refused at write time, `MissingMeta`
             // counts unreadable metadata headers (there are none), `ReplicationStatus`
             // needs a replication configuration and `RequestCharged` a Requester Pays
             // charge this emulator does not model.
@@ -549,3 +644,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+

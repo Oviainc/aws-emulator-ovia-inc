@@ -4,10 +4,11 @@
 //! ACCOUNT has, asked of the service that owns instances.
 //!
 //! The rule under test: an operation of this service that acts on a caller-named EC2
-//! instance — `AssociateUser` and `ListUserAssociations`, the two whose input declares
-//! `InstanceId` `@required` (`smithy_query(query="operation",
-//! operation="AssociateUser,ListUserAssociations")`) — authorizes the request exactly when
-//! the account has an instance of that id. `InstanceId` is a plain `String` in this
+//! instance — `AssociateUser`, `ListUserAssociations` and `DisassociateUser`, the three
+//! whose input carries an `InstanceId` (`smithy_query(query="operation",
+//! operation="AssociateUser,ListUserAssociations,DisassociateUser")`) — authorizes the
+//! request exactly when the account has an instance of that id. `InstanceId` is a plain
+//! `String` in this
 //! service's model and the model declares no set of ids, so an instance a client launched
 //! with `ec2:RunInstances` is a target the whole user-association plane accepts, and only
 //! an id no instance of the account has is refused.
@@ -72,10 +73,12 @@ const UNAUTHORIZED_MESSAGE: &str =
 const REFUSAL_STATUS: u16 = 400;
 
 /// Every operation that acts on the EC2 instance its request names, as the route a client
-/// reaches it at.
+/// reaches it at. Each one's request is addressed by the same
+/// `(Username, InstanceId, IdentityProvider)` members, so one body drives all three.
 const GATED_PATHS: &[(&str, &str)] = &[
     ("AssociateUser", "/user/AssociateUser"),
     ("ListUserAssociations", "/user/ListUserAssociations"),
+    ("DisassociateUser", "/user/DisassociateUser"),
 ];
 
 /// This service and EC2 — the owner of the instances — over ONE shared engine, plus an EC2

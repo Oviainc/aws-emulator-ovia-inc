@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_kms_trentservice::state::key_arn;
 use service_com_amazonaws_kms_trentservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -239,7 +240,130 @@ pub(crate) async fn create_key(router: &MultiServiceRouter, request: &Value) -> 
 
 /// The `KeyMetadata` `DescribeKey` reports for an identifier.
 pub(crate) async fn describe(router: &MultiServiceRouter, identifier: &str) -> Value {
-    ok(router, "DescribeKey", &json!({ "KeyId": identifier })).await["KeyMetadata"].clone()
+    describe_in(router, REGION, identifier).await
+}
+
+/// [`describe`], through the endpoint of `region` — which is a different KEY for a
+/// multi-Region key set, since every Region holds its own member of the set.
+pub(crate) async fn describe_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    identifier: &str,
+) -> Value {
+    ok_in(router, region, "DescribeKey", &json!({ "KeyId": identifier })).await["KeyMetadata"]
+        .clone()
+}
+
+/// Replicate the multi-Region key `key_id` into each of `regions`, which is what
+/// leaves a replica key of the set at each of those Regions' endpoints, and wait for
+/// each replica to leave the transient `Creating` state a replicate starts it in — so a
+/// case about what the SET does next reads the state the replicate left rather than one
+/// it was still owed. What a replicate itself answers is asserted by
+/// `tests/all/replicate_key.rs`.
+pub(crate) async fn replicate_into(
+    router: &MultiServiceRouter,
+    case: &str,
+    key_id: &str,
+    regions: &[&str],
+) {
+    for region in regions {
+        let answer = ok_in(
+            router,
+            REGION,
+            "ReplicateKey",
+            &json!({"KeyId": key_id, "ReplicaRegion": region}),
+        )
+        .await;
+        let metadata = answer["ReplicaKeyMetadata"].clone();
+        assert_eq!(
+            metadata["Arn"],
+            json!(key_arn(region, key_id)),
+            "case {case}: the replica in {region} is named by the key ARN of its own Region, \
+             got {metadata}"
+        );
+        settle_key_state(router, region, case, key_id, "Creating").await;
+    }
+}
+
+/// The `MultiRegionConfiguration` of the multi-Region key set `key_id` as the endpoint
+/// of `region` reports it: which member of the set that endpoint serves, the Region
+/// holding the set's primary key, and the Regions holding a replica key, sorted. Every
+/// member it names is checked to be named by the key ARN of its OWN Region, which is
+/// how a set of one key id spans Regions.
+pub(crate) async fn topology_at(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    key_id: &str,
+) -> (String, String, Vec<String>) {
+    let metadata = describe_in(router, region, key_id).await;
+    let configuration = metadata["MultiRegionConfiguration"].clone();
+    let key_type = text(case, &configuration, "MultiRegionKeyType");
+    let primary = configuration["PrimaryKey"].clone();
+    let primary_region = text(case, &primary, "Region");
+    assert_eq!(
+        primary["Arn"],
+        json!(key_arn(&primary_region, key_id)),
+        "case {case}: the primary key is named by the key ARN of its own Region, got {primary}"
+    );
+    let mut replicas: Vec<String> = configuration["ReplicaKeys"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: expected ReplicaKeys in {configuration}"))
+        .iter()
+        .map(|replica| {
+            let replica_region = text(case, replica, "Region");
+            assert_eq!(
+                replica["Arn"],
+                json!(key_arn(&replica_region, key_id)),
+                "case {case}: a replica key is named by the key ARN of its own Region, \
+                 got {replica}"
+            );
+            replica_region
+        })
+        .collect();
+    replicas.sort();
+    (key_type, primary_region, replicas)
+}
+
+/// Wait until the key `identifier` names at the endpoint of `region` has left the
+/// TRANSIENT key state `transient_state`, and report the `KeyMetadata` it settled
+/// with.
+///
+/// Two of this service's key states are ones only the clock ends, each with its own
+/// span: a replica key is `Creating` for `state::REPLICA_CREATING_SPAN` after the
+/// replicate that made it, and the two keys a primary-Region move goes through are
+/// `Updating` for `state::PRIMARY_REGION_UPDATE_SPAN` after the call that started it
+/// ("even after this operation completes, the process of updating the primary Region
+/// might still be in progress for a few more seconds"). The deadline is that state's
+/// own span over, so a case waiting out the shorter one is not given the longer one's
+/// patience. A case that is about what such a change LEFT waits for it here; what the
+/// service answers WHILE it is in flight is asserted by the suites about those
+/// operations.
+pub(crate) async fn settle_key_state(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    identifier: &str,
+    transient_state: &str,
+) -> Value {
+    let span = match transient_state {
+        "Creating" => service_com_amazonaws_kms_trentservice::state::REPLICA_CREATING_SPAN,
+        "Updating" => service_com_amazonaws_kms_trentservice::state::PRIMARY_REGION_UPDATE_SPAN,
+        other => panic!("case {case}: {other} is not a key state only the clock ends"),
+    };
+    let deadline = std::time::Instant::now() + span * 20;
+    loop {
+        let metadata = describe_in(router, region, identifier).await;
+        if metadata["KeyState"] != json!(transient_state) {
+            return metadata;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case}: {identifier} must leave the transient {transient_state} key state, \
+             got {metadata}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 /// A member of a metadata object, as a string.
