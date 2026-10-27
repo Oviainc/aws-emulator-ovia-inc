@@ -83,6 +83,8 @@ mod metric_math;
 mod metric_read_identity;
 #[path = "all/metric_stream_additional_statistics.rs"]
 mod metric_stream_additional_statistics;
+#[path = "all/metric_stream_unknown_names.rs"]
+mod metric_stream_unknown_names;
 #[path = "all/metric_streams.rs"]
 mod metric_streams;
 #[path = "all/metrics_and_alarms.rs"]
