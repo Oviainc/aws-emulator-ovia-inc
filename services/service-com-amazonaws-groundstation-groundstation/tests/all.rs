@@ -47,6 +47,8 @@ mod dataflow_endpoint_addressing;
 mod dataflow_endpoint_group_deletion;
 #[path = "all/dataflow_endpoint_group_listing.rs"]
 mod dataflow_endpoint_group_listing;
+#[path = "all/dataflow_endpoint_group_reads.rs"]
+mod dataflow_endpoint_group_reads;
 #[path = "all/dataflow_endpoint_groups.rs"]
 mod dataflow_endpoint_groups;
 #[path = "all/dataflow_endpoint_groups_v2.rs"]

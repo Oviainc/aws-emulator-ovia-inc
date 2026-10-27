@@ -176,6 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // A resource of a stack of this Region whose owning service had not reported it
+        // ready when the create answered holds that stack's operation open: those services
+        // are asked, before the store is locked, what they report now
+        // ([`crate::state::provisioning::advance_stabilisations`]).
+        crate::state::provisioning::advance_stabilisations(ctx, &state).await;
+
         let mut store = state.lock();
         // Reporting operation: the only write is materialising a status transition the
         // clock had already made due, which was owed whether or not anyone called — and

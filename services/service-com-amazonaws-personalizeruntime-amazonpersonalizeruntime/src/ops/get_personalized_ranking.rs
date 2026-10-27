@@ -287,15 +287,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
-        // Score descending; `inputList` order decides ties, so an equal pair keeps the
-        // order the caller sent and the ranking stays stable across identical calls.
-        ranked.sort_by(|left, right| {
-            right
-                .1
-                .partial_cmp(&left.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.2.cmp(&right.2))
-        });
+        // Score descending through the one comparator all three operations share;
+        // `inputList` order is this operation's tie-break key, so an equal pair keeps
+        // the order the caller sent and the ranking stays stable across identical calls.
+        ranked.sort_by(|left, right| scoring::by_score_desc((left.2, left.1), (right.2, right.1)));
 
         let mut personalized_ranking: Vec<PredictedItem> = ranked
             .iter()

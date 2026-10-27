@@ -683,6 +683,9 @@ pub const OPERATION_TYPE_CREATE_LOAD_BALANCER_TLS_CERTIFICATE: &str =
 pub const OPERATION_TYPE_DELETE_LOAD_BALANCER_TLS_CERTIFICATE: &str =
     "DeleteLoadBalancerTlsCertificate";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_ATTACH_LOAD_BALANCER_TLS_CERTIFICATE: &str =
+    "AttachLoadBalancerTlsCertificate";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_SNAPSHOT: &str = "CreateDiskSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_DISK_SNAPSHOT: &str = "DeleteDiskSnapshot";
@@ -10677,6 +10680,32 @@ impl StoredLoadBalancer {
         self.certificates
             .iter()
             .position(|certificate| certificate.name == name)
+    }
+
+    /// Make the certificate `name` the one this load balancer terminates HTTPS
+    /// with, answering whether it holds a certificate of that name at all.
+    ///
+    /// A load balancer terminates HTTPS with ONE certificate, so attaching one
+    /// detaches whichever was attached: "Use the AttachLoadBalancerTlsCertificate
+    /// action with the non-attached certificate, and it will replace the existing
+    /// one and become the attached certificate" (the modelled
+    /// `AttachLoadBalancerTlsCertificate` documentation). Attaching the one
+    /// already attached leaves the record in the state the request asks for.
+    ///
+    /// A `name` this load balancer holds no certificate under changes NOTHING
+    /// and answers `false`, which is what the caller refuses the request by:
+    /// the name is resolved through [`Self::certificate_index`] before a single
+    /// certificate is written, so a request for a certificate this load
+    /// balancer does not hold cannot leave its attachment cleared. Both walks
+    /// are bounded by [`MAX_CERTIFICATES_PER_LOAD_BALANCER`].
+    pub fn attach_certificate(&mut self, name: &str) -> bool {
+        if self.certificate_index(name).is_none() {
+            return false;
+        }
+        for certificate in &mut self.certificates {
+            certificate.is_attached = certificate.name == name;
+        }
+        true
     }
 
     /// The modelled `configurationOptions` map: one entry per

@@ -9,6 +9,13 @@
 //! replaces the version it does hold — the stored version's `meta.versionId` advances
 //! with every write, and a `GET` of that id then answers exactly what was stored.
 //!
+//! A write ends the span the version it replaces was current for rather than erasing
+//! that version, so the superseded version stays RETAINED (which is what lets a
+//! point-in-time restore reproduce it — `tests/all/restore_fhir_datastore.rs` asserts
+//! that rule). Retaining it is charged against the data store's retention budgets, so
+//! the last test here pins what happens when they cannot hold it: the versions it
+//! would keep are dropped, oldest first, rather than the write being refused.
+//!
 //! The rows differ along what the rule generalises over: the resource TYPE, the FORM of
 //! the caller-chosen id (plain, hyphenated, dotted, digits only, one character, the
 //! published 64-character maximum), the submitted content, and whether the resource is
@@ -284,6 +291,87 @@ async fn a_put_stores_the_resource_at_the_caller_chosen_id_and_a_read_answers_it
             "case {case:?}: the id is stable across versions, got {third}"
         );
     }
+}
+
+#[tokio::test]
+async fn an_update_a_full_data_store_cannot_retain_a_version_for_is_still_stored() {
+    // A write keeps the version it supersedes, and those bytes are charged against
+    // the data store's retained-byte budget. When the budget cannot hold both, the
+    // versions the write would keep are DROPPED, oldest first — the write itself is
+    // admitted, because a data store that kept no history would have admitted it.
+    let service = HealthLake::new();
+    let (_id, path) = service.active_datastore("fhir-update-budget").await;
+
+    // Resources just under the per-resource ceiling (1 MiB), created until the
+    // per-data-store byte budget (16 MiB) refuses one: at most 17 creates.
+    let chunky = json!({
+        "resourceType": "Observation",
+        "status": "final",
+        "note": [{ "text": "y".repeat((1 << 20) - 256) }],
+    });
+    let mut stored_ids: Vec<String> = Vec::new();
+    let refused = loop {
+        let (status, body, _headers) = service
+            .fhir("POST", &format!("{path}Observation"), &chunky)
+            .await;
+        if status != 201 {
+            break (status, body);
+        }
+        stored_ids.push(
+            body["id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the create assigns an id, got {body}"))
+                .to_string(),
+        );
+        assert!(
+            stored_ids.len() <= 17,
+            "the per-data-store byte budget must refuse a create before {} resources \
+             of ~1 MiB are retained",
+            stored_ids.len()
+        );
+    };
+    assert_eq!(
+        refused.0, 507,
+        "the data store must be at its retained-byte budget, got {}: {}",
+        refused.0, refused.1
+    );
+    let target = stored_ids
+        .first()
+        .expect("the budget admits resources before it refuses one")
+        .clone();
+
+    // The update replaces a resource of the same size, so retaining the version it
+    // supersedes would need bytes the budget does not have.
+    let replacement = json!({
+        "resourceType": "Observation",
+        "id": target,
+        "status": "amended",
+        "note": [{ "text": "z".repeat((1 << 20) - 256) }],
+    });
+    let updated = updated(
+        &service,
+        &path,
+        Write {
+            case: "an update on a data store at its retained-byte budget",
+            resource_type: "Observation",
+            id: &target,
+            resource: &replacement,
+            expected_status: 200,
+            expected_version: "2",
+        },
+    )
+    .await;
+    let (status, read, _headers) = service
+        .fhir("GET", &format!("{path}Observation/{target}"), &Value::Null)
+        .await;
+    assert_eq!(
+        status, 200,
+        "the updated resource must still read back, got {status}: {read}"
+    );
+    assert_eq!(
+        read, updated,
+        "the read answers the version the update stored, got {read}"
+    );
 }
 
 #[tokio::test]

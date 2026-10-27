@@ -137,15 +137,17 @@ async fn get_contact_information(router: &MultiServiceRouter, request: Value) ->
     call(router, "/getContactInformation", request).await
 }
 
-/// A `ContactInformation` carrying only the members the model marks required.
+/// A `ContactInformation` carrying only the members the model marks required,
+/// in a country `StateOrRegion`'s own documentation does NOT list among the
+/// seven that require one — so the structure is complete without it.
 fn required_only() -> Value {
     json!({
         "FullName": "Ada Lovelace",
-        "AddressLine1": "410 Terry Ave N",
-        "City": "Seattle",
-        "PostalCode": "98109",
-        "CountryCode": "US",
-        "PhoneNumber": "+1 206-555-0100",
+        "AddressLine1": "12 Rue de Rivoli",
+        "City": "Paris",
+        "PostalCode": "75001",
+        "CountryCode": "FR",
+        "PhoneNumber": "+33 1 55 55 01 00",
     })
 }
 
@@ -362,6 +364,7 @@ async fn a_stored_contact_information_round_trips_member_for_member() {
                 "AddressLine1": "100 NASA Road",
                 "AddressLine2": "Suite 3",
                 "City": "Hampton",
+                "StateOrRegion": "VA",
                 "PostalCode": "23666",
                 "CountryCode": "US",
                 "PhoneNumber": "+1 757-555-0199",
@@ -421,7 +424,9 @@ async fn a_stored_contact_information_round_trips_member_for_member() {
                 "StateOrRegion": sized('s', STATE_OR_REGION_MAX),
                 "DistrictOrCounty": sized('d', DISTRICT_OR_COUNTY_MAX),
                 "PostalCode": sized('9', POSTAL_CODE_MAX),
-                "CountryCode": sized('Z', COUNTRY_CODE_LEN),
+                // `CountryCode` is fixed at COUNTRY_CODE_LEN characters, so its
+                // maximum IS an assigned two-letter country code.
+                "CountryCode": "ZW",
                 "PhoneNumber": sized_phone_number(PHONE_NUMBER_MAX),
                 "CompanyName": sized('c', COMPANY_NAME_MAX),
                 "WebsiteUrl": sized('u', WEBSITE_URL_MAX),

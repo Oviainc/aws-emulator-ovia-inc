@@ -191,6 +191,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // "Note that this cannot be updated while recording is active": the recording
+        // configuration is the one member this operation cannot write while the stage's
+        // recorder is still writing media, so a request that supplies it while a
+        // recording is running is the modelled `ConflictException` (HTTP 409) — the same
+        // answer `UpdateIngestConfiguration` gives for a configuration that is active —
+        // and it is refused before the record is touched, so a refused update changes
+        // nothing (the request's `name` included). Running is read through the ONE lookup
+        // a read of a participant's recording goes through
+        // (`crate::state::stage_recording_participants`), so the refusal and the state a
+        // caller just read are one fact and not two.
+        let running_recording = if recording_configuration.is_some() {
+            crate::state::stage_recording_participants(&store, &input.arn)
+                .into_iter()
+                .next()
+        } else {
+            None
+        };
+        if let Some(recorded) = running_recording {
+            return Err(crate::state::conflict(
+                UpdateStageErrorModeled::ConflictException,
+                crate::state::stage_recording_active_message(
+                    &input.arn,
+                    &recorded.participant_id,
+                    &recorded.recording_state,
+                ),
+            ));
+        }
+
         let record = store.stage_in_mut(&region, &input.arn).ok_or_else(|| {
             crate::state::resource_not_found(
                 UpdateStageErrorModeled::ResourceNotFoundException,
