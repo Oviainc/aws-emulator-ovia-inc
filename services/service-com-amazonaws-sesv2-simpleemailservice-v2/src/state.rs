@@ -528,6 +528,36 @@ pub fn tenant_resource_type(resource_arn: &str) -> Option<&'static str> {
 /// once, so two surfaces cannot word the one condition differently.
 pub const UNSUPPORTED_RESOURCE_ARN: &str = "Provided ARN is not in SES resource ARN format";
 
+/// How the tenant-resource association surface words `NotFoundException` for a
+/// `ResourceArn` naming a resource of a kind a tenant may hold that the account does
+/// not hold in this Region; `None` when the ARN names no such kind at all, which is
+/// the malformed-input condition [`tenant_resource_type`] reads and
+/// [`UNSUPPORTED_RESOURCE_ARN`] words.
+///
+/// The resource is named the way the rest of this API names a missing resource of that
+/// KIND — the kind's label and the id its ARN addresses it under, in angle brackets —
+/// so a caller reads which resource was not found rather than the whole ARN it passed.
+/// The sentence is the one this surface is RECORDED answering a removal whose
+/// `ResourceArn` names a configuration set the account does not hold: the fixed text
+/// `Configuration set <` + `> does not exist:`, ending in a colon rather than a period,
+/// with the configuration-set name parsed out of the ARN as its only variable part. The
+/// other two kinds a tenant may hold ([`TENANT_RESOURCE_TYPES`]) follow that template
+/// with their own label. The per-kind reads of the same condition elsewhere end the
+/// sentence in a period instead, which is the wording THEY are recorded with; see
+/// [`configuration_set_not_found`] and [`email_identity_not_found`].
+pub fn tenant_resource_not_found(resource_arn: &str) -> Option<String> {
+    let (resource_type, resource_id) = ses_resource_of(resource_arn)?;
+    let label = match resource_type {
+        "identity" => "Email identity",
+        "configuration-set" => "Configuration set",
+        "template" => "Email template",
+        // Any other kind is one no tenant may hold, so the ARN is malformed input to
+        // this surface rather than a resource that happens to be missing.
+        _ => return None,
+    };
+    Some(format!("{label} <{resource_id}> does not exist:"))
+}
+
 /// The keys `ListTenantResourcesFilterKey` names: "currently, the only supported
 /// filter key is RESOURCE_TYPE". The filter arrives as a map of plain strings, so
 /// the handler is what refuses a key the enum does not name.
@@ -760,6 +790,21 @@ impl ComAmazonawsSesv2SimpleemailserviceV2State {
                 .map(TenantRecord::tag_list),
             _ => None,
         }
+    }
+
+    /// Whether the call `scope` describes holds the resource `resource_arn` names.
+    ///
+    /// Resolution is [`Self::resource_tags`]': that is the one place an ARN this
+    /// service addresses is read against the tables holding its records, so "the
+    /// account holds this resource" means the same to every surface that resolves a
+    /// caller-supplied ARN — the tags are simply the view that read reports, and a
+    /// resource carrying none still resolves (to an empty list). A kind this account
+    /// keeps no table for yet resolves to nothing, exactly as an id that was never
+    /// created: the two are indistinguishable to the caller.
+    ///
+    /// Reporting only: the resolution reads the tables and writes nothing.
+    pub fn holds_resource(&self, resource_arn: &str, scope: &CallerScope) -> bool {
+        self.resource_tags(resource_arn, scope).is_some()
     }
 
     /// Put `record` on the suppression list `key` names, refusing a NEW entry once
