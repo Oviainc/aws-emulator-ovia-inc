@@ -1565,6 +1565,49 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
             >= RESOURCE_QUOTA
     }
 
+    /// Start one operation against the connector `connector_arn` names, for a
+    /// call signed for `region`: the ARN the new operation is reported under, or
+    /// — as an `Err` — the message the refusal of a connector that already holds
+    /// as many operations as it may carries.
+    ///
+    /// The ONE way an operation against a connector is started, run by every
+    /// handler that starts one (a restart and an update), so neither can meter
+    /// the store, word that refusal, or mint an operation's ARN differently from
+    /// the other. Only the modelled error VARIANT and the stored record stay with
+    /// the handler, since the error enum and the operation's type are
+    /// per-operation.
+    ///
+    /// The meter is read BEFORE anything is minted, so a refused call moves the
+    /// mint counter no more than it stores a record.
+    pub fn start_connector_operation(
+        &mut self,
+        connector_arn: &str,
+        connector_name: &str,
+        region: &str,
+    ) -> Result<String, String> {
+        // The operations stored against one connector are metered, so a
+        // connector restarted or updated without end does not grow this store
+        // without end. The refusal blames no member of the request, so it keeps
+        // its own wording rather than the member-naming form.
+        if self.connector_operation_quota_reached(connector_arn) {
+            return Err(format!(
+                "Limit exceeded. Resource limit reached: this connector already holds {RESOURCE_QUOTA} operations."
+            ));
+        }
+        let id = self.mint_resource_id(CONNECTOR_OPERATION_KIND, connector_name);
+        // The operation's ARN is derived from the connector's, so it names the
+        // same partition, region and account the connector itself lives in. The
+        // fallback covers only a connector ARN of a shape this service did not
+        // mint, which keeps the call total without a panic.
+        Ok(connector_operation_arn(connector_arn, &id).unwrap_or_else(|| {
+            ::engine::emulator_arn(
+                ARN_SERVICE,
+                region,
+                &format!("{CONNECTOR_OPERATION_KIND}/{connector_name}/{id}"),
+            )
+        }))
+    }
+
     /// The operations stored against the connector `connector_arn` names, each
     /// behind the key it pages under ([`ConnectorOperationRecord::page_key`]),
     /// ready for [`page`].
@@ -1731,6 +1774,11 @@ fn settling_due(pending: Option<PendingChange>, now: Instant) -> bool {
     pending.is_some_and(|change| change.kind == PendingKind::Settle && change.is_due(now))
 }
 
+/// The resource type a connector operation is named under: the kind its minted
+/// id is seeded with ([`ComAmazonawsKafkaconnectKafkaconnectState::mint_resource_id`])
+/// and the type its ARN reports it as, so the two can never name it differently.
+const CONNECTOR_OPERATION_KIND: &str = "connector-operation";
+
 /// The ARN of an operation against the connector `connector_arn` names, or
 /// `None` when that value is not a connector ARN this service minted.
 ///
@@ -1743,7 +1791,7 @@ fn settling_due(pending: Option<PendingChange>, now: Instant) -> bool {
 pub fn connector_operation_arn(connector_arn: &str, operation_id: &str) -> Option<String> {
     let (scope, resource) = connector_arn.rsplit_once(":connector/")?;
     (!resource.is_empty())
-        .then(|| format!("{scope}:connector-operation/{resource}/{operation_id}"))
+        .then(|| format!("{scope}:{CONNECTOR_OPERATION_KIND}/{resource}/{operation_id}"))
 }
 
 /// `at` as the `__timestampIso8601` the read operations carry.

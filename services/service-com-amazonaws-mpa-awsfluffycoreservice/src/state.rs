@@ -176,6 +176,13 @@
 //! * [`unattachable_policy`] — the one message a policy reference the catalog cannot
 //!   resolve is refused with
 //!   ([`ComAmazonawsMpaAwsfluffycoreserviceState::unattachable_policy_reference`]).
+//! * [`repeated_identity`] — the one message either write path that takes an approver
+//!   list refuses a repeated identity with.
+//!
+//! Whatever the sentence, a refusal is a modelled response shape: every `Message` this
+//! service declares is `@length(max: 1000)` while the members a refusal quotes back run
+//! to 2048 characters on their own, so every message built by interpolating a request
+//! value is held to that bound by [`bounded_message`].
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -193,9 +200,12 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 pub const SERVICE_ACTION_PREFIX: &str = "mpa";
 
 /// Longest `Message` this service emits on a modelled error, from the
-/// `@length(max: 1000)` both `AccessDeniedException$Message` and
-/// `ValidationException$Message` declare.
-const MAX_EXCEPTION_MESSAGE: usize = 1000;
+/// `@length(max: 1000)` every error's `Message` member declares — `ValidationException`,
+/// `ConflictException`, `AccessDeniedException`, `ResourceNotFoundException`,
+/// `InvalidParameterException`, `ServiceQuotaExceededException`, `TooManyTagsException`,
+/// `ThrottlingException` and `InternalServerException` alike. It is the bound
+/// [`bounded_message`] holds every refusal to.
+pub const MAX_EXCEPTION_MESSAGE: usize = 1000;
 
 /// The `UpdateAction` token that asks for every approver's MFA devices to be
 /// synchronized with the identity source — the one value `UpdateAction` declares
@@ -537,14 +547,17 @@ pub fn reserved_tag_key() -> ValidationException {
 /// earns.
 ///
 /// The reference is a `QualifiedPolicyArn`, which carries no `@sensitive` trait, so the
-/// refusal names the ARN that resolved to nothing.
+/// refusal names the ARN that resolved to nothing — held, like every refusal that quotes
+/// a request value back, to the bound its own `Message` member declares
+/// ([`bounded_message`]): a `QualifiedPolicyArn` is `@length(max: 1224)`, longer on its
+/// own than the message it goes into.
 #[must_use]
 pub fn unattachable_policy(policy_arn: &str) -> ValidationException {
     ValidationException {
-        message: format!(
+        message: bounded_message(format!(
             "Policies names a policy version that does not exist: {policy_arn}. Attach a \
              policy version ListPolicies and ListPolicyVersions report."
-        ),
+        )),
     }
 }
 
@@ -2924,20 +2937,32 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
     }
 }
 
-/// The `(PrimaryIdentityId, PrimaryIdentitySourceArn)` pair that `approvers` names more
-/// than once, rendered for a refusal message, or `None` when every pair is distinct.
+/// The refusal an `Approvers` list that names one identity more than once earns, or
+/// `None` when every `(PrimaryIdentityId, PrimaryIdentitySourceArn)` pair is distinct.
 ///
 /// One identity cannot hold two seats on a team: a repeat would inflate the approver
 /// count (N) that `MofN` is measured against without adding anyone who can approve.
+///
+/// Neither member is `@sensitive`, so the refusal names the pair that was repeated —
+/// held, like every refusal that quotes a request value back, to the bound its own
+/// `Message` member declares ([`bounded_message`]): `PrimaryIdentitySourceArn` alone is
+/// `@length(max: 1000)`, the whole bound of the message it goes into. Both write paths
+/// that take an approver list raise this one refusal, so neither can word — or overrun —
+/// it differently.
 #[must_use]
-pub fn repeated_identity<'a, I>(approvers: I) -> Option<String>
+pub fn repeated_identity<'a, I>(approvers: I) -> Option<ValidationException>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
     let mut seen = ::std::collections::BTreeSet::new();
     for (identity_id, source_arn) in approvers {
         if !seen.insert((identity_id, source_arn)) {
-            return Some(format!("{identity_id} from {source_arn}"));
+            return Some(ValidationException {
+                message: bounded_message(format!(
+                    "Approvers names the same identity more than once ({identity_id} from \
+                     {source_arn}); each approver must be a distinct identity."
+                )),
+            });
         }
     }
     None
@@ -3218,9 +3243,17 @@ pub fn is_malformed_arn_violation(violation: &::aws_smithy_schema_server::Violat
 
 /// `message` cut to the modelled message bound ([`MAX_EXCEPTION_MESSAGE`]) on a
 /// character boundary, so a long value quoted back — a resource ARN
-/// (`ApprovalTeamArn` is `length(20..2048)`), a `Region` (`length(max: 1000)`) —
-/// cannot push the refusal past the length its own member declares.
-fn bounded_message(message: String) -> String {
+/// (`ApprovalTeamArn` is `length(20..2048)`), a qualified policy reference
+/// (`QualifiedPolicyArn` is `length(max: 1224)`), an identity source ARN or a `Region`
+/// (`length(max: 1000)`) — cannot push the refusal past the length its own member
+/// declares.
+///
+/// Every `Message` member of every error this service declares is `@length(max: 1000)`,
+/// so this is the one bound, and every refusal built by interpolating a value the
+/// REQUEST carried goes through here: a refusal is a modelled response shape, and a
+/// request within its own constraints can never make this service answer outside them.
+#[must_use]
+pub fn bounded_message(message: String) -> String {
     if message.len() <= MAX_EXCEPTION_MESSAGE {
         return message;
     }

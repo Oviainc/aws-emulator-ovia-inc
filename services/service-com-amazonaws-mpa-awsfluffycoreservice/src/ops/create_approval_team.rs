@@ -262,10 +262,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if state.name_index.contains_key(&input.name) {
             return Err(CreateApprovalTeamErrorModeled::ConflictException(ConflictException {
-                message: format!(
+                message: crate::state::bounded_message(format!(
                     "An approval team named '{}' already exists in this account.",
                     input.name
-                ),
+                )),
             })
             .into());
         }
@@ -349,13 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .map(|a| (a.primary_identity_id.as_str(), a.primary_identity_source_arn.as_str())),
         ) {
-            return Err(CreateApprovalTeamErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "Approvers names the same identity more than once ({repeated}); each \
-                     approver must be a distinct identity."
-                ),
-            })
-            .into());
+            return Err(CreateApprovalTeamErrorModeled::ValidationException(repeated).into());
         }
         if approval_strategy.min_approvals_required() > approver_count {
             return Err(CreateApprovalTeamErrorModeled::ValidationException(ValidationException {

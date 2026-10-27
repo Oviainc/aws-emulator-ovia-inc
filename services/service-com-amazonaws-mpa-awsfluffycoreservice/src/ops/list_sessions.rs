@@ -617,9 +617,14 @@ fn unsupported_operator(
     ))
 }
 
-/// This operation's modelled `ValidationException` (400).
+/// This operation's modelled `ValidationException` (400), its message held to the bound
+/// the member declares (`crate::state::bounded_message`): a filter refusal quotes the
+/// `Filter$Value` the request carried, and that member's own `@length(max: 1000)` is the
+/// WHOLE length `ValidationException$Message` allows.
 fn validation(message: String) -> ListSessionsError {
     ListSessionsError::Modeled(ListSessionsErrorModeled::ValidationException(
-        ValidationException { message },
+        ValidationException {
+            message: crate::state::bounded_message(message),
+        },
     ))
 }

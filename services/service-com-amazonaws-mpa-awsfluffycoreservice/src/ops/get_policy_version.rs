@@ -190,10 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some((policy, version)) = state.policy_version(&input.policy_version_arn) else {
             return Err(GetPolicyVersionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
+                    message: crate::state::bounded_message(format!(
                         "No policy version found for ARN '{}'.",
                         input.policy_version_arn
-                    ),
+                    )),
                 },
             )
             .into());

@@ -197,12 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if team.status != crate::state::TeamStatus::Active {
             return Err(StartApprovalTeamBaselineErrorModeled::ValidationException(
                 ValidationException {
-                    message: format!(
+                    message: crate::state::bounded_message(format!(
                         "Approval team '{}' is {} and not ACTIVE, so a baseline session \
                          cannot be started for it.",
                         input.arn,
                         team.status.as_wire()
-                    ),
+                    )),
                 },
             )
             .into());
@@ -221,11 +221,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 return Err(StartApprovalTeamBaselineErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
+                        message: crate::state::bounded_message(format!(
                             "ApproverIds names '{approver_id}', which is not an approver of \
                              approval team '{}'.",
                             input.arn
-                        ),
+                        )),
                     },
                 )
                 .into());
@@ -233,10 +233,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !seen.insert(approver_id.as_str()) {
                 return Err(StartApprovalTeamBaselineErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
+                        message: crate::state::bounded_message(format!(
                             "ApproverIds names approver '{approver_id}' more than once; each \
                              approver may take part in a session once."
-                        ),
+                        )),
                     },
                 )
                 .into());

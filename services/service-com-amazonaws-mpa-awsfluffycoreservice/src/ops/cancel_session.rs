@@ -213,12 +213,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             other @ (crate::state::SessionStatus::Approved
             | crate::state::SessionStatus::Failed) => {
                 return Err(CancelSessionErrorModeled::ConflictException(ConflictException {
-                    message: format!(
+                    message: crate::state::bounded_message(format!(
                         "Approval session '{}' is {} and no longer outstanding, so it cannot \
                          be cancelled.",
                         input.session_arn,
                         other.as_wire()
-                    ),
+                    )),
                 })
                 .into());
             }
