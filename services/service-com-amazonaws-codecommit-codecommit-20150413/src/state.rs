@@ -3105,6 +3105,22 @@ pub const CANNOT_DELETE_APPROVAL_RULE_FROM_TEMPLATE_MESSAGE: &str =
 pub const PULL_REQUEST_ALREADY_CLOSED_MESSAGE: &str =
     "The pull request status cannot be updated because it is already closed.";
 
+/// `PullRequestAlreadyClosedException`'s message for an update of a pull
+/// request's TEXT — its title or its description.
+///
+/// CodeCommit words that code differently there: it names the state the pull
+/// request is IN (a [`PULL_REQUEST_STATUS_OPEN`] / [`PULL_REQUEST_STATUS_CLOSED`]
+/// value, read from the stored record rather than from the request) as the reason
+/// the change cannot be made, and then which changes a closed pull request no
+/// longer takes. Worded here once for both operations that replace a pull
+/// request's text.
+pub fn pull_request_text_cannot_be_changed_message(status: &str) -> String {
+    format!(
+        "The change cannot be made because the state of the pull request is {status}. You cannot \
+         update the title or description of a pull request after it has been closed."
+    )
+}
+
 /// `TipOfSourceReferenceIsDifferentException`'s message: the sentences the model
 /// documents for the shape, echoing nothing from the request. Worded here once
 /// for every operation that merges a pull request whose source reference no
@@ -3409,6 +3425,11 @@ pub const INVALID_PULL_REQUEST_ID_MESSAGE: &str =
 /// `PullRequestIdRequiredException`'s message: a FIXED sentence.
 pub const PULL_REQUEST_ID_REQUIRED_MESSAGE: &str =
     "A pull request ID is required, but none was provided.";
+
+/// `TitleRequiredException`'s message: a FIXED sentence, worded here once for
+/// every operation that takes a pull request `title` — the one that opens a pull
+/// request and the one that retitles it answer a missing title identically.
+pub const TITLE_REQUIRED_MESSAGE: &str = "A pull request title is required.";
 
 /// `RepositoryNotAssociatedWithPullRequestException`'s message: the sentence pair
 /// the model states for that error shape, echoing nothing from the request.

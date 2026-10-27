@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateStage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateStage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateStage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +173,235 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateStage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateStageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStage"))
+        let _ = ctx;
+
+        // The request's own members are checked before any resource is resolved: each is
+        // a rule on the REQUEST, so it holds whatever the store holds, and the same rule
+        // `CreateStage` applies to the member it stores. Every message names the member
+        // and the rule it broke, which is all a caller has to fix it.
+        if let Some(description) = input.description.as_ref() {
+            let length = description.chars().count();
+            if length > MAX_DESCRIPTION_LEN {
+                return Err(bad_request(format!(
+                    "Invalid value for Description: must have length less than or equal \
+                     to {MAX_DESCRIPTION_LEN}, got {length}."
+                )));
+            }
+        }
+        let stage_variables: Option<::std::collections::BTreeMap<String, String>> = input
+            .stage_variables
+            .map(|variables| variables.into_iter().collect());
+        if let Some(variables) = stage_variables.as_ref() {
+            crate::state::validate_stage_variables(variables.iter()).map_err(bad_request)?;
+        }
+        if let Some(settings) = input.access_log_settings.as_ref() {
+            crate::state::validate_access_log_settings(settings).map_err(bad_request)?;
+        }
+
+        // Does this request configure anything the stage record keeps? A patch naming no
+        // such member rewrites nothing, which is what decides whether
+        // `Stage$LastUpdatedDate` moves below.
+        let patches_record = input.access_log_settings.is_some()
+            || input.auto_deploy.is_some()
+            || input.client_certificate_id.is_some()
+            || input.default_route_settings.is_some()
+            || input.deployment_id.is_some()
+            || input.description.is_some()
+            || input.route_settings.is_some()
+            || stage_variables.is_some();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStage"));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(UpdateStageErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::invalid_api_identifier_message(&input.api_id)),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+
+        // Each of these members is documented "Supported only for WebSocket APIs" —
+        // `ClientCertificateId`, and `DataTraceEnabled` and `LoggingLevel` of the
+        // `RouteSettings` shape that `DefaultRouteSettings` and every entry of
+        // `RouteSettings` carry — so a patch cannot put one on a stage of an api of the
+        // other protocol, exactly as the create cannot. Checked before anything is
+        // written, so a refused patch leaves the stage as it was.
+        let route_settings_blocks: Vec<&RouteSettings> = input
+            .default_route_settings
+            .iter()
+            .chain(
+                input
+                    .route_settings
+                    .iter()
+                    .flatten()
+                    .map(|(_, settings)| settings),
+            )
+            .collect();
+        let restricted = [
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "ClientCertificateId",
+                input.client_certificate_id.is_some(),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "RouteSettings DataTraceEnabled",
+                route_settings_blocks
+                    .iter()
+                    .any(|settings| settings.data_trace_enabled == Some(true)),
+            ),
+            crate::state::ProtocolRestrictedMember::websocket_only(
+                "RouteSettings LoggingLevel",
+                route_settings_blocks
+                    .iter()
+                    .any(|settings| settings.logging_level.is_some()),
+            ),
+        ];
+        crate::state::validate_protocol_restricted_members(&api.protocol_type, &restricted)
+            .map_err(bad_request)?;
+
+        let Some(existing) = api.stages.get(&input.stage_name) else {
+            return Err(UpdateStageErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::invalid_identifier_message(
+                    crate::state::STAGE_RESOURCE,
+                )),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+
+        // The update is a PATCH (`PATCH /v2/apis/{ApiId}/stages/{StageName}`): a member
+        // the request carries replaces the stored one, and a member it omits leaves the
+        // stored value exactly as it was. A map member is a VALUE like any other, so one
+        // the request carries replaces the stored map wholesale. Nothing here is
+        // defaulted: a default belongs to the create, and applying one again would
+        // silently undo a value a later caller can still see through `GetStage`. The
+        // members a stage never takes from a request — the name it is keyed by, its
+        // `CreatedDate`, its `Tags`, and whether API Gateway manages it — are carried
+        // over by the clone.
+        let mut updated = existing.clone();
+        if let Some(description) = input.description {
+            updated.description = Some(description);
+        }
+        if let Some(auto_deploy) = input.auto_deploy {
+            updated.auto_deploy = auto_deploy;
+        }
+        if let Some(client_certificate_id) = input.client_certificate_id {
+            updated.client_certificate_id = Some(client_certificate_id);
+        }
+        if let Some(settings) = input.access_log_settings {
+            updated.access_log_settings = Some(settings);
+        }
+        if let Some(settings) = input.default_route_settings {
+            updated.default_route_settings = Some(settings);
+        }
+        if let Some(route_settings) = input.route_settings {
+            updated.route_settings = route_settings.into_iter().collect();
+        }
+        if let Some(variables) = stage_variables {
+            updated.stage_variables = variables;
+        }
+
+        if let Some(deployment_id) = input.deployment_id {
+            // "The deployment identifier for the API stage. Can't be updated if
+            // autoDeploy is enabled" (`UpdateStage$DeploymentId`): a stage whose
+            // deployments the SERVICE releases cannot be moved onto one the caller
+            // picked. The MERGED record decides, so one request may switch auto-deploy
+            // off and name a deployment at the same time.
+            if updated.auto_deploy {
+                return Err(bad_request(
+                    "Invalid value for DeploymentId: the DeploymentId of a stage can't \
+                     be updated if autoDeploy is enabled."
+                        .to_string(),
+                ));
+            }
+            // The stage serves ONE deployment of its own api: a `DeploymentId` naming no
+            // deployment of this api names a resource that is not there.
+            if !api.deployments.contains_key(&deployment_id) {
+                return Err(UpdateStageErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::invalid_identifier_message(
+                        crate::state::DEPLOYMENT_RESOURCE,
+                    )),
+                    resource_type: ::std::option::Option::None,
+                })
+                .into());
+            }
+            updated.deployment_id = Some(deployment_id);
+        }
+
+        let now = ::std::time::SystemTime::now();
+        if updated.auto_deploy && updated.deployment_id.is_none() {
+            // An auto-deploying stage has its deployments RELEASED BY THE SERVICE
+            // ("Specifies whether a deployment was automatically released",
+            // `Deployment$AutoDeployed`), so a patch that leaves the stage auto-deploying
+            // with nothing to serve releases the api's current routes and integrations to
+            // it — which is what makes the stage callable. The same helper `CreateStage`
+            // and quick create use, so one api cannot release two differently shaped
+            // deployments; a stage that already serves a deployment keeps it.
+            let (released, status_message) = api.release_auto_deployment(now);
+            updated.deployment_id = released;
+            updated.last_deployment_status_message = status_message;
+        }
+        if patches_record {
+            // The stage record was rewritten, so it was "last updated" at this instant
+            // ("The timestamp when the stage was last updated", `Stage$LastUpdatedDate`);
+            // its `CreatedDate` does not move. A patch that configured nothing rewrote
+            // nothing, so it leaves the instant where it was.
+            updated.last_updated_date = now;
+        }
+
+        // Read the response back out of the STORE, so what the caller gets is what a
+        // later GetStage will report. The stage exists (checked above), so this replaces
+        // its record rather than minting a second one. A record that is somehow not there
+        // is answered as the modelled "no such stage" rather than by panicking on a
+        // lookup keyed by request input.
+        api.stages.insert(input.stage_name.clone(), updated);
+        let Some(stored) = api
+            .stages
+            .get(&input.stage_name)
+            .map(crate::state::Stage::to_wire)
+        else {
+            return Err(UpdateStageErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::invalid_identifier_message(
+                    crate::state::STAGE_RESOURCE,
+                )),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
+        Ok(UpdateStageOutput {
+            access_log_settings: stored.access_log_settings,
+            api_gateway_managed: stored.api_gateway_managed,
+            auto_deploy: stored.auto_deploy,
+            client_certificate_id: stored.client_certificate_id,
+            created_date: stored.created_date,
+            default_route_settings: stored.default_route_settings,
+            deployment_id: stored.deployment_id,
+            description: stored.description,
+            last_deployment_status_message: stored.last_deployment_status_message,
+            last_updated_date: stored.last_updated_date,
+            route_settings: stored.route_settings,
+            stage_name: Some(stored.stage_name),
+            stage_variables: stored.stage_variables,
+            tags: stored.tags,
+        })
     }
+}
+
+/// The longest `Description` this operation accepts: the upper bound of
+/// `StringWithLengthBetween0And1024`, the shape `UpdateStage$Description` targets.
+const MAX_DESCRIPTION_LEN: usize = 1024;
+
+/// Refuse the request with this operation's `BadRequestException` (HTTP 400) —
+/// "the request is not valid, for example, the input is incomplete or incorrect" — whose
+/// message names the member and the rule it broke. Takes the same owned `String` the
+/// sibling helper in `create_stage` does, so a validator's message passes straight
+/// through `map_err`.
+fn bad_request(message: String) -> UpdateStageError {
+    UpdateStageErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
 }

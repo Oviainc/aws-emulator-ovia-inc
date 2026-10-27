@@ -121,6 +121,10 @@ mod pull_request_events;
 mod pull_request_listing;
 #[path = "all/pull_request_status_update.rs"]
 mod pull_request_status_update;
+#[path = "all/pull_request_text_update.rs"]
+mod pull_request_text_update;
+#[path = "all/pull_request_title_update.rs"]
+mod pull_request_title_update;
 #[path = "all/refusal_message_shape.rs"]
 mod refusal_message_shape;
 #[path = "all/repositories_for_approval_rule_template.rs"]

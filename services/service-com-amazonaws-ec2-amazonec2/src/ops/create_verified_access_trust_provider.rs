@@ -3,7 +3,9 @@
 //! @op CreateVerifiedAccessTrustProvider
 //! Implemented: mints a Verified Access trust provider from the request and stores it, so
 //! `DescribeVerifiedAccessTrustProviders` reports what this call created — this is the
-//! ONLY file to touch for this operation.
+//! ONLY file to touch for this operation. The OIDC client secret is the one member it does
+//! not retain: a report of the trust provider masks it
+//! ([`crate::state::REDACTED_CLIENT_SECRET`]).
 //!
 //! ## Shape of an operation
 //!
@@ -162,8 +164,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             verified_access_trust_provider_limit_exceeded,
             verified_access_trust_provider_payload_bytes, MAX_CLIENT_TOKEN_CHARS,
             MAX_STORED_BYTES, MAX_TAGS_PER_RESOURCE, MAX_VERIFIED_ACCESS_TRUST_PROVIDERS,
-            TRUST_PROVIDER_TYPE_DEVICE, TRUST_PROVIDER_TYPE_USER, USER_TRUST_PROVIDER_TYPE_OIDC,
-            VERIFIED_ACCESS_TRUST_PROVIDER_TAGGABLE_RESOURCE,
+            REDACTED_CLIENT_SECRET, TRUST_PROVIDER_TYPE_DEVICE, TRUST_PROVIDER_TYPE_USER,
+            USER_TRUST_PROVIDER_TYPE_OIDC, VERIFIED_ACCESS_TRUST_PROVIDER_TAGGABLE_RESOURCE,
         };
 
         // `ctx` carries request metadata only, and nothing this record holds names a
@@ -315,7 +317,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 token_endpoint: options.token_endpoint.clone(),
                 user_info_endpoint: options.user_info_endpoint.clone(),
                 client_id: options.client_id.clone(),
-                client_secret: options.client_secret.clone(),
+                // "The client secret" (`OidcOptions$ClientSecret`) is WRITE-ONLY: the
+                // model marks it the one sensitive member of the reported shape, and the
+                // service answers a fixed mask in its place rather than the value the
+                // request configured, so the secret is stored nowhere a read can report it.
+                // A provider configured without one reports no secret at all.
+                client_secret: options
+                    .client_secret
+                    .as_ref()
+                    .map(|_| REDACTED_CLIENT_SECRET.to_string()),
                 scope: options.scope.clone(),
             }),
             device_options: input.device_options.as_ref().map(|options| DeviceOptions {

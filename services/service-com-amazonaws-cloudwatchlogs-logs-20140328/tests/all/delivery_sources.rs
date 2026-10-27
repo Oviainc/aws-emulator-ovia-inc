@@ -672,10 +672,15 @@ async fn a_global_resource_source_lives_only_in_its_partitions_global_region() {
                 code, VALIDATION,
                 "case {case:?} put in {region}: expected {VALIDATION}, got {code}"
             );
-            assert!(
-                message.contains("resourceArn") && message.contains(home_region),
-                "case {case:?} put in {region}: the refusal must name the member and the Region \
-                 the resource is reached through ({home_region}), got {message:?}"
+            // The refusal is the service's fixed sentence for an action it does not serve for
+            // this kind of log in the Region the request reached, whose only interpolated
+            // value is that Region. Its wording, and what it must NOT carry, is the subject of
+            // `tests/all/delivery_source_region_support.rs`.
+            let expected =
+                format!("{PUT} action is not supported for this LogType in region {region}");
+            assert_eq!(
+                message, expected,
+                "case {case:?} put in {region}: expected {expected:?}, got {message:?}"
             );
 
             // A refused put stores nothing.

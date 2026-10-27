@@ -571,6 +571,179 @@ async fn an_absent_pool_client_or_name_is_a_404() {
     );
 }
 
+/// Every set of terms documents of `user_pool_id` as `ListTerms` reports it, as
+/// `(TermsId, TermsName)` pairs in the order the listing answers, so a pool's
+/// documents before and after a refused lookup can be compared whole.
+async fn listed_terms(router: &MultiServiceRouter, user_pool_id: &str) -> Vec<(String, String)> {
+    let listed = ok(router, "ListTerms", &json!({ "UserPoolId": user_pool_id })).await;
+    listed["Terms"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ListTerms must answer a Terms list, got {listed}"))
+        .iter()
+        .map(|entry| {
+            (
+                entry["TermsId"].as_str().unwrap_or_default().to_string(),
+                entry["TermsName"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_client_of_another_pool_is_refused_and_leaves_every_pool_listing_untouched() {
+    let router = router();
+
+    // Three pools: one holding documents of two of its app clients, one holding
+    // a single document, and one holding none — so the refusal is asserted
+    // against a named pool that does hold the requested name, one that holds the
+    // other name, and one that holds nothing at all.
+    let first = pool(&router, "cross-pool-first").await;
+    let second = pool(&router, "cross-pool-second").await;
+    let empty = pool(&router, "cross-pool-empty").await;
+
+    let first_a = client(&router, &first, "first-a").await;
+    let first_b = client(&router, &first, "first-b").await;
+    let second_a = client(&router, &second, "second-a").await;
+
+    for (user_pool_id, client_id, terms_name) in [
+        (&first, &first_a, TERMS_NAMES[0]),
+        (&first, &first_b, TERMS_NAMES[1]),
+        (&second, &second_a, TERMS_NAMES[0]),
+    ] {
+        ok(
+            &router,
+            "CreateTerms",
+            &json!({
+                "UserPoolId": user_pool_id,
+                "ClientId": client_id,
+                "TermsName": terms_name,
+                "TermsSource": "LINK",
+                "Enforcement": "NONE",
+                "Links": { "cognito:default": format!("https://example.com/{terms_name}") },
+            }),
+        )
+        .await;
+    }
+
+    let pools = [
+        ("the pool holding two documents", first.clone(), 2),
+        ("the pool holding one document", second.clone(), 1),
+        ("the pool holding none", empty.clone(), 0),
+    ];
+    let mut before = Vec::new();
+    for (label, user_pool_id, expected_count) in &pools {
+        let listing = listed_terms(&router, user_pool_id).await;
+        assert_eq!(
+            listing.len(),
+            *expected_count,
+            "case {label:?}: the listing must report exactly the documents that were created, got {listing:?}"
+        );
+        before.push((*label, user_pool_id.clone(), listing));
+    }
+
+    // A ClientId that is a real app client of ANOTHER pool, and one no pool ever
+    // minted, are the same refusal: neither is an app client of the pool named
+    // by the request, so that pool has no documents of it to describe.
+    let never_minted = "0000000000notanappclient".to_string();
+    for (label, user_pool_id, client_id, terms_name) in [
+        (
+            "an app client of the second pool, asked against the first, for a name the first pool does hold",
+            &first,
+            &second_a,
+            TERMS_NAMES[0],
+        ),
+        (
+            "an app client of the second pool, asked against the first, for the other document type",
+            &first,
+            &second_a,
+            TERMS_NAMES[1],
+        ),
+        (
+            "an app client of the first pool, asked against the second",
+            &second,
+            &first_b,
+            TERMS_NAMES[1],
+        ),
+        (
+            "an app client of the first pool, asked against a pool that holds no documents",
+            &empty,
+            &first_a,
+            TERMS_NAMES[0],
+        ),
+        (
+            "a well formed client id no pool ever minted",
+            &first,
+            &never_minted,
+            TERMS_NAMES[0],
+        ),
+    ] {
+        let (status, payload) = call(
+            &router,
+            "DescribeTermsByClient",
+            &json!({
+                "UserPoolId": user_pool_id,
+                "ClientId": client_id,
+                "TermsName": terms_name,
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&payload)),
+            (404, "ResourceNotFoundException"),
+            "case {label:?}: a client that is not an app client of the named pool is a 404 ResourceNotFoundException, got {payload}"
+        );
+        assert_eq!(
+            error_message(&payload),
+            format!("User pool client {client_id} does not exist in user pool {user_pool_id}."),
+            "case {label:?}: the refusal must name the client and the pool from the request, got {payload}"
+        );
+        assert!(
+            payload.get("Terms").is_none(),
+            "case {label:?}: a refusal must not answer the named pool's terms documents, got {payload}"
+        );
+
+        // The failed lookup is a read: every pool still reports exactly the
+        // documents that were created, in the same order.
+        for (pool_label, user_pool_id, expected) in &before {
+            let listing = listed_terms(&router, user_pool_id).await;
+            assert_eq!(
+                &listing, expected,
+                "case {label:?}: after the refusal, {pool_label} must still list exactly its created documents, got {listing:?}"
+            );
+        }
+    }
+
+    // And the matching triples still resolve, so the scoping rule refuses the
+    // foreign client without costing the pool's own app clients their documents.
+    for (user_pool_id, client_id, terms_name) in [
+        (&first, &first_a, TERMS_NAMES[0]),
+        (&first, &first_b, TERMS_NAMES[1]),
+        (&second, &second_a, TERMS_NAMES[0]),
+    ] {
+        let label = format!("{terms_name} of {client_id} in {user_pool_id}");
+        let read = ok(
+            &router,
+            "DescribeTermsByClient",
+            &json!({
+                "UserPoolId": user_pool_id,
+                "ClientId": client_id,
+                "TermsName": terms_name,
+            }),
+        )
+        .await;
+        assert_eq!(
+            (&read["Terms"]["ClientId"], &read["Terms"]["TermsName"]),
+            (&json!(client_id), &json!(terms_name)),
+            "case {label:?}: the matching triple must resolve to that app client's document of that name, got {read}"
+        );
+        assert_eq!(
+            read["Terms"]["UserPoolId"],
+            json!(user_pool_id),
+            "case {label:?}: the resolved document belongs to the pool named by the request, got {read}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_request_outside_a_modelled_constraint_is_refused() {
     let router = router();

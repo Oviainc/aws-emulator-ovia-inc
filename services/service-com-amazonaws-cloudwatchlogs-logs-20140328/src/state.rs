@@ -2752,24 +2752,23 @@ pub fn delivery_source_required_region(resource_arn: &str) -> Option<&'static st
         .map(|(_name, region)| *region)
 }
 
-/// The request-derived refusal for a delivery source whose resource is reached through
-/// another Region than the one this request was made in ([`delivery_source_required_region`]),
-/// or `None` when the request's Region can hold it.
+/// The refusal for a delivery source whose resource is reached through another Region than the
+/// one this request was made in ([`delivery_source_required_region`]), or `None` when the
+/// request's Region can hold it.
 ///
-/// The message names the member, the resource and both Regions, because that is what the
-/// caller has to change to make the request work.
-pub fn misplaced_delivery_source_message(
-    member: &str,
+/// What the caller is told is that the ACTION is not served for this kind of log in the Region
+/// the request reached: the message names the action and that Region, and the literal word for
+/// the log-type parameter rather than its value. Nothing else is interpolated — not the
+/// resource, not the Region it is reached through, and not the constraint-violation prefix this
+/// service puts on a parameter that fails a modelled constraint, which this refusal is not.
+pub fn unsupported_log_type_region_message(
+    operation: &str,
     resource_arn: &str,
     request_region: &str,
 ) -> Option<String> {
     let required = delivery_source_required_region(resource_arn)?;
     (required != request_region).then(|| {
-        format!(
-            "1 validation error detected: {member} {resource_arn} names a resource of a global \
-             service, which is reached only through {required}, so its delivery source must be \
-             created in {required} and not in {request_region}"
-        )
+        format!("{operation} action is not supported for this LogType in region {request_region}")
     })
 }
 

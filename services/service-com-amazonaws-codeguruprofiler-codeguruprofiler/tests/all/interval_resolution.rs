@@ -54,8 +54,9 @@ const DELTAS_NANOS: [u32; 4] = [1, 10, 100, 1_000];
 
 /// `secs`.`nanos` in the ISO 8601 `date-time` form the modelled query members carry, with
 /// the fraction spelled to the nanosecond — the precision a row needs the REQUEST to
-/// carry, which is what the rule is compared at.
-fn at(secs: i64, nanos: u32) -> String {
+/// carry, which is what the rule is compared at. `pub(crate)` so every suite in this
+/// target renders a sub-second bound through this one writer.
+pub(crate) fn at(secs: i64, nanos: u32) -> String {
     if nanos == 0 {
         return whole_second(secs);
     }

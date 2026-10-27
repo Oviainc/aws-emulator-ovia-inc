@@ -115,6 +115,17 @@ async fn list_profile_times(harness: &Harness, name: &str, query: &str) -> Answe
 /// `pub(crate)` so every suite that needs a profile at a chosen instant places it one
 /// way.
 pub(crate) fn place_receipts(harness: &Harness, name: &str, receipts: &[i64]) {
+    let exact: Vec<(i64, u32)> = receipts.iter().map(|at| (*at, 0)).collect();
+    place_receipts_at(harness, name, &exact);
+}
+
+/// [`place_receipts`] at nanosecond resolution: each receipt is (epoch seconds,
+/// sub-second nanoseconds), oldest first.
+///
+/// A stored instant carries nanoseconds, so a case about how the service COMPARES two
+/// stored instants places them a nanosecond apart rather than a second apart. `place_receipts`
+/// is this helper with every sub-second part zero, so both go through one writer.
+pub(crate) fn place_receipts_at(harness: &Harness, name: &str, receipts: &[(i64, u32)]) {
     let state = harness
         .engine
         .state::<service_com_amazonaws_codeguruprofiler_codeguruprofiler::ComAmazonawsCodeguruprofilerCodeguruprofilerState>();
@@ -130,11 +141,13 @@ pub(crate) fn place_receipts(harness: &Harness, name: &str, receipts: &[i64]) {
         group.profiles.len(),
         receipts.len()
     );
-    for (profile, at) in group.profiles.iter_mut().zip(receipts) {
-        profile.received_at = DateTime::from_secs(*at);
+    for (profile, (secs, nanos)) in group.profiles.iter_mut().zip(receipts) {
+        profile.received_at = DateTime::from_secs_and_nanos(*secs, *nanos);
     }
-    group.latest_agent_profile_reported_at =
-        receipts.iter().max().map(|at| DateTime::from_secs(*at));
+    group.latest_agent_profile_reported_at = receipts
+        .iter()
+        .max()
+        .map(|(secs, nanos)| DateTime::from_secs_and_nanos(*secs, *nanos));
 }
 
 /// A group holding one posted profile per receipt time, each with its own payload;

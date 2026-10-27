@@ -166,9 +166,8 @@ pub fn bracketed_findings(findings: &[String]) -> String {
 /// Not a schema finding like the three above: the layer refuses the ARN before it looks any
 /// resource up (an ARN of another vendor can name none of this service's resources however
 /// the account changes), so it states what it expected rather than what the value failed.
-/// `services/service-com-amazonaws-emrserverless-awstoledowebservice/src/service.rs` and
-/// `services/service-com-amazonaws-marketplacedeployment-awsmpdeploymentparametersservice/src/state.rs`
-/// still carry their own inlined copies of this sentence; they are to be migrated onto this
+/// `services/service-com-amazonaws-emrserverless-awstoledowebservice/src/service.rs`
+/// still carries its own inlined copy of this sentence; it is to be migrated onto this
 /// one rather than copied again.
 #[must_use]
 pub fn expected_vendor(vendor: &str) -> String {

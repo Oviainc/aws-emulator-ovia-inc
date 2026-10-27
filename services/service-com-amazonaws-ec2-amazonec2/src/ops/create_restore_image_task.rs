@@ -12,11 +12,15 @@
 //! the start call with `InaccessibleStorageLocation` naming it. No AMI is minted: an AMI
 //! restored from an object nothing read would be an image this emulator invented.
 //!
-//! The same storage-location rule the FPGA-image create keeps applies first: a bucket name
-//! outside Amazon S3's published naming rules names no bucket at all
-//! ([`crate::state::s3_bucket_name_is_well_formed`]), which is the same refusal. `DryRun`
-//! sits between the two, because it asks whether the CALLER MAY make the request rather than
-//! whether the object is there.
+//! The bucket name is read as a REQUEST PARAMETER before any object is looked for: a value
+//! outside Amazon S3's published naming rules
+//! ([`crate::state::s3_bucket_name_is_well_formed`]) is not a bucket name at all, so it is
+//! refused as malformed ([`S3_BUCKET_NAME_INVALID_MESSAGE`] under EC2's `InvalidRequest`) and
+//! not as a location that could not be reached — the unreadable-location refusal is kept for
+//! a name that could be a bucket, which is the one a caller would chase permissions for. The
+//! FPGA-image create answers the location code for a malformed name instead, which is that
+//! operation's own behaviour and not this one's. `DryRun` sits between the two, because it
+//! asks whether the CALLER MAY make the request rather than whether the object is there.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +89,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The message EC2 answers a `Bucket` that is not a bucket name at all with. Fixed text with
+/// no variable part: the request parameter is reported as unusable, and nothing is said about
+/// a bucket, because such a name reaches none. Private, so the suite pins the wording by
+/// spelling it out rather than by re-reading this literal.
+const S3_BUCKET_NAME_INVALID_MESSAGE: &str = "The S3 bucket name contains invalid characters.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,9 +165,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            IMAGE_TAGGABLE_RESOURCES, MAX_S3_BUCKET_NAME_CHARS, MIN_S3_BUCKET_NAME_CHARS,
-            dry_run_operation, inaccessible_storage_location, s3_bucket_name_is_well_formed,
-            validate_tag_size,
+            IMAGE_TAGGABLE_RESOURCES, dry_run_operation, inaccessible_s3_resource,
+            invalid_request, s3_bucket_name_is_well_formed, validate_tag_size,
         };
 
         // The restore is refused below for a reason that does not depend on the Region the
@@ -165,16 +174,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = (ctx, &self.engine);
 
         // "The name of the Amazon S3 bucket that contains the stored AMI object"
-        // (`CreateRestoreImageTaskRequest$Bucket`): a value outside Amazon S3's bucket
-        // naming rules names no bucket at all, so it is refused before anything else.
+        // (`CreateRestoreImageTaskRequest$Bucket`): a value outside Amazon S3's bucket naming
+        // rules names no bucket at all, so it is a malformed parameter — answered before
+        // anything is looked for, and with the code a caller must read as a permanent fault
+        // of the request rather than as a location it should retry or get access to.
         if !s3_bucket_name_is_well_formed(&input.bucket) {
-            return Err(inaccessible_storage_location(format!(
-                "The S3 bucket '{}' is not an accessible storage location: an S3 bucket name \
-                 holds {MIN_S3_BUCKET_NAME_CHARS} to {MAX_S3_BUCKET_NAME_CHARS} lowercase \
-                 letters, digits, dots and hyphens, begins and ends with a letter or a digit, \
-                 and is not formatted as an IP address",
-                input.bucket
-            )));
+            return Err(invalid_request(S3_BUCKET_NAME_INVALID_MESSAGE));
         }
         // "The name of the stored AMI object in the bucket" (`ObjectKey`): an empty key names
         // no object.
@@ -215,11 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The object the restore reads is one `CreateStoreImageTask` wrote, and this
         // emulator stores no Amazon S3 objects at all, so there is nothing to restore from
-        // and no AMI is minted (see the module docs).
-        Err(inaccessible_storage_location(format!(
-            "The stored AMI object 's3://{}/{}' could not be read: this emulator stores no \
-             Amazon S3 objects, so there is no stored AMI to restore",
-            input.bucket, input.object_key
-        )))
+        // and no AMI is minted (see the module docs). The location that could not be read is
+        // reported with the crate's one answer for that class, naming the bucket and the key
+        // the request gave.
+        Err(inaccessible_s3_resource(&input.bucket, &input.object_key))
     }
 }

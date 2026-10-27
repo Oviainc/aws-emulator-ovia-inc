@@ -347,7 +347,9 @@ fn write_composite_alarm(
 ) -> Result<(), PutCompositeAlarmError> {
     // "The name for the composite alarm. This name must be unique within the Region."
     // (`PutCompositeAlarmInput$AlarmName`) — one name names ONE alarm, so a name another kind
-    // of alarm already holds cannot also name a composite alarm.
+    // of alarm already holds cannot also name a composite alarm. Asked before the rule's
+    // references below, so a request that is wrong in both ways answers what it answered
+    // before this rule check existed.
     if store
         .alarm_kind(&input.alarm_name)
         .is_some_and(|kind| kind != crate::state::ALARM_TYPE_COMPOSITE)
@@ -355,6 +357,25 @@ fn write_composite_alarm(
         return Err(crate::scaffolded::Scaffolded::validation_error(format!(
             "AlarmName [{}] is already used by another alarm of a different type",
             input.alarm_name
+        )));
+    }
+
+    // "You can use either alarm names or ARNs to reference the other alarms that are to be
+    // evaluated." (`PutCompositeAlarmInput$AlarmRule`) — a rule is evaluated over the STATES of
+    // the alarms it references, so a reference no alarm in the account answers to has no state
+    // to read and the whole alarm is refused rather than stored with a rule that could never be
+    // evaluated. An alarm that already exists — including this one, when this call is an update
+    // — is a reference the rule can read, which is why a cycle between existing composite
+    // alarms is accepted.
+    let missing: Vec<String> = children
+        .iter()
+        .filter(|name| store.alarm_kind(name).is_none())
+        .map(|name| crate::state::alarm_arn(region, name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+            "Could not save the composite alarm as alarms [{}] in the alarm rule do not exist",
+            missing.join(", ")
         )));
     }
 

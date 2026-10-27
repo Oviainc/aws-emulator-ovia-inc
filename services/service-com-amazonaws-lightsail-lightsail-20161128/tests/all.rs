@@ -173,6 +173,8 @@ mod instance_start_addresses;
 mod inverted_time_window;
 #[path = "all/key_pair_delete.rs"]
 mod key_pair_delete;
+#[path = "all/known_host_keys_delete.rs"]
+mod known_host_keys_delete;
 #[path = "all/load_balancer_delete.rs"]
 mod load_balancer_delete;
 #[path = "all/load_balancer_instance_attachment.rs"]

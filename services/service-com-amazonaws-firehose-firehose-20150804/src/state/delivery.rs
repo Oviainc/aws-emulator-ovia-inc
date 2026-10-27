@@ -1296,6 +1296,12 @@ fn write_objects<Eng: Send + Sync + 'static>(engine: &Eng, objects: Vec<Delivere
             // owner's `FULL_CONTROL`, which a reader derives; S3's own `PutObjectAcl` is
             // what sets one on it.
             acl: None,
+            // And no checksum: a delivery names no checksum algorithm for the object to be
+            // stored under, so a read of it reports none, exactly as for an object written
+            // through `PutObject` without one.
+            checksum: None,
+            // Nor is it assembled from parts: a delivered object is written whole.
+            parts: Vec::new(),
         };
         match store.put_object(&object.bucket, &object.key, stored) {
             Some(

@@ -216,6 +216,11 @@ mod elbv2_ip_target_refusal_classes;
 // at the tail of this file, for the reason the notes above give.
 #[path = "all/elbv2_subnet_and_elastic_ip_resolution.rs"]
 mod elbv2_subnet_and_elastic_ip_resolution;
+// Declared beside the Classic/ELBv2 suites above, in this span of the sorted list rather
+// than in the appended tail, for the same reason: the tail is where every concurrently
+// landing router suite puts its line.
+#[path = "all/elb_classic_zone_membership_follows_its_subnets.rs"]
+mod elb_classic_zone_membership_follows_its_subnets;
 // Alphabetically between the `elbv2_` and `es_` suites, rather than appended at the end
 // of this file, which is where every new suite lands and therefore where two changes
 // collide.

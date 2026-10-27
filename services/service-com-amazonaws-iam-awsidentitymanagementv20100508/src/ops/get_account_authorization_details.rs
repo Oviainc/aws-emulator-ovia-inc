@@ -466,11 +466,12 @@ fn group_detail(store: &IamStore, group_key: &str, group: &Group) -> GroupDetail
             &store.group_inline_policies,
             group_key,
         )),
-        // `AttachGroupPolicy` is still a scaffolded 501, so a group the account holds
-        // carries no managed-policy attachment and the list is empty rather than
-        // invented, for the reason `crate::state` gives where a group's attachments
-        // would be read.
-        attached_managed_policies: Some(Vec::new()),
+        // The managed-policy attachments `AttachGroupPolicy` recorded on the group,
+        // each reported by the ARN the attachment was made with — the same
+        // derivation a user's and a role's attachments are reported through.
+        attached_managed_policies: Some(attached_policy_details(
+            store.group_attached_policies.get(group_key),
+        )),
     }
 }
 

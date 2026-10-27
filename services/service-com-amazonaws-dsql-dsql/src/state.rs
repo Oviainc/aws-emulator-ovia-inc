@@ -29,6 +29,14 @@
 //! record are one implementation, parameterised by the output each handler
 //! builds.
 //!
+//! The checks a request's own input has to pass before anything is written live
+//! here for the same reason: a cluster's resource-based policy is attached by two
+//! different operations and ends up in ONE record, so the document checks
+//! ([`validate_cluster_policy`]) — it has to parse, and unless the caller bypasses
+//! the safety check it may not leave nobody able to replace it — are one
+//! implementation both of them call, as the witness-Region, peer-list and tag-key
+//! checks already are.
+//!
 //! The tagging operations address a resource by a caller-supplied `resourceArn`
 //! rather than by identifier, so the read of that ARN ([`parse_resource_arn`]), the
 //! check that the ARN is the one this endpoint serves and the one its resource was
@@ -1702,6 +1710,213 @@ where
         )),
         None => Ok(()),
     }
+}
+
+/// The `ValidationExceptionReason` for input this service could not read as the
+/// document kind the member carries (`smithy_query(query="shape",
+/// shape="ValidationExceptionReason")`: cannotParse | deletionProtectionEnabled |
+/// fieldValidationFailed | other | unknownOperation).
+pub const VALIDATION_REASON_CANNOT_PARSE: &str = "cannotParse";
+
+/// See [`VALIDATION_REASON_CANNOT_PARSE`]: the reason for a refusal that is about
+/// the MEANING of a well-formed value rather than its form.
+pub const VALIDATION_REASON_OTHER: &str = "other";
+
+/// The action a principal needs to replace a cluster's resource-based policy — the
+/// one the lockout safety check is about. A policy that denies this to everybody
+/// can never be replaced.
+pub const POLICY_MANAGEMENT_ACTION: &str = "dsql:PutClusterPolicy";
+
+/// Check a resource-based policy document a request asks this service to attach to
+/// a cluster, refusing the WHOLE request before the document is persisted.
+///
+/// Every operation that WRITES a cluster's policy enforces this here and refuses
+/// identically, because the document ends up in one place — the cluster's own
+/// policy record, which `GetClusterPolicy` reports — so a document one entry point
+/// would refuse cannot be reachable through the other:
+///
+/// * the value has to be a JSON policy document (an object) before anything about
+///   it can be reasoned about, and one that is not is refused as unparseable;
+/// * unless the caller sets the operation's own `bypassPolicyLockoutSafetyCheck`,
+///   which exists to let a caller accept exactly this risk, a document that leaves
+///   NOBODY able to replace it is refused — `cluster_arn` is the ARN of the cluster
+///   the document would be attached to, which is the resource the document's
+///   `Resource` set is read against.
+pub fn validate_cluster_policy(
+    document: &str,
+    cluster_arn: &str,
+    bypass_lockout_safety_check: bool,
+) -> Result<(), ValidationException> {
+    let Some(parsed) = parse_policy(document) else {
+        return Err(ValidationException {
+            message: "The policy is not a valid JSON policy document.".to_string(),
+            reason: VALIDATION_REASON_CANNOT_PARSE.to_string(),
+            field_list: None,
+        });
+    };
+    if !bypass_lockout_safety_check && locks_out_every_principal(&parsed, cluster_arn) {
+        return Err(ValidationException {
+            message: format!(
+                "The policy would prevent every principal from calling \
+                 {POLICY_MANAGEMENT_ACTION} on this cluster. Set \
+                 bypassPolicyLockoutSafetyCheck to true to apply it anyway."
+            ),
+            reason: VALIDATION_REASON_OTHER.to_string(),
+            field_list: None,
+        });
+    }
+    Ok(())
+}
+
+/// Parse a `PolicyDocument` into its JSON object, or `None` when it is not one.
+fn parse_policy(document: &str) -> Option<::serde_json::Map<String, ::serde_json::Value>> {
+    match ::serde_json::from_str::<::serde_json::Value>(document) {
+        Ok(::serde_json::Value::Object(object)) => Some(object),
+        _ => None,
+    }
+}
+
+/// Whether `document` denies EVERY principal the action that replaces it on the
+/// cluster named by `resource_arn`, which is what the lockout safety check exists
+/// to catch.
+///
+/// Read the way an IAM resource policy is read: an explicit `Deny` beats every
+/// `Allow`, so a `Deny` statement that covers all principals, covers
+/// [`POLICY_MANAGEMENT_ACTION`], covers the cluster being protected and carries no
+/// `Condition` narrowing it leaves nobody able to call that action again.
+fn locks_out_every_principal(
+    document: &::serde_json::Map<String, ::serde_json::Value>,
+    resource_arn: &str,
+) -> bool {
+    statements(document).iter().any(|statement| {
+        effect_is(statement, "Deny")
+            && !statement.contains_key("Condition")
+            && covers_every_principal(statement)
+            && covers_management_action(statement)
+            && covers_this_resource(statement, resource_arn)
+    })
+}
+
+/// The `Statement` elements of a policy document: IAM accepts a single statement
+/// object as well as a list of them.
+fn statements(
+    document: &::serde_json::Map<String, ::serde_json::Value>,
+) -> Vec<::serde_json::Map<String, ::serde_json::Value>> {
+    match document.get("Statement") {
+        Some(::serde_json::Value::Array(entries)) => entries
+            .iter()
+            .filter_map(|entry| entry.as_object().cloned())
+            .collect(),
+        Some(::serde_json::Value::Object(one)) => vec![one.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether the statement's `Effect` is `effect`, case-insensitively as IAM reads
+/// it.
+fn effect_is(statement: &::serde_json::Map<String, ::serde_json::Value>, effect: &str) -> bool {
+    statement
+        .get("Effect")
+        .and_then(::serde_json::Value::as_str)
+        .is_some_and(|stated| stated.eq_ignore_ascii_case(effect))
+}
+
+/// Whether the statement applies to every principal: `"Principal": "*"`, or a
+/// `Principal` block whose `AWS` entry is `*`.
+fn covers_every_principal(statement: &::serde_json::Map<String, ::serde_json::Value>) -> bool {
+    match statement.get("Principal") {
+        Some(::serde_json::Value::String(principal)) => principal == "*",
+        Some(::serde_json::Value::Object(block)) => block
+            .values()
+            .flat_map(string_values)
+            .any(|principal| principal == "*"),
+        _ => false,
+    }
+}
+
+/// Whether the statement's `Action` set covers [`POLICY_MANAGEMENT_ACTION`].
+/// `NotAction` is the complement, so it covers the action unless it names it.
+fn covers_management_action(statement: &::serde_json::Map<String, ::serde_json::Value>) -> bool {
+    if let Some(actions) = statement.get("Action") {
+        return string_values(actions)
+            .iter()
+            .any(|action| matches_pattern(action, POLICY_MANAGEMENT_ACTION));
+    }
+    if let Some(not_actions) = statement.get("NotAction") {
+        return !string_values(not_actions)
+            .iter()
+            .any(|action| matches_pattern(action, POLICY_MANAGEMENT_ACTION));
+    }
+    false
+}
+
+/// Whether the statement's `Resource` set covers the cluster the policy is being
+/// attached to, named by `resource_arn`.
+///
+/// An entry covers that cluster when the entry, read as an IAM resource pattern
+/// (`*` any run of characters, `?` any one), matches the cluster's own ARN: the
+/// literal ARN of the cluster being protected covers it exactly as a wildcard
+/// spanning it does, and an ARN naming any other resource covers nothing here. An
+/// absent `Resource` is the whole resource in a resource-based policy, which is
+/// this cluster; `NotResource` is the complement, so it covers this cluster unless
+/// it names it.
+fn covers_this_resource(
+    statement: &::serde_json::Map<String, ::serde_json::Value>,
+    resource_arn: &str,
+) -> bool {
+    if let Some(resources) = statement.get("Resource") {
+        return string_values(resources)
+            .iter()
+            .any(|resource| matches_pattern(resource, resource_arn));
+    }
+    if let Some(not_resources) = statement.get("NotResource") {
+        return !string_values(not_resources)
+            .iter()
+            .any(|resource| matches_pattern(resource, resource_arn));
+    }
+    true
+}
+
+/// Every string in a JSON value that IAM accepts as a string or a list of them.
+fn string_values(value: &::serde_json::Value) -> Vec<String> {
+    match value {
+        ::serde_json::Value::String(one) => vec![one.clone()],
+        ::serde_json::Value::Array(many) => many
+            .iter()
+            .filter_map(::serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether an IAM pattern (`*` matches any run of characters, `?` any one)
+/// matches `candidate`, case-insensitively as IAM matches action names.
+fn matches_pattern(pattern: &str, candidate: &str) -> bool {
+    let pattern: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let candidate: Vec<char> = candidate.to_ascii_lowercase().chars().collect();
+    // Classic two-cursor wildcard match: on a mismatch, fall back to the last
+    // `*` and let it consume one more character. Linear in the candidate.
+    let (mut p, mut c) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
+    while c < candidate.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            p += 1;
+            resume = c;
+        } else if p < pattern.len() && (pattern[p] == '?' || pattern[p] == candidate[c]) {
+            p += 1;
+            c += 1;
+        } else if let Some(last_star) = star {
+            p = last_star + 1;
+            resume += 1;
+            c = resume;
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|symbol| *symbol == '*')
 }
 
 /// The member a witness-Region refusal names, spelled with its path from the

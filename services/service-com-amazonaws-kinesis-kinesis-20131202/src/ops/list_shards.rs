@@ -504,9 +504,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The resource is not available for this operation. For successful operation, the
         // resource must be in the ACTIVE state" (`ResourceInUseException`): a stream whose
-        // creation has not fallen due yet has no shard map to serve.
+        // creation has not fallen due yet has no shard map to serve. One whose shard count
+        // is being changed DOES serve its map: "you can continue to read and write data to
+        // your stream while its status is UPDATING" (`UpdateShardCount`).
         let status = stream.status(now);
-        if status != crate::state::STREAM_ACTIVE {
+        if !stream.serves_shards(now) {
             return Err(ListShardsErrorModeled::ResourceInUseException(
                 ResourceInUseException {
                     message: Some(crate::state::stream_not_active_message(identifier, status)),

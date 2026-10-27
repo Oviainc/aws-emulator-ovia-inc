@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names one unusable instance deregisters none of them. The batch is bounded
         // first, so neither the work nor the allocation below is caller-driven.
         if input.instances.len() > crate::state::MAX_INSTANCES_PER_REQUEST {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "Instances must carry at most {} instances; got {}",
                 crate::state::MAX_INSTANCES_PER_REQUEST,
                 input.instances.len()

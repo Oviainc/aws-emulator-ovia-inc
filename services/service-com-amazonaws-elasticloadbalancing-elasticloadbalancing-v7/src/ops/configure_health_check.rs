@@ -145,15 +145,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // thresholds 2..10), so the boundary validator has already refused a value
         // outside one. The RELATION between two of them is documented rather than
         // modelled — `HealthCheck$Timeout`: "This value must be less than the Interval
-        // value" — so it is refused here, naming both values the caller sent.
+        // value" — so it is refused here, under the code this service answers a value it
+        // cannot accept with, naming both values the caller sent.
         if requested.timeout >= requested.interval {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "HealthCheck.Timeout ({}) must be less than HealthCheck.Interval ({})",
                 requested.timeout, requested.interval
             )));
         }
         if let Err(why) = target_rejection(&requested.target) {
-            return Err(crate::scaffolded::Scaffolded::validation(why));
+            return Err(crate::scaffolded::Scaffolded::validation_error(why));
         }
 
         let accepted = crate::state::HealthCheckConfig {

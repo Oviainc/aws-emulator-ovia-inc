@@ -12,7 +12,7 @@
 //! whether a reference is quoted, unquoted or an ARN, and whether the alarm referenced exists
 //! at all. The recorded happy path is one row among them.
 
-use crate::harness::{build_router, call, error_code, ok};
+use crate::harness::{build_router, call, error_code, error_message, ok};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 use std::time::Duration;
@@ -313,8 +313,10 @@ async fn the_alarm_rule_decides_the_composite_alarm_state() {
         .to_string();
 
     // Rows differ along what the rule generalises over: the state function, the operators,
-    // their nesting and binding, the form of the reference, and whether the referenced alarm
-    // exists. The rule's outcome maps TRUE to ALARM and FALSE to OK.
+    // their nesting and binding, and the form of the reference. The rule's outcome maps TRUE
+    // to ALARM and FALSE to OK. Every row's rule names alarms that exist, because a rule
+    // naming one that does not is refused outright
+    // (`a_rule_the_service_cannot_evaluate_is_refused`).
     let cases: Vec<(&str, String, &str)> = vec![
         ("ALARM of a child in ALARM", "ALARM(\"trip\")".to_string(), "ALARM"),
         ("ALARM of a child in OK", "ALARM(\"calm\")".to_string(), "OK"),
@@ -349,11 +351,6 @@ async fn the_alarm_rule_decides_the_composite_alarm_state() {
         ),
         ("the TRUE literal", "TRUE".to_string(), "ALARM"),
         ("the FALSE literal", "FALSE".to_string(), "OK"),
-        (
-            "a reference to an alarm that does not exist",
-            "ALARM(\"no-such-alarm\")".to_string(),
-            "OK",
-        ),
     ];
 
     for (index, (case, rule, _)) in cases.iter().enumerate() {
@@ -557,6 +554,136 @@ async fn a_composite_alarm_rule_may_reference_another_composite_alarm() {
     );
 }
 
+/// A rule is evaluated over the STATES of the alarms it names, so every alarm a rule names
+/// has to exist when the rule is saved: the refusal names the ones that do not, by the ARN
+/// each reference resolves to.
+#[tokio::test]
+async fn a_rule_naming_an_alarm_that_does_not_exist_is_refused_naming_it() {
+    let router = build_router();
+    put_metric_alarm(&router, "live-child").await;
+    let live_arn = ok(
+        &router,
+        "DescribeAlarms",
+        &json!({"AlarmNames": ["live-child"]}),
+    )
+    .await["MetricAlarms"][0]["AlarmArn"]
+        .as_str()
+        .expect("a stored metric alarm carries its ARN")
+        .to_string();
+    // The ARN form the service resolves an alarm name to, read off an alarm it really stored:
+    // the refusal below names a MISSING alarm by the ARN its own name resolves to, so the
+    // expected text is built from that same form rather than from a literal.
+    let arn_of = |name: &str| live_arn.replace("live-child", name);
+
+    // Rows differ along what the rule generalises over: the form of the reference (quoted
+    // name, ARN, unquoted name), which state function names it, how many references are
+    // missing, and where the missing one sits in the rule.
+    let rows: Vec<(&str, String, Vec<String>)> = vec![
+        (
+            "one missing alarm by name",
+            "ALARM(\"ghost\")".to_string(),
+            vec![arn_of("ghost")],
+        ),
+        (
+            "one missing alarm by ARN",
+            format!("OK(\"{}\")", arn_of("ghost-by-arn")),
+            vec![arn_of("ghost-by-arn")],
+        ),
+        (
+            "an unquoted missing reference",
+            "INSUFFICIENT_DATA(ghost-unquoted)".to_string(),
+            vec![arn_of("ghost-unquoted")],
+        ),
+        (
+            "a missing alarm beside a live one",
+            "ALARM(\"live-child\") AND ALARM(\"ghost-beside\")".to_string(),
+            vec![arn_of("ghost-beside")],
+        ),
+        (
+            "two missing alarms, in the order the rule names them",
+            "NOT (ALARM(\"ghost-one\") OR OK(\"ghost-two\"))".to_string(),
+            vec![arn_of("ghost-one"), arn_of("ghost-two")],
+        ),
+        (
+            // The alarm this very call would create does not exist yet, so a rule naming it
+            // names an alarm that does not exist.
+            "a rule naming the alarm the call creates",
+            "ALARM(\"self-referential\")".to_string(),
+            vec![arn_of("self-referential")],
+        ),
+    ];
+
+    for (case, rule, missing) in &rows {
+        let (status, body) = call(
+            &router,
+            "PutCompositeAlarm",
+            &json!({"AlarmName": "self-referential", "AlarmRule": rule}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationError"),
+            "case {case:?}: expected HTTP 400 ValidationError, got {status} with {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!(
+                "Could not save the composite alarm as alarms [{}] in the alarm rule do not \
+                 exist",
+                missing.join(", ")
+            ),
+            "case {case:?}: the refusal must name the alarms the rule could not read, got {body}"
+        );
+        // Nothing the refused call named was stored.
+        let stored = ok(
+            &router,
+            "DescribeAlarms",
+            &json!({"AlarmNames": ["self-referential"], "AlarmTypes": ["CompositeAlarm"]}),
+        )
+        .await;
+        assert_eq!(
+            stored.get("CompositeAlarms"),
+            Some(&json!([])),
+            "case {case:?}: a refused request must store nothing, got {stored}"
+        );
+    }
+}
+
+/// Two composite alarms whose rules name each other are both SAVED — each reference names an
+/// alarm that exists — and the evaluation settles them both rather than chasing the cycle:
+/// "the evaluation of composite alarms stops if CloudWatch detects a cycle in the evaluation
+/// path."
+#[tokio::test]
+async fn a_cycle_between_two_existing_composite_alarms_is_accepted_and_settles() {
+    let router = build_router();
+    // The pair is built through a live metric alarm, because the alarm each rule names has to
+    // exist before that rule can be saved.
+    put_metric_alarm(&router, "leaf").await;
+    put_composite_alarm(&router, "left", "ALARM(\"leaf\")").await;
+    put_composite_alarm(&router, "right", "ALARM(\"left\")").await;
+    // And now the cycle: `left` is rewritten to name `right`, which exists.
+    put_composite_alarm(&router, "left", "ALARM(\"right\")").await;
+
+    wait_for_evaluation();
+
+    for name in ["left", "right"] {
+        let alarm = composite_alarm(&router, name).await;
+        assert_eq!(
+            text(&alarm, "StateValue").as_deref(),
+            Some("OK"),
+            "case {name:?}: neither alarm of an accepted cycle is in ALARM, got {alarm}"
+        );
+        // A second read reports the same state: the pair settles rather than oscillating.
+        let again = composite_alarm(&router, name).await;
+        assert_eq!(
+            again.get("StateValue"),
+            alarm.get("StateValue"),
+            "case {name:?}: the settled pair must report the same state on every read, got \
+             {again}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_forced_composite_alarm_state_holds_until_a_child_changes_state() {
     let router = build_router();
@@ -635,6 +762,56 @@ async fn a_forced_composite_alarm_state_holds_until_a_child_changes_state() {
             text(item, "AlarmType").as_deref(),
             Some("CompositeAlarm"),
             "a composite alarm's state history is recorded under its own alarm type, got {item}"
+        );
+    }
+}
+
+/// A configuration write hands a composite alarm's state back to its rule, whichever operation
+/// makes it: "It is also reevaluated if you update its configuration" (`SetAlarmState`). Rows
+/// differ along which of the two writers is called and what it asks for.
+#[tokio::test]
+async fn a_configuration_write_hands_a_forced_composite_state_back_to_the_rule() {
+    // (case, the operation, its request, the state once the evaluation is due)
+    let rows: Vec<(&str, &str, Value, &str)> = vec![
+        (
+            "DisableAlarmActions, which writes ActionsEnabled",
+            "DisableAlarmActions",
+            json!({"AlarmNames": ["watcher"]}),
+            "OK",
+        ),
+        (
+            // The alarm is created with its actions on, so asking for them again writes
+            // nothing and the forced state keeps the alarm.
+            "EnableAlarmActions on an alarm whose actions are already on",
+            "EnableAlarmActions",
+            json!({"AlarmNames": ["watcher"]}),
+            "ALARM",
+        ),
+    ];
+
+    for (case, operation, request, expected) in &rows {
+        let router = build_router();
+        put_metric_alarm(&router, "leaf").await;
+        set_alarm_state(&router, "leaf", "OK").await;
+        put_composite_alarm(&router, "watcher", "ALARM(\"leaf\")").await;
+        ok(
+            &router,
+            "SetAlarmState",
+            &json!({
+                "AlarmName": "watcher",
+                "StateValue": "ALARM",
+                "StateReason": "testing the composite alarm",
+            }),
+        )
+        .await;
+
+        ok(&router, operation, request).await;
+        wait_for_evaluation();
+        let settled = composite_alarm(&router, "watcher").await;
+        assert_eq!(
+            text(&settled, "StateValue").as_deref(),
+            Some(*expected),
+            "case {case:?}: expected {expected} once the evaluation is due, got {settled}"
         );
     }
 }
@@ -725,6 +902,15 @@ async fn a_rule_the_service_cannot_evaluate_is_refused() {
             format!("{}TRUE", "NOT ".repeat(32)),
         ),
     ];
+    // Every alarm an ACCEPTED rule references has to exist: a rule naming an alarm that does
+    // not is refused (below), so the rows that exercise the PARSE create their children first.
+    for child in (1..=100)
+        .map(|index| format!("child-{index}"))
+        .chain(::std::iter::once("my child alarm".to_string()))
+    {
+        put_metric_alarm(&router, &child).await;
+    }
+
     for (case, rule) in &accepted {
         let (status, body) = call(
             &router,
@@ -762,6 +948,16 @@ async fn a_rule_the_service_cannot_evaluate_is_refused() {
         (
             "an unknown function",
             json!({"AlarmName": "bad", "AlarmRule": "MAYBE(\"child-1\")"}),
+        ),
+        (
+            // A rule is evaluated over the STATES of the alarms it names, so a name no alarm
+            // answers to has no state to read.
+            "a function naming an alarm that does not exist",
+            json!({"AlarmName": "bad", "AlarmRule": "ALARM(\"no-such-alarm\")"}),
+        ),
+        (
+            "a rule naming the alarm the call itself creates",
+            json!({"AlarmName": "bad", "AlarmRule": "ALARM(\"bad\")"}),
         ),
         (
             "an unbalanced parenthesis",

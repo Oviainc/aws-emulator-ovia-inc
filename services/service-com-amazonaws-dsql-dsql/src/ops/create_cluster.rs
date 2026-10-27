@@ -14,7 +14,11 @@
 //! A `multiRegionProperties.witnessRegion` naming the request's OWN Region — the
 //! Region the minted cluster belongs to — is refused with `ValidationException`
 //! (400) and nothing is created, as is a `multiRegionProperties.clusters` naming
-//! more peers than `state::MAX_MULTI_REGION_PEERS`.
+//! more peers than `state::MAX_MULTI_REGION_PEERS`, and so is a `policy` that is
+//! not a JSON policy document or — unless `bypassPolicyLockoutSafetyCheck` is set
+//! — one that would leave nobody able to replace it
+//! (`state::validate_cluster_policy`, the check `PutClusterPolicy` applies to the
+//! same document).
 //!
 //! ## Shape of an operation
 //!
@@ -261,6 +265,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
         }
 
+        // A `policy` supplied here is persisted as the cluster's own policy record
+        // and reported by `GetClusterPolicy` exactly as one `PutClusterPolicy`
+        // attached, so the document is held to the same rule: it has to parse, and
+        // unless the caller sets `bypassPolicyLockoutSafetyCheck` it may not leave
+        // nobody able to replace it. The cluster the document would be attached to
+        // is the one this call mints, so its identifier — and the ARN the
+        // document's `Resource` set is read against — is drawn first; nothing is
+        // created when the check refuses.
+        let identifier = state.mint_cluster_identifier();
+        let arn = crate::state::cluster_arn(&region, &identifier);
+        if let Some(document) = input.policy.as_deref() {
+            if let Err(invalid) = crate::state::validate_cluster_policy(
+                document,
+                &arn,
+                input.bypass_policy_lockout_safety_check,
+            ) {
+                return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
+            }
+        }
+
         // `@idempotencyToken`: a repeat of the SAME request returns the result of
         // the original call and has no additional effect; the same token with
         // DIFFERENT parameters is a different request wearing a used token, which
@@ -317,14 +341,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let identifier = state.mint_cluster_identifier();
         // The reserved `AWS_OWNED_KMS_KEY` names no customer key: it selects the
         // key owned by Amazon Web Services, so the cluster is stored with no
         // customer key, exactly as a request carrying no `kmsEncryptionKey` is.
         let customer_key =
             crate::state::customer_managed_key(input.kms_encryption_key.as_deref());
         let mut cluster = crate::state::Cluster {
-            arn: crate::state::cluster_arn(&region, &identifier),
+            arn,
             status: crate::state::STATUS_CREATING.to_string(),
             creation_time: now,
             deletion_protection_enabled: input.deletion_protection_enabled,
