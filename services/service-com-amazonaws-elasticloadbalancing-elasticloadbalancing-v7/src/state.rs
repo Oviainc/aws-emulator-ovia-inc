@@ -5,9 +5,20 @@
 //! The primary resource is the Classic load balancer (the model's `AccessPoint`):
 //! [`LoadBalancer`], keyed by `LoadBalancerName` in a [`BTreeMap`] so
 //! `DescribeLoadBalancers` has one stable order to paginate over.
+//!
+//! One thing a load balancer reports is NOT this service's to hold: a subnet is EC2's
+//! resource, and which Availability Zone a subnet is in is EC2's to say, so the zones of a
+//! load balancer placed in subnets are resolved against EC2 ([`resolve_subnet_placement`])
+//! and kept beside the subnet set that produced them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
+
+/// The ELBv2 crate, which this front door already serves on the endpoint the two models
+/// share (`src/service/api_version.rs`): its `state::network` is the ONE place either
+/// model asks EC2 about the account's network, so the subnet lookup lives there rather
+/// than a second time here.
+use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as elbv2;
 
 /// The scheme a load balancer gets when the request names none.
 ///
@@ -443,8 +454,21 @@ pub struct LoadBalancer {
     pub scheme: String,
     pub created_time: SystemTime,
     pub listeners: Vec<ListenerEntry>,
+    /// The zones a request named DIRECTLY, through `CreateLoadBalancer`'s
+    /// `AvailabilityZones`. The zones the load balancer's SUBNETS put it in are
+    /// [`LoadBalancer::subnet_zones`]; [`LoadBalancer::zones`] is the whole set it is in.
     pub availability_zones: Vec<String>,
+    /// The subnets the load balancer is attached to, in attachment order, deduplicated.
     pub subnets: Vec<String>,
+    /// The Availability Zone of each attached subnet, as EC2 reported it, keyed by subnet
+    /// id.
+    ///
+    /// Which zone a subnet is in is EC2's to say, so it is resolved against EC2 when the
+    /// subnet is attached and persisted here beside the subnet that produced it: a later
+    /// read reports the same zone without asking again, and detaching the subnet takes its
+    /// zone with it. A subnet EC2 could not be asked about holds no entry — the zone is
+    /// left unreported rather than invented.
+    pub subnet_zones: BTreeMap<String, String>,
     pub security_groups: Vec<String>,
     pub vpc_id: Option<String>,
     /// Registered `InstanceId`s, deduplicated, in registration order, bounded by
@@ -462,6 +486,48 @@ pub struct LoadBalancer {
 }
 
 impl LoadBalancer {
+    /// Every Availability Zone this load balancer is in, deduplicated: the zones a request
+    /// named directly, then the zone of each attached subnet in attachment order.
+    ///
+    /// Zone membership FOLLOWS the placement rather than being a second list beside it, so
+    /// `DescribeLoadBalancers` reports the zones of the subnets the load balancer is
+    /// attached to now — whichever operation attached or detached them.
+    pub fn zones(&self) -> Vec<String> {
+        let from_subnets = self
+            .subnets
+            .iter()
+            .filter_map(|subnet_id| self.subnet_zones.get(subnet_id));
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut reported: Vec<String> = Vec::new();
+        for zone in self.availability_zones.iter().chain(from_subnets) {
+            if seen.insert(zone.as_str()) {
+                reported.push(zone.clone());
+            }
+        }
+        reported
+    }
+
+    /// Attach `subnet_id`, remembering the zone EC2 reported for it.
+    ///
+    /// Attaching one the load balancer already holds re-states the same placement: the set
+    /// keeps its order and its length, and only the zone is refreshed.
+    pub fn attach_subnet(&mut self, subnet_id: &str, zone: Option<&str>) {
+        if let Some(zone) = zone {
+            self.subnet_zones
+                .insert(subnet_id.to_string(), zone.to_string());
+        }
+        if !self.subnets.iter().any(|held| held == subnet_id) {
+            self.subnets.push(subnet_id.to_string());
+        }
+    }
+
+    /// Detach `subnet_id`, and with it the zone it put the load balancer in. A subnet the
+    /// load balancer is not attached to removes nothing.
+    pub fn detach_subnet(&mut self, subnet_id: &str) {
+        self.subnet_zones.remove(subnet_id);
+        self.subnets.retain(|candidate| candidate != subnet_id);
+    }
+
     /// Register `instance_id`, keeping the set deduplicated and in registration order.
     /// Answers whether the id was newly added.
     pub fn register_instance(&mut self, instance_id: &str) -> bool {
@@ -551,6 +617,80 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsElasticloadbalancingElasticloadbalancingV7State>)
+}
+
+/// The message `CreateLoadBalancer` answers a `DuplicateLoadBalancerName` with.
+///
+/// A load balancer name is unique "within your set of load balancers for the region"
+/// (`AccessPointName`'s own documentation), and the modelled
+/// `DuplicateAccessPointNameException` is documented "The specified load balancer name
+/// already exists for this account" — so the refusal names the load balancer the request
+/// asked for and states the rule that produced it: the name is held by a load balancer
+/// configured with parameters other than the ones this request carried.
+pub fn duplicate_load_balancer_name_message(name: &str) -> String {
+    format!("Load Balancer named {name} already exists and it is configured with different parameters.")
+}
+
+/// The message a listener-creating operation answers a `DuplicateListener` with.
+///
+/// `DuplicateListenerException` is documented "A listener already exists for the specified
+/// load balancer name and port, but with a different instance port, protocol, or SSL
+/// certificate", so the refusal names the load balancer and the `LoadBalancerPort` the
+/// conflict is on and states WHICH of the listener's members the request may differ in —
+/// the three that rule names. The stored listener's own settings are not it: a caller
+/// reads this message to learn why the request was refused, and the request is what it
+/// can fix.
+pub fn duplicate_listener_message(load_balancer_name: &str, load_balancer_port: i32) -> String {
+    format!(
+        "A listener already exists for {load_balancer_name} with LoadBalancerPort \
+         {load_balancer_port}, but with a different InstancePort, Protocol, or \
+         SSLCertificateId"
+    )
+}
+
+/// What EC2 says about the subnets a request named: the Availability Zone of each subnet
+/// it reported one for, and the VPC they all belong to.
+#[derive(Debug, Clone, Default)]
+pub struct SubnetPlacement {
+    /// Subnet id -> the Availability Zone EC2 reports it is in. A subnet EC2 reported no
+    /// zone for, or could not be asked about, is absent.
+    pub zones: BTreeMap<String, String>,
+    /// The VPC the subnets belong to, reported only when every resolved subnet names the
+    /// same one — the only placement AWS creates at all.
+    pub vpc_id: Option<String>,
+}
+
+/// Resolve `subnet_ids` against EC2, which owns them, and answer the placement facts a
+/// load balancer attached to them reports.
+///
+/// A subnet is not this service's resource: which zone it is in and which VPC it belongs
+/// to are EC2's to say, so they are read from EC2 through the in-process callback. An
+/// emulator with no EC2 mounted, and an id EC2 holds no subnet for, say NOTHING: the
+/// placement comes back empty and the members it would have filled are left unreported
+/// rather than invented — and nothing is refused on that silence, because this service
+/// never learned anything to refuse it on.
+pub async fn resolve_subnet_placement(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subnet_ids: &[String],
+) -> SubnetPlacement {
+    let Some(resolved) = elbv2::state::network::subnets_by_id(ctx, region, subnet_ids).await else {
+        return SubnetPlacement::default();
+    };
+    let zones = resolved
+        .iter()
+        .filter_map(|subnet| {
+            let zone = subnet.availability_zone.clone()?;
+            Some((subnet.subnet_id.clone(), zone))
+        })
+        .collect();
+    let first = resolved.first().and_then(|subnet| subnet.vpc_id.clone());
+    let vpc_id = first.filter(|vpc_id| {
+        resolved
+            .iter()
+            .all(|subnet| subnet.vpc_id.as_deref() == Some(vpc_id.as_str()))
+    });
+    SubnetPlacement { zones, vpc_id }
 }
 
 /// The region this request is attributed to: the region field of its SigV4 credential

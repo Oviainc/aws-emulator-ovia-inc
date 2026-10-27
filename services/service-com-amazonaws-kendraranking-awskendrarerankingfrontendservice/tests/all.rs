@@ -39,6 +39,8 @@ mod regional_isolation;
 mod rescore_document_shape_refusals;
 #[path = "all/rescore_execution_plan_lifecycle.rs"]
 mod rescore_execution_plan_lifecycle;
+#[path = "all/rescore_group_id.rs"]
+mod rescore_group_id;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

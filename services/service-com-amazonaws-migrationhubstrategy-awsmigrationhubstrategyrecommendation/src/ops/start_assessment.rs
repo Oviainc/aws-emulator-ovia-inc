@@ -178,18 +178,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
-        // The buckets the collectors use are held to the prefix rule each member's own
-        // documentation states and its `@pattern` cannot express. The analysis-data
-        // bucket is where the collectors send the data this assessment is made of, so
-        // the service refuses a start that names none — recorded wire behaviour of
-        // `POST /start-assessment`, which the model's optional member does not capture.
-        // The report bucket is optional and is only held to the prefix. Both run BEFORE
-        // anything is minted, so a refused request leaves no assessment behind.
+        // The assessment is started in the portfolio of the Region this request was
+        // signed for, and is reported only by reads signed for that same Region; the
+        // bucket lookups below are made in that Region too, so a bucket is looked for
+        // where the caller's own S3 requests go.
+        let region = crate::state::request_region(ctx.parts());
+
+        // The buckets the collectors use. The analysis-data bucket is where the collectors
+        // send the data this assessment is made of, so the service refuses a start that
+        // names none — recorded wire behaviour of `POST /start-assessment`, which the
+        // model's optional member does not capture. The report bucket is optional. Every
+        // check runs BEFORE anything is minted, so a refused request leaves no assessment
+        // behind.
         let analysis_bucket = input.s3bucket_for_analysis_data.as_deref();
         // The bucket members' `@pattern` ([`crate::state::check_bucket_name`]) is the half
         // of their modelled constraints the boundary validator does not enforce, and it is
         // a rule of the MODEL rather than of this service, so it is decided before the
-        // service's own prefix rule below.
+        // service's own rules below.
         crate::state::check_bucket_name(analysis_bucket)
             .map_err(StartAssessmentErrorModeled::ValidationException)?;
         crate::state::check_bucket_name(input.s3bucket_for_report_data.as_deref())
@@ -200,9 +205,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             analysis_bucket,
         )
         .map_err(StartAssessmentErrorModeled::ValidationException)?;
-        crate::state::check_bucket_usable(analysis_bucket)
+        // And a bucket this service cannot use is refused by the condition that actually
+        // holds ([`crate::state::check_bucket_usable`]): a name the account holds no bucket
+        // for is reported as the missing bucket it is, naming the bucket the request sent,
+        // and one the account does hold but may not be reached under is reported as the
+        // permission failure its name earns. The lookup is an in-process call into the
+        // emulator's own S3 service, so it is made before this service's store is locked.
+        crate::state::check_bucket_usable(ctx, &region, analysis_bucket)
+            .await
             .map_err(StartAssessmentErrorModeled::ValidationException)?;
-        crate::state::check_bucket_usable(input.s3bucket_for_report_data.as_deref())
+        crate::state::check_bucket_usable(ctx, &region, input.s3bucket_for_report_data.as_deref())
+            .await
             .map_err(StartAssessmentErrorModeled::ValidationException)?;
 
         // Enum membership, on every member of this request whose target shape is an
@@ -226,8 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The assessment is started in the portfolio of the Region this request was
-        // signed for, and is reported only by reads signed for that same Region.
-        let region = crate::state::request_region(ctx.parts());
+        // signed for (resolved above, with the bucket lookups).
         let mut store = state.lock();
 
         // An assessment is made of the data a collector collects from the environment, so

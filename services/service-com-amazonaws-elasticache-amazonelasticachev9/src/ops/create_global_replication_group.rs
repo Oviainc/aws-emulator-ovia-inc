@@ -254,9 +254,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateGlobalReplicationGroupErrorModeled::ReplicationGroupNotFoundFault(
                     ReplicationGroupNotFoundFault {
-                        message: Some(format!(
-                            "Replication group {} not found.",
-                            input.primary_replication_group_id
+                        message: Some(crate::state::replication_group_not_found_message(
+                            &input.primary_replication_group_id,
                         )),
                     },
                 )
@@ -338,7 +337,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let stored = store.insert_global_replication_group(crate::state::NewGlobalReplicationGroup {
             global_replication_group_id: global_replication_group_id.clone(),
-            description: input.global_replication_group_description,
+            description: input
+                .global_replication_group_description
+                .as_deref()
+                .map(crate::state::stored_description),
             region,
             // The datastore's configuration IS the primary's: "Consists of a
             // primary cluster that accepts writes and an associated secondary

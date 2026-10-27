@@ -894,7 +894,7 @@ async fn published_quotas_bound_what_a_caller_can_store() {
     );
 
     // Listeners per load balancer: 100 is accepted, 101 is refused.
-    for (count, expected_code) in [(100usize, None), (101, Some("ValidationException"))] {
+    for (count, expected_code) in [(100usize, None), (101, Some("ValidationError"))] {
         let router = emulator();
         let mut params = vec![
             param("LoadBalancerName", "listener-quota-elb"),
@@ -955,7 +955,7 @@ async fn published_quotas_bound_what_a_caller_can_store() {
     }
 
     // Security groups per load balancer: 5 is accepted, 6 is refused.
-    for (count, expected_code) in [(5usize, None), (6, Some("ValidationException"))] {
+    for (count, expected_code) in [(5usize, None), (6, Some("ValidationError"))] {
         let router = emulator();
         let mut params = minimal_create("sg-quota-elb");
         for slot in 1..=count {
@@ -982,7 +982,7 @@ async fn published_quotas_bound_what_a_caller_can_store() {
 
     // Placements (Availability Zones or subnets): 50 is accepted, 51 is refused.
     for member in ["AvailabilityZones", "Subnets"] {
-        for (count, expected_code) in [(50usize, None), (51, Some("ValidationException"))] {
+        for (count, expected_code) in [(50usize, None), (51, Some("ValidationError"))] {
             let router = emulator();
             let mut params = vec![
                 param("LoadBalancerName", "placement-quota-elb"),
@@ -1042,7 +1042,7 @@ async fn published_quotas_bound_what_a_caller_can_store() {
     .await;
     assert_eq!(
         (over_batch.status, over_batch.error_code().as_str()),
-        (400, "ValidationException"),
+        (400, "ValidationError"),
         "a batch of 1001 instances must be refused, got {}",
         over_batch.error_code()
     );
@@ -1068,7 +1068,7 @@ async fn published_quotas_bound_what_a_caller_can_store() {
     .await;
     assert_eq!(
         (one_too_many.status, one_too_many.error_code().as_str()),
-        (400, "ValidationException"),
+        (400, "ValidationError"),
         "the 1001st registered instance must be refused, got {}",
         one_too_many.error_code()
     );
@@ -1483,7 +1483,7 @@ async fn invalid_requests_are_refused_with_the_modelled_error() {
                 param("Listeners.member.1.InstancePort", "80"),
             ],
             status: 400,
-            code: "ValidationException",
+            code: "ValidationError",
         },
         Refusal {
             what: "registering with a load balancer that does not exist",

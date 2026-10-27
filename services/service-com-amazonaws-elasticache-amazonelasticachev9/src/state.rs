@@ -154,6 +154,8 @@ use crate::ops::types::{
     UserGroupPendingChanges, UserGroupsUpdateStatus,
 };
 
+pub mod kms_key;
+
 /// The region a request is treated as having been made in when its SigV4
 /// credential scope does not name one (an unsigned or anonymous request).
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -642,6 +644,53 @@ pub const NODE_STATUS_REBOOTING: &str = "rebooting";
 /// See [`STATUS_CREATING`]: the status a cluster carries while a snapshot of it
 /// is being taken.
 pub const STATUS_SNAPSHOTTING: &str = "snapshotting";
+/// The `CacheClusterStatus` of a cluster whose parameter group holds a value its
+/// engine cannot run. No operation of this emulator puts a cluster in it — the
+/// parameter writers refuse such a value outright — but it is one of the states
+/// `RebootCacheCluster` accepts ([`REBOOTABLE_CLUSTER_STATES`]), so the refusal
+/// that names them names it too.
+pub const STATUS_INCOMPATIBLE_PARAMETERS: &str = "incompatible-parameters";
+
+/// The `CacheClusterStatus` values `RebootCacheCluster` accepts.
+///
+/// A reboot is not gated on `available` alone: the service states the states it
+/// accepts in the refusal itself (see [`reboot_state_refusal`]), and a cluster
+/// whose parameters the engine rejected or that is being snapshotted can still be
+/// rebooted — which is how a client recovers one.
+pub const REBOOTABLE_CLUSTER_STATES: [&str; 3] = [
+    STATUS_AVAILABLE,
+    STATUS_INCOMPATIBLE_PARAMETERS,
+    STATUS_SNAPSHOTTING,
+];
+
+/// How ElastiCache refuses a reboot of a cluster that is in none of
+/// [`REBOOTABLE_CLUSTER_STATES`]: the refusal states the rule — the states a
+/// reboot IS accepted in — and then the cluster and the state it is actually in.
+pub fn reboot_state_refusal(cache_cluster_id: &str, status: &str) -> String {
+    format!(
+        "Can only reboot cache clusters with state in: {}. Cluster {cache_cluster_id} has state: \
+         {status}.",
+        REBOOTABLE_CLUSTER_STATES.join(", ")
+    )
+}
+
+/// How ElastiCache refuses a MODIFICATION of a replication group that is not
+/// `available`: the message states the requirement — the state the group has to
+/// be in and the action it gates — and names neither the group nor the state it
+/// is currently in.
+///
+/// One statement, so the operations that change a group's configuration (the two
+/// replica-count operations and `ModifyReplicationGroup`) cannot word their
+/// `InvalidReplicationGroupStateFault` differently from one another.
+pub fn replication_group_modify_state_refusal() -> String {
+    format!("Replication group must be in {STATUS_AVAILABLE} state to modify.")
+}
+
+/// How ElastiCache refuses a replica-count change that asks for the count a
+/// shard already has: the `NoOperationFault` states that the requested count
+/// already matches, naming neither the shard nor the group.
+pub const REPLICA_COUNT_UNCHANGED_MESSAGE: &str =
+    "Requested new replica count already matches current number of replicas.";
 
 /// The `SourceType` values this service records an event under, from the
 /// model's `SourceType` enum (`smithy_query(query="shape",shape="SourceType")`:
@@ -2517,6 +2566,54 @@ pub fn cache_cluster_not_found_message(cache_cluster_id: &str) -> String {
     format!("CacheCluster not found: {cache_cluster_id}")
 }
 
+/// How ElastiCache words a replication group this account does not hold:
+/// `ReplicationGroup <id> not found.`
+///
+/// One helper, so every surface that answers `ReplicationGroupNotFoundFault` for
+/// an id it could not resolve — the describe, the modifies, the failover test,
+/// the creates that join a group, and the `ErrorMessage` a batch update action
+/// reports — words it the one way the service does. The resource is named the way
+/// the SHAPE spells it (`ReplicationGroup`), and the id is reported as the
+/// request spelled it, because the message is built from the request.
+pub fn replication_group_not_found_message(replication_group_id: &str) -> String {
+    format!("ReplicationGroup {replication_group_id} not found.")
+}
+
+/// How ElastiCache words a global replication group (a Global datastore) this
+/// account does not hold.
+///
+/// The template names NO identifier: the service states the class of resource
+/// that could not be resolved and nothing else, so interpolating the requested id
+/// would change the string for every caller.
+pub const GLOBAL_REPLICATION_GROUP_NOT_FOUND_MESSAGE: &str = "Global Replication Group not found";
+
+/// How ElastiCache words a `CreateReplicationGroup` whose `ReplicationGroupId` is
+/// already taken. Like [`SNAPSHOT_ALREADY_EXISTS_MESSAGE`], the template names the
+/// colliding name only as "specified name" rather than interpolating it.
+pub const REPLICATION_GROUP_ALREADY_EXISTS_MESSAGE: &str =
+    "Replication group with specified name already exists.";
+
+/// How ElastiCache words a snapshot name that is already taken, whether the
+/// snapshot would be taken from a cluster or copied from another snapshot; see
+/// [`REPLICATION_GROUP_ALREADY_EXISTS_MESSAGE`].
+pub const SNAPSHOT_ALREADY_EXISTS_MESSAGE: &str = "Snapshot with specified name already exists.";
+
+/// How ElastiCache words a service update its published catalogue does not hold:
+/// `ServiceUpdate <name> not found.`
+///
+/// One helper for the describe and the two batch update-action operations, so the
+/// three cannot disagree. The resource is named the way the SHAPE spells it
+/// (`ServiceUpdate`), not as English prose.
+pub fn service_update_not_found_message(service_update_name: &str) -> String {
+    format!("ServiceUpdate {service_update_name} not found.")
+}
+
+/// How ElastiCache words a `CacheParameterGroupName` that is already taken:
+/// `Parameter group <name> already exists` — no trailing stop.
+pub fn cache_parameter_group_already_exists_message(name: &str) -> String {
+    format!("Parameter group {name} already exists")
+}
+
 /// How ElastiCache words a cache parameter group this account does not hold:
 /// `CacheParameterGroup <name> not found.`
 ///
@@ -2864,6 +2961,16 @@ pub fn normalize_engine(engine: &str) -> Result<String, String> {
             ENGINES.join(" | ")
         ))
     }
+}
+
+/// How ElastiCache words a cache engine name that names no engine at all, which
+/// is what the engine-and-version DISCOVERY describe answers for an `Engine`
+/// filter the published catalog holds nothing for: `Invalid engine name: <name>`.
+///
+/// Distinct from [`normalize_engine`], which is how the operations that CREATE a
+/// resource running an engine word a value that is not one they serve.
+pub fn invalid_engine_name_message(engine: &str) -> String {
+    format!("Invalid engine name: {engine}")
 }
 
 /// `Ok(())` when `num` is a node count `engine` permits, else the reason it is
@@ -4160,6 +4267,32 @@ pub const MAX_CACHE_CLUSTERS_PER_GROUP: i32 = 6;
 /// as `ReplicasPerNodeGroup` documents it: "Valid values are 0 to 5."
 pub const MAX_REPLICAS_PER_NODE_GROUP: i32 = 5;
 
+/// The smallest `NewReplicaCount` `IncreaseReplicaCount` accepts: an increase
+/// ends with at least one replica, so a request to end with none asks this
+/// operation for something it cannot do.
+pub const INCREASE_REPLICA_COUNT_MIN: i32 = 1;
+
+/// The smallest `NewReplicaCount` `DecreaseReplicaCount` accepts: "The minimum
+/// number of replicas in a shard or replication group is … if Multi-AZ is not
+/// enabled: 0" (`DecreaseReplicaCount$NewReplicaCount`), so a decrease may take a
+/// shard down to none.
+pub const DECREASE_REPLICA_COUNT_MIN: i32 = 0;
+
+/// How ElastiCache states the replica-count range a request fell outside of: the
+/// bounds the CALLING operation holds the count to, and nothing of the value that
+/// missed them.
+pub fn replica_count_range_message(minimum: i32) -> String {
+    format!(
+        "New replica count must be between {minimum} and {MAX_REPLICAS_PER_NODE_GROUP} replicas."
+    )
+}
+
+/// How ElastiCache refuses `NumCacheClusters` on a request that also asks for
+/// more than one shard: the member "is not used if there is more than one node
+/// group (shard)", which is the rule the message states.
+pub const NUM_CACHE_CLUSTERS_ONE_SHARD_MESSAGE: &str =
+    "NumCacheClusters can only be specified for one node group.";
+
 /// The largest `NumNodeGroups`, from
 /// `NodeGroupsPerReplicationGroupQuotaExceededFault`: "The request cannot be
 /// processed because it would exceed the maximum allowed number of node groups
@@ -5299,15 +5432,35 @@ pub const USER_GROUP_ENGINE_UNSUPPORTED: &str =
 /// enforced in the handler.
 pub const MAX_SERVERLESS_DESCRIPTION_LENGTH: usize = 255;
 
-/// What `ServerlessCache$Description` reports for a cache created without one.
+/// What ElastiCache reports for a resource whose description is BLANK.
 ///
-/// `CreateServerlessCache$Description` documents "The default is NULL, i.e. if
-/// no description is provided then an empty string will be returned", and the
-/// API normalises that empty description to a single space: a recorded create
-/// that names no `Description` is answered with `" "`, and every later read of
-/// the cache reports the same. The value is STORED, so the create response and
-/// a later describe cannot disagree.
-pub const DEFAULT_SERVERLESS_DESCRIPTION: &str = " ";
+/// The API normalises a blank description to a single space, whichever resource
+/// carries it: a recorded `CreateServerlessCache` that names no `Description` is
+/// answered with `" "` (the member documents "The default is NULL, i.e. if no
+/// description is provided then an empty string will be returned"), and a
+/// recorded `CreateCacheParameterGroup` that sends `Description=''` is reported
+/// by `DescribeCacheParameterGroups` as `" "` too. The normalised value is
+/// STORED, so a create response and a later describe cannot disagree.
+pub const BLANK_DESCRIPTION: &str = " ";
+
+/// See [`BLANK_DESCRIPTION`]: what a serverless cache created without a
+/// description reports.
+pub const DEFAULT_SERVERLESS_DESCRIPTION: &str = BLANK_DESCRIPTION;
+
+/// The description a resource carries for the value `requested` named: the value
+/// itself, byte for byte, or [`BLANK_DESCRIPTION`] when it is blank.
+///
+/// One helper, so every resource whose description a request SETS — the cache
+/// parameter group, the cache subnet group, the replication group and the Global
+/// datastore — normalises it the one way the service does, and a client that
+/// round-trips descriptions reads back a value the service would answer.
+pub fn stored_description(requested: &str) -> String {
+    if requested.trim().is_empty() {
+        BLANK_DESCRIPTION.to_string()
+    } else {
+        requested.to_string()
+    }
+}
 
 /// `ConnectionType`'s values (`smithy_query(query="shape",
 /// shape="ConnectionType")`: `vpc | public`), and the default
@@ -5462,10 +5615,7 @@ pub fn serverless_description(requested: &str) -> Result<String, String> {
              {MAX_SERVERLESS_DESCRIPTION_LENGTH} characters, got {length}."
         ));
     }
-    if requested.trim().is_empty() {
-        return Ok(DEFAULT_SERVERLESS_DESCRIPTION.to_string());
-    }
-    Ok(requested.to_string())
+    Ok(stored_description(requested))
 }
 
 /// Why a serverless cache cannot carry the `SnapshotRetentionLimit` a request
@@ -5585,16 +5735,19 @@ pub fn validate_cache_usage_limits(limits: &CacheUsageLimits) -> Result<(), Stri
             }
             let within = value >= DATA_STORAGE_MIN_GB && upper.is_none_or(|upper| value <= upper);
             if !within {
+                // The template states the RULE the value broke — the member, its
+                // bounds and the value that removes the limit — and carries
+                // nothing of the value that broke it.
                 return Err(match upper {
                     Some(upper) => format!(
-                        "Invalid value {value} for {member} limit. Must be between \
-                         {DATA_STORAGE_MIN_GB} and {upper}. You can set the value to \
-                         {USAGE_LIMIT_REMOVED} to remove the limit."
+                        "Invalid value for {member} limit. Must be between \
+                         {DATA_STORAGE_MIN_GB} and {upper}. You can set the value to zero to \
+                         remove the limit."
                     ),
                     None => format!(
-                        "Invalid value {value} for {member} limit. Must be at least \
-                         {DATA_STORAGE_MIN_GB}. You can set the value to {USAGE_LIMIT_REMOVED} to \
-                         remove the limit."
+                        "Invalid value for {member} limit. Must be at least \
+                         {DATA_STORAGE_MIN_GB}. You can set the value to zero to remove the \
+                         limit."
                     ),
                 });
             }
@@ -8682,7 +8835,7 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
                     Some(group) => Ok((key, group.engine.clone())),
                     None => Err((
                         REPLICATION_GROUP_NOT_FOUND_ERROR_TYPE,
-                        format!("Replication group {id} not found."),
+                        replication_group_not_found_message(id),
                     )),
                 }
             }
@@ -9570,7 +9723,13 @@ pub enum ReplicaTargets {
 /// [`MAX_REPLICAS_PER_NODE_GROUP`] here, before any member is created, and a
 /// configuration entry can only name a shard the group already has (the
 /// handlers resolve it), which [`MAX_NODE_GROUPS`] bounds.
+///
+/// `minimum` is the smallest count the CALLING operation can leave a shard with
+/// — see [`INCREASE_REPLICA_COUNT_MIN`] and [`DECREASE_REPLICA_COUNT_MIN`] — and
+/// is what the refusal states, so the bound a client is told is the one its call
+/// is actually held to.
 pub fn replica_count_targets(
+    minimum: i32,
     new_replica_count: Option<i32>,
     replica_configuration: &[ConfigureShard],
 ) -> Result<ReplicaTargets, ReplicaCountRefusal> {
@@ -9579,18 +9738,17 @@ pub fn replica_count_targets(
             "NewReplicaCount cannot be combined with ReplicaConfiguration.".to_string(),
         ));
     }
-    let in_range = |count: i32, member: &str| -> Result<(), ReplicaCountRefusal> {
-        if (0..=MAX_REPLICAS_PER_NODE_GROUP).contains(&count) {
+    let in_range = |count: i32| -> Result<(), ReplicaCountRefusal> {
+        if (minimum..=MAX_REPLICAS_PER_NODE_GROUP).contains(&count) {
             Ok(())
         } else {
-            Err(ReplicaCountRefusal::Value(format!(
-                "Invalid value {count} for {member}: a node group has between 0 and \
-                 {MAX_REPLICAS_PER_NODE_GROUP} replicas."
+            Err(ReplicaCountRefusal::Value(replica_count_range_message(
+                minimum,
             )))
         }
     };
     if let Some(count) = new_replica_count {
-        in_range(count, "NewReplicaCount")?;
+        in_range(count)?;
         return Ok(ReplicaTargets::EveryShard(count));
     }
     if replica_configuration.is_empty() {
@@ -9602,7 +9760,7 @@ pub fn replica_count_targets(
     }
     let mut targets: Vec<(String, i32)> = Vec::new();
     for shard in replica_configuration {
-        in_range(shard.new_replica_count, "ReplicaConfiguration.NewReplicaCount")?;
+        in_range(shard.new_replica_count)?;
         if targets.iter().any(|(id, _)| id == &shard.node_group_id) {
             return Err(ReplicaCountRefusal::Value(format!(
                 "Invalid value {} for ReplicaConfiguration.NodeGroupId: it is configured more \

@@ -22,7 +22,18 @@
 //! 7. the idempotency token is bounded in CHARACTERS, not bytes;
 //! 8. a create past either ceiling the store keeps — its record count and its
 //!    caller-chosen byte budget — is refused, stores nothing, and leaves a store that
-//!    still answers a read.
+//!    still answers a read;
+//! 9. `DeleteVerifiedAccessTrustProvider` REMOVES THE TRUST PROVIDER THE REQUEST NAMES and
+//!    answers with the record it removed, so the describe no longer reports it and the
+//!    bytes it held go back to the store;
+//! 10. a delete of an id the account holds no trust provider for is REFUSED rather than
+//!     reported as a deletion, whatever shape that id has;
+//! 11. one `ClientToken` names one DELETE: a retry of that delete answers the trust
+//!     provider it removed instead of refusing an id that is gone;
+//! 12. the OIDC client secret is WRITE-ONLY: every report of a trust provider answers the
+//!     mask in its place, never the value the request configured;
+//! 13. the deletes the store remembers for their idempotency tokens are BOUNDED: the
+//!     oldest is dropped to make room and a delete is never refused for a full history.
 //!
 //! Each table row is a distinct input along what the rule generalises over — the trust
 //! provider kind and every value of its sub-type enum, which filter, how many values a
@@ -37,12 +48,14 @@ use ec2::ops::types::{
     DEVICE_TRUST_PROVIDER_TYPE_VALUES, TRUST_PROVIDER_TYPE_VALUES, USER_TRUST_PROVIDER_TYPE_VALUES,
 };
 use ec2::state::{
-    MAX_TAGS_PER_RESOURCE, MAX_VERIFIED_ACCESS_TRUST_PROVIDERS_PAGE_SIZE,
+    MAX_TAGS_PER_RESOURCE, MAX_VERIFIED_ACCESS_TRUST_PROVIDERS_PAGE_SIZE, REDACTED_CLIENT_SECRET,
     TRUST_PROVIDER_TYPE_USER, USER_TRUST_PROVIDER_TYPE_OIDC,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, element, elements, error_code, filters, indexed, unescaped};
+use super::ec2_query::{
+    call, element, elements, error_code, error_message, filters, indexed, unescaped,
+};
 
 /// The Region every call here is signed for. A trust provider is an account-level
 /// resource — its modelled shape names no Region — so the Region only selects the
@@ -83,6 +96,16 @@ async fn describe(router: &MultiServiceRouter, params: &[(String, String)]) -> (
         router,
         REGION,
         "DescribeVerifiedAccessTrustProviders",
+        params,
+    )
+    .await
+}
+
+async fn delete(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
+    call(
+        router,
+        REGION,
+        "DeleteVerifiedAccessTrustProvider",
         params,
     )
     .await
@@ -296,7 +319,9 @@ async fn every_published_kind_round_trips_through_the_describe() {
                     expected.extend([
                         ("issuer", "https://login.example.test/".to_string()),
                         ("clientId", "client-17".to_string()),
-                        ("clientSecret", "secret-17".to_string()),
+                        // The client secret is write-only: what is reported is the mask,
+                        // never the value `kind_params` configured.
+                        ("clientSecret", REDACTED_CLIENT_SECRET.to_string()),
                         ("scope", "openid".to_string()),
                     ]);
                 }
@@ -1448,6 +1473,750 @@ async fn a_create_past_either_store_ceiling_is_refused() {
             status, 200,
             "case {case:?}: expected HTTP 200 from the describe at the ceiling, \
              got {status} with body {body}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The delete: what leaves the store, what the answer reports, and what a retry of the
+// same call sees.
+// ---------------------------------------------------------------------------
+
+/// How many caller-chosen bytes the store has charged against its budget.
+fn stored_bytes(engine: &std::sync::Arc<engine::InMemoryEngine>) -> usize {
+    engine
+        .state::<ec2::state::ComAmazonawsEc2Amazonec2State>()
+        .lock()
+        .stored_bytes()
+}
+
+/// The reported members every kind of trust provider carries, so two reports of the SAME
+/// trust provider can be compared without knowing its kind
+/// (`smithy_query(query="shape",shape="VerifiedAccessTrustProvider")`).
+const COMMON_MEMBERS: [&str; 6] = [
+    "verifiedAccessTrustProviderId",
+    "trustProviderType",
+    "policyReferenceName",
+    "description",
+    "creationTime",
+    "lastUpdatedTime",
+];
+
+/// The reported members THIS kind of trust provider carries on top of [`COMMON_MEMBERS`]:
+/// its sub-type, and the options the model makes a member of that kind.
+fn kind_members(trust_provider_type: &str, sub_type: &str) -> Vec<&'static str> {
+    if trust_provider_type == TRUST_PROVIDER_TYPE_USER {
+        let mut members = vec!["userTrustProviderType"];
+        if sub_type == USER_TRUST_PROVIDER_TYPE_OIDC {
+            members.extend(["issuer", "clientId", "clientSecret", "scope"]);
+        }
+        members
+    } else {
+        vec!["deviceTrustProviderType", "tenantId", "publicSigningKeyUrl"]
+    }
+}
+
+/// Assert that `right` reports the same trust provider as `left`: every member of
+/// `members` is present and non-empty in `left`, and reported identically in `right`.
+fn assert_same_record(
+    case: &str,
+    members: &[&str],
+    left_label: &str,
+    left: &str,
+    right_label: &str,
+    right: &str,
+) {
+    for member in members {
+        let expected = element(left, member);
+        assert!(
+            expected.as_deref().is_some_and(|value| !value.is_empty()),
+            "case {case:?}: the {left_label} reports no {member}, got {left}"
+        );
+        assert_eq!(
+            element(right, member),
+            expected,
+            "case {case:?}: expected the {right_label} to report the {left_label}'s \
+             {member}={expected:?}, got {:?}",
+            element(right, member)
+        );
+    }
+}
+
+/// RULE 9 over the kind catalog: "Delete an Amazon Web Services Verified Access trust
+/// provider" (`DeleteVerifiedAccessTrustProvider`) — the trust provider the request names
+/// LEAVES the store, the answer reports the record that was removed ("Details about the
+/// Verified Access trust provider",
+/// `DeleteVerifiedAccessTrustProviderResult$VerifiedAccessTrustProvider`), the describe no
+/// longer reports it, and the caller-chosen bytes it held go back to the store's budget.
+///
+/// Every published kind is a row, so the rule is asserted over the kinds it generalises
+/// over; the expected answer is the record the CREATE reported, so no literal of one
+/// request is the specification. A second trust provider nobody deletes is seeded beside
+/// each one, so a delete that emptied the store would fail the case.
+#[tokio::test]
+async fn the_delete_removes_the_trust_provider_and_answers_the_record_it_removed() {
+    for (trust_provider_type, sub_type) in published_kinds() {
+        let (router, engine) = emulator_with_engine();
+        let case = format!("{trust_provider_type}/{sub_type}");
+        let policy_reference = format!("del{}", sub_type.replace('-', ""));
+        let (status, created) = create_provider(
+            &router,
+            trust_provider_type,
+            sub_type,
+            &policy_reference,
+            vec![
+                p("Description", format!("the {sub_type} provider")),
+                p("TagSpecification.1.Tag.1.Key", "Team"),
+                p("TagSpecification.1.Tag.1.Value", "platform"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from the create, got {status} with body {created}"
+        );
+        let id = element(&created, "verifiedAccessTrustProviderId").unwrap_or_default();
+        let bystander = seed(
+            &router,
+            &case,
+            trust_provider_type,
+            sub_type,
+            &format!("{policy_reference}keep"),
+            Vec::new(),
+        )
+        .await;
+
+        let held_before = held(&engine);
+        let bytes_before = stored_bytes(&engine);
+
+        let (status, deleted) = delete(&router, &[p("VerifiedAccessTrustProviderId", id.as_str())]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DeleteVerifiedAccessTrustProvider, \
+             got {status} with body {deleted}"
+        );
+        // The answer is the record that was removed, member for member as the create
+        // reported it — including the tags it carried.
+        let members = [COMMON_MEMBERS.to_vec(), kind_members(trust_provider_type, sub_type)]
+            .concat();
+        assert_same_record(&case, &members, "create", &created, "delete", &deleted);
+        assert_eq!(
+            elements(&deleted, "key"),
+            vec!["Team".to_string()],
+            "case {case:?}: expected the delete to report the removed provider's tags, \
+             got {deleted}"
+        );
+
+        // The store, not just the answer: one trust provider fewer, and the bytes it held
+        // given back — this delete named no idempotency token, so nothing of it is kept.
+        assert_eq!(
+            held(&engine),
+            held_before - 1,
+            "case {case:?}: expected {} trust provider(s) left, got {}",
+            held_before - 1,
+            held(&engine)
+        );
+        assert!(
+            stored_bytes(&engine) < bytes_before,
+            "case {case:?}: expected the removed record's caller-chosen bytes back, \
+             still charged {} of {bytes_before}",
+            stored_bytes(&engine)
+        );
+
+        // The describe reports the account as the delete left it: the bystander, and the
+        // deleted id resolves to nothing.
+        assert_eq!(
+            described_ids(&router, &case, &[]).await,
+            vec![bystander.clone()],
+            "case {case:?}: expected only the trust provider nobody deleted to be reported"
+        );
+        let (status, body) =
+            describe(&router, &indexed("VerifiedAccessTrustProviderId", &[&id])).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the describe of the deleted id to be refused, \
+             got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidVerifiedAccessTrustProviderId.NotFound",
+            "case {case:?}: expected the not-found code for the deleted id, got {body}"
+        );
+    }
+}
+
+/// RULE 10: an id the account holds no trust provider for is REFUSED — HTTP 400
+/// `InvalidVerifiedAccessTrustProviderId.NotFound`, naming the id the request gave — and
+/// the store is left alone, so a caller that deletes twice can tell the deletion it
+/// performed from one it did not.
+///
+/// The rows are the shapes such an id comes in: a long and a short EC2 id of this very
+/// resource that was never minted, another resource kind's id, a value that is no EC2 id
+/// at all, and the id of a trust provider this caller already deleted.
+#[tokio::test]
+async fn a_delete_of_an_id_the_account_does_not_hold_is_refused() {
+    let (router, engine) = emulator_with_engine();
+    let kept = seed(
+        &router,
+        "the trust provider nobody deletes",
+        "user",
+        "iam-identity-center",
+        "refkept",
+        Vec::new(),
+    )
+    .await;
+    let spent = seed(
+        &router,
+        "the trust provider deleted before the rows run",
+        "device",
+        "jamf",
+        "refspent",
+        Vec::new(),
+    )
+    .await;
+    let (status, body) = delete(&router, &[p("VerifiedAccessTrustProviderId", spent.as_str())]).await;
+    assert_eq!(
+        status, 200,
+        "expected HTTP 200 deleting the trust provider the last row names, \
+         got {status} with body {body}"
+    );
+
+    // `(case, the id the delete names)`.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "the long id form of this resource, never minted",
+            "vatp-0ffffffffffffffff".to_string(),
+        ),
+        (
+            "the short id form of this resource, never minted",
+            "vatp-0fffffff".to_string(),
+        ),
+        (
+            "another resource kind's id",
+            "vai-0123456789abcdef0".to_string(),
+        ),
+        ("a value that is no EC2 id at all", "not-an-id".to_string()),
+        (
+            "the id of a trust provider this caller already deleted",
+            spent.clone(),
+        ),
+    ];
+
+    for (case, id) in rows {
+        let (status, body) = delete(&router, &[p("VerifiedAccessTrustProviderId", id.as_str())]).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidVerifiedAccessTrustProviderId.NotFound",
+            "case {case:?}: expected the not-found code, got {body}"
+        );
+        assert_eq!(
+            unescaped(&error_message(&body)),
+            format!("VerifiedAccessTrustProvider {id} does not exist"),
+            "case {case:?}: expected the message to name the id the request gave, got {body}"
+        );
+        assert_eq!(
+            described_ids(&router, case, &[]).await,
+            vec![kept.clone()],
+            "case {case:?}: a refused delete removes nothing"
+        );
+        assert_eq!(
+            held(&engine),
+            1,
+            "case {case:?}: a refused delete removes nothing, got {} held",
+            held(&engine)
+        );
+    }
+}
+
+/// RULE 5 for the delete: "Checks whether you have the required permissions for the
+/// action, without actually making the request, and provides an error response"
+/// (`DeleteVerifiedAccessTrustProviderRequest$DryRun`) — the dry run is answered with the
+/// outcome the request would have had, and removes nothing either way. That holds for a
+/// request a token would answer too: a dry run never reports a success status.
+#[tokio::test]
+async fn a_dry_run_of_the_delete_reports_the_outcome_and_removes_nothing() {
+    use ec2::state::MAX_CLIENT_TOKEN_CHARS;
+
+    let (router, engine) = emulator_with_engine();
+    let id = seed(
+        &router,
+        "the trust provider the dry runs name",
+        "user",
+        "oidc",
+        "refdryrun",
+        Vec::new(),
+    )
+    .await;
+
+    // `(case, the parameters under test, the HTTP status, the error code)`.
+    let rows: Vec<(&str, Params, u16, &str)> = vec![
+        (
+            "a delete that would have succeeded",
+            vec![p("VerifiedAccessTrustProviderId", id.as_str())],
+            412,
+            "DryRunOperation",
+        ),
+        (
+            "a delete of an id the account does not hold",
+            vec![p("VerifiedAccessTrustProviderId", "vatp-0ffffffffffffffff")],
+            400,
+            "InvalidVerifiedAccessTrustProviderId.NotFound",
+        ),
+        (
+            "a delete whose idempotency token is past the bound",
+            vec![
+                p("VerifiedAccessTrustProviderId", id.as_str()),
+                p("ClientToken", "t".repeat(MAX_CLIENT_TOKEN_CHARS + 1)),
+            ],
+            400,
+            "InvalidParameterValue",
+        ),
+    ];
+
+    for (case, params, expected_status, expected_code) in rows {
+        let mut params = params;
+        params.push(p("DryRun", "true"));
+        let (status, body) = delete(&router, &params).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
+        );
+        assert_eq!(
+            described_ids(&router, case, &[]).await,
+            vec![id.clone()],
+            "case {case:?}: a dry run removes nothing"
+        );
+        assert_eq!(
+            held(&engine),
+            1,
+            "case {case:?}: a dry run removes nothing, got {} held",
+            held(&engine)
+        );
+    }
+
+    // The dry runs changed nothing, so the real delete still has a trust provider to
+    // remove. It carries a token, so the delete it performs can be retried.
+    let request = vec![
+        p("VerifiedAccessTrustProviderId", id.as_str()),
+        p("ClientToken", "del-after-dry-runs"),
+    ];
+    let (status, body) = delete(&router, &request).await;
+    assert_eq!(
+        status, 200,
+        "expected the delete after the dry runs to succeed, got {status} with body {body}"
+    );
+    assert_eq!(
+        held(&engine),
+        0,
+        "expected the delete after the dry runs to remove the trust provider, got {} held",
+        held(&engine)
+    );
+
+    // A dry run of the RETRY of that delete: the request would have succeeded — the token
+    // answers with the trust provider its own call removed — so it is reported with the dry
+    // run's refusal and never with a success status.
+    let mut dry_retry = request.clone();
+    dry_retry.push(p("DryRun", "true"));
+    let (status, body) = delete(&router, &dry_retry).await;
+    assert_eq!(
+        status, 412,
+        "case \"a dry run of a retry the token answers\": expected HTTP 412, \
+         got {status} with body {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "DryRunOperation",
+        "case \"a dry run of a retry the token answers\": expected DryRunOperation, got {body}"
+    );
+    // And the retry itself still answers the trust provider that delete removed.
+    let (status, body) = delete(&router, &request).await;
+    assert_eq!(
+        status, 200,
+        "expected the retry after the dry run to answer the removed trust provider, \
+         got {status} with body {body}"
+    );
+    assert_eq!(
+        element(&body, "verifiedAccessTrustProviderId").as_deref(),
+        Some(id.as_str()),
+        "expected the retry to report {id}, got {body}"
+    );
+}
+
+/// RULE 11: "A unique, case-sensitive token that you provide to ensure idempotency of your
+/// modification request" (`DeleteVerifiedAccessTrustProviderRequest$ClientToken`) — one
+/// token names the one delete it performed, so a retry of that call answers the trust
+/// provider it removed instead of refusing an id that is gone, and removes nothing more.
+/// Another token answers for its own delete only, and the token is bounded in CHARACTERS
+/// like every other idempotency token of this crate.
+#[tokio::test]
+async fn one_client_token_names_one_delete() {
+    use ec2::state::MAX_CLIENT_TOKEN_CHARS;
+
+    let (router, engine) = emulator_with_engine();
+    let first = seed(
+        &router,
+        "the trust provider the token's delete removes",
+        "user",
+        "oidc",
+        "reftokdel",
+        vec![p("Description", "removed under a token")],
+    )
+    .await;
+    let request = vec![
+        p("VerifiedAccessTrustProviderId", first.as_str()),
+        p("ClientToken", "del-token-a"),
+    ];
+    let (status, deleted) = delete(&router, &request).await;
+    assert_eq!(
+        status, 200,
+        "expected HTTP 200 from the delete under a token, got {status} with body {deleted}"
+    );
+
+    // The SAME request again: the trust provider that delete removed, not a refusal for an
+    // id that is gone.
+    let (status, replayed) = delete(&router, &request).await;
+    assert_eq!(
+        status, 200,
+        "case \"the same delete retried\": expected HTTP 200, got {status} with body {replayed}"
+    );
+    assert_same_record(
+        "the same delete retried",
+        &[
+            COMMON_MEMBERS.to_vec(),
+            kind_members(TRUST_PROVIDER_TYPE_USER, USER_TRUST_PROVIDER_TYPE_OIDC),
+        ]
+        .concat(),
+        "first delete",
+        &deleted,
+        "retry",
+        &replayed,
+    );
+    assert_eq!(
+        held(&engine),
+        0,
+        "case \"the same delete retried\": a retry removes nothing more, got {} held",
+        held(&engine)
+    );
+
+    // The answer comes from the TOKEN, not from a memory of the id: the same delete without
+    // that token, and with a token differing only in case, is a delete of an id the account
+    // no longer holds.
+    for (case, token) in [
+        ("the same delete with no token at all", None),
+        (
+            "a token differing only in case",
+            Some("DEL-TOKEN-A".to_string()),
+        ),
+        ("a token this caller never used", Some("del-token-z".to_string())),
+    ] {
+        let mut params = vec![p("VerifiedAccessTrustProviderId", first.as_str())];
+        if let Some(token) = token {
+            params.push(p("ClientToken", token));
+        }
+        let (status, body) = delete(&router, &params).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidVerifiedAccessTrustProviderId.NotFound",
+            "case {case:?}: expected the not-found code, got {body}"
+        );
+    }
+
+    // A token answers for ITS OWN delete: the second provider's delete reports the second
+    // provider, whatever the first token already answered.
+    let second = seed(
+        &router,
+        "a second trust provider, deleted under its own token",
+        "device",
+        "jumpcloud",
+        "reftokdeltwo",
+        Vec::new(),
+    )
+    .await;
+    let (status, body) = delete(
+        &router,
+        &[
+            p("VerifiedAccessTrustProviderId", second.as_str()),
+            p("ClientToken", "del-token-b"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"a second delete under its own token\": expected HTTP 200, \
+         got {status} with body {body}"
+    );
+    assert_eq!(
+        element(&body, "verifiedAccessTrustProviderId").as_deref(),
+        Some(second.as_str()),
+        "case \"a second delete under its own token\": expected it to report {second}, got {body}"
+    );
+    assert!(
+        described_ids(&router, "after both deletes", &[])
+            .await
+            .is_empty(),
+        "expected both deleted trust providers to be gone from the describe"
+    );
+
+    // The token is bounded in CHARACTERS, not bytes, the way every client token of this
+    // crate is: `(case, the token, the HTTP status)`.
+    let bound_rows: Vec<(String, String, u16)> = vec![
+        (
+            format!("{MAX_CLIENT_TOKEN_CHARS} multi-byte characters"),
+            "é".repeat(MAX_CLIENT_TOKEN_CHARS),
+            200,
+        ),
+        (
+            "one multi-byte character past the bound".to_string(),
+            "ñ".repeat(MAX_CLIENT_TOKEN_CHARS + 1),
+            400,
+        ),
+    ];
+    for (case, token, expected_status) in bound_rows {
+        let id = seed(
+            &router,
+            &case,
+            "user",
+            "iam-identity-center",
+            "reftokbound",
+            Vec::new(),
+        )
+        .await;
+        let (status, body) = delete(
+            &router,
+            &[
+                p("VerifiedAccessTrustProviderId", id.as_str()),
+                p("ClientToken", token),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} with body {body}"
+        );
+        if expected_status == 200 {
+            continue;
+        }
+        assert_eq!(
+            error_code(&body),
+            "InvalidParameterValue",
+            "case {case:?}: expected InvalidParameterValue, got {body}"
+        );
+        assert_eq!(
+            described_ids(&router, &case, &[]).await,
+            vec![id.clone()],
+            "case {case:?}: a refused delete removes nothing"
+        );
+        let (status, body) = delete(&router, &[p("VerifiedAccessTrustProviderId", id.as_str())]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the delete without that token to succeed, \
+             got {status} with body {body}"
+        );
+    }
+}
+
+/// RULE 12: the OIDC client secret is WRITE-ONLY. "The client secret"
+/// (`OidcOptions$ClientSecret`) is the one member of the reported shape the model marks
+/// sensitive, so every report of the trust provider — the create's own answer, the
+/// describe that reads the store, and the delete that removes it — answers the mask
+/// (`state::REDACTED_CLIENT_SECRET`) rather than the value the request configured, and a
+/// trust provider configured without a secret reports none at all.
+///
+/// The rule generalises over the VALUE, so the rows differ in length, alphabet and whether
+/// the configured secret already reads like the mask; the last row configures none.
+#[tokio::test]
+async fn the_oidc_client_secret_is_never_reported_back() {
+    // `(case, the secret the request configures)`.
+    let rows: Vec<(&str, Option<&str>)> = vec![
+        ("a one-character secret", Some("s")),
+        (
+            "a long mixed-case secret with punctuation",
+            Some("Zx-9_aB~cD.eF+gH:iJkL"),
+        ),
+        ("a multi-byte secret", Some("sëcrét-ñ-öäü")),
+        (
+            "a secret that already reads like the mask",
+            Some(REDACTED_CLIENT_SECRET),
+        ),
+        ("no secret at all", None),
+    ];
+
+    for (case, secret) in rows {
+        let router = emulator();
+        // The OIDC options are assembled here rather than through `kind_params`, because
+        // this case chooses the secret that helper fixes.
+        let mut params = vec![
+            p("TrustProviderType", TRUST_PROVIDER_TYPE_USER),
+            p("UserTrustProviderType", USER_TRUST_PROVIDER_TYPE_OIDC),
+            p("PolicyReferenceName", "refsecret"),
+            p("OidcOptions.Issuer", "https://login.example.test/"),
+            p(
+                "OidcOptions.AuthorizationEndpoint",
+                "https://login.example.test/authorize",
+            ),
+            p("OidcOptions.TokenEndpoint", "https://login.example.test/token"),
+            p(
+                "OidcOptions.UserInfoEndpoint",
+                "https://login.example.test/userinfo",
+            ),
+            p("OidcOptions.ClientId", "client-17"),
+            p("OidcOptions.Scope", "openid"),
+        ];
+        if let Some(secret) = secret {
+            params.push(p("OidcOptions.ClientSecret", secret));
+        }
+        let (status, created) = create(&router, &params).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from the create, got {status} with body {created}"
+        );
+        let id = element(&created, "verifiedAccessTrustProviderId").unwrap_or_default();
+        assert!(
+            is_trust_provider_id(&id),
+            "case {case:?}: expected a minted trust provider id, got {id:?}"
+        );
+
+        let (status, described) =
+            describe(&router, &indexed("VerifiedAccessTrustProviderId", &[&id])).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from the describe, got {status} with body {described}"
+        );
+        let (status, deleted) = delete(&router, &[p("VerifiedAccessTrustProviderId", id.as_str())]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from the delete, got {status} with body {deleted}"
+        );
+
+        // Every report of the trust provider, held to the same rule: the mask where a
+        // secret was configured, nothing where none was.
+        let reported = secret.map(|_| REDACTED_CLIENT_SECRET.to_string());
+        for (label, body) in [
+            ("create", &created),
+            ("describe", &described),
+            ("delete", &deleted),
+        ] {
+            assert_eq!(
+                element(body, "clientSecret"),
+                reported,
+                "case {case:?}: expected the {label} to report clientSecret={reported:?}, \
+                 got {:?}",
+                element(body, "clientSecret")
+            );
+            // The configured value is reported nowhere in the answer, under any member.
+            // Only a secret long enough to be distinctive is looked for, because a
+            // one-character one occurs in ordinary response text by chance; the member
+            // assertion above is what pins every row.
+            if let Some(secret) = secret.filter(|secret| {
+                *secret != REDACTED_CLIENT_SECRET && secret.chars().count() >= 6
+            }) {
+                assert!(
+                    !unescaped(body).contains(secret),
+                    "case {case:?}: the {label} answer carries the configured secret, \
+                     got {body}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE 13: the deletes this store remembers for their idempotency tokens are BOUNDED. A
+/// delete frees the live record's slot, so nothing else caps a history that outlives the
+/// resource: the store keeps the most recent
+/// `MAX_REMEMBERED_VERIFIED_ACCESS_TRUST_PROVIDER_DELETIONS` of them and drops the oldest,
+/// so a retry of a delete still remembered is answered while one of a delete long since
+/// displaced sees the id as gone — and a delete is never refused because the history is
+/// full.
+#[tokio::test]
+async fn the_remembered_deletes_are_bounded_and_drop_the_oldest() {
+    use ec2::state::MAX_REMEMBERED_VERIFIED_ACCESS_TRUST_PROVIDER_DELETIONS as REMEMBERED;
+
+    let (router, engine) = emulator_with_engine();
+    // One delete past the bound, each under its own token, so the FIRST one is the entry
+    // the last delete displaces.
+    let mut deleted: Vec<(String, String)> = Vec::new();
+    for nth in 0..=REMEMBERED {
+        let id = seed(
+            &router,
+            "a trust provider deleted under its own token",
+            "user",
+            "iam-identity-center",
+            "refbound",
+            Vec::new(),
+        )
+        .await;
+        let token = format!("del-token-{nth}");
+        let (status, body) = delete(
+            &router,
+            &[
+                p("VerifiedAccessTrustProviderId", id.as_str()),
+                p("ClientToken", token.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case \"delete {nth} of {REMEMBERED}\": a full history must not refuse a delete, \
+             got {status} with body {body}"
+        );
+        deleted.push((token, id));
+    }
+    assert_eq!(
+        held(&engine),
+        0,
+        "expected every trust provider to have been deleted, got {} held",
+        held(&engine)
+    );
+
+    // `(case, the delete to retry, whether the history still answers it)`.
+    let oldest = deleted.first().cloned().unwrap_or_default();
+    let newest = deleted.last().cloned().unwrap_or_default();
+    for (case, (token, id), remembered) in [
+        ("the oldest delete, displaced by the newest", oldest, false),
+        ("the newest delete", newest, true),
+    ] {
+        let (status, body) = delete(
+            &router,
+            &[
+                p("VerifiedAccessTrustProviderId", id.as_str()),
+                p("ClientToken", token.clone()),
+            ],
+        )
+        .await;
+        if remembered {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the retry to be answered, got {status} with body {body}"
+            );
+            assert_eq!(
+                element(&body, "verifiedAccessTrustProviderId").as_deref(),
+                Some(id.as_str()),
+                "case {case:?}: expected the retry to report {id}, got {body}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the retry to see the id as gone, \
+             got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidVerifiedAccessTrustProviderId.NotFound",
+            "case {case:?}: expected the not-found code, got {body}"
         );
     }
 }
