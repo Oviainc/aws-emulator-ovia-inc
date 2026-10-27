@@ -332,7 +332,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // judged against what the policy already holds for the other — unless
         // THIS request states the configuration structure, which replaces that
         // configuration wholesale and so leaves nothing of it to compare
-        // against. Refused before the first write, so the stored policy is left
+        // against, in which case the omitted member's documented default is
+        // what the policy would run on and what the ordering is judged against.
+        // Refused before the first write, so the stored policy is left
         // exactly as it was.
         let replaced_details = input.policy_details.as_ref();
         let keeps_stored_configuration = replaced_details.is_none();
