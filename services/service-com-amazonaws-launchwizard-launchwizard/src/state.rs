@@ -2177,9 +2177,13 @@ pub fn specification_warnings(
     warnings
 }
 
-/// How many clauses, then the clauses — the shape [`validation_report`] states a
-/// refusal in, because a caller reads both the same way. `noun` is pluralised by
-/// appending an `s`, which is what both callers' nouns take.
+/// How many clauses, then the clauses — the ONE shape every refusal this service words
+/// states a report in, because a caller reads them all the same way.
+///
+/// Every renderer goes through here, [`validation_report`] included, so the count, the
+/// singular/plural noun, the `" validation "`/`" detected: "` wording and the `"; "`
+/// separator exist once and cannot differ between two refusals. `noun` is pluralised by
+/// appending an `s`, which is what every caller's noun takes.
 fn counted_clauses(noun: &str, clauses: &[String]) -> String {
     let plural = if clauses.len() == 1 {
         noun.to_string()
@@ -2201,7 +2205,7 @@ fn counted_clauses(noun: &str, clauses: &[String]) -> String {
 pub fn specification_warning_refusal(warnings: &[String]) -> String {
     format!(
         "{}; resubmit with force set to true to update the deployment anyway.",
-        counted_clauses("warning", warnings)
+        counted_clauses(VALIDATION_WARNING_NOUN, warnings)
     )
 }
 
@@ -2237,7 +2241,7 @@ pub fn specification_create_refusal(warnings: &[String]) -> String {
     format!(
         "{}; the specifications a deployment pattern accepts are reported by \
          GetWorkloadDeploymentPattern.",
-        counted_clauses("error", warnings)
+        counted_clauses(VALIDATION_ERROR_NOUN, warnings)
     )
 }
 
@@ -2325,6 +2329,15 @@ const CONSTRAINT_MARKER: &str = "failed to satisfy constraint: ";
 /// constraints: the composed list follows this, bracketed.
 const COMPOSED_MARKER: &str = "Member must satisfy constraint: ";
 
+/// The noun a clause that states a BROKEN requirement is counted by — a modelled
+/// constraint the request failed, or a specification clause a create cannot go on past:
+/// an `error`, which [`counted_clauses`] pluralises for a report of several.
+const VALIDATION_ERROR_NOUN: &str = "error";
+
+/// The noun a clause an update may APPLY ANYWAY is counted by — a specification clause
+/// `force` overrides: a `warning`, pluralised by [`counted_clauses`] like its sibling.
+const VALIDATION_WARNING_NOUN: &str = "warning";
+
 /// AWS's standard validation report for the modelled constraints a request failed at
 /// the protocol boundary, as `src/service.rs` words this service's refusal with.
 ///
@@ -2333,6 +2346,9 @@ const COMPOSED_MARKER: &str = "Member must satisfy constraint: ";
 /// the rejected value — caller-supplied input is not replayed into the error channel —
 /// and reports a `@pattern` as the expression itself, without the `^`/`$` the model
 /// spells "whole value" with.
+///
+/// The sentence the clauses are stated in is [`counted_clauses`]', the same one the
+/// specification refusals are worded by; a modelled constraint is an `error`.
 pub fn validation_report(violations: &[Violation]) -> String {
     let mut clauses: Vec<String> = Vec::new();
     for violation in violations {
@@ -2344,9 +2360,7 @@ pub fn validation_report(violations: &[Violation]) -> String {
             clauses.push(clause);
         }
     }
-    let count = clauses.len();
-    let noun = if count == 1 { "error" } else { "errors" };
-    format!("{count} validation {noun} detected: {}", clauses.join("; "))
+    counted_clauses(VALIDATION_ERROR_NOUN, &clauses)
 }
 
 /// One clause of [`validation_report`].

@@ -2436,6 +2436,12 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // `__stringMin1Max64`, `@length(min: 1, max: 64)` (that service's own Smithy
         // model), which a generated name is already inside but may be longer than.
         MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => rules(64, Characters::AsGenerated),
+        // Amazon MQ `CreateBroker.BrokerName`: that member's own rule is "1-50 characters
+        // long, must contain only letters, numbers, dashes, and underscores" (`BrokerName`,
+        // Amazon MQ's own Smithy model) — a generated name is already inside that character
+        // set, since letters, digits and the hyphen are all admitted, but may be longer
+        // than the bound.
+        MQ_BROKER => rules(50, Characters::AsGenerated),
         _ => None,
     }
 }
@@ -2859,6 +2865,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     FIREHOSE_DELIVERY_STREAM,
     "AWS::Lambda::Function",
     "AWS::Logs::LogGroup",
+    MQ_BROKER,
     MSK_CLUSTER,
     MSK_SERVERLESS_CLUSTER,
     "AWS::RDS::DBCluster",
@@ -3895,6 +3902,29 @@ fn return_values(
             attributes.insert("Arn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // "Ref returns the Amazon MQ broker ID"; Fn::GetAtt: Arn ("the broker's ARN").
+        // Amazon MQ MINTS that id — `CreateBroker` takes a broker NAME and answers with the
+        // `brokerId` it generated — so a declaration reports an identifier of Amazon MQ's
+        // own shape (`b-` followed by 128 bits in the 8-4-4-4-12 grouping its broker ids
+        // carry) rather than CloudFormation's `<stack>-<logical id>-<unique id>` name, with
+        // the broker ARN built from it the way Amazon MQ builds one
+        // (`broker:<name>:<broker id>`). This is also the type `super::provisioning` creates
+        // in Amazon MQ itself, which reports the id IT minted and the ARN it built back as
+        // the resource's identity — and THOSE, not the ones computed here, are what the
+        // stack reports for a broker Amazon MQ created, which is what
+        // [`identity_is_service_assigned`] names this type for.
+        MQ_BROKER => {
+            let id = format!("{MQ_BROKER_ID_PREFIX}{}", generated_uuid(resource_type, name));
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    MQ_ARN_NAMESPACE,
+                    region,
+                    &format!("broker:{name}:{id}"),
+                ),
+            );
+            (id, attributes)
+        }
         _ => (name.to_string(), attributes),
     }
 }
@@ -3997,6 +4027,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         GUARDDUTY_DETECTOR => &["Id"],
         KMS_KEY => &["Arn", "KeyId"],
         MSK_CLUSTER | MSK_SERVERLESS_CLUSTER => &["Arn"],
+        MQ_BROKER => &["Arn"],
         EVENTS_RULE => &["Arn"],
         SSM_PARAMETER => &["Type", "Value"],
         STEP_FUNCTIONS_ACTIVITY => &["Arn", "Name"],
@@ -4078,6 +4109,10 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == ROUTE53RESOLVER_RULE
         || resource_type == ROUTE53RESOLVER_RULE_ASSOCIATION
         || resource_type == TRANSFER_SERVER
+        // An Amazon MQ broker is one more: `CreateBroker` takes the broker's NAME and
+        // answers with the `brokerId` Amazon MQ generated for it, which is the id that
+        // type's `Ref` returns and the one every `mq` operation addresses a broker by.
+        || resource_type == MQ_BROKER
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -4148,6 +4183,30 @@ pub const MSK_SERVERLESS_CLUSTER: &str = "AWS::MSK::ServerlessCluster";
 /// Amazon MSK's ARN namespace, which is its model's own `awsService.arnNamespace`
 /// (`kafka`) rather than the `MSK` its resource types are spelled with.
 pub const MSK_ARN_NAMESPACE: &str = "kafka";
+
+/// The type of an Amazon MQ broker: that middle segment is the Amazon MQ model's own
+/// `awsService.cloudFormationName` (`AmazonMQ`).
+///
+/// "Ref returns the Amazon MQ broker ID", and `Fn::GetAtt` reads `Arn` — the broker's own
+/// ARN. Amazon MQ MINTS that id (`CreateBroker` takes the broker's name and answers with
+/// the `brokerId` it generated, which is the `@httpLabel` every operation on a broker is
+/// addressed by), which is why [`identity_is_service_assigned`] names this type: the id a
+/// `Ref` resolves to is the one that service created the broker under, not one these naming
+/// rules computed.
+pub const MQ_BROKER: &str = "AWS::AmazonMQ::Broker";
+
+/// Amazon MQ's ARN namespace, which is its model's own `awsService.arnNamespace` (`mq`)
+/// rather than the `AmazonMQ` its resource type is spelled with.
+pub const MQ_ARN_NAMESPACE: &str = "mq";
+
+/// What an Amazon MQ broker id begins with (`b-` followed by 128 bits in the 8-4-4-4-12
+/// grouping `BrokerId`'s own documented form carries).
+///
+/// The id built on it here is a PLACEHOLDER, and one that is never reported for a broker
+/// that exists: the id a created broker carries is the one Amazon MQ minted, which
+/// [`super::provisioning::reconcile`] adopts over this one. What this value is for is the
+/// shape of the identifier a declaration reports BEFORE its create answers.
+const MQ_BROKER_ID_PREFIX: &str = "b-";
 
 /// The 1-based ordinal an Amazon MSK cluster ARN ends with
 /// (`cluster/<name>/<id>-<ordinal>`), as the stand-in identifier computed here carries it.

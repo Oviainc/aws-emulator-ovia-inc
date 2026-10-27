@@ -487,6 +487,17 @@ pub const SANDBOX_NOT_FOUND_MESSAGE: &str = "Sandbox does not exist";
 /// constant, which is tracked as its own wire-fidelity issue rather than done here.
 pub const PROJECT_NOT_FOUND_MESSAGE: &str = "Project does not exist";
 
+/// What CodeBuild states as the reason a webhook-addressing request names a project that
+/// carries no webhook, carried by the modelled `ResourceNotFoundException`.
+///
+/// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: the absent thing is the
+/// WEBHOOK rather than the project, and the sentence names neither the project nor its
+/// ARN — `this project` is part of the sentence CodeBuild emits, not a substitution for
+/// the name the request sent. Every operation that resolves a project's webhook reports
+/// the same text, so a client can key on it. Recorded behaviour — the model states no
+/// message for the error.
+pub const WEBHOOK_NOT_FOUND_MESSAGE: &str = "Webhook does not exist for this project";
+
 /// What CodeBuild states as the reason a request addresses a report group this account
 /// does not hold — the sibling of [`PROJECT_NOT_FOUND_MESSAGE`] for the other resource
 /// kind addressed by ARN alone, and fixed text for the same reason.

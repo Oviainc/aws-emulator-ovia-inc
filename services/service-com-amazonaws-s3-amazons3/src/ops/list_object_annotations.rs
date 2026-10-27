@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListObjectAnnotations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListObjectAnnotations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListObjectAnnotations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the annotations the stored object version this request addresses carries —
+//! "lists the annotations attached to an Amazon S3 object", a page at a time and in
+//! ascending name order — and reports nothing else about them.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +134,51 @@ impl From<ListObjectAnnotationsErrorModeled> for ListObjectAnnotationsError {
     }
 }
 
+/// The most annotations one page of this listing carries when the request names no
+/// `max-annotation-results`.
+///
+/// The operation publishes its own ceiling: "Results are paginated, with a maximum of 1,000
+/// annotations per object" (`ListObjectAnnotations`'s own documentation), the same 1,000 an
+/// object may carry ([`crate::state::MAX_ANNOTATIONS_PER_OBJECT`]) and the same maximum the
+/// request's own `MaxAnnotationResults` is bounded by — so a caller naming no page size is
+/// answered with every annotation of the object in one page.
+const DEFAULT_MAX_ANNOTATION_RESULTS: i32 = 1_000;
+
+// The default page size IS the per-object ceiling, so the two cannot drift apart.
+const _: () = assert!(
+    DEFAULT_MAX_ANNOTATION_RESULTS as usize == crate::state::MAX_ANNOTATIONS_PER_OBJECT,
+    "the default page size is the number of annotations an object may carry"
+);
+
+/// The marker a continuation token this operation issued carries, so a token it did not
+/// issue is refused rather than silently read as a cursor.
+///
+/// Distinct from the markers the object and configuration listings in this crate use: a
+/// token minted for one listing is not a cursor into another.
+const CONTINUATION_TOKEN_MARKER: &str = "s3oa1 ";
+
+/// Encode the resume point of a truncated page as the response's `NextContinuationToken`.
+///
+/// "The continuation token to use to retrieve the next page of results"
+/// (`ListObjectAnnotationsOutput$NextContinuationToken`) — hex of a marker plus the first
+/// annotation name NOT returned, so the token a page hands back resumes exactly where it
+/// stopped without storing per-caller cursor state, the way every other paginated listing in
+/// this crate encodes its own. Obfuscated, NOT confidential: hex is trivially reversible, and
+/// the token is only opaque in the sense that a client must not read a name out of it or mint
+/// one of its own.
+fn encode_continuation_token(first_name_not_returned: &str) -> String {
+    hex::encode(format!("{CONTINUATION_TOKEN_MARKER}{first_name_not_returned}").as_bytes())
+}
+
+/// The annotation name a `ContinuationToken` resumes at (inclusive), or `None` when the
+/// token is not one this operation issued.
+fn decode_continuation_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    decoded
+        .strip_prefix(CONTINUATION_TOKEN_MARKER)
+        .map(str::to_string)
+}
+
 /// The `ListObjectAnnotations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -176,17 +216,198 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListObjectAnnotations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListObjectAnnotationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListObjectAnnotations"))
+        // request metadata only, and this read needs nothing from it.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner"
+        // (`ListObjectAnnotationsRequest$ExpectedBucketOwner`), judged the way the writer,
+        // the reader and the delete of this same subresource judge it: this emulator serves
+        // one account, so the owner of every bucket it holds is that account.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // "Filter results to annotations whose name begins with the specified prefix"
+        // (`ListObjectAnnotationsRequest$AnnotationPrefix`): the prefix selects annotation
+        // NAMES, so a prefix no acceptable name could begin with selects nothing and is not
+        // a prefix of this namespace at all — which is the modelled `InvalidPrefix` (400),
+        // "the annotation prefix you provided is invalid". Judged by the one place the name
+        // rules live ([`crate::state::annotation_name_rejection`]), so the prefix filter and
+        // the writer agree on which names exist: past the 512-byte name maximum, or under a
+        // prefix S3 reserves for itself. An EMPTY prefix is not a name — it filters nothing
+        // out — so it is the whole listing, exactly as if none had been sent.
+        if let Some(prefix) = input.annotation_prefix.as_deref() {
+            match crate::state::annotation_name_rejection(prefix) {
+                None | Some(crate::state::AnnotationNameRejection::Empty) => {}
+                Some(
+                    crate::state::AnnotationNameRejection::TooLong { .. }
+                    | crate::state::AnnotationNameRejection::ReservedPrefix { .. },
+                ) => {
+                    return Err(
+                        ListObjectAnnotationsErrorModeled::InvalidPrefix(InvalidPrefix {}).into(),
+                    )
+                }
+            }
+        }
+
+        // A `versionId` that is not SHAPED like one cannot name a version of anything, so
+        // it is a malformed argument rather than an absent version — the way the writer,
+        // the reader and the delete of this subresource answer the same argument.
+        if let Some(version_id) = input.version_id.as_deref() {
+            if !crate::state::version_id_is_well_formed(version_id) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    crate::state::INVALID_ARGUMENT_STATUS,
+                    crate::state::INVALID_VERSION_ID_MESSAGE,
+                ));
+            }
+        }
+
+        // `Token` carries no minimum length, so an EMPTY continuation token is a legal value
+        // that names no cursor — the first page, exactly as if none had been sent (the
+        // reading every other paginated listing in this crate gives it). Anything else must
+        // be a token this operation issued, or it names no resume point at all.
+        let resume_at = match input.continuation_token.as_deref() {
+            Some(token) if !token.is_empty() => {
+                Some(decode_continuation_token(token).ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_ARGUMENT_CODE,
+                        crate::state::INVALID_ARGUMENT_STATUS,
+                        "The continuation token provided is incorrect",
+                    )
+                })?)
+            }
+            _ => None,
+        };
+
+        // "The maximum number of annotations to return in the response"
+        // (`MaxAnnotationResults`), whose `range 1..1000` the boundary already refused
+        // anything outside of, so what reaches here is a usable page size; a request naming
+        // none is answered with the published ceiling.
+        let max_annotation_results = input
+            .max_annotation_results
+            .unwrap_or(DEFAULT_MAX_ANNOTATION_RESULTS);
+        let page_limit = usize::try_from(max_annotation_results).unwrap_or(0);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store there are no annotations to report, and answering an empty
+            // listing would be a false statement about the object the request names, so the
+            // scaffold's 501 carries what is true: this emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListObjectAnnotations",
+            ));
+        };
+        let store = state.lock();
+
+        // The ADDRESS first, so a listing naming a bucket, a key or a version this emulator
+        // does not hold answers that rather than an empty listing of an object that is not
+        // there. "The version ID of the object" (`ListObjectAnnotationsRequest$VersionId`),
+        // and with none the key's current object — what every reader naming no version
+        // answers from.
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(ListObjectAnnotationsErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        let Some(object) = bucket.addressed_object(&input.key, input.version_id.as_deref()) else {
+            // A well-formed `versionId` that names no stored version is `NoSuchVersion`
+            // (404), which this model carries no shape for; a request naming no version at
+            // all is the modelled `NoSuchKey`.
+            return Err(match input.version_id.as_deref() {
+                Some(_) => crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_VERSION_CODE,
+                    404,
+                    crate::state::NO_SUCH_VERSION_MESSAGE,
+                ),
+                None => ListObjectAnnotationsErrorModeled::NoSuchKey(NoSuchKey {}).into(),
+            });
+        };
+
+        let prefix = input.annotation_prefix.clone().unwrap_or_default();
+        let mut reported: Vec<AnnotationEntry> = Vec::new();
+        let mut next_continuation_token: Option<String> = None;
+
+        // The object holds its annotations keyed by name in an ordered map, so this walk is
+        // already in ascending name order and a page's resume point is simply the next name
+        // in it. Nothing here writes: a listing reports what the writes recorded.
+        for (name, annotation) in &object.annotations {
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            // The token's name is the first one this page owes, inclusive.
+            if resume_at.as_deref().is_some_and(|from| name.as_str() < from) {
+                continue;
+            }
+            // Out of slots: this annotation starts the NEXT page, and its name is what the
+            // token hands back.
+            if reported.len() >= page_limit {
+                next_continuation_token = Some(encode_continuation_token(name));
+                break;
+            }
+            reported.push(AnnotationEntry {
+                // "The name of the annotation" — the key the object holds the record under.
+                annotation_name: name.clone(),
+                // "The date and time the annotation was last modified" and "the size of the
+                // annotation payload, in bytes" and "the entity tag of the annotation": all
+                // three read off the stored record, so a listing and a read of the same
+                // annotation report the same three values.
+                last_modified: ::aws_smithy_types::DateTime::from(annotation.last_modified),
+                size: annotation.size(),
+                e_tag: Some(annotation.etag.clone()),
+                // "The checksum algorithm used for the annotation" — nothing in this
+                // emulator computes a checksum of an annotation, so none was stored and
+                // none is reported rather than one being invented, exactly as a read of the
+                // same annotation reports none.
+                checksum_algorithm: None,
+                // "The replication status of the annotation" describes a replication rule
+                // nothing here runs, so nothing is reported for it either.
+                replication_status: None,
+            });
+        }
+
+        // "The number of annotations returned" — counted before the entries are handed to
+        // the response, and over THIS page rather than over every annotation the object
+        // carries.
+        let annotation_count = i32::try_from(reported.len()).unwrap_or(i32::MAX);
+
+        Ok(ListObjectAnnotationsOutput {
+            // "The list of annotations attached to the object", one entry per annotation
+            // this page reports; an object carrying none lists an empty one rather than
+            // omitting the member.
+            annotations: Some(reported),
+            // "The bucket name" and "the object key" the listing was taken from: the
+            // address this read resolved.
+            bucket: Some(input.bucket.clone()),
+            key: Some(input.key.clone()),
+            // "The version ID of the object", read off the stored version rather than
+            // echoed: reported exactly when that version has an id of its own (a write into
+            // a versioning-enabled bucket).
+            object_version_id: object.version_id.clone(),
+            // "The prefix used to filter the response" — the one the request carried, and
+            // nothing when it carried none, since then nothing filtered the response.
+            annotation_prefix: input.annotation_prefix.clone(),
+            // "The maximum number of annotations returned in the response": the page size
+            // this listing actually applied, which is the published ceiling when the request
+            // named none.
+            max_annotation_results: Some(max_annotation_results),
+            // The entries on this page, counted above.
+            annotation_count: Some(annotation_count),
+            // "The continuation token used in this request": the token the REQUEST carried,
+            // reported back as sent.
+            continuation_token: input.continuation_token.clone(),
+            // "The continuation token to use to retrieve the next page of results" — absent
+            // exactly when this page reported the last annotation the filter selects.
+            next_continuation_token,
+            // `RequestCharged` reports a Requester Pays charge this emulator does not model,
+            // so nothing is reported for it rather than a charge being invented — as the
+            // writer, the reader and the delete of this subresource report none.
+            request_charged: None,
+        })
     }
 }

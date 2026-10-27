@@ -1080,10 +1080,15 @@ fn select(selector: &Selector, facts: &Facts<'_>) -> Vec<usize> {
             .iter()
             .enumerate()
             .filter(|(_, segment)| {
+                // The type a `service(name, type)` selector names is the type
+                // the service is REPORTED with, which for a service this trace
+                // only called is the one the call inferred
+                // (`SegmentRecord::service_type`) rather than an `origin` it
+                // never carried.
                 &segment.name == name
-                    && r#type
-                        .as_ref()
-                        .is_none_or(|wanted| segment.origin.as_ref() == Some(wanted))
+                    && r#type.as_deref().is_none_or(|wanted| {
+                        segment.service_type().as_deref() == Some(wanted)
+                    })
             })
             .map(|(at, _)| at)
             .collect(),

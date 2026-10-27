@@ -411,12 +411,18 @@ pub struct Materialised {
     /// attribute the owning service reported for it applied.
     pub resources: Vec<StoredResource>,
     /// The reason the stack cannot reach its completed status: an owning service refused
-    /// to create one of the resources, or to delete one the deployment replaced. `None`
-    /// when every resource this emulator provisions was created.
+    /// to create one of the resources, or to delete one the deployment replaced, or
+    /// CloudFormation itself refused the deployment before any service was asked anything.
+    /// `None` when every resource this emulator provisions was created.
     ///
-    /// This is the STACK-level reason ([`super::resource_failure_summary`]): the summary
-    /// of which logical resources failed, and nothing about why. Why each one failed is
-    /// carried on that resource's own transition ([`ResourceTransition::reason`]).
+    /// This is the STACK-level reason, and WHOSE failure it was decides what it says. A
+    /// resource an owning service refused is reported as the summary of which logical
+    /// resources failed ([`super::resource_failure_summary`]), with why each one failed on
+    /// that resource's own transition ([`ResourceTransition::reason`]). A deployment
+    /// CLOUDFORMATION refused — a dynamic reference it could not resolve
+    /// ([`super::dynamic_references::resolve_declared`]) — is its own diagnostic: no
+    /// resource was asked of anybody, so there is no resource whose failure it could be
+    /// summarising.
     pub failure: Option<String>,
     /// Every resource transition this deployment made, oldest first — the stack's
     /// per-resource event records.
@@ -433,6 +439,12 @@ pub struct Materialised {
 /// re-deploy of the same template a no-op rather than a second create — and what keeps a
 /// resource another deployment created from being forgotten, so the stack's deletion still
 /// deletes it.
+///
+/// Every dynamic reference the declarations carry is resolved FIRST, by CloudFormation
+/// itself ([`super::dynamic_references::resolve_declared`]): one it cannot honour refuses
+/// the whole deployment before any owning service is asked anything, so nothing is created
+/// and [`Materialised::failure`] is the resolver's own diagnostic rather than a summary of
+/// resources that failed.
 ///
 /// The resources are created in the order the template declares them. The first refusal
 /// from an owning service stops the walk and is reported as [`Materialised::failure`]: the
@@ -476,75 +488,52 @@ pub async fn reconcile(
     // the naming rules had computed for that resource ([`repoint_references`]).
     let mut minted: Vec<(String, String)> = Vec::new();
     let mut declared = declared.into_iter();
-    for mut resource in declared.by_ref() {
+    // Every `{{resolve:...}}` DYNAMIC REFERENCE the declarations carry is resolved by
+    // CLOUDFORMATION ITSELF, here, before anything is asked of any owning service: a
+    // reference no store can satisfy has no value, so there is nothing to ask any service
+    // for. Such a reference is therefore CloudFormation's OWN refusal of the deployment —
+    // no provider is called for ANY of the resources, and the reason the stack reports is
+    // the resolver's diagnostic (which reference could not be honoured, and why) rather
+    // than a summary of resources that tried and failed
+    // ([`super::resource_failure_summary`]).
+    let mut resolutions = match super::dynamic_references::resolve_declared(
+        ctx,
+        region,
+        declared.as_slice(),
+    )
+    .await
+    {
+        Ok(resolutions) => resolutions,
+        Err(reason) => {
+            outcome.failure = Some(reason);
+            BTreeMap::new()
+        }
+    };
+    // A deployment the gate above refused deploys nothing: the walk is not entered, and
+    // every declaration is recorded as the declaration left it by the tail below.
+    while outcome.failure.is_none() {
+        let Some(mut resource) = declared.next() else {
+            break;
+        };
+        // The resource's record carries the document the stack RECORDS — a secure
+        // reference's value is never one of them — while the owning service is asked for
+        // the resource with the resolved one.
+        let resolved = resolutions
+            .remove(&resource.logical_id)
+            .unwrap_or_else(|| {
+                super::dynamic_references::Resolution::verbatim(&resource.properties)
+            });
+        resource.properties = resolved.recorded;
+        let mut deployed_properties = resolved.deployed;
         // A property of this resource naming one created EARLIER in this walk carries the
         // stand-in id that resource had when the declaration was resolved, which is not the
         // id its owning service went on to mint. The reference is re-pointed at the minted
         // one before anything is asked about this resource, so the create carries the
         // identifier its service knows the dependency by — and so the comparison below
-        // reads an UNCHANGED declaration as unchanged.
+        // reads an UNCHANGED declaration as unchanged. Both documents the resolution left
+        // are re-pointed, since both name that dependency.
         repoint_references(&mut resource.properties, &minted);
-        // Every `{{resolve:...}}` DYNAMIC REFERENCE the declaration carries is resolved
-        // against the store it names, before anything is asked of the owning service: that
-        // service is asked for the resource the reference's VALUE describes, and a
-        // reference the named store cannot satisfy fails THIS resource — the deployment
-        // stops here, exactly as it does on a refusal, so a create rolls the stack back
-        // rather than creating a resource configured with the reference's own text.
-        let resolved = match super::dynamic_references::resolve(
-            ctx,
-            region,
-            &resource.resource_type,
-            &resource.properties,
-        )
-        .await
-        {
-            Ok(resolved) => resolved,
-            Err(reason) => {
-                let updating = previous
-                    .iter()
-                    .any(|existing| existing.materialised && is_same_resource(existing, &resource));
-                // CloudFormation itself failed the resource here — no owning service was
-                // asked anything — so the reason the RESOURCE's event carries is this
-                // service's own words rather than a provider refusal
-                // ([`handler_failure_reason`]), while the stack's own reason stays the
-                // summary of what failed ([`super::resource_failure_summary`]).
-                if updating {
-                    outcome.failure = Some(super::resource_failure_summary(
-                        super::failed_action::UPDATE,
-                        [resource.logical_id.as_str()],
-                    ));
-                    outcome.transitions.push(ResourceTransition::starting(
-                        &resource,
-                        super::resource_status::UPDATE_IN_PROGRESS,
-                    ));
-                    outcome.transitions.push(ResourceTransition::finished(
-                        &resource,
-                        super::resource_status::UPDATE_FAILED,
-                        Some(reason),
-                    ));
-                } else {
-                    outcome.failure = Some(super::resource_failure_summary(
-                        super::failed_action::CREATE,
-                        [resource.logical_id.as_str()],
-                    ));
-                    outcome
-                        .transitions
-                        .push(ResourceTransition::creating(&resource));
-                    outcome.transitions.push(ResourceTransition::failed(
-                        &resource,
-                        super::resource_status::CREATE_FAILED,
-                        reason,
-                    ));
-                }
-                outcome.resources.push(resource);
-                break;
-            }
-        };
-        // The resource's record carries the document the stack RECORDS — a secure
-        // reference's value is never one of them — while the owning service is asked for
-        // the resource with the resolved one.
-        resource.properties = resolved.recorded;
-        let deployed_properties = resolved.deployed;
+        repoint_references(&mut deployed_properties, &minted);
         if let Some(existing) = previous
             .iter()
             .find(|existing| existing.materialised && is_same_resource(existing, &resource))

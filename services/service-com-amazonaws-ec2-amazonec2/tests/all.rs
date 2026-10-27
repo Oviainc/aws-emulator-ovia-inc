@@ -106,6 +106,12 @@ mod transit_gateway_prefix_list_references;
 // the tail.
 #[path = "all/transit_gateway_route_table_announcements.rs"]
 mod transit_gateway_route_table_announcements;
+// What `RebootInstances` queues, which instances it can be queued for, and what it
+// refuses. Declared beside the suites above rather than in sorted position or at the tail,
+// for the reason this file's header note gives: both are contended regions where a
+// serialized squash merge is lost.
+#[path = "all/reboot_instances.rs"]
+mod reboot_instances;
 #[path = "all/ec2_query_error_envelope.rs"]
 mod ec2_query_error_envelope;
 // The same envelope rule, driven over seven further operations and the four refusal kinds

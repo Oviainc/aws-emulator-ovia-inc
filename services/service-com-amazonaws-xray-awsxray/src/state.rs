@@ -47,7 +47,9 @@
 //!
 //! * a subsegment that names a downstream service (`namespace: "remote"`) gets
 //!   an INFERRED top-level segment synthesised for that downstream service
-//!   ([`inferred_segments`]), which is the service X-Ray attributes the call to;
+//!   ([`inferred_segments`]), which is the service X-Ray attributes the call to,
+//!   and which the call's own namespace TYPES ([`inferred_service_type`])
+//!   because a service nothing reported for carries no `origin`;
 //! * every entity (a segment, or a subsegment inside one) records an
 //!   [`Outcome`], read from the `fault`/`error`/`throttle` fields its document
 //!   DECLARED: the one [`Classification`] a COUNTER splits it
@@ -1096,6 +1098,12 @@ pub struct SegmentRecord {
     /// service a stored document only called (`namespace: "remote"`), rather than
     /// submitted. Its document carries `"inferred": true`.
     pub inferred: bool,
+    /// The service type of the node this segment stands for when the service
+    /// INFERRED it from a call out of another service
+    /// ([`inferred_service_type`]); `None` for a segment a service submitted,
+    /// whose type is the `origin` it carried. Read through
+    /// [`SegmentRecord::service_type`].
+    pub inferred_type: Option<String>,
 }
 
 /// One subsegment, as carried inline in its segment's `subsegments` array, with
@@ -1672,11 +1680,13 @@ pub fn parse_segment_document(document: &str) -> Result<(String, SegmentRecord),
         namespace: optional_string(object, "namespace"),
         exceptions: parse_cause(object.get("cause")),
         subsegments: parse_subsegments(id_ref, object.get("subsegments"), 1, &mut 0)?,
-        // NOT read from the document: `inferred` is service-assigned, and the
-        // segment schema `PutTraceSegments` documents has no such member, so a
-        // submitted document cannot claim to be a service the trace only
-        // called. [`inferred_segment`] is the one place it is set.
+        // NOT read from the document: `inferred` and the type that goes with it
+        // are service-assigned, and the segment schema `PutTraceSegments`
+        // documents has no such member, so a submitted document cannot claim to
+        // be a service the trace only called. [`inferred_segment`] is the one
+        // place they are set; a submitted segment is typed by its `origin`.
         inferred: false,
+        inferred_type: None,
     };
     Ok((trace_id, segment))
 }
@@ -1792,6 +1802,33 @@ fn parse_http(value: Option<&serde_json::Value>) -> Option<HttpRecord> {
 /// The `namespace` that makes a subsegment a call OUT of the service it sits in,
 /// so the work it covers is a downstream service's.
 pub const REMOTE_NAMESPACE: &str = "remote";
+
+/// The `namespace` that makes a subsegment a call out through the AWS SDK, so
+/// the work it covers is an AWS service's.
+pub const AWS_NAMESPACE: &str = "aws";
+
+/// The service type of a node X-Ray INFERRED from a call out of an instrumented
+/// service, which the calling entity's `namespace` names, or `None` when the
+/// entity names no downstream service at all.
+///
+/// `Service$Type` documents the vocabulary: [`SERVICE_TYPE_REMOTE`] is "a
+/// downstream service of indeterminate type", which is what a
+/// [`REMOTE_NAMESPACE`] entity records, and `AWS::<name>` is what
+/// "downstream calls to Amazon Web Services ... that didn't target a specific
+/// table" report, which is what an [`AWS_NAMESPACE`] entity records. An entity
+/// with neither namespace recorded in-process work and infers no service.
+///
+/// This is the crate's ONE namespace-to-service-type derivation, so every
+/// surface that reports the identity of an inferred service — a service graph's
+/// nodes, a trace summary's `ServiceIds`, a root cause's services, a
+/// `service(name, type)` filter expression — types that service the same way.
+pub fn inferred_service_type(name: &str, namespace: Option<&str>) -> Option<String> {
+    match namespace? {
+        REMOTE_NAMESPACE => Some(SERVICE_TYPE_REMOTE.to_string()),
+        AWS_NAMESPACE => Some(format!("AWS::{name}")),
+        _ => None,
+    }
+}
 
 /// The id of the segment synthesised for the remote subsegment `remote_id` of
 /// `trace_id`: 16 hexadecimal digits, as a segment id is.
@@ -1918,6 +1955,9 @@ fn inferred_segment(
         exceptions: remote.exceptions.clone(),
         subsegments: Vec::new(),
         inferred: true,
+        // The node this segment stands for reported nothing itself, so it has no
+        // `origin`: what types it is the call that inferred it.
+        inferred_type: inferred_service_type(&remote.name, remote.namespace.as_deref()),
     }
 }
 
@@ -2204,11 +2244,24 @@ impl SegmentRecord {
         }
     }
 
+    /// The service type this segment's identity reports: the type the call that
+    /// INFERRED the service gave it ([`inferred_service_type`]) when no service
+    /// reported this segment, and otherwise the `origin` the reporting document
+    /// carried.
+    ///
+    /// Every projection of a service identity reads this, so an inferred service
+    /// is typed the same whichever surface reports it.
+    pub fn service_type(&self) -> Option<String> {
+        self.inferred_type
+            .clone()
+            .or_else(|| self.origin.clone())
+    }
+
     /// This segment's service identity, as a root cause reports it.
     fn service(&self, entity_path: Vec<RootCauseEntityView>) -> RootCauseServiceView {
         RootCauseServiceView {
             name: self.name.clone(),
-            r#type: self.origin.clone(),
+            r#type: self.service_type(),
             account_id: self.account_id.clone(),
             inferred: self.inferred,
             entity_path,
@@ -2272,7 +2325,9 @@ impl SegmentRecord {
 pub struct RootCauseServiceView {
     /// The service's name.
     pub name: String,
-    /// Its `origin`, which is what X-Ray reports as the service type.
+    /// Its service type: the `origin` a reporting service carried, or the type
+    /// the call that inferred the service gave it
+    /// ([`SegmentRecord::service_type`]).
     pub r#type: Option<String>,
     /// Its `account_id`, when the document named one.
     pub account_id: Option<String>,
@@ -6121,11 +6176,7 @@ impl NodeKey {
 /// table" report. A subsegment with neither namespace recorded in-process work
 /// and so names no service at all.
 fn downstream_node(name: &str, namespace: Option<&str>) -> Option<NodeKey> {
-    let inferred_type = match namespace? {
-        SERVICE_TYPE_REMOTE => SERVICE_TYPE_REMOTE.to_string(),
-        "aws" => format!("AWS::{name}"),
-        _ => return None,
-    };
+    let inferred_type = inferred_service_type(name, namespace)?;
     Some(NodeKey {
         name: name.to_string(),
         inferred_type: Some(inferred_type),

@@ -7,7 +7,7 @@
 //! `GetAppAuthorization` and `ListAppAuthorizations` answer from the bytes this
 //! call wrote.
 //!
-//! Four rules this handler owns:
+//! Five rules this handler owns:
 //!
 //! * only the members the request SUPPLIES are written — `credential` and
 //!   `tenant` are both optional, and everything else (the ARNs, `app`,
@@ -33,7 +33,18 @@
 //! * a bundle holds AT MOST ONE authorization per (`app`, `tenant`) pair — the
 //!   invariant `CreateAppAuthorization` establishes — so moving one onto a pair
 //!   another authorization of the same bundle already holds is refused, and the
-//!   check is taken under the SAME state lock as the write.
+//!   check is taken under the SAME state lock as the write;
+//! * the pair is also what ties an ingestion to its app authorization (see
+//!   [`crate::state::AppBundleRecord::ingestion_for`]), so a supplied `tenant`
+//!   that would move the authorization OFF a pair the bundle still holds an
+//!   ingestion for is refused with the same precondition
+//!   `DeleteAppAuthorization` documents ("You must delete the associated
+//!   ingestion before you can delete an app authorization"): an ingestion exists
+//!   only for a pair whose authorization has completed the connect handshake, so
+//!   neither the delete nor this re-pointing may leave one without its
+//!   authorization. Keeping the stored `tenantIdentifier` — a call that only
+//!   renames the tenant or only rotates the credential — breaks no association
+//!   and is applied.
 //!
 //! ## Shape of an operation
 //!
@@ -216,6 +227,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = stored.id.clone();
         let app = stored.app.clone();
         let auth_type = stored.auth_type.clone();
+        let arn = stored.arn.clone();
+        // The tenant the record is stored under: half of the pair an ingestion
+        // of this authorization is held for, so the precondition below is taken
+        // against where the authorization is NOW, not where the request moves it.
+        let stored_tenant = stored.tenant_identifier.clone();
 
         // A supplied credential must be the kind the STORED authorization type
         // uses. Only the KIND is read: the secret inside it is never stored,
@@ -239,6 +255,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if held.id != id {
                     return Err(UpdateAppAuthorizationErrorModeled::ValidationException(
                         crate::state::tenant_already_authorized(&app),
+                    )
+                    .into());
+                }
+            }
+
+            // Moving the authorization to ANOTHER tenant takes it off the
+            // (application, tenant) pair its ingestion is held for, which would
+            // leave that ingestion with no app authorization — a state
+            // `CreateIngestion` refuses to create — and would let the delete
+            // through without the ingestion ever being deleted. So the
+            // precondition the delete documents is taken here too: the
+            // associated ingestion must be gone first. Re-stating the stored
+            // `tenantIdentifier` moves nothing, so it is not refused.
+            if tenant.tenant_identifier != stored_tenant {
+                if let Some(ingestion) = bundle.ingestion_for(&app, &stored_tenant) {
+                    return Err(UpdateAppAuthorizationErrorModeled::ValidationException(
+                        crate::state::associated_ingestion_still_held(
+                            &arn,
+                            &ingestion.arn,
+                            "change the tenant of",
+                        ),
                     )
                     .into());
                 }

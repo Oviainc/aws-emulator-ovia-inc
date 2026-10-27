@@ -224,16 +224,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The inline policies embedded in one group have a bounded aggregate size,
         // so a caller cannot grow a group's policy set without limit. A put of an
         // existing name replaces that document, so the one being replaced does not
-        // count toward the quota the new document has to fit inside.
+        // count toward the quota the new document has to fit inside, and every
+        // document is measured the one way a policy document is measured against a
+        // policy-size quota: by `crate::state::policy_document_characters`, which
+        // leaves whitespace out, so how a document is formatted does not decide
+        // whether it fits. The refusal reports the quota in the unit IAM words it
+        // with and names the group the request asked to embed into.
         let policy_key = crate::state::name_key(&input.policy_name);
-        let already_embedded = store.group_inline_policy_characters(&key, &policy_key);
-        let would_embed = already_embedded + input.policy_document.chars().count();
+        let embedded = store.group_inline_policy_size(&key, &policy_key);
+        let would_embed =
+            embedded.measured + crate::state::policy_document_characters(&input.policy_document);
         if would_embed > crate::state::MAX_GROUP_INLINE_POLICY_CHARACTERS {
             return Err(PutGroupPolicyErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
-                        "Maximum policy size of {} characters exceeded for group {}",
+                        "Maximum policy size of {} bytes exceeded for group {}",
                         crate::state::MAX_GROUP_INLINE_POLICY_CHARACTERS, input.group_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // That quota leaves whitespace out, so it does not bound the TEXT this group
+        // makes the store hold: a document that fits it may be formatted with any
+        // amount of whitespace, and every document is kept verbatim for the read to
+        // report. What one group can retain is therefore bounded here, before the
+        // insert below, by the ceiling `MAX_INLINE_POLICY_TEXT_CHARACTERS` carries.
+        let would_retain = embedded.retained + input.policy_document.chars().count();
+        if would_retain > crate::state::MAX_INLINE_POLICY_TEXT_CHARACTERS {
+            return Err(PutGroupPolicyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The inline policies of group {} cannot hold more than {} characters of \
+                         policy text in this emulator",
+                        input.group_name,
+                        crate::state::MAX_INLINE_POLICY_TEXT_CHARACTERS
                     )),
                 },
             )

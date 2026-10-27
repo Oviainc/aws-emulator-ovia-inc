@@ -418,7 +418,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         // The identity whose call writes the commit, which is the actor a pull
         // request reading from this branch attributes the source update to.
-        let actor = crate::state::caller_identity_arn(ctx.parts());
+        let actor = crate::state::caller_identity_arn(&*self.engine, ctx);
         // "If no name is specified, the user's ARN is used as the author name and
         // committer name" — the caller this request was signed by — and "if no email
         // address is specified, the email address is left blank".

@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // "You can only add or update a reaction for yourself": the reaction is
         // stored against the principal this request authenticates as.
-        let caller_arn = crate::state::caller_identity_arn(ctx.parts());
+        let caller_arn = crate::state::caller_identity_arn(&*self.engine, ctx);
 
         let comment_id = match crate::state::normalize_comment_id(&input.comment_id) {
             Ok(comment_id) => comment_id.to_string(),

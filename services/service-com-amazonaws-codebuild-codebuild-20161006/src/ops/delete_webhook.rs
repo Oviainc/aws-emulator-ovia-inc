@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ctx,
                 crate::state::AuditOutcome::NotFound,
                 &project_arn,
-                webhook_not_found(&project_arn),
+                webhook_not_found(),
             ));
         };
 
@@ -265,13 +265,11 @@ fn project_not_found(project_arn: &str) -> DeleteWebhookError {
 }
 
 /// The project is held but carries no webhook, so the resource this call names does not
-/// exist: AWS models that as `ResourceNotFoundException`, "the specified Amazon Web
-/// Services resource cannot be found".
-fn webhook_not_found(project_arn: &str) -> DeleteWebhookError {
+/// exist: AWS models that as `ResourceNotFoundException`, with the one fixed sentence
+/// [`crate::state::WEBHOOK_NOT_FOUND_MESSAGE`] holds.
+fn webhook_not_found() -> DeleteWebhookError {
     DeleteWebhookErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!(
-            "A webhook does not exist for CodeBuild project: {project_arn}"
-        )),
+        message: Some(crate::state::WEBHOOK_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

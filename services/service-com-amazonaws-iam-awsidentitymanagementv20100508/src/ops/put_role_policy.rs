@@ -252,16 +252,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The inline policies embedded in one role have a bounded aggregate size,
         // so a caller cannot grow a role's policy set without limit. A put of an
         // existing name replaces that document, so the one being replaced does not
-        // count toward the quota the new document has to fit inside.
+        // count toward the quota the new document has to fit inside, and every
+        // document is measured the one way a policy document is measured against a
+        // policy-size quota: by `crate::state::policy_document_characters`, which
+        // leaves whitespace out. The refusal reports the quota in the unit IAM words
+        // it with and names the role the request asked to embed into.
         let policy_key = crate::state::name_key(&input.policy_name);
-        let already_embedded = store.role_inline_policy_characters(&key, &policy_key);
-        let would_embed = already_embedded + input.policy_document.chars().count();
+        let embedded = store.role_inline_policy_size(&key, &policy_key);
+        let would_embed =
+            embedded.measured + crate::state::policy_document_characters(&input.policy_document);
         if would_embed > crate::state::MAX_ROLE_INLINE_POLICY_CHARACTERS {
             return Err(PutRolePolicyErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
-                        "Maximum policy size of {} characters exceeded for role {role_name}",
+                        "Maximum policy size of {} bytes exceeded for role {role_name}",
                         crate::state::MAX_ROLE_INLINE_POLICY_CHARACTERS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // That quota leaves whitespace out, so it does not bound the TEXT this role
+        // makes the store hold: a document that fits it may be formatted with any
+        // amount of whitespace, and every document is kept verbatim for the read to
+        // report. What one role can retain is therefore bounded here, before the
+        // insert below, by the ceiling `MAX_INLINE_POLICY_TEXT_CHARACTERS` carries.
+        let would_retain = embedded.retained + input.policy_document.chars().count();
+        if would_retain > crate::state::MAX_INLINE_POLICY_TEXT_CHARACTERS {
+            return Err(PutRolePolicyErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The inline policies of role {role_name} cannot hold more than {} \
+                         characters of policy text in this emulator",
+                        crate::state::MAX_INLINE_POLICY_TEXT_CHARACTERS
                     )),
                 },
             )

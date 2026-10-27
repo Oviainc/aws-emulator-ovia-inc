@@ -261,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         // A rule a CALLER creates on a pull request is attributed to that caller,
         // where one an associated template applied is attributed to the service.
-        let last_modified_user = crate::state::caller_identity_arn(ctx.parts());
+        let last_modified_user = crate::state::caller_identity_arn(&*self.engine, ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             // An unreachable store is an internal mounting fault, not a modelled

@@ -734,6 +734,134 @@ async fn a_replacement_document_that_is_not_saml_metadata_is_refused_and_changes
     }
 }
 
+/// RULE: a provider the account no longer holds is unreachable for WRITES exactly as it
+/// is for reads — an update naming a deleted provider's ARN answers the same
+/// `NoSuchEntity` (HTTP 404) and the same sentence `GetSAMLProvider` answers for it,
+/// whichever members the update supplies, and recreates nothing. Deleting a provider runs
+/// no cascading integrity check either: the role whose trust policy names it as its
+/// `Federated` principal keeps that document exactly as it was written.
+#[tokio::test]
+async fn updating_a_deleted_provider_is_refused_as_absent() {
+    let router = router();
+    let document = metadata_document(MetadataForm::Entity, FIXTURE_ENTITY_ID, None);
+
+    // Rows: which members the update supplies — the replacement document alone, the
+    // encryption mode alone, a key upload, a key removal, and every member at once — so
+    // the refusal is about the provider being gone rather than about what was asked for.
+    let supplied: Vec<(&str, Vec<(String, String)>)> = vec![
+        (
+            "the document alone",
+            vec![param("SAMLMetadataDocument", &document)],
+        ),
+        (
+            "the encryption mode alone",
+            vec![param("AssertionEncryptionMode", "Required")],
+        ),
+        (
+            "a key upload",
+            vec![param("AddPrivateKey", &private_key_material("deleted"))],
+        ),
+        (
+            "a key removal",
+            vec![param("RemovePrivateKey", &"A".repeat(32))],
+        ),
+        (
+            "every member at once",
+            vec![
+                param("SAMLMetadataDocument", &document),
+                param("AssertionEncryptionMode", "Allowed"),
+                param("AddPrivateKey", &private_key_material("deleted-all")),
+                param("RemovePrivateKey", &"B".repeat(32)),
+            ],
+        ),
+    ];
+
+    for (index, (what, members)) in supplied.iter().enumerate() {
+        let name = format!("DeletedIdP{index}");
+        let arn = create_provider(&router, &name, None, Some("Allowed"), true).await;
+
+        // A role that trusts the provider as its federated principal, written before the
+        // provider is deleted.
+        let role_name = format!("FederatedRole{index}");
+        let trust_policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"Federated":"{arn}"}},"Action":"sts:AssumeRoleWithSAML"}}]}}"#
+        );
+        let create_role = vec![
+            param("RoleName", &role_name),
+            param("AssumeRolePolicyDocument", &trust_policy),
+        ];
+        let (status, body) = call(&router, "CreateRole", &borrowed(&create_role)).await;
+        assert_eq!(
+            status, 200,
+            "case {what:?}: the fixture CreateRole must succeed, got {status}: {body}"
+        );
+
+        let (status, body) = call(
+            &router,
+            "DeleteSAMLProvider",
+            &[("SAMLProviderArn", &arn)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {what:?}: DeleteSAMLProvider must be served, got {status}: {body}"
+        );
+
+        // The sentence the READ answers for the deleted ARN, which the write must answer
+        // too: one absence, worded one way.
+        let expected_message = format!("Manifest not found for arn {arn}");
+        let (status, read) = call(&router, "GetSAMLProvider", &[("SAMLProviderArn", &arn)]).await;
+        assert_eq!(
+            status, 404,
+            "case {what:?}: a deleted provider must not be readable, got {status}: {read}"
+        );
+        assert_eq!(
+            element(&read, "Message"),
+            expected_message,
+            "case {what:?}: expected the read's absence wording, got {read}"
+        );
+
+        let mut params = vec![param("SAMLProviderArn", &arn)];
+        params.extend(members.iter().cloned());
+        let (status, body) = update_provider(&router, &params).await;
+        assert_eq!(
+            status, 404,
+            "case {what:?}: an update of a deleted provider must be refused, got {status}: \
+             {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "NoSuchEntity",
+            "case {what:?}: expected NoSuchEntity, got {body}"
+        );
+        assert_eq!(
+            element(&body, "Message"),
+            expected_message,
+            "case {what:?}: the write must answer the read's absence wording, got {body}"
+        );
+
+        // The refused update recreated nothing.
+        let (status, read) = call(&router, "GetSAMLProvider", &[("SAMLProviderArn", &arn)]).await;
+        assert_eq!(
+            status, 404,
+            "case {what:?}: a refused update must persist nothing, got {status}: {read}"
+        );
+
+        // The trust policy naming the deleted provider survives byte for byte.
+        let (status, role) = call(&router, "GetRole", &[("RoleName", &role_name)]).await;
+        assert_eq!(
+            status, 200,
+            "case {what:?}: GetRole must report the role, got {status}: {role}"
+        );
+        let reported_trust = element(&role, "AssumeRolePolicyDocument");
+        assert_eq!(
+            reported_trust, trust_policy,
+            "case {what:?}: deleting the provider must not touch the trust policy, got \
+             {reported_trust:?}"
+        );
+    }
+}
+
 /// `RemovePrivateKey` naming a key id the provider holds no key under is `NoSuchEntity`
 /// (HTTP 404), and nothing else the request carried lands.
 #[tokio::test]
