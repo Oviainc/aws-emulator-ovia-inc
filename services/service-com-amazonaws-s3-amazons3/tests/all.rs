@@ -35,6 +35,8 @@ mod bucket_encryption;
 mod bucket_intelligent_tiering;
 #[path = "all/bucket_inventory_configuration.rs"]
 mod bucket_inventory_configuration;
+#[path = "all/bucket_inventory_configuration_deletion.rs"]
+mod bucket_inventory_configuration_deletion;
 #[path = "all/bucket_inventory_configuration_listing.rs"]
 mod bucket_inventory_configuration_listing;
 #[path = "all/bucket_lifecycle.rs"]
