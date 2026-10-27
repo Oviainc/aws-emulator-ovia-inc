@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CompleteWebAuthnRegistration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CompleteWebAuthnRegistration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CompleteWebAuthnRegistration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The passkey registration a signed-in user COMPLETES: the response the user's passkey
+//! provider produced is resolved against the registration
+//! [`crate::ops::start_web_authn_registration`] stored, by the challenge the response's
+//! collected client data carries, and a response that verifies registers one passkey
+//! credential to the STORED user — its credential id, the transports and attachment the
+//! authenticator reported, and the relying party the registration was started under.
+//! Completing a registration consumes its challenge, so one registration registers one
+//! passkey.
 //!
 //! ## Shape of an operation
 //!
@@ -179,20 +178,505 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CompleteWebAuthnRegistration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CompleteWebAuthnRegistrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CompleteWebAuthnRegistration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+        // The access token's lifetime and the registration's window are both read
+        // against the clock, and the credential this call registers is created at
+        // that same instant.
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+
+        // The token is the only subject this call carries, so the pool, the user
+        // and the passkeys already registered to it all come from the store.
+        let (user_pool_id, username, pool_relying_party_id, registered) = {
+            let (pool, user) = guard
+                .signed_in_user(&input.access_token, now)
+                .map_err(token_rejected)?;
+
+            // A pool that does not admit the passkey factor has not enabled the
+            // feature, so it registers no passkey — whatever was started while it
+            // did.
+            if !pool.allows_first_auth_factor(crate::state::WEB_AUTHN_AUTH_FACTOR) {
+                return Err(web_authn_not_enabled());
+            }
+            (
+                pool.id.clone(),
+                user.username.clone(),
+                pool.relying_party_id(),
+                user.web_authn_credentials.len(),
+            )
+        };
+
+        // The app client the token was issued to, which the started registration
+        // recorded: the token resolved a signed-in user just above, so its record
+        // is stored.
+        let client_id = guard
+            .token(&input.access_token)
+            .map(|record| record.client_id.clone())
+            .ok_or_else(|| not_authorized(INVALID_ACCESS_TOKEN))?;
+
+        // What the passkey provider reported, read out of the presented
+        // registration response once the token has named the user it registers a
+        // passkey for.
+        let presented = PresentedCredential::read(&input.credential)?;
+
+        // The challenge the collected client data carries is what names the
+        // registration this response completes. One this emulator never handed
+        // out, one the clock has taken past its window, and one started for
+        // another user all resolve no registration for this caller.
+        let registration = match guard.web_authn_registration(&presented.challenge, now) {
+            Some(registration)
+                if registration.user_pool_id == user_pool_id
+                    && registration.username == username =>
+            {
+                registration.clone()
+            }
+            Some(_) | None => {
+                // Only a registration the clock has taken past its own window is
+                // an EXPIRED one; one this emulator is not holding, and one held
+                // for another user, were never this caller's to answer.
+                let expired = guard
+                    .web_authn_registrations
+                    .get(&presented.challenge)
+                    .is_some_and(|stored| stored.expires_at <= now);
+                return Err(challenge_not_found(expired));
+            }
+        };
+
+        // "This exception is thrown when the access token is for a different
+        // client than the one in the original StartWebAuthnRegistration request"
+        // (`WebAuthnClientMismatchException` in this service's model).
+        if registration.client_id != client_id {
+            return Err(client_mismatch());
+        }
+
+        // A passkey is registered to the relying party the creation options named,
+        // so the pool's relying party has to still BE that one: a pool whose
+        // relying party id changed — or which no longer names one at all — would
+        // otherwise hold a credential registered to a different relying party than
+        // its own.
+        if pool_relying_party_id.as_deref() != Some(registration.relying_party_id.as_str()) {
+            return Err(relying_party_mismatch(
+                &registration.relying_party_id,
+                pool_relying_party_id.as_deref(),
+            ));
+        }
+
+        // "Verify that the value of C.origin is an origin expected by the Relying
+        // Party" (W3C Web Authentication Level 2 §7.1, step 9): the registration
+        // origin's host is the relying party id itself or a subdomain of it.
+        if !origin_matches_relying_party(&presented.origin, &registration.relying_party_id) {
+            return Err(origin_not_allowed(
+                &presented.origin,
+                &registration.relying_party_id,
+            ));
+        }
+
+        // One user holds a bounded number of passkeys, so a response that would
+        // take it past the bound registers nothing.
+        if registered >= crate::state::MAX_WEB_AUTHN_CREDENTIALS_PER_USER {
+            return Err(limit_exceeded(format!(
+                "User {username} holds at most {} passkey credentials.",
+                crate::state::MAX_WEB_AUTHN_CREDENTIALS_PER_USER
+            )));
+        }
+
+        // "If credential.id is already registered to any user, the Relying Party
+        // SHOULD fail this registration ceremony" (W3C Web Authentication Level 2
+        // §7.1, step 27): a credential id identifies ONE passkey, so registering
+        // it twice would leave two entries no later call could tell apart.
+        if guard
+            .pool(&user_pool_id)
+            .and_then(|pool| pool.user(&username))
+            .is_some_and(|user| user.holds_web_authn_credential(&presented.credential_id))
+        {
+            return Err(credential_already_registered(&presented.credential_id));
+        }
+
+        // Completing the registration is what CONSUMES the challenge: a second
+        // response to the same challenge resolves nothing, so one registration
+        // registers one passkey. A refused response leaves the registration
+        // answerable until the clock expires it.
+        guard.end_web_authn_registration(&presented.challenge);
+
+        let credential = crate::state::WebAuthnCredential {
+            credential_id: presented.credential_id,
+            // `FriendlyCredentialName` is "an automatically-generated friendly
+            // name for the passkey credential" (this service's model). Nothing in
+            // a registration response names the provider the passkey lives in —
+            // the authenticator's own identity travels in an attestation
+            // statement, which these creation options ask for none of
+            // (`attestation: "none"`) — so the name generated here is the relying
+            // party the passkey was registered under, which is what identifies a
+            // passkey to the user holding it.
+            friendly_credential_name: registration.relying_party_id.clone(),
+            relying_party_id: registration.relying_party_id,
+            authenticator_attachment: presented.authenticator_attachment,
+            authenticator_transports: presented.transports,
+            created_at: now,
+        };
+        guard
+            .pool_mut(&user_pool_id)
+            .and_then(|pool| pool.user_mut(&username))
+            .ok_or_else(internal_error)?
+            .register_web_authn_credential(credential);
+
+        Ok(CompleteWebAuthnRegistrationOutput {})
     }
+}
+
+/// The only `PublicKeyCredentialType` the Web Authentication API defines, which
+/// a registration response reports as its `type` (W3C Web Authentication Level 2
+/// §5.10.3, `PublicKeyCredentialType`: "public-key").
+const PUBLIC_KEY_CREDENTIAL_TYPE: &str = "public-key";
+
+/// The `CollectedClientData.type` of a REGISTRATION ceremony: the string
+/// `webauthn.create`, which client data carries "when creating new credentials"
+/// (W3C Web Authentication Level 2 §5.8.1) and step 7 of §7.1 verifies.
+const CLIENT_DATA_CREATE_TYPE: &str = "webauthn.create";
+
+/// What the presented `RegistrationResponseJSON` reports, read out of the
+/// modelled `Document` the `Credential` member carries: "a
+/// RegistrationResponseJSON public-key credential response from the user's
+/// passkey provider" (this service's model).
+struct PresentedCredential {
+    /// `PublicKeyCredential.id`, "the credential ID, chosen by the
+    /// authenticator" (W3C Web Authentication Level 2 §5.1), base64url as its
+    /// JSON form carries it.
+    credential_id: String,
+    /// The `challenge` of the collected client data the authenticator signed
+    /// over, which names the registration this response completes.
+    challenge: String,
+    /// The `origin` of the collected client data: "the fully qualified origin of
+    /// the requester" (§5.8.1).
+    origin: String,
+    /// `PublicKeyCredential.authenticatorAttachment`, when the response reports
+    /// one: "the general category of the passkey authenticator"
+    /// (`WebAuthnCredentialDescription.AuthenticatorAttachment`).
+    authenticator_attachment: Option<String>,
+    /// `AuthenticatorAttestationResponseJSON.transports`, the transports the
+    /// authenticator reported, in the order it reported them.
+    transports: Vec<String>,
+}
+
+impl PresentedCredential {
+    /// Read `credential` as a registration response, refusing one this service
+    /// cannot register a passkey from.
+    fn read(
+        credential: &::aws_smithy_types::Document,
+    ) -> Result<Self, CompleteWebAuthnRegistrationError> {
+        match text(member(credential, "type")) {
+            Some(PUBLIC_KEY_CREDENTIAL_TYPE) => {}
+            // A response reporting any other credential type comes from a
+            // provider whose credentials are not passkeys: the exception "is
+            // thrown when a user presents passkey credentials from an unsupported
+            // device or provider" (this service's model).
+            Some(reported) => return Err(credential_not_supported(reported)),
+            None => return Err(missing_member("type")),
+        }
+        // `PublicKeyCredential.id` is "the base64url encoding of
+        // PublicKeyCredential's rawId" (W3C Web Authentication Level 2 §5.1), so
+        // the two carry the same credential id in the JSON form and either names
+        // it.
+        let credential_id = text(member(credential, "id"))
+            .or_else(|| text(member(credential, "rawId")))
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| missing_member("id"))?
+            .to_string();
+        let response = member(credential, "response").ok_or_else(|| missing_member("response"))?;
+        let client_data_json = text(member(response, "clientDataJSON"))
+            .ok_or_else(|| missing_member("response.clientDataJSON"))?;
+        // "Let JSONtext be the result of running UTF-8 decode on the value of
+        // response.clientDataJSON" and "let C ... be the result of running an
+        // implementation-specific JSON parser on JSONtext" (W3C Web
+        // Authentication Level 2 §7.1, steps 5 and 6); the JSON form of the
+        // response carries those bytes base64url.
+        let client_data = crate::state::base64_url_decode(client_data_json)
+            .and_then(|bytes| ::serde_json::from_slice::<::serde_json::Value>(&bytes).ok())
+            .ok_or_else(|| unreadable_member("response.clientDataJSON"))?;
+        match client_data.get("type").and_then(::serde_json::Value::as_str) {
+            Some(CLIENT_DATA_CREATE_TYPE) => {}
+            // Client data collected for any other ceremony is not a registration
+            // response, whatever else it carries.
+            Some(_) | None => return Err(not_a_registration_ceremony()),
+        }
+        let challenge = client_data
+            .get("challenge")
+            .and_then(::serde_json::Value::as_str)
+            .filter(|challenge| !challenge.is_empty())
+            .ok_or_else(|| missing_member("response.clientDataJSON.challenge"))?
+            .to_string();
+        let origin = client_data
+            .get("origin")
+            .and_then(::serde_json::Value::as_str)
+            .filter(|origin| !origin.is_empty())
+            .ok_or_else(|| missing_member("response.clientDataJSON.origin"))?
+            .to_string();
+        Ok(Self {
+            credential_id,
+            challenge,
+            origin,
+            authenticator_attachment: text(member(credential, "authenticatorAttachment"))
+                .filter(|attachment| !attachment.is_empty())
+                .map(str::to_string),
+            transports: string_list(member(response, "transports")),
+        })
+    }
+}
+
+/// The member `name` of `document`, when `document` is an object that has one.
+fn member<'a>(
+    document: &'a ::aws_smithy_types::Document,
+    name: &str,
+) -> Option<&'a ::aws_smithy_types::Document> {
+    match document {
+        ::aws_smithy_types::Document::Object(members) => members.get(name),
+        _ => None,
+    }
+}
+
+/// The string `document` carries, when it is one.
+fn text(document: Option<&::aws_smithy_types::Document>) -> Option<&str> {
+    match document? {
+        ::aws_smithy_types::Document::String(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+/// The strings `document` carries as a list, in the order it carries them;
+/// empty for a document that is no list of strings.
+fn string_list(document: Option<&::aws_smithy_types::Document>) -> Vec<String> {
+    match document {
+        Some(::aws_smithy_types::Document::Array(items)) => items
+            .iter()
+            .filter_map(|item| text(Some(item)))
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a registration `origin` belongs to the relying party
+/// `relying_party_id`: its host is that id or a subdomain of it, as a relying
+/// party id "must be a registrable domain suffix of, or be equal to, the
+/// caller's origin's effective domain" (W3C Web Authentication Level 2 §5.1.3).
+///
+/// The scheme, the port and anything after the host are not part of the
+/// comparison: an origin is serialized `scheme://host[:port]` (RFC 6454 §6.2),
+/// and a relying party id is a DOMAIN (§5.1.3), so only the origin's host can
+/// be compared with one. A host that is no domain at all — an address literal —
+/// is a registrable domain suffix of nothing, so it matches no relying party.
+fn origin_matches_relying_party(origin: &str, relying_party_id: &str) -> bool {
+    let host = origin_host(origin);
+    host == relying_party_id || host.ends_with(&format!(".{relying_party_id}"))
+}
+
+/// The host of the serialized `origin`: what is left once its scheme, its port
+/// and any path are dropped.
+fn origin_host(origin: &str) -> &str {
+    let without_scheme = origin
+        .split_once("://")
+        .map_or(origin, |(_, remainder)| remainder);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    // An IPv6 host is bracketed (`[::1]`, RFC 3986 §3.2.2), so the colons of the
+    // address itself are inside the brackets: what is dropped here is a PORT,
+    // which is a run of digits, and a colon followed by anything else is part of
+    // the host.
+    match host.rsplit_once(':') {
+        Some((before_port, port))
+            if !port.is_empty() && port.chars().all(|digit| digit.is_ascii_digit()) =>
+        {
+            before_port
+        }
+        _ => host,
+    }
+}
+
+/// The message a token this emulator cannot resolve to a signed-in user is
+/// refused with.
+const INVALID_ACCESS_TOKEN: &str = "Invalid Access Token";
+
+/// This operation's answer to an `AccessToken` that names no signed-in user.
+///
+/// Every rejection of the token itself answers `NotAuthorizedException`, which
+/// "is thrown when a user isn't authorized" (this service's model); this
+/// operation models no error for a pool or user that is gone, so a token naming
+/// a deleted one is refused as the token it is.
+fn token_rejected(rejection: crate::state::TokenRejection) -> CompleteWebAuthnRegistrationError {
+    match rejection {
+        crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::MissingRequiredScopes => {
+            not_authorized(crate::state::MISSING_REQUIRED_SCOPES_MESSAGE)
+        }
+        crate::state::TokenRejection::NotAnAccessToken
+        | crate::state::TokenRejection::PoolGone
+        | crate::state::TokenRejection::UserGone => not_authorized(INVALID_ACCESS_TOKEN),
+    }
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> CompleteWebAuthnRegistrationError {
+    CompleteWebAuthnRegistrationErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The refusal for a pool that does not offer passkeys at all: the exception "is
+/// thrown when the passkey feature isn't enabled for the user pool" (this
+/// service's model).
+fn web_authn_not_enabled() -> CompleteWebAuthnRegistrationError {
+    CompleteWebAuthnRegistrationErrorModeled::WebAuthnNotEnabledException(
+        WebAuthnNotEnabledException {
+            message: Some("WebAuthn is not enabled for this user pool.".to_string()),
+        },
+    )
+    .into()
+}
+
+/// The refusal for a response whose challenge names no registration this caller
+/// can complete: `expired` tells a challenge this emulator handed out and the
+/// clock has since taken past its window from one it is not holding at all.
+fn challenge_not_found(expired: bool) -> CompleteWebAuthnRegistrationError {
+    CompleteWebAuthnRegistrationErrorModeled::WebAuthnChallengeNotFoundException(
+        WebAuthnChallengeNotFoundException {
+            message: Some(
+                if expired {
+                    "The challenge from StartWebAuthnRegistration has expired."
+                } else {
+                    "The challenge from StartWebAuthnRegistration was not found."
+                }
+                .to_string(),
+            ),
+        },
+    )
+    .into()
+}
+
+/// The refusal for a response presented with an access token of another app
+/// client than the one the registration was started on.
+fn client_mismatch() -> CompleteWebAuthnRegistrationError {
+    CompleteWebAuthnRegistrationErrorModeled::WebAuthnClientMismatchException(
+        WebAuthnClientMismatchException {
+            message: Some(
+                "The access token is for a different client than the one in the original \
+                 StartWebAuthnRegistration request."
+                    .to_string(),
+            ),
+        },
+    )
+    .into()
+}
+
+/// The refusal for a registration whose relying party is no longer the pool's.
+fn relying_party_mismatch(
+    registered_under: &str,
+    pool_relying_party_id: Option<&str>,
+) -> CompleteWebAuthnRegistrationError {
+    let pool_relying_party_id = pool_relying_party_id.unwrap_or("none");
+    CompleteWebAuthnRegistrationErrorModeled::WebAuthnRelyingPartyMismatchException(
+        WebAuthnRelyingPartyMismatchException {
+            message: Some(format!(
+                "The passkey credential is associated with relying party ID \
+                 {registered_under}, which is not the user pool relying party ID \
+                 {pool_relying_party_id}."
+            )),
+        },
+    )
+    .into()
+}
+
+/// The refusal for a registration origin that is not the relying party's: the
+/// exception "is thrown when the passkey credential's registration origin does
+/// not align with the user pool relying party id" (this service's model).
+fn origin_not_allowed(origin: &str, relying_party_id: &str) -> CompleteWebAuthnRegistrationError {
+    CompleteWebAuthnRegistrationErrorModeled::WebAuthnOriginNotAllowedException(
+        WebAuthnOriginNotAllowedException {
+            message: Some(format!(
+                "The registration origin {origin} does not align with the user pool \
+                 relying party ID {relying_party_id}."
+            )),
+        },
+    )
+    .into()
+}
+
+/// The refusal for a credential whose reported type is not a passkey's.
+fn credential_not_supported(reported: &str) -> CompleteWebAuthnRegistrationError {
+    CompleteWebAuthnRegistrationErrorModeled::WebAuthnCredentialNotSupportedException(
+        WebAuthnCredentialNotSupportedException {
+            message: Some(format!(
+                "Credentials of type {reported} are not supported; a passkey credential is of \
+                 type {PUBLIC_KEY_CREDENTIAL_TYPE}."
+            )),
+        },
+    )
+    .into()
+}
+
+/// This operation's `LimitExceededException` for a user already holding every
+/// passkey one user may hold.
+fn limit_exceeded(message: String) -> CompleteWebAuthnRegistrationError {
+    CompleteWebAuthnRegistrationErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The refusal for a `Credential` document missing the member `name`.
+fn missing_member(name: &str) -> CompleteWebAuthnRegistrationError {
+    invalid_parameter(format!(
+        "Credential does not carry the required member {name}."
+    ))
+}
+
+/// The refusal for a `Credential` member that carries no value this service can
+/// read.
+fn unreadable_member(name: &str) -> CompleteWebAuthnRegistrationError {
+    invalid_parameter(format!(
+        "Credential member {name} is not base64url-encoded JSON."
+    ))
+}
+
+/// The refusal for client data collected for another ceremony than a passkey
+/// registration.
+fn not_a_registration_ceremony() -> CompleteWebAuthnRegistrationError {
+    invalid_parameter(format!(
+        "Credential member response.clientDataJSON must carry type \
+         {CLIENT_DATA_CREATE_TYPE}."
+    ))
+}
+
+/// The refusal for a credential id this user already holds a passkey under.
+fn credential_already_registered(credential_id: &str) -> CompleteWebAuthnRegistrationError {
+    invalid_parameter(format!(
+        "A passkey credential with ID {credential_id} is already registered."
+    ))
+}
+
+/// This operation's `InvalidParameterException`, which "is thrown when the
+/// Amazon Cognito service encounters an invalid parameter" (this service's
+/// model), carrying `message`.
+fn invalid_parameter(message: String) -> CompleteWebAuthnRegistrationError {
+    CompleteWebAuthnRegistrationErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> CompleteWebAuthnRegistrationError {
+    CompleteWebAuthnRegistrationErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
