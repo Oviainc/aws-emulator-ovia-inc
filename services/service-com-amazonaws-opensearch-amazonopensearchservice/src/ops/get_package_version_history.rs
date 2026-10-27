@@ -190,7 +190,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The ONLY write this report makes, and it writes only what the clock already
+        // owed a record at this instant had nobody called: a package whose copy has
+        // fallen due is reported in the status it is then in, and one whose deletion has
+        // fallen due is no longer a package of this account at all.
+        store.settle_packages(now);
 
         // "The unique identifier of the package": the history belongs to the package
         // the request names, so an id this account holds no package under names no
