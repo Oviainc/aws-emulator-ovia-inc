@@ -87,11 +87,6 @@ use crate::state::JobRunEntry;
 /// page size for a request that names none.
 const MAX_PAGE_SIZE: i32 = 200;
 
-/// How many digits the instant part of a continuation token is padded to, so the token
-/// orders the same way as a string as the instant it names orders as a number. Twenty
-/// digits hold any nanosecond count this clock can report.
-const CURSOR_INSTANT_DIGITS: usize = 20;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -242,19 +237,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// One run's place in this listing, as the continuation token renders it: the instant the
-/// run started, zero-padded so the string orders as the number does, then the run's id to
-/// separate two runs started in the same nanosecond.
+/// One run's place in this listing, as the continuation token renders it: the shared
+/// history cursor ([`crate::state::history_page_cursor`]) over the instant this run
+/// started and its own id.
 ///
 /// Ordering runs by this key DESCENDING is the newest-first order the operation documents,
 /// and comparing a token against it is what resumes a page — so any string a request sends
 /// names a well-defined place in that order, the way a table listing's name-keyed token
 /// does.
 fn page_cursor(run: &JobRunEntry) -> String {
-    let started_on = run
-        .started_on
-        .duration_since(::std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{started_on:0CURSOR_INSTANT_DIGITS$}:{}", run.id)
+    crate::state::history_page_cursor(run.started_on, &run.id)
 }
