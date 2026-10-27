@@ -15,6 +15,8 @@
 mod account_health;
 #[path = "all/account_overview.rs"]
 mod account_overview;
+#[path = "all/anomalies_for_insight.rs"]
+mod anomalies_for_insight;
 #[path = "all/anomalous_log_groups.rs"]
 mod anomalous_log_groups;
 #[path = "all/anomaly_reads.rs"]
