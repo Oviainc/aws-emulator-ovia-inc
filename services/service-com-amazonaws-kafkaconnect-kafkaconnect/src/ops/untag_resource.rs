@@ -173,6 +173,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle_due();
 
+        // A value that is not a kafkaconnect ARN at all names none of this
+        // service's taggable resources, so it is incorrect input rather than a
+        // resource that is absent: the modelled 400, blaming the member that
+        // carried it. Refused before any tag is removed.
+        if let Some(message) = crate::state::arn_syntax_refusal(
+            "resourceArn",
+            &input.resource_arn,
+            crate::state::ARN_SERVICE,
+        ) {
+            return Err(UntagResourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into());
+        }
+
         // The same ARN-keyed seam `TagResource` and `ListTagsForResource` use, so
         // an untag is applied to the one stored tag map a later read answers
         // from, and only within the region this call was signed for. Per key:

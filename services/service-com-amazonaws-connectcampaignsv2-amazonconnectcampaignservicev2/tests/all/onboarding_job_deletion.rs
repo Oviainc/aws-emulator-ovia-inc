@@ -24,14 +24,17 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::sta
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router};
+use super::common::{call, error_code, router, Harness};
 
 /// The region every case here signs for; nothing in the onboarding record is
 /// region-dependent, so one is enough.
 const REGION: &str = "us-east-1";
 
-/// `StartInstanceOnboardingJob` for `instance_id`, with the service's own key.
-async fn start(router: &MultiServiceRouter, instance_id: &str) -> (u16, Value) {
+/// `StartInstanceOnboardingJob` for `instance_id`, with the service's own key — on an
+/// instance registered in the account's Connect registry first, since onboarding
+/// resolves the `connectInstanceId` against it.
+async fn start(router: &Harness, instance_id: &str) -> (u16, Value) {
+    router.register_connect_instance(REGION, instance_id);
     call(
         router,
         REGION,

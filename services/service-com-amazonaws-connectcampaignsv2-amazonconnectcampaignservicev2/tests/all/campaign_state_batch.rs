@@ -22,11 +22,12 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
 // One harness per crate: the routing header, the router under test and the
 // request/response plumbing live in `tests/all/common.rs`.
-use super::common::{call, campaign_state, create_campaign, drive_lifecycle, error_code, router};
+use super::common::{
+    call, campaign_state, create_campaign, drive_lifecycle, error_code, router, Harness,
+};
 
 /// The `GetCampaignStateBatchFailureCode` a requested id that names no campaign is
 /// reported with. Source: the model's own `GetCampaignStateBatchFailureCode` catalog
@@ -106,7 +107,7 @@ fn closed_window() -> Value {
 /// Create every fixture campaign on `instance` and drive it to its state, returning
 /// the minted id of each by fixture key.
 async fn create_fixtures(
-    router: &MultiServiceRouter,
+    router: &Harness,
     region: &str,
     instance: &str,
 ) -> BTreeMap<&'static str, String> {
@@ -141,7 +142,7 @@ fn fixture_state(key: &str) -> &'static str {
 
 /// Drive one `GetCampaignStateBatch` for `ids`.
 async fn get_state_batch(
-    router: &MultiServiceRouter,
+    router: &Harness,
     region: &str,
     ids: &[String],
 ) -> (u16, Value) {

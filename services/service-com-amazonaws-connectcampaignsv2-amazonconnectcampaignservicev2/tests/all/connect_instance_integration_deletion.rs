@@ -321,6 +321,7 @@ async fn only_an_onboarded_instance_has_an_integration_to_delete() {
 
     // An instance whose onboarding job has only just started has not finished
     // onboarding, so it holds no integration to delete yet.
+    router.register_connect_instance(REGION, "in-progress-instance");
     let (status, body) = call(
         &router,
         REGION,
@@ -391,6 +392,7 @@ async fn only_an_onboarded_instance_has_an_integration_to_delete() {
     // An instance that was onboarded, then had its onboarding job deleted while it is
     // still in progress, is not onboarded again: the delete there is not found.
     let in_progress = "restarted-instance";
+    router.register_connect_instance(REGION, in_progress);
     let (status, body) = call(
         &router,
         REGION,

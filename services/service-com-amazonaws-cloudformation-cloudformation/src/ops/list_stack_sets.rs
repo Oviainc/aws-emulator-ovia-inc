@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStackSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStackSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStackSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the StackSets the administrator account holds in the Region the
+//! request was signed for: one `StackSetSummary` per stored StackSet, in creation order,
+//! every member read off the stored record, narrowed to the `Status` the request names
+//! when it names one, and one bounded page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +85,39 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::stack_sets::StoredStackSet;
+
+/// One stored StackSet as the modelled `StackSetSummary`.
+///
+/// Every member is read off the StackSet record, and the drift members off the same
+/// aggregate `DescribeStackSet` reports as `StackSetDriftDetectionDetails`
+/// ([`crate::state::stack_sets::drift_detection_details`]), so this read cannot disagree
+/// with that one about a StackSet's name, id, description, status, deployment settings or
+/// drift. A member the record does not carry — the description of a StackSet created
+/// without one, the automatic deployment of one whose request named none, the drift-check
+/// instant of one no detection has run against — is absent rather than reported empty.
+fn stack_set_summary(stored: &StoredStackSet) -> StackSetSummary {
+    let drift = crate::state::stack_sets::drift_detection_details(stored);
+    StackSetSummary {
+        stack_set_name: Some(stored.stack_set_name.clone()),
+        stack_set_id: Some(stored.stack_set_id.clone()),
+        description: stored.description.clone(),
+        status: Some(stored.status.clone()),
+        auto_deployment: stored.auto_deployment.as_ref().map(|auto_deployment| {
+            AutoDeployment {
+                enabled: auto_deployment.enabled,
+                retain_stacks_on_account_removal: auto_deployment.retain_stacks_on_account_removal,
+                depends_on: crate::state::non_empty(auto_deployment.depends_on.clone()),
+            }
+        }),
+        permission_model: Some(stored.permission_model.clone()),
+        drift_status: drift.drift_status,
+        last_drift_check_timestamp: drift.last_drift_check_timestamp,
+        managed_execution: Some(ManagedExecution {
+            active: Some(stored.managed_execution_active),
+        }),
+    }
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,18 +186,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStackSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStackSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStackSets"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no StackSet store to read, so this
+            // answers 501 rather than an empty, truthful-looking list.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListStackSets",
+            ));
+        };
+
+        // `CallAs` chooses which administrator account the call is made from — the
+        // management account itself or a delegated administrator in a member account. This
+        // emulator holds one administrator account's StackSets, so either value reads the
+        // same store, and the operation models no error to refuse one with.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Reporting operation: the only write is materialising a status transition the clock
+        // had already made due — the conclusion of an operation still in flight, which was
+        // owed at that instant whether or not anyone called.
+        store.settle(::std::time::SystemTime::now());
+
+        // "Returns summary information about StackSets that are associated with the user" —
+        // the StackSets of the administrator account in the Region the request was signed
+        // for, in the order they were created, since this service reports the collections it
+        // holds in the order their records entered the store. "The status of the StackSets
+        // that you want to get summary information about" narrows that set to one
+        // `StackSetStatus` when the request names one, and a Region holding none answers the
+        // empty list.
+        let summaries: Vec<StackSetSummary> = store
+            .stack_sets_in(&region)
+            .filter(|stack_set| {
+                input
+                    .status
+                    .as_ref()
+                    .is_none_or(|status| &stack_set.status == status)
+            })
+            .map(stack_set_summary)
+            .collect();
+
+        // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Summaries,
+        // pageSize: MaxResults)`: one response carries at most the `MaxResults` the request
+        // asks for, and the token resumes just past that page. The cursor counts into this
+        // Region's StackSets, as every paginated read of this service counts into the
+        // collection it answers.
+        let max_results = input.max_results.and_then(|max| usize::try_from(max).ok());
+        let (summaries, next_token) = crate::state::paginate_at_most(
+            crate::state::PageOf::StackSetSummaries,
+            summaries,
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+
+        Ok(ListStackSetsOutput {
+            // Always present, as an empty element for a Region holding no StackSet: a
+            // client reading the list sees the same shape either way.
+            summaries: Some(summaries),
+            next_token,
+        })
     }
 }

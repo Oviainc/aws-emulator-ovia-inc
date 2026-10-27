@@ -172,14 +172,6 @@ pub(crate) fn expire_session(harness: &Harness, session_arn: &str, expiration: S
     session.expiration_time = expiration;
 }
 
-/// Force a stored team's pending deletion window to have already elapsed.
-fn expire_deletion_window(harness: &Harness, team_arn: &str) {
-    let store = state::service_state(&*harness.engine).expect("the service store");
-    let mut guard = store.lock();
-    let team = guard.team_mut(team_arn).expect("a stored team to expire");
-    team.deletion_completion_time = Some(SystemTime::now() - Duration::from_secs(1));
-}
-
 /// A team made ACTIVE: created, then the clock-owed invitation responses waited out.
 pub(crate) async fn active_team(
     harness: &Harness,
@@ -885,8 +877,9 @@ async fn a_baseline_request_the_team_cannot_answer_is_refused() {
     );
 }
 
-/// A session cannot outlive the team it asks: once the team's pending deletion window has
-/// elapsed and the team is gone, its sessions answer the same 404 the team does.
+/// A session cannot outlive the team it asks: once the team has approved its deletion and
+/// the pending window has elapsed, the team is gone and its sessions answer the same 404
+/// the team does.
 #[tokio::test]
 async fn a_session_of_a_removed_team_is_not_found() {
     let harness = Harness::new();
@@ -899,7 +892,7 @@ async fn a_session_of_a_removed_team_is_not_found() {
         .start_deletion(&team_arn, Some(json!({ "PendingWindowDays": 7 })))
         .await;
     assert_eq!(status, 200, "start_deletion must be accepted for an ACTIVE team");
-    expire_deletion_window(&harness, &team_arn);
+    harness.expire_deletion_window(&team_arn);
 
     let (status, body) = get_session(&harness, &session_arn).await;
     assert_eq!(

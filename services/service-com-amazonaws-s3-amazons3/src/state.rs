@@ -5496,6 +5496,21 @@ impl Bucket {
         self.inventory_configurations.get(id)
     }
 
+    /// Every S3 Inventory configuration the bucket carries, in ascending id order — empty
+    /// for a bucket that carries none.
+    ///
+    /// The order is the store's own (a `BTreeMap` of ids), the reading
+    /// [`Self::analytics_configurations`] gives: two listings of an unchanged bucket report
+    /// the same sequence and a page can resume at the next id. The stored containers
+    /// themselves, so a listing reports what the puts recorded.
+    pub fn inventory_configurations(
+        &self,
+    ) -> impl Iterator<Item = (&str, &crate::ops::types::InventoryConfiguration)> + '_ {
+        self.inventory_configurations
+            .iter()
+            .map(|(id, configuration)| (id.as_str(), configuration))
+    }
+
     /// Associate `configuration` with the bucket under `id`, and report what that did.
     ///
     /// Per-ID and a full replacement of that id alone: a put "adds an S3 Inventory

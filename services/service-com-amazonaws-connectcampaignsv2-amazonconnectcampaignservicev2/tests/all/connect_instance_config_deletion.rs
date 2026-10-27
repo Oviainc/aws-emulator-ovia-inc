@@ -30,7 +30,7 @@ use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::ops
 use service_com_amazonaws_connectcampaignsv2_amazonconnectcampaignservicev2::state::ONBOARDING_JOB_DURATION;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, error_code, router};
+use super::common::{call, error_code, router, Harness};
 
 /// The region every case here signs for; nothing in an instance configuration is
 /// region-dependent — the ARNs it holds are the caller's — so one is enough.
@@ -41,8 +41,11 @@ const REGION: &str = "us-east-1";
 /// and is a campaign target, only after its job has finished. Nothing in the emulator
 /// sleeps for the transition — the record stores the due instant — so a case only has
 /// to let the clock pass it.
-async fn onboard_all(router: &MultiServiceRouter, instances: &[&str]) {
+async fn onboard_all(router: &Harness, instances: &[&str]) {
     for instance in instances {
+        // Onboarding resolves the `connectInstanceId` against the account's Connect
+        // instance registry, so each instance is registered there first.
+        router.register_connect_instance(REGION, instance);
         let (status, body) = call(
             router,
             REGION,
@@ -410,6 +413,7 @@ async fn an_instance_with_no_configuration_has_none_to_delete() {
     // An instance whose onboarding job has only just started has no configuration yet:
     // no wait here, so the job is still in progress when the delete runs.
     let in_progress = "in-progress-instance";
+    router.register_connect_instance(REGION, in_progress);
     let (status, body) = call(
         &router,
         REGION,

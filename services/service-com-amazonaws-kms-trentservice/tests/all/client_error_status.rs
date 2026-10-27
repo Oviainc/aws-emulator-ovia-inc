@@ -346,7 +346,6 @@ async fn a_scaffolded_operation_still_answers_501() {
             "GenerateDataKeyPair",
             json!({"KeyId": key_id, "KeyPairSpec": "RSA_2048"}),
         ),
-        ("GenerateRandom", json!({"NumberOfBytes": 32})),
     ];
     for (operation, body) in cases {
         let (status, payload) = call(&router, REGION, operation, &body).await;
