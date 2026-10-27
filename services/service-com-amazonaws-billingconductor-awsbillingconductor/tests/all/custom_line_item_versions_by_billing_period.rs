@@ -362,19 +362,23 @@ struct Row {
 #[tokio::test]
 async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
     let filter = line_item_filter("SERVICE", "EQUAL", "AWSCostExplorer");
+    // Every write here is applied from one of the two periods this operation may act in —
+    // the current one ([`period(0)`](period)) and the previous one, which is also the one
+    // the item was created from — while the EXCLUSIVE end, which that window does not
+    // judge, reaches as far forward as the row needs.
     let rows: Vec<Row> = vec![
         Row {
             case: "the name, applied from an open-ended range",
             create: json!({ "Type": "FEE", "Flat": { "ChargeValue": 10.0 } }),
             update: json!({
                 "Name": "renamed",
-                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(4) },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
             }),
             path: "Name",
             kept: json!("versioned"),
             updated: json!("renamed"),
-            keeping: vec![period(-1), period(0), period(3)],
-            updating: vec![period(4), period(5), period(70)],
+            keeping: vec![period(-1)],
+            updating: vec![period(0), period(5), period(70)],
             absent: vec![],
         },
         Row {
@@ -382,13 +386,13 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
             create: json!({ "Type": "FEE", "Flat": { "ChargeValue": 10.0 } }),
             update: json!({
                 "Description": "a new description",
-                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(4) },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
             }),
             path: "Description",
             kept: json!("the original custom line item"),
             updated: json!("a new description"),
-            keeping: vec![period(-1), period(3)],
-            updating: vec![period(4), period(11)],
+            keeping: vec![period(-1)],
+            updating: vec![period(0), period(11)],
             absent: vec![],
         },
         Row {
@@ -397,31 +401,31 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
             update: json!({
                 "ChargeDetails": { "Flat": { "ChargeValue": 42.5 } },
                 "BillingPeriodRange": {
-                    "InclusiveStartBillingPeriod": period(4),
-                    "ExclusiveEndBillingPeriod": period(7),
+                    "InclusiveStartBillingPeriod": period(0),
+                    "ExclusiveEndBillingPeriod": period(3),
                 },
             }),
             path: "ChargeDetails/Flat/ChargeValue",
             kept: json!(10.0),
             updated: json!(42.5),
-            keeping: vec![period(-1), period(3)],
-            updating: vec![period(4), period(5), period(6)],
+            keeping: vec![period(-1)],
+            updating: vec![period(0), period(1), period(2)],
             // The write named the periods the item applies in from its own start on, so
             // the item applies in none of the periods from its exclusive end.
-            absent: vec![period(7), period(11)],
+            absent: vec![period(3), period(11)],
         },
         Row {
             case: "the percentage value of a percentage item",
             create: json!({ "Type": "CREDIT", "Percentage": { "PercentageValue": 2.0 } }),
             update: json!({
                 "ChargeDetails": { "Percentage": { "PercentageValue": 7.5 } },
-                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(4) },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
             }),
             path: "ChargeDetails/Percentage/PercentageValue",
             kept: json!(2.0),
             updated: json!(7.5),
-            keeping: vec![period(-1), period(3)],
-            updating: vec![period(4), period(37)],
+            keeping: vec![period(-1)],
+            updating: vec![period(0), period(37)],
             absent: vec![],
         },
         Row {
@@ -429,13 +433,13 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
             create: json!({ "Type": "FEE", "Flat": { "ChargeValue": 10.0 } }),
             update: json!({
                 "ChargeDetails": { "LineItemFilters": [filter.clone()] },
-                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(4) },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
             }),
             path: "ChargeDetails/LineItemFilters",
             kept: Value::Null,
             updated: json!([filter.clone()]),
-            keeping: vec![period(-1), period(3)],
-            updating: vec![period(4), period(10)],
+            keeping: vec![period(-1)],
+            updating: vec![period(0), period(10)],
             absent: vec![],
         },
         Row {
@@ -444,16 +448,36 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
             update: json!({
                 "Name": "one_month",
                 "BillingPeriodRange": {
-                    "InclusiveStartBillingPeriod": one_digit_month(&period(4)),
-                    "ExclusiveEndBillingPeriod": one_digit_month(&period(5)),
+                    "InclusiveStartBillingPeriod": one_digit_month(&period(0)),
+                    "ExclusiveEndBillingPeriod": one_digit_month(&period(1)),
                 },
             }),
             path: "Name",
             kept: json!("versioned"),
             updated: json!("one_month"),
-            keeping: vec![period(-1), period(3), one_digit_month(&period(3))],
-            updating: vec![period(4), one_digit_month(&period(4))],
-            absent: vec![period(5), period(6)],
+            keeping: vec![period(-1), one_digit_month(&period(-1))],
+            updating: vec![period(0), one_digit_month(&period(0))],
+            absent: vec![period(1), period(2)],
+        },
+        Row {
+            // Applied from the PREVIOUS billing period, the other period this operation
+            // may act in and the one the item was created from: the write takes over the
+            // item's whole life, so no period is left reporting an earlier version.
+            case: "applied from the previous billing period, bounded years later",
+            create: json!({ "Type": "FEE", "Flat": { "ChargeValue": 10.0 } }),
+            update: json!({
+                "Name": "from_the_previous_period",
+                "BillingPeriodRange": {
+                    "InclusiveStartBillingPeriod": period(-1),
+                    "ExclusiveEndBillingPeriod": period(24),
+                },
+            }),
+            path: "Name",
+            kept: json!("versioned"),
+            updated: json!("from_the_previous_period"),
+            keeping: vec![],
+            updating: vec![period(-1), period(0), period(23)],
+            absent: vec![period(24), period(25)],
         },
     ];
 
@@ -501,9 +525,10 @@ async fn an_update_changes_only_the_billing_periods_it_is_applied_in() {
 async fn every_billing_period_of_the_item_reports_one_version_after_an_open_ended_write() {
     let (emulator, _group, item) = fixture("swept", json!({})).await;
     let case = "a sweep across the write";
-    // The write lands in the middle of the swept run, so periods on both sides of it are
-    // checked, plus the period before the item existed at all.
-    let applied_from_offset = 5;
+    // The write is applied from the CURRENT billing period, one of the two this operation
+    // may act in, so the swept run has the period the item was created in before it and
+    // two years of periods after it — plus the period before the item existed at all.
+    let applied_from_offset = 0;
     let applied_from = period(applied_from_offset);
     emulator
         .update_ok(
@@ -543,17 +568,22 @@ async fn every_billing_period_of_the_item_reports_one_version_after_an_open_ende
 /// THE RULE under REPEATED writes: each one takes over from the billing period it is
 /// applied in, so the item holds one version per stretch of periods, every stretch keeps
 /// the values its own write left, and the history reports each generation with the
-/// stretch it applies in.
+/// stretch it applies in. A write applied from the period the current generation already
+/// starts in opens no new stretch — one billing period holds one version of the item — so
+/// it replaces that generation instead.
 #[tokio::test]
 async fn repeated_writes_leave_one_version_per_stretch_of_billing_periods() {
     let (emulator, group, item) = fixture("history", json!({})).await;
-    let case = "three writes, each applied from a later billing period";
+    let case = "three writes across the periods this operation may act in";
     // (the period the write is applied from, the name and the flat charge value it
-    // leaves)
+    // leaves). The writes walk the two periods this operation may act in, oldest first:
+    // the first re-states the item's whole life from the period it was created in, the
+    // second opens a stretch at the current period, and the third lands in that same
+    // period and so replaces the generation holding it.
     let writes = [
-        (period(1), "second", 20.0),
-        (period(4), "third", 30.0),
-        (period(7), "fourth", 40.0),
+        (created_from(), "second", 20.0),
+        (period(0), "third", 30.0),
+        (period(0), "fourth", 40.0),
     ];
     for (from, name, charge_value) in &writes {
         emulator
@@ -571,13 +601,10 @@ async fn repeated_writes_leave_one_version_per_stretch_of_billing_periods() {
 
     // (the period read, the name and the charge value the version in force there holds)
     let expected = [
-        (period(-1), "history", 10.0),
-        (period(0), "history", 10.0),
-        (period(1), "second", 20.0),
-        (period(3), "second", 20.0),
-        (period(4), "third", 30.0),
-        (period(6), "third", 30.0),
-        (period(7), "fourth", 40.0),
+        (period(-1), "second", 20.0),
+        (period(0), "fourth", 40.0),
+        (period(1), "fourth", 40.0),
+        (period(3), "fourth", 40.0),
         (period(50), "fourth", 40.0),
     ];
     for (probe, name, charge_value) in &expected {
@@ -594,13 +621,14 @@ async fn repeated_writes_leave_one_version_per_stretch_of_billing_periods() {
         );
     }
 
-    // The history is those same four generations, each with the stretch it applies in.
+    // The history is one generation per stretch, each with the stretch it applies in: the
+    // generation the create left was re-stated for every period it applied in and the
+    // third write replaced the second's generation in the period they share, so neither is
+    // a version of the item in any billing period.
     let reported = emulator.versions(case, &item).await;
     let generations = [
-        ("history", created_from(), Some(period(1))),
-        ("second", period(1), Some(period(4))),
-        ("third", period(4), Some(period(7))),
-        ("fourth", period(7), None),
+        ("second", created_from(), Some(period(0))),
+        ("fourth", period(0), None),
     ];
     assert_eq!(
         reported.len(),
@@ -632,14 +660,14 @@ async fn repeated_writes_leave_one_version_per_stretch_of_billing_periods() {
         .proforma_by_period(case, &group, &period(-1), &period(9))
         .await;
     let expected = [
-        (period(-1), 10.0),
-        (period(0), 10.0),
-        (period(1), 20.0),
-        (period(2), 20.0),
-        (period(3), 20.0),
-        (period(4), 30.0),
-        (period(5), 30.0),
-        (period(6), 30.0),
+        (period(-1), 20.0),
+        (period(0), 40.0),
+        (period(1), 40.0),
+        (period(2), 40.0),
+        (period(3), 40.0),
+        (period(4), 40.0),
+        (period(5), 40.0),
+        (period(6), 40.0),
         (period(7), 40.0),
         (period(8), 40.0),
     ];

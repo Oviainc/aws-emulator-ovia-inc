@@ -97,6 +97,11 @@ async fn updating_a_custom_line_item_leaves_its_tags_exactly_as_they_were() {
     let em = Emulator::new();
     let plan = em.create_plan("LifecyclePlan", None).await;
     let group = em.create_group("LifecycleGroup", &plan, None).await;
+    // An update takes effect only in the billing periods the operation may act in — the
+    // current one and the one before it — so the row that narrows an item's span names
+    // the period the wall clock says it is in rather than a fixed month.
+    let current_billing_period =
+        service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
 
     let cases: Vec<LifecycleCase<'_>> = vec![
         LifecycleCase {
@@ -129,7 +134,9 @@ async fn updating_a_custom_line_item_leaves_its_tags_exactly_as_they_were() {
             charge_details: json!({ "Type": "CREDIT", "Percentage": { "PercentageValue": 1.0 } }),
             created: vec![("a", "1"), ("b", "2"), ("c", "3")],
             by_bare_id: true,
-            update: json!({ "BillingPeriodRange": { "InclusiveStartBillingPeriod": "2026-1" } }),
+            update: json!({
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": current_billing_period },
+            }),
         },
     ];
 

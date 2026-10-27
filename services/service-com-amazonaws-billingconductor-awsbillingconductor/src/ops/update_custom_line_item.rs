@@ -12,7 +12,12 @@
 //! The values it leaves take effect in the billing periods the request's
 //! `BillingPeriodRange` names, as a new VERSION of the item: every billing period before
 //! the one the update is applied from keeps the version the item had there, which is
-//! what a read of such a period — and `ListCustomLineItemVersions` — reports.
+//! what a read of such a period — and `ListCustomLineItemVersions` — reports. Those
+//! periods are BOUNDED to the window this operation acts in — the current or the
+//! previous billing period (see
+//! [`crate::state::check_billing_period_range_is_modifiable`], the same check
+//! `CreateCustomLineItem` and `DeleteCustomLineItem` decide their own window with) — so
+//! a range starting anywhere else is refused and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -320,6 +325,18 @@ fn merge(
     if let Some(range) = input.billing_period_range.as_ref() {
         if let Err((reason, field, message)) =
             crate::state::check_billing_period_range_is_ordered(range)
+        {
+            return Err(validation(reason, field, message));
+        }
+        // "Update an existing custom line item in the current or previous billing
+        // period": the periods this operation may re-state the item for are bounded to
+        // that window, so a range starting outside it — a month whose bill is already
+        // closed, or one that has not begun — is refused and the stored item is left
+        // exactly as it was (the same refusal `CreateCustomLineItem` and
+        // `DeleteCustomLineItem`, both bounded to the same window, answer such a range
+        // with).
+        if let Err((reason, field, message)) =
+            crate::state::check_billing_period_range_is_modifiable(range)
         {
             return Err(validation(reason, field, message));
         }

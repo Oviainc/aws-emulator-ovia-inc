@@ -657,45 +657,64 @@ type RangeRow = (
 async fn the_billing_period_range_decides_which_periods_report_the_updated_item() {
     // (case, the range, the periods that must report the updated version, the periods
     // that must still report the version the item had, the periods that must report no
-    // item at all). The fixture's item names no range, so it applies from the CURRENT
-    // billing period on and every period here is counted from that one.
+    // item at all). The fixture's item is created from the PREVIOUS billing period on, so
+    // a period before the one an update is applied from exists to keep the version the
+    // item had; every period here is counted from the current one. An update may be
+    // applied only from the current or the previous billing period
+    // (`tests/all/update_custom_line_item_billing_period_window.rs`), so that is where
+    // every range here starts, while the exclusive end — which the window does not judge
+    // — reaches as far forward as the row needs.
     let rows: Vec<RangeRow> = vec![
         (
             "a half-open range of three months",
             json!({
-                "InclusiveStartBillingPeriod": period(1),
-                "ExclusiveEndBillingPeriod": period(4),
+                "InclusiveStartBillingPeriod": period(0),
+                "ExclusiveEndBillingPeriod": period(3),
             }),
             vec![
+                period(0),
+                one_digit_month(&period(0)),
                 period(1),
-                one_digit_month(&period(1)),
                 period(2),
-                period(3),
             ],
-            vec![period(0)],
-            vec![period(-1), period(4), period(16)],
+            vec![period(-1)],
+            vec![period(-2), period(3), period(16)],
         ),
         (
             "an open-ended range",
-            json!({ "InclusiveStartBillingPeriod": period(3) }),
-            vec![period(3), period(4), period(52)],
-            vec![period(0), period(1), period(2)],
-            vec![period(-1), period(-13)],
+            json!({ "InclusiveStartBillingPeriod": period(0) }),
+            vec![period(0), period(1), period(52)],
+            vec![period(-1)],
+            vec![period(-2), period(-13)],
         ),
         (
             "a one-month range",
             json!({
-                "InclusiveStartBillingPeriod": one_digit_month(&period(1)),
-                "ExclusiveEndBillingPeriod": period(2),
+                "InclusiveStartBillingPeriod": one_digit_month(&period(0)),
+                "ExclusiveEndBillingPeriod": period(1),
             }),
-            vec![period(1), one_digit_month(&period(1))],
-            vec![period(0)],
-            vec![period(-1), period(2)],
+            vec![period(0), one_digit_month(&period(0))],
+            vec![period(-1)],
+            vec![period(-2), period(1)],
+        ),
+        (
+            // Applied from the PREVIOUS billing period, the other period this operation
+            // may act in: the new version takes that period over too, so no earlier
+            // version of the item is left for any period to report.
+            "a range starting in the previous billing period",
+            json!({ "InclusiveStartBillingPeriod": period(-1) }),
+            vec![period(-1), period(0), period(5)],
+            vec![],
+            vec![period(-2)],
         ),
     ];
 
     for (case, range, updated, kept, absent) in rows {
-        let (emulator, _group, item) = fixture("ranged", json!({})).await;
+        let (emulator, _group, item) = fixture(
+            "ranged",
+            json!({ "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(-1) } }),
+        )
+        .await;
         emulator
             .update_ok(
                 case,

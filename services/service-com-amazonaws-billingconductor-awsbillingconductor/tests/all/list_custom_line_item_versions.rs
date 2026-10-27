@@ -418,7 +418,10 @@ async fn fixture(create: Value) -> (Emulator, String, String) {
 #[tokio::test]
 async fn the_history_is_one_version_per_billing_period_the_item_was_in_effect_in() {
     // (case, the range the create names, the update bodies in order, the
-    // (StartBillingPeriod, EndBillingPeriod) of every expected version, oldest first)
+    // (StartBillingPeriod, EndBillingPeriod) of every expected version, oldest first).
+    // A write may be applied only from the current or the previous billing period, so
+    // every range here starts in one of those two, while an exclusive end — which that
+    // window does not judge — reaches as far forward as the row needs.
     let rows: Vec<HistoryRow> = vec![
         (
             "a create and nothing else",
@@ -429,36 +432,18 @@ async fn the_history_is_one_version_per_billing_period_the_item_was_in_effect_in
         (
             "one update in a later billing period",
             period_range(&period(-1), None),
-            vec![json!({ "BillingPeriodRange": period_range(&period(1), None) })],
-            vec![(period(-1), Some(period(1))), (period(1), None)],
+            vec![json!({ "BillingPeriodRange": period_range(&period(0), None) })],
+            vec![(period(-1), Some(period(0))), (period(0), None)],
         ),
         (
-            "two updates in later billing periods",
+            "three writes across the periods a write may be applied from",
             period_range(&period(-1), None),
             vec![
+                json!({ "BillingPeriodRange": period_range(&period(-1), None) }),
                 json!({ "BillingPeriodRange": period_range(&period(0), None) }),
-                json!({ "BillingPeriodRange": period_range(&period(3), None) }),
-            ],
-            vec![
-                (period(-1), Some(period(0))),
-                (period(0), Some(period(3))),
-                (period(3), None),
-            ],
-        ),
-        (
-            "four writes, one per consecutive billing period",
-            period_range(&period(-1), None),
-            vec![
                 json!({ "BillingPeriodRange": period_range(&period(0), None) }),
-                json!({ "BillingPeriodRange": period_range(&period(1), None) }),
-                json!({ "BillingPeriodRange": period_range(&period(2), None) }),
             ],
-            vec![
-                (period(-1), Some(period(0))),
-                (period(0), Some(period(1))),
-                (period(1), Some(period(2))),
-                (period(2), None),
-            ],
+            vec![(period(-1), Some(period(0))), (period(0), None)],
         ),
         (
             "an update in the generation's own billing period replaces it",
@@ -478,8 +463,8 @@ async fn the_history_is_one_version_per_billing_period_the_item_was_in_effect_in
         (
             "a successor closes a generation before the end its own write named",
             period_range(&period(-1), Some(&period(4))),
-            vec![json!({ "BillingPeriodRange": period_range(&period(1), None) })],
-            vec![(period(-1), Some(period(1))), (period(1), None)],
+            vec![json!({ "BillingPeriodRange": period_range(&period(0), None) })],
+            vec![(period(-1), Some(period(0))), (period(0), None)],
         ),
         (
             "the newest generation ends where its own write said",
@@ -492,10 +477,12 @@ async fn the_history_is_one_version_per_billing_period_the_item_was_in_effect_in
         (
             "a month spelled without its leading zero names the same period",
             period_range(&one_digit_month(&period(-1)), None),
-            vec![json!({ "BillingPeriodRange": period_range(&period(1), None) })],
+            vec![json!({
+                "BillingPeriodRange": period_range(&one_digit_month(&period(0)), None),
+            })],
             vec![
-                (period(-1), Some(one_digit_month(&period(1)))),
-                (one_digit_month(&period(1)), None),
+                (period(-1), Some(one_digit_month(&period(0)))),
+                (one_digit_month(&period(0)), None),
             ],
         ),
     ];
@@ -614,7 +601,7 @@ async fn each_version_reports_the_values_that_generation_held() {
         let mut update = object(&change);
         update.insert(
             "BillingPeriodRange".to_string(),
-            period_range(&period(1), None),
+            period_range(&period(0), None),
         );
         emulator
             .update_ok(case, &item, Value::Object(update))
@@ -670,7 +657,7 @@ async fn each_version_reports_the_values_that_generation_held() {
         // ROUND TRIP: the newest version is the item a read of the item itself reports
         // for the billing period that generation applies in.
         let stored = emulator
-            .item(case, &item, &period(1))
+            .item(case, &item, &period(0))
             .await
             .unwrap_or_else(|| panic!("case {case:?}: expected {item} to be readable"));
         for member in [
@@ -727,7 +714,7 @@ async fn a_frozen_version_keeps_the_association_size_it_had() {
         .update_ok(
             case,
             &item,
-            json!({ "BillingPeriodRange": period_range(&period(1), None) }),
+            json!({ "BillingPeriodRange": period_range(&period(0), None) }),
         )
         .await;
     emulator
@@ -758,10 +745,11 @@ async fn a_frozen_version_keeps_the_association_size_it_had() {
 /// anywhere inside it — both of its bounds inclusive, an absent bound open.
 #[tokio::test]
 async fn the_billing_period_filter_selects_the_versions_in_effect_in_that_span() {
-    // The fixture's generations: [period(-1), period(1)), [period(1), period(4)),
-    // [period(4), ..).
+    // The fixture's generations: [period(-1), period(0)) and [period(0), period(4)) —
+    // the two stretches two writes applied from the two billing periods a write may be
+    // applied from leave, the newest bounded by the end its own write named.
     // (case, the filter, the StartBillingPeriod of every expected version)
-    let generations: Vec<String> = vec![period(-1), period(1), period(4)];
+    let generations: Vec<String> = vec![period(-1), period(0)];
     let rows: Vec<(&str, Value, Vec<String>)> = vec![
         ("no filter at all", json!({}), generations.clone()),
         (
@@ -776,34 +764,34 @@ async fn the_billing_period_filter_selects_the_versions_in_effect_in_that_span()
             vec![period(-1)],
         ),
         (
-            "one period inside the middle generation",
+            "one period inside the newest generation",
             json!({ "Filters": { "BillingPeriodRange": {
                 "StartBillingPeriod": period(2), "EndBillingPeriod": period(2) } } }),
-            vec![period(1)],
+            vec![period(0)],
         ),
         (
             "a span across two generations",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": period(0), "EndBillingPeriod": period(1) } } }),
-            vec![period(-1), period(1)],
+                "StartBillingPeriod": period(-1), "EndBillingPeriod": period(0) } } }),
+            generations.clone(),
         ),
         (
             "a span open at its end",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": period(1) } } }),
-            vec![period(1), period(4)],
+                "StartBillingPeriod": period(0) } } }),
+            vec![period(0)],
         ),
         (
             "a span open at its start",
             json!({ "Filters": { "BillingPeriodRange": {
-                "EndBillingPeriod": period(0) } } }),
+                "EndBillingPeriod": period(-1) } } }),
             vec![period(-1)],
         ),
         (
-            "a span entirely after the last generation began",
+            "a span entirely after the newest generation ended",
             json!({ "Filters": { "BillingPeriodRange": {
                 "StartBillingPeriod": period(7), "EndBillingPeriod": period(9) } } }),
-            vec![period(4)],
+            vec![],
         ),
         (
             "a span entirely before the item existed",
@@ -814,21 +802,21 @@ async fn the_billing_period_filter_selects_the_versions_in_effect_in_that_span()
         (
             "months spelled without their leading zeroes",
             json!({ "Filters": { "BillingPeriodRange": {
-                "StartBillingPeriod": one_digit_month(&period(4)),
-                "EndBillingPeriod": one_digit_month(&period(4)) } } }),
-            vec![period(4)],
+                "StartBillingPeriod": one_digit_month(&period(3)),
+                "EndBillingPeriod": one_digit_month(&period(3)) } } }),
+            vec![period(0)],
         ),
     ];
 
     for (case, request, expected) in rows {
         let (emulator, _, item) =
             fixture(json!({ "BillingPeriodRange": period_range(&period(-1), None) })).await;
-        for start in [period(1), period(4)] {
+        for (start, end) in [(period(-1), None), (period(0), Some(period(4)))] {
             emulator
                 .update_ok(
                     case,
                     &item,
-                    json!({ "BillingPeriodRange": period_range(&start, None) }),
+                    json!({ "BillingPeriodRange": period_range(&start, end.as_deref()) }),
                 )
                 .await;
         }
@@ -858,7 +846,9 @@ async fn the_billing_period_filter_selects_the_versions_in_effect_in_that_span()
 async fn paging_walks_every_version_once_in_order() {
     let (emulator, _, item) =
         fixture(json!({ "BillingPeriodRange": period_range(&period(-1), None) })).await;
-    for start in [period(0), period(1), period(2)] {
+    // Two writes applied from the two billing periods a write may be applied from, which
+    // leaves the item one generation per stretch.
+    for start in [period(-1), period(0)] {
         emulator
             .update_ok(
                 "the paged fixture",
@@ -872,13 +862,13 @@ async fn paging_walks_every_version_once_in_order() {
         .await;
     assert_eq!(
         unpaged.len(),
-        4,
-        "case \"unpaged\": expected the four generations, got {unpaged:?}"
+        2,
+        "case \"unpaged\": expected the two generations, got {unpaged:?}"
     );
 
-    // Each published bound of `MaxResults`, and the sizes between one and the number of
-    // versions there are.
-    for max_results in [MAX_RESULTS_BOUNDS.0, 2, 3, 4, MAX_RESULTS_BOUNDS.1] {
+    // Each published bound of `MaxResults`, the sizes between one and the number of
+    // versions there are, and one past that number.
+    for max_results in [MAX_RESULTS_BOUNDS.0, 2, 3, MAX_RESULTS_BOUNDS.1] {
         let case = format!("MaxResults {max_results}");
         let mut walked: Vec<Value> = Vec::new();
         let mut next_token: Option<String> = None;
@@ -936,7 +926,7 @@ async fn either_spelling_of_the_arn_reports_the_same_history_and_a_read_changes_
         .update_ok(
             case,
             &item,
-            json!({ "BillingPeriodRange": period_range(&period(1), None) }),
+            json!({ "BillingPeriodRange": period_range(&period(0), None) }),
         )
         .await;
 
@@ -954,7 +944,7 @@ async fn either_spelling_of_the_arn_reports_the_same_history_and_a_read_changes_
         again, by_arn,
         "case {case:?}: expected a repeated read to report the same history, got {again:?}"
     );
-    let stored = emulator.item(case, &item, &period(1)).await;
+    let stored = emulator.item(case, &item, &period(0)).await;
     assert!(
         stored.is_some(),
         "case {case:?}: expected the item itself to be unchanged by the reads"
