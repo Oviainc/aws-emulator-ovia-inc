@@ -10,9 +10,10 @@
 //!
 //! The rules under test:
 //!
-//! 1. An allocation is made FROM a stored Capacity Reservation: an id the account holds no
-//!    reservation for is refused with `InvalidCapacityReservationId.NotFound`, whatever the
-//!    id looks like.
+//! 1. An allocation is made FROM a stored Capacity Reservation: a well-formed id the
+//!    account holds no reservation for is refused with
+//!    `InvalidCapacityReservationId.NotFound`, and a value outside the id form EC2 issues
+//!    with `InvalidCapacityReservationId.Malformed` before any lookup.
 //! 2. "Your Capacity Reservation must be in active state with no end date set and have
 //!    available capacity for allocation"
 //!    (`CreateInterruptibleCapacityReservationAllocationRequest$CapacityReservationId`): a
@@ -171,6 +172,11 @@ const SOURCE_INSTANCE_TYPE: &str = "c5.xlarge";
 const SOURCE_INSTANCE_PLATFORM: &str = "Linux/UNIX";
 const SOURCE_AVAILABILITY_ZONE: &str = "us-east-1a";
 
+/// A WELL-FORMED Capacity Reservation id the account holds no reservation for: `cr-`
+/// followed by the long id form EC2 issues, which is what makes the service look it up at
+/// all rather than refuse it as malformed before the lookup.
+const UNKNOWN_CAPACITY_RESERVATION_ID: &str = "cr-0ffffffffffffffff";
+
 /// What one seeded source Capacity Reservation is created with: the capacity it reserves,
 /// the state it sits in and whether it has an end date. Everything else is the same across
 /// the rows, so each row differs only along what the rules generalise over.
@@ -239,9 +245,10 @@ fn stored_count(engine: &engine::InMemoryEngine) -> usize {
 // The allocation is made from a STORED source reservation
 // ---------------------------------------------------------------------------
 
-/// An id the account holds no Capacity Reservation for is refused with
-/// `InvalidCapacityReservationId.NotFound`, whatever the id looks like — and nothing is
-/// written for it.
+/// An id the account holds no Capacity Reservation for is refused — a WELL-FORMED one with
+/// `InvalidCapacityReservationId.NotFound` and a value outside the id form EC2 issues with
+/// `InvalidCapacityReservationId.Malformed`, before any lookup — and nothing is written for
+/// either.
 #[tokio::test]
 async fn an_unknown_source_is_refused_whatever_the_id_looks_like() {
     let (router, engine) = super::ec2_query::emulator();
@@ -250,16 +257,20 @@ async fn an_unknown_source_is_refused_whatever_the_id_looks_like() {
     let known = create_source(&router, 4).await;
     let before = stored_count(&engine);
 
-    // The rows differ in the FORM of the id: the long id form, the short one, another
-    // resource's id, a known id with a suffix, and something that is not an id at all.
-    let cases: [&str; 5] = [
-        "cr-00000000000000000",
-        "cr-12345678",
-        "cb-00000000000000001",
-        &format!("{known}x"),
-        "not-an-id",
+    // The rows differ in the FORM of the id: the long id form EC2 issues, the null id, the
+    // short form, a leading digit above zero, another resource's id, a known id with a
+    // suffix, and something that is not an id at all.
+    let cases: [(&str, &str); 7] = [
+        (UNKNOWN_CAPACITY_RESERVATION_ID, "NotFound"),
+        ("cr-00000000000000000", "Malformed"),
+        ("cr-12345678", "Malformed"),
+        ("cr-1234567890abcdef0", "Malformed"),
+        ("cb-00000000000000001", "Malformed"),
+        (&format!("{known}x"), "Malformed"),
+        ("not-an-id", "Malformed"),
     ];
-    for case in cases {
+    for (case, half) in cases {
+        let expected = format!("InvalidCapacityReservationId.{half}");
         let (status, body) = allocate(&router, &allocation_params(case, 1)).await;
         assert_eq!(
             status, 400,
@@ -267,8 +278,8 @@ async fn an_unknown_source_is_refused_whatever_the_id_looks_like() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidCapacityReservationId.NotFound",
-            "case {case:?}: expected InvalidCapacityReservationId.NotFound, got {body}"
+            expected,
+            "case {case:?}: expected {expected}, got {body}"
         );
         let message = unescaped(&element(&body, "Message").unwrap_or_default());
         assert!(
@@ -765,7 +776,7 @@ async fn a_dry_run_writes_nothing() {
     );
 
     // A dry run of a request that would have been refused is refused with ITS reason.
-    let mut params = allocation_params("cr-00000000000000000", 2);
+    let mut params = allocation_params(UNKNOWN_CAPACITY_RESERVATION_ID, 2);
     params.push(("DryRun".to_string(), "true".to_string()));
     let (status, body) = allocate(&router, &params).await;
     assert_eq!(
@@ -914,7 +925,7 @@ async fn reading_a_reservation_back_reports_the_store() {
     let source = create_source(&router, 4).await;
     let stored_before = stored_count(&engine);
 
-    let (status, body) = usage(&router, "cr-00000000000000000").await;
+    let (status, body) = usage(&router, UNKNOWN_CAPACITY_RESERVATION_ID).await;
     assert_eq!(
         status, 400,
         "an unknown reservation: expected HTTP 400, got {status} with body {body}"

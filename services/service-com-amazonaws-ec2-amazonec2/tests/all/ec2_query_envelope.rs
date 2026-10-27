@@ -63,8 +63,10 @@ pub(crate) const RESPONSE_CONTENT_TYPE: &str = "text/xml;charset=UTF-8";
 /// reason [`RESPONSE_CONTENT_TYPE`] is.
 pub(crate) const UNKNOWN_VPC_ID: &str = "vpc-0ffffffffffffffff";
 
-/// A well-formed Capacity Reservation id the account holds no reservation for.
-const UNKNOWN_CAPACITY_RESERVATION_ID: &str = "cr-00000000000000000";
+/// A well-formed Capacity Reservation id the account holds no reservation for — `cr-`
+/// followed by the long id form EC2 issues, so the service looks it up rather than refusing
+/// it as malformed before the lookup.
+const UNKNOWN_CAPACITY_RESERVATION_ID: &str = "cr-0ffffffffffffffff";
 
 /// A well-formed transit gateway attachment id the account holds no attachment for. The
 /// dry-run row names it because an authorized `DryRun=true` is answered
