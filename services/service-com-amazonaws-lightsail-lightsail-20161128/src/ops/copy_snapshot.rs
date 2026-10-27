@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopySnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopySnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Inserts a new MANUAL snapshot into this service's store, in the Region the
+//! request is made in, holding what the snapshot the request named holds: either
+//! a manual snapshot of the source Region (`sourceSnapshotName`) or one of the
+//! copies the `AutoSnapshot` add-on took of a source instance or disk there
+//! (`sourceResourceName` with the restore date, or with the latest restorable
+//! copy asked for) — and answers the operation-log entry the insert appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopySnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +192,535 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopySnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopySnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopySnapshot"))
+        // A copy is a snapshot of the Region it was copied INTO, and the only
+        // Region the request names is the SOURCE's — so the Region the copy is
+        // created in is the one this request was made in, which is what its
+        // credential scope says.
+        let target_region = crate::state::request_region(ctx.parts());
+
+        // `targetSnapshotName` and `sourceRegion` are modelled `@required`
+        // members, `sourceRegion` targets the modelled `RegionName` enum and
+        // every pattern on this input is a modelled constraint, so the
+        // centralized walk refused anything outside them before this body ran.
+        // What is left is what the model cannot express: exactly one source must
+        // be named, the automatic-snapshot members must be used only with the
+        // source they describe, the source must be a snapshot the account holds
+        // in that Region and complete, and the target name must be free. Every
+        // one of those is checked BEFORE the first write, so a refused request
+        // creates nothing.
+        let source = requested_source(&input)?;
+
+        let source_region = input.source_region;
+        let target_name = input.target_snapshot_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A snapshot name addresses ONE snapshot of this account — a name is
+            // resolved across both kinds wherever this service takes a snapshot
+            // name (`ExportSnapshot`) — so copying onto a name already taken is
+            // refused rather than silently replacing a record a restore may
+            // already be using.
+            if store.disk_snapshot(&target_name).is_some()
+                || store.instance_snapshot(&target_name).is_some()
+            {
+                return Err(invalid(format!(
+                    "a snapshot named '{target_name}' already exists"
+                )));
+            }
+
+            let copied = copied_snapshot(store, &source, &source_region)?;
+            let location = copy_location(&copied.source_location, &target_region);
+            // A copy is not restorable yet: the clock owes it its terminal
+            // state, which is why a read straight after this call still reports
+            // the snapshot as being taken, exactly as it does against AWS.
+            let (resource_type, settles_at_ms) = match copied.content {
+                Content::DiskSnapshot { size_in_gb, source } => {
+                    if store.disk_snapshots.len() >= crate::state::MAX_DISK_SNAPSHOTS {
+                        return Err(invalid(format!(
+                            "copying a disk snapshot would take this account past the {} \
+                             this emulator holds",
+                            crate::state::MAX_DISK_SNAPSHOTS
+                        )));
+                    }
+                    let id = store.mint_uuid();
+                    let due = crate::state::DueNamedState::after(
+                        now,
+                        crate::state::DISK_SNAPSHOT_STATE_COMPLETED,
+                    );
+                    store.insert_disk_snapshot(crate::state::StoredDiskSnapshot {
+                        name: target_name.clone(),
+                        arn: crate::state::disk_snapshot_arn(&location.region_name, &id),
+                        support_code: crate::state::support_code(&id),
+                        created_at_ms: now,
+                        location: location.clone(),
+                        // This input models no tags: a copy is a new manual
+                        // snapshot, and `TagResource` is what tags one.
+                        tags: Vec::new(),
+                        size_in_gb,
+                        state: crate::state::DISK_SNAPSHOT_STATE_PENDING,
+                        due: Some(due),
+                        // The copy describes the volume the SNAPSHOT was taken
+                        // of, not the snapshot it was copied from: the modelled
+                        // `DiskSnapshot` names a source disk or instance and
+                        // nothing else.
+                        source,
+                        is_from_auto_snapshot: copied.from_auto_snapshot,
+                    });
+                    (crate::state::RESOURCE_TYPE_DISK_SNAPSHOT, due.at_ms)
+                }
+                Content::InstanceSnapshot {
+                    size_in_gb,
+                    from_instance_name,
+                    from_instance_arn,
+                    from_blueprint_id,
+                    from_bundle_id,
+                    from_attached_disks,
+                } => {
+                    if store.instance_snapshots.len() >= crate::state::MAX_INSTANCE_SNAPSHOTS {
+                        return Err(invalid(format!(
+                            "copying an instance snapshot would take this account past the \
+                             {} this emulator holds",
+                            crate::state::MAX_INSTANCE_SNAPSHOTS
+                        )));
+                    }
+                    let id = store.mint_uuid();
+                    let due = crate::state::DueNamedState::after(
+                        now,
+                        crate::state::INSTANCE_SNAPSHOT_STATE_AVAILABLE,
+                    );
+                    store.insert_instance_snapshot(crate::state::StoredInstanceSnapshot {
+                        name: target_name.clone(),
+                        arn: crate::state::instance_snapshot_arn(&location.region_name, &id),
+                        support_code: crate::state::support_code(&id),
+                        created_at_ms: now,
+                        location: location.clone(),
+                        tags: Vec::new(),
+                        size_in_gb,
+                        state: crate::state::INSTANCE_SNAPSHOT_STATE_PENDING,
+                        due: Some(due),
+                        from_instance_name,
+                        from_instance_arn,
+                        from_blueprint_id,
+                        from_bundle_id,
+                        from_attached_disks,
+                        is_from_auto_snapshot: copied.from_auto_snapshot,
+                    });
+                    (crate::state::RESOURCE_TYPE_INSTANCE_SNAPSHOT, due.at_ms)
+                }
+            };
+            // `operations` is a list because other Lightsail calls act on
+            // several resources at once; one `CopySnapshot` creates exactly one
+            // snapshot, so it answers exactly one entry — against the copy, the
+            // resource the call created — left non-terminal until the copy the
+            // clock owes it is due. It reports no `operationType`: the modelled
+            // `OperationType` enum declares no value for this call, and an
+            // absent optional member is the model's answer to that.
+            let operation = store.start_untyped_operation(
+                now,
+                resource_type,
+                &target_name,
+                &location,
+                settles_at_ms,
+            );
+            Ok(CopySnapshotOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The snapshot the request asked to copy: exactly one of the two mutually
+/// exclusive sources the modelled input admits, resolved against the store once
+/// the request is known to name one.
+enum RequestedSource {
+    /// A manual snapshot of the source Region, named by `sourceSnapshotName`.
+    Snapshot(String),
+    /// An AUTOMATIC snapshot of the instance or disk `sourceResourceName` names,
+    /// addressed either by the `restoreDate` the request carried, or — for
+    /// `None` — by asking for the latest restorable copy, as the modelled
+    /// `useLatestRestorableAutoSnapshot` documentation words it.
+    AutoSnapshot {
+        resource_name: String,
+        date: Option<String>,
+    },
+}
+
+/// The source `input` names, or the refusal its combination of members earns.
+///
+/// The modelled documentation states each rule enforced here: `sourceSnapshotName`
+/// is to be defined "only when copying a manual snapshot as another manual
+/// snapshot" and `sourceResourceName` "only when copying an automatic snapshot as
+/// a manual snapshot", so the two are the sources of the two copies this
+/// operation makes and naming both, or neither, is no copy at all; `restoreDate`
+/// and `useLatestRestorableAutoSnapshot` "are mutually exclusive" and are to be
+/// defined "only when copying an automatic snapshot as a manual snapshot", which
+/// is what `sourceResourceName` names the source of — and one of them has to
+/// say WHICH copy, since the add-on takes one a day.
+fn requested_source(input: &CopySnapshotInput) -> Result<RequestedSource, CopySnapshotError> {
+    let wants_latest = input.use_latest_restorable_auto_snapshot == Some(true);
+    if let Some(restore_date) = &input.restore_date {
+        if !crate::state::is_auto_snapshot_date(restore_date) {
+            return Err(invalid(format!(
+                "restoreDate '{restore_date}' must be specified in YYYY-MM-DD format"
+            )));
+        }
+        if wants_latest {
+            return Err(invalid(
+                "restoreDate and useLatestRestorableAutoSnapshot are mutually exclusive: \
+                 name the date of the automatic snapshot to copy, or ask for the latest \
+                 restorable one, but not both"
+                    .to_string(),
+            ));
+        }
+    }
+    match (&input.source_snapshot_name, &input.source_resource_name) {
+        (Some(snapshot_name), None) => {
+            if input.restore_date.is_some() || wants_latest {
+                return Err(invalid(
+                    "restoreDate and useLatestRestorableAutoSnapshot are to be defined only \
+                     when copying an automatic snapshot as a manual snapshot, which \
+                     sourceResourceName names the source of, not together with \
+                     sourceSnapshotName"
+                        .to_string(),
+                ));
+            }
+            Ok(RequestedSource::Snapshot(snapshot_name.clone()))
+        }
+        (None, Some(resource_name)) => match (&input.restore_date, wants_latest) {
+            (Some(restore_date), false) => Ok(RequestedSource::AutoSnapshot {
+                resource_name: resource_name.clone(),
+                date: Some(restore_date.clone()),
+            }),
+            (None, true) => Ok(RequestedSource::AutoSnapshot {
+                resource_name: resource_name.clone(),
+                date: None,
+            }),
+            _ => Err(invalid(
+                "sourceResourceName names the source instance or disk of an automatic \
+                 snapshot, so one of restoreDate or useLatestRestorableAutoSnapshot must be \
+                 defined with it"
+                    .to_string(),
+            )),
+        },
+        (Some(_), Some(_)) => Err(invalid(
+            "sourceSnapshotName and sourceResourceName are mutually exclusive: name the \
+             manual snapshot to copy, or the source instance or disk of the automatic \
+             snapshot to copy, but not both"
+                .to_string(),
+        )),
+        (None, None) => Err(invalid(
+            "one of sourceSnapshotName or sourceResourceName must be defined: a manual \
+             snapshot is copied as another manual snapshot, or an automatic snapshot of an \
+             instance or disk is copied as a manual one"
+                .to_string(),
+        )),
+    }
+}
+
+/// What the copy will hold, which is what the snapshot being copied holds: a
+/// disk snapshot is copied as a disk snapshot and an instance snapshot as an
+/// instance snapshot, each keeping everything it says about the resource it was
+/// taken of.
+enum Content {
+    DiskSnapshot {
+        size_in_gb: i32,
+        source: crate::state::DiskSnapshotSource,
+    },
+    InstanceSnapshot {
+        size_in_gb: i32,
+        from_instance_name: String,
+        from_instance_arn: String,
+        from_blueprint_id: String,
+        from_bundle_id: String,
+        from_attached_disks: Vec<crate::state::StoredDisk>,
+    },
+}
+
+/// One resolved copy: what the new snapshot holds, where the snapshot it was
+/// copied from lives, and whether that snapshot was an automatic one.
+struct Copied {
+    content: Content,
+    /// Where the snapshot being copied lives, which is what decides whether this
+    /// copy is made within one Region or into another ([`copy_location`]).
+    source_location: crate::state::StoredLocation,
+    /// `isFromAutoSnapshot` of the copy: true exactly when the snapshot being
+    /// copied is one the `AutoSnapshot` add-on took, which is the case the
+    /// modelled member describes ("whether the snapshot was created from an
+    /// automatic snapshot").
+    from_auto_snapshot: bool,
+}
+
+/// The snapshot `source` names, as the copy of it this store will hold, or the
+/// refusal the request earns against the store's own state.
+///
+/// Everything the copy holds is read out of the records as they stand now, so
+/// the copy keeps it however the source changes or is deleted afterwards.
+fn copied_snapshot(
+    store: &crate::state::ComAmazonawsLightsailLightsail20161128State,
+    source: &RequestedSource,
+    source_region: &str,
+) -> Result<Copied, CopySnapshotError> {
+    match source {
+        RequestedSource::Snapshot(name) => manual_snapshot(store, name, source_region),
+        RequestedSource::AutoSnapshot {
+            resource_name,
+            date,
+        } => automatic_snapshot(store, resource_name, date.as_deref(), source_region),
+    }
+}
+
+/// The manual snapshot `name` names in `source_region` — a disk snapshot or an
+/// instance snapshot, the two kinds this store holds and the two the operation's
+/// documentation names ("a manual snapshot of an instance or disk") — as the copy
+/// of it, or the refusal.
+///
+/// A snapshot belongs to the Region it was taken in, and only that Region's
+/// endpoint holds it, so a snapshot of any other Region is not one
+/// `sourceRegion` names.
+fn manual_snapshot(
+    store: &crate::state::ComAmazonawsLightsailLightsail20161128State,
+    name: &str,
+    source_region: &str,
+) -> Result<Copied, CopySnapshotError> {
+    if let Some(snapshot) = store
+        .disk_snapshot(name)
+        .filter(|snapshot| snapshot.location.region_name == source_region)
+    {
+        // A snapshot can be copied only once every block it captures is
+        // captured: while Lightsail is still taking it the snapshot reports
+        // `pending` (`DiskSnapshot$state`), and there is no complete copy to
+        // copy from yet. That is a well-formed request the resources' state does
+        // not allow, which is what the modelled `OperationFailureException` is
+        // for.
+        if snapshot.state != crate::state::DISK_SNAPSHOT_STATE_COMPLETED {
+            return Err(operation_failure(format!(
+                "The disk snapshot {} is {}: a snapshot can be copied only when it is {}.",
+                snapshot.name,
+                snapshot.state,
+                crate::state::DISK_SNAPSHOT_STATE_COMPLETED
+            )));
+        }
+        return Ok(Copied {
+            content: Content::DiskSnapshot {
+                size_in_gb: snapshot.size_in_gb,
+                source: snapshot.source.clone(),
+            },
+            source_location: snapshot.location.clone(),
+            // The snapshot being copied is a manual one, whatever it was itself
+            // created from.
+            from_auto_snapshot: false,
+        });
+    }
+    let snapshot = store
+        .instance_snapshot(name)
+        .filter(|snapshot| snapshot.location.region_name == source_region)
+        .ok_or_else(|| snapshot_not_found(name))?;
+    if snapshot.state != crate::state::INSTANCE_SNAPSHOT_STATE_AVAILABLE {
+        return Err(operation_failure(format!(
+            "The instance snapshot {} is {}: a snapshot can be copied only when it is {}.",
+            snapshot.name,
+            snapshot.state,
+            crate::state::INSTANCE_SNAPSHOT_STATE_AVAILABLE
+        )));
+    }
+    Ok(Copied {
+        content: Content::InstanceSnapshot {
+            size_in_gb: snapshot.size_in_gb,
+            from_instance_name: snapshot.from_instance_name.clone(),
+            from_instance_arn: snapshot.from_instance_arn.clone(),
+            from_blueprint_id: snapshot.from_blueprint_id.clone(),
+            from_bundle_id: snapshot.from_bundle_id.clone(),
+            from_attached_disks: snapshot.from_attached_disks.clone(),
+        },
+        source_location: snapshot.location.clone(),
+        from_auto_snapshot: false,
+    })
+}
+
+/// The automatic snapshot of the resource `resource_name` names in
+/// `source_region` that `date` addresses — the latest restorable copy when
+/// `date` is absent — as the copy of it, or the refusal.
+///
+/// An automatic snapshot has no name and no ARN of its own: it is addressed by
+/// the resource it was taken of plus the date it was taken on, and the resources
+/// one is taken of are the instance and the disk, resolved in that order exactly
+/// as every other operation that addresses one resolves a name.
+///
+/// What the copy says about the resource the snapshot was taken of — a disk's
+/// size, an instance's blueprint, plan and system volume — is read from the
+/// resource's own record: this service models no call that changes any of them
+/// (a larger volume is made by restoring a snapshot onto a new resource), so
+/// those are the values the copy captured, while what DOES change between one
+/// copy and the next, the block storage disks attached to an instance, is what
+/// the copy itself recorded.
+fn automatic_snapshot(
+    store: &crate::state::ComAmazonawsLightsailLightsail20161128State,
+    resource_name: &str,
+    date: Option<&str>,
+    source_region: &str,
+) -> Result<Copied, CopySnapshotError> {
+    let resource_type = if store
+        .instance(resource_name)
+        .is_some_and(|instance| instance.location.region_name == source_region)
+    {
+        crate::state::RESOURCE_TYPE_INSTANCE
+    } else if store
+        .disk(resource_name)
+        .is_some_and(|disk| disk.location.region_name == source_region)
+    {
+        crate::state::RESOURCE_TYPE_DISK
+    } else {
+        return Err(resource_not_found(resource_name));
+    };
+    let taken = store
+        .auto_snapshots
+        .get(&(resource_type, resource_name.to_string()))
+        .map(|schedule| schedule.taken.as_slice())
+        .unwrap_or_default();
+    // One copy a day, so a date addresses exactly one of a resource's copies;
+    // the latest RESTORABLE one is the newest the service has finished taking,
+    // the copies being held oldest first.
+    let copy = match date {
+        Some(date) => taken.iter().find(|copy| copy.date == date),
+        None => taken
+            .iter()
+            .rev()
+            .find(|copy| copy.status == crate::state::AUTO_SNAPSHOT_STATUS_SUCCESS),
+    }
+    .ok_or_else(|| auto_snapshot_not_found(resource_type, resource_name, date))?;
+    // The same rule the manual sources are held to: a copy the service has not
+    // finished taking holds no complete snapshot to copy from.
+    if copy.status != crate::state::AUTO_SNAPSHOT_STATUS_SUCCESS {
+        return Err(operation_failure(format!(
+            "The automatic snapshot of the {resource_type} {resource_name} dated {} is {}: \
+             a snapshot can be copied only when it is {}.",
+            copy.date,
+            copy.status,
+            crate::state::AUTO_SNAPSHOT_STATUS_SUCCESS
+        )));
+    }
+    if resource_type == crate::state::RESOURCE_TYPE_INSTANCE {
+        let instance = store
+            .instance(resource_name)
+            .ok_or_else(|| resource_not_found(resource_name))?;
+        return Ok(Copied {
+            content: Content::InstanceSnapshot {
+                // The system volume is the instance plan's own SSD, the disk
+                // `GetInstance` reports as the instance's system disk.
+                size_in_gb: instance.bundle.disk_size_in_gb,
+                from_instance_name: instance.name.clone(),
+                from_instance_arn: instance.arn.clone(),
+                from_blueprint_id: instance.blueprint_id.clone(),
+                from_bundle_id: instance.bundle_id.clone(),
+                from_attached_disks: copy.from_attached_disks.clone().unwrap_or_default(),
+            },
+            source_location: instance.location.clone(),
+            from_auto_snapshot: true,
+        });
+    }
+    let disk = store
+        .disk(resource_name)
+        .ok_or_else(|| resource_not_found(resource_name))?;
+    Ok(Copied {
+        content: Content::DiskSnapshot {
+            size_in_gb: disk.size_in_gb,
+            source: crate::state::DiskSnapshotSource::Disk {
+                name: disk.name.clone(),
+                arn: disk.arn.clone(),
+            },
+        },
+        source_location: disk.location.clone(),
+        from_auto_snapshot: true,
+    })
+}
+
+/// Where the copy lives: the Region the request was made in — "from one Amazon
+/// Web Services Region to another" — keeping the source's Availability Zone when
+/// that zone is one of that Region's, since a copy taken within one Region holds
+/// the same volume in the same zone, while a copy into another Region names no
+/// zone of the Region it came from.
+fn copy_location(
+    source_location: &crate::state::StoredLocation,
+    target_region: &str,
+) -> crate::state::StoredLocation {
+    if source_location.region_name == target_region {
+        source_location.clone()
+    } else {
+        crate::state::StoredLocation::regional(target_region)
+    }
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// snapshot that is in the way and the state it is in.
+fn operation_failure(message: String) -> CopySnapshotError {
+    CopySnapshotErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CopySnapshotError {
+    CopySnapshotErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// `sourceSnapshotName` names no snapshot this account holds in the source
+/// Region: Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message built from the
+/// request.
+///
+/// The member names "the source manual snapshot to copy" without saying which
+/// kind it is, so the message names the member's own subject rather than one of
+/// the two resource types it could have been — the same sentence `ExportSnapshot`
+/// refuses an unknown snapshot name with.
+fn snapshot_not_found(name: &str) -> CopySnapshotError {
+    crate::scaffolded::Scaffolded::does_not_exist(format!("The snapshot does not exist: {name}"))
+}
+
+/// `sourceResourceName` names no instance or disk this account holds in the
+/// source Region, so there is no automatic snapshot of it to copy. The same
+/// `DoesNotExist` envelope, naming the member's own subject: "the source
+/// instance or disk from which the source automatic snapshot was created".
+fn resource_not_found(name: &str) -> CopySnapshotError {
+    crate::scaffolded::Scaffolded::does_not_exist(format!(
+        "The instance or disk does not exist: {name}"
+    ))
+}
+
+/// The resource holds no automatic snapshot the request addresses: the same
+/// `DoesNotExist` envelope, naming the resource and the copy that was asked for.
+fn auto_snapshot_not_found(
+    resource_type: &str,
+    resource_name: &str,
+    date: Option<&str>,
+) -> CopySnapshotError {
+    crate::scaffolded::Scaffolded::does_not_exist(match date {
+        Some(date) => format!(
+            "The automatic snapshot of the {resource_type} {resource_name} does not exist: \
+             {date}"
+        ),
+        None => format!(
+            "The {resource_type} {resource_name} has no restorable automatic snapshot to copy"
+        ),
+    })
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CopySnapshotError {
+    CopySnapshotErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail snapshot store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
