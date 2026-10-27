@@ -8,14 +8,11 @@
 //!
 //! The `arn:aws:iam::aws:policy/` namespace is AWS's own: those policies exist in every
 //! account, which is why one can be attached to a role, so a read of one must answer
-//! from AWS's catalog rather than from the account's policy store. This emulator carries
-//! a SUBSET of that catalog, so an `aws:policy` ARN it does not carry answers 501 — "the
-//! emulator does not hold this policy" — and NOT `NoSuchEntityException`, which would
-//! claim AWS serves no such policy. `NoSuchEntityException` is reserved for the ARN of
-//! an account policy the account does not hold.
-//!
-//! A 501 from an operation in this service means "nobody has written it yet", never
-//! "the emulator is broken".
+//! from AWS's catalog rather than from the account's policy store. An ARN that resolves
+//! to no policy — in either namespace — is refused with the `NoSuchEntityException` this
+//! operation MODELS, because the only refusals it declares are `InvalidInputException`,
+//! `NoSuchEntityException` and `ServiceFailureException`, and a code outside that set is
+//! one no SDK has a branch for.
 //!
 //! ## Shape of an operation
 //!
@@ -192,19 +189,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // An ARN in AWS's own namespace names a policy AWS owns, and this emulator
-        // carries only part of AWS's catalog: answering `NoSuchEntity` here would
-        // assert that AWS holds no such policy, which this emulator cannot know.
-        // The 501 says what is true — the catalog entry is not carried yet — and is
-        // the same answer every unimplemented behaviour gives.
-        if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
-            return Err(crate::scaffolded::Scaffolded::NotImplemented(
-                crate::state::uncarried_aws_managed_policy(&input.policy_arn, "metadata"),
-            ));
-        }
-
-        // An account-owned ARN the account does not hold "referenced a resource
-        // entity that does not exist".
+        // An ARN this service can resolve no policy under "referenced a resource
+        // entity that does not exist" — the one refusal this operation models for a
+        // policy it cannot report, whichever namespace the ARN is in. An entry of
+        // AWS's catalog the emulator does not carry is answered the same way: the
+        // alternative would be a code this operation does not declare, which an SDK
+        // cannot classify.
         Err(GetPolicyErrorModeled::NoSuchEntityException(NoSuchEntityException {
             message: Some(crate::state::policy_not_found(&input.policy_arn)),
         })

@@ -527,9 +527,14 @@ async fn an_aws_managed_policy_reports_the_catalog_entrys_tags() {
     ] {
         let (status, body) = list_tags(&router, arn, None, None).await;
         assert_eq!(
-            status, 501,
-            "case {label:?}: an uncarried AWS-managed ARN is not reported as absent, got \
-             {status}: {body}"
+            status, 404,
+            "case {label:?}: an ARN resolving to no policy is the modelled missing \
+             entity, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "NoSuchEntity",
+            "case {label:?}: expected the modelled awsQuery code, got {body}"
         );
     }
 }
