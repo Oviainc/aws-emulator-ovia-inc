@@ -358,6 +358,10 @@ impl Row {
             name: self.name.clone(),
             causal_anomaly_id: self.causal_anomaly_id.clone(),
             description: self.description.clone(),
+            // Neither anomaly DETAIL shape models a service attribution, so these rows
+            // leave it empty; the anomaly listing's service filter is pinned by the
+            // suite that drives that filter.
+            service_names: Vec::new(),
         }
     }
 

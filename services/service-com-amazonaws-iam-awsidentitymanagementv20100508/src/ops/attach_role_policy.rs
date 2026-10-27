@@ -226,15 +226,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the service that depends on the service-linked role can modify … the role
         // on your behalf" (`UnmodifiableEntityException`), and attaching a managed
         // policy modifies the role's permission policy. The role's PATH is what says
-        // it is service-linked.
+        // it is service-linked, and the refusal is stated in the one sentence this
+        // service words that protection with
+        // (`crate::state::protected_role_message`).
         if crate::state::is_service_linked_role_path(&role.path) {
             return Err(AttachRolePolicyErrorModeled::UnmodifiableEntityException(
                 UnmodifiableEntityException {
-                    message: Some(format!(
-                        "Service role {} cannot be modified: only the service it is linked \
-                         to can modify it",
-                        role.role_name
-                    )),
+                    message: Some(crate::state::protected_role_message(&input.role_name)),
                 },
             )
             .into());

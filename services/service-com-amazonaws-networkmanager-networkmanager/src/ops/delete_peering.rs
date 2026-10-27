@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePeering
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePeering`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes an existing peering connection: the one stored peering the `PeeringId` names is
+//! REMOVED from this service's store and reported back as it was stored, in the state of a
+//! peering on its way out, so every other reader of the store — the peering's own reader,
+//! the network-resource inventory and its tags — stops reporting it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePeering::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This file is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +144,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePeering` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePeeringErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePeering"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeletePeeringErrorModeled::InternalServerException(InternalServerException {
+                message: "the networkmanager store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let mut store = state.lock();
+
+        // An attachment created over this peering takes its core network and its edge
+        // location from it, so removing the peering would leave that attachment reaching a
+        // route table through nothing. Like every other delete of this service, such
+        // dependents block the delete until the caller removes them. The refusal is computed
+        // only for a peering that IS stored, so the one not-found answer below stays the
+        // single path for an id that names nothing.
+        if store.peerings.contains_key(&input.peering_id) {
+            let over = store.attachment_count_over_peering(&input.peering_id);
+            if let Some(refusal) = crate::state::dependents_block_delete(
+                crate::state::PEERING_KIND,
+                &[(crate::state::ATTACHMENT_KIND, over)],
+            ) {
+                return Err(DeletePeeringErrorModeled::ValidationException(refusal).into());
+            }
+        }
+
+        // An id naming no stored peering — never created, or already deleted — is not found,
+        // which is how a caller tells a completed delete from one that never happened.
+        let removed = store.peerings.remove(&input.peering_id).ok_or_else(|| {
+            DeletePeeringErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+                crate::state::PEERING_KIND,
+                &input.peering_id,
+            ))
+        })?;
+
+        // The removed record has no state of its own any more, so the response reports the
+        // state a peering on its way out is in rather than the one the clock would compute.
+        Ok(DeletePeeringOutput {
+            peering: Some(removed.to_peering_with_state(crate::state::STATE_DELETING)),
+        })
     }
 }

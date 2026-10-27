@@ -174,7 +174,9 @@ async fn create_network_interface(router: &MultiServiceRouter, subnet_id: &str) 
 
 /// The form fields a CloudWatch Logs flow log on one resource is created with: everything
 /// the destination type requires, and nothing else.
-fn cloud_watch_logs_params(
+///
+/// Shared with [`super::describe_page_truncation`], which seeds a flow log set to page.
+pub(crate) fn cloud_watch_logs_params(
     resource_type: &str,
     resource_id: &str,
     log_group_name: &str,

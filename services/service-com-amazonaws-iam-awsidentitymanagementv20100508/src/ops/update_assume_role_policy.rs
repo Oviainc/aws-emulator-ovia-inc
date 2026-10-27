@@ -211,26 +211,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let role_name = role.role_name.clone();
-        // Which service a role is linked to is carried by its path, read through the
-        // one definition of that rule in `crate::state`.
-        let linked_service =
-            crate::state::service_linked_role_principal(&role.path).map(str::to_string);
+        // Whether a role is one a service links to itself is carried by its path, read
+        // through the one definition of that rule in `crate::state`.
+        let service_linked = crate::state::is_service_linked_role_path(&role.path);
 
         // "Service-linked roles are protected Amazon Web Services resources. Only the
         // service that depends on the service-linked role can modify or delete the role
         // on your behalf" — so a caller's trust-policy update is refused with the
-        // modelled `UnmodifiableEntityException`, whose documentation says the message
-        // "includes the name of the service that depends on this service-linked role".
-        if let Some(linked_service) = linked_service {
+        // modelled `UnmodifiableEntityException`, stated in the one sentence this
+        // service words that protection with
+        // (`crate::state::protected_role_message`).
+        if service_linked {
             return Err(
                 UpdateAssumeRolePolicyErrorModeled::UnmodifiableEntityException(
                     UnmodifiableEntityException {
-                        message: Some(format!(
-                            "Service role {role_name} cannot be modified: its trust policy is \
-                             that of a service-linked role, so the change must be requested \
-                             through {linked_service}"
-                        )),
+                        message: Some(crate::state::protected_role_message(&input.role_name)),
                     },
                 )
                 .into(),

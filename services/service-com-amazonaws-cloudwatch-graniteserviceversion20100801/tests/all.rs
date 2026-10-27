@@ -29,6 +29,8 @@ mod alarm_evaluation;
 mod alarm_history;
 #[path = "all/alarm_history_data.rs"]
 mod alarm_history_data;
+#[path = "all/alarm_m_of_n_directions.rs"]
+mod alarm_m_of_n_directions;
 #[path = "all/alarm_period_windows.rs"]
 mod alarm_period_windows;
 #[path = "all/alarm_reason_datapoints.rs"]

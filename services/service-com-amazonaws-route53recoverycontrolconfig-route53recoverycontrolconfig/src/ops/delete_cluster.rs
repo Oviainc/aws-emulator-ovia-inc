@@ -5,7 +5,7 @@
 //! with it, from [`crate::state`] once nothing else is left under it, so a following
 //! `DescribeCluster` answers 404; an ARN no cluster is stored under is
 //! `ResourceNotFoundException` (404), and a cluster that still holds a control panel the
-//! caller created, or any routing control, is `ConflictException` (409).
+//! caller created, or any routing control, is `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -171,19 +171,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let default_panel_arn = cluster.default_control_panel_arn.clone();
 
         // A parent is only removable once its children are gone. The default control
-        // panel is part of the cluster, so it does not count as a child here.
+        // panel is part of the cluster, so it does not count as a child here. The
+        // refusal is of the REQUEST — deleting this cluster is not something the service
+        // will do while it owns children — so it is stated as a 400 naming the kind of
+        // dependent that keeps it alive.
         let user_panels = guard
             .ordered_control_panels(Some(&input.cluster_arn))
             .iter()
             .filter(|panel| !panel.default_control_panel)
             .count();
         if user_panels > 0 {
-            return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "cluster {} still has {user_panels} control panel(s)",
-                    input.cluster_arn
-                ),
-            })
+            return Err(DeleteClusterErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::cannot_delete_message(
+                        crate::state::CLUSTER_RESOURCE,
+                        crate::state::NON_DEFAULT_CONTROL_PANEL_DEPENDENTS,
+                    ),
+                },
+            )
             .into());
         }
 
@@ -193,12 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|rc| rc.cluster_arn == input.cluster_arn)
             .count();
         if remaining_controls > 0 {
-            return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "cluster {} still has {remaining_controls} routing control(s)",
-                    input.cluster_arn
-                ),
-            })
+            return Err(DeleteClusterErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::cannot_delete_message(
+                        crate::state::CLUSTER_RESOURCE,
+                        crate::state::ROUTING_CONTROL_DEPENDENTS,
+                    ),
+                },
+            )
             .into());
         }
 

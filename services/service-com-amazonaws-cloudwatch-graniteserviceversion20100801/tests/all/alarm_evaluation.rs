@@ -12,13 +12,14 @@
 //!    beginning with `AWS/`) with HTTP 400 `InvalidParameterValue` and stores nothing, and
 //!    accepts every other namespace. Rows differ in which reserved namespace is named, how
 //!    the prefix is spelled and where it appears.
-//! 2. A metric alarm is in `ALARM` once at least `DatapointsToAlarm` of the datapoints its
-//!    evaluation found in the range it searches satisfy its `ComparisonOperator` against
-//!    `Threshold` — or, where the missing-data treatment left it with fewer datapoints than
-//!    that, once every datapoint it has does — in `OK` when fewer do and at least one
-//!    datapoint was evaluated, and in `INSUFFICIENT_DATA` when none was. Rows differ in the
-//!    comparison, the statistic, the datapoint values and their count, how many of the
-//!    evaluated periods carry one, the age of a datapoint, its unit, its dimension set and
+//! 2. A metric alarm's "M out of N" predicate has two directions, each with a minimum built
+//!    from its configuration: it is in `ALARM` once at least `DatapointsToAlarm` of the
+//!    datapoints its evaluation found in the range it searches satisfy its `ComparisonOperator`
+//!    against `Threshold`, in `OK` once at least `EvaluationPeriods - DatapointsToAlarm + 1` of
+//!    them do not, and in `INSUFFICIENT_DATA` where the datapoints it has reach neither minimum
+//!    — unless the missing-data treatment is `ignore`, which keeps the state it has. Rows
+//!    differ in the comparison, the statistic, the datapoint values and their count, how many of
+//!    the evaluated periods carry one, the age of a datapoint, its unit, its dimension set and
 //!    the `TreatMissingData` setting.
 //! 3. The `StateReason` of an evaluated state explains how that state was decided: it NAMES
 //!    the datapoints the evaluation graded, each value with the instant of the window it
@@ -312,10 +313,13 @@ async fn an_alarms_state_is_evaluated_from_the_datapoints_it_watches() {
             "ALARM",
         ),
         (
+            // "ignore — the current alarm state is maintained" speaks about a window the data
+            // present cannot decide: one clean datapoint is short of the two an alarm needs to
+            // clear a 1-of-2 predicate, so the alarm keeps the state its creation left it in.
             "a non-breaching period beside a missing one, with missing data ignored",
             json!({"EvaluationPeriods": 2, "DatapointsToAlarm": 1, "TreatMissingData": "ignore"}),
             vec![datum(1.0, 0.0)],
-            "OK",
+            "INSUFFICIENT_DATA",
         ),
         (
             "a breaching period beside a missing one, with missing data missing",
@@ -325,17 +329,28 @@ async fn an_alarms_state_is_evaluated_from_the_datapoints_it_watches() {
         ),
         (
             // The missing-data treatments that substitute NOTHING leave the evaluation with
-            // fewer datapoints than the alarm's N, and it is decided by the datapoints it
-            // has: both of the real ones breach, so the alarm crosses even though its M is
-            // three.
+            // fewer datapoints than the alarm's N, and a window that short reaches neither
+            // minimum: two breaching datapoints are one short of this alarm's M, and no
+            // datapoint at all satisfies the OK direction, so nothing is decided.
             "two of three periods breach and the third is missing, with three needed",
             json!({"EvaluationPeriods": 3, "DatapointsToAlarm": 3}),
             vec![datum(42.0, 0.0), datum(43.0, 70.0)],
-            "ALARM",
+            "INSUFFICIENT_DATA",
         ),
         (
+            // The same shape with M defaulting to N: one breaching datapoint of two periods
+            // reaches neither the two breaching the ALARM direction needs nor the one clean
+            // datapoint the OK direction needs.
             "one of two periods breaches and the other is missing, with no DatapointsToAlarm",
             json!({"EvaluationPeriods": 2}),
+            vec![datum(42.0, 0.0)],
+            "INSUFFICIENT_DATA",
+        ),
+        (
+            // … and one breaching datapoint IS enough where the alarm's M is one: the window
+            // being short of N does not change the minimum the direction needs.
+            "one of two periods breaches and the other is missing, with one datapoint needed",
+            json!({"EvaluationPeriods": 2, "DatapointsToAlarm": 1}),
             vec![datum(42.0, 0.0)],
             "ALARM",
         ),
@@ -556,12 +571,27 @@ async fn an_evaluated_state_reason_reports_an_empty_window_as_a_hole_and_names_t
         ),
         reason_row(
             // `missing` substitutes no datapoint, so the two real ones are all the evaluation
-            // had and that is the count it reports — no arm decided anything here.
+            // had — one short of this alarm's M and with no clean datapoint for the OK
+            // direction, so the window decides nothing: the state the alarm reports is the one
+            // its creation left it in, and so is the explanation of it.
             "two real breaching datapoints and a third window the default treatment leaves out",
             json!({"EvaluationPeriods": 3, "DatapointsToAlarm": 3}),
             vec![datum(42.0, 0.0), datum(43.0, 70.0)],
+            "INSUFFICIENT_DATA",
+            vec!["Unchecked: initial alarm creation"],
+            vec!["out of the last", "missing datapoint"],
+        ),
+        reason_row(
+            // The same two real breaching datapoints with an M of two: the ALARM direction's
+            // minimum IS reached, and the reason counts the datapoints it was reached over.
+            "two real breaching datapoints and a third window left out, with two needed",
+            json!({"EvaluationPeriods": 3, "DatapointsToAlarm": 2}),
+            vec![datum(42.0, 0.0), datum(43.0, 70.0)],
             "ALARM",
-            vec!["2 out of the last 2 datapoints"],
+            vec![
+                "2 out of the last 2 datapoints",
+                "(minimum 2 datapoints for OK -> ALARM transition).",
+            ],
             vec!["missing datapoint", "no datapoints were received"],
         ),
     ];
@@ -626,6 +656,9 @@ async fn an_evaluation_with_nothing_to_grade_reports_the_datapoints_it_did_not_h
     // to wait out: no datapoint is left in it, the default `missing` treatment substitutes
     // none, and the evaluation reports the datapoints it does not have instead of naming an
     // arm.
+    // The rows differ in how many evaluation periods the alarm covers; each names an M of one,
+    // so the single datapoint it publishes decides the alarm while it is in the range and the
+    // reason reports the periods it has no datapoint for once that datapoint has aged out.
     let rows = [
         (
             "one evaluation period",
@@ -650,7 +683,11 @@ async fn an_evaluation_with_nothing_to_grade_reports_the_datapoints_it_did_not_h
         let name = format!("aged-out-{index}");
         let alarm = patched(
             &name,
-            &json!({"Period": SHORTEST_PERIOD_SECS, "EvaluationPeriods": periods}),
+            &json!({
+                "Period": SHORTEST_PERIOD_SECS,
+                "EvaluationPeriods": periods,
+                "DatapointsToAlarm": 1,
+            }),
         );
         ok(&router, "PutMetricAlarm", &alarm).await;
         // The oldest period the alarm's evaluation range still searches, mid-period: the

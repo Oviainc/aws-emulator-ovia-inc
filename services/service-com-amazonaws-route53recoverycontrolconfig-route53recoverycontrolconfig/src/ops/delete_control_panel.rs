@@ -4,8 +4,8 @@
 //! Implemented: removes the control panel from [`crate::state`] once nothing is left
 //! under it, so a following `DescribeControlPanel` answers 404; an ARN no control panel
 //! is stored under is `ResourceNotFoundException` (404), a panel that still holds routing
-//! controls is `ConflictException` (409), and so is the cluster's default control panel,
-//! which exists for as long as its cluster does.
+//! controls is `ValidationException` (400), and so is the cluster's default control
+//! panel, which exists for as long as its cluster does.
 //!
 //! ## Shape of an operation
 //!
@@ -170,27 +170,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The default control panel is created with its cluster and removed with it, so
-        // it cannot be deleted on its own.
+        // it cannot be deleted on its own. Deleting it is not something the service
+        // will do at all, so the refusal is of the request's input.
         if panel.default_control_panel {
-            return Err(DeleteControlPanelErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "{} is the default control panel of cluster {} and is deleted with it",
-                        input.control_panel_arn, panel.cluster_arn
+            return Err(DeleteControlPanelErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::cannot_delete_default_message(
+                        crate::state::CONTROL_PANEL_RESOURCE,
                     ),
                 },
             )
             .into());
         }
 
-        // A parent is only removable once its children are gone.
+        // A parent is only removable once its children are gone, stated the way the
+        // cluster states the same refusal: the kind of resource addressed and the kind
+        // of dependent that keeps it alive.
         let remaining = guard.routing_control_count(&input.control_panel_arn);
         if remaining > 0 {
-            return Err(DeleteControlPanelErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "control panel {} still has {remaining} routing control(s)",
-                        input.control_panel_arn
+            return Err(DeleteControlPanelErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::cannot_delete_message(
+                        crate::state::CONTROL_PANEL_RESOURCE,
+                        crate::state::ROUTING_CONTROL_DEPENDENTS,
                     ),
                 },
             )

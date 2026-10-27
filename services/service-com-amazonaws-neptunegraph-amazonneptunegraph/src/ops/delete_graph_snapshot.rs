@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGraphSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGraphSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGraphSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: accepts the deletion of a persisted snapshot and reports the stored
+//! record on its way out. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +151,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGraphSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGraphSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGraphSnapshot"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteGraphSnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A snapshot lives in exactly one Region, so the Region this request was signed
+        // for is part of the lookup: a snapshot of another Region is not deletable
+        // through this endpoint.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // The lookup materialises what the clock already made due, so a snapshot whose
+        // own deletion has already fallen due is gone rather than deletable twice, and
+        // one whose creation has come due is deletable.
+        let Some(snapshot) = store.settled_snapshot_mut(&input.snapshot_identifier, &region, now)
+        else {
+            return Err(DeleteGraphSnapshotErrorModeled::ResourceNotFoundException(
+                crate::state::snapshot_not_found(&input.snapshot_identifier),
+            )
+            .into());
+        };
+
+        // A snapshot with a transition still outstanding cannot be deleted yet: it is
+        // either still being captured (`CREATING`), so it holds no complete copy of the
+        // data this call would discard, or already on its way out (`DELETING`). That is
+        // the same precondition `DeleteGraph` states for a graph whose status change is
+        // in flight. `AVAILABLE` is the only status a snapshot rests in, and deletion is
+        // how it goes away.
+        if snapshot.status != crate::state::SnapshotStatus::Available {
+            return Err(DeleteGraphSnapshotErrorModeled::ConflictException(
+                crate::state::snapshot_state_conflict("delete", snapshot.status),
+            )
+            .into());
+        }
+
+        // The deletion is ACCEPTED, not finished: the snapshot reports `DELETING` and
+        // stays observable — readable, listed, and holding the name it reserves — until
+        // the removal the clock owes falls due (`crate::state::SNAPSHOT_DELETION_SPAN`),
+        // after which no read reports it at all. No handler sleeps for it.
+        snapshot.begin_deletion(now);
+        // Report the record that was stored, so this response cannot drift from what a
+        // later GetGraphSnapshot answers while the deletion is in flight.
+        Ok(Self::Output::from(&*snapshot))
     }
 }

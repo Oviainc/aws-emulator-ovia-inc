@@ -131,6 +131,8 @@ mod route_update;
 mod route_validation;
 #[path = "all/routing_rule_lifecycle.rs"]
 mod routing_rule_lifecycle;
+#[path = "all/routing_rule_update.rs"]
+mod routing_rule_update;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/stage_lifecycle.rs"]

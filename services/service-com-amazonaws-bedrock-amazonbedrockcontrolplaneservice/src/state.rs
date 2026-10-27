@@ -113,9 +113,10 @@
 //! removes, each holding the foundation models that profile tracks metrics and costs for.
 //!
 //! And it holds the batch inference jobs `ops/create_model_invocation_job.rs` submits,
-//! `ops/get_model_invocation_job.rs` reads back and `ops/list_model_invocation_jobs.rs`
-//! reports, together with the instant each job's non-terminal `status` is owed its next
-//! move and the instant the job would time out.
+//! `ops/get_model_invocation_job.rs` reads back, `ops/list_model_invocation_jobs.rs`
+//! reports and `ops/stop_model_invocation_job.rs` winds down, together with the instant
+//! each job's non-terminal `status` is owed its next move and the instant the job would
+//! time out.
 //!
 //! And it holds the published foundation model catalog — the base models
 //! `ops/list_foundation_models.rs` reports and `ops/get_foundation_model.rs` resolves one
@@ -1759,6 +1760,16 @@ impl ModelCustomizationJobRecord {
 /// clock moves it on.
 pub const MODEL_INVOCATION_JOB_STATUS_SUBMITTED: &str = "Submitted";
 
+/// `ModelInvocationJobStatus` — a batch inference job being checked over before it is
+/// queued to run: "Validating – This job is being validated for the requirements described
+/// in Format and upload your batch inference data".
+pub const MODEL_INVOCATION_JOB_STATUS_VALIDATING: &str = "Validating";
+
+/// `ModelInvocationJobStatus` — a validated batch inference job waiting its turn:
+/// "Scheduled – This job has been validated and is now in a queue. The job will
+/// automatically start when it reaches its turn".
+pub const MODEL_INVOCATION_JOB_STATUS_SCHEDULED: &str = "Scheduled";
+
 /// `ModelInvocationJobStatus` — a batch inference job that has begun: "InProgress – This
 /// job has begun. You can start viewing the results in the output S3 location".
 pub const MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS: &str = "InProgress";
@@ -1766,6 +1777,33 @@ pub const MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS: &str = "InProgress";
 /// `ModelInvocationJobStatus` — the terminal status of a batch inference job that ran to
 /// the end of its input: "Completed – This job has successfully completed".
 pub const MODEL_INVOCATION_JOB_STATUS_COMPLETED: &str = "Completed";
+
+/// `ModelInvocationJobStatus` — a batch inference job a user asked to stop, while that
+/// stop is still being carried out: "Stopping – This job is being stopped by a user".
+pub const MODEL_INVOCATION_JOB_STATUS_STOPPING: &str = "Stopping";
+
+/// `ModelInvocationJobStatus` — the terminal status of a batch inference job a user
+/// stopped: "Stopped – This job was stopped by a user".
+pub const MODEL_INVOCATION_JOB_STATUS_STOPPED: &str = "Stopped";
+
+/// The `ModelInvocationJobStatus` values a batch inference job can still be stopped from:
+/// a job that has been submitted, is being validated, is queued or is running has work a
+/// stop winds down (`smithy_query(query="doc",shape="ModelInvocationJobSummary",member="status")`).
+/// Every other value of the enum is either terminal or a stop already in flight, which is
+/// why a stop of one of those changes nothing.
+pub const MODEL_INVOCATION_JOB_STOPPABLE_STATUSES: &[&str] = &[
+    MODEL_INVOCATION_JOB_STATUS_SUBMITTED,
+    MODEL_INVOCATION_JOB_STATUS_VALIDATING,
+    MODEL_INVOCATION_JOB_STATUS_SCHEDULED,
+    MODEL_INVOCATION_JOB_STATUS_IN_PROGRESS,
+];
+
+/// How long after `StopModelInvocationJob` accepted the stop a batch inference job is owed
+/// its move from [`MODEL_INVOCATION_JOB_STATUS_STOPPING`] to
+/// [`MODEL_INVOCATION_JOB_STATUS_STOPPED`]. Chosen for the reason
+/// [`MODEL_INVOCATION_JOB_BEGINS_AFTER`] is, and non-zero so a caller reading the job
+/// straight after the stop still sees the status the stop recorded.
+pub const MODEL_INVOCATION_JOB_STOPPED_AFTER: Duration = Duration::from_millis(500);
 
 /// How long after it was submitted a batch inference job is owed its move from
 /// [`MODEL_INVOCATION_JOB_STATUS_SUBMITTED`] to
@@ -1858,6 +1896,9 @@ pub struct ModelInvocationJobRecord {
     /// [`MODEL_INVOCATION_JOB_STATUS_COMPLETED`], or `None` while the job has not begun yet
     /// or has already reached a terminal status.
     pub completed_due_at: Option<SystemTime>,
+    /// When [`Self::status`] is owed its move to
+    /// [`MODEL_INVOCATION_JOB_STATUS_STOPPED`], or `None` while no stop is in flight.
+    pub stopped_due_at: Option<SystemTime>,
     /// `submitTime` — when the job was submitted.
     pub submit_time: SystemTime,
     /// `lastModifiedTime`: the submission instant until something changes the job, and the
@@ -1868,9 +1909,30 @@ pub struct ModelInvocationJobRecord {
 }
 
 impl ModelInvocationJobRecord {
+    /// Whether a stop has work to wind down on this job: its status is one a job that has
+    /// not finished carries ([`MODEL_INVOCATION_JOB_STOPPABLE_STATUSES`]).
+    #[must_use]
+    pub fn is_stoppable(&self) -> bool {
+        MODEL_INVOCATION_JOB_STOPPABLE_STATUSES.contains(&self.status)
+    }
+
+    /// Move this job to [`MODEL_INVOCATION_JOB_STATUS_STOPPING`] and record when the stop
+    /// is owed its move to [`MODEL_INVOCATION_JOB_STATUS_STOPPED`].
+    ///
+    /// The caller's own write, asked for by `StopModelInvocationJob` — not a clock
+    /// transition. The inference it was queued for or running is being wound down, so the
+    /// job is owed neither its start nor its completion any more.
+    pub fn stop(&mut self, now: SystemTime) {
+        self.status = MODEL_INVOCATION_JOB_STATUS_STOPPING;
+        self.in_progress_due_at = None;
+        self.completed_due_at = None;
+        self.stopped_due_at = Some(now + MODEL_INVOCATION_JOB_STOPPED_AFTER);
+        self.last_modified_at = now;
+    }
+
     /// Materialise the status transitions the clock has already made due at `now`.
     ///
-    /// Both moves are owed at their due instant even if nobody called, which is why that
+    /// Every move is owed at its due instant even if nobody called, which is why that
     /// instant — not `now` — is the one the job reports as its last modification and its
     /// end, and why settling twice at different instants reports the same instants.
     pub fn settle(&mut self, now: SystemTime) {
@@ -1883,6 +1945,12 @@ impl ModelInvocationJobRecord {
         if let Some(due) = self.completed_due_at.filter(|due| now >= *due) {
             self.status = MODEL_INVOCATION_JOB_STATUS_COMPLETED;
             self.completed_due_at = None;
+            self.ended_at = Some(due);
+            self.last_modified_at = due;
+        }
+        if let Some(due) = self.stopped_due_at.filter(|due| now >= *due) {
+            self.status = MODEL_INVOCATION_JOB_STATUS_STOPPED;
+            self.stopped_due_at = None;
             self.ended_at = Some(due);
             self.last_modified_at = due;
         }
