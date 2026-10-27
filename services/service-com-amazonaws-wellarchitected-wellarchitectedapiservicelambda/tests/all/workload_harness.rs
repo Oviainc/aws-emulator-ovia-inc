@@ -296,6 +296,15 @@ impl Client {
         .await
     }
 
+    /// `UpdateReviewTemplate`: `PATCH /reviewTemplates/{TemplateArn}`. The ARN is a
+    /// non-greedy `@httpLabel`, so it travels percent-encoded in one path segment, exactly
+    /// as an SDK sends it.
+    pub(crate) async fn update_review_template(&self, template_arn: &str, body: Value) -> Answer {
+        let encoded = encode_path_segment(template_arn);
+        self.send("PATCH", &format!("/reviewTemplates/{encoded}"), Some(body))
+            .await
+    }
+
     /// `UpdateReviewTemplateLensReview`:
     /// `PATCH /reviewTemplates/{TemplateArn}/lensReviews/{LensAlias}`. Both labels are
     /// non-greedy, so each travels percent-encoded in one path segment, exactly as an

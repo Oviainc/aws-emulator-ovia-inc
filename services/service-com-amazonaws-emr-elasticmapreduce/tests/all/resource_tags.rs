@@ -30,22 +30,26 @@ use crate::refusal_messages::{message, studio_request};
 
 /// The resource kinds `AddTags` names: "a cluster identifier or an Amazon EMR Studio ID"
 /// (`AddTags$ResourceId` doc), each with the read that reports its tags.
-const CLUSTER: &str = "cluster";
-const STUDIO: &str = "studio";
+pub(crate) const CLUSTER: &str = "cluster";
+pub(crate) const STUDIO: &str = "studio";
 
 /// The error code the operation models, which every refusal below carries.
-const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
+pub(crate) const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
 
 /// A tag key and its value, as a row states it. `None` is a tag submitted with no
 /// `Value` at all, which the model allows ("an optional value string").
-type Pair = (String, Option<String>);
+///
+/// `pub(crate)` here and below so the sibling suite that drives `RemoveTags` states its
+/// tags, creates its resources and reads them back through these helpers rather than its
+/// own copies.
+pub(crate) type Pair = (String, Option<String>);
 
-fn pair(key: &str, value: Option<&str>) -> Pair {
+pub(crate) fn pair(key: &str, value: Option<&str>) -> Pair {
     (key.to_string(), value.map(str::to_string))
 }
 
 /// A `TagList` as the wire carries it: `Value` is left out of an entry that has none.
-fn tag_list(pairs: &[Pair]) -> Value {
+pub(crate) fn tag_list(pairs: &[Pair]) -> Value {
     Value::Array(
         pairs
             .iter()
@@ -83,7 +87,7 @@ fn expected_map(pairs: &[Pair]) -> BTreeMap<String, Option<String>> {
 }
 
 /// A Studio this account holds, under `name`.
-async fn create_studio(emr: &Emr, name: &str) -> String {
+pub(crate) async fn create_studio(emr: &Emr, name: &str) -> String {
     emr.ok("CreateStudio", studio_request(name)).await["StudioId"]
         .as_str()
         .unwrap_or_else(|| panic!("CreateStudio must answer a StudioId for {name:?}"))
@@ -92,7 +96,7 @@ async fn create_studio(emr: &Emr, name: &str) -> String {
 
 /// The `Tags` member of the resource `resource_id` names, read back through the
 /// operation that reports that kind of resource.
-async fn read_tags(emr: &Emr, kind: &str, resource_id: &str) -> Value {
+pub(crate) async fn read_tags(emr: &Emr, kind: &str, resource_id: &str) -> Value {
     if kind == CLUSTER {
         let cluster = emr.describe_cluster(resource_id).await;
         at(&cluster, &["Tags"]).clone()
@@ -105,7 +109,13 @@ async fn read_tags(emr: &Emr, kind: &str, resource_id: &str) -> Value {
 }
 
 /// Assert the resource carries exactly `expected`, read back through its own describe.
-async fn assert_tags(emr: &Emr, case: &str, kind: &str, resource_id: &str, expected: &[Pair]) {
+pub(crate) async fn assert_tags(
+    emr: &Emr,
+    case: &str,
+    kind: &str,
+    resource_id: &str,
+    expected: &[Pair],
+) {
     let tags = read_tags(emr, kind, resource_id).await;
     if expected.is_empty() {
         assert!(
@@ -262,7 +272,7 @@ fn cases() -> Vec<Case> {
 }
 
 /// `AddTags` on `resource_id`, which must succeed and answer a body with no members.
-async fn add_tags_ok(emr: &Emr, case: &str, resource_id: &str, tags: &[Pair]) {
+pub(crate) async fn add_tags_ok(emr: &Emr, case: &str, resource_id: &str, tags: &[Pair]) {
     let out = emr
         .ok(
             "AddTags",
@@ -536,7 +546,7 @@ async fn cluster_id_scopes_the_tag_operation() {
 // ---------------------------------------------------------------------------
 
 /// The `ErrorCode` member of a refusal, or `None` when it carries none.
-fn error_code(payload: &Value) -> Option<String> {
+pub(crate) fn error_code(payload: &Value) -> Option<String> {
     at(payload, &["ErrorCode"]).as_str().map(str::to_string)
 }
 

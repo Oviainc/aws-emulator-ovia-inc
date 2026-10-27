@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ActivateType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ActivateType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Activating a public third-party extension in this account and Region: the registry
+//! record the activation leaves, and the ARN this account addresses it by.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`ActivateType::handle`] with real behaviour and
@@ -115,6 +114,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::registry;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -185,18 +185,269 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ActivateType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ActivateTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ActivateType"))
+        // What the request names, and the rules the model states in prose rather than in a
+        // constraint. Refused before any state is touched.
+        let named = PublicExtension::read(&input).map_err(registry_exception)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no registry to activate an
+            // extension in, so this answers 501 rather than an activation nothing recorded.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("ActivateType"));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The settle walk every operation makes first, so this call reads and writes a
+        // registry in which every transition the clock had already made due is installed.
+        store.settle(now);
+
+        // "If you specify an alias for the extension, CloudFormation treats the alias as the
+        // extension type name within this account and Region": the activation is addressed
+        // by the local name, which is the alias where the request gives one.
+        let local_name = named.local_name().to_string();
+        let arn = registry::type_arn(&region, &named.type_kind, &local_name);
+        // "Extensions provided by Amazon Web Services are not assigned a publisher ID": the
+        // activation carries the publisher the request named, and none where it named
+        // nobody.
+        let publisher_id = Some(named.publisher_id.clone()).filter(|id| !id.is_empty());
+
+        // What this Region's registry already holds under that local name. Re-activating the
+        // same extension updates the activation ("manually updates a previously-activated
+        // type"); another extension under that name is the alias clash the registry refuses,
+        // since "an extension alias must be unique within a given account and Region".
+        if let Some(held) = store.extension_by_arn(&region, &arn) {
+            let same = held.original_type_name.as_deref() == Some(named.type_name.as_str())
+                && held.publisher_id == publisher_id;
+            if !same {
+                return Err(registry_exception(format!(
+                    "Type name alias {local_name} is already in use by another extension in \
+                     this account and Region"
+                )));
+            }
+        }
+
+        // The version of the PUBLIC extension being activated, where this Region's registry
+        // holds the publication it was published by ([`state::published_extension`]): the
+        // activated extension is that version, so its schema and its published version
+        // number are the activation's. A public extension this registry does not hold is
+        // activated from what the request names alone — this emulator does not mirror the
+        // public registry AWS runs — so the activation records no schema rather than one it
+        // invented.
+        let published = store
+            .published_extension(&region, &named.type_kind, &named.type_name)
+            .and_then(|public| {
+                public
+                    .versions
+                    .iter()
+                    .next_back()
+                    .map(|version| (public.arn.clone(), version.clone()))
+            });
+
+        let existing = store.extension_by_arn_mut(&region, &arn);
+        let activation = match existing {
+            Some(held) => held,
+            None => {
+                let mut record =
+                    registry::StoredExtension::new(&region, &named.type_kind, &local_name);
+                record.visibility = registry::visibility::PUBLIC.to_string();
+                record.publisher_id = publisher_id.clone();
+                record.original_type_name = Some(named.type_name.clone());
+                record.original_type_arn = Some(
+                    published
+                        .as_ref()
+                        .map(|(public_arn, _)| public_arn.clone())
+                        .unwrap_or_else(|| {
+                            registry::public_type_arn(
+                                &region,
+                                &named.type_kind,
+                                &named.type_name,
+                            )
+                        }),
+                );
+                let version_id = registry::next_public_version_id(&[]);
+                let mut version =
+                    registry::StoredTypeVersion::new(&record.arn, &version_id, now);
+                if let Some((_, published)) = &published {
+                    version.schema = published.schema.clone();
+                    version.description = published.description.clone();
+                    version.provisioning_type = published.provisioning_type.clone();
+                    version.public_version_number = published.public_version_number.clone();
+                    version.source_url = published.source_url.clone();
+                    version.documentation_url = published.documentation_url.clone();
+                }
+                record.latest_public_version = version.public_version_number.clone();
+                record.versions.push(version);
+                // An activation names the extension by a CALLER-CHOSEN local name (its
+                // `TypeNameAlias`), so this is the one site at which a caller adds registry
+                // records: the oldest is reclaimed past the registry's ceiling, exactly as
+                // the versions of one record are, so the store cannot grow without limit.
+                let over_the_bound =
+                    (store.extensions.len() + 1).saturating_sub(registry::MAX_EXTENSIONS);
+                if over_the_bound > 0 {
+                    store.extensions.drain(..over_the_bound);
+                }
+                store.extensions.push(record);
+                store
+                    .extension_by_arn_mut(&region, &arn)
+                    .expect("the record pushed just above")
+            }
+        };
+        // "Whether to automatically update the extension in this account and Region when a
+        // new minor version is published by the extension publisher… The default is true."
+        activation.is_activated = Some(true);
+        activation.auto_update = Some(input.auto_update.unwrap_or(true));
+        if let Some(version) = activation.versions.iter_mut().next_back() {
+            // "The name of the IAM execution role to use to activate the extension", and the
+            // logging configuration the activation was given, both recorded on the version
+            // the activation installed — where `DescribeType` reports them.
+            if let Some(role_arn) = &input.execution_role_arn {
+                version.execution_role_arn = Some(role_arn.clone());
+            }
+            if let Some(logging) = &input.logging_config {
+                version.logging_config = Some(registry::StoredLoggingConfig {
+                    log_role_arn: logging.log_role_arn.clone(),
+                    log_group_name: logging.log_group_name.clone(),
+                });
+            }
+            version.last_updated = Some(now);
+        }
+
+        Ok(ActivateTypeOutput { arn: Some(arn) })
     }
+}
+
+/// The PUBLIC extension one `ActivateType` request names: its kind, its name, the publisher
+/// that published it, and the alias (if any) this account is to address the activation by.
+#[derive(Debug, Clone)]
+struct PublicExtension {
+    type_kind: String,
+    type_name: String,
+    publisher_id: String,
+    type_name_alias: Option<String>,
+}
+
+impl PublicExtension {
+    /// What the request names, or `Err(message)` for a request that identifies no public
+    /// extension at all.
+    ///
+    /// Every modelled constraint (each member's length, pattern and range) is already
+    /// enforced before the handler runs; what is left are the conditional rules the model
+    /// states in prose: "You must specify PublicTypeArn, or TypeName, Type, and PublisherId"
+    /// and "You can specify MajorVersion or VersionBump, but not both".
+    ///
+    /// The first of those is a rule about what must be IDENTIFIED, not about which members
+    /// may appear: a `PublicTypeArn` carries the kind, the publisher and the name itself, so
+    /// a request that also spells one of them out is honoured where the two agree and refused
+    /// where they disagree — which is the only case in which the request names two different
+    /// extensions. Without that ARN the extension is named by its kind and its name, and the
+    /// publisher is whoever published it.
+    fn read(input: &ActivateTypeInput) -> Result<Self, String> {
+        if input.major_version.is_some() && input.version_bump.is_some() {
+            return Err(
+                "Specify MajorVersion or VersionBump, but not both: the two name the version \
+                 to activate independently"
+                    .to_string(),
+            );
+        }
+        let type_name_alias = input.type_name_alias.clone();
+        let named = match input.public_type_arn.as_deref() {
+            Some(public_type_arn) => {
+                let (type_kind, publisher_id, type_name) = split_public_type_arn(public_type_arn)
+                    .ok_or_else(|| {
+                        format!(
+                            "PublicTypeArn {public_type_arn} does not name the kind, the \
+                             publisher and the name of a public extension"
+                        )
+                    })?;
+                for (member, spelled, carried) in [
+                    ("Type", input.r#type.as_deref(), type_kind.as_str()),
+                    (
+                        "PublisherId",
+                        input.publisher_id.as_deref(),
+                        publisher_id.as_str(),
+                    ),
+                    ("TypeName", input.type_name.as_deref(), type_name.as_str()),
+                ] {
+                    if spelled.is_some_and(|spelled| !spelled.eq_ignore_ascii_case(carried)) {
+                        return Err(format!(
+                            "{member} states {} while PublicTypeArn names {carried}: the two \
+                             identify different public extensions",
+                            spelled.unwrap_or_default()
+                        ));
+                    }
+                }
+                Self {
+                    type_kind,
+                    type_name,
+                    publisher_id,
+                    type_name_alias,
+                }
+            }
+            None => match (input.r#type.as_deref(), input.type_name.as_deref()) {
+                (Some(type_kind), Some(type_name)) => Self {
+                    type_kind: type_kind.to_string(),
+                    type_name: type_name.to_string(),
+                    publisher_id: input.publisher_id.clone().unwrap_or_default(),
+                    type_name_alias,
+                },
+                _ => {
+                    return Err(
+                        "Either PublicTypeArn, or both Type and TypeName, must be specified to \
+                         identify the public extension to activate"
+                            .to_string(),
+                    )
+                }
+            },
+        };
+        Ok(named)
+    }
+
+    /// The name this account addresses the activation by: the alias where the request gives
+    /// one, else the public extension's own name.
+    fn local_name(&self) -> &str {
+        self.type_name_alias.as_deref().unwrap_or(&self.type_name)
+    }
+}
+
+/// The kind, the publisher id and the extension name a `PublicTypeArn` carries.
+///
+/// The modelled pattern is `…::type/.+/[0-9a-zA-Z]{12,40}/.+$`, so the segments after
+/// `type/` are the extension's KIND, the id of the publisher that published it and the
+/// extension's name. A registry ARN spells the kind in lower case and the `::` separators of
+/// a type name as `-` ([`registry::arn_kind_segment`], [`registry::arn_type_name`]), so both
+/// are read back here into the spellings the registry keys a record by — a type name's own
+/// segments carry no `-` of their own (`TypeName`'s pattern admits only letters and digits in
+/// them), so that reading is unambiguous, and a kind the registry does not name is read as
+/// the extension kind it spells. `None` for an ARN carrying no such segments at all.
+fn split_public_type_arn(arn: &str) -> Option<(String, String, String)> {
+    let (_, path) = arn.split_once(":type/")?;
+    let mut segments = path.split('/');
+    let type_kind = segments.next()?;
+    let publisher_id = segments.next()?;
+    let type_name = segments.next()?;
+    if type_kind.is_empty() || publisher_id.is_empty() || type_name.is_empty() {
+        return None;
+    }
+    let type_kind = [
+        registry::registry_type::RESOURCE,
+        registry::registry_type::MODULE,
+        registry::registry_type::HOOK,
+    ]
+    .into_iter()
+    .find(|kind| registry::arn_kind_segment(kind).eq_ignore_ascii_case(type_kind))
+    .map_or_else(|| type_kind.to_ascii_uppercase(), str::to_string);
+    Some((
+        type_kind,
+        publisher_id.to_string(),
+        type_name.replace('-', "::"),
+    ))
+}
+
+/// The registry's own modelled refusal: HTTP 400 `CFNRegistryException`, "an error occurred
+/// during a CloudFormation registry operation".
+fn registry_exception(message: String) -> ActivateTypeError {
+    ActivateTypeErrorModeled::CFNRegistryException(CFNRegistryException {
+        message: Some(message),
+    })
+    .into()
 }

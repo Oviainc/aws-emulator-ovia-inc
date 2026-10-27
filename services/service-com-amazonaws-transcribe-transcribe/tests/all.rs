@@ -109,6 +109,8 @@ mod tagging_resource_families;
 mod transcription_job_absent_media_state;
 #[path = "all/transcription_job_language_identification.rs"]
 mod transcription_job_language_identification;
+#[path = "all/transcription_job_output_encryption.rs"]
+mod transcription_job_output_encryption;
 #[path = "all/transcription_job_queueing.rs"]
 mod transcription_job_queueing;
 #[path = "all/transcription_job_redacted_output.rs"]

@@ -21,8 +21,9 @@
 //! created, whether it carries tags, how many announcements one gateway holds, which selector
 //! the request uses, how many ids it names, and how large a page it asks for (both published
 //! bounds of `TransitGatewayMaxResults` and one past each). The announcements are seeded
-//! through the store's own writer (`insert_transit_gateway_route_table_announcement`),
-//! because `CreateTransitGatewayRouteTableAnnouncement` is still a scaffold stub.
+//! through the store's own writer (`insert_transit_gateway_route_table_announcement`), so
+//! this suite covers the describe alone; what
+//! `CreateTransitGatewayRouteTableAnnouncement` writes has its own suite.
 
 use ec2::ops::types::{
     TRANSIT_GATEWAY_ROUTE_TABLE_ANNOUNCEMENT_DIRECTION_VALUES,

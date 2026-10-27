@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDescribeTypeConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDescribeTypeConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reading the account-level CONFIGURATIONS this account and Region holds for a batch of
+//! extensions: one entry per identifier the request names, and this batch's own error entry
+//! for an identifier that names no extension.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`BatchDescribeTypeConfigurations::handle`] with real behaviour and
@@ -76,6 +76,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::registry;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +147,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDescribeTypeConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDescribeTypeConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDescribeTypeConfigurations"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Not the shared in-memory engine: there is no registry to read the
+            // configurations out of, so this answers 501 rather than an empty batch.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "BatchDescribeTypeConfigurations",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        let store = state.lock();
+        // Every identifier is read against ONE held view of the store, so a write landing
+        // while this batch is served is observed as a whole pre- or post-image: the batch
+        // cannot report one extension's configuration from before it and another's from
+        // after it.
+        let mut details: Vec<TypeConfigurationDetails> = Vec::new();
+        let mut errors: Vec<BatchDescribeTypeConfigurationsError2> = Vec::new();
+        // The identifier list carries no modelled upper bound, so the read is served for at
+        // most [`MAX_DESCRIBED_TYPE_CONFIGURATIONS`] of them and the rest are reported as
+        // the configurations this call did not process — the member the output models for
+        // exactly that. Both the work done under the lock and the size of the answer are
+        // therefore bounded whatever one caller asks for.
+        let (described, unprocessed) = input
+            .type_configuration_identifiers
+            .split_at(input.type_configuration_identifiers.len().min(
+                MAX_DESCRIBED_TYPE_CONFIGURATIONS,
+            ));
+        for identifier in described {
+            // "The alias specified for this configuration, if one was specified when the
+            // configuration was set": an identifier naming no alias names the extension's
+            // default configuration.
+            let alias = identifier
+                .type_configuration_alias
+                .clone()
+                .unwrap_or_else(|| registry::DEFAULT_CONFIGURATION_ALIAS.to_string());
+            let resolved = store.extensions_in(&region).find(|extension| {
+                match identifier.type_configuration_arn.as_deref() {
+                    // A configuration ARN addresses one configuration of one extension, so
+                    // the record that holds it is the one this identifier names.
+                    Some(configuration_arn) => {
+                        extension.configuration_by_arn(configuration_arn).is_some()
+                    }
+                    None => match (
+                        identifier.type_arn.as_deref(),
+                        identifier.r#type.as_deref(),
+                        identifier.type_name.as_deref(),
+                    ) {
+                        (Some(type_arn), _, _) => extension.arn == type_arn,
+                        (None, Some(type_kind), Some(type_name)) => {
+                            extension.type_kind == type_kind && extension.type_name == type_name
+                        }
+                        _ => false,
+                    },
+                }
+            });
+            let Some(extension) = resolved else {
+                // An identifier no extension of this account and Region answers to is
+                // reported as this batch's own error entry, naming the identifier it came
+                // from: the read as a whole succeeds, which is what makes a batch a batch.
+                errors.push(BatchDescribeTypeConfigurationsError2 {
+                    error_code: Some(NOT_FOUND_ERROR_CODE.to_string()),
+                    error_message: Some(crate::state::extension_does_not_exist(
+                        &named(identifier),
+                    )),
+                    type_configuration_identifier: Some(identifier.clone()),
+                });
+                continue;
+            };
+            let held = match identifier.type_configuration_arn.as_deref() {
+                Some(configuration_arn) => extension.configuration_by_arn(configuration_arn),
+                None => extension.configuration_with_alias(&alias),
+            };
+            details.push(TypeConfigurationDetails {
+                // "If a configuration hasn't been set for a specified extension,
+                // CloudFormation returns `{}`" — and `null` for when it was last updated,
+                // there being no write to report the instant of.
+                configuration: Some(
+                    held.map_or_else(
+                        || NO_CONFIGURATION.to_string(),
+                        |held| held.configuration.clone(),
+                    ),
+                ),
+                arn: held.map(|held| held.arn.clone()),
+                alias: held.map(|held| held.alias.clone()),
+                last_updated: held.map(|held| crate::state::timestamp(held.last_updated)),
+                type_arn: Some(extension.arn.clone()),
+                type_name: Some(extension.type_name.clone()),
+                is_default_configuration: Some(
+                    held.is_some_and(|held| {
+                        held.alias == registry::DEFAULT_CONFIGURATION_ALIAS
+                    }),
+                ),
+            });
+        }
+
+        Ok(BatchDescribeTypeConfigurationsOutput {
+            type_configurations: crate::state::non_empty(details),
+            errors: crate::state::non_empty(errors),
+            // What the bound above left out: "a list of any of the specified extension
+            // configurations that CloudFormation could not process for any reason".
+            unprocessed_type_configurations: crate::state::non_empty(unprocessed.to_vec()),
+        })
     }
+}
+
+/// How many of one request's identifiers this read serves.
+///
+/// `TypeConfigurationIdentifiers` carries a minimum and no maximum (`len 1..`), and each
+/// identifier costs a scan of this Region's registry and a reported configuration of up to
+/// the modelled `TypeConfiguration` length, so the whole read — the work under the store lock
+/// and the bytes of the answer — would otherwise grow with what one caller sends. Chosen,
+/// and chosen to be the batch size AWS's own console reads an account's extensions in; the
+/// identifiers past it are reported under `UnprocessedTypeConfigurations`, so a caller with
+/// more of them reads the rest in another call rather than being refused.
+const MAX_DESCRIBED_TYPE_CONFIGURATIONS: usize = 50;
+
+/// The `ErrorCode` this batch reports for an identifier no extension of this account and
+/// Region answers to: the HTTP status of the modelled `TypeConfigurationNotFoundException`
+/// the same miss is refused with when it is the whole request, as the modelled `ErrorCode`
+/// length (exactly three characters) carries.
+const NOT_FOUND_ERROR_CODE: &str = "404";
+
+/// What `Configuration` reports for an extension no configuration has been set for: "if a
+/// configuration hasn't been set for a specified extension, CloudFormation returns `{}`".
+const NO_CONFIGURATION: &str = "{}";
+
+/// What one identifier named the extension by, for the error entry's message: whichever of
+/// the identifying members it carries.
+fn named(identifier: &TypeConfigurationIdentifier) -> String {
+    identifier
+        .type_configuration_arn
+        .clone()
+        .or_else(|| identifier.type_arn.clone())
+        .or_else(|| identifier.type_name.clone())
+        .unwrap_or_default()
 }

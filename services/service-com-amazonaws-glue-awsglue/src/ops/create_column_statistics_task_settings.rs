@@ -248,9 +248,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .tables
             .get_mut(&crate::state::fold_name(&input.table_name))
         else {
-            return Err(not_found(crate::state::messages::table_not_found(
-                &input.table_name,
-            )));
+            return Err(not_found(
+                crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_TABLE_NOT_FOUND
+                    .to_string(),
+            ));
         };
         // Decided before anything is persisted, so a refused create leaves the table
         // carrying exactly the settings it carried — none, if no create has succeeded for
