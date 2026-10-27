@@ -3,7 +3,10 @@
 //! @op CreateMicrovmAuthToken
 //!
 //! Mints the authentication token a client presents to reach a MicroVM's endpoint,
-//! for the MicroVM the `microvmIdentifier` names.
+//! for the MicroVM the `microvmIdentifier` names. The token's digest, the ports it
+//! grants and its expiry are recorded, so the MicroVM endpoint this emulator serves
+//! (`crate::state::microvm_endpoint`) accepts exactly the tokens this operation
+//! minted.
 //!
 //! HAND-AUTHORED, not generated: the scaffold op-stub generator declined this
 //! operation (`ops/SKIPPED_STUBS.md`: "shape missing from model: smithy.api#Unit" —
@@ -68,7 +71,9 @@ use super::types::*;
 
 /// The `authToken` key the response member documents: "Use the value at key
 /// \"X-aws-proxy-auth\" as the header value when connecting to the MicroVM endpoint."
-const AUTH_TOKEN_KEY: &str = "X-aws-proxy-auth";
+/// The endpoint reads the token from that same header
+/// (`crate::state::microvm_endpoint::AUTH_TOKEN_HEADER`).
+const AUTH_TOKEN_KEY: &str = crate::state::microvm_endpoint::AUTH_TOKEN_HEADER;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module.
@@ -157,7 +162,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        store.materialize_due(::std::time::Instant::now());
+        let now = ::std::time::Instant::now();
+        store.materialize_due(now);
 
         let Some(vm) = store.microvm(&input.microvm_identifier) else {
             // The not-found envelope this service puts on the wire: a request-derived
@@ -192,11 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // Nothing of the stored record is needed past this point, and the token is
         // minted outside the lock.
+        let microvm_id = vm.microvm_id.clone();
         drop(store);
 
         // `expirationInMinutes` and `allowedPorts` scope what the token GRANTS at the
-        // MicroVM endpoint; the response models the token alone, so they are checked
-        // here and carried by the token itself, which is opaque to this API.
+        // MicroVM endpoint; the response models the token alone, so they are recorded
+        // with the token rather than reported, and the endpoint enforces them
+        // (`crate::state::microvm_endpoint`).
         //
         // Nothing in a service constructs a secret: the emulator's credential store
         // mints it (see `crate::state::mint_microvm_auth_token`).
@@ -205,6 +213,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "no authentication token could be minted for the MicroVM",
             ));
         };
+
+        // Only the DIGEST of the token is kept, so the caller holds the one copy of the
+        // secret and the endpoint can still recognise it.
+        state.lock().record_auth_token(
+            &microvm_id,
+            &token,
+            input.expiration_in_minutes,
+            input.allowed_ports,
+            now,
+        );
 
         let mut auth_token = ::std::collections::HashMap::new();
         auth_token.insert(AUTH_TOKEN_KEY.to_string(), token);

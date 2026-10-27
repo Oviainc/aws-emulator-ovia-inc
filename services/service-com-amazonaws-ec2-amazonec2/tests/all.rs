@@ -519,6 +519,14 @@ mod vpn_connection_routes;
 // Reading one VPC back out of an ec2Query response, on top of `ec2_query`'s plumbing.
 #[path = "all/wire.rs"]
 mod wire;
+// Declared HERE, between two long-settled suites, rather than in sorted position or at the
+// end of this file: the header records that both the sorted neighbourhood and the tail are
+// where every new ec2 suite inserts its lines, and these two lines lost repeated serialized
+// squash merges to the tail. What `DescribeCapacityReservationTopology` reports for the
+// Capacity Reservations of one Region: the path through the topology tree each one's capacity
+// hangs off, and how the ids, the two documented filters and the page size narrow it.
+#[path = "all/capacity_reservation_topology.rs"]
+mod capacity_reservation_topology;
 // Stopping the advertisement of a BYOIP address range, and what that refuses.
 #[path = "all/withdraw_byoip_cidr.rs"]
 mod withdraw_byoip_cidr;
