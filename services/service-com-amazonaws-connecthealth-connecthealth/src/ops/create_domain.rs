@@ -157,10 +157,7 @@ fn rendered(stored: &crate::state::Domain) -> CreateDomainResponse {
             arn: stored.arn.clone(),
             name: stored.name.clone(),
             kms_key_arn: stored.kms_key_arn.clone(),
-            encryption_context: Some(EncryptionContext {
-                encryption_type: stored.encryption_type.as_wire().to_string(),
-                kms_key_arn: stored.kms_key_arn.clone(),
-            }),
+            encryption_context: Some(stored.encryption_context()),
             status: stored.status.as_wire().to_string(),
             web_app_url: stored.web_app_url.clone(),
             web_app_configuration: stored
