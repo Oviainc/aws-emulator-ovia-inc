@@ -17,16 +17,26 @@
 //!   reported exactly where the preference records in force for the database activate them.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::{
     DBStorageConfiguration, RDSDBUtilizationMetric,
 };
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, AnalysedResource, RdsDatabaseDetail, SOURCE_TYPE_RDS_DB_INSTANCE,
+    service_state, AnalysedResource, RdsDatabaseDetail, ANALYSIS_DELAY,
+    SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 
 use crate::harness::{call, emulator_with_engine, get_preferences, opt_in, put_preference};
+
+/// Opt the account in and wait the analysis span out: a catalogued recommendation is
+/// reported only once the analysis the enrollment started is due ([`ANALYSIS_DELAY`]); the
+/// extra margin covers scheduler jitter.
+async fn opted_in_and_analysed(router: &smithy_server_runtime::MultiServiceRouter) {
+    opt_in(router).await;
+    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+}
 
 /// The region the harness signs for, and so the regional endpoint every call below
 /// addresses: the ARN reported for an analysed database names it.
@@ -258,7 +268,7 @@ async fn the_recommended_class_is_reported_with_the_utilization_projected_onto_i
     ];
 
     let (router, engine) = emulator_with_engine();
-    opt_in(&router).await;
+    opted_in_and_analysed(&router).await;
     let catalog: Vec<AnalysedResource> = rows
         .iter()
         .map(|row| {
@@ -451,7 +461,7 @@ async fn the_savings_estimation_mode_preference_is_applied_to_rds_recommendation
     for row in &rows {
         // A fresh store per row: a preference one row stored must not decide another's.
         let (router, engine) = emulator_with_engine();
-        opt_in(&router).await;
+        opted_in_and_analysed(&router).await;
         record(&engine, &[instance_db.clone(), storage_db.clone()]);
         if let Some(request) = &row.request {
             put_preference(&router, request).await;

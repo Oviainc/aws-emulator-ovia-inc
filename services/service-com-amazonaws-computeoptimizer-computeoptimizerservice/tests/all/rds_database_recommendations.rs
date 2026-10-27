@@ -17,14 +17,15 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::{
     DBStorageConfiguration, RDSDBUtilizationMetric, Tag,
 };
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, AnalysedResource, RdsDatabaseDetail, DEFAULT_LOOK_BACK_PERIOD, MAX_PAGE_SIZE,
-    NO_RECOMMENDATION_CODE, SOURCE_TYPE_RDS_DB_INSTANCE,
+    service_state, AnalysedResource, RdsDatabaseDetail, ANALYSIS_DELAY, DEFAULT_LOOK_BACK_PERIOD,
+    MAX_PAGE_SIZE, NO_RECOMMENDATION_CODE, SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 
 use crate::harness::{
@@ -262,7 +263,12 @@ fn reported_arns(body: &Value) -> Vec<String> {
         .collect()
 }
 
-/// An emulator whose account is opted in and whose findings catalog holds [`corpus`].
+/// An emulator whose account is opted in, whose analysis is due and whose findings catalog
+/// holds [`corpus`].
+///
+/// A recommendation is reported only once the analysis the enrollment started is due
+/// ([`ANALYSIS_DELAY`]), so the fixture waits that span out before reading, the way every
+/// other recommendation suite of this crate does; the extra margin covers scheduler jitter.
 async fn emulator_with_corpus() -> (
     smithy_server_runtime::MultiServiceRouter,
     Arc<engine::InMemoryEngine>,
@@ -272,6 +278,7 @@ async fn emulator_with_corpus() -> (
     opt_in(&router).await;
     let corpus = corpus();
     record(&engine, &corpus);
+    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
     (router, engine, corpus)
 }
 
@@ -325,6 +332,8 @@ fn assert_members(case: &str, reported: &Value, expected: &Value) {
 async fn the_seeded_analysed_database_is_reported_from_its_catalog_row() {
     let (router, engine) = emulator_with_engine();
     opt_in(&router).await;
+    // The catalog is read only once the analysis the enrollment started is due.
+    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
     let seeded = db_arn(own_account(), "orders-primary");
     let before = catalog_size(&engine);
 
@@ -1324,6 +1333,8 @@ async fn the_reported_arn_names_the_region_the_endpoint_serves() {
     let (router, engine) = emulator_with_engine();
     opt_in(&router).await;
     record(&engine, &corpus());
+    // The catalog is read only once the analysis the enrollment started is due.
+    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
 
     // The regions these rows are read at: the harness default, another commercial region and
     // one in another continent.
@@ -1388,10 +1399,12 @@ async fn the_reported_arn_names_the_region_the_endpoint_serves() {
     }
 }
 
-/// The service analyses an account's resources only once it has opted in, so an account that
-/// never did — or that opted back out — reads no recommendations at all.
+/// The service analyses an account's resources only once it has opted in, and reports that
+/// analysis only once the analysis its enrollment started is due: an account that never
+/// opted in — or that opted back out — reads no recommendations at all, and one that has
+/// just opted in reads no analysis yet.
 #[tokio::test]
-async fn the_read_is_refused_until_the_account_opts_in() {
+async fn the_read_waits_for_the_enrollment_and_the_analysis() {
     let (router, engine) = emulator_with_engine();
     record(&engine, &corpus());
 
@@ -1409,10 +1422,19 @@ async fn the_read_is_refused_until_the_account_opts_in() {
 
         if case == "before opting in" {
             opt_in(&router).await;
-            let body = get_rds(&router, "opted in", json!({})).await;
+            let fresh = get_rds(&router, "just opted in", json!({})).await;
+            assert_eq!(
+                reported_arns(&fresh),
+                Vec::<String>::new(),
+                "just opted in: the analysis is not due yet, so nothing is analysed: {fresh}"
+            );
+
+            tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+            let body = get_rds(&router, "the analysis is due", json!({})).await;
             assert!(
                 !reported_arns(&body).is_empty(),
-                "an opted-in account reads its analysed databases, got {body}"
+                "an opted-in account whose analysis is due reads its analysed databases, \
+                 got {body}"
             );
             let (status, body) = call(
                 &router,

@@ -22,12 +22,13 @@
 //! * a database the analysis would not move has no option, so there is nothing to project.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::RDSDBUtilizationMetric;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, AnalysedResource, RdsDatabaseDetail, MAX_PROJECTED_METRIC_DATA_POINTS,
-    SOURCE_TYPE_RDS_DB_INSTANCE,
+    service_state, AnalysedResource, RdsDatabaseDetail, ANALYSIS_DELAY,
+    MAX_PROJECTED_METRIC_DATA_POINTS, SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 
 use crate::harness::{call, call_in_region, emulator_with_engine, error_code, opt_in, ACCOUNT};
@@ -237,7 +238,12 @@ fn catalog_size(engine: &Arc<engine::InMemoryEngine>) -> usize {
         .len()
 }
 
-/// An emulator whose account is opted in and whose findings catalog holds [`corpus`].
+/// An emulator whose account is opted in, whose analysis is due and whose findings catalog
+/// holds [`corpus`].
+///
+/// A projection is reported only once the analysis the enrollment started is due
+/// ([`ANALYSIS_DELAY`]), so the fixture waits that span out before reading, the way every
+/// other recommendation suite of this crate does; the extra margin covers scheduler jitter.
 async fn emulator_with_corpus() -> (
     smithy_server_runtime::MultiServiceRouter,
     Arc<engine::InMemoryEngine>,
@@ -245,6 +251,7 @@ async fn emulator_with_corpus() -> (
     let (router, engine) = emulator_with_engine();
     opt_in(&router).await;
     record(&engine, &corpus());
+    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
     (router, engine)
 }
 
@@ -813,10 +820,11 @@ async fn a_database_of_another_region_is_not_this_endpoints() {
     }
 }
 
-/// The service analyses an account's resources only once it has opted in, so an account that
-/// never did reads no recommendation and no projection of one.
+/// The service analyses an account's resources only once it has opted in, and only once the
+/// analysis that enrollment starts is due: an account that never opted in reads no projection
+/// at all, and one that has just opted in reads no analysis yet.
 #[tokio::test]
-async fn the_read_is_refused_until_the_account_opts_in() {
+async fn the_read_waits_for_the_enrollment_and_the_analysis() {
     let (router, engine) = emulator_with_engine();
     record(&engine, &corpus());
 
@@ -844,13 +852,31 @@ async fn the_read_is_refused_until_the_account_opts_in() {
     );
 
     opt_in(&router).await;
-    let response = projected(&router, "after opting in", body).await;
+    let (status, response) = call(
+        &router,
+        "GetRDSDatabaseRecommendationProjectedMetrics",
+        body.clone(),
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "just opted in: the analysis is not due yet, so there is nothing to project, got \
+         {status}: {response}"
+    );
+    assert_eq!(
+        error_code(&response),
+        "ResourceNotFoundException",
+        "just opted in: expected ResourceNotFoundException, got {response}"
+    );
+
+    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    let response = projected(&router, "once the analysis is due", body).await;
     assert!(
         !response["recommendedOptionProjectedMetrics"]
             .as_array()
             .expect("a list of options")
             .is_empty(),
-        "after opting in the projection is served, got {response}"
+        "once the analysis is due the projection is served, got {response}"
     );
 }
 
@@ -861,6 +887,8 @@ async fn the_read_is_refused_until_the_account_opts_in() {
 async fn the_projected_option_is_the_recommended_option() {
     let (router, engine) = emulator_with_engine();
     opt_in(&router).await;
+    // The catalog is read only once the analysis the enrollment started is due.
+    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
     let before = catalog_size(&engine);
     let seeded = db_arn(SEEDED_ACCOUNT, "orders-primary");
 
