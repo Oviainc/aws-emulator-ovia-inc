@@ -86,32 +86,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// What a `ListTypes` resume point is prefixed with, so a token this listing issued is
-/// distinguishable from one another listing of the same keyspace issued: `ListTables`
-/// pages the same keyspace by a name of the same shape, and resuming a type listing after
-/// a TABLE name would silently skip types. A `keyspaceName` cannot contain `/` (its
-/// modelled pattern is `^[a-zA-Z0-9][a-zA-Z0-9_]{0,47}$`), so no other listing's token can
-/// carry this prefix.
-const PAGE_TOKEN_SCOPE: &str = "types/";
-
-/// Encode the resume point of a page as the opaque `nextToken` the caller hands back.
-///
-/// The token names the LAST type on the page just returned, qualified by its keyspace and
-/// by [`PAGE_TOKEN_SCOPE`], and is hex-encoded so no caller can read a resource name out
-/// of it or build one by hand. A `keyspaceName` cannot contain `#` either, so splitting at
-/// the FIRST `#` separates the two parts unambiguously even for a double-quoted
-/// `typeName`, which may contain one.
-fn encode_page_token(keyspace_name: &str, type_name: &str) -> String {
-    ::hex::encode(format!("{PAGE_TOKEN_SCOPE}{keyspace_name}#{type_name}"))
-}
-
-/// The type name a `nextToken` resumes after, or `None` when the token is not one this
-/// operation issued for `keyspace_name` — a token minted for a different keyspace, or by a
-/// different listing, resumes nothing here and is refused rather than silently ignored.
-fn decode_page_token(token: &str, keyspace_name: &str) -> Option<String> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    let (keyspace, type_name) = decoded.strip_prefix(PAGE_TOKEN_SCOPE)?.split_once('#')?;
-    (keyspace == keyspace_name && !type_name.is_empty()).then(|| type_name.to_string())
+/// The scope a `ListTypes` resume point is qualified by: the keyspace whose types the page
+/// came from, prefixed so a token this listing issued is distinguishable from one another
+/// listing of the same keyspace issued. `ListTables` pages the same keyspace by a name of
+/// the same shape, and resuming a type listing after a TABLE name would silently skip
+/// types, so [`crate::state::decode_page_token`] refuses the other listing's token here.
+/// A `keyspaceName` cannot contain `/` (its modelled pattern is
+/// `^[a-zA-Z0-9][a-zA-Z0-9_]{0,47}$`), so no other listing's scope can carry this prefix.
+fn page_token_scope(keyspace_name: &str) -> String {
+    format!("types/{keyspace_name}")
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -198,7 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_page_token(token, &input.keyspace_name).ok_or_else(
+            Some(token) => Some(crate::state::decode_page_token(
+                token,
+                &page_token_scope(&input.keyspace_name),
+            )
+            .ok_or_else(
                 || {
                     ListTypesErrorModeled::ValidationException(ValidationException {
                         message: Some(format!(
@@ -243,9 +230,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.max_results,
         );
         let next_token = match truncated {
-            true => page
-                .last()
-                .map(|type_name| encode_page_token(&input.keyspace_name, type_name)),
+            true => page.last().map(|type_name| {
+                crate::state::encode_page_token(
+                    &page_token_scope(&input.keyspace_name),
+                    type_name,
+                )
+            }),
             false => None,
         };
 

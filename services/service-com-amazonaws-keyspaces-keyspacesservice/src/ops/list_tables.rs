@@ -84,23 +84,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// Encode the resume point of a page as the opaque `nextToken` the caller hands back.
+/// The scope a `ListTables` resume point is qualified by, which is the keyspace whose
+/// tables the page came from: a token this listing issued resumes only a listing of the
+/// SAME keyspace, and [`crate::state::decode_page_token`] refuses one minted for another.
 ///
-/// The token names the LAST table on the page just returned, qualified by its keyspace,
-/// and is hex-encoded so no caller can read a resource name out of it or build one by
-/// hand. `tableName` cannot contain `#` (its modelled pattern is
-/// `^[a-zA-Z0-9][a-zA-Z0-9_]{0,47}$`), so the separator is unambiguous.
-fn encode_page_token(keyspace_name: &str, table_name: &str) -> String {
-    ::hex::encode(format!("{keyspace_name}#{table_name}"))
-}
-
-/// The table name a `nextToken` resumes after, or `None` when the token is not one this
-/// service issued for `keyspace_name` — a token minted for a different keyspace resumes
-/// nothing here and is refused rather than silently ignored.
-fn decode_page_token(token: &str, keyspace_name: &str) -> Option<String> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    let (keyspace, table) = decoded.split_once('#')?;
-    (keyspace == keyspace_name && !table.is_empty()).then(|| table.to_string())
+/// A `keyspaceName` cannot contain the codec's separator (its modelled pattern is
+/// `^[a-zA-Z0-9][a-zA-Z0-9_]{0,47}$`), so the scope half of the token is unambiguous, and
+/// a listing of the same keyspace by a name of the same shape qualifies its own scope
+/// further rather than colliding with this bare one.
+fn page_token_scope(keyspace_name: &str) -> &str {
+    keyspace_name
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -187,7 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_page_token(token, &input.keyspace_name).ok_or_else(
+            Some(token) => Some(crate::state::decode_page_token(
+                token,
+                page_token_scope(&input.keyspace_name),
+            )
+            .ok_or_else(
                 || {
                     ListTablesErrorModeled::ValidationException(ValidationException {
                         message: Some(format!(
@@ -230,9 +227,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.max_results,
         );
         let next_token = match truncated {
-            true => page
-                .last()
-                .map(|table| encode_page_token(&table.keyspace_name, &table.table_name)),
+            true => page.last().map(|table| {
+                crate::state::encode_page_token(
+                    page_token_scope(&table.keyspace_name),
+                    &table.table_name,
+                )
+            }),
             false => None,
         };
 
