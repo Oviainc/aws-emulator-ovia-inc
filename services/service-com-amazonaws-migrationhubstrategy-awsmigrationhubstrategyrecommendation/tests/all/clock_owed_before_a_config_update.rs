@@ -46,10 +46,10 @@ use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommenda
 use service_com_amazonaws_migrationhubstrategy_awsmigrationhubstrategyrecommendation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::assessment_analysis::{assert_recommendation, complete_the_span, expected_application};
+use crate::assessment_analysis::{assert_recommendation, expected_application};
 use crate::import_and_assess::{
-    at, call, get_assessment, minimal_assessment, register_collector_in, start_assessment, Answer,
-    TEST_REGION,
+    at, bring_every_completion_forward, call, get_assessment, minimal_assessment,
+    register_collector_in, start_assessment, Answer, TEST_REGION,
 };
 
 /// The component and the server every assessment case runs against, and the configuration
@@ -357,7 +357,7 @@ async fn run(case: &str, row: &Row, read_first: bool) -> Observed {
     let assessment_id = started.string("/assessmentId");
     // The completion is now OWED: its due instant is in the past and nothing has
     // materialised it yet.
-    complete_the_span(&engine);
+    bring_every_completion_forward(&engine);
     if read_first {
         let early = component_details(&router, SEED_COMPONENT).await;
         assert_eq!(
@@ -560,7 +560,7 @@ async fn the_configuration_an_update_stored_governs_the_next_assessment() {
             first.status, first.body
         );
         let first_id = first.string("/assessmentId");
-        complete_the_span(&engine);
+        bring_every_completion_forward(&engine);
 
         let mut request = json!({"applicationComponentId": SEED_COMPONENT});
         if let Some(app_type) = row.app_type {
@@ -587,7 +587,7 @@ async fn the_configuration_an_update_stored_governs_the_next_assessment() {
             second.status, second.body
         );
         let second_id = second.string("/assessmentId");
-        complete_the_span(&engine);
+        bring_every_completion_forward(&engine);
         let component = component_details(&router, SEED_COMPONENT).await;
         let second_completion = at(
             &get_assessment(&router, &second_id).await.body,
