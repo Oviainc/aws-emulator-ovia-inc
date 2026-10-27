@@ -8,7 +8,7 @@
 //!
 //! The rule under test: a user pool is a set of replicas keyed by Region — the
 //! pool's own Region holds the PRIMARY one, and each `CreateUserPoolReplica`
-//! adds a SECONDARY one that comes up `CREATING` and reaches `ACTIVE` only once
+//! adds a SECONDARY one that comes up `CREATING` and reaches `INACTIVE` only once
 //! the clock makes that transition due; `UpdateUserPoolReplica` stores the
 //! `Status` its request names on the named secondary replica and answers with
 //! the value it stored, so overlapping calls on one replica are serialized and
@@ -24,11 +24,11 @@ use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice as cognito_idp;
 use cognito_idp::state::{
     REPLICA_ACTIVATION_SPAN, REPLICA_ROLE_PRIMARY, REPLICA_ROLE_SECONDARY, REPLICA_STATUS_ACTIVE,
     REPLICA_STATUS_CREATING, REPLICA_STATUS_INACTIVE,
 };
+use service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice as cognito_idp;
 
 /// A request's SigV4 credential scope is what routes it to this service, and
 /// its Region is the one a created pool — the PRIMARY replica — lives in. The
@@ -237,11 +237,11 @@ fn replica_cases() -> Vec<ReplicaCase> {
 }
 
 /// A created replica is stored on the pool it names, comes up `CREATING`, and
-/// reaches `ACTIVE` only once the clock makes that transition due — beside the
-/// pool's own `PRIMARY` replica, which `ListUserPoolReplicas` reports from the
-/// moment the pool exists.
+/// reaches `INACTIVE` only once the clock makes that transition due — beside the
+/// pool's own `PRIMARY` replica, which `ListUserPoolReplicas` reports as
+/// `ACTIVE` from the moment the pool exists.
 #[tokio::test]
-async fn a_created_replica_is_listed_and_settles_from_creating_to_active() {
+async fn a_created_replica_is_listed_and_settles_from_creating_to_inactive() {
     for ReplicaCase {
         case,
         tier,
@@ -346,21 +346,28 @@ async fn a_created_replica_is_listed_and_settles_from_creating_to_active() {
 
         tokio::time::sleep(PAST_THE_ACTIVATION).await;
 
-        let active: Vec<Value> = expected_regions
+        // A created secondary replica settles into INACTIVE, not ACTIVE: "The
+        // replica has been created, but is not accepting requests for
+        // end-users" (`UserPoolReplicaType.Status`), which is the status the
+        // recorded multi-Region traces read back from a replica nothing has
+        // activated yet. The pool's own Region serves every operation, so its
+        // PRIMARY replica is ACTIVE from the moment the pool exists.
+        let settled_replicas: Vec<Value> = expected_regions
             .iter()
             .map(|region| {
-                let role = if *region == PRIMARY_REGION {
-                    REPLICA_ROLE_PRIMARY
+                let (status, role) = if *region == PRIMARY_REGION {
+                    (REPLICA_STATUS_ACTIVE, REPLICA_ROLE_PRIMARY)
                 } else {
-                    REPLICA_ROLE_SECONDARY
+                    (REPLICA_STATUS_INACTIVE, REPLICA_ROLE_SECONDARY)
                 };
-                expected_entry(&pool_arn, region, REPLICA_STATUS_ACTIVE, role)
+                expected_entry(&pool_arn, region, status, role)
             })
             .collect();
         let settled = replicas(&router, &user_pool_id).await;
         assert_eq!(
-            settled, active,
-            "case {case:?}: each replica is ACTIVE once the clock owes it the transition"
+            settled, settled_replicas,
+            "case {case:?}: each created replica settles into INACTIVE once the clock owes it \
+             the transition, beside the pool's ACTIVE primary"
         );
 
         // A read changes nothing a later caller sees.
@@ -786,7 +793,9 @@ async fn a_replica_call_a_pool_does_not_admit_is_refused_and_persists_nothing() 
             expected_entry(
                 &pool_arn,
                 REGION,
-                REPLICA_STATUS_ACTIVE,
+                // A created secondary replica settles into INACTIVE until an
+                // update activates it.
+                REPLICA_STATUS_INACTIVE,
                 REPLICA_ROLE_SECONDARY
             ),
         ],

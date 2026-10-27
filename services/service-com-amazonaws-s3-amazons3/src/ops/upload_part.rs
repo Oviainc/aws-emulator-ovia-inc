@@ -374,21 +374,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // `ContentMD5` is "the Base64 encoded 128-bit MD5 digest of the part data", so
-        // when the request carries it, it is CHECKED against the payload actually
-        // received: a mismatch means the bytes are not the bytes the client hashed, which
-        // S3 answers with `BadDigest` (400) rather than recording a part the client did
-        // not intend. The same check `PutObject` performs on its own body.
-        if let Some(declared) = input.content_md5.as_deref() {
-            let actual = crate::state::content_md5(&input.body);
-            if declared != actual {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::BAD_DIGEST_CODE,
-                    crate::state::BAD_DIGEST_STATUS,
-                    crate::state::BAD_DIGEST_MESSAGE,
-                ));
-            }
-        }
+        // The integrity values this part DECLARED: `Content-MD5` is "the Base64 encoded
+        // 128-bit MD5 digest of the part data" and each `Checksum*` member is the client's
+        // digest of the same bytes under one algorithm, so each is checked against the
+        // payload actually received — first for its SHAPE, then against the digest — before
+        // the part is recorded. The codes and the sentences are the store's
+        // ([`crate::state::verify_declared_integrity`]), the same ones `PutObject` answers
+        // the same headers with.
+        crate::state::verify_declared_integrity(
+            input.content_md5.as_deref(),
+            &crate::state::DeclaredChecksums {
+                crc32: input.checksum_crc32.as_deref(),
+                crc32c: input.checksum_crc32_c.as_deref(),
+                crc64nvme: input.checksum_crc64_nvme.as_deref(),
+                sha1: input.checksum_sha1.as_deref(),
+                sha256: input.checksum_sha256.as_deref(),
+                sha512: input.checksum_sha512.as_deref(),
+                md5: input.checksum_md5.as_deref(),
+                xxhash64: input.checksum_xxhash64.as_deref(),
+                xxhash3: input.checksum_xxhash3.as_deref(),
+                xxhash128: input.checksum_xxhash128.as_deref(),
+            },
+            &input.body,
+        )
+        .map_err(|rejection| {
+            crate::scaffolded::Scaffolded::unmodeled(
+                rejection.code(),
+                rejection.status(),
+                rejection.to_string(),
+            )
+        })?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Without the store the part cannot be recorded at all, and no modelled error

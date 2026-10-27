@@ -25,8 +25,8 @@
 //!   does not resolve is `auto_management_exclusions.rs`'s rule;
 //! * updating overwrites only the members the update call names, and an exclusion list
 //!   it does name replaces the stored one outright;
-//! * an `OptInType` the service does not offer yet is refused by BOTH writers of the
-//!   member, with the modelled `IllegalArgumentException`, and records nothing;
+//! * an `OptInType` is stored as given whichever member of the enum it names, by BOTH
+//!   writers of the member, and switching the mode leaves `OptInStatus` as it was;
 //! * stopping moves the opt-in to `OptInStatus = DISABLED` and keeps the preferences,
 //!   after which the calls that need Automatic Management RUNNING are refused with the
 //!   modelled `NoSuchResourceException`;
@@ -42,7 +42,7 @@ use service_com_amazonaws_servicequotas_servicequotasv20190624::ops::types::{
     OPT_IN_LEVEL_VALUES, OPT_IN_TYPE_VALUES,
 };
 use service_com_amazonaws_servicequotas_servicequotasv20190624::state::{
-    AVAILABLE_OPT_IN_TYPES, OPT_IN_STATUS_DISABLED, OPT_IN_STATUS_ENABLED,
+    OPT_IN_STATUS_DISABLED, OPT_IN_STATUS_ENABLED,
 };
 
 use crate::quota_workflow::{client, emulator, Client, ACCOUNT};
@@ -66,11 +66,10 @@ fn notification_arn(name: &str) -> String {
     format!("arn:aws:notifications::{ACCOUNT}:configuration/{name}")
 }
 
-/// The `OptInType` member `name`, checked against the model's own value list AND
-/// against the members Automatic Management currently offers, so a row cannot ask for a
-/// type the model does not declare, nor for one a write would refuse.
+/// The `OptInType` member `name`, checked against the model's own value list, so a row
+/// cannot ask for a type the model does not declare.
 fn opt_in_type(name: &str) -> &'static str {
-    let member = OPT_IN_TYPE_VALUES
+    OPT_IN_TYPE_VALUES
         .iter()
         .copied()
         .find(|member| *member == name)
@@ -79,25 +78,17 @@ fn opt_in_type(name: &str) -> &'static str {
                 "case {name}: not an OptInType member; the model declares \
                  {OPT_IN_TYPE_VALUES:?}"
             )
-        });
-    assert!(
-        AVAILABLE_OPT_IN_TYPES.contains(&member),
-        "case {name}: not an opt-in type the service offers yet; the available ones are \
-         {AVAILABLE_OPT_IN_TYPES:?}"
-    );
-    member
+        })
 }
 
-/// The `OptInType` members the model declares that Automatic Management does not offer
-/// yet: every member outside the available set. Computed from the two lists rather than
-/// spelled out here, so a member that becomes available — or one the model gains — moves
-/// this table without it being edited.
-fn unavailable_opt_in_types() -> Vec<&'static str> {
+/// A declared `OptInType` member OTHER than `name`, so an update of the member has
+/// something to change; `name` itself if the enum ever declares only one member.
+fn another_opt_in_type(name: &str) -> &'static str {
     OPT_IN_TYPE_VALUES
         .iter()
         .copied()
-        .filter(|member| !AVAILABLE_OPT_IN_TYPES.contains(member))
-        .collect()
+        .find(|member| *member != name)
+        .unwrap_or_else(|| opt_in_type(name))
 }
 
 /// The scalar members of a reported configuration, as `(OptInLevel, OptInType,
@@ -219,10 +210,9 @@ struct StartCase {
 /// The rows differ along everything the rule generalises over: a notification ARN
 /// present or absent, and an exclusion list absent, naming one service or several,
 /// carrying one quota code or several, carrying the same code twice, and naming a
-/// service with no quota codes at all. The opt-in
-/// type is spanned by
-/// [`every_available_opt_in_type_is_accepted_and_reads_back`], since only the
-/// types the service offers can be recorded at all.
+/// service with no quota codes at all. The opt-in type is spanned by
+/// [`every_modeled_opt_in_type_is_stored_by_both_writers`] over every member the enum
+/// declares.
 #[tokio::test]
 async fn starting_records_the_whole_configuration_and_the_read_reports_it() {
     let rows = [
@@ -777,8 +767,8 @@ async fn changing_a_configuration_that_was_never_started_is_refused() {
 /// An exclusion list a row carries, as the tables below spell one.
 type Exclusions = &'static [(&'static str, &'static [&'static str])];
 
-/// The optional members a row carries beside the opt-in type, so the refusal is
-/// asserted for a request that names the member alone and for one that names it beside
+/// The optional members a row carries beside the opt-in type, so the rule is asserted
+/// for a request that names the member alone and for one that names it beside
 /// everything else the operation takes.
 ///
 /// `(case, NotificationArn, ExclusionList)`.
@@ -821,74 +811,61 @@ fn opt_in_request(
     request
 }
 
-/// Assert that `request` is refused as an opt-in type the service does not offer: the
-/// modelled `IllegalArgumentException` on this front end's client-fault status, with a
-/// `Message` naming the member the caller got wrong.
-async fn refused_as_unavailable_type(client: &Client, case: &str, operation: &str, request: &Value) {
-    let (status, code, message) = refused(client, operation, request).await;
-    assert_eq!(
-        status, CLIENT_FAULT,
-        "case {case}: expected {request} to be refused with HTTP {CLIENT_FAULT}, got {status}"
-    );
-    assert_eq!(
-        code, "IllegalArgumentException",
-        "case {case}: expected {request} to be refused as IllegalArgumentException, got {code}"
-    );
-    assert!(
-        message.starts_with("OptInType"),
-        "case {case}: the refusal must name the member that was wrong (OptInType), \
-         got {message:?}"
-    );
-}
-
-/// An `OptInType` the service does not offer yet is refused by BOTH writers of the
-/// member, and the refusal records nothing — so a stored configuration can only ever
-/// report a mode the service would act on.
+/// EVERY `OptInType` member the enum declares is stored as given by both writers of the
+/// member: the member carries no constraint narrowing it to a subset of the enum, so a
+/// value the enum declares is never invalid input, and nothing beyond the boundary
+/// validator's enum check stands between the caller and the stored mode.
 ///
-/// The rows span every member the model declares outside the available set
-/// (`state::AVAILABLE_OPT_IN_TYPES`, from the member's own documentation), each one
-/// submitted alone and beside every other member the operation takes, through the full
-/// writer (`StartAutoManagement`) and the partial one (`UpdateAutoManagement`) — the
-/// latter both over a running configuration and with nothing started at all.
+/// The rows span every member of the model's own value list (`ops::types::
+/// OPT_IN_TYPE_VALUES`, generated from `OptInType`), each one submitted alone and beside
+/// every other member the operation takes, through the full writer
+/// (`StartAutoManagement`) and the partial one (`UpdateAutoManagement`) over a running
+/// configuration that was started on a DIFFERENT member, so each row genuinely moves the
+/// stored mode. A member the model gains is covered without this table being edited.
 #[tokio::test]
-async fn an_opt_in_type_the_service_does_not_offer_yet_is_refused_and_records_nothing() {
-    let unavailable = unavailable_opt_in_types();
-    assert!(
-        !unavailable.is_empty(),
-        "case setup: the model must declare an OptInType outside the available set \
-         {AVAILABLE_OPT_IN_TYPES:?}, got {OPT_IN_TYPE_VALUES:?}"
-    );
-
-    for requested in unavailable {
+async fn every_modeled_opt_in_type_is_stored_by_both_writers() {
+    for requested in OPT_IN_TYPE_VALUES {
+        let requested = opt_in_type(requested);
         for (shape, notification, exclusions) in OPTIONAL_MEMBERS {
-            // The FULL writer: nothing was running, and nothing is recorded, so the
-            // account still reads as one that never opted in.
+            // The FULL writer records the whole call, whichever member it names.
             let case = format!("StartAutoManagement {requested} {shape}");
             let start_engine = emulator();
             let start_client = client(&start_engine, "us-east-1");
             let request = opt_in_request(requested, true, notification, exclusions);
-            refused_as_unavailable_type(&start_client, &case, "StartAutoManagement", &request)
+            let started = start_client
+                .ok("StartAutoManagement", request.clone())
                 .await;
+            assert_eq!(
+                started,
+                json!({}),
+                "case {case}: StartAutoManagement models no output members, got {started}"
+            );
 
             let read = configuration(&start_client, &case).await;
             assert_eq!(
                 scalars(&read),
-                (None, None, Some(OPT_IN_STATUS_DISABLED), None),
-                "case {case}: a refused start must record nothing, got {read}"
+                (
+                    Some(ACCOUNT_LEVEL),
+                    Some(requested),
+                    Some(OPT_IN_STATUS_ENABLED),
+                    notification.map(notification_arn).as_deref(),
+                ),
+                "case {case}: starting with {request} must read back as stored, got {read}"
             );
             assert_eq!(
                 exclusion_codes(&read),
-                None,
-                "case {case}: a refused start must record no exclusion list, got {read}"
+                expected_codes(exclusions.unwrap_or(&[])),
+                "case {case}: the exclusion list must be reported as named, got {read}"
             );
+            assert_every_entry_is_named(&case, &read);
 
-            // The PARTIAL writer over a RUNNING configuration: none of the members the
-            // refused call named is recorded, not even the ones that were legal.
+            // The PARTIAL writer moves a running configuration from one member to
+            // another, and leaves the members the call does not name alone.
             let case = format!("UpdateAutoManagement {requested} {shape}");
             let running_engine = emulator();
             let running_client = client(&running_engine, "us-east-1");
             let running_arn = notification_arn("running-channel");
-            let running_type = opt_in_type(AVAILABLE_OPT_IN_TYPES[0]);
+            let running_type = another_opt_in_type(requested);
             running_client
                 .ok(
                     "StartAutoManagement",
@@ -902,96 +879,110 @@ async fn an_opt_in_type_the_service_does_not_offer_yet_is_refused_and_records_no
                 .await;
 
             let update = opt_in_request(requested, false, notification, exclusions);
-            refused_as_unavailable_type(&running_client, &case, "UpdateAutoManagement", &update)
+            let updated = running_client
+                .ok("UpdateAutoManagement", update.clone())
                 .await;
+            assert_eq!(
+                updated,
+                json!({}),
+                "case {case}: UpdateAutoManagement models no output members, got {updated}"
+            );
 
             let read = configuration(&running_client, &case).await;
+            let expected_arn = notification
+                .map(notification_arn)
+                .unwrap_or_else(|| running_arn.clone());
             assert_eq!(
                 scalars(&read),
                 (
                     Some(ACCOUNT_LEVEL),
-                    Some(running_type),
+                    Some(requested),
                     Some(OPT_IN_STATUS_ENABLED),
-                    Some(running_arn.as_str()),
+                    Some(expected_arn.as_str()),
                 ),
-                "case {case}: a refused update must leave the running configuration as it \
-                 was, got {read}"
+                "case {case}: updating with {update} must store the mode it names and \
+                 leave OptInStatus ENABLED, got {read}"
             );
             assert_eq!(
                 exclusion_codes(&read),
-                expected_codes(RUNNING_EXCLUSIONS),
-                "case {case}: a refused update must leave the stored exclusion list alone, \
-                 got {read}"
+                expected_codes(exclusions.unwrap_or(RUNNING_EXCLUSIONS)),
+                "case {case}: updating with {update} must leave the exclusion list it \
+                 does not name alone, got {read}"
             );
         }
-
-        // Availability is a fact of the REQUEST rather than of the account, so the same
-        // refusal answers an update made before anything was ever started.
-        let case = format!("UpdateAutoManagement {requested} with nothing started");
-        let engine = emulator();
-        let client = client(&engine, "us-east-1");
-        let request = opt_in_request(requested, false, None, None);
-        refused_as_unavailable_type(&client, &case, "UpdateAutoManagement", &request).await;
-
-        let read = configuration(&client, &case).await;
-        assert_eq!(
-            scalars(&read),
-            (None, None, Some(OPT_IN_STATUS_DISABLED), None),
-            "case {case}: a refused update must record nothing, got {read}"
-        );
     }
 }
 
-/// Every `OptInType` the service DOES offer is accepted by both writers of the member
-/// and reads back as stored — the other half of the availability rule, spanned over the
-/// whole available set rather than over one member of it.
+/// The Automatic Management lifecycle a client drives when it changes its mode: start on
+/// one member, switch to another with the partial writer — which must leave `OptInStatus`
+/// at `ENABLED`, since the opt-in type is not the status — and stop, which returns the
+/// configuration to `DISABLED` with the switched mode still on record.
+///
+/// The rows are every ORDERED pair of members the model declares, so each switch is
+/// driven in both directions as well as from a member to itself.
 #[tokio::test]
-async fn every_available_opt_in_type_is_accepted_and_reads_back() {
-    for available in AVAILABLE_OPT_IN_TYPES {
-        let case = format!("available {available}");
-        let engine = emulator();
-        let client = client(&engine, "us-east-1");
-        let arn = notification_arn("quota-alerts");
+async fn switching_the_opt_in_type_keeps_the_status_and_stops_back_to_disabled() {
+    for started in OPT_IN_TYPE_VALUES {
+        for switched in OPT_IN_TYPE_VALUES {
+            let started = opt_in_type(started);
+            let switched = opt_in_type(switched);
+            let case = format!("{started} -> {switched}");
+            let engine = emulator();
+            let client = client(&engine, "us-east-1");
 
-        // The full writer records it.
-        client
-            .ok(
-                "StartAutoManagement",
-                json!({
-                    "OptInLevel": ACCOUNT_LEVEL,
-                    "OptInType": *available,
-                    "NotificationArn": arn,
-                }),
-            )
-            .await;
-        let read = configuration(&client, &case).await;
-        assert_eq!(
-            scalars(&read),
-            (
-                Some(ACCOUNT_LEVEL),
-                Some(*available),
-                Some(OPT_IN_STATUS_ENABLED),
-                Some(arn.as_str()),
-            ),
-            "case {case}: starting with an available opt-in type must read back as \
-             stored, got {read}"
-        );
+            client
+                .ok(
+                    "StartAutoManagement",
+                    json!({"OptInLevel": ACCOUNT_LEVEL, "OptInType": started}),
+                )
+                .await;
+            let read = configuration(&client, &case).await;
+            assert_eq!(
+                scalars(&read),
+                (
+                    Some(ACCOUNT_LEVEL),
+                    Some(started),
+                    Some(OPT_IN_STATUS_ENABLED),
+                    None,
+                ),
+                "case {case}: the start must read back ENABLED on the mode it named, \
+                 got {read}"
+            );
 
-        // And so does the partial one, which leaves the rest of the record alone.
-        client
-            .ok("UpdateAutoManagement", json!({"OptInType": *available}))
-            .await;
-        let read = configuration(&client, &case).await;
-        assert_eq!(
-            scalars(&read),
-            (
-                Some(ACCOUNT_LEVEL),
-                Some(*available),
-                Some(OPT_IN_STATUS_ENABLED),
-                Some(arn.as_str()),
-            ),
-            "case {case}: updating to an available opt-in type must read back as stored, \
-             got {read}"
-        );
+            let updated = client
+                .ok("UpdateAutoManagement", json!({"OptInType": switched}))
+                .await;
+            assert_eq!(
+                updated,
+                json!({}),
+                "case {case}: UpdateAutoManagement models no output members, got {updated}"
+            );
+            let read = configuration(&client, &case).await;
+            assert_eq!(
+                scalars(&read),
+                (
+                    Some(ACCOUNT_LEVEL),
+                    Some(switched),
+                    Some(OPT_IN_STATUS_ENABLED),
+                    None,
+                ),
+                "case {case}: switching the mode must not change OptInStatus, got {read}"
+            );
+
+            client.ok("StopAutoManagement", json!({})).await;
+            let read = configuration(&client, &case).await;
+            assert_eq!(
+                scalars(&read),
+                (
+                    Some(ACCOUNT_LEVEL),
+                    Some(switched),
+                    Some(OPT_IN_STATUS_DISABLED),
+                    None,
+                ),
+                "case {case}: stopping must report DISABLED with the switched mode still \
+                 on record, got {read}"
+            );
+        }
     }
 }
+

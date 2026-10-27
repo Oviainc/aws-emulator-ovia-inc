@@ -596,10 +596,11 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
     }
 
     // `Content-MD5` is "a message integrity check to verify that the request body was not
-    // corrupted in transit", so a digest that does not match the payload received means
-    // the body is not the body the client hashed: the write is refused (`BadDigest` is
-    // not a shape in this model, so it goes out as the modelled `InvalidRequest`, HTTP
-    // 400) and the key is not created.
+    // corrupted in transit", so a value that does not describe the payload received is
+    // refused and the key is not created. Which refusal depends on WHAT is wrong with the
+    // value: one that cannot be a 128-bit digest at all is `InvalidDigest`, and a
+    // well-formed digest of other bytes is `BadDigest` — both HTTP 400, neither a shape in
+    // this model.
     let correct = ::aws_smithy_types::base64::encode(Md5::digest(b"# dag"));
     let matching = put_object(
         &router,
@@ -616,16 +617,22 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
         matching.status,
         text(&matching)
     );
-    for (case, digest) in [
+    for (case, digest, code) in [
         (
             "a digest of different bytes",
             ::aws_smithy_types::base64::encode(Md5::digest(b"# other")),
+            "BadDigest",
         ),
         (
             "a digest of the empty body",
             ::aws_smithy_types::base64::encode(Md5::digest(b"")),
+            "BadDigest",
         ),
-        ("not a digest at all", "not-base64-at-all".to_string()),
+        (
+            "not a digest at all",
+            "not-base64-at-all".to_string(),
+            "InvalidDigest",
+        ),
     ] {
         let refused = put_object(
             &router,
@@ -644,8 +651,8 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
         );
         assert_eq!(
             refused.error_code(),
-            "InvalidRequest",
-            "case {case:?}: expected the modelled InvalidRequest code, got {:?}",
+            code,
+            "case {case:?}: expected the {code} code, got {:?}",
             refused.error_code()
         );
         let absent = get_object(&router, "refusal-bucket", "dags/unchecked.py", "", &[]).await;
