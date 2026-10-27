@@ -302,12 +302,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(error) = serde_json::from_str::<serde_json::Value>(&execution_input) {
             // The refusal names WHAT was invalid and quotes the diagnostic for it,
             // through the same constructor an invalid definition is reported with,
-            // rather than answering the parser's own string bare.
+            // rather than answering the parser's own string bare: the diagnostic
+            // names where the document stopped parsing and what was expected there.
             return Err(StartExecutionErrorModeled::InvalidExecutionInput(
                 InvalidExecutionInput {
                     message: Some(crate::state::resource_error_message(
                         crate::state::INVALID_STATE_MACHINE_EXECUTION_INPUT,
-                        &error.to_string(),
+                        &crate::state::json_parse_diagnostic(&execution_input, &error),
                     )),
                 },
             )
