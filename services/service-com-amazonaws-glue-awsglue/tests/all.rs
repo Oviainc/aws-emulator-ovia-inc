@@ -149,6 +149,8 @@ mod security_configurations;
 mod state_roundtrip;
 #[path = "all/store_capacity.rs"]
 mod store_capacity;
+#[path = "all/table_version_deletion.rs"]
+mod table_version_deletion;
 #[path = "all/table_version_listing.rs"]
 mod table_version_listing;
 #[path = "all/table_versions.rs"]

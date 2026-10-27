@@ -7687,11 +7687,27 @@ pub mod messages {
     pub const TABLE_ALREADY_EXISTS: &str = "Table already exists.";
 
     /// A version read (`GetTableVersion`) for a version the addressed table's history
-    /// does not hold. NOT recorded: the wording follows [`table_not_found`], the
-    /// refusal for the resource one step up, and carries only the request's `VersionId`.
-    pub fn table_version_not_found(version_id: &str) -> String {
-        format!("Table version {version_id} not found.")
+    /// does not hold, and the version DELETE (`DeleteTableVersion`) for the same miss.
+    /// Recorded constant: the refusal names neither the version the request addressed nor
+    /// the table it was addressed in.
+    pub const TABLE_VERSION_NOT_FOUND: &str = "Table version not found.";
+
+    /// Any table-version operation whose `VersionId` spells no version counter
+    /// ([`super::parse_version_counter`]) — the version read's and the version delete's
+    /// one refusal for an id that is not a version id at all. NOT recorded: the sentence
+    /// restates the requirement the model declares for the member ("A VersionID is a
+    /// string representation of an integer", `GetTableVersionRequest$VersionId`) over the
+    /// value the request sent; what is pinned is the behaviour — 400 with the operation's
+    /// modelled `InvalidInputException`.
+    pub fn malformed_version_id(version_id: &str) -> String {
+        format!("VersionId {version_id} is not a string representation of an integer")
     }
+
+    /// `DeleteTableVersion` (and the per-version failure of `BatchDeleteTableVersion`) for
+    /// the version a table is CURRENTLY under. Recorded constant: the newest version of a
+    /// table is its live definition, which only `DeleteTable` removes, so the refusal
+    /// names no version and no table.
+    pub const TABLE_VERSION_IS_LATEST: &str = "VersionId cannot be equal to the latest.";
 
     /// Any schema-registry operation whose `RegistryId` resolves to a registry this
     /// endpoint holds none of — the parent-registry miss of a schema create, and the miss
