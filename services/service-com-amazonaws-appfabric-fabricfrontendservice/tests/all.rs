@@ -33,6 +33,8 @@ mod connected_authorization_rule;
 mod create_app_authorization_contract;
 #[path = "all/create_app_authorization_credential_idempotency.rs"]
 mod create_app_authorization_credential_idempotency;
+#[path = "all/idempotent_replay_before_preconditions.rs"]
+mod idempotent_replay_before_preconditions;
 #[path = "all/ingestion_deletion.rs"]
 mod ingestion_deletion;
 #[path = "all/ingestion_destination_lifecycle.rs"]

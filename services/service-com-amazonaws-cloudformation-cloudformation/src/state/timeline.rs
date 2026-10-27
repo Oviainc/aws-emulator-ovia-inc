@@ -54,8 +54,9 @@ use std::time::{Duration, SystemTime};
 use super::provisioning::ResourceTransition;
 
 /// The suffix of every `ResourceStatus` that OPENS a resource's transition
-/// ([`super::resource_status`]), which is what tells the two halves of a step apart.
-const IN_PROGRESS: &str = "_IN_PROGRESS";
+/// ([`super::resource_status`]), which is what tells the two halves of a step apart. The
+/// same suffix a STACK's own in-progress statuses carry, so there is one spelling of it.
+const IN_PROGRESS: &str = super::IN_PROGRESS_SUFFIX;
 
 /// The prefix of every `ResourceStatus` of a resource being DELETED, which is the half of
 /// the walk that runs against the dependency relation rather than along it.

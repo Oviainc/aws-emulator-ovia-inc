@@ -5,6 +5,15 @@
 //! context and (when asked for) its web-app configuration, PERSISTS the record in
 //! [`crate::state`], and renders the stored record — never the echoed input.
 //!
+//! The operation is modelled `@idempotent`
+//! (`smithy_query(query="operation",operation="CreateDomain")` reports
+//! `"idempotent": true`), so a REPEAT of a request this account already created a live
+//! domain with in this Region resolves to that domain and mints nothing: the effect of
+//! the repeated call is the effect of the single call. The request's identity is the
+//! digest of the parameters it carried ([`crate::state::domain_creation_fingerprint`]),
+//! stored on the record it created, so a request differing in any parameter is a
+//! different request and creates its own domain.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -135,6 +144,41 @@ const ONBOARDING_GENERATION_MEMBER: ::aws_smithy_schema::Schema =
 /// top-level `accountId` and `onboardingGeneration`.
 pub type CreateDomainResponse = crate::state::RecordedMembers<CreateDomainOutput>;
 
+/// The STORED record as this operation's response.
+///
+/// One projection for both of this operation's answers — the create that minted the
+/// record and the `@idempotent` repeat that resolved to it — so the two cannot report
+/// one domain differently. Every member is read out of the store rather than echoed
+/// from the request.
+fn rendered(stored: &crate::state::Domain) -> CreateDomainResponse {
+    CreateDomainResponse {
+        payload: CreateDomainOutput {
+            domain_id: stored.domain_id.clone(),
+            arn: stored.arn.clone(),
+            name: stored.name.clone(),
+            kms_key_arn: stored.kms_key_arn.clone(),
+            encryption_context: Some(EncryptionContext {
+                encryption_type: stored.encryption_type.as_wire().to_string(),
+                kms_key_arn: stored.kms_key_arn.clone(),
+            }),
+            status: stored.status.as_wire().to_string(),
+            web_app_url: stored.web_app_url.clone(),
+            web_app_configuration: stored
+                .web_app_configuration
+                .as_ref()
+                .map(crate::state::WebAppConfigurationRecord::projected),
+            created_at: crate::state::to_timestamp(stored.created_at),
+        },
+        members: vec![
+            crate::state::RecordedMember::Text(&ACCOUNT_ID_MEMBER, stored.account_id.clone()),
+            crate::state::RecordedMember::Text(
+                &ONBOARDING_GENERATION_MEMBER,
+                stored.onboarding_generation.as_wire().to_string(),
+            ),
+        ],
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -231,6 +275,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.purge_due_deletions(now);
 
+        // The parameters this request carried, as the store holds them: a tag set in KEY
+        // order, so the same entries in a different wire order are the same set. The
+        // digest of those parameters is the identity of the REQUEST — what tells a repeat
+        // from a different request.
+        let requested_tags: ::std::collections::BTreeMap<String, String> = input
+            .tags
+            .iter()
+            .flatten()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let fingerprint = crate::state::domain_creation_fingerprint(
+            &input.name,
+            input.kms_key_arn.as_deref(),
+            &requested_tags,
+            input.web_app_setup_configuration.as_ref(),
+        );
+        // `@idempotent`: a request this account already created a live domain with in
+        // this Region is a REPEAT — the retry of a 201 the client never saw — so what it
+        // answers is the domain that request already created, and it mints nothing.
+        // Resolved BEFORE the quotas below, because a repeat occupies the slot its own
+        // first call took rather than a second one: it can neither be refused by a cap it
+        // does not grow nor consume another of the account's domains.
+        if let Some(existing) = store.domain_created_by(&region, &account_id, &fingerprint) {
+            return Ok(rendered(existing));
+        }
+
         // The account's Domain cap IN THE REGION this create is addressed to, enforced
         // BEFORE anything is minted so a refused request advances nothing. It is a LIVE
         // count of the domains the account holds in this Region, so a `DeleteDomain`
@@ -275,7 +345,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carried. A refusal writes nothing: it is raised before any id is minted.
         let tags = crate::service::tag_bounds::merged_within_cap(
             ::std::collections::BTreeMap::new(),
-            input.tags.unwrap_or_default(),
+            requested_tags,
         )
         .map_err(|count| {
             CreateDomainErrorModeled::ServiceQuotaExceededException(
@@ -351,6 +421,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deleted_at: None,
             web_app_url,
             web_app_configuration,
+            // The request that created this domain, so its repeat resolves here rather
+            // than minting a second domain.
+            creation_fingerprint: fingerprint,
             created_at: now,
             subscriptions: ::std::collections::BTreeMap::new(),
             // A freshly created domain has had no patient insights job started in it,
@@ -367,31 +440,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `or_insert` hands back the record it STORED, so every field rendered below is
         // read out of the store rather than echoed from the request.
         let stored = store.domains.entry(domain_id).or_insert(domain);
-        Ok(CreateDomainResponse {
-            payload: CreateDomainOutput {
-                domain_id: stored.domain_id.clone(),
-                arn: stored.arn.clone(),
-                name: stored.name.clone(),
-                kms_key_arn: stored.kms_key_arn.clone(),
-                encryption_context: Some(EncryptionContext {
-                    encryption_type: stored.encryption_type.as_wire().to_string(),
-                    kms_key_arn: stored.kms_key_arn.clone(),
-                }),
-                status: stored.status.as_wire().to_string(),
-                web_app_url: stored.web_app_url.clone(),
-                web_app_configuration: stored
-                    .web_app_configuration
-                    .as_ref()
-                    .map(crate::state::WebAppConfigurationRecord::projected),
-                created_at: crate::state::to_timestamp(stored.created_at),
-            },
-            members: vec![
-                crate::state::RecordedMember::Text(&ACCOUNT_ID_MEMBER, stored.account_id.clone()),
-                crate::state::RecordedMember::Text(
-                    &ONBOARDING_GENERATION_MEMBER,
-                    stored.onboarding_generation.as_wire().to_string(),
-                ),
-            ],
-        })
+        Ok(rendered(stored))
     }
 }

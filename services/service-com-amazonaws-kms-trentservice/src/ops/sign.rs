@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Sign
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Sign`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: signs the caller's message with the PRIVATE half of the key pair of
+//! the asymmetric KMS key a `KeyId` names, and answers that signature, the key's ARN
+//! and the algorithm it was produced with. This is the only file holding THIS
+//! operation's own request walk; the signature schemes themselves live in
+//! `crate::state` beside the key material and the rest of this service's cryptographic
+//! composition, because `Verify` signs nothing but judges the same schemes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Sign::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The message is hashed with the hash the requested `SigningAlgorithm` names, unless
+//! the caller says the message IS that hash (`MessageType: DIGEST`), in which case it
+//! is signed as it stands. The signing itself is done by the library that implements
+//! the algorithm, over the private key this store holds for that KMS key
+//! (`crate::state::sign_message`), so the signature verifies under the public half
+//! `GetPublicKey` publishes and under the key's own `Verify` — nothing here composes a
+//! signature of its own, and the private half never leaves the process.
+//!
+//! A key that cannot sign is refused with the modelled error for why: an identifier
+//! that names no key, a key state no cryptographic operation runs in, a `KeyUsage`
+//! other than `SIGN_VERIFY` or an algorithm the key's `KeySpec` does not support. A
+//! request that signs is a USE of the key, so it is recorded as the key's last usage.
 //!
 //! ## Shape of an operation
 //!
@@ -254,18 +264,231 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Sign` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SignErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal("the KMS state store is unavailable"));
+        };
+
+        // Who the request speaks for, resolved BEFORE this service's store is locked, so
+        // the IAM and STS stores the resolution reads are never reached while this
+        // service's guard is held.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // Permission a request draws from a grant is judged below, once the key is
+        // known and its key state has been judged.
+        let tokens = input.grant_tokens.clone().unwrap_or_default();
+
+        // `Sign` models no `InvalidArnException`, so an identifier shaped like an ARN
+        // but not a valid one is reported the same way as one that names nothing.
+        let key = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::UnauthorizedAccount => {
+                return Err(crate::state::unauthorized_account(Self::NAME));
+            }
+            crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
+                return Err(SignErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                })
+                .into());
+            }
+        };
+
+        // "The KMS key that you use for this operation must be in a compatible key
+        // state" (this operation's own doc): a disabled key answers
+        // `DisabledException`, and any other state a cryptographic operation cannot
+        // run in answers `KMSInvalidStateException`, which names the state the key is
+        // actually in. Judged BEFORE the grant tokens, so a key that cannot be used at
+        // all reports why rather than reporting an authorization failure.
+        if !key.is_usable() {
+            if key.key_state == crate::state::KEY_STATE_DISABLED {
+                return Err(SignErrorModeled::DisabledException(DisabledException {
+                    message: Some(crate::state::invalid_state_message(key)),
+                })
+                .into());
+            }
+            return Err(SignErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(crate::state::invalid_state_message(key)),
+                },
+            )
+            .into());
+        }
+
+        // A grant token is handed out by `CreateGrant` and names the grant it was
+        // minted for. A token that is not one this service minted names no grant at
+        // all, so the TOKEN "is not valid".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Sign"))
+        // Everything else about permission is the service's one authorization decision
+        // (`crate::state::authorization`): the key's own key policy, the calling
+        // principal's identity policies, and the grants on this key the caller holds or
+        // presented a token for, judged together.
+        let named = match state.grants_for_tokens(&region, &tokens) {
+            Ok(named) => named,
+            Err(crate::state::GrantRefusal::MalformedToken) => {
+                return Err(SignErrorModeled::InvalidGrantTokenException(
+                    InvalidGrantTokenException {
+                        message: Some("The specified grant token is not valid.".to_string()),
+                    },
+                )
+                .into());
+            }
+            // Every token is well formed but names a grant the store no longer holds,
+            // which carries no permission; what else the caller holds is judged below.
+            Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
+        };
+        let presented = (!tokens.is_empty()).then_some(named.as_slice());
+        // `Sign` takes no `EncryptionContext`, so no encryption-context grant
+        // constraint applies to it.
+        if let Err(message) = crate::state::authorization::authorize(
+            &caller,
+            &state,
+            &region,
+            key,
+            Self::NAME,
+            None,
+            presented,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(message));
+        }
+
+        // "For signing and verifying messages, the KeyUsage must be SIGN_VERIFY", and
+        // the algorithm must be one the key's own key spec supports — otherwise it "is
+        // incompatible with the type of key material in the KMS key (KeySpec)"
+        // (`smithy_query(query="doc",shape="InvalidKeyUsageException")`). A key whose
+        // usage is not SIGN_VERIFY supports no signing algorithm at all, so the usage
+        // is judged first and the algorithm list it selects is the key's.
+        if key.key_usage != crate::state::KEY_USAGE_SIGN_VERIFY {
+            return Err(invalid_key_usage(format!(
+                "The KeyUsage value of the KMS key is incompatible with the API operation. {} \
+                 has KeyUsage {}; for signing and verifying messages, the KeyUsage must be {}.",
+                key.arn,
+                key.key_usage,
+                crate::state::KEY_USAGE_SIGN_VERIFY
+            )));
+        }
+        let algorithms = key
+            .algorithms_under(crate::state::KEY_USAGE_SIGN_VERIFY)
+            .unwrap_or_default();
+        if !algorithms.contains(&input.signing_algorithm) {
+            return Err(invalid_key_usage(format!(
+                "The signing algorithm specified for the operation is incompatible with the \
+                 type of key material in the KMS key (KeySpec). {} has KeySpec {}, which \
+                 supports {}.",
+                key.arn,
+                key.key_spec,
+                algorithms.join(", ")
+            )));
+        }
+
+        // "Use the MessageType parameter" to say what the message is; a request that
+        // names none is signing the message itself.
+        let message_type = input
+            .message_type
+            .clone()
+            .unwrap_or_else(|| crate::state::MESSAGE_TYPE_RAW.to_string());
+        if !crate::state::signs_message_type(&input.signing_algorithm, &message_type) {
+            // An algorithm that takes exactly one message type is refused in the words
+            // the model states that requirement in; the only other way to reach here is
+            // the external μ of ML-DSA named for an algorithm that is not ML-DSA.
+            let message = match crate::state::required_message_type(&input.signing_algorithm) {
+                Some(required) => format!(
+                    "{} signing algorithm requires KMS MessageType:{required}.",
+                    input.signing_algorithm
+                ),
+                None => format!(
+                    "MessageType:{message_type} is the 64-byte representative μ used in \
+                     ML-DSA signing; the {} signing algorithm does not sign one.",
+                    input.signing_algorithm
+                ),
+            };
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+        // "When the value of MessageType is DIGEST, the length of the Message value
+        // must match the length of hashed messages for the specified signing algorithm"
+        // (`smithy_query(query="doc",shape="SignRequest",member="MessageType")`), so a
+        // message that is not that many bytes is not the digest it says it is.
+        if message_type == crate::state::MESSAGE_TYPE_DIGEST {
+            let hashed_len = crate::state::signing_hash(&input.signing_algorithm)
+                .map(::aws_lc_rs::digest::Algorithm::output_len);
+            if hashed_len.is_some_and(|len| len != input.message.len()) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Digest is invalid length for algorithm {}.",
+                    input.signing_algorithm
+                )));
+            }
+        }
+
+        // "The request was rejected because the DryRun parameter was specified"
+        // (`smithy_query(query="doc",shape="DryRunOperationException")`): a dry run
+        // checks the request and then always fails, so it is answered AFTER every
+        // check above and BEFORE anything is signed.
+        if input.dry_run == Some(true) {
+            return Err(SignErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(
+                        "The request was rejected because the DryRun parameter was specified."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The signature is produced by the library that implements the algorithm, from
+        // the private half of THIS key's key pair, so the public half `GetPublicKey`
+        // publishes verifies it.
+        let signature = match crate::state::sign_message(
+            key,
+            &input.signing_algorithm,
+            &message_type,
+            &input.message,
+        ) {
+            Ok(signature) => signature,
+            // A key pair or a signature scheme no library reachable from here signs
+            // with: answered as not implemented rather than with bytes that are not a
+            // signature of the caller's message.
+            Err(crate::state::SignatureRefusal::Unsupported) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "Sign with the {} signing algorithm and a KMS key whose KeySpec is {}",
+                    input.signing_algorithm, key.key_spec
+                )));
+            }
+            Err(crate::state::SignatureRefusal::Failed) => {
+                return Err(internal("the message could not be signed"));
+            }
+        };
+        // KMS answers with "the Amazon Resource Name (key ARN) of the asymmetric KMS
+        // key that was used to sign the message", not the identifier the request used.
+        let key_arn = key.arn.clone();
+        let key_id = key.key_id.clone();
+
+        // The key was just used in a successful cryptographic operation, and `Sign` is
+        // one of the operations that use is reported for
+        // (`smithy_query(query="shape",shape="KeyLastUsageTrackingOperation")`).
+        state.record_last_usage(&region, &key_id, Self::NAME);
+
+        Ok(SignOutput {
+            key_id: Some(key_arn),
+            signature: Some(signature),
+            signing_algorithm: Some(input.signing_algorithm),
+        })
     }
+}
+
+/// Refuse a key or a signing algorithm that cannot perform this operation.
+fn invalid_key_usage(message: impl Into<String>) -> SignError {
+    SignErrorModeled::InvalidKeyUsageException(InvalidKeyUsageException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The state store is missing, or the library refused to sign: a server fault rather
+/// than anything about the request.
+fn internal(message: impl Into<String>) -> SignError {
+    SignErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some(message.into()),
+    })
+    .into()
 }

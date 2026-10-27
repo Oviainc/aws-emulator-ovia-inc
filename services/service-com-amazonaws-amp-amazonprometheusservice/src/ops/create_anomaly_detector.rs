@@ -209,19 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // even when the `{workspaceId}` it names resolves to nothing, so a member the
         // caller got wrong is reported whatever the parent.
         //
-        // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
-        // its own tag keys, so it holds for the tags a detector is created with too.
-        if crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys())).is_some()
-        {
-            return Err(field_validation(
-                "tags",
-                &crate::state::reserved_tag_key_requirement(),
-            ));
-        }
-
         // A map's KEYS carry the key shape's own modelled constraints, and nothing in the
         // request walk applies them (see the map-keys section of `crate::state`) — so both
-        // maps this request carries are checked here rather than stored unchecked.
+        // maps this request carries are checked here rather than stored unchecked, and
+        // BEFORE the rule this handler adds, so a key that misses both is refused by the
+        // modelled constraint the request boundary stands for.
         crate::state::check_map_keys(
             "labels",
             input.labels.iter().flat_map(|labels| labels.keys()),
@@ -234,6 +226,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::TAG_KEY,
         )
         .map_err(CreateAnomalyDetectorErrorModeled::ValidationException)?;
+
+        // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
+        // its own tag keys, so it holds for the tags a detector is created with too.
+        if crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys())).is_some()
+        {
+            return Err(field_validation(
+                "tags",
+                &crate::state::reserved_tag_key_requirement(),
+            ));
+        }
 
         // The configuration's own rule, shared with every operation that stores one.
         crate::state::check_random_cut_forest_configuration(&input.configuration)

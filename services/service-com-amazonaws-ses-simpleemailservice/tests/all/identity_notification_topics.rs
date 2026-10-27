@@ -24,7 +24,11 @@
 //!   topic;
 //! * an identity this account has not verified is refused and nothing is stored;
 //! * only identities in the list are reported, and a call may ask about at most
-//!   100 of them.
+//!   100 of them;
+//! * `GetIdentityNotificationAttributes` computes every member it reports for an
+//!   identity from that identity's own stored record, so one call reporting many
+//!   differently configured identities answers each of them from its own
+//!   settings, and reporting changes nothing a later reader sees.
 
 use crate::harness::{call, element, emulator, field, map_entries, Field};
 use service_com_amazonaws_ses_simpleemailservice::ops::NOTIFICATION_TYPE_VALUES;
@@ -880,6 +884,227 @@ async fn an_arn_naming_no_identity_of_this_account_is_refused() {
         assert!(
             reported.is_empty(),
             "case {label} ({named:?}): expected no attributes, got {reported:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_reported_member_comes_from_the_named_identitys_own_record() {
+    /// One identity, configured through the three setters, and what the report
+    /// therefore has to say about it.
+    struct ReportCase {
+        label: &'static str,
+        /// The identity as it is verified, which is the key it is reported under.
+        name: &'static str,
+        /// A domain identity rather than an email address.
+        domain: bool,
+        /// The notification types a topic is stored for.
+        topics: &'static [&'static str],
+        /// The header flag written per type, in order: a type written twice keeps
+        /// the value written LAST, and a type absent here keeps its default.
+        headers: &'static [(&'static str, bool)],
+        /// What feedback forwarding is left set to.
+        forwarding: bool,
+    }
+
+    /// The topic this suite stores for one identity's `kind` notifications.
+    fn stored_topic(identity: &str, kind: &str) -> String {
+        topic_arn(&format!(
+            "ses-report-{}-{}",
+            identity.replace(['@', '.'], "-"),
+            kind.to_lowercase()
+        ))
+    }
+
+    /// Every member of `IdentityNotificationAttributes`, read off a reported
+    /// attributes element as `(member name, value)`.
+    fn reported_members(attributes: &str) -> Vec<(String, String)> {
+        let mut read = vec![(
+            "ForwardingEnabled".to_string(),
+            member(attributes, "ForwardingEnabled"),
+        )];
+        for kind in NOTIFICATION_TYPE_VALUES {
+            read.push((format!("{kind}Topic"), reported_topic(attributes, kind)));
+            read.push((
+                format!("HeadersIn{kind}NotificationsEnabled"),
+                reported_headers_flag(attributes, kind),
+            ));
+        }
+        read
+    }
+
+    /// The same members, as the case's stored settings require them to read.
+    fn expected_members(case: &ReportCase) -> Vec<(String, String)> {
+        let mut expected = vec![(
+            "ForwardingEnabled".to_string(),
+            case.forwarding.to_string(),
+        )];
+        for kind in NOTIFICATION_TYPE_VALUES {
+            let topic = if case.topics.contains(kind) {
+                stored_topic(case.name, kind)
+            } else {
+                String::new()
+            };
+            let flag = case
+                .headers
+                .iter()
+                .filter(|(written, _)| written == kind)
+                .map(|(_, enabled)| *enabled)
+                .next_back()
+                .unwrap_or(false);
+            expected.push((format!("{kind}Topic"), topic));
+            expected.push((
+                format!("HeadersIn{kind}NotificationsEnabled"),
+                flag.to_string(),
+            ));
+        }
+        expected
+    }
+
+    let cases = [
+        ReportCase {
+            label: "an address nobody configured",
+            name: "fresh@example.com",
+            domain: false,
+            topics: &[],
+            headers: &[],
+            forwarding: true,
+        },
+        ReportCase {
+            label: "an address publishing bounces, with their headers on",
+            name: "bounces@example.com",
+            domain: false,
+            topics: &["Bounce"],
+            headers: &[("Bounce", true)],
+            forwarding: true,
+        },
+        ReportCase {
+            label: "an address publishing every class, forwarding off",
+            name: "every-class@example.com",
+            domain: false,
+            topics: &["Bounce", "Complaint", "Delivery"],
+            headers: &[("Complaint", true), ("Delivery", true)],
+            forwarding: false,
+        },
+        ReportCase {
+            label: "a domain publishing complaints, headers turned back off",
+            name: "example.com",
+            domain: true,
+            topics: &["Complaint"],
+            headers: &[("Complaint", true), ("Complaint", false)],
+            forwarding: true,
+        },
+        ReportCase {
+            label: "a subdomain publishing deliveries, with their headers on",
+            name: "mail.corp.example.net",
+            domain: true,
+            topics: &["Delivery"],
+            headers: &[("Delivery", true)],
+            forwarding: true,
+        },
+        ReportCase {
+            label: "an address with every topic and every header flag on",
+            name: "loud@example.com",
+            domain: false,
+            topics: &["Bounce", "Complaint", "Delivery"],
+            headers: &[("Bounce", true), ("Complaint", true), ("Delivery", true)],
+            forwarding: true,
+        },
+    ];
+
+    let router = emulator();
+    for case in &cases {
+        if case.domain {
+            verify_domain(&router, case.name).await;
+        } else {
+            verify_email(&router, case.name).await;
+        }
+        for kind in case.topics {
+            set_topic_ok(
+                &router,
+                case.name,
+                kind,
+                Some(&stored_topic(case.name, kind)),
+            )
+            .await;
+        }
+        for (kind, enabled) in case.headers {
+            let (status, body) = set_headers_enabled(&router, case.name, kind, *enabled).await;
+            assert_eq!(
+                status, 200,
+                "case {}: SetIdentityHeadersInNotificationsEnabled({kind}, {enabled}) must be \
+                 accepted, got {status} with {body}",
+                case.label
+            );
+        }
+        let (status, body) = set_forwarding_enabled(&router, case.name, case.forwarding).await;
+        assert_eq!(
+            status, 200,
+            "case {}: SetIdentityFeedbackForwardingEnabled({}) must be accepted, got {status} \
+             with {body}",
+            case.label, case.forwarding
+        );
+    }
+
+    // ONE call naming every configured identity — each of them twice, once by
+    // name and once by the ARN form `Identity` documents — beside two identities
+    // this account never verified. One identity, one entry, from its own record.
+    let mut named: Vec<String> = Vec::new();
+    for case in &cases {
+        named.push(case.name.to_string());
+        named.push(identity_arn(case.name));
+    }
+    named.push("stranger@example.com".to_string());
+    named.push("example.org".to_string());
+    let listed: Vec<&str> = named.iter().map(String::as_str).collect();
+
+    let reported = notification_attributes(&router, &listed).await;
+    assert_eq!(
+        reported.len(),
+        cases.len(),
+        "case the whole report: expected one entry per verified identity, got {reported:?}"
+    );
+    for case in &cases {
+        let (_, attributes) = reported
+            .iter()
+            .find(|(key, _)| key == case.name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {}: expected an entry for {:?}, got {reported:?}",
+                    case.label, case.name
+                )
+            });
+        let expected = expected_members(case);
+        assert_eq!(
+            reported_members(attributes),
+            expected,
+            "case {}: expected the stored settings {expected:?}, got {attributes:?}",
+            case.label
+        );
+    }
+
+    // Reporting is a READ: asking again answers the same, whether the call names
+    // every identity or just one of them.
+    let sorted = |mut entries: Vec<(String, String)>| {
+        entries.sort();
+        entries
+    };
+    let again = notification_attributes(&router, &listed).await;
+    assert_eq!(
+        sorted(again.clone()),
+        sorted(reported.clone()),
+        "case a second report: expected the first report unchanged, got {again:?}"
+    );
+    for case in &cases {
+        let alone = attributes_of(&router, case.name)
+            .await
+            .unwrap_or_else(|| panic!("case {}: expected {:?} to be reported", case.label, case.name));
+        let expected = expected_members(case);
+        assert_eq!(
+            reported_members(&alone),
+            expected,
+            "case {}: expected one identity's report to still read {expected:?}, got {alone:?}",
+            case.label
         );
     }
 }

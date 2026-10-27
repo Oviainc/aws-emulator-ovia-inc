@@ -58,7 +58,7 @@ fn stored_count(amp: &Amp) -> usize {
 
 /// An EKS source, as `EksConfiguration` models it: `clusterArn` and `subnetIds` are
 /// `@required`, and `securityGroupIds` is optional (both lists are `len 1..5`).
-fn eks_source_json(
+pub(crate) fn eks_source_json(
     region: &str,
     cluster: &str,
     subnets: &[&str],
@@ -89,7 +89,7 @@ fn vpc_source_json(security_groups: &[&str], subnets: &[&str]) -> serde_json::Va
 }
 
 /// An Amazon Managed Service for Prometheus destination, naming a workspace by ARN.
-fn workspace_destination_json(workspace_arn: &str) -> serde_json::Value {
+pub(crate) fn workspace_destination_json(workspace_arn: &str) -> serde_json::Value {
     serde_json::json!({ "ampConfiguration": { "workspaceArn": workspace_arn } })
 }
 
