@@ -79,11 +79,12 @@ pub const PRINCIPAL_TYPE_UNKNOWN: &str = "Unknown";
 ///
 /// The emulator publishes ONE long-term credential, and it belongs to the IAM user
 /// `user/emulator` — the identity STS answers `GetCallerIdentity` with for a caller
-/// presenting it. CloudTrail reports that name as an event's `Username`, which is what a
-/// lookup by the `Username` attribute filters on. A request signed with a TEMPORARY
-/// credential speaks for a session whose role name a serving service cannot resolve, so
-/// it is recorded without a user name rather than with a guessed one.
-pub const AMBIENT_USER_NAME: &str = "emulator";
+/// presenting it, and the record IAM holds for it, both stated once by
+/// [`crate::caller_principal`]. CloudTrail reports that name as an event's `Username`,
+/// which is what a lookup by the `Username` attribute filters on. A request signed with a
+/// TEMPORARY credential speaks for a session whose role name a serving service cannot
+/// resolve, so it is recorded without a user name rather than with a guessed one.
+pub const AMBIENT_USER_NAME: &str = crate::caller_principal::AMBIENT_USER_NAME;
 
 /// The access-key-id prefix of a temporary (session) credential, from the IAM
 /// "unique identifier prefixes" table: `ASIA` for a temporary access key, `AKIA` for an

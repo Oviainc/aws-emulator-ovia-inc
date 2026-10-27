@@ -198,6 +198,10 @@ pub mod rds_cluster_parameters;
 pub mod agentic_rft_jobs;
 pub mod arn;
 pub mod bedrock;
+/// The ONE definition of the IAM principal this emulator's own long-term credential speaks
+/// for: the user STS reports as the caller and IAM holds among the account's users, so the
+/// two cannot disagree about who the caller is.
+pub mod caller_principal;
 /// The app-instance ADMIN directory the Amazon Chime SDK family shares: Chime SDK
 /// Identity promotes an identity to an administrator and Chime SDK Messaging reads the
 /// role, which it reserves two of its actions for.

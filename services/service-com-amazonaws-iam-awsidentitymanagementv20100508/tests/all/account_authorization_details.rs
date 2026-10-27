@@ -49,6 +49,20 @@ const TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Al
 /// exercised on an entity with policies and on one without.
 const USERS: &[(&str, &str)] = &[("alice", "/eng/"), ("Bob", "/")];
 
+/// Every user the account holds while the fixture is in place: the two the fixture
+/// created, and the one the account holds BEFORE any request — the IAM user this
+/// emulator's own long-term credential belongs to
+/// (`service_common::caller_principal`), at the account root. A report of the
+/// account's configuration carries it like any other user of the account.
+const ALL_USERS: &[(&str, &str)] = &[
+    ("alice", "/eng/"),
+    ("Bob", "/"),
+    (
+        ::service_common::caller_principal::AMBIENT_USER_NAME,
+        ::service_common::caller_principal::AMBIENT_USER_PATH,
+    ),
+];
+
 /// The fixture groups, likewise: one carrying an inline policy, one carrying none.
 const GROUPS: &[(&str, &str)] = &[("Admins", "/"), ("auditors_1", "/audit/")];
 
@@ -508,7 +522,7 @@ fn type_cases() -> Vec<TypeCase> {
             entity_type: state::ENTITY_FILTER_USER,
             list_tag: "UserDetailList",
             name_tag: "UserName",
-            expected: in_store_order(USERS),
+            expected: in_store_order(ALL_USERS),
         },
         TypeCase {
             case: "groups",
