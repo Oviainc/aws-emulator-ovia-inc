@@ -1182,6 +1182,20 @@
 //! place a record is built, so the id, the ARN, the owning account and the id of each
 //! IPv4 CIDR block association are decided once however many writers there are.
 //!
+//! ## Secondary interfaces
+//!
+//! [`ComAmazonawsEc2Amazonec2State::secondary_interfaces`] holds the account's secondary
+//! interfaces — the interfaces an instance has in a secondary subnet — on exactly the terms
+//! the secondary subnets above are held on: the modelled [`SecondaryInterface`] shape
+//! itself, keyed by `SecondaryInterfaceId` in a [`BTreeMap`] whose id order is both the
+//! order `DescribeSecondaryInterfaces` reports in and the position a pagination token
+//! names. [`ComAmazonawsEc2Amazonec2State::insert_secondary_interface`] is the one place a
+//! record is built, so the interface's id, its ARN, its MAC address, the owning account, the
+//! id of its attachment and the `available`/`in-use` status that follows from that
+//! attachment are decided once however many writers there are — an interface can no more
+//! claim to be `available` while an instance holds it than a
+//! [`ComAmazonawsEc2Amazonec2State::network_interfaces`] record can.
+//!
 //! ## A Capacity Block OFFERING is a search result, not a stored resource
 //!
 //! Nothing in the EC2 API creates or deletes a Capacity Block offering:
@@ -1432,7 +1446,8 @@ use crate::ops::types::{
     RouteServer, RouteServerBfdStatus,
     RouteServerBgpOptions, RouteServerBgpStatus, RouteServerEndpoint, RouteServerPeer,
     RouteServerAssociation,
-    RunInstancesOutput, SecondaryNetwork,
+    RunInstancesOutput, SecondaryInterface, SecondaryInterfaceAttachment,
+    SecondaryInterfaceIpv4Address, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
     ServiceDetail, ServiceTypeDetail,
@@ -3289,6 +3304,10 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`SecondarySubnet`] shape itself — see the module docs. Ordered by id, which is the
     /// order `DescribeSecondarySubnets` reports and pages over.
     pub secondary_subnets: BTreeMap<String, SecondarySubnet>,
+    /// Every secondary interface the account holds, by `SecondaryInterfaceId`, as the
+    /// modelled [`SecondaryInterface`] shape itself — see the module docs. Ordered by id,
+    /// which is the order `DescribeSecondaryInterfaces` reports and pages over.
+    pub secondary_interfaces: BTreeMap<String, SecondaryInterface>,
     /// Every request to assign the billing of a Capacity Reservation's unused capacity, by
     /// `CapacityReservationId`, as the modelled [`CapacityReservationBillingRequest`] shape
     /// itself — see the module docs. Ordered by that id, which is the order
@@ -3807,6 +3826,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             image_usage_reports: BTreeMap::new(),
             export_tasks: BTreeMap::new(),
             secondary_subnets: BTreeMap::new(),
+            secondary_interfaces: BTreeMap::new(),
             capacity_reservation_billing_requests: BTreeMap::new(),
             vpc_endpoint_connection_moves: BTreeMap::new(),
             vpc_endpoint_services: BTreeMap::new(),
@@ -8044,6 +8064,7 @@ impl ComAmazonawsEc2Amazonec2State {
             route_server_endpoints,
             route_server_peers,
             route_servers => view,
+            secondary_interfaces,
             secondary_networks => view,
             secondary_subnets,
             security_groups,
@@ -32298,6 +32319,289 @@ pub fn secondary_subnet_payload_bytes(secondary_subnet: &SecondarySubnet) -> usi
                 .unwrap_or_default()
                 .len(),
         )
+        .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
+}
+
+// ---------------------------------------------------------------------------
+// Secondary interfaces
+// ---------------------------------------------------------------------------
+
+/// EC2's error code for a request that named a secondary interface id no secondary interface
+/// of the account has.
+///
+/// EC2 spells an id it cannot resolve `Invalid<Resource>ID.NotFound` —
+/// [`INVALID_SECONDARY_SUBNET_ID_NOT_FOUND`], [`INVALID_SUBNET_ID_NOT_FOUND`],
+/// [`INVALID_VPC_ID_NOT_FOUND`] — so the secondary interface's own code follows that form.
+/// EC2 models no error shapes at all, so it is answered through
+/// [`crate::scaffolded::Scaffolded::service_error`] like every other code here.
+pub const INVALID_SECONDARY_INTERFACE_ID_NOT_FOUND: &str = "InvalidSecondaryInterfaceID.NotFound";
+
+/// Refuse a request that named a secondary interface id no secondary interface of the
+/// account has, the way [`invalid_secondary_subnet_id_not_found`] refuses an unknown
+/// secondary subnet id: HTTP 400.
+pub fn invalid_secondary_interface_id_not_found<E>(secondary_interface_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_SECONDARY_INTERFACE_ID_NOT_FOUND,
+        400,
+        format!("The secondary interface ID '{secondary_interface_id}' does not exist"),
+    )
+}
+
+/// The id prefix a secondary interface carries.
+///
+/// CHOSEN, on the same terms as [`SECONDARY_SUBNET_ID_PREFIX`]: the model publishes no
+/// `@pattern` for `SecondaryInterfaceId`
+/// (`smithy_query(query="shape",shape="SecondaryInterfaceId")` reports a plain string), so
+/// the only form it has to satisfy is EC2's own `<prefix>-<hex>`, which
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] gives. The prefix follows the elastic network
+/// interface's [`NETWORK_INTERFACE_ID_PREFIX`] with the resource's `s`econdary initial, the
+/// way the secondary subnet's own prefix follows a subnet's.
+pub const SECONDARY_INTERFACE_ID_PREFIX: &str = "seni";
+
+/// The id prefix of the attachment of a secondary interface to an instance, which is what
+/// `SecondaryInterfaceAttachment$AttachmentId` names. CHOSEN on the same terms as
+/// [`SECONDARY_INTERFACE_ID_PREFIX`], following the ordinary interface attachment's
+/// [`NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX`].
+pub const SECONDARY_INTERFACE_ATTACHMENT_ID_PREFIX: &str = "seni-attach";
+
+/// The only secondary interface type the model publishes: `SecondaryInterfaceType`'s sole
+/// member — "The type of secondary interface (`secondary`)"
+/// (`DescribeSecondaryInterfacesRequest$Filters`). The whole catalog is the generated
+/// [`crate::ops::types::SECONDARY_INTERFACE_TYPE_VALUES`], so an interface's type is derived
+/// from it rather than chosen by a writer.
+pub const SECONDARY_INTERFACE_TYPE_SECONDARY: &str = "secondary";
+
+/// The status of a secondary interface nothing holds: `SecondaryInterfaceStatus`'s
+/// `available` member — "The status of the secondary interface (`available` | `in-use`)"
+/// (`DescribeSecondaryInterfacesRequest$Filters`). The whole catalog is the generated
+/// [`crate::ops::types::SECONDARY_INTERFACE_STATUS_VALUES`].
+pub const SECONDARY_INTERFACE_STATUS_AVAILABLE: &str = "available";
+
+/// The status of a secondary interface an instance holds: `SecondaryInterfaceStatus`'s
+/// `in-use` member, where an interface with an attachment that has not been taken away sits.
+pub const SECONDARY_INTERFACE_STATUS_IN_USE: &str = "in-use";
+
+/// The `ResourceType` a secondary interface is named by — the resource part of its ARN, and
+/// the word EC2 uses for the kind in its messages.
+pub const SECONDARY_INTERFACE_RESOURCE: &str = "secondary-interface";
+
+/// How many secondary interfaces this emulator stores before a write of another is refused.
+///
+/// CHOSEN, like [`MAX_STORED_SECONDARY_SUBNETS`] and for the reason the module gives for
+/// every other ceiling: nothing in this emulator reclaims a stored secondary interface, so
+/// this store needs a ceiling that is not the process's memory.
+pub const MAX_STORED_SECONDARY_INTERFACES: usize = MAX_STORED_RECORDS_PER_STORE;
+
+/// Refuse a create that would take the store past [`MAX_STORED_SECONDARY_INTERFACES`]: HTTP
+/// 400, with the same quota code family a secondary network's own ceiling answers with.
+pub fn secondary_interface_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(SECONDARY_NETWORK_LIMIT_EXCEEDED, 400, message)
+}
+
+/// What one attachment of a secondary interface to an instance is created with, beside the
+/// ids and the owning account the store derives itself.
+///
+/// The attachment id is NOT here: it is minted by
+/// [`ComAmazonawsEc2Amazonec2State::insert_secondary_interface`], the way every other stored
+/// id is, so no writer can choose one.
+#[derive(Debug, Clone)]
+pub struct SecondaryInterfaceAttachmentSpec {
+    /// "The ID of the instance to which the secondary interface is attached"
+    /// (`DescribeSecondaryInterfacesRequest$Filters`), which
+    /// `SecondaryInterfaceAttachment$InstanceId` reports.
+    pub instance_id: String,
+    /// "The device index of the secondary interface"
+    /// (`SecondaryInterfaceAttachment$DeviceIndex`).
+    pub device_index: i32,
+    /// The index of the network card the interface is on
+    /// (`SecondaryInterfaceAttachment$NetworkCardIndex`).
+    pub network_card_index: i32,
+    /// Whether the interface is deleted when the instance terminates
+    /// (`SecondaryInterfaceAttachment$DeleteOnTermination`).
+    pub delete_on_termination: bool,
+    /// "The attachment status (`attaching` | `attached` | `detaching` | `detached`)"
+    /// (`DescribeSecondaryInterfacesRequest$Filters`), as the model's `AttachmentStatus` enum
+    /// spells it — see [`ATTACHMENT_STATUS_ATTACHED`] and [`ATTACHMENT_STATUS_DETACHED`].
+    pub status: String,
+    /// When the interface was attached (`SecondaryInterfaceAttachment$AttachTime`), as a
+    /// [`SystemTime`] the store renders into the modelled timestamp.
+    pub attach_time: SystemTime,
+}
+
+/// What one stored secondary interface is created with, beside the facts the store derives
+/// itself.
+///
+/// The spec of the resource, in the same shape [`SecondarySubnetSpec`] has for a secondary
+/// subnet: a writer fills this in and
+/// [`ComAmazonawsEc2Amazonec2State::insert_secondary_interface`] turns it into the modelled
+/// [`SecondaryInterface`] the describe reports, so the ids, the ARN, the MAC address, the
+/// owning account, the interface type, the status and the byte charge are decided in exactly
+/// one place.
+#[derive(Debug, Clone)]
+pub struct SecondaryInterfaceSpec {
+    /// "The ID of the secondary subnet" the interface is in
+    /// (`SecondaryInterface$SecondarySubnetId`).
+    pub secondary_subnet_id: String,
+    /// "The ID of the secondary network" the interface belongs to
+    /// (`SecondaryInterface$SecondaryNetworkId`).
+    pub secondary_network_id: String,
+    /// "The type of the secondary network" (`SecondaryInterface$SecondaryNetworkType`), as
+    /// the model's `SecondaryNetworkType` enum spells it — see
+    /// [`SECONDARY_NETWORK_TYPE_RDMA`].
+    pub secondary_network_type: String,
+    /// "The Availability Zone of the secondary interface"
+    /// (`SecondaryInterface$AvailabilityZone`).
+    pub availability_zone: String,
+    /// "The ID of the Availability Zone of the secondary interface"
+    /// (`SecondaryInterface$AvailabilityZoneId`).
+    pub availability_zone_id: String,
+    /// The Region the interface's ARN names. Not a member of the shape: it is what
+    /// `engine::emulator_arn` needs to build `SecondaryInterfaceArn`.
+    pub region: String,
+    /// "The private IPv4 address associated with the secondary interface"
+    /// (`DescribeSecondaryInterfacesRequest$Filters`), in the order they are reported, and
+    /// empty for an interface that holds none.
+    pub private_ipv4_addresses: Vec<String>,
+    /// "Indicates whether source/destination checking is enabled"
+    /// (`SecondaryInterface$SourceDestCheck`) — [`DEFAULT_SOURCE_DEST_CHECK`] unless the
+    /// writer turned it off.
+    pub source_dest_check: bool,
+    /// "The secondary interface attachment" (`SecondaryInterface$Attachment`), for an
+    /// interface an instance holds; `None` for one attached to nothing. The `Status` the
+    /// store derives follows from it, so a stored interface cannot claim to be `available`
+    /// while an instance holds it.
+    pub attachment: Option<SecondaryInterfaceAttachmentSpec>,
+    /// "The tags assigned to the secondary interface" (`SecondaryInterface$Tags`).
+    pub tags: Vec<Tag>,
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Is there room for another secondary interface in this store
+    /// ([`MAX_STORED_SECONDARY_INTERFACES`])?
+    ///
+    /// A create asks this so it can refuse with the quota code instead of overshooting the
+    /// ceiling; [`Self::insert_secondary_interface`] asks it again, so a writer that forgets
+    /// the gate still cannot grow the store past it.
+    pub fn has_secondary_interface_capacity(&self) -> bool {
+        self.secondary_interfaces.len() < MAX_STORED_SECONDARY_INTERFACES
+    }
+
+    /// Store a secondary interface, and answer the `SecondaryInterfaceId` it was given — or
+    /// `None` when this store is already at [`MAX_STORED_SECONDARY_INTERFACES`], which a
+    /// handler answers with [`secondary_interface_limit_exceeded`].
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller — the interface's id, the ARN and the MAC address built from it, the owning
+    /// account, the id of its attachment, the one `SecondaryInterfaceType` the model
+    /// publishes, and the `available`/`in-use` status that follows from the attachment — so
+    /// two writers cannot report the same interface differently. Like
+    /// [`Self::insert_secondary_subnet`], the caller-chosen bytes the record holds are
+    /// charged against the store's byte budget here, by
+    /// [`secondary_interface_payload_bytes`], which is the one definition of that charge and
+    /// already carries the fixed per-record overhead, so a tag-free interface is not free
+    /// against the budget either — and the ceiling is checked BEFORE any id is minted, so a
+    /// refused write consumes nothing at all.
+    pub fn insert_secondary_interface(&mut self, spec: SecondaryInterfaceSpec) -> Option<String> {
+        if !self.has_secondary_interface_capacity() {
+            return None;
+        }
+        let secondary_interface_id = self.next_id(SECONDARY_INTERFACE_ID_PREFIX);
+        // The MAC address is derived from the store's counter, the way an elastic network
+        // interface's is, so it is the same across reads and no two interfaces share one.
+        let mac_address = mac_address_for(self.id_counter);
+        let attachment = spec.attachment.map(|attachment| SecondaryInterfaceAttachment {
+            attachment_id: Some(self.next_id(SECONDARY_INTERFACE_ATTACHMENT_ID_PREFIX)),
+            attach_time: Some(system_time_to_date_time(attachment.attach_time)),
+            delete_on_termination: Some(attachment.delete_on_termination),
+            device_index: Some(attachment.device_index),
+            instance_id: Some(attachment.instance_id),
+            // The instance an interface of this account is attached to is this account's
+            // own: nothing in this emulator attaches one across accounts.
+            instance_owner_id: Some(::engine::emulator_account_id().to_string()),
+            network_card_index: Some(attachment.network_card_index),
+            status: Some(attachment.status),
+        });
+        // "The status of the secondary interface (`available` | `in-use`)": an interface an
+        // instance holds is `in-use`, one attached to nothing is `available`, and an
+        // attachment that has reached `detached` holds nothing. Derived here rather than
+        // taken from the writer, for the reason
+        // [`Self::insert_network_interface`] derives an elastic network interface's.
+        let held = attachment
+            .as_ref()
+            .is_some_and(|attachment| attachment.status.as_deref() != Some(ATTACHMENT_STATUS_DETACHED));
+        let status = if held {
+            SECONDARY_INTERFACE_STATUS_IN_USE
+        } else {
+            SECONDARY_INTERFACE_STATUS_AVAILABLE
+        };
+        let secondary_interface = SecondaryInterface {
+            secondary_interface_id: Some(secondary_interface_id.clone()),
+            secondary_interface_arn: Some(::engine::emulator_arn(
+                "ec2",
+                &spec.region,
+                &format!("{SECONDARY_INTERFACE_RESOURCE}/{secondary_interface_id}"),
+            )),
+            // The model publishes exactly one `SecondaryInterfaceType`, so the type of an
+            // interface is a fact of the kind rather than something a writer picks.
+            secondary_interface_type: Some(SECONDARY_INTERFACE_TYPE_SECONDARY.to_string()),
+            secondary_subnet_id: Some(spec.secondary_subnet_id),
+            secondary_network_id: Some(spec.secondary_network_id),
+            secondary_network_type: Some(spec.secondary_network_type),
+            availability_zone: Some(spec.availability_zone),
+            availability_zone_id: Some(spec.availability_zone_id),
+            mac_address: Some(mac_address),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            private_ipv4_addresses: Some(
+                spec.private_ipv4_addresses
+                    .into_iter()
+                    .map(|address| SecondaryInterfaceIpv4Address {
+                        private_ip_address: Some(address),
+                    })
+                    .collect(),
+            ),
+            source_dest_check: Some(spec.source_dest_check),
+            status: Some(status.to_string()),
+            attachment,
+            tags: Some(spec.tags),
+        };
+        // `secondary_interface_payload_bytes` is the ONE definition of this charge and
+        // already carries the fixed per-record overhead, so the call site adds nothing to
+        // it: a removal path gives back exactly this number.
+        self.add_stored_bytes(secondary_interface_payload_bytes(&secondary_interface));
+        self.secondary_interfaces
+            .insert(secondary_interface_id.clone(), secondary_interface);
+        Some(secondary_interface_id)
+    }
+}
+
+/// The bytes one stored secondary interface is charged: its tags, each private IPv4 address
+/// it holds and the id of the instance its attachment names, plus
+/// [`STORED_RECORD_OVERHEAD_BYTES`] for the record itself. The ids this module mints, the
+/// ARN, the MAC address, the owning account, the statuses and the network type are derived
+/// here or bounded by the model, so they are fixed-size.
+///
+/// The fixed overhead is what makes an interface written with no tags and no address cost
+/// something: a count ceiling alone leaves a zero-payload record free against
+/// [`MAX_STORED_BYTES`], so repeated writes would advance no budget at all.
+///
+/// The ONE definition of that charge, the way [`secondary_subnet_payload_bytes`] is for a
+/// secondary subnet: a writer charges exactly it, and a removal path must give back the same
+/// number.
+pub fn secondary_interface_payload_bytes(secondary_interface: &SecondaryInterface) -> usize {
+    let address_bytes: usize = secondary_interface
+        .private_ipv4_addresses
+        .iter()
+        .flatten()
+        .map(|address| address.private_ip_address.as_deref().unwrap_or_default().len())
+        .sum();
+    let attachment_bytes = secondary_interface
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.instance_id.as_deref())
+        .map_or(0, str::len);
+    tag_list_bytes(secondary_interface.tags.as_deref().unwrap_or_default())
+        .saturating_add(address_bytes)
+        .saturating_add(attachment_bytes)
         .saturating_add(STORED_RECORD_OVERHEAD_BYTES)
 }
 

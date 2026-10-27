@@ -153,7 +153,10 @@ pub(crate) async fn create_channel(
     name: &str,
     placement: Option<(&str, &str)>,
 ) -> String {
-    let mut request = json!({ "name": name });
+    let mut request = json!({
+        "name": name,
+        "encoderSettings": crate::support::channel_encoder_settings(),
+    });
     if let Some((cluster, group)) = placement {
         request["anywhereSettings"] =
             json!({ "clusterId": cluster, "channelPlacementGroupId": group });

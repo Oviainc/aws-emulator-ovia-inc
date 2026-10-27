@@ -60,6 +60,7 @@ async fn channels_with_links(
                 }
             });
         }
+        let body = crate::support::resolved_channel_body(router, body).await;
         let (status, created) = call(router, "POST", "/prod/channels", Some(body)).await;
         assert_eq!(
             status, 201,
@@ -949,6 +950,7 @@ async fn signal_map_discovery_traces_a_channel_to_the_inputs_it_attaches() {
                     }
                 });
             }
+            let body = crate::support::resolved_channel_body(&router, body).await;
             let (status, created) = call(&router, "POST", "/prod/channels", Some(body)).await;
             assert_eq!(
                 status, 201,

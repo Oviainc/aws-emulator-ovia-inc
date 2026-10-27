@@ -559,7 +559,10 @@ async fn a_listing_request_the_service_cannot_satisfy_is_refused() {
         &router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "neighbour" })),
+        Some(json!({
+            "name": "neighbour",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(

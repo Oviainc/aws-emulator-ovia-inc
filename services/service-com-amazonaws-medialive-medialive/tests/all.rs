@@ -32,6 +32,9 @@ mod channel_alerts;
 #[path = "all/channel_class_update.rs"]
 mod channel_class_update;
 
+#[path = "all/channel_configuration_validation.rs"]
+mod channel_configuration_validation;
+
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 

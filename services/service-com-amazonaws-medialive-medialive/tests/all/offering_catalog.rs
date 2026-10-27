@@ -574,6 +574,7 @@ async fn create_channel(
     let mut request = json!({
         "name": format!("offering-filter-{case}"),
         "channelClass": channel_class,
+        "encoderSettings": crate::support::channel_encoder_settings(),
     });
     if let Some(specification) = input_specification {
         request["inputSpecification"] = specification;

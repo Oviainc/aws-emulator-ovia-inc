@@ -70,7 +70,9 @@
 //! documented [`VALIDATION_WINDOW`], which is what a request waiting for evidence from
 //! outside is owed. Beside it — for a certificate ACM validates by EMAIL — sits the
 //! instant the initial validation mail it owes falls due
-//! ([`Certificate::pending_validation_email`]). Nothing sleeps for those instants —
+//! ([`Certificate::pending_validation_email`]), and — for one `RenewCertificate` has
+//! been called for — the completion of the managed renewal it started ([`Renewal`]).
+//! Nothing sleeps for those instants —
 //! [`ComAmazonawsAcmCertificatemanagerState::materialize_due`] applies whatever was
 //! already due, and every handler calls it before reading or writing the store.
 
@@ -89,7 +91,7 @@ use crate::ops::types::{
     Expiration,
     ExpiryEventsConfiguration,
     ExtendedKeyUsage, FailureDetails, GeneralName, HttpRedirect, KeyUsage, PrevalidationDetails,
-    ResourceRecord, Tag, X509Attributes,
+    RenewalSummary, ResourceRecord, Tag, X509Attributes,
 };
 
 /// This service's SigV4 signing name, and the `acm` segment of every ARN it mints.
@@ -267,12 +269,71 @@ pub const CERTIFICATE_VALIDITY: Duration = Duration::from_secs(395 * 24 * 60 * 6
 /// certificate ACM issues, which a certificate carries only once it has been issued.
 pub const ISSUED_KEY_USAGES: &[&str] = &["DIGITAL_SIGNATURE", "KEY_ENCIPHERMENT"];
 
-/// The `ExtendedKeyUsageName` values of the X.509 Extended Key Usage extension of a
-/// TLS certificate ACM issues, with the same lifecycle as [`ISSUED_KEY_USAGES`].
-pub const ISSUED_EXTENDED_KEY_USAGES: &[&str] = &[
-    "TLS_WEB_SERVER_AUTHENTICATION",
-    "TLS_WEB_CLIENT_AUTHENTICATION",
+/// The key purposes of the X.509 Extended Key Usage extension of a TLS certificate ACM
+/// issues — server and client authentication — each as the object identifier RFC 5280
+/// section 4.2.1.12 assigns it, with the same lifecycle as [`ISSUED_KEY_USAGES`].
+///
+/// Stored as the identifiers rather than the names because the identifier is what an
+/// X.509 extension carries; the name each one is reported under comes from
+/// [`EXTENDED_KEY_USAGE_OIDS`].
+pub const ISSUED_EXTENDED_KEY_USAGE_OIDS: &[&str] =
+    &["1.3.6.1.5.5.7.3.1", "1.3.6.1.5.5.7.3.2"];
+
+/// One key purpose of a certificate's X.509 Extended Key Usage extension, as ACM
+/// publishes it: the object identifier the extension carries and the
+/// `ExtendedKeyUsageName` that identifier is named by.
+///
+/// Both halves are stored because a purpose outside the ones the model names is
+/// reported under one name ([`EXTENDED_KEY_USAGE_CUSTOM`]), so the identifier is the
+/// only thing that still says WHICH purpose it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendedKeyUsageRecord {
+    /// An `ExtendedKeyUsageName` value.
+    pub name: String,
+    /// The dotted-decimal object identifier of the key purpose.
+    pub oid: String,
+}
+
+/// The `ExtendedKeyUsageName` each key purpose is reported under, as
+/// `ExtendedKeyUsage$OID`'s own documentation pairs the two
+/// (`smithy_query(query="doc", shape="com.amazonaws.acm#ExtendedKeyUsage",
+/// member="OID")` — "1.3.6.1.5.5.7.3.1 (TLS_WEB_SERVER_AUTHENTICATION)" and the eight
+/// entries beside it), plus `anyExtendedKeyUsage` (`2.5.29.37.0`, RFC 5280 section
+/// 4.2.1.12), which the model names `ANY`.
+pub const EXTENDED_KEY_USAGE_OIDS: &[(&str, &str)] = &[
+    ("TLS_WEB_SERVER_AUTHENTICATION", "1.3.6.1.5.5.7.3.1"),
+    ("TLS_WEB_CLIENT_AUTHENTICATION", "1.3.6.1.5.5.7.3.2"),
+    ("CODE_SIGNING", "1.3.6.1.5.5.7.3.3"),
+    ("EMAIL_PROTECTION", "1.3.6.1.5.5.7.3.4"),
+    ("IPSEC_END_SYSTEM", "1.3.6.1.5.5.7.3.5"),
+    ("IPSEC_TUNNEL", "1.3.6.1.5.5.7.3.6"),
+    ("IPSEC_USER", "1.3.6.1.5.5.7.3.7"),
+    ("TIME_STAMPING", "1.3.6.1.5.5.7.3.8"),
+    ("OCSP_SIGNING", "1.3.6.1.5.5.7.3.9"),
+    ("ANY", "2.5.29.37.0"),
 ];
+
+/// The `ExtendedKeyUsageName` a key purpose outside [`EXTENDED_KEY_USAGE_OIDS`] is
+/// reported under, the value that enum declares for exactly that.
+pub const EXTENDED_KEY_USAGE_CUSTOM: &str = "CUSTOM";
+
+/// The key purpose `oid` names, as ACM publishes it: the identifier itself beside the
+/// name [`EXTENDED_KEY_USAGE_OIDS`] pairs it with, or [`EXTENDED_KEY_USAGE_CUSTOM`]
+/// for one that catalogue does not name.
+///
+/// The single place a key purpose becomes a reportable pair, so the purposes read out
+/// of an imported certificate's DER and those of a certificate ACM issues cannot be
+/// named by two different catalogues.
+pub fn extended_key_usage(oid: &str) -> ExtendedKeyUsageRecord {
+    let name = EXTENDED_KEY_USAGE_OIDS
+        .iter()
+        .find(|(_, identifier)| *identifier == oid)
+        .map_or(EXTENDED_KEY_USAGE_CUSTOM, |(name, _)| *name);
+    ExtendedKeyUsageRecord {
+        name: name.to_string(),
+        oid: oid.to_string(),
+    }
+}
 
 /// `CertificateType`: "For certificates provided by ACM, this value is
 /// `AMAZON_ISSUED`" (`CertificateDetail$Type` doc).
@@ -288,6 +349,33 @@ pub const TYPE_IMPORTED: &str = "IMPORTED";
 /// RenewCertificate command" (`CertificateDetail$RenewalEligibility` doc), so a
 /// public certificate ACM issues is not eligible.
 pub const RENEWAL_INELIGIBLE: &str = "INELIGIBLE";
+
+/// `RenewalEligibility` of the one certificate ACM renews on request: "only exported
+/// private certificates can be renewed with the RenewCertificate command"
+/// (`CertificateDetail$RenewalEligibility` doc) — see
+/// [`Certificate::renewal_eligibility`].
+pub const RENEWAL_ELIGIBLE: &str = "ELIGIBLE";
+
+/// `RenewalStatus` of a renewal ACM has started and not finished: "the status of ACM's
+/// managed renewal of the certificate" (`RenewalSummary$RenewalStatus` doc).
+pub const RENEWAL_STATUS_PENDING_AUTO_RENEWAL: &str = "PENDING_AUTO_RENEWAL";
+
+/// `RenewalStatus` of a renewal that completed, which is when the renewed
+/// certificate's validity window is the one the record carries.
+pub const RENEWAL_STATUS_SUCCESS: &str = "SUCCESS";
+
+/// `RenewalStatus` of a renewal ACM could not complete, which is what a renewal owed to
+/// a certificate that stopped being issued before it fell due ends as.
+pub const RENEWAL_STATUS_FAILED: &str = "FAILED";
+
+/// How long after `RenewCertificate` the renewal it started falls due.
+///
+/// A CHOSEN span, not a documented one: ACM's managed renewal takes minutes to hours,
+/// which no client could poll through here. It is never zero, so a caller that reads
+/// straight after renewing still observes [`RENEWAL_STATUS_PENDING_AUTO_RENEWAL`], and
+/// it is never slept on: the due instant is stored on the record ([`Renewal::due_at`])
+/// and materialised by whichever call next touches the store.
+pub const RENEWAL_SETTLE_DELAY: Duration = Duration::from_millis(750);
 
 /// `CertificateKeyPairOrigin` of a certificate whose key pair ACM generated, which
 /// is every certificate `RequestCertificate` creates.
@@ -689,6 +777,23 @@ impl PendingValidation {
     }
 }
 
+/// The managed renewal ACM has started for one certificate: the status it reports and
+/// the instant its completion falls due, while it is still owed.
+///
+/// Stored, never slept on, exactly as [`PendingValidation`] is: the instant is fixed by
+/// the `RenewCertificate` call that started the renewal, so the renewal completes at
+/// that instant whether or not anybody calls again.
+#[derive(Debug, Clone)]
+pub struct Renewal {
+    /// A `RenewalStatus` value.
+    pub status: String,
+    /// "The time at which the renewal summary was last updated"
+    /// (`RenewalSummary$UpdatedAt` doc).
+    pub updated_at: SystemTime,
+    /// When the renewal completes, while it is still owed; `None` once it has.
+    pub due_at: Option<SystemTime>,
+}
+
 /// One stored ACM certificate. Every field a response reports is read from here.
 #[derive(Debug, Clone)]
 pub struct Certificate {
@@ -702,8 +807,8 @@ pub struct Certificate {
     /// A `CertificateType` value.
     pub cert_type: String,
     /// A `KeyAlgorithm` value, in the model enum's spelling (`RSA_2048`) — the
-    /// spelling the request and the `Includes.keyTypes` filter use. The detail
-    /// projection reports it through [`detail_key_algorithm`].
+    /// spelling the request and the `Includes.keyTypes` filter use. Every projection
+    /// that REPORTS the algorithm renders it through [`reported_key_algorithm`].
     pub key_algorithm: String,
     /// "The name of the entity that is associated with the public key contained in the
     /// certificate" (`CertificateDetail$Subject`): the subject distinguished name,
@@ -724,8 +829,11 @@ pub struct Certificate {
     pub certificate_authority_arn: Option<String>,
     /// A `CertificateManagedBy` value.
     pub managed_by: Option<String>,
-    /// A `RenewalEligibility` value.
-    pub renewal_eligibility: String,
+    /// The managed renewal `RenewCertificate` started for this certificate, while
+    /// there is one: "contains information about the status of ACM's managed renewal
+    /// for the certificate" (`CertificateDetail$RenewalSummary` doc). `None` for a
+    /// certificate no renewal was ever asked for.
+    pub renewal: Option<Renewal>,
     /// A `FailureReason` value, which "exists only when the certificate status is
     /// FAILED" (`CertificateDetail$FailureReason` doc).
     pub failure_reason: Option<String>,
@@ -740,9 +848,10 @@ pub struct Certificate {
     /// empty while it is pending — which is what the `Includes.keyUsage` filter
     /// compares against.
     pub key_usages: Vec<String>,
-    /// The `ExtendedKeyUsageName` values of the certificate's X.509 Extended Key
-    /// Usage extensions, with the same lifecycle as [`Self::key_usages`].
-    pub extended_key_usages: Vec<String>,
+    /// The key purposes of the certificate's X.509 Extended Key Usage extension, each
+    /// as the name/identifier pair ACM publishes it as
+    /// ([`ExtendedKeyUsageRecord`]), with the same lifecycle as [`Self::key_usages`].
+    pub extended_key_usages: Vec<ExtendedKeyUsageRecord>,
     /// Whether the certificate has ever been exported. Only an exported certificate
     /// may be revoked (`RevokeCertificate` doc: "You can only revoke certificates
     /// that have been previously exported").
@@ -778,9 +887,10 @@ pub struct Certificate {
     /// by a reimport that replaces the certificate stored under the same ARN.
     pub imported_at: Option<SystemTime>,
     /// "The serial number of the certificate" (`CertificateDetail$Serial` doc), which
-    /// the certificate authority that signed it assigned. `None` for a record this
-    /// emulator holds no signed certificate for — it signs none itself — and `Some` for
-    /// an imported one, read out of the X.509 body the import carried.
+    /// the certificate authority that signed it assigned, rendered as
+    /// [`serial_number`] renders one. `None` for a record this emulator holds no
+    /// signed certificate for — it signs none itself — and `Some` for an imported one,
+    /// read out of the X.509 body the import carried.
     pub serial: Option<String>,
     pub not_before: Option<SystemTime>,
     pub not_after: Option<SystemTime>,
@@ -826,6 +936,11 @@ impl Certificate {
     /// The two are applied in DUE ORDER, so the record passes through the same states
     /// it would have if somebody had called in between.
     pub fn materialize_due(&mut self, now: SystemTime) {
+        // The managed renewal of an already issued certificate, which is owed
+        // independently of the validation outcomes below: a renewal is started only on
+        // an issued certificate, and such a certificate has no validation outcome left
+        // to reach.
+        self.materialize_renewal_due(now);
         if let Some(due) = self.pending_validation_email {
             // The outcome is applied first when it falls due first: a request ACM has
             // finished processing sends no validation mail afterwards.
@@ -856,6 +971,84 @@ impl Certificate {
             }
             ValidationOutcome::TimedOut => self.time_out(),
         }
+    }
+
+    /// Apply the managed renewal the clock already owes this certificate at `now`.
+    ///
+    /// A renewal ACM reports as `PENDING_AUTO_RENEWAL` is work ACM does on its own; the
+    /// instant it completes was fixed by the call that started it, so applying it here
+    /// materialises a change the clock already made. The renewed certificate's validity
+    /// window opens at that instant — "the time at which the certificate was issued"
+    /// (`CertificateDetail$IssuedAt` doc) is the issuance the renewal performed — and
+    /// nothing else about the certificate changes.
+    ///
+    /// A certificate that stopped being issued while the renewal was owed — a
+    /// revocation is permanent (`RevokeCertificate` doc) — has nothing left to renew, so
+    /// the owed renewal is dropped rather than handing that record a fresh validity
+    /// window: "the reason that a renewal request was unsuccessful"
+    /// (`RenewalSummary$RenewalStatusReason` doc) is what the summary then reports it
+    /// as.
+    fn materialize_renewal_due(&mut self, now: SystemTime) {
+        let Some(renewed_at) = self
+            .renewal
+            .as_ref()
+            .and_then(|renewal| renewal.due_at)
+            .filter(|due_at| now >= *due_at)
+        else {
+            return;
+        };
+        let still_issued = self.status == STATUS_ISSUED;
+        if let Some(renewal) = self.renewal.as_mut() {
+            renewal.due_at = None;
+            renewal.status = if still_issued {
+                RENEWAL_STATUS_SUCCESS.to_string()
+            } else {
+                RENEWAL_STATUS_FAILED.to_string()
+            };
+            renewal.updated_at = renewed_at;
+        }
+        if !still_issued {
+            return;
+        }
+        self.issued_at = Some(renewed_at);
+        self.not_before = Some(renewed_at);
+        self.not_after = Some(renewed_at + CERTIFICATE_VALIDITY);
+    }
+
+    /// Whether ACM renews this certificate on request: "at this time, only exported
+    /// private certificates can be renewed with the RenewCertificate command"
+    /// (`CertificateDetail$RenewalEligibility` doc).
+    ///
+    /// A private certificate is one a private certificate authority issued (the record
+    /// carries that authority's ARN); the export is what put a copy of it outside ACM,
+    /// the same fact `RevokeCertificate` requires. A certificate that is no longer
+    /// issued has nothing to renew.
+    pub fn renewal_eligibility(&self) -> &'static str {
+        if self.certificate_authority_arn.is_some() && self.exported && self.status == STATUS_ISSUED
+        {
+            RENEWAL_ELIGIBLE
+        } else {
+            RENEWAL_INELIGIBLE
+        }
+    }
+
+    /// Whether a renewal of this certificate is still owed, so there is nothing to
+    /// start: "the certificate request is in process" is what the request to start
+    /// another one is answered with.
+    pub fn renewal_in_progress(&self) -> bool {
+        self.renewal
+            .as_ref()
+            .is_some_and(|renewal| renewal.due_at.is_some())
+    }
+
+    /// Record the managed renewal `RenewCertificate` started at `at`: it is owed from
+    /// here on, and [`Self::materialize_renewal_due`] applies it once it falls due.
+    pub fn start_renewal(&mut self, at: SystemTime) {
+        self.renewal = Some(Renewal {
+            status: RENEWAL_STATUS_PENDING_AUTO_RENEWAL.to_string(),
+            updated_at: at,
+            due_at: Some(at + RENEWAL_SETTLE_DELAY),
+        });
     }
 
     /// Record the domain-validation email ACM sent at `at` for every name this
@@ -934,9 +1127,9 @@ impl Certificate {
             .iter()
             .map(|name| (*name).to_string())
             .collect();
-        self.extended_key_usages = ISSUED_EXTENDED_KEY_USAGES
+        self.extended_key_usages = ISSUED_EXTENDED_KEY_USAGE_OIDS
             .iter()
-            .map(|name| (*name).to_string())
+            .map(|oid| extended_key_usage(oid))
             .collect();
     }
 
@@ -2297,6 +2490,99 @@ pub fn not_export_enabled_message(certificate_arn: &str) -> String {
     format!("Certificate ARN: {certificate_arn} is not an export enabled certificate")
 }
 
+/// The `ValidationException` message `RevokeCertificate` answers for a certificate ACM
+/// did not issue, built from the ARN the request asked for.
+///
+/// "Revokes a public ACM certificate" (`RevokeCertificate` doc): a certificate whose
+/// material came from outside ACM is no certificate ACM issued, so it is not one of
+/// the public certificates this operation revokes. `ValidationException` carries one
+/// modelled member (`message: String`) and the model documents no text for it, so the
+/// sentence comes from ACM's recorded behaviour for this error class: `Certificate `,
+/// the requested ARN, and ` is not a public certificate.`
+pub fn not_a_public_certificate_message(certificate_arn: &str) -> String {
+    format!("Certificate {certificate_arn} is not a public certificate.")
+}
+
+/// The `ResourceNotFoundException` message `ImportCertificate` answers for a
+/// `CertificateArn` that resolves to a certificate ACM issued, built from the ARN the
+/// request asked for.
+///
+/// The member names "an imported certificate to replace"
+/// (`ImportCertificateRequest$CertificateArn` doc), so what is not found at an
+/// ACM-issued certificate's ARN is an IMPORTED certificate — the resource this
+/// argument addresses — even though the ARN itself resolves.
+/// `ResourceNotFoundException` carries one modelled member (`message: String`) and the
+/// model documents no text for it, so the sentence comes from ACM's recorded behaviour
+/// for this error class: `The certificate ARN `, the requested ARN, and ` is not an
+/// imported certificate ARN.`
+pub fn not_an_imported_certificate_message(certificate_arn: &str) -> String {
+    format!("The certificate ARN {certificate_arn} is not an imported certificate ARN.")
+}
+
+/// The `InvalidStateException` message `ResendValidationEmail` answers for a
+/// certificate that is not awaiting domain validation, built from the ARN the request
+/// asked for.
+///
+/// There is validation mail to resend only while ACM is still waiting for proof of
+/// domain control, which is the [`STATUS_PENDING_VALIDATION`] status.
+/// `InvalidStateException` carries one modelled member (`message: String`) and the
+/// model documents no text for it, so the sentence comes from ACM's recorded behaviour
+/// for this error class: `Certificate `, the requested ARN, and ` is not in pending
+/// validation state`.
+pub fn not_pending_validation_message(certificate_arn: &str) -> String {
+    format!("Certificate {certificate_arn} is not in pending validation state")
+}
+
+/// The `InvalidStateException` message `UpdateCertificateOptions` answers for a
+/// certificate ACM did not issue.
+///
+/// `CertificateOptions` configures ACM's own issuance of a certificate — the
+/// transparency logging of a public certificate it issues, the export it allows, the
+/// method it validates by — and a certificate whose material came from outside ACM has
+/// no such issuance to configure. `InvalidStateException` carries one modelled member
+/// (`message: String`) and the model documents no text for it, so the sentence comes
+/// from ACM's recorded behaviour for this error class: ONE constant sentence naming the
+/// operation and the kind of certificate it does not apply to, and neither the
+/// certificate nor its status.
+pub const IMPORTED_CERTIFICATE_OPTIONS_MESSAGE: &str =
+    "The UpdateCertificateOptions command is not permitted for imported certificates.";
+
+/// The `ValidationException` message `RenewCertificate` answers for a certificate ACM
+/// does not renew, built from the ARN the request asked for.
+///
+/// "Renews an ELIGIBLE ACM certificate" (`RenewCertificate` doc), and "only exported
+/// private certificates can be renewed with the RenewCertificate command"
+/// (`CertificateDetail$RenewalEligibility` doc), so a certificate whose
+/// `RenewalEligibility` is [`RENEWAL_INELIGIBLE`] is one this operation does not apply
+/// to. `ValidationException` carries one modelled member (`message: String`) and the
+/// model documents no text for it, so the sentence comes from ACM's recorded behaviour
+/// for this error class: `Certificate ARN `, the requested ARN, and ` is for a public
+/// or imported certificate and not eligible for the Renew Certificate API` — the two
+/// kinds of certificate that are not an exported private one.
+pub fn not_renewal_eligible_message(certificate_arn: &str) -> String {
+    format!(
+        "Certificate ARN {certificate_arn} is for a public or imported certificate and not \
+         eligible for the Renew Certificate API"
+    )
+}
+
+/// A certificate's serial number as ACM renders it: the bytes of the X.509 serial the
+/// signing authority assigned, each as exactly two lowercase hex digits — so a byte
+/// below `0x10` keeps its leading zero — joined by colons.
+///
+/// "The serial number of the certificate" (`CertificateDetail$Serial` doc) is modelled
+/// as a plain string, and this is the rendering ACM publishes it in: the byte-wise form
+/// a serial is compared in everywhere else it appears (a revocation list, an
+/// OpenSSL-printed certificate, the authority's own record). Rendered here so every
+/// path that stores a serial stores the one form every reader reports.
+pub fn serial_number(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 /// A wall-clock instant as the modelled `TStamp`.
 pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at
@@ -2773,11 +3059,16 @@ pub fn signature_algorithm(key_algorithm: &str) -> Option<String> {
     Some(format!("SHA256WITH{family}"))
 }
 
-/// `KeyAlgorithm` as a certificate's detail reports it: the X.509 algorithm
-/// descriptor, whose family and parameter are joined by a HYPHEN (`RSA-2048`,
-/// `EC-prime256v1`), rather than the model enum's underscored name (`RSA_2048`) that
-/// a request and the `Includes.keyTypes` filter are written in.
-pub fn detail_key_algorithm(key_algorithm: &str) -> String {
+/// `KeyAlgorithm` as every projection that reports a certificate's algorithm states
+/// it: the X.509 algorithm descriptor, whose family and parameter are joined by a
+/// HYPHEN (`RSA-2048`, `EC-prime256v1`), rather than the model enum's underscored name
+/// (`RSA_2048`) that a request and the `Includes.keyTypes` filter are written in.
+///
+/// `SearchCertificates` is the one reader that states the underscored name instead, and
+/// deliberately: every member of its result is the value the filter on that member
+/// selects on (see [`certificate_search_result`]), and no filter is written in the
+/// descriptor spelling.
+pub fn reported_key_algorithm(key_algorithm: &str) -> String {
     key_algorithm.replacen('_', "-", 1)
 }
 
@@ -2848,7 +3139,7 @@ pub fn certificate_detail(cert: &Certificate) -> CertificateDetail {
         status: Some(cert.status.clone()),
         not_before: cert.not_before.map(to_date_time),
         not_after: cert.not_after.map(to_date_time),
-        key_algorithm: Some(detail_key_algorithm(&cert.key_algorithm)),
+        key_algorithm: Some(reported_key_algorithm(&cert.key_algorithm)),
         subject: cert.subject.clone(),
         issuer: cert.issuer.clone(),
         signature_algorithm: cert.signature_algorithm.clone(),
@@ -2863,20 +3154,23 @@ pub fn certificate_detail(cert: &Certificate) -> CertificateDetail {
                 })
                 .collect(),
         ),
+        // Each purpose the extension asserts, as the {name, identifier} pair ACM
+        // publishes it as: "each object specifies a purpose for which the certificate
+        // public key can be used and consists of a name and an object identifier (OID)"
+        // (`CertificateDetail$ExtendedKeyUsages` doc).
         extended_key_usages: Some(
             cert.extended_key_usages
                 .iter()
-                .map(|name| ExtendedKeyUsage {
-                    name: Some(name.clone()),
-                    // The extension's object identifier, which only a parsed
-                    // certificate carries.
-                    oid: None,
+                .map(|usage| ExtendedKeyUsage {
+                    name: Some(usage.name.clone()),
+                    oid: Some(usage.oid.clone()),
                 })
                 .collect(),
         ),
         r#type: Some(cert.cert_type.clone()),
         certificate_authority_arn: cert.certificate_authority_arn.clone(),
-        renewal_eligibility: Some(cert.renewal_eligibility.clone()),
+        renewal_summary: renewal_summary(cert),
+        renewal_eligibility: Some(cert.renewal_eligibility().to_string()),
         // "This value exists only when the certificate status is FAILED"
         // (`CertificateDetail$FailureReason` doc), which is what the record stores.
         failure_reason: cert.failure_reason.clone(),
@@ -2908,20 +3202,21 @@ pub fn certificate_summary(cert: &Certificate) -> CertificateSummary {
         has_additional_subject_alternative_names: Some(total_sans > shown),
         status: Some(cert.status.clone()),
         r#type: Some(cert.cert_type.clone()),
-        // The summary reports the algorithm in the model enum's spelling — the one a
-        // request's `Includes.keyTypes` is written in and this very list is filtered
-        // on. Only the certificate's DETAIL carries the X.509 descriptor spelling
-        // (see [`detail_key_algorithm`]).
-        key_algorithm: Some(cert.key_algorithm.clone()),
+        // The summary states the algorithm exactly as the certificate's DETAIL does
+        // ([`reported_key_algorithm`]): both report the same member of the same
+        // certificate, so one certificate cannot carry two key algorithms depending on
+        // which reader is asked. The enum's underscored spelling is what the
+        // `Includes.keyTypes` filter is written in, not what a report states.
+        key_algorithm: Some(reported_key_algorithm(&cert.key_algorithm)),
         // The X.509 key-usage extension names of an issued certificate; absent while
         // the record carries none.
         key_usages: (!cert.key_usages.is_empty()).then(|| cert.key_usages.clone()),
         extended_key_usages: (!cert.extended_key_usages.is_empty())
-            .then(|| cert.extended_key_usages.clone()),
+            .then(|| extended_key_usage_names(&cert.extended_key_usages)),
         export_option: Some(export_option(cert)),
         in_use: Some(!cert.in_use_by.is_empty()),
         exported: Some(cert.exported),
-        renewal_eligibility: Some(cert.renewal_eligibility.clone()),
+        renewal_eligibility: Some(cert.renewal_eligibility().to_string()),
         not_before: cert.not_before.map(to_date_time),
         not_after: cert.not_after.map(to_date_time),
         // As on `CertificateDetail`: `CreatedAt` is when the certificate was
@@ -2934,6 +3229,34 @@ pub fn certificate_summary(cert: &Certificate) -> CertificateSummary {
         managed_by: cert.managed_by.clone(),
         certificate_key_pair_origin: Some(cert.key_pair_origin.clone()),
     }
+}
+
+/// The `ExtendedKeyUsageName` of each stored key purpose, for the two projections that
+/// report the names alone (`CertificateSummary$ExtendedKeyUsages`,
+/// `X509Attributes$ExtendedKeyUsages`, both lists of `ExtendedKeyUsageName`).
+fn extended_key_usage_names(usages: &[ExtendedKeyUsageRecord]) -> Vec<String> {
+    usages.iter().map(|usage| usage.name.clone()).collect()
+}
+
+/// The managed renewal a certificate carries as the modelled `RenewalSummary`, or
+/// `None` for one no renewal was ever started for — the member "exists only when the
+/// certificate type is AMAZON_ISSUED" (`CertificateDetail$RenewalSummary` doc) and a
+/// renewal is what brings it into existence.
+///
+/// `DomainValidationOptions` is the validation of each name "as it pertains to ACM's
+/// managed renewal" (`RenewalSummary$DomainValidationOptions` doc), which is the
+/// certificate's own validation records: a renewal re-proves the names the certificate
+/// covers, and those are the records that hold their evidence.
+pub fn renewal_summary(cert: &Certificate) -> Option<RenewalSummary> {
+    cert.renewal.as_ref().map(|renewal| RenewalSummary {
+        renewal_status: renewal.status.clone(),
+        domain_validation_options: cert.domain_validations.iter().map(domain_validation).collect(),
+        // "The reason that a renewal request was unsuccessful"
+        // (`RenewalSummary$RenewalStatusReason` doc): no renewal this service starts
+        // fails, so no record carries one.
+        renewal_status_reason: None,
+        updated_at: to_date_time(renewal.updated_at),
+    })
 }
 
 /// A stored ACME endpoint as `DescribeAcmeEndpoint`'s `AcmeEndpoint`.
@@ -3127,9 +3450,10 @@ pub fn acme_account_summary(account: &AcmeAccountRecord) -> AcmeAccountSummary {
 ///   [`issuer_name`] does report. `SerialNumber` is the serial the signing authority
 ///   assigned, reported for a record that carries one (an imported certificate's own
 ///   X.509 serial) and absent for one this emulator never signed.
-/// * `AcmCertificateMetadata.RenewalStatus` belongs to a renewal ACM has started and
-///   the ACME members to a certificate obtained through an ACME endpoint; no stored
-///   record carries any of them. `ImportedAt` is reported for an imported certificate,
+/// * `AcmCertificateMetadata.RenewalStatus` belongs to a renewal ACM has started,
+///   which `RenewCertificate` is what starts, and the ACME members to a certificate
+///   obtained through an ACME endpoint, which no stored record carries. `ImportedAt` is
+///   reported for an imported certificate,
 ///   `RevokedAt` for a revoked one, and each is absent exactly when the record carries
 ///   nothing for it, which "exists only when the certificate status is REVOKED"
 ///   (`CertificateDetail$RevokedAt` doc) and "only when the certificate type is
@@ -3155,15 +3479,16 @@ pub fn certificate_search_result(cert: &Certificate) -> CertificateSearchResult 
             // attribute selects on, so a certificate a filter kept reports the value
             // that kept it: `X509AttributeFilter.KeyAlgorithm` compares the stored
             // `KeyAlgorithm` in the model enum's spelling (`EC_prime256v1`), which is
-            // therefore the spelling reported here. Only the certificate's DETAIL
-            // carries the X.509 descriptor spelling (see [`detail_key_algorithm`]),
-            // which no filter is written in.
+            // therefore the spelling reported here. The certificate's own REPORTS of
+            // the algorithm — its detail and its listing summary — state the X.509
+            // descriptor spelling instead (see [`reported_key_algorithm`]), which no
+            // filter is written in.
             key_algorithm: Some(cert.key_algorithm.clone()),
             // The X.509 key-usage extensions of an issued certificate; absent while
             // the record carries none.
             key_usages: (!cert.key_usages.is_empty()).then(|| cert.key_usages.clone()),
             extended_key_usages: (!cert.extended_key_usages.is_empty())
-                .then(|| cert.extended_key_usages.clone()),
+                .then(|| extended_key_usage_names(&cert.extended_key_usages)),
             not_before: cert.not_before.map(to_date_time),
             not_after: cert.not_after.map(to_date_time),
             serial_number: cert.serial.clone(),
@@ -3179,7 +3504,11 @@ pub fn certificate_search_result(cert: &Certificate) -> CertificateSearchResult 
                 // The revocation instant, which exists only beside the `REVOKED`
                 // status the same record carries.
                 revoked_at: cert.revoked_at.map(to_date_time),
-                renewal_eligibility: Some(cert.renewal_eligibility.clone()),
+                renewal_eligibility: Some(cert.renewal_eligibility().to_string()),
+                // The status of the managed renewal this certificate carries, for one a
+                // renewal was started for; absent for every other record, which is what
+                // the matching filter then keeps nothing on.
+                renewal_status: cert.renewal.as_ref().map(|renewal| renewal.status.clone()),
                 status: Some(cert.status.clone()),
                 r#type: Some(cert.cert_type.clone()),
                 export_option: Some(export_option(cert)),

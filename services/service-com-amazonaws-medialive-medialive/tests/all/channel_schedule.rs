@@ -32,7 +32,10 @@ async fn channel(router: &MultiServiceRouter) -> String {
         router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "scheduled-channel" })),
+        Some(json!({
+            "name": "scheduled-channel",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(status, 201, "CreateChannel: expected 201, got {status}: {created}");

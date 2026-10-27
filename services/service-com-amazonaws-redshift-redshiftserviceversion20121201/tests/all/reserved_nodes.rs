@@ -20,6 +20,10 @@
 //! Each table row differs along what the rule generalises over: which offering is
 //! bought (node type, term, utilization), how many nodes the purchase reserves,
 //! how many reservations the account holds, and how the page is asked for.
+//!
+//! The helpers this suite owns are `pub(crate)` so the sibling reserved-node
+//! EXCHANGE suite reads the offering catalog, buys a reservation and polls a
+//! clock-owed state change through this one copy of them.
 
 use std::time::{Duration, Instant};
 
@@ -50,23 +54,23 @@ const OFFERING_MEMBERS: [&str; 10] = [
 
 /// The shorter published term, in seconds: a one-year commitment of 365-day
 /// years, as the offering catalog publishes it.
-const ONE_YEAR: &str = "31536000";
+pub(crate) const ONE_YEAR: &str = "31536000";
 
 /// The longer published term, in seconds: a three-year commitment of the same
 /// years.
-const THREE_YEARS: &str = "94608000";
+pub(crate) const THREE_YEARS: &str = "94608000";
 
 /// How long a poll loop is given before the suite calls the clock-owed payment
 /// confirmation unobservable — generous next to the span it is due after, so a
 /// loaded runner cannot fail the suite.
-const POLL_DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const POLL_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The gap between two polls of one loop.
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The value of `<tag>` in one served record, asserting the record carries
 /// exactly one.
-fn one(case: &str, block: &str, tag: &str) -> String {
+pub(crate) fn one(case: &str, block: &str, tag: &str) -> String {
     let found = all_text(block, tag);
     assert_eq!(
         found.len(),
@@ -77,7 +81,7 @@ fn one(case: &str, block: &str, tag: &str) -> String {
 }
 
 /// Every offering the catalog publishes, as the inner XML of its element.
-async fn catalog(emulator: &Emulator) -> Vec<String> {
+pub(crate) async fn catalog(emulator: &Emulator) -> Vec<String> {
     let answer = emulator.call("DescribeReservedNodeOfferings", &[]).await;
     assert_eq!(
         answer.status, 200,
@@ -94,7 +98,7 @@ async fn catalog(emulator: &Emulator) -> Vec<String> {
 }
 
 /// The one published offering of this node type, term and offering type.
-fn offering_of(
+pub(crate) fn offering_of(
     case: &str,
     catalog: &[String],
     node_type: &str,
@@ -119,7 +123,7 @@ fn offering_of(
 
 /// Buy `node_count` nodes of the offering this block describes, answering the
 /// response as served.
-async fn purchase(
+pub(crate) async fn purchase(
     emulator: &Emulator,
     offering_block: &str,
     node_count: Option<i32>,
@@ -152,7 +156,7 @@ async fn described(emulator: &Emulator, case: &str, params: &[(&str, &str)]) -> 
 }
 
 /// The one reservation the id names, asserting the read reports exactly one.
-async fn reservation(emulator: &Emulator, case: &str, reserved_node_id: &str) -> String {
+pub(crate) async fn reservation(emulator: &Emulator, case: &str, reserved_node_id: &str) -> String {
     let (_, blocks) = described(emulator, case, &[("ReservedNodeId", reserved_node_id)]).await;
     assert_eq!(
         blocks.len(),
@@ -168,7 +172,7 @@ async fn reservation(emulator: &Emulator, case: &str, reserved_node_id: &str) ->
 ///
 /// This loop makes NO mutating call, so only a transition the clock owes can end
 /// it.
-async fn poll_until_state(
+pub(crate) async fn poll_until_state(
     emulator: &Emulator,
     case: &str,
     reserved_node_id: &str,

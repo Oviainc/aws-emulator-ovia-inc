@@ -124,6 +124,7 @@ async fn fixture(router: &MultiServiceRouter, case: &str, name: &str) -> Fixture
                     "primaryChannelArn": stored_entry,
                 }
             },
+            "encoderSettings": crate::support::channel_encoder_settings(),
         })),
     )
     .await;

@@ -22,6 +22,7 @@ pub(crate) fn wait_for_the_clock() {
 }
 
 async fn create(router: &MultiServiceRouter, body: Value) -> Value {
+    let body = crate::support::resolved_channel_body(router, body).await;
     let (status, response) = call(router, "POST", "/prod/channels", Some(body)).await;
     assert_eq!(status, 201, "CreateChannel: expected 201, got {status}: {response}");
     response["channel"].clone()
@@ -327,6 +328,11 @@ async fn every_member_a_create_supplies_is_read_back_by_describe() {
 
     for (case, request) in rows {
         let router = medialive();
+        // Every id the configuration names has to resolve to a resource this
+        // account holds, so the row's attachments are pointed at inputs this
+        // router's account really holds before the create — and the comparison
+        // below is against the configuration that was actually submitted.
+        let request = crate::support::resolved_channel_body(&router, request).await;
         let created = create(&router, request.clone()).await;
         let id = created["id"].as_str().unwrap_or_default().to_string();
 
@@ -620,7 +626,10 @@ async fn the_store_is_bounded_and_a_full_store_fits_one_page() {
         &router,
         "POST",
         "/prod/channels",
-        Some(json!({ "name": "one too many" })),
+        Some(json!({
+            "name": "one too many",
+            "encoderSettings": crate::support::channel_encoder_settings(),
+        })),
     )
     .await;
     assert_eq!(
@@ -761,8 +770,12 @@ async fn a_dry_run_create_validates_without_creating_a_channel() {
         ),
     ];
 
-    for (case, configuration, verdict, code) in table {
+    for (case, row, verdict, code) in table {
         let router = medialive();
+        // Resolved per router: each repetition of the row below starts from a
+        // fresh account, and an attachment's `InputId` has to name an input of
+        // the account the request is made against.
+        let configuration = crate::support::resolved_channel_body(&router, row.clone()).await;
         let mut asked = configuration.clone();
         asked["dryRun"] = json!(true);
         let (status, body) = call(&router, "POST", "/prod/channels", Some(asked)).await;
@@ -796,7 +809,7 @@ async fn a_dry_run_create_validates_without_creating_a_channel() {
         // verdict the dry run reported, and creates a channel when it succeeds.
         for flag in [Some(false), None] {
             let router = medialive();
-            let mut performed = configuration.clone();
+            let mut performed = crate::support::resolved_channel_body(&router, row.clone()).await;
             if let Some(flag) = flag {
                 performed["dryRun"] = json!(flag);
             }
@@ -837,6 +850,7 @@ async fn a_dry_run_create_writes_nothing_a_later_create_can_see() {
                 "name": format!("dry-{attempt}"),
                 "requestId": "retry-token",
                 "dryRun": true,
+                "encoderSettings": crate::support::channel_encoder_settings(),
             })),
         )
         .await;
@@ -905,13 +919,16 @@ async fn the_attachment_list_of_one_channel_is_bounded() {
         let attachments: Vec<Value> = (0..count)
             .map(|slot| json!({ "inputId": format!("100000{slot}"), "inputAttachmentName": format!("slot-{slot}") }))
             .collect();
-        let (status, body) = call(
+        // The attachments as the account can hold them: one input behind every
+        // `inputId` the row spells, since an attachment names an input of this
+        // account. What the create stores is then what it carried.
+        let body = crate::support::resolved_channel_body(
             &router,
-            "POST",
-            "/prod/channels",
-            Some(json!({ "name": "attaching", "inputAttachments": attachments.clone() })),
+            json!({ "name": "attaching", "inputAttachments": attachments }),
         )
         .await;
+        let attachments = body["inputAttachments"].clone();
+        let (status, body) = call(&router, "POST", "/prod/channels", Some(body)).await;
         assert_eq!(
             status, expected_status,
             "case {case:?}: expected {expected_status}, got {status}: {body}"
@@ -919,8 +936,7 @@ async fn the_attachment_list_of_one_channel_is_bounded() {
 
         if expected_status == 201 {
             assert_eq!(
-                body["channel"]["inputAttachments"],
-                json!(attachments),
+                body["channel"]["inputAttachments"], attachments,
                 "case {case:?}: expected the stored attachments, got {:?}",
                 body["channel"]["inputAttachments"]
             );
@@ -971,7 +987,11 @@ async fn the_destination_list_of_one_channel_is_bounded() {
             &router,
             "POST",
             "/prod/channels",
-            Some(json!({ "name": "outputting", "destinations": destinations.clone() })),
+            Some(json!({
+                "name": "outputting",
+                "destinations": destinations.clone(),
+                "encoderSettings": crate::support::channel_encoder_settings(),
+            })),
         )
         .await;
         assert_eq!(

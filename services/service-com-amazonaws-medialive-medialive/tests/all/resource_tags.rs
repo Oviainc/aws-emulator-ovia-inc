@@ -151,7 +151,10 @@ pub(crate) async fn create_resource(
     let (uri, body, status, arn) = match kind {
         "channel" => (
             "/prod/channels".to_string(),
-            with_tags(json!({ "name": name })),
+            with_tags(json!({
+                "name": name,
+                "encoderSettings": crate::support::channel_encoder_settings(),
+            })),
             201,
             vec!["channel", "arn"],
         ),
@@ -197,7 +200,10 @@ pub(crate) async fn create_resource(
                 router,
                 "POST",
                 "/prod/channels",
-                Some(json!({ "name": format!("{name}-entry") })),
+                Some(json!({
+                    "name": format!("{name}-entry"),
+                    "encoderSettings": crate::support::channel_encoder_settings(),
+                })),
             )
             .await;
             assert_eq!(

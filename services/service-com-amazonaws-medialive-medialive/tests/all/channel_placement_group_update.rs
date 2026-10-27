@@ -685,6 +685,7 @@ async fn an_update_touches_only_the_group_it_names() {
         Some(json!({
             "name": "placed",
             "anywhereSettings": { "clusterId": cluster, "channelPlacementGroupId": id },
+            "encoderSettings": crate::support::channel_encoder_settings(),
         })),
     )
     .await;

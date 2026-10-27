@@ -162,7 +162,10 @@ async fn a_page_carries_as_many_channels_as_the_request_asks_for() {
             &router,
             "the stored channels",
             CHANNELS,
-            json!({ "name": format!("channel-{index}") }),
+            json!({
+                "name": format!("channel-{index}"),
+                "encoderSettings": crate::support::channel_encoder_settings(),
+            }),
         )
         .await;
         minted.push(id_of("the stored channels", &response["channel"]));
@@ -248,7 +251,10 @@ async fn every_listing_of_the_service_honours_the_asked_for_page_size() {
             case: "ListChannels",
             uri: CHANNELS,
             member: "channels",
-            body: |index| json!({ "name": format!("paged-{index}") }),
+            body: |index| json!({
+                "name": format!("paged-{index}"),
+                "encoderSettings": crate::support::channel_encoder_settings(),
+            }),
         },
         Listing {
             // `smithy_query(query="operation", operation="ListInputSecurityGroups")`:

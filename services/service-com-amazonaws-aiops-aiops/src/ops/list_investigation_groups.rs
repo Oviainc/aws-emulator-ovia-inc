@@ -141,13 +141,15 @@ fn encode_page_token(id: &str) -> String {
 /// and the refusal is worded through [`crate::state::validation_message`], so a token
 /// this operation rejects reads like every other refusal this service makes (the
 /// member and the requirement, with no value).
+///
+/// What a group id looks like is [`crate::state::is_group_id`]'s to decide — the same
+/// rule that judges the id segment of an ARN — so a token carries a group id here
+/// exactly when an ARN could carry it as its last segment.
 fn decode_page_token(token: &str) -> Result<String, ListInvestigationGroupsError> {
     hex::decode(token)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
-        .filter(|id| {
-            id.len() == crate::state::GROUP_ID_LEN && id.bytes().all(|b| b.is_ascii_alphanumeric())
-        })
+        .filter(|id| crate::state::is_group_id(id))
         .ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation(crate::state::validation_message(
                 "nextToken",
@@ -215,21 +217,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .transpose()?;
 
         let store = state.lock();
-        let mut remaining = match &start {
-            Some(id) => store.investigation_groups.range(id.clone()..),
-            None => store.investigation_groups.range::<String, _>(..),
-        }
-        .filter(|(_, group)| group.region == region);
 
         // Reserve no more than the store can actually yield.
         let mut investigation_groups =
             Vec::with_capacity(page_size.min(store.investigation_groups.len()));
         let mut next_token = None;
-        for (id, group) in remaining.by_ref() {
+        // Which groups belong to this Region is the store's rule, and so is where a
+        // page token resumes the walk: this operation reports what that reader yields.
+        for group in store.groups_in_region_from(&region, start.as_deref()) {
             // The first group that does not fit becomes the next page's start, and
             // only then is a `nextToken` emitted — the last page carries none.
             if investigation_groups.len() == page_size {
-                next_token = Some(encode_page_token(id));
+                next_token = Some(encode_page_token(&group.id));
                 break;
             }
             investigation_groups.push(ListInvestigationGroupsModel {
