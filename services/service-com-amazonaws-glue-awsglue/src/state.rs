@@ -129,6 +129,17 @@
 //! alone. One record per resource, so a second create for a resource that already has one
 //! writes THAT record rather than adding a second.
 //!
+//! INTEGRATION TABLE PROPERTIES — the override properties
+//! `CreateIntegrationTableProperties` sets for ONE table that an integration replicates —
+//! sit in the same kind of per-account namespace
+//! ([`ComAmazonawsGlueAwsglueState::integration_table_properties`]), keyed by the
+//! `ResourceArn` the request named AND the `TableName` it carried, because those two
+//! members are the whole address every operation that reaches one record
+//! (`CreateIntegrationTableProperties`, `GetIntegrationTableProperties`,
+//! `UpdateIntegrationTableProperties`, `DeleteIntegrationTableProperties`) takes. One
+//! record per (resource, table) pair, so a second create for a pair that already has one
+//! writes THAT record.
+//!
 //! WORKFLOWS — the containers for the dependent jobs and crawlers `CreateWorkflow`
 //! registers — sit beside that tree in a per-account namespace keyed by workflow name
 //! ([`ComAmazonawsGlueAwsglueState::workflows`]): "The name to be assigned to the
@@ -197,7 +208,7 @@ use crate::ops::types::{
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateClassifierInput,
     CreateColumnStatisticsTaskSettingsInput, CreateCrawlerInput,
     CreateCustomEntityTypeInput, CreateGlossaryInput, CreateGlossaryTermInput,
-    CreateIntegrationResourcePropertyInput, CreateJobInput,
+    CreateIntegrationResourcePropertyInput, CreateIntegrationTablePropertiesInput, CreateJobInput,
     CreateMLTransformInput, CsvClassifier,
     CreateSecurityConfigurationInput, CreateTriggerInput, CreateWorkflowInput, CustomEntityType,
     DataCatalogEncryptionSettings, DataLakeAccessPropertiesOutput, DataLakePrincipal,
@@ -214,14 +225,14 @@ use crate::ops::types::{
     RLSProperties,
     RecrawlPolicy, RegistryId, Schedule,
     SchemaChangePolicy, SchemaColumn, SchemaId, SecurityConfiguration, SourceControlDetails,
-    SourceProcessingProperties,
+    SourceProcessingProperties, SourceTableConfig,
     StartColumnStatisticsTaskRunInput,
     StartDataQualityRuleRecommendationRunInput,
     StartJobRunInput, StorageDescriptor, Table, TableIdentifier, TableInput,
     TableVersion, TargetRedshiftCatalog,
     TransformEncryption, TransformFilterCriteria, TransformParameters, TransformSortCriteria,
     Trigger, TriggerNodeDetails,
-    Tag, TargetProcessingProperties,
+    Tag, TargetProcessingProperties, TargetTableConfig,
     UpdateClassifierInput, UpdateCrawlerInput, UpdateMLTransformInput, Workflow, WorkflowGraph,
     WorkflowRun,
     WorkflowRunStatistics, XMLClassifier,
@@ -428,6 +439,14 @@ pub const MAX_RESOURCE_POLICIES: usize = 1_000;
 /// past the ceiling is refused rather than stored; that operation models no limit error, so
 /// the refusal is the closest client error it does model (`InvalidInputException`).
 pub const MAX_INTEGRATION_RESOURCE_PROPERTIES: usize = 1_000;
+
+/// Ceiling on the integration table property records this emulator will hold, for the same
+/// reason as [`MAX_INTEGRATION_RESOURCE_PROPERTIES`]: `CreateIntegrationTableProperties`
+/// writes a record any caller can reach, one per (resource, table) pair, so the number of
+/// records one process will hold is bounded here. A create that would add one past the
+/// ceiling is refused rather than stored; that operation models no limit error, so the
+/// refusal is the closest client error it does model (`InvalidInputException`).
+pub const MAX_INTEGRATION_TABLE_PROPERTIES: usize = 1_000;
 
 /// The `ExistCondition` a `PutResourcePolicy` carries to require that a policy is already
 /// attached ("A value of MUST_EXIST is used to update a policy"). One of the modelled
@@ -913,6 +932,23 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// fold for it. Ordered, so `ListIntegrationResourceProperties` has one deterministic
     /// order to page over, and bounded by [`MAX_INTEGRATION_RESOURCE_PROPERTIES`].
     pub integration_resource_properties: BTreeMap<String, IntegrationResourcePropertyEntry>,
+    /// Every integration table property record this emulator holds, keyed by the
+    /// `ResourceArn` whose leg of the integration the properties belong to and then by the
+    /// `TableName` they override, in that order.
+    ///
+    /// A record lives BESIDE the catalog tree, like an integration resource property
+    /// record, because every operation that addresses one
+    /// (`CreateIntegrationTableProperties`, `GetIntegrationTableProperties`,
+    /// `UpdateIntegrationTableProperties`, `DeleteIntegrationTableProperties`) addresses it
+    /// by `ResourceArn` and `TableName` alone, with no `CatalogId` member — so the
+    /// namespace is per account and the pair a record belongs to is the key. Both halves of
+    /// the key are as sent: the model documents no fold for either member, and the table
+    /// named is "the table to be replicated"
+    /// (`CreateIntegrationTablePropertiesRequest$TableName`), a source-side entity rather
+    /// than a catalog table whose name the catalog folds. Ordered, so
+    /// `ListIntegrationTableProperties` has one deterministic order to page over, and
+    /// bounded by [`MAX_INTEGRATION_TABLE_PROPERTIES`].
+    pub integration_table_properties: BTreeMap<(String, String), IntegrationTablePropertiesEntry>,
     /// Every workflow this emulator holds, keyed by its name.
     ///
     /// Per account and beside the catalog tree, like crawlers and custom entity types:
@@ -1694,6 +1730,47 @@ impl ComAmazonawsGlueAwsglueState {
     /// below [`MAX_INTEGRATION_RESOURCE_PROPERTIES`].
     pub fn can_store_integration_resource_property(&self) -> bool {
         self.integration_resource_properties.len() < MAX_INTEGRATION_RESOURCE_PROPERTIES
+    }
+
+    /// The integration table property record stored for `resource_arn` and `table_name`, if
+    /// this account holds one for that pair.
+    ///
+    /// The pair is the record's whole address, so the lookup is the key lookup. One copy,
+    /// shared, so the create and every read of one record cannot disagree about which
+    /// record a request names.
+    pub fn integration_table_properties(
+        &self,
+        resource_arn: &str,
+        table_name: &str,
+    ) -> Option<&IntegrationTablePropertiesEntry> {
+        self.integration_table_properties
+            .get(&(resource_arn.to_string(), table_name.to_string()))
+    }
+
+    /// Whether the store can hold another integration table property record, i.e. is below
+    /// [`MAX_INTEGRATION_TABLE_PROPERTIES`].
+    pub fn can_store_integration_table_properties(&self) -> bool {
+        self.integration_table_properties.len() < MAX_INTEGRATION_TABLE_PROPERTIES
+    }
+
+    /// Whether this store holds the resource an integration table property call's
+    /// `ResourceArn` named ([`integration_table_reference`]).
+    ///
+    /// The properties belong to that resource, so it is the resource that has to exist —
+    /// for a connection or a database this is the same question a tagging call asks
+    /// ([`Self::resource_tags`]), and for a table ARN it is the table itself, inside the
+    /// database its ARN names.
+    pub fn holds_integration_table_resource(&self, resource: &IntegrationTableResource) -> bool {
+        match resource {
+            IntegrationTableResource::Tagged(tagged) => self.resource_tags(tagged).is_some(),
+            IntegrationTableResource::Table {
+                account_id,
+                database,
+                table,
+            } => self
+                .database(account_id, database)
+                .is_some_and(|database| database.tables.contains_key(table)),
+        }
     }
 
     /// Whether this store has room for another classifier, bounded by
@@ -3999,13 +4076,19 @@ pub fn integration_resource_property_arn(region: &str, property_id: &str) -> Str
     )
 }
 
-/// The Glue resource an integration resource property call's `ResourceArn` names, or
+/// The Glue resource an integration property call's `ResourceArn` names, or
 /// `Err` with the message a refusal carries when the value cannot name one.
 ///
 /// `ResourceArn` is documented as "The connection ARN of the source, or the database ARN of
 /// the target", so a value that is not the ARN of a Glue connection or a Glue database
 /// names neither and is a bad parameter. The ONE resolution of that member, so the create
 /// and every read of a record agree on which values address a resource at all.
+///
+/// Shared by the integration TABLE property operations, whose `ResourceArn` names the same
+/// two legs of an integration: "the same API need to be invoked with the Glue connection ARN
+/// as ResourceArn with SourceTableConfig, and the Glue database ARN as ResourceArn with
+/// TargetTableConfig respectively" (`CreateIntegrationTableProperties`). A catalog TABLE's
+/// own ARN is one of the values that names neither leg.
 ///
 /// Only the KIND and the identity fields are read here; whether this store holds the
 /// resource is [`ComAmazonawsGlueAwsglueState::resource_tags`]'s answer, exactly as for a
@@ -4095,6 +4178,166 @@ impl IntegrationResourcePropertyEntry {
     /// This record's own ARN, as served in `region`.
     pub fn arn(&self, region: &str) -> String {
         integration_resource_property_arn(region, &self.property_id)
+    }
+}
+
+/// The ARN resource-type segment of a Data Catalog table, whose resource portion carries
+/// the table's database as well as its own name: `table/<database>/<table>`.
+///
+/// Not in [`TAGGED_RESOURCE_TYPES`] because a table carries no tag set of its own
+/// (`CreateTable` models no `Tags` member), but it IS a value an integration table
+/// property's `ResourceArn` may carry: "the provided ARN should be the ARN of the target
+/// table in the Glue Data Catalog" (`CreateIntegrationTablePropertiesRequest$ResourceArn`).
+pub const TABLE_ARN_SEGMENT: &str = "table";
+
+/// The Glue resource an integration table property call's `ResourceArn` names.
+///
+/// Either the LEG of an integration whose table properties the call writes — the Glue
+/// connection of the source or the Glue database of the target ("the same API need to be
+/// invoked with the Glue connection ARN as ResourceArn with SourceTableConfig, and the Glue
+/// database ARN as ResourceArn with TargetTableConfig respectively") — or a replicated
+/// table's own ARN, which `CreateIntegrationTableProperties` also takes ("the provided ARN
+/// should be the ARN of the target table in the Glue Data Catalog").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntegrationTableResource {
+    /// A Glue connection or a Glue database, resolved the way every call that names one by
+    /// ARN resolves it ([`parse_tagged_resource`]).
+    Tagged(TaggedResource),
+    /// A Data Catalog table, whose ARN names its database as well as itself.
+    Table {
+        /// Field 5 of the ARN, which for a catalog resource is the `CatalogId` it lives
+        /// under.
+        account_id: String,
+        /// The folded database name, the way the catalog keys it.
+        database: String,
+        /// The folded table name, the same way.
+        table: String,
+    },
+}
+
+impl IntegrationTableResource {
+    /// Whether this resource is a LEG of an integration, which is what a read of a table
+    /// property record addresses.
+    ///
+    /// Recorded behaviour: a create against a replicated table's own ARN is accepted, and
+    /// `GetIntegrationTableProperties` for that same ARN is then refused — the read resolves
+    /// its `ResourceArn` to the connection or the database an integration runs between, and a
+    /// catalog table is neither.
+    pub fn is_integration_leg(&self) -> bool {
+        matches!(self, Self::Tagged(_))
+    }
+}
+
+/// The Glue resource `resource_arn` names, or `Err` with the message a refusal carries when
+/// the value can name no resource an integration table property could belong to.
+///
+/// The ONE resolution of that member, so the create and every read of a record agree on
+/// which values address a resource at all. Only the KIND and the identity fields are read
+/// here; whether this store holds the resource is
+/// [`ComAmazonawsGlueAwsglueState::holds_integration_table_resource`]'s answer, exactly as a
+/// tagging call's `ResourceArn` splits those two questions.
+pub fn integration_table_reference(resource_arn: &str) -> Result<IntegrationTableResource, String> {
+    if let Some(resource) = parse_tagged_resource(resource_arn) {
+        if matches!(
+            resource.kind,
+            TaggedResourceKind::Connection | TaggedResourceKind::Database
+        ) {
+            return Ok(IntegrationTableResource::Tagged(resource));
+        }
+    }
+    if let Some(parsed) = parse_glue_arn(resource_arn) {
+        if let Some((database, table)) = parsed
+            .resource_of_type(TABLE_ARN_SEGMENT)
+            .and_then(|rest| rest.split_once('/'))
+        {
+            if !database.is_empty() && !table.is_empty() && !table.contains('/') {
+                return Ok(IntegrationTableResource::Table {
+                    account_id: parsed.account_id.clone(),
+                    database: fold_name(database),
+                    table: fold_name(table),
+                });
+            }
+        }
+    }
+    Err(format!(
+        "ResourceArn {resource_arn:?} is not the ARN of a Glue connection, a Glue database or a \
+         Glue Data Catalog table"
+    ))
+}
+
+/// The `SourceTableConfig` members the service does not process yet, named as the model
+/// spells them.
+///
+/// Source: the three members the model documents as "Currently unsupported" — `Fields` ("A
+/// list of fields used for column-level filtering. Currently unsupported."),
+/// `FilterPredicate` ("A condition clause used for row-level filtering. Currently
+/// unsupported.") and `RecordUpdateField` ("Incremental pull timestamp-based field.
+/// Currently unsupported."). `PrimaryKey` is NOT one of them: it is "Currently supported
+/// specifically for SAP EntityOf entities upon request".
+pub const UNSUPPORTED_SOURCE_TABLE_CONFIG_MEMBERS: [&str; 3] =
+    ["Fields", "FilterPredicate", "RecordUpdateField"];
+
+/// Whether a source table configuration states any member of
+/// [`UNSUPPORTED_SOURCE_TABLE_CONFIG_MEMBERS`], which is what makes a write of it a request
+/// for processing the source leg does not do.
+///
+/// The ONE reading of that rule, so the create and any later write of a record refuse the
+/// same configurations.
+pub fn states_unsupported_source_table_properties(config: &SourceTableConfig) -> bool {
+    config.fields.is_some()
+        || config.filter_predicate.is_some()
+        || config.record_update_field.is_some()
+}
+
+/// The override properties ONE replicated table carries on one leg of an integration: the
+/// record `CreateIntegrationTableProperties` writes for a `ResourceArn` and a `TableName`.
+///
+/// Both modelled sides are held here — the source leg's filtering and partitioning
+/// properties and the target leg's — because the two are written by separate calls against
+/// separate `ResourceArn`s and read back together by one `GetIntegrationTableProperties`.
+/// The record carries no server-set member: the model gives integration table properties no
+/// id, ARN, status or timestamp of their own.
+#[derive(Debug, Clone)]
+pub struct IntegrationTablePropertiesEntry {
+    /// The ARN of the integration leg these properties belong to, the first half of this
+    /// record's key in
+    /// [`ComAmazonawsGlueAwsglueState::integration_table_properties`].
+    pub resource_arn: String,
+    /// "The name of the table to be replicated", the second half of that key.
+    pub table_name: String,
+    /// "A structure for the source table configuration", as the last write that stated it
+    /// sent it, or `None` while no write has.
+    pub source_table_config: Option<SourceTableConfig>,
+    /// "A structure for the target table configuration", held the same way.
+    pub target_table_config: Option<TargetTableConfig>,
+}
+
+impl IntegrationTablePropertiesEntry {
+    /// The record a first `CreateIntegrationTableProperties` for a pair stores: the
+    /// configuration the request carried, for the resource and table it named.
+    pub fn from_create_input(input: &CreateIntegrationTablePropertiesInput) -> Self {
+        Self {
+            resource_arn: input.resource_arn.clone(),
+            table_name: input.table_name.clone(),
+            source_table_config: input.source_table_config.clone(),
+            target_table_config: input.target_table_config.clone(),
+        }
+    }
+
+    /// Apply a create for a pair this store ALREADY holds a record for: the side the
+    /// request states replaces the stored one, and a side it does not state is left as
+    /// stored.
+    ///
+    /// The source and the target configuration of one table are written by separate calls —
+    /// each against the ARN of its own leg — so a write that states one side says nothing
+    /// about the other and must not erase it.
+    pub fn apply_create(&mut self, input: &CreateIntegrationTablePropertiesInput) {
+        if input.source_table_config.is_some() {
+            self.source_table_config = input.source_table_config.clone();
+        }
+        if input.target_table_config.is_some() {
+            self.target_table_config = input.target_table_config.clone();
+        }
     }
 }
 
@@ -7187,6 +7430,41 @@ pub mod messages {
     pub fn integration_resource_property_not_found(resource_arn: &str) -> String {
         format!("Integration resource property for {resource_arn} not found.")
     }
+
+    /// An operation that addresses ONE integration table property record
+    /// (`GetIntegrationTableProperties`) for a `ResourceArn` and `TableName` this account
+    /// holds no reachable record for. Recorded template: the fixed text around the two
+    /// members the request addressed the record by, which the service names `sourceArn` and
+    /// `tableName`, and no trailing period.
+    pub fn integration_table_properties_not_found(resource_arn: &str, table_name: &str) -> String {
+        format!(
+            "Failed to find the sourceTableProperties with sourceArn {resource_arn} and tableName \
+             {table_name}"
+        )
+    }
+
+    /// A `CreateIntegrationTableProperties` whose `ResourceArn` names a resource this
+    /// account does not hold. Fixed text around the ARN the request addressed, as this API
+    /// family words a miss of the resource a call is addressed at; what is pinned is the
+    /// behaviour — `EntityNotFoundException`.
+    pub fn integration_table_target_resource_not_found(resource_arn: &str) -> String {
+        format!("The target resource {resource_arn} is not found.")
+    }
+
+    /// A `CreateIntegrationTableProperties` (or its update) that states BOTH table
+    /// configurations in one call. Recorded constant, entirely fixed text: the model names
+    /// both members optional, and the service's rule is that one call carries the
+    /// configuration of the ONE leg its `ResourceArn` names — "the same API need to be
+    /// invoked with the Glue connection ARN as ResourceArn with SourceTableConfig, and the
+    /// Glue database ARN as ResourceArn with TargetTableConfig respectively".
+    pub const INTEGRATION_TABLE_CONFIG_SIDES_EXCLUSIVE: &str =
+        "Source and Target config can't both be set.";
+
+    /// A write of a `SourceTableConfig` that states a member the service does not process
+    /// yet ([`super::UNSUPPORTED_SOURCE_TABLE_CONFIG_MEMBERS`]). Recorded constant,
+    /// entirely fixed text: it names neither the member nor the value that was refused.
+    pub const UNSUPPORTED_SOURCE_TABLE_PROPERTIES: &str =
+        "Unsupported source table properties are provided.";
 
     /// Any schema-registry operation whose `SchemaId` resolves to a schema set this
     /// endpoint holds none of (`GetSchema`, and the parent-schema miss of every version

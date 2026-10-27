@@ -101,6 +101,8 @@ mod glossary_term_listing;
 mod glossary_terms;
 #[path = "all/integration_resource_properties.rs"]
 mod integration_resource_properties;
+#[path = "all/integration_table_properties.rs"]
+mod integration_table_properties;
 #[path = "all/job_deletion.rs"]
 mod job_deletion;
 #[path = "all/job_listing.rs"]
