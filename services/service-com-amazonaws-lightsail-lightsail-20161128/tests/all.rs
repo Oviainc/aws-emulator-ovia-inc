@@ -115,6 +115,8 @@ mod distribution_cache_reset_clock;
 mod distribution_cdn;
 #[path = "all/distribution_certificate_attachment.rs"]
 mod distribution_certificate_attachment;
+#[path = "all/distribution_certificate_detach.rs"]
+mod distribution_certificate_detach;
 #[path = "all/distribution_create_certificate_validation.rs"]
 mod distribution_create_certificate_validation;
 #[path = "all/distribution_delete.rs"]

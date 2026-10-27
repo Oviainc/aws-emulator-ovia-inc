@@ -50,7 +50,7 @@ const ERROR_SHAPE_VALIDATION: &str = "ValidationException";
 const PLATFORM_ID: &str = "AWSLambda-SHA384-ECDSA";
 
 /// A second such platform, so a listing can be filtered to a subset.
-const OTHER_PLATFORM_ID: &str = "AWSIoTDeviceManagement-SHA256-ECDSA";
+const OTHER_PLATFORM_ID: &str = "Notation-OCI-SHA384-ECDSA";
 
 /// `MaxResults`'s modelled maximum (`@range(min: 1, max: 25)`).
 const MAX_RESULTS_CEILING: i32 = 25;
@@ -582,7 +582,7 @@ fn walk_cases() -> Vec<WalkCase> {
         },
         WalkCase {
             case: "the other platform's filter",
-            filters: "&platformId=AWSIoTDeviceManagement-SHA256-ECDSA",
+            filters: "&platformId=Notation-OCI-SHA384-ECDSA",
             platform_id: Some(OTHER_PLATFORM_ID),
             statuses: &[STATUS_ACTIVE],
             page_size: 2,
@@ -807,7 +807,7 @@ async fn a_final_page_carries_no_token() {
         ),
         (
             "a listing holding nothing at all",
-            "?maxResults=25&platformId=Notation-OCI-SHA384-ECDSA",
+            "?maxResults=25&platformId=AWSIoTDeviceManagement-SHA256-ECDSA",
             0,
         ),
     ];
