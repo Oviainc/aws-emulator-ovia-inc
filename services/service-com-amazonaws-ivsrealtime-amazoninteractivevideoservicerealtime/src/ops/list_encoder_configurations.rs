@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEncoderConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEncoderConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEncoderConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,23 +141,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_ENCODER_CONFIGURATIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report a page of the encoder configurations this account holds.
+    ///
+    /// A pure read over the stored configurations (`@readonly` in the model, and "Gets
+    /// summary information about all EncoderConfigurations in your account, in the AWS
+    /// region where the API request is processed"); nothing is written, so paging through
+    /// the listing cannot itself change what a later caller sees.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEncoderConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEncoderConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEncoderConfigurations"))
+        // The page is this request's own region's view of the account: an encoder
+        // configuration belongs to the region its ARN names. Nothing else here reads
+        // request metadata — the page is named by the request's own members, whose
+        // modelled lengths, patterns and ranges the framework's constraint walk refuses
+        // with a 400 `ValidationException` before `handle` runs.
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                ListEncoderConfigurationsErrorModeled::InternalServerException,
+            )
+        })?;
+
+        // A `nextToken` this listing did not issue names no position, so it is refused
+        // rather than read as "start from the beginning" — including a token from this
+        // service's other listings, which name a position among records these pages do
+        // not hold.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                crate::state::decode_encoder_configuration_page_token(token).ok_or_else(|| {
+                    crate::state::validation_failed(
+                        ListEncoderConfigurationsErrorModeled::ValidationException,
+                        // The one rule this service words a foreign page token with,
+                        // shared with its other listings.
+                        crate::state::foreign_page_token_message(Self::NAME),
+                    )
+                })?,
+            ),
+        };
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            // "Maximum number of results to return. Default: 100", as
+            // `ListEncoderConfigurationsRequest$maxResults` documents it.
+            .unwrap_or(crate::state::DEFAULT_ENCODER_CONFIGURATION_PAGE_SIZE)
+            // Unreachable defence, not an accepted-and-adjusted input: the modelled
+            // `MaxEncoderConfigurationResults` range (1..100) refuses a non-positive
+            // `maxResults` with a 400 before this handler runs. It is here only so a page
+            // size of zero can never make pagination loop forever.
+            .max(1);
+
+        let store = state.lock();
+        // Creation order, so a configuration created or deleted mid-pagination cannot
+        // shift a later page onto an already-returned one. This listing carries no
+        // filter, so a page is every configuration of the region from the resumed
+        // position on, bounded by the page size.
+        let remaining: Vec<&crate::state::EncoderConfigurationRecord> = store
+            .encoder_configurations_in_order(&region)
+            .into_iter()
+            .filter(|record| resume_after.is_none_or(|after| record.sequence > after))
+            .collect();
+        let encoder_configurations: Vec<EncoderConfigurationSummary> = remaining
+            .iter()
+            .take(page_size)
+            .map(|record| record.to_summary())
+            .collect();
+        // A token only when a configuration is left over, and it names the position this
+        // page ended at: the last page carries none.
+        let next_token = (remaining.len() > page_size).then(|| {
+            crate::state::encode_encoder_configuration_page_token(remaining[page_size - 1].sequence)
+        });
+
+        Ok(ListEncoderConfigurationsOutput {
+            encoder_configurations,
+            next_token,
+        })
     }
 }
