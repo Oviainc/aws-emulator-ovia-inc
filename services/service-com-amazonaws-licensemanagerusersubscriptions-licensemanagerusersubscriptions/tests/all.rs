@@ -27,6 +27,8 @@ mod instance_fleet_resolution;
 mod instance_products_follow_the_registrations;
 #[path = "all/instance_status_check_date.rs"]
 mod instance_status_check_date;
+#[path = "all/instances_come_from_the_ec2_fleet.rs"]
+mod instances_come_from_the_ec2_fleet;
 #[path = "all/license_based_subscription_expiry.rs"]
 mod license_based_subscription_expiry;
 #[path = "all/license_server_endpoint_delete_resolution.rs"]
