@@ -27,11 +27,9 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{member_of, Answer, Emulator, PAST_START_SPAN, ROLE, SSH_KEY};
-
-/// `SERVER_STOP_SPAN` in `src/state.rs` is 500 ms, like the start span
-/// [`PAST_START_SPAN`] waits out; wait past it.
-const PAST_STOP_SPAN: std::time::Duration = std::time::Duration::from_millis(900);
+use crate::harness::{
+    member_of, Answer, Emulator, PAST_START_SPAN, PAST_STOP_SPAN, ROLE, SSH_KEY,
+};
 
 /// A name at `UserName`'s modelled upper length bound (`len 3..100`, pattern
 /// `^[\w][\w@.-]{2,99}$`).

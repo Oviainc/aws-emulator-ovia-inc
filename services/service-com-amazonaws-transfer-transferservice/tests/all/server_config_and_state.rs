@@ -21,12 +21,9 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{assert_members, generated_host_key, member_of, Emulator, PAST_START_SPAN};
-
-/// `SERVER_STOP_SPAN` in `src/state.rs` is 500 ms; wait past it. It is kept HERE, next
-/// to the only suite that stops a server, rather than in the shared harness beside
-/// `PAST_START_SPAN`, so this suite adds no line to a file every other suite shares.
-const PAST_STOP_SPAN: std::time::Duration = std::time::Duration::from_millis(900);
+use crate::harness::{
+    assert_members, generated_host_key, member_of, Emulator, PAST_START_SPAN, PAST_STOP_SPAN,
+};
 
 /// What `DescribedServer.ProtocolDetails` reports for a server created without any
 /// `ProtocolDetails`: each member at the default its own model doc states (`PassiveIp`

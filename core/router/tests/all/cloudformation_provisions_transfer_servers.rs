@@ -33,9 +33,15 @@ use smithy_server_runtime::MultiServiceRouter;
 // (`tests/all/query_wire.rs`).
 use super::query_wire::{elements, form_encode, opt_element};
 
-/// Long enough for the stack's clock-owed span (`STATUS_TRANSITION_DELAY`, 500 ms) and
-/// for the created server's own start (`SERVER_START_SPAN`, 500 ms) to come due.
-const PAST_STACK_SPAN: Duration = Duration::from_millis(900);
+/// Long enough for the stack's own clock-owed span and for the created server's start
+/// (or stop) span to come due, with a margin on top.
+///
+/// Both spans are read from the crates under test rather than copied, so a suite cannot
+/// wait out a span a service no longer has; they are SUMMED because a const context has
+/// no `max`, and a sum is an upper bound on either.
+const PAST_STACK_SPAN: Duration = service_com_amazonaws_cloudformation_cloudformation::state::STATUS_TRANSITION_DELAY
+    .saturating_add(service_com_amazonaws_transfer_transferservice::state::SERVER_START_SPAN)
+    .saturating_add(Duration::from_millis(400));
 
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT: &str = "000000000000";
