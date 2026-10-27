@@ -16,6 +16,7 @@ use crate::ops::types::{
     Address, ClusterListEntry, ClusterMetadata, CompatibleImage, DeviceConfiguration, JobListEntry,
     JobMetadata, JobResource, LongTermPricingListEntry, Notification,
     OnDeviceServiceConfiguration, PickupDetails, ServiceVersion, ShippingDetails, TaxDocuments,
+    UpdateClusterInput, UpdateJobInput,
 };
 
 /// What a handler says when the engine it was constructed with does not carry this
@@ -1113,6 +1114,158 @@ impl StoredCluster {
             // it holds no job parts.
             job_part_ids: Vec::new(),
             unlock_code,
+        }
+    }
+}
+
+/// The members a cluster holds for its whole order, as one request supplied them: the
+/// address the devices ship to, the forwarding address, the description, the role, the
+/// shipping speed, the notification, the resources and the on-device services.
+///
+/// A cluster's node job holds no copy of these — "you need to provide only this clusterId
+/// value. The other job attributes are inherited from the cluster"
+/// (`CreateJobRequest$ClusterId`), and `ClusterMetadata` models ONE address and ONE
+/// shipping speed for the whole cluster — so they are the cluster's to hold and every
+/// record of the order carries the same value for each. `UpdateClusterRequest` and
+/// `UpdateJobRequest` both model all eight, and an update to either end of the order
+/// writes them to the same two kinds of record (the cluster, and each node job of it), so
+/// the rule "apply the member the request supplied, leave an omitted member as it was"
+/// lives here once, borrowed from whichever request carried it, rather than once per
+/// (record, request) pair in each handler: the two operations cannot drift into disagreeing
+/// about what a cluster's order carries, and a member added to or removed from the set is
+/// changed in this one place.
+#[derive(Debug, Clone, Copy)]
+pub struct ClusterOrderMembers<'a> {
+    pub address_id: Option<&'a str>,
+    pub forwarding_address_id: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub role_arn: Option<&'a str>,
+    pub shipping_option: Option<&'a str>,
+    pub notification: Option<&'a Notification>,
+    pub resources: Option<&'a JobResource>,
+    pub on_device_service_configuration: Option<&'a OnDeviceServiceConfiguration>,
+}
+
+impl<'a> ClusterOrderMembers<'a> {
+    /// Whether the request supplied any of these members at all.
+    ///
+    /// Asked of the same set [`Self::apply_to_cluster`] and [`Self::apply_to_job`] write, so
+    /// a request this answers `false` for changes nothing about the order.
+    pub fn any_supplied(&self) -> bool {
+        self.address_id.is_some()
+            || self.forwarding_address_id.is_some()
+            || self.description.is_some()
+            || self.role_arn.is_some()
+            || self.shipping_option.is_some()
+            || self.notification.is_some()
+            || self.resources.is_some()
+            || self.on_device_service_configuration.is_some()
+    }
+
+    /// Apply the members the request supplied to `cluster`, leaving every member it omitted
+    /// as it was.
+    ///
+    /// Neither request models a member that clears a stored value — `Description` is
+    /// modelled `length 1..1024`, so not even an empty string reaches a handler — so an
+    /// absent member means "leave this as it is", which is what makes an update partial. The
+    /// members `CreateClusterRequest` makes required are held as plain values, so they are
+    /// replaced rather than wrapped. Nothing else about the cluster (its id, its job type,
+    /// its device type, its state, the instant it was created, the key it was created with,
+    /// the node jobs it holds) is something an update takes.
+    pub fn apply_to_cluster(&self, cluster: &mut StoredCluster) {
+        if let Some(address_id) = self.address_id {
+            cluster.address_id = address_id.to_string();
+        }
+        if let Some(forwarding_address_id) = self.forwarding_address_id {
+            cluster.forwarding_address_id = Some(forwarding_address_id.to_string());
+        }
+        if let Some(description) = self.description {
+            cluster.description = Some(description.to_string());
+        }
+        if let Some(role_arn) = self.role_arn {
+            cluster.role_arn = Some(role_arn.to_string());
+        }
+        if let Some(shipping_option) = self.shipping_option {
+            cluster.shipping_option = shipping_option.to_string();
+        }
+        if let Some(notification) = self.notification {
+            cluster.notification = Some(notification.clone());
+        }
+        if let Some(resources) = self.resources {
+            cluster.resources = Some(resources.clone());
+        }
+        if let Some(configuration) = self.on_device_service_configuration {
+            cluster.on_device_service_configuration = Some(configuration.clone());
+        }
+    }
+
+    /// Apply the members the request supplied to `job`, one node job of the order, leaving
+    /// every member it omitted as it was.
+    ///
+    /// The same set lands on the node as on the cluster, since the node carries the
+    /// cluster's attributes. The members only a job has — the device it is configured with,
+    /// its impact level, its pickup details, the long-term pricing it is associated with, its
+    /// capacity preference — are not the cluster's, so they are left alone here, as are the
+    /// node's own id, state, unlock code and creation instant.
+    pub fn apply_to_job(&self, job: &mut StoredJob) {
+        if let Some(address_id) = self.address_id {
+            job.address_id = Some(address_id.to_string());
+        }
+        if let Some(forwarding_address_id) = self.forwarding_address_id {
+            job.forwarding_address_id = Some(forwarding_address_id.to_string());
+        }
+        if let Some(description) = self.description {
+            job.description = Some(description.to_string());
+        }
+        if let Some(role_arn) = self.role_arn {
+            job.role_arn = Some(role_arn.to_string());
+        }
+        if let Some(shipping_option) = self.shipping_option {
+            job.shipping_option = Some(shipping_option.to_string());
+        }
+        if let Some(notification) = self.notification {
+            job.notification = Some(notification.clone());
+        }
+        if let Some(resources) = self.resources {
+            job.resources = Some(resources.clone());
+        }
+        if let Some(configuration) = self.on_device_service_configuration {
+            job.on_device_service_configuration = Some(configuration.clone());
+        }
+    }
+}
+
+impl<'a> From<&'a UpdateClusterInput> for ClusterOrderMembers<'a> {
+    /// Every member `UpdateClusterRequest` models beyond the cluster it names is one the
+    /// cluster holds for its order, so this projection drops nothing.
+    fn from(input: &'a UpdateClusterInput) -> Self {
+        Self {
+            address_id: input.address_id.as_deref(),
+            forwarding_address_id: input.forwarding_address_id.as_deref(),
+            description: input.description.as_deref(),
+            role_arn: input.role_arn.as_deref(),
+            shipping_option: input.shipping_option.as_deref(),
+            notification: input.notification.as_ref(),
+            resources: input.resources.as_ref(),
+            on_device_service_configuration: input.on_device_service_configuration.as_ref(),
+        }
+    }
+}
+
+impl<'a> From<&'a UpdateJobInput> for ClusterOrderMembers<'a> {
+    /// `UpdateJobRequest` models these eight members too, beside the job it names and the
+    /// members only a job has (`SnowballCapacityPreference`, `PickupDetails`), which are the
+    /// named job's own and are therefore not part of the order's set.
+    fn from(input: &'a UpdateJobInput) -> Self {
+        Self {
+            address_id: input.address_id.as_deref(),
+            forwarding_address_id: input.forwarding_address_id.as_deref(),
+            description: input.description.as_deref(),
+            role_arn: input.role_arn.as_deref(),
+            shipping_option: input.shipping_option.as_deref(),
+            notification: input.notification.as_ref(),
+            resources: input.resources.as_ref(),
+            on_device_service_configuration: input.on_device_service_configuration.as_ref(),
         }
     }
 }
