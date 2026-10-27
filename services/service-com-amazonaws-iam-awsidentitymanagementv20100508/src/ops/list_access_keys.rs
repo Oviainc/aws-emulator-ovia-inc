@@ -2,6 +2,12 @@
 
 //! @op ListAccessKeys
 //!
+//! Reports the metadata of the access keys held by the IAM user the request names (or,
+//! with no `UserName`, the user the signing key resolves to), paged by `Marker`/
+//! `MaxItems`. A pure READ — nothing here writes, so a later caller sees exactly what
+//! this one did — decided first against the caller's own identity-based policies and the
+//! permissions boundary that caps them ([`crate::state::authorization`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -232,16 +238,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The keys reported are those of an IAM user the account holds: a name the
-        // account does not hold names no user whose keys could be reported, which is
-        // the one modelled client error this operation declares.
-        let Some(user) = store.users.get(&user_key) else {
+        // The keys reported are those of an IAM user the account holds. The LOOKUP comes
+        // first but the answer to it is withheld until the call has been authorized,
+        // because IAM decides a call against the caller's policies before it reads the
+        // resource: a caller that may not list a user's keys learns that it may not,
+        // never whether that user exists.
+        let held = store.users.get(&user_key);
+        // How the request addressed the user: its own spelling where it named one, and
+        // for a nameless call the name the account HOLDS the signing key's user under,
+        // since IAM names "are not distinguished by case" and the key order the store is
+        // keyed in is not a spelling any caller wrote. This is what a refusal names, and
+        // what a missing entity is reported under.
+        let addressed = input
+            .user_name
+            .clone()
+            .or_else(|| held.map(|user| user.user_name.clone()))
+            .unwrap_or_else(|| user_key.clone());
+        // IAM authorizes its own API: the signing principal's identity-based policies,
+        // within the boundary that caps them, are evaluated before any key is reported.
+        // The decision is made on the ARN of the user the request addresses — the held
+        // user's own ARN, or, for a name the account holds no user under, the ARN that
+        // name would carry at the default path, since there is no other path to
+        // attribute it to. A refusal names that user as the request named it
+        // (`user Bob`) rather than by ARN.
+        let resource = held.map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &addressed),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_ACCESS_KEYS,
+            &resource,
+            &format!("user {addressed}"),
+        )?;
+
+        // A name the account does not hold names no user whose keys could be reported,
+        // which is the one modelled client error this operation declares.
+        let Some(user) = held else {
             return Err(ListAccessKeysErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!(
-                        "The user with name {} cannot be found.",
-                        input.user_name.as_deref().unwrap_or(&user_key)
-                    )),
+                    message: Some(format!("The user with name {addressed} cannot be found.")),
                 },
             )
             .into());

@@ -3,9 +3,10 @@
 //! Engine state for the com-amazonaws-appstream-photonadminproxyservice service.
 //!
 //! The stack/fleet lifecycle lives here: `CreateStack`/`CreateFleet` write a record,
-//! `DescribeStacks`/`DescribeFleets` render the stored record back, `AssociateFleet`
-//! records the fleet/stack edge, and `DeleteStack`/`DeleteFleet` refuse while an edge
-//! still names the resource.
+//! `UpdateStack` applies the members it is given to the stored record and clears the
+//! fields its `AttributesToDelete` names, `DescribeStacks`/`DescribeFleets` render the
+//! stored record back, `AssociateFleet` records the fleet/stack edge, and
+//! `DeleteStack`/`DeleteFleet` refuse while an edge still names the resource.
 //!
 //! Records hold the MODELLED sub-shapes (`StorageConnector`, `UserSetting`,
 //! `VpcConfig`, …) rather than copies of them, so what a Describe returns is literally
@@ -115,6 +116,18 @@ pub struct StackRecord {
     pub tags: BTreeMap<String, String>,
 }
 
+/// Render a stored configuration collection the way the resource reports it: a
+/// collection with no entries is a configuration the stack does not have, so the member
+/// is ABSENT from the rendered resource rather than present-and-empty.
+///
+/// This is the representation side of clearing a stack attribute: once an `UpdateStack`
+/// request drops a stack's access endpoints, user settings, embedded host domains or
+/// storage connectors, the corresponding key is gone from the returned `Stack` and from
+/// every later `DescribeStacks`, exactly as it is for a stack that was never given one.
+fn reported<T: Clone>(entries: &[T]) -> Option<Vec<T>> {
+    (!entries.is_empty()).then(|| entries.to_vec())
+}
+
 impl StackRecord {
     /// Render the stored record as the modelled `Stack` every reader returns.
     pub fn to_stack(&self) -> Stack {
@@ -124,14 +137,16 @@ impl StackRecord {
             description: self.description.clone(),
             display_name: self.display_name.clone(),
             created_time: Some(self.created_time),
-            storage_connectors: Some(self.storage_connectors.clone()),
+            storage_connectors: reported(&self.storage_connectors),
             redirect_url: self.redirect_url.clone(),
             feedback_url: self.feedback_url.clone(),
+            // A stack always reports its error list; an empty one says "no errors",
+            // which is a value, not a missing configuration.
             stack_errors: Some(self.stack_errors.clone()),
-            user_settings: Some(self.user_settings.clone()),
+            user_settings: reported(&self.user_settings),
             application_settings: self.application_settings.clone(),
-            access_endpoints: Some(self.access_endpoints.clone()),
-            embed_host_domains: Some(self.embed_host_domains.clone()),
+            access_endpoints: reported(&self.access_endpoints),
+            embed_host_domains: reported(&self.embed_host_domains),
             streaming_experience_settings: self.streaming_experience_settings.clone(),
             content_redirection: self.content_redirection.clone(),
             agent_access_config: self.agent_access_config.clone(),

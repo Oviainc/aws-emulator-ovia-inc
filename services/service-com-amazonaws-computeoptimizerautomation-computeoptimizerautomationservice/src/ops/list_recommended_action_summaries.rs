@@ -232,17 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `maxResults` carries a member `@range` of min 1 / max 100
         // (`smithy_query(query="shape",shape="ListRecommendedActionSummariesRequest")`),
         // enforced by the generated request walk BEFORE this handler runs — so
-        // the page size is only defaulted here, never validated, and the clamp is
-        // a floor against a zero page, which would return nothing while carrying
-        // a token whose offset never advances.
-        let max_page_size = usize::try_from(crate::state::DEFAULT_MAX_RESULTS).unwrap_or(1);
-        let page_size = usize::try_from(
-            input
-                .max_results
-                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
-        )
-        .unwrap_or(1)
-        .clamp(1, max_page_size);
+        // the page size is only defaulted here, never validated. One rule for
+        // every paginated listing here, including the floor against a
+        // non-advancing zero page: `crate::state::page_size`.
+        let page_size = crate::state::page_size(input.max_results);
 
         let guard = state.lock();
         // The service-wide enrollment gate, AHEAD of filter evaluation: an

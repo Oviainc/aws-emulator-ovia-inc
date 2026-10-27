@@ -288,10 +288,8 @@ async fn a_refused_request_states_the_position_and_the_constraint_only() {
 
 /// A value INSIDE the declared bound is not refused: each published bound of
 /// `ListSourcesForS3TableIntegrationMaxResults` (1 and 100) and of `DescribeLimit`
-/// (1 and 50) passes the constraint walk, so the request reaches its operation — 200 for
-/// `DescribeLogGroups`, and the scaffold's 501 `NotImplemented` for
-/// `ListSourcesForS3TableIntegration`, which is still a stub — instead of a 400 naming
-/// that member.
+/// (1 and 50) passes the constraint walk, so the request reaches its operation — a 200 from
+/// both readers — instead of a 400 naming that member.
 #[tokio::test]
 async fn a_value_on_either_published_bound_is_not_refused() {
     let logs = Logs::new();
@@ -302,14 +300,14 @@ async fn a_value_on_either_published_bound_is_not_refused() {
             "ListSourcesForS3TableIntegration",
             "maxResults",
             json!({"integrationArn": SOME_ARN, "maxResults": 1}),
-            501,
+            200,
         ),
         (
             "ListSourcesForS3TableIntegration maxResults at the maximum",
             "ListSourcesForS3TableIntegration",
             "maxResults",
             json!({"integrationArn": SOME_ARN, "maxResults": 100}),
-            501,
+            200,
         ),
         (
             "DescribeLogGroups limit at the minimum",

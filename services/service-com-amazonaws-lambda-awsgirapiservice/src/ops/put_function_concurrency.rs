@@ -261,14 +261,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reservation, so the capacity its aliases and versions already keep initialised
         // has to fit inside the reservation being set: the same per-function rule
         // `PutProvisionedConcurrencyConfig` weighs a new allocation against, enforced from
-        // the other side, and refused with the one sentence that states it.
+        // the other side. This side's refusal states what THIS call asked for — the
+        // reservation the request carries and the total the function already keeps
+        // initialised — so the remedy it points at is releasing provisioned concurrency
+        // rather than raising the reservation.
         let provisioned = store
             .functions
             .get(&reference.name)
             .map_or(0, |record| record.provisioned_concurrency_except(None));
         if requested < provisioned {
             return Err(invalid_parameter(
-                crate::state::PROVISIONED_ABOVE_RESERVED_MESSAGE.to_string(),
+                crate::state::reserved_below_provisioned_message(
+                    "ReservedConcurrentExecutions",
+                    requested,
+                    provisioned,
+                ),
             ));
         }
 

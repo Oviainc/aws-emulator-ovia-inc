@@ -165,6 +165,8 @@ mod origin_request_policy_delete;
 mod origin_request_policy_lifecycle;
 #[path = "all/origin_request_policy_list.rs"]
 mod origin_request_policy_list;
+#[path = "all/origin_request_policy_update.rs"]
+mod origin_request_policy_update;
 #[path = "all/public_key_lifecycle.rs"]
 mod public_key_lifecycle;
 #[path = "all/realtime_log_config_lifecycle.rs"]

@@ -187,7 +187,9 @@ async fn successive_writes_merge_and_can_be_restored() {
 
     // The requests, in order, spanning the subsets a client sends: one member
     // alone, a nested member alone, the organization-scoped member alone, two
-    // at once, the empty request, and finally a restore of an earlier state.
+    // at once, the empty request, a restore of an earlier state, and finally
+    // the organization-scoped member moved back — which the restore of the
+    // unrestricted mode above is what makes acceptable.
     let requests: Vec<Value> = vec![
         json!({"savingsEstimationMode": "BeforeDiscounts"}),
         json!({"preferredCommitment": {"term": "OneYear"}}),
@@ -198,13 +200,13 @@ async fn successive_writes_merge_and_can_be_restored() {
             "preferredCommitment": {"paymentOption": "PartialUpfront", "term": "OneYear"},
         }),
         json!({}),
-        json!({"memberAccountDiscountVisibility": "None"}),
         // The restore: the same shape of request the configure step sent, with
         // the values the account started from.
         json!({
             "savingsEstimationMode": "BeforeDiscounts",
             "preferredCommitment": {"paymentOption": "AllUpfront", "term": "ThreeYears"},
         }),
+        json!({"memberAccountDiscountVisibility": "None"}),
     ];
 
     let mut stored = Value::Null;

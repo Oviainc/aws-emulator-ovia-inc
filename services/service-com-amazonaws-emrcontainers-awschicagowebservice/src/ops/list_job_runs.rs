@@ -80,30 +80,16 @@ fn matches_filters(record: &crate::state::JobRunRecord, input: &ListJobRunsInput
     if input.name.is_some() && record.name != input.name {
         return false;
     }
-    // `states` keeps the runs in any listed state. An empty list names no state to keep
-    // out, so it constrains nothing.
-    if let Some(states) = input.states.as_ref().filter(|states| !states.is_empty()) {
-        if !states.contains(&record.state) {
-            return false;
-        }
-    }
-    // `createdBefore` / `createdAfter` bound `createdAt` strictly, so the two together
-    // name an open interval and neither ever returns the run created exactly at a bound.
-    if input
-        .created_before
-        .as_ref()
-        .is_some_and(|bound| record.created_at_millis >= crate::state::millis_of(bound))
-    {
-        return false;
-    }
-    if input
-        .created_after
-        .as_ref()
-        .is_some_and(|bound| record.created_at_millis <= crate::state::millis_of(bound))
-    {
-        return false;
-    }
-    true
+    // `states` and the `createdBefore` / `createdAfter` window are the filters every
+    // paginated listing in this service shares, so each is applied out of the one place
+    // that holds it ([`crate::state::within_listed_states`],
+    // [`crate::state::within_created_bounds`]) rather than written out again here.
+    crate::state::within_listed_states(&record.state, input.states.as_deref())
+        && crate::state::within_created_bounds(
+            record.created_at_millis,
+            input.created_before.as_ref(),
+            input.created_after.as_ref(),
+        )
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative

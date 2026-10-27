@@ -31,7 +31,7 @@ use crate::ops::types::{
     PermissionSet, PermissionSetProvisioningStatus, PermissionSetProvisioningStatusMetadata,
     PermissionsBoundary, PortalOptions,
     RegionMetadata, ResourceServerConfig, ResourceServerScopeDetails, ScopeDetails, Tag,
-    TrustedTokenIssuerConfiguration,
+    TrustedTokenIssuerConfiguration, TrustedTokenIssuerMetadata,
 };
 
 /// The identity-store instance every `InstanceArn`-taking operation resolves against.
@@ -1925,6 +1925,23 @@ pub struct TrustedTokenIssuerRecord {
     /// a retry carrying the SAME token can be told from the same token carrying a
     /// DIFFERENT request.
     pub request_fingerprint: String,
+}
+
+impl TrustedTokenIssuerRecord {
+    /// This record as the modeled `TrustedTokenIssuerMetadata` shape — the projection an
+    /// ENUMERATION of trusted token issuers reports, holding the same values
+    /// `DescribeTrustedTokenIssuer` reports for the same record, member for member.
+    ///
+    /// The shape carries three members and no more, so the stored configuration and the
+    /// tags are not part of this view: a caller that wants them describes the issuer this
+    /// names.
+    pub fn to_metadata(&self) -> TrustedTokenIssuerMetadata {
+        TrustedTokenIssuerMetadata {
+            trusted_token_issuer_arn: Some(self.trusted_token_issuer_arn.clone()),
+            name: Some(self.name.clone()),
+            trusted_token_issuer_type: Some(self.trusted_token_issuer_type.clone()),
+        }
+    }
 }
 
 /// An assignment of a permission set to a principal on one account.
@@ -3895,6 +3912,13 @@ pub const CURSOR_APPLICATION_PROVIDERS: &str = "applicationProviders";
 /// whose permission sets it walks.
 pub fn cursor_permission_sets(instance_arn: &str) -> String {
     format!("permissionSets|{instance_arn}")
+}
+
+/// Cursor scope of a `ListTrustedTokenIssuers` enumeration: the operation and the
+/// instance whose trusted token issuers it walks, since the key (a
+/// `TrustedTokenIssuerArn`) only distinguishes rows WITHIN one instance.
+pub fn cursor_trusted_token_issuers(instance_arn: &str) -> String {
+    format!("trustedTokenIssuers|{instance_arn}")
 }
 
 /// Cursor scope of a `ListRegions` enumeration: the operation and the instance whose

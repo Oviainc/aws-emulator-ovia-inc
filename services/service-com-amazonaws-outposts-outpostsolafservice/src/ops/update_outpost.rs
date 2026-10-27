@@ -9,6 +9,12 @@
 //! path that reports an Outpost — so it is exactly what `GetOutpost` and `ListOutposts`
 //! report afterwards.
 //!
+//! `SupportedHardwareType` is the one member that is more than a stored value: it names
+//! the hardware configuration this service installs on the Outpost, so a request naming
+//! a form factor other than the one the Outpost carries starts the install of the
+//! configuration that form factor names, and the Outpost never reports hardware it does
+//! not hold.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -198,10 +204,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // value the caller may set and is stored as sent rather than dropped.
         crate::state::apply(&mut record.outpost.name, input.name);
         crate::state::apply(&mut record.outpost.description, input.description);
-        crate::state::apply(
-            &mut record.outpost.supported_hardware_type,
-            input.supported_hardware_type,
-        );
+        // `SupportedHardwareType` is the exception: it is the one input that selects
+        // WHICH hardware this service installs on the Outpost, so recording it is
+        // recording the hardware the Outpost is installed with and the two are never
+        // written apart. The record is what pairs them
+        // (`OutpostRecord::set_supported_hardware_type`): a form factor other than
+        // the one the Outpost carries names different hardware, which this service
+        // installs in its turn, so no Outpost is left reporting a configuration it
+        // does not hold. A request carrying no form factor leaves both alone, and a
+        // value the modelled `SupportedHardwareType` enum does not declare — the empty
+        // string included — never reaches here: an enum's value set is validated at the
+        // boundary, so only `RACK` or `SERVER` is ever recorded (the `non_empty` call
+        // is the same guard the create side keeps).
+        if let Some(form_factor) = crate::state::non_empty(input.supported_hardware_type) {
+            record.set_supported_hardware_type(form_factor);
+        }
 
         Ok(UpdateOutpostOutput {
             outpost: Some(record.outpost.clone()),

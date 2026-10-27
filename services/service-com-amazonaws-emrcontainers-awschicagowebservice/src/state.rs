@@ -546,6 +546,37 @@ pub fn page_of<'a, R: ListPosition>(
     })
 }
 
+/// The `createdBefore` / `createdAfter` rule every `@paginated` list in this service
+/// applies to a record's stored `createdAt`: both bound it STRICTLY, so the two together
+/// name an open interval and neither ever keeps the record created exactly at a bound. A
+/// bound the request omitted constrains nothing.
+///
+/// One rule for every paginated list here, beside the one page rule ([`page_of`]), so the
+/// halves of a listing's contract cannot drift apart: a bound is exclusive for every
+/// listing or for none.
+pub fn within_created_bounds(
+    created_at_millis: i64,
+    created_before: Option<&::aws_smithy_types::DateTime>,
+    created_after: Option<&::aws_smithy_types::DateTime>,
+) -> bool {
+    created_before.is_none_or(|bound| created_at_millis < millis_of(bound))
+        && created_after.is_none_or(|bound| created_at_millis > millis_of(bound))
+}
+
+/// The `states` rule every list in this service that carries one applies to a record's
+/// stored state: the record is kept when its state is one of the states the request
+/// listed. A filter the request omitted constrains nothing, and nor does one that lists no
+/// state at all — an empty list names no state to keep out.
+///
+/// One rule for every listing that filters by state, beside [`within_created_bounds`], so
+/// an empty list cannot come to mean "keep nothing" in one listing and "keep everything"
+/// in another.
+pub fn within_listed_states(state: &str, states: Option<&[String]>) -> bool {
+    states
+        .filter(|states| !states.is_empty())
+        .is_none_or(|states| states.iter().any(|listed| listed == state))
+}
+
 /// `arn:aws:emr-containers:{region}:{account}:/virtualclusters/{id}` — the
 /// `VirtualClusterArn` shape's pattern.
 pub fn virtual_cluster_arn(region: &str, id: &str) -> String {

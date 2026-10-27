@@ -1598,6 +1598,75 @@ pub fn check_subnet_mapping(
     Ok(())
 }
 
+/// The VPC a load balancer placed in these subnets is in: the one every subnet EC2
+/// reported belongs to.
+///
+/// A load balancer's network interfaces all live in one VPC, so subnets that do not agree
+/// on one — or that EC2 could not be asked about — resolve no VPC and the member is left
+/// unreported rather than guessed from the first of them.
+pub fn subnets_vpc(resolved: Option<&[network::SubnetFacts]>) -> Option<String> {
+    let mut vpcs = resolved?
+        .iter()
+        .filter_map(|subnet| subnet.vpc_id.as_deref());
+    let first = vpcs.next()?;
+    vpcs.all(|vpc| vpc == first).then(|| first.to_string())
+}
+
+/// Whether every subnet a request places a load balancer in belongs to ONE VPC — the one
+/// the load balancer already carries when it carries one — and, when one does not, the
+/// rule the request broke.
+///
+/// A load balancer's network interfaces live in the subnets it is placed in and a network
+/// interface belongs to exactly one VPC, so a placement that spans two VPCs is a
+/// configuration no load balancer can hold: the whole request is refused rather than
+/// leaving the load balancer straddling two VPCs or silently moved out of its own. Which
+/// VPC each subnet is in is EC2's to say, so the comparison is made on what EC2 reported
+/// (`resolved`); with no EC2 to ask nothing is known and nothing is refused, because a
+/// refusal has to be grounded in what EC2 reported rather than assumed from silence.
+///
+/// `carried` is the VPC the load balancer is already in, for a call that REPLACES its
+/// subnets; a load balancer that carries none yet — and a create, which has none — is
+/// judged against the VPC of the FIRST subnet the request names, the VPC the placement
+/// would put it in.
+///
+/// The ONE reading of that rule, called by `CreateLoadBalancer` for the subnets a load
+/// balancer starts in and by `SetSubnets` for the subnets that replace them.
+///
+/// `resolved` is what EC2 answered about `requested_subnets` — the facts of exactly those
+/// ids, because a read naming one the account holds no subnet for is refused WHOLE — so
+/// every fact in it is a subnet this placement names, and `requested_subnets` is what says
+/// in which ORDER the request named them.
+pub fn check_subnet_vpcs(
+    carried: Option<&str>,
+    requested_subnets: &[String],
+    resolved: Option<&[network::SubnetFacts]>,
+) -> Result<(), String> {
+    let Some(resolved) = resolved else {
+        return Ok(());
+    };
+    let reported_vpc = |subnet_id: &str| -> Option<&str> {
+        resolved
+            .iter()
+            .find(|subnet| subnet.subnet_id == subnet_id)?
+            .vpc_id
+            .as_deref()
+    };
+    let Some(vpc_id) = carried.or_else(|| {
+        requested_subnets
+            .iter()
+            .find_map(|subnet_id| reported_vpc(subnet_id))
+    }) else {
+        return Ok(());
+    };
+    if resolved
+        .iter()
+        .any(|subnet| subnet.vpc_id.as_deref().is_some_and(|held| held != vpc_id))
+    {
+        return Err(format!("All subnets must belong to the same VPC: '{vpc_id}'"));
+    }
+    Ok(())
+}
+
 /// The `LoadBalancerTypeEnum` value a family is named by, for a refusal that states which
 /// kind of load balancer the request asked for.
 fn family_type_name(family: LoadBalancerFamily) -> &'static str {

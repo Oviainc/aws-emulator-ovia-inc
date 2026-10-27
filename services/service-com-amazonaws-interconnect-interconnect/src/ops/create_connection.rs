@@ -245,10 +245,12 @@ fn judge_against_store(
         .into());
     }
 
-    // `Environment$remoteIdentifierType` is the kind of identifying information the
-    // partner of THIS Environment verifies the remote side by, so an Environment
-    // that declares one asks every create on it for a `remoteAccount` carrying that
-    // kind, and one that declares none asks for nothing.
+    // `Environment$remoteIdentifierType` names the kind of identifying information
+    // the partner of THIS Environment will verify the remote side by, so an
+    // Environment that declares one needs a `remoteAccount` on every create against
+    // it and one that declares none needs nothing. Beyond that presence, the only
+    // rules on the identifier are the union member's own modelled length and
+    // pattern — the identity itself is verified later, at the partner portal.
     if let Some(message) =
         crate::state::remote_account_violation(&environment, input.remote_account.as_ref())
     {

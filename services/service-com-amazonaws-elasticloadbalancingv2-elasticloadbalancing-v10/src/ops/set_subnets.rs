@@ -16,8 +16,11 @@
 //! mappings" and not both, "you can specify only one subnet per Availability Zone",
 //! "[Application Load Balancers] You must specify subnets from at least two Availability
 //! Zones", and `EnablePrefixForIpv6SourceNat` "[Network Load Balancers with UDP
-//! listeners] ... The IP address type must be dualstack". A request one of them refuses is
-//! the modelled `InvalidConfigurationRequestException`; an ARN this store holds no load
+//! listeners] ... The IP address type must be dualstack". Beside them, the subnets that
+//! replace the enabled ones are the load balancer's own VPC's: its network interfaces live
+//! in them and each belongs to exactly one VPC, so a placement naming a subnet of another
+//! VPC is a configuration no load balancer can hold. A request one of these rules refuses
+//! is the modelled `InvalidConfigurationRequestException`; an ARN this store holds no load
 //! balancer for is the modelled `LoadBalancerNotFoundException`.
 //!
 //! ## Shape of an operation
@@ -221,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // What the load balancer is today, read under the lock and then released: the
         // subnets are resolved against EC2 next, and nothing is held across that call.
-        let (family, scheme, carried_address_type) = {
+        let (family, scheme, carried_address_type, carried_vpc) = {
             let guard = state.lock();
             let Some(load_balancer) = guard.load_balancers.get(&input.load_balancer_arn) else {
                 return Err(not_found(&input.load_balancer_arn));
@@ -230,6 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 load_balancer.family(),
                 load_balancer.scheme.clone(),
                 load_balancer.ip_address_type.clone(),
+                load_balancer.vpc_id.clone(),
             )
         };
 
@@ -320,6 +324,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+        // A load balancer's network interfaces live in the subnets it is placed in, and
+        // each of them belongs to exactly one VPC: the subnets that replace the enabled
+        // ones have to be the VPC's own, so a placement naming a subnet of ANOTHER VPC is
+        // refused — before anything is written, so the zones the load balancer carries are
+        // left as they were. The ONE reading of that rule, the same one
+        // `CreateLoadBalancer` applies to the subnets a load balancer STARTS in.
+        if let Err(rule) = crate::state::check_subnet_vpcs(
+            carried_vpc.as_deref(),
+            &requested_subnets,
+            resolved_subnets.as_deref(),
+        ) {
+            return Err(invalid_configuration(rule));
         }
         let zones = crate::state::availability_zone_records(
             subnets,

@@ -8,6 +8,10 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# `validation`: the element-path spelling a constraint violation on a list's element is
+# reported under, and the walk that renders the list the caller sent — the value a clause
+# stated at the list member quotes.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

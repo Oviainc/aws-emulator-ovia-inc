@@ -17,6 +17,11 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `DeleteVolume` removes, what it refuses, and what a dry run of it performs. Declared
+// beside `prefix_lists` for the reason the note above gives: the sorted neighbourhood is where
+// every new ec2 suite inserts its two lines.
+#[path = "all/delete_volume.rs"]
+mod delete_volume;
 // The endpoint services a caller can create a VPC endpoint to: the Region's catalogue and the
 // account's own service configurations. Declared beside `prefix_lists` for the reason the note
 // above gives — the sorted neighbourhood is where every new ec2 suite inserts its two lines.

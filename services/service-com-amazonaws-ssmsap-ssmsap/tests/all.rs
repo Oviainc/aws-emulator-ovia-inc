@@ -51,6 +51,8 @@ mod list_configuration_check_definitions;
 mod list_configuration_check_operations;
 #[path = "all/list_databases.rs"]
 mod list_databases;
+#[path = "all/list_element_validation_messages.rs"]
+mod list_element_validation_messages;
 #[path = "all/list_operation_events.rs"]
 mod list_operation_events;
 #[path = "all/list_operations.rs"]
